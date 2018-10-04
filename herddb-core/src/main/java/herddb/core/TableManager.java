@@ -32,7 +32,6 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -105,6 +104,8 @@ import herddb.utils.Holder;
 import herddb.utils.LocalLockManager;
 import herddb.utils.LockHandle;
 import herddb.utils.SystemProperties;
+import java.util.concurrent.ConcurrentMap;
+import org.apache.bookkeeper.util.collections.ConcurrentLongHashMap;
 
 /**
  * Handles Data of a Table
@@ -133,9 +134,11 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
     private static final boolean ENABLE_STREAMING_DATA_SCANNER = SystemProperties.
             getBooleanSystemProperty("herddb.tablemanager.enableStreamingDataScanner", true);
+    
+    private static final int INITIAL_DATAPAGE_CAPACITY  = SystemProperties.
+            getIntSystemProperty("herddb.tablemanager.datapageinitsize", 1024);
 
-    private final ConcurrentMap<Long, DataPage> newPages;
-
+    private final ConcurrentLongHashMap<DataPage> newPages;
     private final ConcurrentMap<Long, DataPage> pages;
 
     /**
@@ -250,7 +253,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
         @Override
         public int getLoadedpages() {
-            return pages.size();
+            return (int) pages.size();
         }
 
         @Override
@@ -331,7 +334,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
         this.pageReplacementPolicy = memoryManager.getDataPageReplacementPolicy();
         this.pages = new ConcurrentHashMap<>();
-        this.newPages = new ConcurrentHashMap<>();
+        this.newPages = new ConcurrentLongHashMap<>();
 
         this.dirtyThreshold = tableSpaceManager.getDbmanager().getServerConfiguration().getDouble(
                 ServerConfiguration.PROPERTY_DIRTY_PAGE_THRESHOLD,
@@ -562,11 +565,11 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         return pageId;
     }
 
-    private Long allocateLivePage(Long lastKnownPageId) {
+    private long allocateLivePage(Long lastKnownPageId) {
         /* This method expect that a new page actually exists! */
         nextPageLock.lock();
 
-        final Long newId;
+        final long newId;
         Page.Metadata unload = null;
         try {
 
@@ -582,7 +585,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 newId = nextPageId++;
 
                 if (pages.containsKey(newId)) {
-                    throw new IllegalStateException("invalid newpage id " + newId + ", " + newPages.keySet() + "/" + pages.keySet());
+                    throw new IllegalStateException("invalid newpage id " + newId + ", " + newPages.keys() + "/" + pages.keySet());
                 }
 
                 /*
@@ -591,10 +594,10 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                  */
                 lastKnownPage = pages.get(lastKnownPageId);
                 if (lastKnownPage == null) {
-                    throw new IllegalStateException("invalid last known new page id " + lastKnownPageId + ", " + newPages.keySet() + "/" + pages.keySet());
+                    throw new IllegalStateException("invalid last known new page id " + lastKnownPageId + ", " + newPages.keys() + "/" + pages.keySet());
                 }
 
-                final DataPage newPage = new DataPage(this, newId, maxLogicalPageSize, 0, new ConcurrentHashMap<>(), false);
+                final DataPage newPage = new DataPage(this, newId, maxLogicalPageSize, 0, new ConcurrentHashMap<>(INITIAL_DATAPAGE_CAPACITY), false);
                 newPages.put(newId, newPage);
                 pages.put(newId, newPage);
 
@@ -626,7 +629,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         /* Both created now or already created */
         return newId;
     }
-
+    
     /**
      * Create a new page and set it as the target page for dirty records.
      * <p>
@@ -637,10 +640,10 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     private void initNewPage() {
 
         final Long newId = nextPageId++;
-        final DataPage newPage = new DataPage(this, newId, maxLogicalPageSize, 0, new ConcurrentHashMap<>(), false);
+        final DataPage newPage = new DataPage(this, newId, maxLogicalPageSize, 0, new ConcurrentHashMap<>(INITIAL_DATAPAGE_CAPACITY), false);
 
         if (!newPages.isEmpty()) {
-            throw new IllegalStateException("invalid new page initialization, other new pages already exist: " + newPages.keySet());
+            throw new IllegalStateException("invalid new page initialization, other new pages already exist: " + newPages.keys());
         }
         newPages.put(newId, newPage);
         pages.put(newId, newPage);
@@ -849,7 +852,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
          the insert will update the 'maxKey' for auto_increment primary keys
          */
         Bytes key = new Bytes(insert.getKeyFunction().computeNewValue(null, context, tableContext));
-        byte[] value = insert.getValuesFunction().computeNewValue(new Record(key, null), context, tableContext);
+        byte[] value = insert.getValuesFunction().computeNewValue(null, context, tableContext);
         Map<String, AbstractIndexManager> indexes = tableSpaceManager.getIndexesOnTable(table.name);
         if (indexes != null) {
             try {
@@ -1350,7 +1353,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         }
 
         /* Insertion page */
-        Long insertionPageId;
+        long insertionPageId;
 
         if (insertedInSamePage) {
             /* Inserted in temporary mutable previous page, no need to alter keyToPage too: no record page change */
@@ -1510,7 +1513,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         final Record record = new Record(key, value);
 
         /* Do real insertion */
-        Long insertionPageId = currentDirtyRecordsPage.get();
+        long insertionPageId = currentDirtyRecordsPage.get();
 
         while (true) {
             final DataPage newPage = newPages.get(insertionPageId);
@@ -1707,7 +1710,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     }
 
     private DataPage buildImmutableDataPage(long pageId, List<Record> page) {
-        Map<Bytes, Record> newPageMap = new HashMap<>();
+        Map<Bytes, Record> newPageMap = new HashMap<>(page.size());
         long estimatedPageSize = 0;
         for (Record r : page) {
             newPageMap.put(r.key, r);

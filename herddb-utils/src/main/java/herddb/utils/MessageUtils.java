@@ -371,15 +371,17 @@ public class MessageUtils {
         return new String(bufferToArray(data), StandardCharsets.UTF_8);
     }
 
-    public static List<Object> decodeAnyValueList(AnyValueList params) {
-        List<Object> res = new ArrayList<>();
+    public static List<Object> decodeAnyValueList(AnyValueList params) {        
         if (params != null) {
+            List<Object> res = new ArrayList<>(params.itemsLength());
             for (int i = 0; i < params.itemsLength(); i++) {
                 Object value = decodeObject(params.items(i));
                 res.add(value);
             }
-        }
-        return res;
+            return res;
+        } else {
+            return Collections.emptyList();
+        }        
     }
 
     public static Object decodeObject(AnyValueWrapper item) throws IllegalArgumentException {
