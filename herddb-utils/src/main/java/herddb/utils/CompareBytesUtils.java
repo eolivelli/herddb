@@ -19,6 +19,8 @@
  */
 package herddb.utils;
 
+import io.netty.util.internal.PlatformDependent;
+import java.util.Arrays;
 import java.util.logging.Logger;
 
 /**
@@ -30,7 +32,7 @@ public final class CompareBytesUtils {
     private static final Logger LOG = Logger.getLogger(CompareBytesUtils.class.getName());
 
     static {
-        LOG.info("Not Using Arrays#compare(byte[], byte[]). Using legacy pure-Java implementation, use JDK10 in order to get best performances");
+        LOG.info("Not Using Arrays#compare(byte[], byte[]). Using legacy pure-Java implementation, use JDK9+ in order to get best performances");
     }
 
     private CompareBytesUtils() {
@@ -45,5 +47,10 @@ public final class CompareBytesUtils {
             }
         }
         return left.length - right.length;
+    }
+    
+    public static boolean equals(byte[] data, byte[] other) {
+        // Netty uses Unsafe
+        return PlatformDependent.equals(data, 0, other, 0, data.length);
     }
 }

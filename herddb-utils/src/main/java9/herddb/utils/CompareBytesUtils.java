@@ -19,6 +19,7 @@
  */
 package herddb.utils;
 
+import io.netty.util.internal.PlatformDependent;
 import java.util.Arrays;
 import java.util.logging.Logger;
 
@@ -31,13 +32,19 @@ public final class CompareBytesUtils {
     private static final Logger LOG = Logger.getLogger(CompareBytesUtils.class.getName());
 
     static {
-        LOG.info("Using Arrays#compare(byte[], byte[])");
+        LOG.info("Using java.util.Arrays HotSpot intrinsics (detected JDK9+)");
     }
 
     private CompareBytesUtils() {
     }
 
     public static int compare(byte[] left, byte[] right) {
+        // use HotSpot Intrinsics
         return Arrays.compare(left, right);
+    }
+    
+    public static boolean equals(byte[] data, byte[] other) {
+        // use HotSpot Intrinsics
+        return Arrays.equals(data, 0, data.length, other, 0, other.length);
     }
 }

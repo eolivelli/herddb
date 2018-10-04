@@ -161,7 +161,7 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
 
     public Bytes(byte[] data) {
         this.data = data;
-        this.hashCode = Arrays.hashCode(this.data);;
+        this.hashCode = Arrays.hashCode(this.data);
     }
 
     @Override
@@ -174,6 +174,9 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         if (obj == null) {
             return false;
         }
+        if (this == POSITIVE_INFINITY) {
+            return obj == POSITIVE_INFINITY;
+        }
         try {
             final Bytes other = (Bytes) obj;
             if (other.hashCode != this.hashCode) {
@@ -182,7 +185,7 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
             if (data.length != other.data.length) {
                 return false;
             }
-            return PlatformDependent.equals(data, 0, other.data, 0, data.length);
+            return CompareBytesUtils.equals(data, other.data);
         } catch (ClassCastException otherClass) {
             return false;
         }
