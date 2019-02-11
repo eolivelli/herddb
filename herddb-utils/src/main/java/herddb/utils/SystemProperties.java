@@ -64,7 +64,7 @@ public class SystemProperties {
             return false;
         } else {
             RuntimeException rerr = new RuntimeException("Error reading system property "
-                + name + " =" + value + " allowed only true|false");
+                    + name + " =" + value + " allowed only true|false");
             throw rerr;
         }
     }

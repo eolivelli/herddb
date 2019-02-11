@@ -19,11 +19,10 @@
  */
 package herddb.utils;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-
-import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 
 /**
  * Extended version of DataInputStream
@@ -35,15 +34,16 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
  */
 public class ExtendedDataInputStream extends DataInputStream {
 
-    private static final boolean USE_FOLDED_VAR_INT = SystemProperties.getBooleanSystemProperty("herddb.vint.read.folded",false);
+    private static final boolean USE_FOLDED_VAR_INT = SystemProperties.getBooleanSystemProperty("herddb.vint.read.folded", false);
 
     public ExtendedDataInputStream(InputStream in) {
         super(in);
     }
 
     /**
-     * Reads an int stored in variable-length format. Reads between one and five bytes. Smaller values take fewer bytes.
-     * Negative numbers are not supported.
+     * Reads an int stored in variable-length format. Reads between one and five
+     * bytes. Smaller values take fewer bytes. Negative numbers are not
+     * supported.
      *
      * @return
      * @throws java.io.IOException
@@ -51,11 +51,11 @@ public class ExtendedDataInputStream extends DataInputStream {
     public int readVInt() throws IOException {
         return USE_FOLDED_VAR_INT ? readVIntFolded(readByte()) : readVIntUnfolded(readByte());
     }
-    
+
     int readVIntFolded() throws IOException {
         return readVIntFolded(readByte());
     }
-    
+
     int readVIntUnfolded() throws IOException {
         return readVIntUnfolded(readByte());
     }
@@ -107,8 +107,9 @@ public class ExtendedDataInputStream extends DataInputStream {
     }
 
     /**
-     * Same as {@link  #readVInt() } but does not throw EOFException. Since throwing exceptions is very expensive for the
-     * JVM this operation is preferred if you could hit and EOF
+     * Same as {@link  #readVInt() } but does not throw EOFException. Since
+     * throwing exceptions is very expensive for the JVM this operation is
+     * preferred if you could hit and EOF
      *
      * @return
      * @throws IOException
@@ -125,8 +126,9 @@ public class ExtendedDataInputStream extends DataInputStream {
     }
 
     /**
-     * Reads a long stored in variable-length format. Reads between one and nine bytes. Smaller values take fewer bytes.
-     * Negative numbers are not supported.
+     * Reads a long stored in variable-length format. Reads between one and nine
+     * bytes. Smaller values take fewer bytes. Negative numbers are not
+     * supported.
      *
      * @return
      * @throws java.io.IOException
@@ -219,7 +221,7 @@ public class ExtendedDataInputStream extends DataInputStream {
     public Bytes readBytes() throws IOException {
         return Bytes.from_nullable_array(readArray());
     }
-    
+
     public byte[] readArray() throws IOException {
         int len = readVInt();
         if (len == 0) {

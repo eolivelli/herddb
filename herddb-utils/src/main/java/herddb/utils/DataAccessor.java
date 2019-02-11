@@ -35,7 +35,7 @@ public interface DataAccessor {
     }
 
     public String[] getFieldNames();
-    
+
     public default int getNumFields() {
         return getFieldNames().length;
     }
@@ -49,12 +49,12 @@ public interface DataAccessor {
     public default Object get(int index) {
         return get(getFieldNames()[index]);
     }
-    
+
     public default boolean fieldEqualsTo(int index, Object value) {
         Object val = get(index);
         return SQLRecordPredicateFunctions.objectEquals(val, value);
     }
-    
+
     public default int fieldCompareTo(int index, Object value) {
         Object val = get(index);
         return SQLRecordPredicateFunctions.compare(val, value);
@@ -89,9 +89,7 @@ public interface DataAccessor {
         public int fieldCompareTo(int index, Object value) {
             return SQLRecordPredicateFunctions.compareNullTo(value);
         }
-        
-        
-                
+
         @Override
         public Object[] getValues() {
             return Constants.EMPTY_OBJECT_ARRAY;

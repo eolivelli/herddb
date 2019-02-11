@@ -57,7 +57,7 @@ public class RandomPageReplacementPolicy implements PageReplacementPolicy {
     public PlainMetadata add(Page<?> page) {
         final PlainMetadata metadata = new PlainMetadata(page);
         page.metadata = metadata;
-        lock.lock();       
+        lock.lock();
         try {
             int count = positions.size();
             if (count < pages.length) {
@@ -165,7 +165,8 @@ public class RandomPageReplacementPolicy implements PageReplacementPolicy {
     }
 
     /**
-     * Implementation of {@link Page.Metadata} with all data needed for {@link RandomPageReplacement}.
+     * Implementation of {@link Page.Metadata} with all data needed for
+     * {@link RandomPageReplacement}.
      *
      * @author diego.salvi
      */

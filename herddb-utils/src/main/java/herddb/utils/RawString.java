@@ -22,7 +22,6 @@ package herddb.utils;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.netty.util.Recycler;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 
 /**
  * A container for strings. Data is decoded to a real java.lang.String only if

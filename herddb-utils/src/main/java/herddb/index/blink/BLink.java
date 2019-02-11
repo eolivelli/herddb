@@ -19,6 +19,10 @@
  */
 package herddb.index.blink;
 
+import herddb.core.Page;
+import herddb.core.Page.Metadata;
+import herddb.core.PageReplacementPolicy;
+import herddb.index.blink.BLinkMetadata.BLinkNodeMetadata;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
@@ -51,11 +55,6 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
-
-import herddb.core.Page;
-import herddb.core.Page.Metadata;
-import herddb.core.PageReplacementPolicy;
-import herddb.index.blink.BLinkMetadata.BLinkNodeMetadata;
 
 /**
  * Java implementation of b-link tree derived from Vladimir Lanin and Dennis
@@ -157,8 +156,8 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
         public long evaluateAll(X key, Y value);
 
         /**
-         * Returns a value which is greater than all of the other values.
-         * Code will check using '==', so this value must be a singleton.
+         * Returns a value which is greater than all of the other values. Code
+         * will check using '==', so this value must be a singleton.
          *
          * @return a value which is greater than every other value
          */
@@ -1626,7 +1625,8 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
          * will have an opportunity do read this field until the lock is released.
          */
         /**
-         * Managed key set size, {@link NavigableMap} size could not be a a O(1) operation.
+         * Managed key set size, {@link NavigableMap} size could not be a a O(1)
+         * operation.
          */
         int keys;
 
@@ -1673,7 +1673,7 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
             this.dirty = true;
         }
 
-        private static final <A,B> NavigableMap<A, B> newNodeMap() {
+        private static <A, B> NavigableMap<A, B> newNodeMap() {
             return new TreeMap<>();
         }
 
@@ -1870,7 +1870,7 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
 
                 boolean toright = false;
                 for (Iterator<Entry<X, Object>> entryIt = map.entrySet().iterator();
-                        entryIt.hasNext(); ) {
+                        entryIt.hasNext();) {
                     Entry<X, Object> entry = entryIt.next();
                     if (toright) {
                         right.map.put(entry.getKey(), entry.getValue());
@@ -2606,7 +2606,7 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
 
         private void readLeafPage(long pageId) throws IOException {
             map = newNodeMap();
-            owner.storage.loadLeafPage(pageId, (Map<X,Y>) map);
+            owner.storage.loadLeafPage(pageId, (Map<X, Y>) map);
 
             /* Recalculate size if needed */
             if (size == UNKNOWN_SIZE) {
@@ -3016,7 +3016,7 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
 
                     /* We couln't get any more data do cleanup */
 
-                    /* Cleanup: there is no interesting data at right */
+ /* Cleanup: there is no interesting data at right */
                     rightsep = null;
                     lastRead = null;
                     node = null;

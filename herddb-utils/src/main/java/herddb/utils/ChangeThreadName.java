@@ -30,11 +30,11 @@ public class ChangeThreadName implements AutoCloseable {
 
     public ChangeThreadName(String newName) {
         threadName = Thread.currentThread().getName();
-        Thread.currentThread().setName(threadName+" - "+newName);
+        Thread.currentThread().setName(threadName + " - " + newName);
     }
 
     @Override
-    public void close()  {
+    public void close() {
         Thread.currentThread().setName(threadName);
     }
 

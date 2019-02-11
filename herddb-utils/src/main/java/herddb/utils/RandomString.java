@@ -30,14 +30,14 @@ import java.util.Random;
 @SuppressFBWarnings("EI_EXPOSE_REP2")
 public class RandomString {
 
-    private static final char[] ALPHABET = new char[] {
-            '1','2','3','4','5','6','7','8','9','0',
-            'A','B','C','D','E','F','G','H','I','J','K','L','M',
-            'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
-            'a','b','c','d','e','f','g','h','i','j','k','l','m',
-            'n','o','p','q','r','s','t','u','v','w','x','y','z'};
+    private static final char[] ALPHABET = new char[]{
+        '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',
+        'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+        'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+        'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'};
 
-    private static final RandomString INSTANCE = new RandomString(new Random(),ALPHABET);
+    private static final RandomString INSTANCE = new RandomString(new Random(), ALPHABET);
 
     public static final RandomString getInstance() {
         return INSTANCE;
@@ -51,27 +51,26 @@ public class RandomString {
      * Build a new {@link RandomString} with a specific alphabet.
      */
     public RandomString(char[] alphabet) {
-        this(INSTANCE.random,alphabet);
+        this(INSTANCE.random, alphabet);
     }
 
     /**
-     * Build a new {@link RandomString} with a specific random generator, useful when repeatable random
-     * sequences are needed.
+     * Build a new {@link RandomString} with a specific random generator, useful
+     * when repeatable random sequences are needed.
      */
     public RandomString(Random random) {
-        this(random,ALPHABET);
+        this(random, ALPHABET);
     }
 
     /**
-     * Build a new {@link RandomString} with a specific random generator, useful when repeatable random
-     * sequences are needed.
+     * Build a new {@link RandomString} with a specific random generator, useful
+     * when repeatable random sequences are needed.
      */
     public RandomString(Random random, char[] alphabet) {
         super();
-        this.random   = random;
+        this.random = random;
         this.alphabet = alphabet;
     }
-
 
     public String nextString(int len) {
         return nextString(len, new StringBuilder(len)).toString();
@@ -83,7 +82,7 @@ public class RandomString {
     }
 
     public StringBuilder nextString(int len, StringBuilder builder) {
-        for(int i = 0; i < len; ++i) {
+        for (int i = 0; i < len; ++i) {
             builder.append(alphabet[random.nextInt(alphabet.length)]);
         }
         return builder;
@@ -91,7 +90,7 @@ public class RandomString {
 
     public StringBuilder nextString(int min, int max, StringBuilder builder) {
         int len = min == max ? min : random.nextInt(max - min) + min;
-        return nextString(len,builder);
+        return nextString(len, builder);
     }
 
 }

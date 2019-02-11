@@ -42,19 +42,26 @@ public abstract class Page<O extends Page.Owner> {
 
     }
 
-    /** Owner of the page */
+    /**
+     * Owner of the page
+     */
     public final O owner;
 
-    /** Page id absolute on the owner */
+    /**
+     * Page id absolute on the owner
+     */
     public final long pageId;
 
-    /** Page metadata for {@link PageReplacementPolicy} use */
+    /**
+     * Page metadata for {@link PageReplacementPolicy} use
+     */
     Metadata metadata;
 
     public Page(O owner, long pageId) {
         super();
         this.owner = owner;
         this.pageId = pageId;
-    };
+    }
+;
 
 }

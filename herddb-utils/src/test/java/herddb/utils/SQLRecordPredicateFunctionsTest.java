@@ -21,7 +21,6 @@ package herddb.utils;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
-
 import org.junit.Test;
 
 /**
@@ -35,7 +34,6 @@ public class SQLRecordPredicateFunctionsTest {
     public void testCompareAndLike() throws Exception {
         assertTrue(SQLRecordPredicateFunctions.like("test", "test"));
         assertFalse(SQLRecordPredicateFunctions.like("test", "est"));
-
 
         assertTrue(SQLRecordPredicateFunctions.like("test", "%"));
         assertTrue(SQLRecordPredicateFunctions.like("test", "%%"));

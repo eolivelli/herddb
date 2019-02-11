@@ -31,8 +31,8 @@ import java.util.EnumSet;
 import java.util.Set;
 
 /**
- * A <i>"managed"</i> file that give access to underlying {@link OutputStream} for write operations and permit
- * to sync to disk flushed data.
+ * A <i>"managed"</i> file that give access to underlying {@link OutputStream}
+ * for write operations and permit to sync to disk flushed data.
  *
  * @author diego.salvi
  */
@@ -49,23 +49,25 @@ public class ManagedFile implements AutoCloseable {
     }
 
     private static final Set<StandardOpenOption> DEFAULT_OPTIONS_SET = EnumSet.of(
-            StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.CREATE );
+            StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.CREATE);
 
-    private static final StandardOpenOption[] DEFAULT_OPTIONS =
-            DEFAULT_OPTIONS_SET.toArray(new StandardOpenOption[DEFAULT_OPTIONS_SET.size()]);
-
+    private static final StandardOpenOption[] DEFAULT_OPTIONS
+            = DEFAULT_OPTIONS_SET.toArray(new StandardOpenOption[DEFAULT_OPTIONS_SET.size()]);
 
     public static ManagedFile open(Path path, boolean requirefsync) throws IOException {
         return open(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.CREATE), requirefsync);
     }
 
     /**
-     * Opens or creates a file, returning a {@link ManagedFile} that may be used to write bytes to the file.
+     * Opens or creates a file, returning a {@link ManagedFile} that may be used
+     * to write bytes to the file.
      *
      * <p>
-     * If no options are present then this method works as if the CREATE, TRUNCATE_EXISTING, and WRITE options
-     * are present. In other words, it opens the file for writing, creating the file if it doesn't exist, or
-     * initially truncating an existing regular-file to a size of 0 if it exists.
+     * If no options are present then this method works as if the CREATE,
+     * TRUNCATE_EXISTING, and WRITE options are present. In other words, it
+     * opens the file for writing, creating the file if it doesn't exist, or
+     * initially truncating an existing regular-file to a size of 0 if it
+     * exists.
      * </p>
      *
      * @param path
@@ -79,12 +81,15 @@ public class ManagedFile implements AutoCloseable {
     }
 
     /**
-     * Opens or creates a file, returning a {@link ManagedFile} that may be used to write bytes to the file.
+     * Opens or creates a file, returning a {@link ManagedFile} that may be used
+     * to write bytes to the file.
      *
      * <p>
-     * If no options are present then this method works as if the CREATE, TRUNCATE_EXISTING, and WRITE options
-     * are present. In other words, it opens the file for writing, creating the file if it doesn't exist, or
-     * initially truncating an existing regular-file to a size of 0 if it exists.
+     * If no options are present then this method works as if the CREATE,
+     * TRUNCATE_EXISTING, and WRITE options are present. In other words, it
+     * opens the file for writing, creating the file if it doesn't exist, or
+     * initially truncating an existing regular-file to a size of 0 if it
+     * exists.
      * </p>
      *
      * @param path

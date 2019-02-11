@@ -19,9 +19,8 @@
  */
 package herddb.utils;
 
-import java.nio.charset.StandardCharsets;
-
 import io.netty.buffer.ByteBuf;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Utilities for write variable length values on {@link ByteBuf}.
@@ -33,12 +32,11 @@ public class ByteBufUtils {
     private static final boolean READ_FOLDED_VAR_INT = SystemProperties.getBooleanSystemProperty("herddb.vint.read.folded", false);
     private static final boolean WRITE_FOLDED_VAR_INT = SystemProperties.getBooleanSystemProperty("herddb.vint.write.folded", false);
 
-
     public static final void writeArray(ByteBuf buffer, byte[] array) {
         writeVInt(buffer, array.length);
         buffer.writeBytes(array);
     }
-    
+
     public static final void writeArray(ByteBuf buffer, Bytes array) {
         writeVInt(buffer, array.getLength());
         buffer.writeBytes(array.getBuffer(), array.getOffset(), array.getLength());
@@ -186,7 +184,7 @@ public class ByteBufUtils {
     }
 
     // write a potentially negative vLong
-    private static final void writeSignedVLong(ByteBuf buffer, long i) {
+    private static void writeSignedVLong(ByteBuf buffer, long i) {
         while ((i & ~0x7FL) != 0L) {
             buffer.writeByte((byte) ((i & 0x7FL) | 0x80L));
             i >>>= 7;
@@ -198,7 +196,7 @@ public class ByteBufUtils {
         return readVLong(buffer, false);
     }
 
-    private static final long readVLong(ByteBuf buffer, boolean allowNegative) {
+    private static long readVLong(ByteBuf buffer, boolean allowNegative) {
         byte b = buffer.readByte();
         if (b >= 0) {
             return b;
@@ -275,7 +273,7 @@ public class ByteBufUtils {
     /**
      * Same as {@link #zigZagEncode(long)} but on integers.
      */
-    private static final int zigZagEncode(int i) {
+    private static int zigZagEncode(int i) {
         return (i >> 31) ^ (i << 1);
     }
 
@@ -285,21 +283,21 @@ public class ByteBufUtils {
      * absolute value can be stored on <tt>n</tt> bits, the returned value will
      * be an unsigned long that can be stored on <tt>n+1</tt> bits.
      */
-    private static final long zigZagEncode(long l) {
+    private static long zigZagEncode(long l) {
         return (l >> 63) ^ (l << 1);
     }
 
     /**
      * Decode an int previously encoded with {@link #zigZagEncode(int)}.
      */
-    private static final int zigZagDecode(int i) {
+    private static int zigZagDecode(int i) {
         return ((i >>> 1) ^ -(i & 1));
     }
 
     /**
      * Decode a long previously encoded with {@link #zigZagEncode(long)}.
      */
-    private static final long zigZagDecode(long l) {
+    private static long zigZagDecode(long l) {
         return ((l >>> 1) ^ -(l & 1));
     }
 

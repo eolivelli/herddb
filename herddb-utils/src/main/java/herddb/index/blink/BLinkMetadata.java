@@ -25,8 +25,8 @@ import java.util.List;
  * Serializable metadata for BLink indexes.
  *
  * <p>
- * Doesn't contains any node max size because page byte size can change between reboots. Nodes need to be
- * able to adapt to page size changes.
+ * Doesn't contains any node max size because page byte size can change between
+ * reboots. Nodes need to be able to adapt to page size changes.
  * </p>
  *
  * @author diego.salvi
@@ -35,22 +35,34 @@ public final class BLinkMetadata<K> {
 
     final long nextID;
 
-    /** Anchor <i>fast node</i> pointer */
+    /**
+     * Anchor <i>fast node</i> pointer
+     */
     final long fast;
 
-    /** Anchor <i>fast node</i> height */
+    /**
+     * Anchor <i>fast node</i> height
+     */
     final int fastheight;
 
-    /** Anchor real <i>root</i> pointer */
+    /**
+     * Anchor real <i>root</i> pointer
+     */
     final long top;
 
-    /** Anchor real <i>root</i> height */
+    /**
+     * Anchor real <i>root</i> height
+     */
     final int topheight;
 
-    /** Leftmost leaf */
+    /**
+     * Leftmost leaf
+     */
     final long first;
 
-    /** Stored values count */
+    /**
+     * Stored values count
+     */
     final long values;
 
     final List<BLinkNodeMetadata<K>> nodes;
@@ -72,19 +84,19 @@ public final class BLinkMetadata<K> {
 
     @Override
     public String toString() {
-        return "BLinkMetadata [nextID=" + nextID +
-                ", fast=" + fast +
-                ", fastheight=" + fastheight +
-                ", top=" + top +
-                ", topheight=" + topheight +
-                ", first=" + first +
-                ", size=" + values +
-                ", nodes=" + nodes.size() +
-                "]";
+        return "BLinkMetadata [nextID=" + nextID
+                + ", fast=" + fast
+                + ", fastheight=" + fastheight
+                + ", top=" + top
+                + ", topheight=" + topheight
+                + ", first=" + first
+                + ", size=" + values
+                + ", nodes=" + nodes.size()
+                + "]";
     }
 
     public String nodesToStrings() {
-        return nodes+"";
+        return nodes + "";
     }
 
     public static final class BLinkNodeMetadata<K> {
@@ -121,16 +133,16 @@ public final class BLinkMetadata<K> {
 
         @Override
         public String toString() {
-            return "BLinkNodeMetadata [leaf=" + leaf +
-                    ", id=" + id +
-                    ", storeId=" + storeId +
-                    ", empty=" + empty +
-                    ", keys=" + keys +
-                    ", size=" + bytes +
-                    ", outlink=" + outlink +
-                    ", rightlink=" + rightlink +
-                    ", rightsep=" + rightsep +
-                    "]";
+            return "BLinkNodeMetadata [leaf=" + leaf
+                    + ", id=" + id
+                    + ", storeId=" + storeId
+                    + ", empty=" + empty
+                    + ", keys=" + keys
+                    + ", size=" + bytes
+                    + ", outlink=" + outlink
+                    + ", rightlink=" + rightlink
+                    + ", rightsep=" + rightsep
+                    + "]";
         }
 
     }

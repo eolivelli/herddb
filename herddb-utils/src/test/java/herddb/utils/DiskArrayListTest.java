@@ -19,13 +19,10 @@
  */
 package herddb.utils;
 
-import herddb.utils.DiskArrayList;
-import herddb.utils.ExtendedDataInputStream;
-import herddb.utils.ExtendedDataOutputStream;
 import java.io.IOException;
+import static org.junit.Assert.*;
 import org.junit.Rule;
 import org.junit.Test;
-import static org.junit.Assert.*;
 import org.junit.rules.TemporaryFolder;
 
 public class DiskArrayListTest {
@@ -73,7 +70,7 @@ public class DiskArrayListTest {
             }
 
             assertEquals(
-                0, read);
+                    0, read);
         }
     }
 
@@ -81,7 +78,7 @@ public class DiskArrayListTest {
     public void swap() throws IOException {
         try (DiskArrayList<String> list = new DiskArrayList<>(1000, testFolder.getRoot().toPath(), new StringSerializer())) {
             for (int i = 0;
-                i < 1100; i++) {
+                    i < 1100; i++) {
                 list.add("a");
             }
 
@@ -95,7 +92,7 @@ public class DiskArrayListTest {
             }
 
             assertEquals(
-                1100, read);
+                    1100, read);
 
             // facciamo una seconda lettura
             read = 0;
@@ -113,7 +110,7 @@ public class DiskArrayListTest {
         try (DiskArrayList<String> list = new DiskArrayList<>(1000, testFolder.getRoot().toPath(), new StringSerializer())) {
             list.enableCompression();
             for (int i = 0;
-                i < 1100; i++) {
+                    i < 1100; i++) {
                 list.add("a");
             }
 
@@ -127,7 +124,7 @@ public class DiskArrayListTest {
             }
 
             assertEquals(
-                1100, read);
+                    1100, read);
 
             // facciamo una seconda lettura
             read = 0;
@@ -137,7 +134,7 @@ public class DiskArrayListTest {
             }
 
             assertEquals(
-                1100, read);
+                    1100, read);
         }
     }
 

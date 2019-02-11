@@ -343,6 +343,6 @@ public final class DiskArrayList<T> implements AutoCloseable, Iterable<T> {
     private boolean written;
     private int size;
     private int countread;
-    private static Logger logger = Logger.getLogger(DiskArrayList.class.getName());
+    private static final Logger logger = Logger.getLogger(DiskArrayList.class.getName());
     private final Path tmpDir;
 }

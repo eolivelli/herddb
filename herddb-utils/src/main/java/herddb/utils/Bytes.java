@@ -19,12 +19,10 @@
  */
 package herddb.utils;
 
-import java.nio.ByteOrder;
-import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.netty.util.internal.PlatformDependent;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 
 /**
  * A wrapper for byte[], in order to use it as keys on HashMaps
@@ -35,7 +33,7 @@ import io.netty.util.internal.PlatformDependent;
 public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
 
     public static final Bytes POSITIVE_INFINITY = new Bytes(new byte[0]);
-    
+
     public static final Bytes EMPTY_ARRAY = new Bytes(new byte[0]);
 
     private static final boolean UNALIGNED = PlatformDependent.isUnaligned();
@@ -121,7 +119,7 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     public static Bytes from_array(byte[] data) {
         return new Bytes(data);
     }
-    
+
     public static Bytes from_array(byte[] data, int offset, int len) {
         return new Bytes(data, offset, len);
     }
@@ -366,7 +364,7 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         } else if (o == POSITIVE_INFINITY) {
             return -1;
         }
-        return CompareBytesUtils.compare(buffer, offset, offset + length, 
+        return CompareBytesUtils.compare(buffer, offset, offset + length,
                 o.buffer, o.offset, o.offset + o.length);
     }
 
@@ -460,7 +458,9 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     /**
-     * Ensure that this value is not retaining strong references to a shared buffer
+     * Ensure that this value is not retaining strong references to a shared
+     * buffer
+     *
      * @return the buffer itself or a copy
      */
     public Bytes nonShared() {
@@ -471,5 +471,5 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         System.arraycopy(buffer, offset, array, 0, length);
         return new Bytes(array, 0, length);
     }
-    
+
 }

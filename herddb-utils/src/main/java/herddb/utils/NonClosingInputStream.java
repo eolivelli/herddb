@@ -5,11 +5,13 @@ import java.io.IOException;
 import java.io.InputStream;
 
 /**
- * {@link FilterInputStream} implementation which doesn't propagate {@link #close()} invocations.
+ * {@link FilterInputStream} implementation which doesn't propagate
+ * {@link #close()} invocations.
  * <p>
- * Usefull when wrapped stream musn't be close but you want to wrap it in a try-with-resources manner
+ * Usefull when wrapped stream musn't be close but you want to wrap it in a
+ * try-with-resources manner
  * </p>
- * 
+ *
  * @author diego.salvi
  */
 public class NonClosingInputStream extends FilterInputStream {
@@ -19,6 +21,7 @@ public class NonClosingInputStream extends FilterInputStream {
     }
 
     @Override
-    public void close() throws IOException {}
-    
+    public void close() throws IOException {
+    }
+
 }

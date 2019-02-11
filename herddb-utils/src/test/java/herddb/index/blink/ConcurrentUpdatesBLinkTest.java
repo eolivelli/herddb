@@ -19,10 +19,9 @@
  */
 package herddb.index.blink;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
-
+import herddb.core.ClockProPolicy;
+import herddb.utils.RandomString;
+import herddb.utils.Sized;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -32,13 +31,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
-
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 import org.junit.Ignore;
 import org.junit.Test;
-
-import herddb.core.ClockProPolicy;
-import herddb.utils.RandomString;
-import herddb.utils.Sized;
 
 /**
  * Tests on concurcurrent massive updates on different keys
@@ -149,7 +146,7 @@ public class ConcurrentUpdatesBLinkTest {
             System.out.println("updates " + updates);
             System.out.println("skipped " + skipped);
             System.out.println("deletes " + deletes);
-            System.out.println("iterations " + ITERATIONS + " (" + (inserts.intValue() + updates.intValue() + deletes.intValue()+ skipped.intValue()) + ")");
+            System.out.println("iterations " + ITERATIONS + " (" + (inserts.intValue() + updates.intValue() + deletes.intValue() + skipped.intValue()) + ")");
             System.out.println("nulls " + nulls);
             threadpool.shutdown();
         }

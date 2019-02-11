@@ -64,7 +64,7 @@ public class Pdu implements AutoCloseable {
             return new Pdu(handle);
         }
     };
-    
+
     public static Pdu newPdu(ByteBuf buffer, byte type, byte flags, long messageId) {
         Pdu res = RECYCLER.get();
         res.type = type;
@@ -73,7 +73,7 @@ public class Pdu implements AutoCloseable {
         res.buffer = buffer;
         return res;
     }
-    
+
     private Pdu(Recycler.Handle<Pdu> handle) {
         this.handle = handle;
     }

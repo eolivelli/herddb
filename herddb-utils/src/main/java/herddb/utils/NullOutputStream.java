@@ -28,7 +28,7 @@ import java.io.OutputStream;
  * @author enrico.olivelli
  */
 public final class NullOutputStream extends OutputStream {
-        
+
     public static final NullOutputStream INSTANCE = new NullOutputStream();
 
     @Override

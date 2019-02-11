@@ -19,11 +19,10 @@
  */
 package herddb.utils;
 
+import herddb.core.HerdDBInternalException;
 import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-
-import herddb.core.HerdDBInternalException;
 
 /**
  * Predicate expressed using SQL syntax
@@ -239,7 +238,7 @@ public interface SQLRecordPredicateFunctions {
         int limit = b.length();
         for (int idx = 0; idx < limit; ++idx) {
             char ch = b.charAt(idx);
-            switch(ch) {
+            switch (ch) {
                 case '%':
                     builder.append("\\E.*\\Q");
                     break;

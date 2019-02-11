@@ -17,7 +17,6 @@
  under the License.
 
  */
-
 package herddb.utils;
 
 import java.util.ArrayList;
@@ -38,20 +37,18 @@ import java.util.Map;
 public class ListWithMap<E> {
 
     /**
-     * Pointer to first node.
-     * Invariant: (head == null && tail == null) ||
-     *            (head.prev == null && head.item != null)
+     * Pointer to first node. Invariant: (head == null && tail == null) ||
+     * (head.prev == null && head.item != null)
      */
     private Node<E> head;
 
     /**
-     * Pointer to last node.
-     * Invariant: (head == null && tail == null) ||
-     *            (tail.next == null && tail.item != null)
+     * Pointer to last node. Invariant: (head == null && tail == null) ||
+     * (tail.next == null && tail.item != null)
      */
     private Node<E> tail;
 
-    private Map<E,Node<E>> space;
+    private final Map<E, Node<E>> space;
 
     public ListWithMap() {
 
@@ -60,7 +57,7 @@ public class ListWithMap<E> {
         space = new HashMap<>();
     }
 
-    public void append( E e ){
+    public void append(E e) {
         final Node<E> ref = tail;
         final Node<E> node = new Node<>(ref, e, null);
         tail = node;
@@ -153,7 +150,7 @@ public class ListWithMap<E> {
     public void clear() {
 
         Node<E> ref = head;
-        while(ref != null) {
+        while (ref != null) {
             Node<E> next = ref.next;
 
             ref.item = null;
@@ -167,6 +164,7 @@ public class ListWithMap<E> {
     }
 
     private static class Node<E> {
+
         E item;
         Node<E> prev;
         Node<E> next;
@@ -180,11 +178,10 @@ public class ListWithMap<E> {
 
     public List<E> toList() {
 
-
         final List<E> list = new ArrayList<>(space.size());
 
         Node<E> ref = head;
-        while(ref != null) {
+        while (ref != null) {
             list.add(ref.item);
             ref = ref.next;
         }

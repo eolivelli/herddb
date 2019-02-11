@@ -45,7 +45,7 @@ public abstract class AbstractDataAccessor implements DataAccessor {
         }
         return false;
     }
-  
+
     private int _hashcode = Integer.MIN_VALUE;
 
     @Override

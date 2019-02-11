@@ -25,8 +25,9 @@ import java.util.Collection;
  * Cache replacement policy for memory pagination.
  *
  * <p>
- * A {@link PageReplacementPolicy} will not load or unload memory pages but will keep track of their usage and
- * instruct the system about which page need to be replaced.
+ * A {@link PageReplacementPolicy} will not load or unload memory pages but will
+ * keep track of their usage and instruct the system about which page need to be
+ * replaced.
  * </p>
  *
  * @author diego.salvi
@@ -62,8 +63,8 @@ public interface PageReplacementPolicy {
     /**
      * Remove many {@code Page Pages} from memory.
      * <p>
-     * This method is logically equivalent to multiple {@link #remove(Page)} invocations but is expected
-     * to be more efficient.
+     * This method is logically equivalent to multiple {@link #remove(Page)}
+     * invocations but is expected to be more efficient.
      * </p>
      *
      * @param pages pages to be removed.

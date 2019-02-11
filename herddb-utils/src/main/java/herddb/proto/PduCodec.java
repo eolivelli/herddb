@@ -15,16 +15,6 @@
  */
 package herddb.proto;
 
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.io.StringWriter;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.function.BiConsumer;
-import java.util.function.Consumer;
-
 import herddb.utils.ByteBufUtils;
 import herddb.utils.DataAccessor;
 import herddb.utils.IntHolder;
@@ -34,6 +24,15 @@ import herddb.utils.RecordsBatch;
 import herddb.utils.TuplesList;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 
 /**
  * Codec for PDUs

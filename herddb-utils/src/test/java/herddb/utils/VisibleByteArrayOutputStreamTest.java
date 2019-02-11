@@ -19,13 +19,10 @@
  */
 package herddb.utils;
 
-import herddb.utils.VisibleByteArrayOutputStream;
-import herddb.utils.XXHash64Utils;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.util.Arrays;
-import org.junit.Test;
 import static org.junit.Assert.*;
+import org.junit.Test;
 
 /**
  *

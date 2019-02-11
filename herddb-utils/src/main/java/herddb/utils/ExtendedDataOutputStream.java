@@ -42,7 +42,8 @@ public final class ExtendedDataOutputStream extends DataOutputStream {
     }
 
     /**
-     * Writes an int in a variable-length format. Writes between one and five bytes. Smaller values take fewer bytes.
+     * Writes an int in a variable-length format. Writes between one and five
+     * bytes. Smaller values take fewer bytes.
      *
      * @param i
      * @throws java.io.IOException
@@ -89,8 +90,9 @@ public final class ExtendedDataOutputStream extends DataOutputStream {
     }
 
     /**
-     * Writes a long in a variable-length format. Writes between one and nine bytes. Smaller values take fewer bytes.
-     * Negative numbers are not supported.
+     * Writes a long in a variable-length format. Writes between one and nine
+     * bytes. Smaller values take fewer bytes. Negative numbers are not
+     * supported.
      *
      * @param i
      * @throws java.io.IOException
@@ -118,7 +120,7 @@ public final class ExtendedDataOutputStream extends DataOutputStream {
     public final void writeZLong(long l) throws IOException {
         writeSignedVLong((l >> 63) ^ (l << 1));
     }
-    
+
     public void writeArray(Bytes data) throws IOException {
         if (data == null) {
             writeNullArray();
@@ -130,8 +132,8 @@ public final class ExtendedDataOutputStream extends DataOutputStream {
 
     public void writeNullArray() throws IOException {
         writeVInt(-1);
-    }    
-    
+    }
+
     public void writeArray(byte[] data) throws IOException {
         if (data == null) {
             writeNullArray();

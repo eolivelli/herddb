@@ -19,10 +19,9 @@
  */
 package herddb.utils;
 
-import herddb.utils.MinDeltaLongIncrementAccumulator;
 import java.util.concurrent.atomic.AtomicLong;
-import org.junit.Test;
 import static org.junit.Assert.*;
+import org.junit.Test;
 
 public class ConditionalLongIncrementAccumulatorTest {
 

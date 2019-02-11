@@ -2,7 +2,6 @@ package herddb.utils;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -21,11 +20,11 @@ public class ExtendedDataInputStreamTest {
     @Test
     public void testReadVInt() throws IOException {
 
-        checkAndCompareVInt(0, new byte[] { 0 });
-        checkAndCompareVInt(1, new byte[] { 1 });
-        checkAndCompareVInt(-1, new byte[] { -1, -1, -1, -1, 15 });
-        checkAndCompareVInt(Integer.MIN_VALUE, new byte[] { -128, -128, -128, -128, 8 });
-        checkAndCompareVInt(Integer.MAX_VALUE, new byte[] { -1, -1, -1, -1, 7 });
+        checkAndCompareVInt(0, new byte[]{0});
+        checkAndCompareVInt(1, new byte[]{1});
+        checkAndCompareVInt(-1, new byte[]{-1, -1, -1, -1, 15});
+        checkAndCompareVInt(Integer.MIN_VALUE, new byte[]{-128, -128, -128, -128, 8});
+        checkAndCompareVInt(Integer.MAX_VALUE, new byte[]{-1, -1, -1, -1, 7});
 
     }
 
@@ -38,8 +37,8 @@ public class ExtendedDataInputStreamTest {
             is.reset();
             int unfolded = is.readVIntUnfolded();
 
-            Assert.assertEquals(expected,unfolded);
-            Assert.assertEquals(expected,folded);
+            Assert.assertEquals(expected, unfolded);
+            Assert.assertEquals(expected, folded);
         }
 
     }

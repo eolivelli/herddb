@@ -19,11 +19,13 @@
  */
 package herddb.index.blink;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
-
+import herddb.core.PageReplacementPolicy;
+import herddb.core.RandomPageReplacementPolicy;
+import herddb.index.blink.BLink.SizeEvaluator;
+import herddb.index.blink.BLinkMetadata.BLinkNodeMetadata;
+import herddb.utils.Holder;
+import herddb.utils.SizeAwareObject;
+import herddb.utils.Sized;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -34,16 +36,11 @@ import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
-
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 import org.junit.Test;
-
-import herddb.core.PageReplacementPolicy;
-import herddb.core.RandomPageReplacementPolicy;
-import herddb.index.blink.BLink.SizeEvaluator;
-import herddb.index.blink.BLinkMetadata.BLinkNodeMetadata;
-import herddb.utils.Holder;
-import herddb.utils.SizeAwareObject;
-import herddb.utils.Sized;
 
 /**
  * Simpler tests for {@link BLink}
@@ -56,7 +53,7 @@ public class BLinkTest {
 
         AtomicLong newPageId = new AtomicLong();
         AtomicLong swapIn = new AtomicLong();
-        private ConcurrentHashMap<Long, Object> datas = new ConcurrentHashMap<>();
+        private final ConcurrentHashMap<Long, Object> datas = new ConcurrentHashMap<>();
 
         @Override
         public void loadNodePage(long pageId, Map<K, Long> data) throws IOException {

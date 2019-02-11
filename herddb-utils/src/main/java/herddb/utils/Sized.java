@@ -19,13 +19,11 @@
  */
 package herddb.utils;
 
-import herddb.utils.SizeAwareObject;
-import herddb.utils.SizeAwareObject;
 import java.nio.charset.StandardCharsets;
 
 /**
- * An utility class for wrap objects into {@link SizeAwareObject} instances. It should used only for testing
- * purposes.
+ * An utility class for wrap objects into {@link SizeAwareObject} instances. It
+ * should used only for testing purposes.
  *
  * @author diego.salvi
  *
@@ -83,7 +81,7 @@ public final class Sized<O extends Comparable<O>> implements SizeAwareObject, Co
     @Override
     public boolean equals(Object obj) {
         if (obj instanceof Sized) {
-            return dummy.equals(((Sized<?>)obj).dummy);
+            return dummy.equals(((Sized<?>) obj).dummy);
         }
 
         return false;

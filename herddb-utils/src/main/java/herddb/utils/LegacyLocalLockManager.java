@@ -80,7 +80,7 @@ public class LegacyLocalLockManager implements ILocalLockManager {
                 if (instance.count < 1) {
                     /* Worst concurrent case: released by another thread, retry */
 
-                    /*
+ /*
                      * Do not release current lock before doing another attemp. Other threads checking the
                      * same instance will have to wait here untill a live lock is created (trying to avoid
                      * spinning and contention between threads). The lock will released in finally block upon
