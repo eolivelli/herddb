@@ -37,7 +37,6 @@ import herddb.metadata.MetadataStorageManagerException;
 import herddb.model.Record;
 import herddb.model.Table;
 import herddb.server.ServerConfiguration;
-import jdk.jpackage.internal.Log;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 
 import static herddb.client.ClientConfiguration.PROPERTY_ZOOKEEPER_ADDRESS;
@@ -99,6 +98,17 @@ public class CaptureDataChange implements AutoCloseable {
         {
             return timestamp;
         }
+
+        @Override
+        public String toString() {
+            return "Mutation{" +
+                    "table=" + table +
+                    ", mutationType=" + mutationType +
+                    ", record=" + record +
+                    ", logSequenceNumber=" + logSequenceNumber +
+                    ", timestamp=" + timestamp +
+                    '}';
+        }
     }
 
     public interface MutationListener {
@@ -107,7 +117,7 @@ public class CaptureDataChange implements AutoCloseable {
 
     private final ClientConfiguration configuration;
     private final MutationListener listener;
-    private final LogSequenceNumber startingPosition;
+    private LogSequenceNumber lastPosition;
     private final String tableSpaceUUID;
     private volatile boolean closed = false;
 
@@ -115,7 +125,7 @@ public class CaptureDataChange implements AutoCloseable {
     {
         this.configuration = configuration;
         this.listener = listener;
-        this.startingPosition = startingPosition;
+        this.lastPosition = startingPosition;
         this.tableSpaceUUID = tableSpaceUUID;
     }
 
@@ -134,13 +144,14 @@ public class CaptureDataChange implements AutoCloseable {
             manager.start();
             try (BookkeeperCommitLog cdc = manager.createCommitLog(tableSpaceUUID, tableSpaceUUID, "cdc");)
             {
-                CommitLog.FollowerContext context = cdc.startFollowing(startingPosition);
-                cdc.followTheLeader(startingPosition, new CommitLog.EntryAcceptor()
+                CommitLog.FollowerContext context = cdc.startFollowing(lastPosition);
+                cdc.followTheLeader(lastPosition, new CommitLog.EntryAcceptor()
                 {
                     @Override
                     public boolean accept(LogSequenceNumber lsn, LogEntry entry) throws Exception
                     {
                         applyEntry(entry, lsn);
+                        lastPosition = lsn;
                         return !closed;
                     }
                 }, context);
@@ -222,7 +233,7 @@ public class CaptureDataChange implements AutoCloseable {
             {
                 Table table = lookupTable(entry);
                 DataAccessorForFullRecord record = new DataAccessorForFullRecord(table, new Record(entry.key, entry.value));
-                fire(new Mutation(table, MutationType.CREATE_TABLE, record, lsn, entry.timestamp), entry.transactionId);
+                fire(new Mutation(table, MutationType.INSERT, record, lsn, entry.timestamp), entry.transactionId);
             }
             break;
             case LogEntryType.DELETE:
