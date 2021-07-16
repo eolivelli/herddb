@@ -19,7 +19,9 @@
  */
 package herddb.cdc;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import herddb.client.ClientConfiguration;
@@ -27,7 +29,6 @@ import herddb.cluster.BookkeeperCommitLog;
 import herddb.cluster.BookkeeperCommitLogManager;
 import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.codec.DataAccessorForFullRecord;
-import herddb.codec.RecordSerializer;
 import herddb.log.CommitLog;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
@@ -50,9 +51,9 @@ public class CaptureDataChange implements AutoCloseable {
         INSERT,
         UPDATE,
         DELETE,
-        CREATETABLE,
-        DELETETABLE,
-        ALTERTABLE
+        CREATE_TABLE,
+        DROP_TABLE,
+        ALTER_TABLE
     }
 
     public static class Mutation {
@@ -117,7 +118,15 @@ public class CaptureDataChange implements AutoCloseable {
         this.tableSpaceUUID = tableSpaceUUID;
     }
 
-    private Map<String, Table> tablesDefinition = new HashMap<>();
+    private Map<String, Table> tablesDefinitions = new HashMap<>();
+    private Map<Long, TransactionHolder> transactions = new HashMap<>();
+
+    private class TransactionHolder {
+        private List<Mutation> mutations = new ArrayList<>();
+        // TODO: add better support for DDL
+        // we have to apply DDL changes only at commit time
+        // but we have to deal with tables that are not participating in the transaction
+    }
 
     public void run() throws Exception {
         try (ZookeeperMetadataStorageManager zookeeperMetadataStorageManager = buildMetadataStorageManager(configuration);
@@ -143,8 +152,17 @@ public class CaptureDataChange implements AutoCloseable {
         closed = true;
     }
 
+    private void fire(Mutation mutation, long transactionId) {
+        if (transactionId > 0) {
+            TransactionHolder transaction = transactions.get(transactionId);
+            transaction.mutations.add(mutation);
+        } else {
+            listener.accept(mutation);;
+        }
+    }
     private void applyEntry(LogEntry entry, LogSequenceNumber lsn) throws Exception
     {
+
         switch (entry.type)
         {
             case LogEntryType.NOOP:
@@ -153,46 +171,61 @@ public class CaptureDataChange implements AutoCloseable {
                 break;
             case LogEntryType.DROP_TABLE:
             {
-                Table table = tablesDefinition.remove(entry.tableName);
-                listener.accept(new Mutation(table, MutationType.DELETETABLE, null, lsn, entry.timestamp));
+                // TODO: deal with transactions
+                Table table = tablesDefinitions.remove(entry.tableName);
+                fire(new Mutation(table, MutationType.DROP_TABLE, null, lsn, entry.timestamp), entry.transactionId);
             }
-            ;
             break;
             case LogEntryType.CREATE_TABLE:
             {
                 Table table = Table.deserialize(entry.value.to_array());
-                tablesDefinition.put(entry.tableName, table);
-                listener.accept(new Mutation(table, MutationType.CREATETABLE, null, lsn, entry.timestamp));
+                // TODO: deal with transactions
+                tablesDefinitions.put(entry.tableName, table);
+                fire(new Mutation(table, MutationType.CREATE_TABLE, null, lsn, entry.timestamp), entry.transactionId);
             }
-            ;
+            break;
+            case LogEntryType.ALTER_TABLE:
+            {
+                Table table = Table.deserialize(entry.value.to_array());
+                // TODO: deal with transactions
+                tablesDefinitions.put(entry.tableName, table);
+                fire(new Mutation(table, MutationType.ALTER_TABLE, null, lsn, entry.timestamp), entry.transactionId);
+            }
             break;
             case LogEntryType.INSERT:
             {
-                Table table = tablesDefinition.get(entry.tableName);
+                Table table = tablesDefinitions.get(entry.tableName);
                 DataAccessorForFullRecord record = new DataAccessorForFullRecord(table, new Record(entry.key, entry.value));
-                listener.accept(new Mutation(table, MutationType.CREATETABLE, record, lsn, entry.timestamp));
+                fire(new Mutation(table, MutationType.CREATE_TABLE, record, lsn, entry.timestamp), entry.transactionId);
             }
-            ;
             break;
             case LogEntryType.DELETE:
             {
-                Table table = tablesDefinition.get(entry.tableName);
+                Table table = tablesDefinitions.get(entry.tableName);
                 DataAccessorForFullRecord record = new DataAccessorForFullRecord(table, new Record(entry.key, entry.value));
-                listener.accept(new Mutation(table, MutationType.DELETE, record, lsn, entry.timestamp));
+                fire(new Mutation(table, MutationType.DELETE, record, lsn, entry.timestamp), entry.transactionId);
             }
-            ;
             break;
             case LogEntryType.UPDATE:
             {
-                Table table = tablesDefinition.get(entry.tableName);
+                Table table = tablesDefinitions.get(entry.tableName);
                 DataAccessorForFullRecord record = new DataAccessorForFullRecord(table, new Record(entry.key, entry.value));
-                listener.accept(new Mutation(table, MutationType.UPDATE, record, lsn, entry.timestamp));
+                fire(new Mutation(table, MutationType.UPDATE, record, lsn, entry.timestamp), entry.transactionId);
             }
-            ;
             break;
-            case LogEntryType.BEGINTRANSACTION:
-            case LogEntryType.COMMITTRANSACTION:
+            case LogEntryType.BEGINTRANSACTION: {
+                transactions.put(entry.transactionId, new TransactionHolder());
+            }
+            break;
+            case LogEntryType.COMMITTRANSACTION: {
+                TransactionHolder transaction = transactions.get(entry.transactionId);
+                for (Mutation mutation : transaction.mutations) {
+                    listener.accept(mutation);
+                }
+            }
+            break;
             case LogEntryType.ROLLBACKTRANSACTION:
+                transactions.remove(entry.transactionId);
                 break;
             default:
                 // discard unkwown entry types
