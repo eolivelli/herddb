@@ -37,6 +37,7 @@ import herddb.metadata.MetadataStorageManagerException;
 import herddb.model.Record;
 import herddb.model.Table;
 import herddb.server.ServerConfiguration;
+import jdk.jpackage.internal.Log;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 
 import static herddb.client.ClientConfiguration.PROPERTY_ZOOKEEPER_ADDRESS;
@@ -123,9 +124,7 @@ public class CaptureDataChange implements AutoCloseable {
 
     private class TransactionHolder {
         private List<Mutation> mutations = new ArrayList<>();
-        // TODO: add better support for DDL
-        // we have to apply DDL changes only at commit time
-        // but we have to deal with tables that are not participating in the transaction
+        private Map<String, Table> tablesDefinitions = new HashMap<>();
     }
 
     public void run() throws Exception {
@@ -160,6 +159,18 @@ public class CaptureDataChange implements AutoCloseable {
             listener.accept(mutation);;
         }
     }
+    private Table lookupTable(LogEntry entry) {
+        String tableName = entry.tableName;
+        if (entry.transactionId > 0) {
+            TransactionHolder transaction = transactions.get(entry.transactionId);
+            Table table = transaction.tablesDefinitions.get(tableName);
+            if (table != null) {
+                return table;
+            }
+        }
+        return tablesDefinitions.get(tableName);
+    }
+
     private void applyEntry(LogEntry entry, LogSequenceNumber lsn) throws Exception
     {
 
@@ -171,44 +182,59 @@ public class CaptureDataChange implements AutoCloseable {
                 break;
             case LogEntryType.DROP_TABLE:
             {
-                // TODO: deal with transactions
-                Table table = tablesDefinitions.remove(entry.tableName);
+                Table table = lookupTable(entry);
+
+                if (entry.transactionId > 0) {
+                    TransactionHolder transaction = transactions.get(entry.transactionId);
+                    // set null to mark the table as DROPPED
+                    transaction.tablesDefinitions.put(entry.tableName, null);
+                } else {
+                    tablesDefinitions.remove(entry.tableName, table);
+                }
                 fire(new Mutation(table, MutationType.DROP_TABLE, null, lsn, entry.timestamp), entry.transactionId);
             }
             break;
             case LogEntryType.CREATE_TABLE:
             {
                 Table table = Table.deserialize(entry.value.to_array());
-                // TODO: deal with transactions
-                tablesDefinitions.put(entry.tableName, table);
+                if (entry.transactionId > 0) {
+                    TransactionHolder transaction = transactions.get(entry.transactionId);
+                    transaction.tablesDefinitions.put(entry.tableName, table);
+                } else {
+                    tablesDefinitions.put(entry.tableName, table);
+                }
                 fire(new Mutation(table, MutationType.CREATE_TABLE, null, lsn, entry.timestamp), entry.transactionId);
             }
             break;
             case LogEntryType.ALTER_TABLE:
             {
                 Table table = Table.deserialize(entry.value.to_array());
-                // TODO: deal with transactions
-                tablesDefinitions.put(entry.tableName, table);
+                if (entry.transactionId > 0) {
+                    TransactionHolder transaction = transactions.get(entry.transactionId);
+                    transaction.tablesDefinitions.put(entry.tableName, table);
+                } else {
+                    tablesDefinitions.put(entry.tableName, table);
+                }
                 fire(new Mutation(table, MutationType.ALTER_TABLE, null, lsn, entry.timestamp), entry.transactionId);
             }
             break;
             case LogEntryType.INSERT:
             {
-                Table table = tablesDefinitions.get(entry.tableName);
+                Table table = lookupTable(entry);
                 DataAccessorForFullRecord record = new DataAccessorForFullRecord(table, new Record(entry.key, entry.value));
                 fire(new Mutation(table, MutationType.CREATE_TABLE, record, lsn, entry.timestamp), entry.transactionId);
             }
             break;
             case LogEntryType.DELETE:
             {
-                Table table = tablesDefinitions.get(entry.tableName);
+                Table table = lookupTable(entry);
                 DataAccessorForFullRecord record = new DataAccessorForFullRecord(table, new Record(entry.key, entry.value));
                 fire(new Mutation(table, MutationType.DELETE, record, lsn, entry.timestamp), entry.transactionId);
             }
             break;
             case LogEntryType.UPDATE:
             {
-                Table table = tablesDefinitions.get(entry.tableName);
+                Table table = lookupTable(entry);
                 DataAccessorForFullRecord record = new DataAccessorForFullRecord(table, new Record(entry.key, entry.value));
                 fire(new Mutation(table, MutationType.UPDATE, record, lsn, entry.timestamp), entry.transactionId);
             }
@@ -219,6 +245,13 @@ public class CaptureDataChange implements AutoCloseable {
             break;
             case LogEntryType.COMMITTRANSACTION: {
                 TransactionHolder transaction = transactions.get(entry.transactionId);
+                transaction.tablesDefinitions.forEach( (tableName, tableDef) -> {
+                    if (tableDef == null) { // DROP TABLE
+                        tablesDefinitions.remove(tableName);
+                    } else { // CREATE/ALTER
+                        tablesDefinitions.put(tableName, tableDef);
+                    }
+                });
                 for (Mutation mutation : transaction.mutations) {
                     listener.accept(mutation);
                 }
@@ -228,7 +261,7 @@ public class CaptureDataChange implements AutoCloseable {
                 transactions.remove(entry.transactionId);
                 break;
             default:
-                // discard unkwown entry types
+                // discard unknown entry types
                 break;
         }
     }
