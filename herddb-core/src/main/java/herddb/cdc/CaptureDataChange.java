@@ -64,9 +64,8 @@ public class CaptureDataChange implements AutoCloseable {
         private final long timestamp;
 
         public Mutation(Table table, MutationType mutationType,
-                DataAccessorForFullRecord record, LogSequenceNumber logSequenceNumber,
-                long timestamp)
-        {
+                        DataAccessorForFullRecord record, LogSequenceNumber logSequenceNumber,
+                        long timestamp) {
             this.table = table;
             this.mutationType = mutationType;
             this.record = record;
@@ -74,28 +73,23 @@ public class CaptureDataChange implements AutoCloseable {
             this.timestamp = timestamp;
         }
 
-        public Table getTable()
-        {
+        public Table getTable() {
             return table;
         }
 
-        public MutationType getMutationType()
-        {
+        public MutationType getMutationType() {
             return mutationType;
         }
 
-        public DataAccessorForFullRecord getRecord()
-        {
+        public DataAccessorForFullRecord getRecord() {
             return record;
         }
 
-        public LogSequenceNumber getLogSequenceNumber()
-        {
+        public LogSequenceNumber getLogSequenceNumber() {
             return logSequenceNumber;
         }
 
-        public long getTimestamp()
-        {
+        public long getTimestamp() {
             return timestamp;
         }
 
@@ -120,9 +114,13 @@ public class CaptureDataChange implements AutoCloseable {
     private LogSequenceNumber lastPosition;
     private final String tableSpaceUUID;
     private volatile boolean closed = false;
+    private volatile boolean running = false;
 
-    public CaptureDataChange(String tableSpaceUUID, ClientConfiguration configuration, MutationListener listener, LogSequenceNumber startingPosition)
-    {
+    private ZookeeperMetadataStorageManager zookeeperMetadataStorageManager;
+    private BookkeeperCommitLogManager manager;
+
+
+    public CaptureDataChange(String tableSpaceUUID, ClientConfiguration configuration, MutationListener listener, LogSequenceNumber startingPosition) {
         this.configuration = configuration;
         this.listener = listener;
         this.lastPosition = startingPosition;
@@ -137,29 +135,49 @@ public class CaptureDataChange implements AutoCloseable {
         private Map<String, Table> tablesDefinitions = new HashMap<>();
     }
 
-    public void run() throws Exception {
-        try (ZookeeperMetadataStorageManager zookeeperMetadataStorageManager = buildMetadataStorageManager(configuration);
-             BookkeeperCommitLogManager manager = new BookkeeperCommitLogManager(zookeeperMetadataStorageManager, new ServerConfiguration(), NullStatsLogger.INSTANCE);)
-        {
-            manager.start();
-            try (BookkeeperCommitLog cdc = manager.createCommitLog(tableSpaceUUID, tableSpaceUUID, "cdc");)
-            {
-                CommitLog.FollowerContext context = cdc.startFollowing(lastPosition);
-                cdc.followTheLeader(lastPosition, new CommitLog.EntryAcceptor()
-                {
-                    @Override
-                    public boolean accept(LogSequenceNumber lsn, LogEntry entry) throws Exception
-                    {
-                        applyEntry(entry, lsn);
-                        lastPosition = lsn;
-                        return !closed;
-                    }
-                }, context);
-            }
+    public void start() throws Exception {
+        zookeeperMetadataStorageManager = buildMetadataStorageManager(configuration);
+        manager = new BookkeeperCommitLogManager(zookeeperMetadataStorageManager, new ServerConfiguration(), NullStatsLogger.INSTANCE);
+        manager.start();
+    }
+
+    public LogSequenceNumber run() throws Exception {
+        if (zookeeperMetadataStorageManager == null) {
+            throw new IllegalStateException("not started");
+        }
+
+        try (BookkeeperCommitLog cdc = manager.createCommitLog(tableSpaceUUID, tableSpaceUUID, "cdc");) {
+            running = true;
+            CommitLog.FollowerContext context = cdc.startFollowing(lastPosition);
+            cdc.followTheLeader(lastPosition, new CommitLog.EntryAcceptor() {
+                @Override
+                public boolean accept(LogSequenceNumber lsn, LogEntry entry) throws Exception {
+                    applyEntry(entry, lsn);
+                    lastPosition = lsn;
+                    return !closed;
+                }
+            }, context);
+            return lastPosition;
+        } finally {
+            running = false;
         }
     }
-    public void close() {
+
+    @Override
+    public void close() throws Exception {
         closed = true;
+        long _start = System.currentTimeMillis();
+
+        while (running
+                && (System.currentTimeMillis() - _start < 10_000)) {
+            Thread.sleep(100);
+        }
+        if (manager != null) {
+            manager.close();
+        }
+        if (zookeeperMetadataStorageManager != null) {
+            zookeeperMetadataStorageManager.close();
+        }
     }
 
     private void fire(Mutation mutation, long transactionId) {
@@ -167,9 +185,11 @@ public class CaptureDataChange implements AutoCloseable {
             TransactionHolder transaction = transactions.get(transactionId);
             transaction.mutations.add(mutation);
         } else {
-            listener.accept(mutation);;
+            listener.accept(mutation);
+            ;
         }
     }
+
     private Table lookupTable(LogEntry entry) {
         String tableName = entry.tableName;
         if (entry.transactionId > 0) {
@@ -182,17 +202,14 @@ public class CaptureDataChange implements AutoCloseable {
         return tablesDefinitions.get(tableName);
     }
 
-    private void applyEntry(LogEntry entry, LogSequenceNumber lsn) throws Exception
-    {
+    private void applyEntry(LogEntry entry, LogSequenceNumber lsn) throws Exception {
 
-        switch (entry.type)
-        {
+        switch (entry.type) {
             case LogEntryType.NOOP:
             case LogEntryType.CREATE_INDEX:
             case LogEntryType.DROP_INDEX:
                 break;
-            case LogEntryType.DROP_TABLE:
-            {
+            case LogEntryType.DROP_TABLE: {
                 Table table = lookupTable(entry);
 
                 if (entry.transactionId > 0) {
@@ -205,8 +222,7 @@ public class CaptureDataChange implements AutoCloseable {
                 fire(new Mutation(table, MutationType.DROP_TABLE, null, lsn, entry.timestamp), entry.transactionId);
             }
             break;
-            case LogEntryType.CREATE_TABLE:
-            {
+            case LogEntryType.CREATE_TABLE: {
                 Table table = Table.deserialize(entry.value.to_array());
                 if (entry.transactionId > 0) {
                     TransactionHolder transaction = transactions.get(entry.transactionId);
@@ -217,8 +233,7 @@ public class CaptureDataChange implements AutoCloseable {
                 fire(new Mutation(table, MutationType.CREATE_TABLE, null, lsn, entry.timestamp), entry.transactionId);
             }
             break;
-            case LogEntryType.ALTER_TABLE:
-            {
+            case LogEntryType.ALTER_TABLE: {
                 Table table = Table.deserialize(entry.value.to_array());
                 if (entry.transactionId > 0) {
                     TransactionHolder transaction = transactions.get(entry.transactionId);
@@ -229,22 +244,19 @@ public class CaptureDataChange implements AutoCloseable {
                 fire(new Mutation(table, MutationType.ALTER_TABLE, null, lsn, entry.timestamp), entry.transactionId);
             }
             break;
-            case LogEntryType.INSERT:
-            {
+            case LogEntryType.INSERT: {
                 Table table = lookupTable(entry);
                 DataAccessorForFullRecord record = new DataAccessorForFullRecord(table, new Record(entry.key, entry.value));
                 fire(new Mutation(table, MutationType.INSERT, record, lsn, entry.timestamp), entry.transactionId);
             }
             break;
-            case LogEntryType.DELETE:
-            {
+            case LogEntryType.DELETE: {
                 Table table = lookupTable(entry);
                 DataAccessorForFullRecord record = new DataAccessorForFullRecord(table, new Record(entry.key, entry.value));
                 fire(new Mutation(table, MutationType.DELETE, record, lsn, entry.timestamp), entry.transactionId);
             }
             break;
-            case LogEntryType.UPDATE:
-            {
+            case LogEntryType.UPDATE: {
                 Table table = lookupTable(entry);
                 DataAccessorForFullRecord record = new DataAccessorForFullRecord(table, new Record(entry.key, entry.value));
                 fire(new Mutation(table, MutationType.UPDATE, record, lsn, entry.timestamp), entry.transactionId);
@@ -256,7 +268,7 @@ public class CaptureDataChange implements AutoCloseable {
             break;
             case LogEntryType.COMMITTRANSACTION: {
                 TransactionHolder transaction = transactions.get(entry.transactionId);
-                transaction.tablesDefinitions.forEach( (tableName, tableDef) -> {
+                transaction.tablesDefinitions.forEach((tableName, tableDef) -> {
                     if (tableDef == null) { // DROP TABLE
                         tablesDefinitions.remove(tableName);
                     } else { // CREATE/ALTER
@@ -276,9 +288,9 @@ public class CaptureDataChange implements AutoCloseable {
                 break;
         }
     }
+
     private static ZookeeperMetadataStorageManager buildMetadataStorageManager(ClientConfiguration configuration)
-        throws MetadataStorageManagerException
-    {
+            throws MetadataStorageManagerException {
         String zkAddress = configuration.getString(PROPERTY_ZOOKEEPER_ADDRESS, PROPERTY_ZOOKEEPER_ADDRESS_DEFAULT);
         String zkPath = configuration.getString(PROPERTY_ZOOKEEPER_PATH, PROPERTY_ZOOKEEPER_PATH_DEFAULT);
         int sessionTimeout = configuration.getInt(PROPERTY_ZOOKEEPER_SESSIONTIMEOUT, 60000);

@@ -46,10 +46,7 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -85,7 +82,7 @@ public class SimpleCDCTest {
     }
 
     @Test
-    public void testCaptureDataChange() throws Exception {
+    public void testBasicCaptureDataChange() throws Exception {
         ServerConfiguration serverconfig_1 = newServerConfigurationWithAutoPort(folder.newFolder().toPath());
         serverconfig_1.set(ServerConfiguration.PROPERTY_NODEID, "server1");
         serverconfig_1.set(ServerConfiguration.PROPERTY_MODE, ServerConfiguration.PROPERTY_MODE_CLUSTER);
@@ -111,8 +108,10 @@ public class SimpleCDCTest {
             server_1.getManager().executeStatement(new CreateTableStatement(table), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
             server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 1, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
             server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 2, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
-            server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 3, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
-            server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 4, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            long tx = TestUtils.beginTransaction(server_1.getManager(), TableSpace.DEFAULT);
+
+            server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 3, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), new TransactionContext(tx));
+            server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 4, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), new TransactionContext(tx));
 
             List<CaptureDataChange.Mutation> mutations = new ArrayList<>();
             try (final CaptureDataChange cdc = new CaptureDataChange(
@@ -126,10 +125,60 @@ public class SimpleCDCTest {
                         }
                     },
                     LogSequenceNumber.START_OF_TIME);) {
+
+                cdc.start();
+
                 cdc.run();
 
                 // we are missing the last entry, because it is not confirmed yet on BookKeeper at this point
-                assertEquals(4, mutations.size());
+                // also the mutations in the transaction are not visible
+                assertEquals(3, mutations.size());
+
+                // commit the transaction
+                TestUtils.commitTransaction(server_1.getManager(), TableSpace.DEFAULT, tx);
+
+                server_1.getManager().executeUpdate(new UpdateStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 4, "d", 2), null), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+
+                cdc.run();
+                assertEquals(5, mutations.size());
+
+                server_1.getManager().executeStatement(new AlterTableStatement(Arrays.asList(Column.column("e", ColumnTypes.INTEGER)), Collections.emptyList(), Collections.emptyList(), null, table.name, TableSpace.DEFAULT, null, Collections.emptyList(),
+                        Collections.emptyList()), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+                cdc.run();
+                assertEquals(6, mutations.size());
+
+
+                // transaction to be rolled back
+                long tx2 = TestUtils.beginTransaction(server_1.getManager(), TableSpace.DEFAULT);
+                server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 30, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), new TransactionContext(tx2));
+                server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 31, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), new TransactionContext(tx2));
+                TestUtils.roolbackTransaction(server_1.getManager(), TableSpace.DEFAULT, tx2);
+
+                // nothing is to be sent to CDC
+                cdc.run();
+                assertEquals(7, mutations.size());
+
+                server_1.getManager().executeUpdate(new DeleteStatement(TableSpace.DEFAULT, "t1", Bytes.from_int(1), null), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+                cdc.run();
+                assertEquals(7, mutations.size());
+
+                // close the server...close the ledger, now we can read the last mutation
+                server_1.close();
+
+                cdc.run();
+                assertEquals(8, mutations.size());
+
+
+                int i = 0;
+                assertEquals(CaptureDataChange.MutationType.CREATE_TABLE, mutations.get(i++).getMutationType());
+                assertEquals(CaptureDataChange.MutationType.INSERT, mutations.get(i++).getMutationType());
+                assertEquals(CaptureDataChange.MutationType.INSERT, mutations.get(i++).getMutationType());
+                assertEquals(CaptureDataChange.MutationType.INSERT, mutations.get(i++).getMutationType());
+                assertEquals(CaptureDataChange.MutationType.INSERT, mutations.get(i++).getMutationType());
+                assertEquals(CaptureDataChange.MutationType.UPDATE, mutations.get(i++).getMutationType());
+                assertEquals(CaptureDataChange.MutationType.ALTER_TABLE, mutations.get(i++).getMutationType());
+                assertEquals(CaptureDataChange.MutationType.DELETE, mutations.get(i++).getMutationType());
+
 
             }
         }
