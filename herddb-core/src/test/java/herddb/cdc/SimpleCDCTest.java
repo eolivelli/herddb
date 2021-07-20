@@ -20,23 +20,15 @@
 
 package herddb.cdc;
 
-import herddb.backup.BackupUtils;
-import herddb.backup.ProgressListener;
 import herddb.client.ClientConfiguration;
-import herddb.client.HDBClient;
-import herddb.client.HDBConnection;
-import herddb.cluster.RetryOnLeaderChangedTest;
 import herddb.codec.RecordSerializer;
-import herddb.core.DBManager;
 import herddb.core.TestUtils;
 import herddb.log.LogSequenceNumber;
-import herddb.model.Record;
 import herddb.model.*;
 import herddb.model.commands.*;
 import herddb.server.Server;
 import herddb.server.ServerConfiguration;
 import herddb.utils.Bytes;
-import herddb.utils.IntHolder;
 import herddb.utils.ZKTestEnv;
 import org.junit.After;
 import org.junit.Before;
@@ -44,15 +36,12 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.util.*;
-import java.util.concurrent.CountDownLatch;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
-import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.*;
 
 /**
  * Tests around backup/restore
@@ -113,14 +102,17 @@ public class SimpleCDCTest {
             server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 3, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), new TransactionContext(tx));
             server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 4, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), new TransactionContext(tx));
 
-            List<CaptureDataChange.Mutation> mutations = new ArrayList<>();
-            try (final CaptureDataChange cdc = new CaptureDataChange(
+            List<ChangeDataCapture.Mutation> mutations = new ArrayList<>();
+            try (final ChangeDataCapture cdc = new ChangeDataCapture(
                     server_1.getManager().getTableSpaceManager(TableSpace.DEFAULT).getTableSpaceUUID(),
                     client_configuration,
-                    new CaptureDataChange.MutationListener() {
+                    new ChangeDataCapture.MutationListener() {
                         @Override
-                        public void accept(CaptureDataChange.Mutation mutation) {
+                        public void accept(ChangeDataCapture.Mutation mutation) {
                             LOG.log(Level.INFO, "mutation "+mutation);
+                            assertTrue(mutation.getTimestamp() > 0);
+                            assertNotNull(mutation.getLogSequenceNumber());
+                            assertNotNull(mutation.getTable());
                             mutations.add(mutation);
                         }
                     },
@@ -170,15 +162,97 @@ public class SimpleCDCTest {
 
 
                 int i = 0;
-                assertEquals(CaptureDataChange.MutationType.CREATE_TABLE, mutations.get(i++).getMutationType());
-                assertEquals(CaptureDataChange.MutationType.INSERT, mutations.get(i++).getMutationType());
-                assertEquals(CaptureDataChange.MutationType.INSERT, mutations.get(i++).getMutationType());
-                assertEquals(CaptureDataChange.MutationType.INSERT, mutations.get(i++).getMutationType());
-                assertEquals(CaptureDataChange.MutationType.INSERT, mutations.get(i++).getMutationType());
-                assertEquals(CaptureDataChange.MutationType.UPDATE, mutations.get(i++).getMutationType());
-                assertEquals(CaptureDataChange.MutationType.ALTER_TABLE, mutations.get(i++).getMutationType());
-                assertEquals(CaptureDataChange.MutationType.DELETE, mutations.get(i++).getMutationType());
+                assertEquals(ChangeDataCapture.MutationType.CREATE_TABLE, mutations.get(i++).getMutationType());
+                assertEquals(ChangeDataCapture.MutationType.INSERT, mutations.get(i++).getMutationType());
+                assertEquals(ChangeDataCapture.MutationType.INSERT, mutations.get(i++).getMutationType());
+                assertEquals(ChangeDataCapture.MutationType.INSERT, mutations.get(i++).getMutationType());
+                assertEquals(ChangeDataCapture.MutationType.INSERT, mutations.get(i++).getMutationType());
+                assertEquals(ChangeDataCapture.MutationType.UPDATE, mutations.get(i++).getMutationType());
+                assertEquals(ChangeDataCapture.MutationType.ALTER_TABLE, mutations.get(i++).getMutationType());
+                assertEquals(ChangeDataCapture.MutationType.DELETE, mutations.get(i++).getMutationType());
 
+
+            }
+        }
+    }
+
+    @Test
+    public void testBasicCaptureDataChangeWithTransactions() throws Exception {
+        ServerConfiguration serverconfig_1 = newServerConfigurationWithAutoPort(folder.newFolder().toPath());
+        serverconfig_1.set(ServerConfiguration.PROPERTY_NODEID, "server1");
+        serverconfig_1.set(ServerConfiguration.PROPERTY_MODE, ServerConfiguration.PROPERTY_MODE_CLUSTER);
+        serverconfig_1.set(ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, testEnv.getAddress());
+        serverconfig_1.set(ServerConfiguration.PROPERTY_ZOOKEEPER_PATH, testEnv.getPath());
+        serverconfig_1.set(ServerConfiguration.PROPERTY_ZOOKEEPER_SESSIONTIMEOUT, testEnv.getTimeout());
+
+        ClientConfiguration client_configuration = new ClientConfiguration(folder.newFolder().toPath());
+        client_configuration.set(ClientConfiguration.PROPERTY_MODE, ServerConfiguration.PROPERTY_MODE_CLUSTER);
+        client_configuration.set(ClientConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, testEnv.getAddress());
+        client_configuration.set(ClientConfiguration.PROPERTY_ZOOKEEPER_PATH, testEnv.getPath());
+        client_configuration.set(ClientConfiguration.PROPERTY_ZOOKEEPER_SESSIONTIMEOUT, testEnv.getTimeout());
+
+        try (Server server_1 = new Server(serverconfig_1)) {
+            server_1.start();
+            server_1.waitForStandaloneBoot();
+            Table table = Table.builder()
+                    .name("t1")
+                    .column("c", ColumnTypes.INTEGER)
+                    .column("d", ColumnTypes.INTEGER)
+                    .primaryKey("c")
+                    .build();
+
+            // create table in transaction
+            long tx = TestUtils.beginTransaction(server_1.getManager(), TableSpace.DEFAULT);
+            server_1.getManager().executeStatement(new CreateTableStatement(table), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), new TransactionContext(tx));
+            // work on the table in transaction
+            server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 1, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), new TransactionContext(tx));
+
+            // commit
+            TestUtils.commitTransaction(server_1.getManager(), TableSpace.DEFAULT, tx);
+
+            // work on the table outside of the transaction
+            server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 2, "d", 2)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+
+            // close the server and the ledger
+            server_1.close();
+
+            List<ChangeDataCapture.Mutation> mutations = new ArrayList<>();
+            try (final ChangeDataCapture cdc = new ChangeDataCapture(
+                    server_1.getManager().getTableSpaceManager(TableSpace.DEFAULT).getTableSpaceUUID(),
+                    client_configuration,
+                    new ChangeDataCapture.MutationListener() {
+                        @Override
+                        public void accept(ChangeDataCapture.Mutation mutation) {
+                            LOG.log(Level.INFO, "mutation "+mutation);
+                            assertTrue(mutation.getTimestamp() > 0);
+                            assertNotNull(mutation.getLogSequenceNumber());
+                            assertNotNull(mutation.getTable());
+                            mutations.add(mutation);
+                        }
+                    },
+                    LogSequenceNumber.START_OF_TIME);) {
+                cdc.start();
+                cdc.run();
+
+
+                assertEquals(3, mutations.size());
+
+                int i = 0;
+                ChangeDataCapture.Mutation m1 = mutations.get(i++);
+                assertEquals(ChangeDataCapture.MutationType.CREATE_TABLE, m1.getMutationType());
+                Table tableFromM1 = m1.getTable();
+                assertNotNull(tableFromM1);
+                assertEquals(table, tableFromM1);
+                ChangeDataCapture.Mutation m2 = mutations.get(i++);
+                assertEquals(ChangeDataCapture.MutationType.INSERT, m2.getMutationType());
+                assertEquals(m2.getTable(), tableFromM1);
+                assertEquals(1, m2.getRecord().get("c"));
+                assertEquals(2, m2.getRecord().get("d"));
+                ChangeDataCapture.Mutation m3 = mutations.get(i++);
+                assertEquals(ChangeDataCapture.MutationType.INSERT, m3.getMutationType());
+                assertEquals(m3.getTable(), tableFromM1);
+                assertEquals(2, m3.getRecord().get("c"));
+                assertEquals(2, m3.getRecord().get("d"));
 
             }
         }

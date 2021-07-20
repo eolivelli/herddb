@@ -45,8 +45,14 @@ import static herddb.client.ClientConfiguration.PROPERTY_ZOOKEEPER_PATH;
 import static herddb.client.ClientConfiguration.PROPERTY_ZOOKEEPER_PATH_DEFAULT;
 import static herddb.client.ClientConfiguration.PROPERTY_ZOOKEEPER_SESSIONTIMEOUT;
 
-public class CaptureDataChange implements AutoCloseable {
+/**
+ * This utility provides a way to Change Data Capture with HerdDB.
+ */
+public class ChangeDataCapture implements AutoCloseable {
 
+    /**
+     * Type of Mutation
+     */
     public enum MutationType {
         INSERT,
         UPDATE,
@@ -56,6 +62,9 @@ public class CaptureDataChange implements AutoCloseable {
         ALTER_TABLE
     }
 
+    /**
+     * Details about a Mutation
+     */
     public static class Mutation {
         private final Table table;
         private final MutationType mutationType;
@@ -105,6 +114,9 @@ public class CaptureDataChange implements AutoCloseable {
         }
     }
 
+    /**
+     * Implement this interface in order to receive the flow of Mutations
+     */
     public interface MutationListener {
         void accept(Mutation mutation);
     }
@@ -118,29 +130,36 @@ public class CaptureDataChange implements AutoCloseable {
 
     private ZookeeperMetadataStorageManager zookeeperMetadataStorageManager;
     private BookkeeperCommitLogManager manager;
+    private Map<String, Table> tablesDefinitions = new HashMap<>();
+    private Map<Long, TransactionHolder> transactions = new HashMap<>();
 
+    private static class TransactionHolder {
+        private List<Mutation> mutations = new ArrayList<>();
+        private Map<String, Table> tablesDefinitions = new HashMap<>();
+    }
 
-    public CaptureDataChange(String tableSpaceUUID, ClientConfiguration configuration, MutationListener listener, LogSequenceNumber startingPosition) {
+    public ChangeDataCapture(String tableSpaceUUID, ClientConfiguration configuration, MutationListener listener, LogSequenceNumber startingPosition) {
         this.configuration = configuration;
         this.listener = listener;
         this.lastPosition = startingPosition;
         this.tableSpaceUUID = tableSpaceUUID;
     }
 
-    private Map<String, Table> tablesDefinitions = new HashMap<>();
-    private Map<Long, TransactionHolder> transactions = new HashMap<>();
-
-    private class TransactionHolder {
-        private List<Mutation> mutations = new ArrayList<>();
-        private Map<String, Table> tablesDefinitions = new HashMap<>();
-    }
-
+    /**
+     * Bootstrap the procedure.
+     * @throws Exception
+     */
     public void start() throws Exception {
         zookeeperMetadataStorageManager = buildMetadataStorageManager(configuration);
         manager = new BookkeeperCommitLogManager(zookeeperMetadataStorageManager, new ServerConfiguration(), NullStatsLogger.INSTANCE);
         manager.start();
     }
 
+    /**
+     * Execute one run
+     * @return the last sequence number, to be used to configure CDC for the next execution
+     * @throws Exception
+     */
     public LogSequenceNumber run() throws Exception {
         if (zookeeperMetadataStorageManager == null) {
             throw new IllegalStateException("not started");
