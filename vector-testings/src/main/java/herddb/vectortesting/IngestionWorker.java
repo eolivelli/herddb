@@ -3,21 +3,25 @@ package herddb.vectortesting;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
-import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class IngestionWorker implements Runnable {
 
     private final Config config;
-    private final List<float[]> vectors;
-    private final int startId;
-    private final int endId;
+    private final BlockingQueue<float[]> queue;
+    private final AtomicBoolean done;
+    private final AtomicLong rowId;
     private final MetricsCollector metrics;
 
-    public IngestionWorker(Config config, List<float[]> vectors, int startId, int endId, MetricsCollector metrics) {
+    public IngestionWorker(Config config, BlockingQueue<float[]> queue, AtomicBoolean done, AtomicLong rowId, MetricsCollector metrics) {
         this.config = config;
-        this.vectors = vectors;
-        this.startId = startId;
-        this.endId = endId;
+        this.queue = queue;
+        this.done = done;
+        this.rowId = rowId;
         this.metrics = metrics;
     }
 
@@ -28,10 +32,17 @@ public class IngestionWorker implements Runnable {
             conn.setAutoCommit(false);
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 int batchCount = 0;
-                for (int id = startId; id < endId; id++) {
+                while (true) {
+                    float[] vec = queue.poll(100, TimeUnit.MILLISECONDS);
+                    if (vec == null) {
+                        if (done.get() && queue.isEmpty()) break;
+                        else continue;
+                    }
+                    if (vec.length == 0) break; // poison pill
+                    long id = rowId.getAndIncrement();
                     long start = System.nanoTime();
-                    ps.setInt(1, id);
-                    ps.setObject(2, vectors.get(id % vectors.size()));
+                    ps.setLong(1, id);
+                    ps.setObject(2, vec);
                     ps.executeUpdate();
                     batchCount++;
                     if (batchCount >= config.batchSize) {
@@ -51,7 +62,7 @@ public class IngestionWorker implements Runnable {
                 }
             }
         } catch (Exception e) {
-            System.err.println("Ingestion error in range [" + startId + ", " + endId + "): " + e.getMessage());
+            System.err.println("Ingestion error: " + e.getMessage());
             e.printStackTrace();
         }
     }

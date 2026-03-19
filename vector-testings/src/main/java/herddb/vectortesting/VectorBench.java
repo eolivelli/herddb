@@ -8,9 +8,13 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class VectorBench {
 
@@ -23,13 +27,6 @@ public class VectorBench {
         // Phase 1: Dataset
         DatasetLoader loader = new DatasetLoader(config.datasetDir, config.dataset, config.datasetUrl);
         loader.ensureDataset();
-
-        System.out.println("Loading base vectors...");
-        List<float[]> baseVectors = loader.loadBaseVectors(Integer.MAX_VALUE);
-        System.out.println("Loaded " + baseVectors.size() + " base vectors (dim=" + baseVectors.get(0).length + ")");
-        if (config.numRows > baseVectors.size()) {
-            System.out.println("Requested " + config.numRows + " rows > dataset size " + baseVectors.size() + ", vectors will cycle");
-        }
 
         System.out.println("Loading query vectors...");
         loader.ensureQueryAndGroundTruth();
@@ -73,12 +70,23 @@ public class VectorBench {
             MetricsCollector ingestMetrics = new MetricsCollector();
             long ingestStart = System.nanoTime();
 
+            BlockingQueue<float[]> ingestQueue = new ArrayBlockingQueue<>(1000);
+            AtomicBoolean producerDone = new AtomicBoolean(false);
+            AtomicLong rowId = new AtomicLong(0);
+
             ExecutorService ingestPool = Executors.newFixedThreadPool(config.ingestThreads);
-            int chunkSize = actualRows / config.ingestThreads;
             for (int t = 0; t < config.ingestThreads; t++) {
-                int start = t * chunkSize;
-                int end = (t == config.ingestThreads - 1) ? actualRows : start + chunkSize;
-                ingestPool.submit(new IngestionWorker(config, baseVectors, start, end, ingestMetrics));
+                ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId, ingestMetrics));
+            }
+
+            try (DatasetLoader.VectorStream stream = loader.streamBaseVectors(actualRows)) {
+                for (float[] vec : stream) {
+                    ingestQueue.put(vec);
+                }
+            }
+            producerDone.set(true);
+            for (int t = 0; t < config.ingestThreads; t++) {
+                ingestQueue.put(new float[0]); // poison pills
             }
             ingestPool.shutdown();
             ingestPool.awaitTermination(24, TimeUnit.HOURS);

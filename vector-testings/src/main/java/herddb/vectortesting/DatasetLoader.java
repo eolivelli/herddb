@@ -1,6 +1,7 @@
 package herddb.vectortesting;
 
 import java.io.BufferedInputStream;
+import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -11,7 +12,9 @@ import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.zip.GZIPInputStream;
 
 public class DatasetLoader {
@@ -33,7 +36,8 @@ public class DatasetLoader {
     public void ensureDataset() throws IOException {
         File dir = getDatasetSubDir();
         File baseFile = new File(dir, preset.baseFile);
-        if (baseFile.exists()) {
+        File baseFileGz = new File(dir, preset.baseFile + ".gz");
+        if (baseFile.exists() || baseFileGz.exists()) {
             System.out.println("Dataset already present at " + dir.getAbsolutePath());
             return;
         }
@@ -48,16 +52,18 @@ public class DatasetLoader {
             System.out.println("Download complete: " + archive.length() + " bytes");
         }
 
-        System.out.println("Extracting " + archive.getAbsolutePath() + " ...");
         if (archiveName.endsWith(".tar.gz") || archiveName.endsWith(".tgz")) {
+            System.out.println("Extracting " + archive.getAbsolutePath() + " ...");
             extractTarGz(archive, new File(datasetDir));
-        } else if (archiveName.endsWith(".bvecs.gz") || archiveName.endsWith(".gz")) {
-            extractGz(archive, baseFile);
-        }
-        System.out.println("Extraction complete.");
-
-        if (!baseFile.exists()) {
-            throw new IOException("Expected file not found after extraction: " + baseFile.getAbsolutePath());
+            System.out.println("Extraction complete.");
+            if (!baseFile.exists()) {
+                throw new IOException("Expected file not found after extraction: " + baseFile.getAbsolutePath());
+            }
+        } else if (archiveName.endsWith(".gz")) {
+            // Keep the .gz file to save disk space — load methods decompress on-the-fly
+            if (!archive.renameTo(baseFileGz)) {
+                throw new IOException("Failed to move " + archive + " to " + baseFileGz);
+            }
         }
     }
 
@@ -76,7 +82,8 @@ public class DatasetLoader {
     private void ensureBigannFile(String targetFile, String url) throws IOException {
         File dir = getDatasetSubDir();
         File target = new File(dir, targetFile);
-        if (target.exists()) {
+        File targetGz = new File(dir, targetFile + ".gz");
+        if (target.exists() || targetGz.exists()) {
             return;
         }
 
@@ -91,7 +98,11 @@ public class DatasetLoader {
         if (archiveName.endsWith(".tar.gz")) {
             extractTarGz(archive, dir);
         } else if (archiveName.endsWith(".gz")) {
-            extractGz(archive, target);
+            // Keep the .gz file to save disk space — load methods decompress on-the-fly
+            targetGz.getParentFile().mkdirs();
+            if (!archive.renameTo(targetGz)) {
+                throw new IOException("Failed to move " + archive + " to " + targetGz);
+            }
         }
     }
 
@@ -128,45 +139,120 @@ public class DatasetLoader {
         }
     }
 
-    private void extractGz(File gzFile, File destFile) throws IOException {
-        destFile.getParentFile().mkdirs();
-        try (InputStream fi = new FileInputStream(gzFile);
-             GZIPInputStream gzi = new GZIPInputStream(new BufferedInputStream(fi));
-             FileOutputStream out = new FileOutputStream(destFile)) {
-            byte[] buf = new byte[8192];
-            int read;
-            while ((read = gzi.read(buf)) != -1) {
-                out.write(buf, 0, read);
+    private InputStream openInputStream(File file) throws IOException {
+        if (!file.exists()) {
+            File gz = new File(file.getParent(), file.getName() + ".gz");
+            if (gz.exists()) {
+                return new GZIPInputStream(new BufferedInputStream(new FileInputStream(gz)));
             }
         }
+        return new BufferedInputStream(new FileInputStream(file));
     }
 
     public List<float[]> loadBaseVectors(int maxVectors) throws IOException {
         File file = new File(getDatasetSubDir(), preset.baseFile);
         if (preset.baseFormat == VecFormat.BVECS) {
-            return loadBvecs(file, maxVectors);
+            return loadBvecs(openInputStream(file), maxVectors);
         } else {
-            return loadFvecs(file, maxVectors);
+            return loadFvecs(openInputStream(file), maxVectors);
         }
+    }
+
+    public interface VectorStream extends Iterable<float[]>, Closeable {}
+
+    public VectorStream streamBaseVectors(int maxVectors) throws IOException {
+        File file = new File(getDatasetSubDir(), preset.baseFile);
+        InputStream in = openInputStream(file);
+        DataInputStream dis = new DataInputStream(in);
+        VecFormat format = preset.baseFormat;
+        return new VectorStream() {
+            @Override
+            public void close() throws IOException {
+                dis.close();
+            }
+
+            @Override
+            public Iterator<float[]> iterator() {
+                return new Iterator<float[]>() {
+                    private int count = 0;
+                    private float[] next = null;
+                    private boolean eof = false;
+
+                    private float[] readNext() {
+                        if (count >= maxVectors || eof) return null;
+                        try {
+                            int dim;
+                            try {
+                                dim = readLittleEndianInt(dis);
+                            } catch (java.io.EOFException e) {
+                                eof = true;
+                                return null;
+                            }
+                            if (format == VecFormat.BVECS) {
+                                byte[] bytes = new byte[dim];
+                                dis.readFully(bytes);
+                                float[] vec = new float[dim];
+                                for (int i = 0; i < dim; i++) {
+                                    vec[i] = (bytes[i] & 0xFF);
+                                }
+                                return vec;
+                            } else {
+                                byte[] bytes = new byte[dim * 4];
+                                dis.readFully(bytes);
+                                ByteBuffer bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+                                float[] vec = new float[dim];
+                                for (int i = 0; i < dim; i++) {
+                                    vec[i] = bb.getFloat();
+                                }
+                                return vec;
+                            }
+                        } catch (IOException e) {
+                            eof = true;
+                            throw new RuntimeException("Error reading vector stream", e);
+                        }
+                    }
+
+                    @Override
+                    public boolean hasNext() {
+                        if (next == null && !eof && count < maxVectors) {
+                            next = readNext();
+                        }
+                        return next != null;
+                    }
+
+                    @Override
+                    public float[] next() {
+                        if (!hasNext()) throw new NoSuchElementException();
+                        float[] v = next;
+                        next = null;
+                        count++;
+                        if (count % 1_000_000 == 0) {
+                            System.out.println("  Streamed " + count + " vectors...");
+                        }
+                        return v;
+                    }
+                };
+            }
+        };
     }
 
     public List<float[]> loadQueryVectors(int maxVectors) throws IOException {
         File file = new File(getDatasetSubDir(), preset.queryFile);
         if (preset.queryFormat == VecFormat.BVECS) {
-            return loadBvecs(file, maxVectors);
+            return loadBvecs(openInputStream(file), maxVectors);
         } else {
-            return loadFvecs(file, maxVectors);
+            return loadFvecs(openInputStream(file), maxVectors);
         }
     }
 
     public List<int[]> loadGroundTruth(int maxVectors) throws IOException {
         File file = new File(getDatasetSubDir(), preset.groundTruthFile);
-        return loadIvecs(file, maxVectors);
+        return loadIvecs(openInputStream(file), maxVectors);
     }
 
-    private List<float[]> loadFvecs(File file, int maxVectors) throws IOException {
+    private List<float[]> loadFvecs(InputStream in, int maxVectors) throws IOException {
         List<float[]> vectors = new ArrayList<>();
-        try (DataInputStream dis = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))) {
+        try (DataInputStream dis = new DataInputStream(in)) {
             while (vectors.size() < maxVectors) {
                 int dim;
                 try {
@@ -190,9 +276,9 @@ public class DatasetLoader {
         return vectors;
     }
 
-    private List<float[]> loadBvecs(File file, int maxVectors) throws IOException {
+    private List<float[]> loadBvecs(InputStream in, int maxVectors) throws IOException {
         List<float[]> vectors = new ArrayList<>();
-        try (DataInputStream dis = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))) {
+        try (DataInputStream dis = new DataInputStream(in)) {
             while (vectors.size() < maxVectors) {
                 int dim;
                 try {
@@ -215,9 +301,9 @@ public class DatasetLoader {
         return vectors;
     }
 
-    private List<int[]> loadIvecs(File file, int maxVectors) throws IOException {
+    private List<int[]> loadIvecs(InputStream in, int maxVectors) throws IOException {
         List<int[]> vectors = new ArrayList<>();
-        try (DataInputStream dis = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))) {
+        try (DataInputStream dis = new DataInputStream(in)) {
             while (vectors.size() < maxVectors) {
                 int dim;
                 try {
