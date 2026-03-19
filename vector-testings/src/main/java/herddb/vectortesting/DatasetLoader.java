@@ -70,11 +70,11 @@ public class DatasetLoader {
     public void ensureQueryAndGroundTruth() throws IOException {
         File dir = getDatasetSubDir();
 
-        // For BIGANN, query and ground truth are separate downloads
-        if (preset == DatasetPreset.BIGANN) {
+        // For BIGANN/SIFT10M, query and ground truth are separate downloads
+        if (preset == DatasetPreset.BIGANN || preset == DatasetPreset.SIFT10M) {
             ensureBigannFile("bigann_query.bvecs",
                     "ftp://ftp.irisa.fr/local/texmex/corpus/bigann_query.bvecs.gz");
-            ensureBigannFile("bigann_gnd/idx_1000M.ivecs",
+            ensureBigannFile(preset.groundTruthFile,
                     "ftp://ftp.irisa.fr/local/texmex/corpus/bigann_gnd.tar.gz");
         }
     }

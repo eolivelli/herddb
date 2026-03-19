@@ -51,10 +51,13 @@ import herddb.security.UserManager;
 import herddb.storage.DataStorageManager;
 import herddb.utils.Version;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
@@ -248,6 +251,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 LOGGER.info("JDBC URL is not available. This server will not be accessible outside the JVM");
                 break;
             case ServerConfiguration.PROPERTY_MODE_STANDALONE:
+            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE:
                 jdbcUrl = "jdbc:herddb:server:" + serverHostData.getHost() + ":" + serverHostData.getPort();
                 LOGGER.log(Level.INFO, "Use this JDBC URL to connect to this server: {0}", new Object[]{jdbcUrl});
                 break;
@@ -307,6 +311,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
             case ServerConfiguration.PROPERTY_MODE_LOCAL:
                 return new MemoryMetadataStorageManager();
             case ServerConfiguration.PROPERTY_MODE_STANDALONE:
+            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE:
                 Path metadataDirectory = this.baseDirectory.resolve(configuration.getString(ServerConfiguration.PROPERTY_METADATADIR, ServerConfiguration.PROPERTY_METADATADIR_DEFAULT));
                 return new FileMetadataStorageManager(metadataDirectory);
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
@@ -338,6 +343,21 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 return new BookKeeperDataStorageManager(nodeId, tmpDirectory, diskswapThreshold, (ZookeeperMetadataStorageManager) metadataStorageManager,
                         (BookkeeperCommitLogManager) this.commitLogManager, this.statsLogger);
             }
+            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE: {
+                int diskswapThreshold = configuration.getInt(ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS, ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS_DEFAULT);
+                String remoteServers = configuration.getString(ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS, ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
+                List<String> servers = Arrays.asList(remoteServers.split(","));
+                try {
+                    Class<?> clientClass = Class.forName("herddb.remote.RemoteFileServiceClient");
+                    Object client = clientClass.getConstructor(List.class).newInstance(servers);
+                    Class<?> storageClass = Class.forName("herddb.remote.RemoteFileDataStorageManager");
+                    Constructor<?> ctor = storageClass.getConstructor(Path.class, Path.class, int.class, clientClass);
+                    return (DataStorageManager) ctor.newInstance(dataDirectory, tmpDirectory, diskswapThreshold, client);
+                } catch (ReflectiveOperationException e) {
+                    throw new RuntimeException("Cannot create RemoteFileDataStorageManager. " +
+                            "Ensure herddb-remote-file-service is on the classpath.", e);
+                }
+            }
             default:
                 throw new RuntimeException();
         }
@@ -348,6 +368,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         switch (mode) {
             case ServerConfiguration.PROPERTY_MODE_LOCAL:
                 return new MemoryCommitLogManager(false);
+            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE:
             case ServerConfiguration.PROPERTY_MODE_STANDALONE:
                 Path logDirectory = this.baseDirectory.resolve(configuration.getString(ServerConfiguration.PROPERTY_LOGDIR, ServerConfiguration.PROPERTY_LOGDIR_DEFAULT));
                 return new FileCommitLogManager(logDirectory,
@@ -395,6 +416,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
             case ServerConfiguration.PROPERTY_MODE_STANDALONE:
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
             case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER:
+            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE:
                 return new LocalNodeIdManager(dataDirectory);
             default:
                 throw new RuntimeException();

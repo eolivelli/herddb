@@ -164,6 +164,11 @@
             <artifactId>jersey-media-json-jackson</artifactId>
             <version>${libs.jersey}</version>
         </dependency>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>herddb-remote-file-service</artifactId>
+            <version>${project.version}</version>
+        </dependency>
 
     </dependencies>
     <build>

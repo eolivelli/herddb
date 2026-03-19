@@ -28,6 +28,7 @@ public class Config {
     int indexBeamWidth = 100;
     boolean skipIngest = false;
     boolean skipIndex = false;
+    boolean skipVerify = false;
     boolean dropTable = false;
 
     private static Options buildOptions() {
@@ -49,6 +50,7 @@ public class Config {
         opts.addOption(null, "beam-width", true, "Vector index beamWidth (default: 100)");
         opts.addOption(null, "skip-ingest", false, "Skip ingestion phase");
         opts.addOption(null, "skip-index", false, "Skip index creation");
+        opts.addOption(null, "skip-verify", false, "Skip row count verification after ingestion");
         opts.addOption(null, "drop-table", false, "Drop table before starting");
         opts.addOption(null, "config", true, "Path to properties file");
         opts.addOption("h", "help", false, "Show help");
@@ -95,6 +97,7 @@ public class Config {
         if (cmd.hasOption("beam-width")) cfg.indexBeamWidth = Integer.parseInt(cmd.getOptionValue("beam-width"));
         if (cmd.hasOption("skip-ingest")) cfg.skipIngest = true;
         if (cmd.hasOption("skip-index")) cfg.skipIndex = true;
+        if (cmd.hasOption("skip-verify")) cfg.skipVerify = true;
         if (cmd.hasOption("drop-table")) cfg.dropTable = true;
 
         return cfg;
@@ -118,6 +121,7 @@ public class Config {
         if (props.containsKey("beam-width")) indexBeamWidth = Integer.parseInt(props.getProperty("beam-width"));
         if (props.containsKey("skip-ingest")) skipIngest = Boolean.parseBoolean(props.getProperty("skip-ingest"));
         if (props.containsKey("skip-index")) skipIndex = Boolean.parseBoolean(props.getProperty("skip-index"));
+        if (props.containsKey("skip-verify")) skipVerify = Boolean.parseBoolean(props.getProperty("skip-verify"));
         if (props.containsKey("drop-table")) dropTable = Boolean.parseBoolean(props.getProperty("drop-table"));
     }
 
@@ -147,6 +151,7 @@ public class Config {
                 + ", beamWidth=" + indexBeamWidth
                 + ", skipIngest=" + skipIngest
                 + ", skipIndex=" + skipIndex
+                + ", skipVerify=" + skipVerify
                 + ", dropTable=" + dropTable
                 + '}';
     }

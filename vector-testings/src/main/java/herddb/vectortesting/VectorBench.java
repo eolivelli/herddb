@@ -99,6 +99,22 @@ public class VectorBench {
                     ingestMetrics.getCount(), ingestSecs, ingestMetrics.getCount() / ingestSecs);
             System.out.printf("Threads: %d | Batch size: %d%n", config.ingestThreads, config.batchSize);
             ingestMetrics.computeStats().print("INGESTION LATENCY");
+
+            // Verify row count matches ingested records
+            if (!config.skipVerify) {
+                long expectedRows = ingestMetrics.getCount();
+                try (Connection conn = DriverManager.getConnection(config.jdbcUrl, config.username, config.password);
+                     Statement stmt = conn.createStatement();
+                     java.sql.ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM " + config.tableName)) {
+                    rs.next();
+                    long actualCount = rs.getLong(1);
+                    if (actualCount != expectedRows) {
+                        throw new IllegalStateException("Row count mismatch after ingestion: expected "
+                                + expectedRows + " but table has " + actualCount);
+                    }
+                    System.out.printf("Verification OK: %d rows in table%n", actualCount);
+                }
+            }
             System.out.println();
         } else {
             System.out.println("Skipping ingestion phase.");
