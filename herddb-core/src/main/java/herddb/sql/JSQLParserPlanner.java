@@ -82,6 +82,7 @@ import herddb.model.planner.SimpleUpdateOp;
 import herddb.model.planner.SortOp;
 import herddb.model.planner.UnionAllOp;
 import herddb.model.planner.ValuesOp;
+import herddb.model.planner.VectorANNScanOp;
 import herddb.server.ServerConfiguration;
 import herddb.sql.expressions.AccessCurrentRowExpression;
 import herddb.sql.expressions.ColumnRef;
@@ -1818,7 +1819,13 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
 
         // add order by
         if (plainSelect.getOrderByElements() != null) {
-            op = planSort(op, currentSchema, plainSelect.getOrderByElements());
+            PlannerOp annOp = tryBuildVectorANNSortOp(
+                    plainSelect, tableImpl, primaryTableSchema, predicate, op);
+            if (annOp != null) {
+                op = annOp;
+            } else {
+                op = planSort(op, currentSchema, plainSelect.getOrderByElements());
+            }
         }
 
         // add limit
@@ -2063,6 +2070,46 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
     private static ExecutionPlan optimizePlan(PlannerOp op) {
         op = op.optimize();
         return ExecutionPlan.simple(new SQLPlannedOperationStatement(op), op);
+    }
+
+    private PlannerOp tryBuildVectorANNSortOp(
+            PlainSelect plainSelect, Table tableImpl,
+            OpSchema primaryTableSchema, Predicate predicate, PlannerOp fallback)
+            throws StatementExecutionException {
+
+        List<OrderByElement> orderByElements = plainSelect.getOrderByElements();
+        if (orderByElements == null || orderByElements.size() != 1) return null;
+
+        OrderByElement obe = orderByElements.get(0);
+        Expression expr = obe.getExpression();
+        if (!(expr instanceof net.sf.jsqlparser.expression.Function)) return null;
+
+        net.sf.jsqlparser.expression.Function func =
+                (net.sf.jsqlparser.expression.Function) expr;
+        if (!BuiltinFunctions.NAME_ANN_OF.equalsIgnoreCase(func.getName())) return null;
+        if (func.getParameters() == null
+                || func.getParameters().getExpressions().size() != 2) return null;
+
+        Expression firstArg = func.getParameters().getExpressions().get(0);
+        if (!(firstArg instanceof net.sf.jsqlparser.schema.Column)) return null;
+        String columnName = fixMySqlBackTicks(
+                ((net.sf.jsqlparser.schema.Column) firstArg).getColumnName().toLowerCase());
+
+        Expression secondArg = func.getParameters().getExpressions().get(1);
+        OpSchema schema = new OpSchema(primaryTableSchema.tableSpace,
+                primaryTableSchema.name, primaryTableSchema.alias,
+                primaryTableSchema.columnNames, primaryTableSchema.columns);
+        CompiledSQLExpression queryVecExpr =
+                SQLParserExpressionCompiler.compileExpression(secondArg, schema);
+
+        return new VectorANNScanOp(
+                primaryTableSchema.tableSpace, tableImpl, columnName,
+                queryVecExpr,
+                null,       // fallback: null → throws if no index found
+                predicate,  // reuse compiled WHERE predicate
+                null,       // scanProjection: null → identity
+                null        // innerProjection: null → full table row
+        );
     }
 
     private PlannerOp planSort(PlannerOp input, OpSchema columns, List<OrderByElement> fieldCollations) {

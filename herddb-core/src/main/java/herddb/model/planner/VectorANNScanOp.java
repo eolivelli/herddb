@@ -91,7 +91,7 @@ public class VectorANNScanOp implements PlannerOp {
 
     @Override
     public Column[] getOutputSchema() {
-        return innerProjection.getColumns();
+        return innerProjection != null ? innerProjection.getColumns() : tableDef.columns;
     }
 
     @Override
@@ -109,7 +109,11 @@ public class VectorANNScanOp implements PlannerOp {
     ) throws StatementExecutionException {
         VectorIndexManager vim = findVectorIndex(tableSpaceManager);
         if (vim == null) {
-            return fallback.execute(tableSpaceManager, transactionContext, context, lockRequired, forWrite);
+            if (fallback != null) {
+                return fallback.execute(tableSpaceManager, transactionContext, context, lockRequired, forWrite);
+            } else {
+                throw new StatementExecutionException("No vector index found for column '" + columnName + "' on table " + tableDef.name);
+            }
         }
 
         Object qvObj = queryVectorExpr.evaluate(DataAccessor.NULL, context);
@@ -118,8 +122,11 @@ public class VectorANNScanOp implements PlannerOp {
         List<Map.Entry<Bytes, Float>> annResults = vim.search(queryVector, Integer.MAX_VALUE);
 
         Transaction transaction = tableSpaceManager.getTransaction(transactionContext.transactionId);
+        String[] fieldNames = (innerProjection != null) ? innerProjection.getFieldNames()
+                : Column.buildFieldNamesList(tableDef.columns);
+        Column[] cols = (innerProjection != null) ? innerProjection.getColumns() : tableDef.columns;
         MaterializedRecordSet recordSet = tableSpaceManager.getDbmanager().getRecordSetFactory()
-                .createRecordSet(innerProjection.getFieldNames(), innerProjection.getColumns());
+                .createRecordSet(fieldNames, cols);
 
         for (Map.Entry<Bytes, Float> entry : annResults) {
             Bytes pk = entry.getKey();
@@ -133,8 +140,8 @@ public class VectorANNScanOp implements PlannerOp {
                 continue;
             }
             DataAccessor fullRow = record.getDataAccessor(tableDef);
-            DataAccessor scanRow = scanProjection.map(fullRow, context);
-            DataAccessor projectedRow = innerProjection.map(scanRow, context);
+            DataAccessor scanRow = (scanProjection != null) ? scanProjection.map(fullRow, context) : fullRow;
+            DataAccessor projectedRow = (innerProjection != null) ? innerProjection.map(scanRow, context) : scanRow;
             recordSet.add(projectedRow);
         }
 
