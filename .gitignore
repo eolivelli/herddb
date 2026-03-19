@@ -24,6 +24,7 @@ release.properties
 buildNumber.properties
 
 dependency-reduced-pom.xml
+herddb-jdbc/thin-dependency-reduced-pom.xml
 .mvn/timing.properties
 herddb-core/nbproject/
 /herddb-cli/nbproject/

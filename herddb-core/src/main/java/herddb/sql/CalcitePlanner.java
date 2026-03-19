@@ -63,6 +63,7 @@ import herddb.model.planner.SimpleUpdateOp;
 import herddb.model.planner.SortOp;
 import herddb.model.planner.TableScanOp;
 import herddb.model.planner.UnionAllOp;
+import herddb.model.planner.VectorANNScanOp;
 import herddb.model.planner.UpdateOp;
 import herddb.model.planner.ValuesOp;
 import herddb.sql.expressions.AccessCurrentRowExpression;
@@ -136,6 +137,7 @@ import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.rex.RexBuilder;
+import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
@@ -458,9 +460,7 @@ public class CalcitePlanner extends AbstractSQLPlanner {
             props.put(CalciteConnectionProperty.DEFAULT_NULL_COLLATION.camelName(), NullCollation.LAST.toString());
             final CalciteConnectionConfigImpl calciteRuntimeContextConfig = new CalciteConnectionConfigImpl(props);
 
-            subSchema.add("COSINE_SIMILARITY", CosineSimilarityFunction.INSTANCE);
-            subSchema.add("DOT_PRODUCT", DotProductSimilarityFunction.INSTANCE);
-            subSchema.add("EUCLIDEAN_DISTANCE", EuclideanSimilarityFunction.INSTANCE);
+            // functions are registered once in getRootSchema(), not here
 
             final FrameworkConfig config = Frameworks.newConfigBuilder()
                     .parserConfig(SQL_PARSER_CONFIG)
@@ -531,6 +531,12 @@ public class CalcitePlanner extends AbstractSQLPlanner {
             return rootSchema;
         }
         final SchemaPlus _rootSchema = Frameworks.createRootSchema(true);
+        // Register vector/similarity functions once on the root schema so they
+        // are never duplicated across multiple runPlanner() invocations.
+        _rootSchema.add("COSINE_SIMILARITY", CosineSimilarityFunction.INSTANCE);
+        _rootSchema.add("DOT_PRODUCT", DotProductSimilarityFunction.INSTANCE);
+        _rootSchema.add("EUCLIDEAN_DISTANCE", EuclideanSimilarityFunction.INSTANCE);
+        _rootSchema.add("ANN_OF", AnnOfFunction.INSTANCE);
         for (String tableSpace : manager.getLocalTableSpaces()) {
             TableSpaceManager tableSpaceManager = manager.getTableSpaceManager(tableSpace);
             SchemaPlus schema = _rootSchema.add(tableSpace, new AbstractSchema());
@@ -1088,6 +1094,93 @@ public class CalcitePlanner extends AbstractSQLPlanner {
     }
 
     private PlannerOp planSort(EnumerableSort op, RelDataType rowType) {
+        // Check for ANN_OF pattern: ORDER BY ann_of(col, ?) [DESC|ASC]
+        // If matched and a vector index exists at runtime, VectorANNScanOp uses it.
+        // Falls back to brute-force SortOp if no vector index is found.
+        if (op.getInput() instanceof EnumerableProject) {
+            EnumerableProject innerProject = (EnumerableProject) op.getInput();
+            RelCollation annCollation = op.getCollation();
+            List<RelFieldCollation> annFcs = annCollation.getFieldCollations();
+            if (annFcs.size() == 1) {
+                int sortFieldIdx = annFcs.get(0).getFieldIndex();
+                List<RexNode> projectExprs = innerProject.getProjects();
+                if (sortFieldIdx < projectExprs.size()
+                        && projectExprs.get(sortFieldIdx) instanceof RexCall) {
+                    RexCall annOfCall = (RexCall) projectExprs.get(sortFieldIdx);
+                    if ("ANN_OF".equalsIgnoreCase(annOfCall.getOperator().getName())
+                            && annOfCall.getOperands().size() == 2
+                            && innerProject.getInput() instanceof BindableTableScan) {
+                        BindableTableScan bts = (BindableTableScan) innerProject.getInput();
+                        RexNode colRef = annOfCall.getOperands().get(0);
+                        if (colRef instanceof RexInputRef) {
+                            int colIdx = ((RexInputRef) colRef).getIndex();
+                            String columnName = bts.getRowType().getFieldList()
+                                    .get(colIdx).getName().toLowerCase(Locale.ROOT);
+                            String annTableSpace = bts.getTable().getQualifiedName().get(0);
+                            TableImpl annTableImpl = (TableImpl) bts.getTable()
+                                    .unwrap(org.apache.calcite.schema.Table.class);
+                            Table annTable = annTableImpl.tableManager.getTable();
+
+                            CompiledSQLExpression queryVecExpr =
+                                    SQLExpressionCompiler.compileExpression(annOfCall.getOperands().get(1));
+
+                            // Compile WHERE predicate from bts.filters
+                            SQLRecordPredicate annPredicate = null;
+                            if (!bts.filters.isEmpty()) {
+                                CompiledSQLExpression where;
+                                if (bts.filters.size() == 1) {
+                                    where = SQLExpressionCompiler.compileExpression(bts.filters.get(0));
+                                } else {
+                                    CompiledSQLExpression[] ops = new CompiledSQLExpression[bts.filters.size()];
+                                    int k = 0;
+                                    for (RexNode expr : bts.filters) {
+                                        ops[k++] = SQLExpressionCompiler.compileExpression(expr);
+                                    }
+                                    where = new CompiledMultiAndExpression(ops);
+                                }
+                                annPredicate = new SQLRecordPredicate(annTable, null, where);
+                            }
+
+                            // Scan projection: maps full table row → bts output schema
+                            RelDataType btsRowType = bts.getRowType();
+                            List<RexNode> scanProjExprs = new ArrayList<>(bts.projects.size());
+                            int k = 0;
+                            for (int fieldpos : bts.projects) {
+                                scanProjExprs.add(new RexInputRef(fieldpos,
+                                        btsRowType.getFieldList().get(k++).getType()));
+                            }
+                            Projection scanProjection = buildProjection(
+                                    scanProjExprs, btsRowType, true, annTable.columns);
+
+                            // Inner projection: maps bts output → final schema (including ann_of column)
+                            Projection innerProjection = buildProjection(
+                                    projectExprs, innerProject.getRowType(), false, null);
+
+                            // Build brute-force fallback SortOp
+                            PlannerOp normalInput = convertRelNode(op.getInput(), rowType, false, false);
+                            boolean[] annDirs = new boolean[annFcs.size()];
+                            boolean[] annNullLastDirs = new boolean[annFcs.size()];
+                            int[] annFields = new int[annFcs.size()];
+                            int ai = 0;
+                            for (RelFieldCollation col : annFcs) {
+                                RelFieldCollation.Direction dir = col.getDirection();
+                                annDirs[ai] = dir == RelFieldCollation.Direction.ASCENDING
+                                        || dir == RelFieldCollation.Direction.STRICTLY_ASCENDING;
+                                annNullLastDirs[ai] = col.nullDirection == RelFieldCollation.NullDirection.LAST
+                                        || col.nullDirection == RelFieldCollation.NullDirection.UNSPECIFIED;
+                                annFields[ai++] = col.getFieldIndex();
+                            }
+                            PlannerOp fallback = new SortOp(normalInput, annDirs, annFields, annNullLastDirs);
+
+                            return new VectorANNScanOp(annTableSpace, annTable, columnName,
+                                    queryVecExpr, fallback, annPredicate,
+                                    scanProjection, innerProjection);
+                        }
+                    }
+                }
+            }
+        }
+
         PlannerOp input = convertRelNode(op.getInput(), rowType, false, false);
         RelCollation collation = op.getCollation();
         List<RelFieldCollation> fieldCollations = collation.getFieldCollations();
@@ -1397,6 +1490,24 @@ public class CalcitePlanner extends AbstractSQLPlanner {
                     return typeFactory.createSqlType(SqlTypeName.ANY);
 
             }
+        }
+
+    }
+
+    private static class AnnOfFunction implements Function, ScalarFunction {
+
+        static final AnnOfFunction INSTANCE = new AnnOfFunction();
+
+        @Override
+        public List<FunctionParameter> getParameters() {
+            return Arrays.asList(
+                    new CalcitePlanner.SimpleArrayParameter(0, "op1", SqlTypeName.FLOAT),
+                    new CalcitePlanner.SimpleArrayParameter(1, "op2", SqlTypeName.FLOAT));
+        }
+
+        @Override
+        public RelDataType getReturnType(RelDataTypeFactory typeFactory) {
+            return typeFactory.createSqlType(SqlTypeName.FLOAT);
         }
 
     }

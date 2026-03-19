@@ -56,6 +56,7 @@ public class BuiltinFunctions {
     public static final String COSINE_SIMILARITY = "cosine_similarity";
     public static final String DOT_PRODUCT = "dot_product";
     public static final String EUCLIDEAN_DISTANCE = "euclidean_distance";
+    public static final String ANN_OF = "ann_of";
 
     public static final String ROUND = "round";
     public static final String EXTRACT = "extract";
@@ -81,6 +82,7 @@ public class BuiltinFunctions {
     public static final String NAME_COSINE_SIMILARITY = "COSINE_SIMILARITY";
     public static final String NAME_DOT_PRODUCT = "DOT_PRODUCT";
     public static final String NAME_EUCLIDEAN_DISTANCE = "EUCLIDEAN_DISTANCE";
+    public static final String NAME_ANN_OF = "ANN_OF";
 
     public static final String NAME_ROUND = "ROUND";
     public static final String NAME_EXTRACT = "EXTRACT";

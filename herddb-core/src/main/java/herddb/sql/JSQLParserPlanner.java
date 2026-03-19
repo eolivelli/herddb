@@ -101,6 +101,7 @@ import herddb.utils.SQLUtils;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -173,6 +174,14 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
         }
         return "`" + name + "`";
     }
+    /**
+     * Thread-local storage for index WITH-clause properties.
+     * Populated in {@link #translate} when a {@code CREATE INDEX ... WITH key=value ...}
+     * query is detected and the WITH suffix is stripped before JSQLParser sees it.
+     * Consumed (and cleared) in {@link #buildCreateIndexStatement}.
+     */
+    private static final ThreadLocal<Map<String, String>> PENDING_INDEX_PROPERTIES = new ThreadLocal<>();
+
     private final PlansCache cache;
     /**
      * Used in case of unsupported Statement
@@ -393,11 +402,22 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
                 return new TranslatedQuery(executionPlan, new SQLStatementEvaluationContext(query, parameters, false, false));
             }
 
+            // Pre-process: strip WITH clause from CREATE INDEX ... WITH key=value ...
+            // (JSQLParser does not support this syntax; properties are stored in a ThreadLocal
+            //  and consumed by buildCreateIndexStatement)
+            query = extractIndexWithClause(query);
+
             net.sf.jsqlparser.statement.Statement stmt = parseStatement(query);
             if (!isCachable(stmt)) {
                 allowCache = false;
             }
-            ExecutionPlan executionPlan = plan(defaultTableSpace, stmt, scan, returnValues, maxRows);
+            ExecutionPlan executionPlan;
+            try {
+                executionPlan = plan(defaultTableSpace, stmt, scan, returnValues, maxRows);
+            } finally {
+                // Always clear the ThreadLocal; buildCreateIndexStatement has already consumed it
+                PENDING_INDEX_PROPERTIES.remove();
+            }
             if (LOG.isLoggable(DUMP_QUERY_LEVEL)) {
                 LOG.log(DUMP_QUERY_LEVEL, "Query: {0} --HerdDB Plan\n{1}",
                         new Object[]{query, executionPlan.mainStatement});
@@ -717,11 +737,137 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
                 builder.column(column.name, column.type);
             }
 
+            // Apply WITH-clause properties pre-processed by extractIndexWithClause()
+            // (stored in PENDING_INDEX_PROPERTIES ThreadLocal before JSQLParser was called)
+            Map<String, String> pending = PENDING_INDEX_PROPERTIES.get();
+            if (pending != null) {
+                for (Map.Entry<String, String> e : pending.entrySet()) {
+                    builder.property(e.getKey(), e.getValue());
+                }
+            }
+
+            // Also check tail parameters (for cases where JSQLParser manages to parse them)
+            List<String> tailParams = s.getTailParameters();
+            if (tailParams != null && !tailParams.isEmpty()) {
+                parseIndexWithClause(tailParams, builder);
+            }
+
             CreateIndexStatement statement = new CreateIndexStatement(builder.build());
             return statement;
         } catch (IllegalArgumentException err) {
             throw new StatementExecutionException("bad index definition: " + err.getMessage(), err);
         }
+    }
+
+    private static void parseIndexWithClause(List<String> tailParams, herddb.model.Index.Builder builder)
+            throws StatementExecutionException {
+        // Join all tail tokens into a single string for robust parsing.
+        // JSQLParser may tokenize "m=32" as one token or as separate "m", "=", "32" tokens.
+        StringBuilder sb = new StringBuilder();
+        for (String t : tailParams) {
+            if (sb.length() > 0) {
+                sb.append(' ');
+            }
+            sb.append(t);
+        }
+        String text = sb.toString().trim();
+
+        // Strip leading "WITH" keyword
+        if (text.regionMatches(true, 0, "WITH", 0, 4)
+                && (text.length() == 4 || Character.isWhitespace(text.charAt(4)))) {
+            text = text.substring(4).trim();
+        }
+
+        if (text.isEmpty()) {
+            return;
+        }
+
+        // Normalize whitespace around '=' so "m = 32" becomes "m=32"
+        text = text.replaceAll("\\s*=\\s*", "=");
+
+        // Split by whitespace and/or commas into individual key=value tokens
+        String[] parts = text.split("[\\s,]+");
+        for (String part : parts) {
+            if (part.isEmpty()) {
+                continue;
+            }
+            int eq = part.indexOf('=');
+            if (eq <= 0) {
+                throw new StatementExecutionException(
+                        "invalid index property syntax: expected key=value but got '" + part + "'");
+            }
+            String key = part.substring(0, eq).trim();
+            String value = part.substring(eq + 1).trim();
+            if (key.isEmpty() || value.isEmpty()) {
+                throw new StatementExecutionException(
+                        "invalid index property syntax: expected key=value but got '" + part + "'");
+            }
+            builder.property(key, value);
+        }
+    }
+
+    /**
+     * If {@code query} is a CREATE INDEX statement that contains a WITH clause
+     * (e.g. {@code CREATE VECTOR INDEX ... ON t(c) WITH m=32 beamWidth=200}),
+     * stores the parsed key=value properties in {@link #PENDING_INDEX_PROPERTIES}
+     * and returns the query with the WITH suffix stripped so JSQLParser can parse it.
+     * Otherwise returns {@code query} unchanged.
+     */
+    private static String extractIndexWithClause(String query) {
+        String upper = query.toUpperCase();
+        // Quick exit: must be a CREATE INDEX statement with "WITH" somewhere after "INDEX"
+        int indexPos = upper.indexOf("INDEX");
+        if (indexPos < 0) {
+            return query;
+        }
+        // Find " WITH " outside of parentheses (i.e., after the column list)
+        int parenDepth = 0;
+        int withStart = -1;
+        for (int i = indexPos; i < query.length(); i++) {
+            char c = query.charAt(i);
+            if (c == '(') {
+                parenDepth++;
+            } else if (c == ')') {
+                parenDepth--;
+            } else if (parenDepth == 0) {
+                // Look for whitespace-bounded "WITH"
+                if ((c == 'W' || c == 'w') && i + 4 <= query.length()) {
+                    boolean precedingWhitespace = (i == 0 || Character.isWhitespace(query.charAt(i - 1)));
+                    boolean matchesWord = query.regionMatches(true, i, "WITH", 0, 4);
+                    boolean followingWhitespace = (i + 4 == query.length() || Character.isWhitespace(query.charAt(i + 4)));
+                    if (precedingWhitespace && matchesWord && followingWhitespace) {
+                        withStart = i;
+                        break;
+                    }
+                }
+            }
+        }
+        if (withStart < 0) {
+            return query;
+        }
+
+        // Extract the WITH clause text (everything from "WITH" to end of query)
+        String withText = query.substring(withStart + 4).trim(); // skip "WITH"
+        withText = withText.replaceAll("\\s*=\\s*", "=");
+
+        Map<String, String> props = new HashMap<>();
+        String[] parts = withText.split("[\\s,]+");
+        for (String part : parts) {
+            if (part.isEmpty()) {
+                continue;
+            }
+            int eq = part.indexOf('=');
+            if (eq > 0) {
+                props.put(part.substring(0, eq).trim(), part.substring(eq + 1).trim());
+            }
+        }
+
+        if (!props.isEmpty()) {
+            PENDING_INDEX_PROPERTIES.set(props);
+        }
+
+        // Return query without the WITH clause
+        return query.substring(0, withStart).trim();
     }
 
     private static boolean isUnique(String indexType) throws StatementExecutionException {
@@ -739,6 +885,7 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
         switch (indexType) {
             case herddb.model.Index.TYPE_HASH:
             case herddb.model.Index.TYPE_BRIN:
+            case herddb.model.Index.TYPE_VECTOR:
                 break;
             default:
                 throw new StatementExecutionException("Invalid index type " + indexType);

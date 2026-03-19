@@ -153,6 +153,8 @@ public class SQLExpressionCompiler {
                     return new CompiledFunction(BuiltinFunctions.UPPER, Arrays.asList(operands));
                 case BuiltinFunctions.NAME_ABS:
                     return new CompiledFunction(BuiltinFunctions.ABS, Arrays.asList(operands));
+                case BuiltinFunctions.NAME_ANN_OF:
+                    return new CompiledFunction(BuiltinFunctions.ANN_OF, Arrays.asList(operands));
                 case BuiltinFunctions.NAME_COSINE_SIMILARITY:
                     return new CompiledFunction(BuiltinFunctions.COSINE_SIMILARITY, Arrays.asList(operands));
                 case BuiltinFunctions.NAME_DOT_PRODUCT:

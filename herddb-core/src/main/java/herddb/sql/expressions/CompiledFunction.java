@@ -97,7 +97,8 @@ public class CompiledFunction implements CompiledSQLExpression {
                     return Math.abs((int) parValue);
                 }
             }
-            case BuiltinFunctions.COSINE_SIMILARITY: {
+            case BuiltinFunctions.COSINE_SIMILARITY:
+            case BuiltinFunctions.ANN_OF: {
                 Object par1Value = RecordSerializer.convert(ColumnTypes.FLOATARRAY, parameters.get(0).evaluate(bean, context));
                 Object par2Value = RecordSerializer.convert(ColumnTypes.FLOATARRAY, parameters.get(1).evaluate(bean, context));
                 return cosineSimilarity((float[]) par1Value, (float[]) par2Value);

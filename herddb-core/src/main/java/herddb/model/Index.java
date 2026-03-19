@@ -21,6 +21,7 @@
 package herddb.model;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import herddb.model.ColumnTypes;
 import herddb.utils.ExtendedDataInputStream;
 import herddb.utils.ExtendedDataOutputStream;
 import herddb.utils.SimpleByteArrayInputStream;
@@ -28,6 +29,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +46,7 @@ public class Index implements ColumnsList {
 
     public static final String TYPE_HASH = "hash";
     public static final String TYPE_BRIN = "brin";
+    public static final String TYPE_VECTOR = "vector";
 
     private static final int PROPERTY_UNIQUE = 0x01;
 
@@ -56,6 +59,7 @@ public class Index implements ColumnsList {
     public final String[] columnNames;
     public final Map<String, Column> columnByName = new HashMap<>();
     public final boolean unique;
+    public final Map<String, String> properties;
 
     @Override
     public String[] getPrimaryKey() {
@@ -69,7 +73,8 @@ public class Index implements ColumnsList {
 
     private Index(
             String uuid,
-            String name, String table, String tablespace, String type, Column[] columns, boolean unique
+            String name, String table, String tablespace, String type, Column[] columns, boolean unique,
+            Map<String, String> properties
     ) {
         this.name = name;
         this.unique = unique;
@@ -78,6 +83,9 @@ public class Index implements ColumnsList {
         this.tablespace = tablespace;
         this.columns = columns;
         this.type = type;
+        this.properties = properties == null || properties.isEmpty()
+                ? Collections.emptyMap()
+                : Collections.unmodifiableMap(new HashMap<>(properties));
         this.columnNames = new String[columns.length];
         int i = 0;
         for (Column c : columns) {
@@ -107,18 +115,15 @@ public class Index implements ColumnsList {
             ExtendedDataInputStream dii = new ExtendedDataInputStream(ii);
             long iversion = dii.readVLong(); // version
             long iflags = dii.readVLong(); // flags for future implementations
-            if (iversion != 1 || iflags != 0) {
+            if ((iversion != 1 && iversion != 2) || iflags != 0) {
                 throw new IOException("corrupted index file");
             }
             String tablespace = dii.readUTF();
             String name = dii.readUTF();
             String uuid = dii.readUTF();
             String table = dii.readUTF();
-            int properties = dii.readVInt(); // extensible for future implementations
-            boolean unique = false;
-            if ((properties & PROPERTY_UNIQUE) == PROPERTY_UNIQUE) {
-                unique = true;
-            }
+            int propertyBits = dii.readVInt();
+            boolean unique = (propertyBits & PROPERTY_UNIQUE) == PROPERTY_UNIQUE;
             String type = dii.readUTF();
             int ncols = dii.readVInt();
             Column[] columns = new Column[ncols];
@@ -134,7 +139,19 @@ public class Index implements ColumnsList {
                 dii.readVInt(); // for future implementations
                 columns[i] = Column.column(cname, ctype, serialPosition);
             }
-            return new Index(uuid, name, table, tablespace, type, columns, unique);
+            Map<String, String> properties = Collections.emptyMap();
+            if (iversion >= 2) {
+                int numProps = dii.readVInt();
+                if (numProps > 0) {
+                    properties = new HashMap<>(numProps);
+                    for (int i = 0; i < numProps; i++) {
+                        String key = dii.readUTF();
+                        String value = dii.readUTF();
+                        properties.put(key, value);
+                    }
+                }
+            }
+            return new Index(uuid, name, table, tablespace, type, columns, unique, properties);
         } catch (IOException err) {
             throw new IllegalArgumentException(err);
         }
@@ -143,17 +160,17 @@ public class Index implements ColumnsList {
     public byte[] serialize() {
         ByteArrayOutputStream oo = new ByteArrayOutputStream();
         try (ExtendedDataOutputStream doo = new ExtendedDataOutputStream(oo)) {
-            doo.writeVLong(1); // version
+            doo.writeVLong(2); // version
             doo.writeVLong(0); // flags for future implementations
             doo.writeUTF(tablespace);
             doo.writeUTF(name);
             doo.writeUTF(uuid);
             doo.writeUTF(table);
-            int properties = 0;
+            int propertyBits = 0;
             if (unique) {
-                properties = properties | PROPERTY_UNIQUE;
+                propertyBits = propertyBits | PROPERTY_UNIQUE;
             }
-            doo.writeVInt(properties); // exensible for future implementation
+            doo.writeVInt(propertyBits);
             doo.writeUTF(type);
             doo.writeVInt(columns.length);
             for (Column c : columns) {
@@ -164,6 +181,12 @@ public class Index implements ColumnsList {
                 doo.writeVInt(c.serialPosition);
                 doo.writeVInt(0); // flags for future implementations
             }
+            // version 2: write properties map
+            doo.writeVInt(properties.size());
+            for (Map.Entry<String, String> e : properties.entrySet()) {
+                doo.writeUTF(e.getKey());
+                doo.writeUTF(e.getValue());
+            }
         } catch (IOException ee) {
             throw new RuntimeException(ee);
         }
@@ -173,6 +196,7 @@ public class Index implements ColumnsList {
     public static class Builder {
 
         private final List<Column> columns = new ArrayList<>();
+        private final Map<String, String> properties = new HashMap<>();
         private String name;
         private String uuid;
         private String table;
@@ -219,6 +243,11 @@ public class Index implements ColumnsList {
             return this;
         }
 
+        public Builder property(String key, String value) {
+            this.properties.put(key, value);
+            return this;
+        }
+
         public Builder column(String name, int type) {
             if (name == null || name.isEmpty()) {
                 throw new IllegalArgumentException();
@@ -234,11 +263,23 @@ public class Index implements ColumnsList {
             if (table == null || table.isEmpty()) {
                 throw new IllegalArgumentException("table is not defined");
             }
-            if (!TYPE_HASH.equals(type) && !TYPE_BRIN.equals(type)) {
-                throw new IllegalArgumentException("only index type " + TYPE_HASH + "," + TYPE_BRIN + " are supported");
+            if (!TYPE_HASH.equals(type) && !TYPE_BRIN.equals(type) && !TYPE_VECTOR.equals(type)) {
+                throw new IllegalArgumentException("only index type " + TYPE_HASH + "," + TYPE_BRIN + "," + TYPE_VECTOR + " are supported");
             }
             if (columns.isEmpty()) {
                 throw new IllegalArgumentException("specify at least one column to index");
+            }
+            if (TYPE_VECTOR.equals(type)) {
+                if (unique) {
+                    throw new IllegalArgumentException("vector index does not support UNIQUE constraint");
+                }
+                if (columns.size() != 1) {
+                    throw new IllegalArgumentException("vector index requires exactly one column");
+                }
+                int colType = columns.get(0).type;
+                if (colType != ColumnTypes.FLOATARRAY && colType != ColumnTypes.NOTNULL_FLOATARRAY) {
+                    throw new IllegalArgumentException("vector index column must be of type floata (FLOATARRAY)");
+                }
             }
             if (name == null || name.isEmpty()) {
                 name = table + "_" + columns.stream().map(s -> s.name.toLowerCase()).collect(Collectors.joining("_"));
@@ -246,7 +287,7 @@ public class Index implements ColumnsList {
             if (uuid == null || uuid.isEmpty()) {
                 uuid = UUID.randomUUID().toString();
             }
-            return new Index(uuid, name, table, tablespace, type, columns.toArray(new Column[columns.size()]), unique);
+            return new Index(uuid, name, table, tablespace, type, columns.toArray(new Column[columns.size()]), unique, properties);
         }
 
     }

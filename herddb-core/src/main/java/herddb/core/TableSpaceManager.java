@@ -51,6 +51,7 @@ import herddb.data.consistency.TableChecksum;
 import herddb.data.consistency.TableDataChecksum;
 import herddb.index.MemoryHashIndexManager;
 import herddb.index.brin.BRINIndexManager;
+import herddb.index.vector.VectorIndexManager;
 import herddb.jmx.JMXUtils;
 import herddb.log.CommitLog;
 import herddb.log.CommitLogListener;
@@ -1861,6 +1862,10 @@ public class TableSpaceManager {
                 break;
             case Index.TYPE_BRIN:
                 indexManager = new BRINIndexManager(index, dbmanager.getMemoryManager(), tableManager, log, dataStorageManager, this, tableSpaceUUID, transaction,
+                        writeLockTimeout, readLockTimeout);
+                break;
+            case Index.TYPE_VECTOR:
+                indexManager = new VectorIndexManager(index, tableManager, log, dataStorageManager, this, tableSpaceUUID, transaction,
                         writeLockTimeout, readLockTimeout);
                 break;
             default:
