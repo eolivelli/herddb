@@ -1,0 +1,13 @@
+{{- if .Values.tools.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "herddb.fullname" . }}-tools-scripts
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tools
+data:
+  herddb-cli: |
+    #!/bin/bash
+    exec /opt/herddb/bin/herddb-cli.sh -u "${HERDDB_JDBC_URL}" "$@"
+{{- end }}

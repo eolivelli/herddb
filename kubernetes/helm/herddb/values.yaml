@@ -1,0 +1,61 @@
+image:
+  repository: herddb/herddb-server
+  tag: "0.30.0-SNAPSHOT"
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  # Override the generated name
+  name: ""
+
+# HerdDB server (JDBC endpoint + metadata)
+server:
+  replicaCount: 1
+  port: 7000
+  httpPort: 9845
+  # Extra key=value entries appended to server.properties
+  extraConfig: {}
+  storage:
+    data:
+      size: 10Gi
+      storageClass: ""
+    commitlog:
+      size: 5Gi
+      storageClass: ""
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "4"
+    limits:
+      memory: "1Gi"
+      cpu: "4"
+
+# RemoteFileServer (gRPC page storage)
+fileServer:
+  replicaCount: 2
+  port: 9845
+  storage:
+    size: 10Gi
+    storageClass: ""
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "4"
+    limits:
+      memory: "1Gi"
+      cpu: "4"
+
+# Tools pod — sleep + pre-configured CLI for kubectl exec
+tools:
+  enabled: true
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "0.5"
+    limits:
+      memory: "256Mi"
+      cpu: "0.5"

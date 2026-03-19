@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "herddb.fullname" . }}-file-server
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: file-server
+spec:
+  clusterIP: None
+  selector:
+    {{- include "herddb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: file-server
+  ports:
+    - name: grpc
+      port: {{ .Values.fileServer.port }}
+      targetPort: grpc

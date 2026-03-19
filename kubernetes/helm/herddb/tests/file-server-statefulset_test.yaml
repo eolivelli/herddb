@@ -1,0 +1,99 @@
+suite: file-server StatefulSet
+templates:
+  - templates/file-server-statefulset.yaml
+tests:
+  - it: should have default replica count of 2
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 2
+
+  - it: should reference the correct headless service
+    asserts:
+      - equal:
+          path: spec.serviceName
+          value: RELEASE-NAME-herddb-file-server
+
+  - it: should use the configured image
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "herddb/herddb-server:0.30.0-SNAPSHOT"
+
+  - it: should pass file-server role to service launcher
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: file-server
+
+  - it: should pass console command to service launcher
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: console
+
+  - it: should pass default port as CLI arg
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--port=9845"
+
+  - it: should pass data-dir as CLI arg
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--data-dir=/opt/herddb/filedata"
+
+  - it: should expose grpc port 9845
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: grpc
+            containerPort: 9845
+            protocol: TCP
+
+  - it: should have one volumeClaimTemplate
+    asserts:
+      - lengthEqual:
+          path: spec.volumeClaimTemplates
+          count: 1
+
+  - it: should mount data PVC at /opt/herddb/filedata
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: data
+            mountPath: /opt/herddb/filedata
+
+  - it: should allow overriding replica count
+    set:
+      fileServer.replicaCount: 4
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 4
+
+  - it: should use custom port in args when overridden
+    set:
+      fileServer.port: 9900
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--port=9900"
+
+  - it: should set default memory and cpu resources
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.memory
+          value: 1Gi
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: "4"
+
+  - it: should use the configured service account
+    asserts:
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: RELEASE-NAME-herddb

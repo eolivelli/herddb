@@ -1,0 +1,15 @@
+apiVersion: v2
+name: herddb
+description: HerdDB distributed SQL database with remote file storage
+type: application
+version: 0.1.0
+appVersion: "0.30.0-SNAPSHOT"
+keywords:
+  - database
+  - sql
+  - distributed
+home: https://github.com/diennea/herddb
+sources:
+  - https://github.com/diennea/herddb
+maintainers:
+  - name: HerdDB Community

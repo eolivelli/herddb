@@ -1,0 +1,42 @@
+{{- if .Values.tools.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "herddb.fullname" . }}-tools
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tools
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: tools
+  template:
+    metadata:
+      labels:
+        {{- include "herddb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: tools
+    spec:
+      serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      containers:
+        - name: tools
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sleep"]
+          args: ["infinity"]
+          env:
+            - name: HERDDB_JDBC_URL
+              value: {{ include "herddb.jdbcUrl" . | quote }}
+          resources:
+            {{- toYaml .Values.tools.resources | nindent 12 }}
+          volumeMounts:
+            - name: tools-scripts
+              mountPath: /usr/local/bin/herddb-cli
+              subPath: herddb-cli
+      volumes:
+        - name: tools-scripts
+          configMap:
+            name: {{ include "herddb.fullname" . }}-tools-scripts
+            defaultMode: 0755
+{{- end }}

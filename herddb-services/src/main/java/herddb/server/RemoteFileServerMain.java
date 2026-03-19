@@ -45,9 +45,9 @@ public class RemoteFileServerMain {
     public static void main(String... args) throws Exception {
         Properties configuration = new Properties();
 
+        // Pass 1: find and load config file (lowest priority)
         boolean configFileFromParameter = false;
-        for (int i = 0; i < args.length; i++) {
-            String arg = args[i];
+        for (String arg : args) {
             if (!arg.startsWith("-")) {
                 File configFile = new File(arg).getAbsoluteFile();
                 LOG.severe("Reading configuration from " + configFile);
@@ -56,27 +56,9 @@ public class RemoteFileServerMain {
                     configuration.load(reader);
                 }
                 configFileFromParameter = true;
-            } else if (arg.equals("--use-env")) {
-                System.getenv().forEach((key, value) -> {
-                    System.out.println("Considering env as system property " + key + " -> " + value);
-                    System.setProperty(key, value);
-                });
-            } else if (arg.startsWith("-D")) {
-                int equals = arg.indexOf('=');
-                if (equals > 0) {
-                    String key = arg.substring(2, equals);
-                    String value = arg.substring(equals + 1);
-                    System.setProperty(key, value);
-                }
-            } else if (arg.startsWith("--port=")) {
-                configuration.setProperty("port", arg.substring("--port=".length()));
-            } else if (arg.startsWith("--data-dir=")) {
-                configuration.setProperty("data.dir", arg.substring("--data-dir=".length()));
-            } else if (arg.startsWith("--bind-host=")) {
-                configuration.setProperty("bind.host", arg.substring("--bind-host=".length()));
+                break;
             }
         }
-
         if (!configFileFromParameter) {
             File configFile = new File("conf/fileserver.properties").getAbsoluteFile();
             System.out.println("Reading configuration from " + configFile);
@@ -88,7 +70,24 @@ public class RemoteFileServerMain {
             }
         }
 
-        // Allow -D system properties to override config file values
+        // Pass 2: apply --use-env and -D flags as system properties
+        for (String arg : args) {
+            if (arg.equals("--use-env")) {
+                System.getenv().forEach((key, value) -> {
+                    System.out.println("Considering env as system property " + key + " -> " + value);
+                    System.setProperty(key, value);
+                });
+            } else if (arg.startsWith("-D")) {
+                int equals = arg.indexOf('=');
+                if (equals > 0) {
+                    String key = arg.substring(2, equals);
+                    String value = arg.substring(equals + 1);
+                    System.setProperty(key, value);
+                }
+            }
+        }
+
+        // Merge system properties into configuration (overrides config file)
         System.getProperties().forEach((k, v) -> {
             String key = k + "";
             if (!key.startsWith("java") && !key.startsWith("user")) {
@@ -96,9 +95,23 @@ public class RemoteFileServerMain {
             }
         });
 
+        // Pass 3: apply explicit CLI flags (highest priority — override everything)
+        for (String arg : args) {
+            if (arg.startsWith("--port=")) {
+                configuration.setProperty("port", arg.substring("--port=".length()));
+            } else if (arg.startsWith("--data-dir=")) {
+                configuration.setProperty("data.dir", arg.substring("--data-dir=".length()));
+            } else if (arg.startsWith("--bind-host=")) {
+                configuration.setProperty("bind.host", arg.substring("--bind-host=".length()));
+            }
+        }
+
         int port = Integer.parseInt(configuration.getProperty("port", "9845"));
         String bindHost = configuration.getProperty("bind.host", "0.0.0.0");
         String dataDir = configuration.getProperty("data.dir", "fileserver_" + port);
+
+        // Per-port PID file so multiple instances can coexist on the same host
+        System.setProperty("pidfile", "file-server-" + port + ".java.pid");
 
         CountDownLatch shutdownLatch = new CountDownLatch(1);
 

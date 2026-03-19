@@ -1,0 +1,22 @@
+HerdDB has been deployed.
+
+Server (JDBC endpoint):
+  {{ include "herddb.fullname" . }}-server-0.{{ include "herddb.fullname" . }}-server.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.server.port }}
+
+JDBC URL:
+  {{ include "herddb.jdbcUrl" . }}
+
+File servers ({{ .Values.fileServer.replicaCount }} replicas):
+  {{ include "herddb.remoteFileServers" . }}
+
+{{- if .Values.tools.enabled }}
+
+Tools pod — run the CLI:
+  kubectl exec -it -n {{ .Release.Namespace }} \
+    deploy/{{ include "herddb.fullname" . }}-tools -- herddb-cli
+
+  Or for a one-off query:
+  kubectl exec -n {{ .Release.Namespace }} \
+    deploy/{{ include "herddb.fullname" . }}-tools -- \
+    herddb-cli -q "SELECT * FROM SYSTABLES"
+{{- end }}

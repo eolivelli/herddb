@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "herddb.fullname" . }}-server
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  serviceName: {{ include "herddb.fullname" . }}-server
+  replicas: {{ .Values.server.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        {{- include "herddb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: server
+    spec:
+      serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      containers:
+        - name: server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/opt/herddb/bin/service"]
+          args:
+            - server
+            - console
+            - /opt/herddb/conf/server.properties
+          ports:
+            - name: jdbc
+              containerPort: {{ .Values.server.port }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.server.httpPort }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.server.resources | nindent 12 }}
+          volumeMounts:
+            - name: server-config
+              mountPath: /opt/herddb/conf/server.properties
+              subPath: server.properties
+            - name: data
+              mountPath: /opt/herddb/data
+            - name: commitlog
+              mountPath: /opt/herddb/commitlog
+      volumes:
+        - name: server-config
+          configMap:
+            name: {{ include "herddb.fullname" . }}-server-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.server.storage.data.storageClass }}
+        storageClassName: {{ .Values.server.storage.data.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.server.storage.data.size }}
+    - metadata:
+        name: commitlog
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.server.storage.commitlog.storageClass }}
+        storageClassName: {{ .Values.server.storage.commitlog.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.server.storage.commitlog.size }}

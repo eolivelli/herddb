@@ -1,0 +1,55 @@
+suite: server ConfigMap
+templates:
+  - templates/server-configmap.yaml
+tests:
+  - it: should set server mode to remote-file-service
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: "server\\.mode=remote-file-service"
+
+  - it: should bind to all interfaces
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: "server\\.host=0\\.0\\.0\\.0"
+
+  - it: should include both default file-server addresses (2 replicas)
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: "file-server-0\\..*file-server-1\\."
+
+  - it: should compute file server list from replica count 3
+    set:
+      fileServer.replicaCount: 3
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: "file-server-2\\."
+
+  - it: should use custom file server port
+    set:
+      fileServer.port: 9900
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: ":9900"
+
+  - it: should include extra config entries
+    set:
+      server.extraConfig:
+        server.node.id: mynode
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: "server\\.node\\.id=mynode"
+
+  - it: should configure data and commitlog directories
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: "server\\.base\\.dir=/opt/herddb/data"
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: "server\\.log\\.dir=/opt/herddb/commitlog"

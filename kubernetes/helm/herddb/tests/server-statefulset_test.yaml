@@ -1,0 +1,99 @@
+suite: server StatefulSet
+templates:
+  - templates/server-statefulset.yaml
+tests:
+  - it: should have default replica count of 1
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 1
+
+  - it: should reference the correct headless service
+    asserts:
+      - equal:
+          path: spec.serviceName
+          value: RELEASE-NAME-herddb-server
+
+  - it: should use the configured image
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "herddb/herddb-server:0.30.0-SNAPSHOT"
+
+  - it: should expose jdbc port 7000
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: jdbc
+            containerPort: 7000
+            protocol: TCP
+
+  - it: should expose http port 9845
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: http
+            containerPort: 9845
+            protocol: TCP
+
+  - it: should have two volumeClaimTemplates (data and commitlog)
+    asserts:
+      - lengthEqual:
+          path: spec.volumeClaimTemplates
+          count: 2
+
+  - it: should mount the server config file
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: server-config
+            mountPath: /opt/herddb/conf/server.properties
+            subPath: server.properties
+
+  - it: should mount data PVC at /opt/herddb/data
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: data
+            mountPath: /opt/herddb/data
+
+  - it: should mount commitlog PVC at /opt/herddb/commitlog
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: commitlog
+            mountPath: /opt/herddb/commitlog
+
+  - it: should allow overriding replica count
+    set:
+      server.replicaCount: 3
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3
+
+  - it: should set default memory and cpu resources
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.memory
+          value: 1Gi
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: "4"
+
+  - it: should use the configured service account
+    asserts:
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: RELEASE-NAME-herddb
+
+  - it: should pass config file as argument
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: /opt/herddb/conf/server.properties

@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "herddb.fullname" . }}-file-server
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: file-server
+spec:
+  serviceName: {{ include "herddb.fullname" . }}-file-server
+  replicas: {{ .Values.fileServer.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: file-server
+  template:
+    metadata:
+      labels:
+        {{- include "herddb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: file-server
+    spec:
+      serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      containers:
+        - name: file-server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/opt/herddb/bin/service"]
+          args:
+            - file-server
+            - console
+            - "--port={{ .Values.fileServer.port }}"
+            - "--data-dir=/opt/herddb/filedata"
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.fileServer.port }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.fileServer.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /opt/herddb/filedata
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.fileServer.storage.storageClass }}
+        storageClassName: {{ .Values.fileServer.storage.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.fileServer.storage.size }}
