@@ -31,5 +31,8 @@ herddb-core/nbproject/
 /herddb-utils/nbproject/
 /herddb-net/nbproject/
 
+# Benchmark datasets
+vector-testings/datasets/
+
 # Mac
 **/.DS_Store
