@@ -495,3 +495,84 @@ The project targets Java 8. The HerdDB integration code avoids `var` and other p
 ### @Deprecated / @Experimental jvector APIs
 
 `OnHeapGraphIndex.save()` / `load()` and the `GraphIndexBuilder` constructor that accepts an existing `MutableGraphIndex` are marked deprecated/experimental in jvector 4.x. They are stable within the 4.x series but should be reviewed when upgrading jvector.
+
+---
+
+## Performance Benchmark
+
+A standalone benchmark tool lives in `vector-testings/`. It measures ingestion throughput, index build time, ANN query latency/throughput, and recall accuracy against ground truth.
+
+### Prerequisites
+
+- JDK 21+
+- A running HerdDB server
+- The HerdDB modules installed locally (`mvn install -DskipTests` from the root)
+
+### Build
+
+```bash
+mvn -f vector-testings/pom.xml package -DskipTests
+```
+
+### Run
+
+```bash
+# Using the convenience script (auto-builds if needed)
+./vector-testings/run.sh [options]
+
+# Or directly
+java -jar vector-testings/target/vector-testings-*.jar [options]
+```
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-u` / `--url` | `jdbc:herddb:server:localhost:7000` | JDBC connection URL |
+| `--user` | `sa` | Username |
+| `--password` | (empty) | Password |
+| `--dataset` | `sift1m` | Dataset preset: `sift1m`, `sift10m`, `bigann` |
+| `--dataset-url` | (per preset) | Override dataset download URL |
+| `--dataset-dir` | `./datasets` | Dataset download/cache directory |
+| `-n` / `--rows` | `100000` | Rows to ingest (cycles dataset if larger) |
+| `--ingest-threads` | `4` | Ingestion parallelism |
+| `--batch-size` | `500` | Commit after N inserts |
+| `--query-threads` | `4` | Query parallelism |
+| `--queries` | `1000` | Number of ANN queries |
+| `-k` | `10` | LIMIT K for queries |
+| `--m` | `16` | Vector index M parameter |
+| `--beam-width` | `100` | Vector index beamWidth |
+| `--skip-ingest` | `false` | Skip ingestion phase |
+| `--skip-index` | `false` | Skip index creation |
+| `--drop-table` | `false` | Drop and recreate table |
+
+### Datasets
+
+- **sift1m** — 1M vectors, 128 dims, ~170 MB download (fvecs format)
+- **sift10m** — First 10M vectors from BIGANN, 128 dims, ~98 GB download (bvecs format)
+- **bigann** — 1B vectors, 128 dims, ~98 GB download (bvecs format)
+
+The dataset is downloaded and cached automatically on first run.
+
+### Examples
+
+```bash
+# Quick smoke test with 1K rows
+./vector-testings/run.sh --password secret -n 1000 --batch-size 100
+
+# Full SIFT-1M benchmark
+./vector-testings/run.sh --password secret --dataset sift1m -n 1000000 --ingest-threads 8
+
+# Re-run queries only (data already loaded)
+./vector-testings/run.sh --password secret --skip-ingest --skip-index --queries 5000 -k 20
+
+# Reset and re-run with custom index parameters
+./vector-testings/run.sh --password secret --drop-table -n 500000 --m 32 --beam-width 200
+
+# SIFT-10M benchmark
+./vector-testings/run.sh --password secret --dataset sift10m -n 10000000
+```
+
+### Output
+
+The tool prints metrics for each phase: ingestion throughput (ops/s), latency percentiles (p50/p95/p99), index creation time, query throughput (qps), and recall@K against ground truth.

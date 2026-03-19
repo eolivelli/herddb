@@ -179,6 +179,9 @@ public final class Tuple extends AbstractDataAccessor {
                         columnType = ColumnTypes.LONG;
                     } else if (value instanceof java.sql.Timestamp) {
                         columnType = ColumnTypes.TIMESTAMP;
+                    } else if (value instanceof Float) {
+                        columnType = ColumnTypes.DOUBLE;
+                        value = ((Float) value).doubleValue();
                     } else if (value instanceof Double) {
                         columnType = ColumnTypes.DOUBLE;
                     } else if (value instanceof Boolean) {
