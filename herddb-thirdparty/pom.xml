@@ -33,5 +33,6 @@
     </properties> 
     <modules>
         <module>openjpa</module>
+	<module>openjpa-test</module>
     </modules>    
 </project>
