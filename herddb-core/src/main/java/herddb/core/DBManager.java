@@ -64,6 +64,7 @@ import herddb.model.commands.DropTableSpaceStatement;
 import herddb.model.commands.GetStatement;
 import herddb.model.commands.ScanStatement;
 import herddb.model.commands.TableConsistencyCheckStatement;
+import herddb.model.commands.CheckpointStatement;
 import herddb.model.commands.TableSpaceConsistencyCheckStatement;
 import herddb.network.Channel;
 import herddb.network.ServerHostData;
@@ -742,6 +743,14 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
                 return Futures.exception(new StatementExecutionException("DROP TABLESPACE cannot be issued inside a transaction"));
             }
             return CompletableFuture.completedFuture(dropTableSpace((DropTableSpaceStatement) statement));
+        }
+        if (statement instanceof CheckpointStatement) {
+            try {
+                checkpoint();
+            } catch (Exception e) {
+                return Futures.exception(new StatementExecutionException("CHECKPOINT failed: " + e.getMessage(), e));
+            }
+            return CompletableFuture.completedFuture(new DDLStatementExecutionResult(TransactionContext.NOTRANSACTION_ID));
         }
         if (statement instanceof TableSpaceConsistencyCheckStatement) {
             if (transactionContext.transactionId > 0) {

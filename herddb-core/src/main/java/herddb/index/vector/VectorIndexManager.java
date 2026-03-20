@@ -474,16 +474,26 @@ public class VectorIndexManager extends AbstractIndexManager {
 
     @Override
     public void rebuild() throws DataStorageManagerException {
-        long start = System.currentTimeMillis();
-        LOGGER.log(Level.FINE, "rebuilding vector index {0}", index.name);
+        final long start = System.currentTimeMillis();
+        long currentTableSize = tableManager.getStats().getTablesize();
+        LOGGER.log(Level.INFO, "rebuilding vector index {0} - {1} records", new Object[] {index.name, currentTableSize});
         dataStorageManager.initIndex(tableSpaceUUID, index.uuid);
         resetState();
         Table table = tableManager.getTable();
+        AtomicLong count = new AtomicLong();
         tableManager.scanForIndexRebuild(r -> {
             herddb.utils.DataAccessor values = r.getDataAccessor(table);
             Bytes key = RecordSerializer.serializeIndexKey(values, table, table.primaryKey);
             Bytes indexKey = RecordSerializer.serializeIndexKey(values, index, index.columnNames);
             recordInserted(key, indexKey);
+            long value = count.incrementAndGet();
+            if (value % 100000 == 0) {
+                long elapsed = System.currentTimeMillis() - start;
+                long percent = (value * 100) / currentTableSize;
+                LOGGER.log(Level.INFO,
+                        "rebuild vector index {0} in progress, indexed {1} records ({2}%), started {3} ms ago: {4} nodes",
+                        new Object[]{index.name, value, percent, elapsed, vectors.size()});
+            }
         });
         long elapsed = System.currentTimeMillis() - start;
         LOGGER.log(Level.INFO,

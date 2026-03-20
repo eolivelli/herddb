@@ -58,7 +58,7 @@ public final class ServerConfiguration {
     public static final String PROPERTY_MODE_REMOTE_FILE_SERVICE = "remote-file-service";
 
     public static final String PROPERTY_REMOTE_FILE_SERVERS = "remote.file.servers";
-    public static final String PROPERTY_REMOTE_FILE_SERVERS_DEFAULT = "localhost:9845";
+    public static final String PROPERTY_REMOTE_FILE_SERVERS_DEFAULT = "localhost:9846";
 
     public static final String PROPERTY_BASEDIR = "server.base.dir";
     public static final String PROPERTY_BASEDIR_DEFAULT = "dbdata";

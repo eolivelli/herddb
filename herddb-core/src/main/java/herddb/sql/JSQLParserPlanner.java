@@ -51,6 +51,7 @@ import herddb.model.TupleComparator;
 import herddb.model.commands.AlterTableSpaceStatement;
 import herddb.model.commands.AlterTableStatement;
 import herddb.model.commands.BeginTransactionStatement;
+import herddb.model.commands.CheckpointStatement;
 import herddb.model.commands.CommitTransactionStatement;
 import herddb.model.commands.CreateIndexStatement;
 import herddb.model.commands.CreateTableSpaceStatement;
@@ -1062,6 +1063,18 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
                             "BEGINTRANSACTION requires one parameter (EXECUTE BEGINTRANSACTION tableSpaceName)");
                 }
                 return new BeginTransactionStatement(tableSpaceName.toString());
+            }
+            case "CHECKPOINT": {
+                if (execute.getExprList() == null || execute.getExprList().getExpressions().size() != 1) {
+                    throw new StatementExecutionException(
+                            "CHECKPOINT requires one parameter (EXECUTE CHECKPOINT tableSpaceName)");
+                }
+                Object tableSpaceName = resolveValue(execute.getExprList().getExpressions().get(0), true);
+                if (tableSpaceName == null) {
+                    throw new StatementExecutionException(
+                            "CHECKPOINT requires one parameter (EXECUTE CHECKPOINT tableSpaceName)");
+                }
+                return new CheckpointStatement(tableSpaceName.toString());
             }
             case "COMMITTRANSACTION": {
                 if (execute.getExprList() == null || execute.getExprList().getExpressions().size() != 2) {
