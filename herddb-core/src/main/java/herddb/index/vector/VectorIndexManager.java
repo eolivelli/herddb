@@ -63,14 +63,19 @@ import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 
 import java.util.AbstractMap;
 import java.io.BufferedInputStream;
-import java.io.ByteArrayOutputStream;
+import java.io.BufferedOutputStream;
 import java.io.DataOutputStream;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.HashSet;
@@ -83,6 +88,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -182,6 +188,9 @@ public class VectorIndexManager extends AbstractIndexManager {
     /** Page-ID counter, same pattern as BRINIndexManager. */
     private final AtomicLong newPageId = new AtomicLong(1);
 
+    /** Tracks whether the index has been modified since the last successful checkpoint. */
+    private final AtomicBoolean dirty = new AtomicBoolean(true);
+
     private volatile int dimension = 0;
     private volatile MapRandomAccessVectorValues mravv = null;
     private volatile GraphIndexBuilder builder = null;
@@ -193,8 +202,11 @@ public class VectorIndexManager extends AbstractIndexManager {
     /** Loaded on-disk graph (FusedPQ format). Null if not using FusedPQ or not yet checkpointed. */
     private volatile OnDiskGraphIndex onDiskGraph = null;
 
-    /** Raw bytes of the on-disk graph (kept in memory as the ReaderSupplier source). */
-    private volatile byte[] onDiskGraphBytes = null;
+    /** Temp file holding the on-disk graph data (kept alive as the ReaderSupplier source). */
+    private volatile Path onDiskGraphFile = null;
+
+    /** ReaderSupplier backed by onDiskGraphFile; must be closed before deleting the file. */
+    private volatile ReaderSupplier onDiskReaderSupplier = null;
 
     /** on-disk sequential ordinal → primary-key bytes */
     private final ConcurrentHashMap<Integer, Bytes> onDiskNodeToPk = new ConcurrentHashMap<>();
@@ -342,99 +354,72 @@ public class VectorIndexManager extends AbstractIndexManager {
             return true;
         }
 
-        // --- Load map chunks → restore vectors + pk mappings ---
-        ByteArrayOutputStream mapBaos = new ByteArrayOutputStream();
-        for (long pageId : mapChunkPageIds) {
-            byte[] chunkData = dataStorageManager.readIndexPage(
-                    tableSpaceUUID, index.uuid, pageId,
-                    in -> {
-                        int type = in.readVInt();
-                        if (type != TYPE_VECTOR_MAPCHUNK) {
-                            throw new IOException(
-                                    "page " + pageId + ": expected TYPE_VECTOR_MAPCHUNK(" +
-                                            TYPE_VECTOR_MAPCHUNK + ") but got " + type);
-                        }
-                        int len = in.readVInt();
-                        byte[] data = new byte[len];
-                        in.readArray(len, data);
-                        return data;
-                    });
-            mapBaos.write(chunkData);
-        }
-
-        // --- Load graph chunks ---
-        ByteArrayOutputStream graphBaos = new ByteArrayOutputStream();
-        for (long pageId : graphChunkPageIds) {
-            byte[] chunkData = dataStorageManager.readIndexPage(
-                    tableSpaceUUID, index.uuid, pageId,
-                    in -> {
-                        int type = in.readVInt();
-                        if (type != TYPE_VECTOR_GRAPHCHUNK) {
-                            throw new IOException(
-                                    "page " + pageId + ": expected TYPE_VECTOR_GRAPHCHUNK(" +
-                                            TYPE_VECTOR_GRAPHCHUNK + ") but got " + type);
-                        }
-                        int len = in.readVInt();
-                        byte[] data = new byte[len];
-                        in.readArray(len, data);
-                        return data;
-                    });
-            graphBaos.write(chunkData);
-        }
+        // --- Load map and graph chunks into temp files ---
+        Path mapFile = readChunksToTempFile(mapChunkPageIds, TYPE_VECTOR_MAPCHUNK);
+        Path graphFile = readChunksToTempFile(graphChunkPageIds, TYPE_VECTOR_GRAPHCHUNK);
 
         this.dimension = dim;
         newPageId.set(status.newPageId);
 
         if (savedFusedPQ) {
-            return loadFusedPQFormat(mapBaos.toByteArray(), graphBaos.toByteArray(),
+            return loadFusedPQFormat(mapFile, graphFile,
                     dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
         } else {
-            return loadSimpleFormat(mapBaos.toByteArray(), graphBaos.toByteArray(),
-                    dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+            try {
+                return loadSimpleFormat(mapFile, graphFile,
+                        dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+            } finally {
+                Files.deleteIfExists(mapFile);
+                Files.deleteIfExists(graphFile);
+            }
         }
     }
 
-    private boolean loadSimpleFormat(byte[] mapBytes, byte[] graphBytes,
+    private boolean loadSimpleFormat(Path mapFile, Path graphFile,
                                      int dim, int savedNextNodeId,
                                      int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
             throws IOException {
-        // Restore pk/vector maps (original nodeIds)
-        ByteBuffer mapBuf = ByteBuffer.wrap(mapBytes);
-        int entryCount = mapBuf.getInt();
-        for (int i = 0; i < entryCount; i++) {
-            int nodeId = mapBuf.getInt();
-            int pkLen = mapBuf.getInt();
-            byte[] pkData = new byte[pkLen];
-            mapBuf.get(pkData);
-            int floatCount = mapBuf.getInt();
-            float[] floats = new float[floatCount];
-            for (int j = 0; j < floatCount; j++) {
-                floats[j] = mapBuf.getFloat();
+        // Restore pk/vector maps from temp file
+        try (FileChannel mapCh = FileChannel.open(mapFile, StandardOpenOption.READ)) {
+            ByteBuffer mapBuf = mapCh.map(FileChannel.MapMode.READ_ONLY, 0, mapCh.size());
+            int entryCount = mapBuf.getInt();
+            for (int i = 0; i < entryCount; i++) {
+                int nodeId = mapBuf.getInt();
+                int pkLen = mapBuf.getInt();
+                byte[] pkData = new byte[pkLen];
+                mapBuf.get(pkData);
+                int floatCount = mapBuf.getInt();
+                float[] floats = new float[floatCount];
+                for (int j = 0; j < floatCount; j++) {
+                    floats[j] = mapBuf.getFloat();
+                }
+                Bytes pk = Bytes.from_array(pkData);
+                VectorFloat<?> vec = VTS.createFloatVector(floats);
+                vectors.put(nodeId, vec);
+                pkToNode.put(pk, nodeId);
+                nodeToPk.put(nodeId, pk);
             }
-            Bytes pk = Bytes.from_array(pkData);
-            VectorFloat<?> vec = VTS.createFloatVector(floats);
-            vectors.put(nodeId, vec);
-            pkToNode.put(pk, nodeId);
-            nodeToPk.put(nodeId, pk);
         }
 
         this.nextNodeId.set(savedNextNodeId);
         this.mravv = new MapRandomAccessVectorValues(vectors, dim);
 
-        // Load OnHeapGraphIndex
-        ByteBuffer graphBuf = ByteBuffer.wrap(graphBytes);
-        ByteBufferReader reader = new ByteBufferReader(graphBuf);
+        // Load OnHeapGraphIndex from temp file
+        try (FileChannel graphCh = FileChannel.open(graphFile, StandardOpenOption.READ)) {
+            ByteBuffer graphBuf = graphCh.map(FileChannel.MapMode.READ_ONLY, 0, graphCh.size());
+            ByteBufferReader reader = new ByteBufferReader(graphBuf);
 
-        BuildScoreProvider bsp =
-                BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
-        VamanaDiversityProvider diversityProvider = new VamanaDiversityProvider(bsp, savedAlpha);
-        OnHeapGraphIndex loadedGraph =
-                OnHeapGraphIndex.load(reader, dim, savedNeighborOverflow, diversityProvider);
-        this.builder = new GraphIndexBuilder(
-                bsp, dim, loadedGraph,
-                savedBeamWidth, savedNeighborOverflow, savedAlpha,
-                REFINE_FINAL_GRAPH,
-                PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
+            BuildScoreProvider bsp =
+                    BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+            VamanaDiversityProvider diversityProvider = new VamanaDiversityProvider(bsp, savedAlpha);
+            OnHeapGraphIndex loadedGraph =
+                    OnHeapGraphIndex.load(reader, dim, savedNeighborOverflow, diversityProvider);
+            this.builder = new GraphIndexBuilder(
+                    bsp, dim, loadedGraph,
+                    savedBeamWidth, savedNeighborOverflow, savedAlpha,
+                    REFINE_FINAL_GRAPH,
+                    PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
+        }
 
         LOGGER.log(Level.INFO,
                 "loaded vector index {0} (simple): {1} nodes, dimension {2}",
@@ -442,38 +427,41 @@ public class VectorIndexManager extends AbstractIndexManager {
         return true;
     }
 
-    private boolean loadFusedPQFormat(byte[] mapBytes, byte[] graphBytes,
+    private boolean loadFusedPQFormat(Path mapFile, Path graphFile,
                                       int dim, int savedNextNodeId,
                                       int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
             throws IOException {
         // Map data stores (newOrdinal, pk, vector) — newOrdinals are sequential 0..N-1
-        ByteBuffer mapBuf = ByteBuffer.wrap(mapBytes);
-        int entryCount = mapBuf.getInt();
-        int maxOrdinal = -1;
-        for (int i = 0; i < entryCount; i++) {
-            int ordinal = mapBuf.getInt();
-            int pkLen = mapBuf.getInt();
-            byte[] pkData = new byte[pkLen];
-            mapBuf.get(pkData);
-            int floatCount = mapBuf.getInt();
-            // skip vector floats (not needed for on-disk graph; vectors are stored inline)
-            mapBuf.position(mapBuf.position() + floatCount * Float.BYTES);
-            Bytes pk = Bytes.from_array(pkData);
-            onDiskNodeToPk.put(ordinal, pk);
-            onDiskPkToNode.put(pk, ordinal);
-            if (ordinal > maxOrdinal) {
-                maxOrdinal = ordinal;
+        try (FileChannel mapCh = FileChannel.open(mapFile, StandardOpenOption.READ)) {
+            ByteBuffer mapBuf = mapCh.map(FileChannel.MapMode.READ_ONLY, 0, mapCh.size());
+            int entryCount = mapBuf.getInt();
+            int maxOrdinal = -1;
+            for (int i = 0; i < entryCount; i++) {
+                int ordinal = mapBuf.getInt();
+                int pkLen = mapBuf.getInt();
+                byte[] pkData = new byte[pkLen];
+                mapBuf.get(pkData);
+                int floatCount = mapBuf.getInt();
+                // skip vector floats (not needed for on-disk graph; vectors are stored inline)
+                mapBuf.position(mapBuf.position() + floatCount * Float.BYTES);
+                Bytes pk = Bytes.from_array(pkData);
+                onDiskNodeToPk.put(ordinal, pk);
+                onDiskPkToNode.put(pk, ordinal);
+                if (ordinal > maxOrdinal) {
+                    maxOrdinal = ordinal;
+                }
             }
+            // Live inserts start after the loaded on-disk ordinals
+            this.nextNodeId.set(maxOrdinal + 1);
         }
+        // Map file fully consumed
+        Files.deleteIfExists(mapFile);
 
-        // Live inserts start after the loaded on-disk ordinals
-        this.nextNodeId.set(maxOrdinal + 1);
-
-        // Load OnDiskGraphIndex from bytes
-        final byte[] graphBytesRef = graphBytes;
-        ReaderSupplier readerSupplier = () -> new ByteBufferReader(ByteBuffer.wrap(graphBytesRef));
+        // Load OnDiskGraphIndex from temp file (file stays alive for graph's lifetime)
+        ReaderSupplier readerSupplier = new io.github.jbellis.jvector.disk.SimpleMappedReader.Supplier(graphFile);
         this.onDiskGraph = OnDiskGraphIndex.load(readerSupplier);
-        this.onDiskGraphBytes = graphBytesRef;
+        this.onDiskReaderSupplier = readerSupplier;
+        this.onDiskGraphFile = graphFile;
 
         // Create an empty live builder for new inserts
         this.mravv = new MapRandomAccessVectorValues(vectors, dim);
@@ -563,6 +551,11 @@ public class VectorIndexManager extends AbstractIndexManager {
     private List<PostCheckpointAction> doCheckpoint(LogSequenceNumber sequenceNumber, boolean pin)
             throws IOException, DataStorageManagerException {
 
+        if (!dirty.get()) {
+            LOGGER.log(Level.FINE, "checkpoint vector index {0}: skipped (no changes)", index.name);
+            return Collections.emptyList();
+        }
+
         boolean hasLiveNodes = builder != null && !nodeToPk.isEmpty();
         boolean hasOnDiskNodes = !onDiskNodeToPk.isEmpty();
 
@@ -572,6 +565,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                     index.name, sequenceNumber, newPageId.get(), new HashSet<>(), new byte[0]);
             List<PostCheckpointAction> result = new ArrayList<>();
             result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, emptyStatus, pin));
+            dirty.set(false);
             LOGGER.log(Level.INFO, "checkpoint vector index {0}: empty", index.name);
             return result;
         }
@@ -581,6 +575,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                     index.name, sequenceNumber, newPageId.get(), new HashSet<>(), new byte[0]);
             List<PostCheckpointAction> result = new ArrayList<>();
             result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, emptyStatus, pin));
+            dirty.set(false);
             LOGGER.log(Level.INFO, "checkpoint vector index {0}: empty dimension", index.name);
             return result;
         }
@@ -648,15 +643,25 @@ public class VectorIndexManager extends AbstractIndexManager {
             // Purge orphan vectors (deleted nodes whose vectors were kept for the builder)
             vectors.keySet().retainAll(nodeToPk.keySet());
 
-            // For simple format: just save the current live state
-            ByteArrayOutputStream graphBaos = new ByteArrayOutputStream();
-            if (builder != null) {
-                try (DataOutputStream graphDos = new DataOutputStream(graphBaos)) {
-                    ((OnHeapGraphIndex) builder.getGraph()).save(graphDos);
+            // For simple format: write graph to temp file then chunk it
+            Path graphTmpFile = Files.createTempFile("herddb-vector-graph-", ".tmp");
+            try {
+                if (builder != null) {
+                    try (DataOutputStream graphDos = new DataOutputStream(
+                            new BufferedOutputStream(new FileOutputStream(graphTmpFile.toFile()), CHUNK_SIZE))) {
+                        ((OnHeapGraphIndex) builder.getGraph()).save(graphDos);
+                    }
                 }
+                graphPageIds = writeChunks(graphTmpFile, TYPE_VECTOR_GRAPHCHUNK);
+            } finally {
+                Files.deleteIfExists(graphTmpFile);
             }
-            graphPageIds = writeChunks(graphBaos.toByteArray(), TYPE_VECTOR_GRAPHCHUNK);
-            mapPageIds = writeChunks(serializeMapData(vectors, nodeToPk), TYPE_VECTOR_MAPCHUNK);
+            Path mapTmpFile = serializeMapDataToFile(vectors, nodeToPk);
+            try {
+                mapPageIds = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
+            } finally {
+                Files.deleteIfExists(mapTmpFile);
+            }
             totalNodes = nodeToPk.size();
         }
 
@@ -727,45 +732,18 @@ public class VectorIndexManager extends AbstractIndexManager {
             onDiskPkToNode.clear();
             this.builder = null;
             this.onDiskGraph = null;
-            this.onDiskGraphBytes = null;
+            closeAndDeleteOnDiskGraphFile();
 
-            // Reconstruct map bytes for reload (reuse the ones we just wrote)
-            ByteArrayOutputStream reloadMapBaos = new ByteArrayOutputStream();
-            for (long pageId : mapPageIds) {
-                byte[] chunkData = dataStorageManager.readIndexPage(
-                        tableSpaceUUID, index.uuid, pageId,
-                        in -> {
-                            int type = in.readVInt();
-                            if (type != TYPE_VECTOR_MAPCHUNK) {
-                                throw new IOException("unexpected page type " + type);
-                            }
-                            int len = in.readVInt();
-                            byte[] data = new byte[len];
-                            in.readArray(len, data);
-                            return data;
-                        });
-                reloadMapBaos.write(chunkData);
-            }
-            ByteArrayOutputStream reloadGraphBaos = new ByteArrayOutputStream();
-            for (long pageId : graphPageIds) {
-                byte[] chunkData = dataStorageManager.readIndexPage(
-                        tableSpaceUUID, index.uuid, pageId,
-                        in -> {
-                            int type = in.readVInt();
-                            if (type != TYPE_VECTOR_GRAPHCHUNK) {
-                                throw new IOException("unexpected page type " + type);
-                            }
-                            int len = in.readVInt();
-                            byte[] data = new byte[len];
-                            in.readArray(len, data);
-                            return data;
-                        });
-                reloadGraphBaos.write(chunkData);
-            }
-            loadFusedPQFormat(reloadMapBaos.toByteArray(), reloadGraphBaos.toByteArray(),
+            // Reconstruct from persisted pages via temp files
+            Path reloadMapFile = readChunksToTempFile(
+                    mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
+            Path reloadGraphFile = readChunksToTempFile(
+                    graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
+            loadFusedPQFormat(reloadMapFile, reloadGraphFile,
                     dimension, nextNodeId.get(), beamWidth, neighborOverflow, alpha);
         }
 
+        dirty.set(false);
         LOGGER.log(Level.INFO,
                 "checkpoint vector index {0}: {1} nodes, {2} graph pages, {3} map pages, fusedPQ={4}",
                 new Object[]{index.name, totalNodes, graphPageIds.size(), mapPageIds.size(), useFusedPQ});
@@ -788,11 +766,9 @@ public class VectorIndexManager extends AbstractIndexManager {
         BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(allMravv, similarityFunction);
         GraphIndexBuilder mergedBuilder = new GraphIndexBuilder(
                 bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
-        for (Map.Entry<Integer, VectorFloat<?>> e : allVectors.entrySet()) {
-            if (allNodeToPk.containsKey(e.getKey())) { // only active nodes
-                mergedBuilder.addGraphNode(e.getKey(), e.getValue());
-            }
-        }
+        allVectors.entrySet().parallelStream()
+                .filter(e -> allNodeToPk.containsKey(e.getKey()))
+                .forEach(e -> mergedBuilder.addGraphNode(e.getKey(), e.getValue()));
         mergedBuilder.cleanup();
         OnHeapGraphIndex mergedGraph = (OnHeapGraphIndex) mergedBuilder.getGraph();
 
@@ -846,34 +822,70 @@ public class VectorIndexManager extends AbstractIndexManager {
             oldToNew.put(sortedNodeIds.get(i), i);
         }
 
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        int entryCount = sortedNodeIds.size();
-        writeInt(baos, entryCount);
+        Path mapTmpFile = Files.createTempFile("herddb-vector-map-", ".tmp");
+        try {
+            try (BufferedOutputStream bos = new BufferedOutputStream(
+                    new FileOutputStream(mapTmpFile.toFile()), CHUNK_SIZE)) {
+                int entryCount = sortedNodeIds.size();
+                writeInt(bos, entryCount);
 
-        for (int oldId : sortedNodeIds) {
-            int newOrdinal = oldToNew.get(oldId);
-            Bytes pk = allNodeToPk.get(oldId);
-            byte[] pkBytes = pk.to_array();
-            VectorFloat<?> vec = allVectors.get(oldId);
+                for (int oldId : sortedNodeIds) {
+                    int newOrdinal = oldToNew.get(oldId);
+                    Bytes pk = allNodeToPk.get(oldId);
+                    byte[] pkBytes = pk.to_array();
+                    VectorFloat<?> vec = allVectors.get(oldId);
 
-            writeInt(baos, newOrdinal);
-            writeInt(baos, pkBytes.length);
-            baos.write(pkBytes);
-            int floatCount = vec.length();
-            writeInt(baos, floatCount);
-            for (int j = 0; j < floatCount; j++) {
-                int bits = Float.floatToIntBits(vec.get(j));
-                writeInt(baos, bits);
+                    writeInt(bos, newOrdinal);
+                    writeInt(bos, pkBytes.length);
+                    bos.write(pkBytes);
+                    int floatCount = vec.length();
+                    writeInt(bos, floatCount);
+                    for (int j = 0; j < floatCount; j++) {
+                        int bits = Float.floatToIntBits(vec.get(j));
+                        writeInt(bos, bits);
+                    }
+                }
             }
+            return writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
+        } finally {
+            Files.deleteIfExists(mapTmpFile);
         }
-        return writeChunks(baos.toByteArray(), TYPE_VECTOR_MAPCHUNK);
     }
 
-    private static void writeInt(ByteArrayOutputStream baos, int v) {
-        baos.write((v >>> 24) & 0xFF);
-        baos.write((v >>> 16) & 0xFF);
-        baos.write((v >>> 8) & 0xFF);
-        baos.write(v & 0xFF);
+    private static void writeInt(OutputStream out, int v) throws IOException {
+        out.write((v >>> 24) & 0xFF);
+        out.write((v >>> 16) & 0xFF);
+        out.write((v >>> 8) & 0xFF);
+        out.write(v & 0xFF);
+    }
+
+    /**
+     * Reads index chunk pages into a temporary file and returns the path.
+     */
+    private Path readChunksToTempFile(long[] pageIds, int expectedChunkType)
+            throws IOException, DataStorageManagerException {
+        Path tempFile = Files.createTempFile("herddb-vector-", ".tmp");
+        try (FileOutputStream fos = new FileOutputStream(tempFile.toFile());
+             BufferedOutputStream bos = new BufferedOutputStream(fos, CHUNK_SIZE)) {
+            for (long pageId : pageIds) {
+                byte[] chunkData = dataStorageManager.readIndexPage(
+                        tableSpaceUUID, index.uuid, pageId,
+                        in -> {
+                            int type = in.readVInt();
+                            if (type != expectedChunkType) {
+                                throw new IOException(
+                                        "page " + pageId + ": expected type " +
+                                                expectedChunkType + " but got " + type);
+                            }
+                            int len = in.readVInt();
+                            byte[] data = new byte[len];
+                            in.readArray(len, data);
+                            return data;
+                        });
+                bos.write(chunkData);
+            }
+        }
+        return tempFile;
     }
 
     /**
@@ -941,36 +953,40 @@ public class VectorIndexManager extends AbstractIndexManager {
     }
 
     /**
-     * Serialises the pk/vector map into a flat byte array:
+     * Serialises the pk/vector map into a temp file:
      * [ entryCount:int ]
      * for each entry:
      *   [ nodeId:int | pkLen:int | pkBytes | floatCount:int | floats ]
+     * Returns the path to the temp file (caller must delete after use).
      */
-    private byte[] serializeMapData(ConcurrentHashMap<Integer, VectorFloat<?>> vecs,
-                                    ConcurrentHashMap<Integer, Bytes> nodeToKey) throws IOException {
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        List<Map.Entry<Integer, Bytes>> entries = new ArrayList<>(nodeToKey.entrySet());
-        int entryCount = entries.size();
-        writeInt(baos, entryCount);
+    private Path serializeMapDataToFile(ConcurrentHashMap<Integer, VectorFloat<?>> vecs,
+                                        ConcurrentHashMap<Integer, Bytes> nodeToKey) throws IOException {
+        Path tmpFile = Files.createTempFile("herddb-vector-map-", ".tmp");
+        try (BufferedOutputStream bos = new BufferedOutputStream(
+                new FileOutputStream(tmpFile.toFile()), CHUNK_SIZE)) {
+            List<Map.Entry<Integer, Bytes>> entries = new ArrayList<>(nodeToKey.entrySet());
+            int entryCount = entries.size();
+            writeInt(bos, entryCount);
 
-        for (Map.Entry<Integer, Bytes> e : entries) {
-            int nodeId = e.getKey();
-            byte[] pkBytes = e.getValue().to_array();
-            VectorFloat<?> vec = vecs.get(nodeId);
-            if (vec == null) {
-                continue;
-            }
-            int floatCount = vec.length();
-            writeInt(baos, nodeId);
-            writeInt(baos, pkBytes.length);
-            baos.write(pkBytes);
-            writeInt(baos, floatCount);
-            for (int j = 0; j < floatCount; j++) {
-                int bits = Float.floatToIntBits(vec.get(j));
-                writeInt(baos, bits);
+            for (Map.Entry<Integer, Bytes> e : entries) {
+                int nodeId = e.getKey();
+                byte[] pkBytes = e.getValue().to_array();
+                VectorFloat<?> vec = vecs.get(nodeId);
+                if (vec == null) {
+                    continue;
+                }
+                int floatCount = vec.length();
+                writeInt(bos, nodeId);
+                writeInt(bos, pkBytes.length);
+                bos.write(pkBytes);
+                writeInt(bos, floatCount);
+                for (int j = 0; j < floatCount; j++) {
+                    int bits = Float.floatToIntBits(vec.get(j));
+                    writeInt(bos, bits);
+                }
             }
         }
-        return baos.toByteArray();
+        return tmpFile;
     }
 
     @Override
@@ -998,6 +1014,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                         "error closing on-disk graph index for " + index.name, e);
             }
         }
+        closeAndDeleteOnDiskGraphFile();
     }
 
     // -------------------------------------------------------------------------
@@ -1028,6 +1045,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         pkToNode.put(key, nodeId);
         nodeToPk.put(nodeId, key);
         builder.addGraphNode(nodeId, vec);
+        dirty.set(true);
     }
 
     @Override
@@ -1039,6 +1057,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         Integer onDiskOrdinal = onDiskPkToNode.remove(key);
         if (onDiskOrdinal != null) {
             onDiskNodeToPk.remove(onDiskOrdinal);
+            dirty.set(true);
             // No need to mark deleted in OnDiskGraphIndex — filtered at search time
         }
         // Check live nodes
@@ -1047,6 +1066,7 @@ public class VectorIndexManager extends AbstractIndexManager {
             return;
         }
         nodeToPk.remove(nodeId);
+        dirty.set(true);
         GraphIndexBuilder b = builder;
         if (b != null) {
             b.markNodeDeleted(nodeId);
@@ -1068,6 +1088,7 @@ public class VectorIndexManager extends AbstractIndexManager {
     public void truncate() throws DataStorageManagerException {
         resetState();
         truncateIndexData();
+        dirty.set(true);
     }
 
     @Override
@@ -1199,7 +1220,28 @@ public class VectorIndexManager extends AbstractIndexManager {
         builder = null;
         mravv = null;
         onDiskGraph = null;
-        onDiskGraphBytes = null;
+        closeAndDeleteOnDiskGraphFile();
+    }
+
+    private void closeAndDeleteOnDiskGraphFile() {
+        ReaderSupplier rs = this.onDiskReaderSupplier;
+        if (rs != null) {
+            try {
+                rs.close();
+            } catch (Exception e) {
+                // ignore
+            }
+            this.onDiskReaderSupplier = null;
+        }
+        Path f = this.onDiskGraphFile;
+        if (f != null) {
+            try {
+                Files.deleteIfExists(f);
+            } catch (IOException e) {
+                // ignore
+            }
+            this.onDiskGraphFile = null;
+        }
     }
 
     // -------------------------------------------------------------------------
