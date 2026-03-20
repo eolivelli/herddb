@@ -62,8 +62,10 @@ import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 
 import java.util.AbstractMap;
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
@@ -76,9 +78,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntFunction;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -118,6 +125,15 @@ public class VectorIndexManager extends AbstractIndexManager {
     /** Minimum number of vectors required for FusedPQ (jvector FusedPQ requires exactly 256 PQ clusters). */
     static final int MIN_VECTORS_FOR_FUSED_PQ = 256;
 
+    /** Number of threads used for parallel index rebuild. */
+    private static final int REBUILD_THREADS = Integer.getInteger("herddb.vectorindex.rebuild.threads", 4);
+
+    private static final ThreadFactory DAEMON_THREAD_FACTORY = r -> {
+        Thread t = new Thread(r, "vector-index-rebuild");
+        t.setDaemon(true);
+        return t;
+    };
+
     /* property keys for CREATE INDEX ... WITH */
     public static final String PROP_M = "m";
     public static final String PROP_BEAM_WIDTH = "beamWidth";
@@ -142,8 +158,8 @@ public class VectorIndexManager extends AbstractIndexManager {
     /** Page-type tag written at the start of each pk/vector-map page. */
     static final int TYPE_VECTOR_MAPCHUNK = 13;
 
-    /** Metadata version for the legacy OnHeapGraphIndex format. */
-    private static final int METADATA_VERSION_LEGACY = 1;
+    /** Metadata version for the simple OnHeapGraphIndex format. */
+    private static final int METADATA_VERSION_SIMPLE = 1;
     /** Metadata version for the FusedPQ OnDiskGraphIndex format. */
     private static final int METADATA_VERSION_FUSEDPQ = 2;
 
@@ -287,7 +303,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         ByteBuffer metaBuf = ByteBuffer.wrap(status.indexData);
 
         int version = metaBuf.getInt();
-        if (version != METADATA_VERSION_LEGACY && version != METADATA_VERSION_FUSEDPQ) {
+        if (version != METADATA_VERSION_SIMPLE && version != METADATA_VERSION_FUSEDPQ) {
             LOGGER.log(Level.SEVERE,
                     "unsupported vector index metadata version {0} for {1}, rebuilding",
                     new Object[]{version, index.name});
@@ -373,12 +389,12 @@ public class VectorIndexManager extends AbstractIndexManager {
             return loadFusedPQFormat(mapBaos.toByteArray(), graphBaos.toByteArray(),
                     dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
         } else {
-            return loadLegacyFormat(mapBaos.toByteArray(), graphBaos.toByteArray(),
+            return loadSimpleFormat(mapBaos.toByteArray(), graphBaos.toByteArray(),
                     dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
         }
     }
 
-    private boolean loadLegacyFormat(byte[] mapBytes, byte[] graphBytes,
+    private boolean loadSimpleFormat(byte[] mapBytes, byte[] graphBytes,
                                      int dim, int savedNextNodeId,
                                      int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
             throws IOException {
@@ -421,7 +437,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                 PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
 
         LOGGER.log(Level.INFO,
-                "loaded vector index {0} (legacy): {1} nodes, dimension {2}",
+                "loaded vector index {0} (simple): {1} nodes, dimension {2}",
                 new Object[]{index.name, vectors.size(), dim});
         return true;
     }
@@ -476,25 +492,58 @@ public class VectorIndexManager extends AbstractIndexManager {
     public void rebuild() throws DataStorageManagerException {
         final long start = System.currentTimeMillis();
         long currentTableSize = tableManager.getStats().getTablesize();
-        LOGGER.log(Level.INFO, "rebuilding vector index {0} - {1} records", new Object[] {index.name, currentTableSize});
+        LOGGER.log(Level.INFO, "rebuilding vector index {0} - {1} records using {2} threads",
+                new Object[] {index.name, currentTableSize, REBUILD_THREADS});
         dataStorageManager.initIndex(tableSpaceUUID, index.uuid);
         resetState();
         Table table = tableManager.getTable();
         AtomicLong count = new AtomicLong();
-        tableManager.scanForIndexRebuild(r -> {
-            herddb.utils.DataAccessor values = r.getDataAccessor(table);
-            Bytes key = RecordSerializer.serializeIndexKey(values, table, table.primaryKey);
-            Bytes indexKey = RecordSerializer.serializeIndexKey(values, index, index.columnNames);
-            recordInserted(key, indexKey);
-            long value = count.incrementAndGet();
-            if (value % 100000 == 0) {
-                long elapsed = System.currentTimeMillis() - start;
-                long percent = (value * 100) / currentTableSize;
-                LOGGER.log(Level.INFO,
-                        "rebuild vector index {0} in progress, indexed {1} records ({2}%), started {3} ms ago: {4} nodes",
-                        new Object[]{index.name, value, percent, elapsed, vectors.size()});
+        ExecutorService executor = Executors.newFixedThreadPool(REBUILD_THREADS, DAEMON_THREAD_FACTORY);
+        Semaphore semaphore = new Semaphore(REBUILD_THREADS);
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        try {
+            tableManager.scanForIndexRebuild(r -> {
+                herddb.utils.DataAccessor values = r.getDataAccessor(table);
+                Bytes key = RecordSerializer.serializeIndexKey(values, table, table.primaryKey);
+                Bytes indexKey = RecordSerializer.serializeIndexKey(values, index, index.columnNames);
+                if (builder == null) {
+                    // Single-threaded until builder is initialized (typically first non-null vector)
+                    try {
+                        recordInserted(key, indexKey);
+                    } catch (Throwable t) {
+                        error.compareAndSet(null, t);
+                    }
+                } else {
+                    semaphore.acquireUninterruptibly();
+                    executor.submit(() -> {
+                        try {
+                            recordInserted(key, indexKey);
+                        } catch (Throwable t) {
+                            error.compareAndSet(null, t);
+                        } finally {
+                            semaphore.release();
+                        }
+                    });
+                }
+                long value = count.incrementAndGet();
+                if (value % 100000 == 0) {
+                    long elapsed = System.currentTimeMillis() - start;
+                    long percent = (value * 100) / currentTableSize;
+                    LOGGER.log(Level.INFO,
+                            "rebuild vector index {0} in progress, indexed {1} records ({2}%), started {3} ms ago: {4} nodes",
+                            new Object[]{index.name, value, percent, elapsed, vectors.size()});
+                }
+            });
+            // Drain: acquire all permits to ensure all submitted tasks completed
+            for (int i = 0; i < REBUILD_THREADS; i++) {
+                semaphore.acquireUninterruptibly();
             }
-        });
+            if (error.get() != null) {
+                throw new DataStorageManagerException(error.get());
+            }
+        } finally {
+            executor.shutdownNow();
+        }
         long elapsed = System.currentTimeMillis() - start;
         LOGGER.log(Level.INFO,
                 "rebuilt vector index {0} in {1} ms: {2} nodes",
@@ -560,8 +609,15 @@ public class VectorIndexManager extends AbstractIndexManager {
             if (builder != null) {
                 builder.cleanup();
             }
-            allVectors.putAll(vectors);
-            allNodeToPk.putAll(nodeToPk);
+            // Only include vectors for nodes that are still live (not deleted)
+            for (Map.Entry<Integer, Bytes> e : nodeToPk.entrySet()) {
+                int nid = e.getKey();
+                VectorFloat<?> vec = vectors.get(nid);
+                if (vec != null) {
+                    allVectors.put(nid, vec);
+                    allNodeToPk.put(nid, e.getValue());
+                }
+            }
 
             // Include on-disk nodes that haven't been deleted
             // We need their vectors; re-read from on-disk graph inline vectors
@@ -585,13 +641,14 @@ public class VectorIndexManager extends AbstractIndexManager {
             mapPageIds = writeFusedPQMapData(allVectors, allNodeToPk);
             totalNodes = allNodeToPk.size();
         } else {
-            // Legacy format: only serialize live builder
+            // Simple format: only serialize live builder
             if (builder != null) {
                 builder.cleanup();
             }
+            // Purge orphan vectors (deleted nodes whose vectors were kept for the builder)
+            vectors.keySet().retainAll(nodeToPk.keySet());
 
-            // Include on-disk vectors in the live builder before saving if we need to consolidate
-            // For legacy format: just save the current live state
+            // For simple format: just save the current live state
             ByteArrayOutputStream graphBaos = new ByteArrayOutputStream();
             if (builder != null) {
                 try (DataOutputStream graphDos = new DataOutputStream(graphBaos)) {
@@ -612,7 +669,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         if (useFusedPQ) {
             metaBuf.putInt(METADATA_VERSION_FUSEDPQ);
         } else {
-            metaBuf.putInt(METADATA_VERSION_LEGACY);
+            metaBuf.putInt(METADATA_VERSION_SIMPLE);
         }
         metaBuf.putInt(dimension);
         metaBuf.putInt(m);
@@ -643,6 +700,71 @@ public class VectorIndexManager extends AbstractIndexManager {
 
         List<PostCheckpointAction> result = new ArrayList<>();
         result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, indexStatus, pin));
+
+        // After a successful FusedPQ checkpoint, reload from the bytes just written
+        // so that the on-disk graph is ready and live state is cleared.
+        if (useFusedPQ) {
+            GraphIndexBuilder oldBuilder = this.builder;
+            if (oldBuilder != null) {
+                try {
+                    oldBuilder.close();
+                } catch (IOException e) {
+                    // ignore
+                }
+            }
+            OnDiskGraphIndex oldOdg = this.onDiskGraph;
+            if (oldOdg != null) {
+                try {
+                    oldOdg.close();
+                } catch (Exception e) {
+                    // ignore
+                }
+            }
+            vectors.clear();
+            pkToNode.clear();
+            nodeToPk.clear();
+            onDiskNodeToPk.clear();
+            onDiskPkToNode.clear();
+            this.builder = null;
+            this.onDiskGraph = null;
+            this.onDiskGraphBytes = null;
+
+            // Reconstruct map bytes for reload (reuse the ones we just wrote)
+            ByteArrayOutputStream reloadMapBaos = new ByteArrayOutputStream();
+            for (long pageId : mapPageIds) {
+                byte[] chunkData = dataStorageManager.readIndexPage(
+                        tableSpaceUUID, index.uuid, pageId,
+                        in -> {
+                            int type = in.readVInt();
+                            if (type != TYPE_VECTOR_MAPCHUNK) {
+                                throw new IOException("unexpected page type " + type);
+                            }
+                            int len = in.readVInt();
+                            byte[] data = new byte[len];
+                            in.readArray(len, data);
+                            return data;
+                        });
+                reloadMapBaos.write(chunkData);
+            }
+            ByteArrayOutputStream reloadGraphBaos = new ByteArrayOutputStream();
+            for (long pageId : graphPageIds) {
+                byte[] chunkData = dataStorageManager.readIndexPage(
+                        tableSpaceUUID, index.uuid, pageId,
+                        in -> {
+                            int type = in.readVInt();
+                            if (type != TYPE_VECTOR_GRAPHCHUNK) {
+                                throw new IOException("unexpected page type " + type);
+                            }
+                            int len = in.readVInt();
+                            byte[] data = new byte[len];
+                            in.readArray(len, data);
+                            return data;
+                        });
+                reloadGraphBaos.write(chunkData);
+            }
+            loadFusedPQFormat(reloadMapBaos.toByteArray(), reloadGraphBaos.toByteArray(),
+                    dimension, nextNodeId.get(), beamWidth, neighborOverflow, alpha);
+        }
 
         LOGGER.log(Level.INFO,
                 "checkpoint vector index {0}: {1} nodes, {2} graph pages, {3} map pages, fusedPQ={4}",
@@ -695,8 +817,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                         ordinal -> new InlineVectors.State(allMravv.getVector(ordinal)));
                 writer.write(suppliers);
             }
-            byte[] graphBytes = Files.readAllBytes(tempFile);
-            return writeChunks(graphBytes, TYPE_VECTOR_GRAPHCHUNK);
+            return writeChunks(tempFile, TYPE_VECTOR_GRAPHCHUNK);
         } finally {
             Files.deleteIfExists(tempFile);
             try {
@@ -753,6 +874,40 @@ public class VectorIndexManager extends AbstractIndexManager {
         baos.write((v >>> 16) & 0xFF);
         baos.write((v >>> 8) & 0xFF);
         baos.write(v & 0xFF);
+    }
+
+    /**
+     * Streams a file into CHUNK_SIZE pieces, writes each as an index page,
+     * and returns the list of assigned page IDs.
+     * Writes at least one page even if the file is empty (zero-length chunk).
+     */
+    private List<Long> writeChunks(Path file, int chunkType) throws DataStorageManagerException, IOException {
+        List<Long> pageIds = new ArrayList<>();
+        long fileSize = Files.size(file);
+        if (fileSize == 0) {
+            long pageId = newPageId.getAndIncrement();
+            dataStorageManager.writeIndexPage(tableSpaceUUID, index.uuid, pageId, out -> {
+                out.writeVInt(chunkType);
+                out.writeVInt(0);
+            });
+            pageIds.add(pageId);
+            return pageIds;
+        }
+        try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(file.toFile()), CHUNK_SIZE)) {
+            byte[] buf = new byte[CHUNK_SIZE];
+            int bytesRead;
+            while ((bytesRead = bis.read(buf, 0, CHUNK_SIZE)) > 0) {
+                final byte[] chunk = Arrays.copyOf(buf, bytesRead);
+                long pageId = newPageId.getAndIncrement();
+                dataStorageManager.writeIndexPage(tableSpaceUUID, index.uuid, pageId, out -> {
+                    out.writeVInt(chunkType);
+                    out.writeVInt(chunk.length);
+                    out.write(chunk);
+                });
+                pageIds.add(pageId);
+            }
+        }
+        return pageIds;
     }
 
     /**
@@ -895,6 +1050,10 @@ public class VectorIndexManager extends AbstractIndexManager {
         GraphIndexBuilder b = builder;
         if (b != null) {
             b.markNodeDeleted(nodeId);
+            // Vector kept in map until builder.cleanup() purges the deleted node,
+            // because the builder may still visit this node during neighbor search.
+        } else {
+            vectors.remove(nodeId);
         }
     }
 
@@ -1057,5 +1216,17 @@ public class VectorIndexManager extends AbstractIndexManager {
 
     public boolean isFusedPQEnabled() {
         return fusedPQ;
+    }
+
+    public int getVectorsMapSize() {
+        return vectors.size();
+    }
+
+    public int getLiveNodeCount() {
+        return nodeToPk.size();
+    }
+
+    public int getOnDiskNodeCount() {
+        return onDiskNodeToPk.size();
     }
 }

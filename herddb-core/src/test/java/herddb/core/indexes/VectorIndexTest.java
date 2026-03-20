@@ -774,7 +774,7 @@ public class VectorIndexTest {
     }
 
     /**
-     * Tests that setting fusedPQ=false via WITH clause uses the legacy format.
+     * Tests that setting fusedPQ=false via WITH clause uses the simple format.
      */
     @Test
     public void testFusedPQDisabled() throws Exception {
@@ -818,7 +818,7 @@ public class VectorIndexTest {
             manager.checkpoint();
         }
 
-        // Restart: index should reload correctly via legacy path
+        // Restart: index should reload correctly via simple path
         try (DBManager manager = new DBManager(nodeId,
                 new FileMetadataStorageManager(metadataPath),
                 new FileDataStorageManager(dataPath),
@@ -831,7 +831,7 @@ public class VectorIndexTest {
             VectorIndexManager vim = (VectorIndexManager)
                     manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
             assertNotNull(vim);
-            assertEquals("node count after legacy reload", numRows, vim.getNodeCount());
+            assertEquals("node count after simple reload", numRows, vim.getNodeCount());
             assertFalse("fusedPQ should remain disabled after restart", vim.isFusedPQEnabled());
         }
     }
@@ -912,6 +912,258 @@ public class VectorIndexTest {
                 assertTrue("scores must be descending",
                         results.get(i).getValue() >= results.get(i + 1).getValue());
             }
+        }
+    }
+
+    /**
+     * Tests that deleting rows removes entries from the vectors map.
+     */
+    @Test
+    public void testVectorsCleanedOnDelete() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= 5; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, new float[]{i * 1.0f, 0.0f, 0.0f}));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals(5, vim.getVectorsMapSize());
+            assertEquals(5, vim.getNodeCount());
+
+            // Delete 2 rows
+            executeUpdate(manager, "DELETE FROM tblspace1.t1 WHERE id=?", Arrays.asList(1));
+            executeUpdate(manager, "DELETE FROM tblspace1.t1 WHERE id=?", Arrays.asList(3));
+
+            // Node count reflects deletes immediately
+            assertEquals(3, vim.getNodeCount());
+            // Vectors for deleted nodes are kept until builder.cleanup() during checkpoint
+            // (builder may still visit deleted nodes during neighbor search)
+            assertEquals(5, vim.getVectorsMapSize());
+
+            // After checkpoint, orphan vectors are purged
+            manager.checkpoint();
+            assertEquals(3, vim.getVectorsMapSize());
+            assertEquals(3, vim.getNodeCount());
+        }
+    }
+
+    /**
+     * Tests that after a FusedPQ checkpoint, live maps are cleared and on-disk maps are populated.
+     */
+    @Test
+    public void testVectorsCleanedAfterCheckpoint() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final int numRows = 300;
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= numRows; i++) {
+                float[] vec = randomVec(dimension, i);
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, vec));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals(numRows, vim.getVectorsMapSize());
+            assertEquals(numRows, vim.getLiveNodeCount());
+
+            // Checkpoint triggers FusedPQ write + reload
+            manager.checkpoint();
+
+            // After checkpoint: live maps cleared, on-disk populated
+            assertEquals("vectors map should be cleared after FusedPQ checkpoint",
+                    0, vim.getVectorsMapSize());
+            assertEquals("live node count should be 0 after FusedPQ checkpoint",
+                    0, vim.getLiveNodeCount());
+            assertEquals("on-disk node count should match total",
+                    numRows, vim.getOnDiskNodeCount());
+            assertEquals("total node count should still be correct",
+                    numRows, vim.getNodeCount());
+
+            // Insert 5 more after checkpoint — they go to live state
+            for (int i = numRows + 1; i <= numRows + 5; i++) {
+                float[] vec = randomVec(dimension, i);
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, vec));
+            }
+
+            assertEquals(5, vim.getVectorsMapSize());
+            assertEquals(numRows + 5, vim.getNodeCount());
+        }
+    }
+
+    /**
+     * Tests that updating a row does not leak entries in the vectors map.
+     */
+    @Test
+    public void testUpdateDoesNotLeakVectors() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= 5; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, new float[]{i * 1.0f, 0.0f, 0.0f}));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals(5, vim.getVectorsMapSize());
+
+            // Update 3 rows
+            for (int i = 1; i <= 3; i++) {
+                executeUpdate(manager, "UPDATE tblspace1.t1 SET vec=? WHERE id=?",
+                        Arrays.asList(new float[]{0.0f, i * 1.0f, 0.0f}, i));
+            }
+
+            // Node count stays 5 after updates
+            assertEquals(5, vim.getNodeCount());
+            // Vectors for deleted-then-reinserted nodes: 5 original + 3 new = 8 until cleanup
+            // After checkpoint, orphan vectors (from the old versions) are purged
+            manager.checkpoint();
+            assertEquals("vectors map should not leak on update", 5, vim.getVectorsMapSize());
+            assertEquals(5, vim.getNodeCount());
+        }
+    }
+
+    /**
+     * Tests that rebuild works correctly when vectors contain nulls.
+     * Covers: all non-null, all null, and mixed scenarios.
+     */
+    @Test
+    public void testRebuildWithNullableVectors() throws Exception {
+        // A) All non-null vectors
+        doTestRebuildWithNullableVectors(10, 0, 10);
+        // B) All null vectors
+        doTestRebuildWithNullableVectors(0, 10, 0);
+        // C) Mixed
+        doTestRebuildWithNullableVectors(5, 5, 5);
+    }
+
+    private void doTestRebuildWithNullableVectors(int nonNullCount, int nullCount, int expectedNodeCount)
+            throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 4;
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            // Nullable vector column
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            // Insert non-null rows
+            int id = 1;
+            for (int i = 0; i < nonNullCount; i++) {
+                float[] vec = randomVec(dimension, id);
+                executeUpdate(manager,
+                        "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(id, vec));
+                id++;
+            }
+            // Insert null rows
+            for (int i = 0; i < nullCount; i++) {
+                executeUpdate(manager,
+                        "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(id, (Object) null));
+                id++;
+            }
+
+            // Drop and recreate index to trigger rebuild
+            execute(manager, "DROP INDEX tblspace1.vidx", Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals("node count after rebuild", expectedNodeCount, vim.getNodeCount());
         }
     }
 
