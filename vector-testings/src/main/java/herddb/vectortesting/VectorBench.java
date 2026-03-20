@@ -174,6 +174,7 @@ public class VectorBench {
         }
 
         System.out.println("\nBenchmark complete.");
+        System.exit(0);
     }
 
     private static double computeRecall(List<List<Integer>> results, List<int[]> groundTruth, int k) {
