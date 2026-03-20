@@ -1,0 +1,91 @@
+suite: MinIO Services
+templates:
+  - templates/minio-svc.yaml
+tests:
+  - it: should not render when minio is disabled (default)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render two services when minio is enabled
+    set:
+      minio.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 2
+
+  - it: headless service should be clusterIP None
+    set:
+      minio.enabled: true
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: spec.clusterIP
+          value: None
+
+  - it: headless service should have correct name
+    set:
+      minio.enabled: true
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-herddb-minio-headless
+
+  - it: clusterip service should have correct name
+    set:
+      minio.enabled: true
+    documentIndex: 1
+    asserts:
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-herddb-minio
+
+  - it: clusterip service should expose s3-api port
+    set:
+      minio.enabled: true
+    documentIndex: 1
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            name: s3-api
+            port: 9000
+            targetPort: s3-api
+            protocol: TCP
+
+  - it: clusterip service should expose console port
+    set:
+      minio.enabled: true
+    documentIndex: 1
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            name: console
+            port: 9001
+            targetPort: console
+            protocol: TCP
+
+  - it: services should select minio pods
+    set:
+      minio.enabled: true
+    documentIndex: 1
+    asserts:
+      - equal:
+          path: spec.selector["app.kubernetes.io/component"]
+          value: minio
+
+  - it: should use custom port in clusterip service
+    set:
+      minio.enabled: true
+      minio.port: 9100
+    documentIndex: 1
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            name: s3-api
+            port: 9100
+            targetPort: s3-api
+            protocol: TCP

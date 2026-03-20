@@ -1,0 +1,172 @@
+suite: MinIO StatefulSet
+templates:
+  - templates/minio-statefulset.yaml
+tests:
+  - it: should not render when minio is disabled (default)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render when minio is enabled
+    set:
+      minio.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: StatefulSet
+
+  - it: should have replica count of 1
+    set:
+      minio.enabled: true
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 1
+
+  - it: should reference the headless service
+    set:
+      minio.enabled: true
+    asserts:
+      - equal:
+          path: spec.serviceName
+          value: RELEASE-NAME-herddb-minio-headless
+
+  - it: should use the minio image
+    set:
+      minio.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: quay.io/minio/minio:latest
+
+  - it: should set MINIO_ROOT_USER env var
+    set:
+      minio.enabled: true
+      minio.adminUser: minioadmin
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MINIO_ROOT_USER
+            value: minioadmin
+
+  - it: should set MINIO_ROOT_PASSWORD env var
+    set:
+      minio.enabled: true
+      minio.adminPassword: minioadmin
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MINIO_ROOT_PASSWORD
+            value: minioadmin
+
+  - it: should use custom admin credentials
+    set:
+      minio.enabled: true
+      minio.adminUser: myadmin
+      minio.adminPassword: mypassword
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MINIO_ROOT_USER
+            value: myadmin
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MINIO_ROOT_PASSWORD
+            value: mypassword
+
+  - it: should expose s3-api port
+    set:
+      minio.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: s3-api
+            containerPort: 9000
+            protocol: TCP
+
+  - it: should expose console port 9001
+    set:
+      minio.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: console
+            containerPort: 9001
+            protocol: TCP
+
+  - it: should mount data volume at /data
+    set:
+      minio.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: data
+            mountPath: /data
+
+  - it: should have one volumeClaimTemplate for data
+    set:
+      minio.enabled: true
+    asserts:
+      - lengthEqual:
+          path: spec.volumeClaimTemplates
+          count: 1
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: data
+
+  - it: should use configured storage size
+    set:
+      minio.enabled: true
+      minio.storage.size: 20Gi
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.resources.requests.storage
+          value: 20Gi
+
+  - it: should set storage class when configured
+    set:
+      minio.enabled: true
+      minio.storage.storageClass: fast-ssd
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.storageClassName
+          value: fast-ssd
+
+  - it: should set default resource requests
+    set:
+      minio.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.memory
+          value: 512Mi
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: "0.5"
+
+  - it: should use custom port
+    set:
+      minio.enabled: true
+      minio.port: 9100
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: s3-api
+            containerPort: 9100
+            protocol: TCP
+
+  - it: should have correct component label
+    set:
+      minio.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/component"]
+          value: minio

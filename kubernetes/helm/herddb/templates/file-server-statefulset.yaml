@@ -27,6 +27,7 @@ spec:
           args:
             - file-server
             - console
+            - "/opt/herddb/conf/fileserver.properties"
             - "--port={{ .Values.fileServer.port }}"
             - "--data-dir=/opt/herddb/filedata"
           ports:
@@ -38,6 +39,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /opt/herddb/filedata
+            - name: config
+              mountPath: /opt/herddb/conf
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "herddb.fullname" . }}-file-server-config
   volumeClaimTemplates:
     - metadata:
         name: data

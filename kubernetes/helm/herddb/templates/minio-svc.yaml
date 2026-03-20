@@ -1,0 +1,43 @@
+{{- if .Values.minio.enabled }}
+---
+# Headless service for StatefulSet pod identity
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "herddb.fullname" . }}-minio-headless
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+spec:
+  clusterIP: None
+  selector:
+    {{- include "herddb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+  ports:
+    - name: s3-api
+      port: {{ .Values.minio.port }}
+      targetPort: s3-api
+      protocol: TCP
+---
+# ClusterIP service — stable DNS name for file-server and init job
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "herddb.fullname" . }}-minio
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+spec:
+  selector:
+    {{- include "herddb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+  ports:
+    - name: s3-api
+      port: {{ .Values.minio.port }}
+      targetPort: s3-api
+      protocol: TCP
+    - name: console
+      port: 9001
+      targetPort: console
+      protocol: TCP
+{{- end }}

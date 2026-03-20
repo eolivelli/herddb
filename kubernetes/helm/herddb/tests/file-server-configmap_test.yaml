@@ -1,0 +1,192 @@
+suite: file-server ConfigMap
+templates:
+  - templates/file-server-configmap.yaml
+tests:
+  - it: should render the configmap
+    asserts:
+      - isKind:
+          of: ConfigMap
+
+  - it: should have correct component label
+    asserts:
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: file-server
+
+  - it: should default to local storage mode
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "storage\\.mode=local"
+
+  - it: should include port from values
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "port=9846"
+
+  - it: should include bind.host
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "bind\\.host=0\\.0\\.0\\.0"
+
+  - it: should not include s3 properties when storageMode is local
+    asserts:
+      - notMatchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\."
+
+  - it: should include s3 properties when storageMode is s3
+    set:
+      fileServer.storageMode: s3
+      fileServer.s3.bucket: my-bucket
+      fileServer.s3.accessKey: mykey
+      fileServer.s3.secretKey: mysecret
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "storage\\.mode=s3"
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.bucket=my-bucket"
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.access\\.key=mykey"
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.secret\\.key=mysecret"
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.region=us-east-1"
+
+  - it: should use explicit s3 endpoint when set
+    set:
+      fileServer.storageMode: s3
+      fileServer.s3.endpoint: http://my-minio:9000
+      fileServer.s3.bucket: my-bucket
+      fileServer.s3.accessKey: mykey
+      fileServer.s3.secretKey: mysecret
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.endpoint=http://my-minio:9000"
+
+  - it: should include custom s3 region
+    set:
+      fileServer.storageMode: s3
+      fileServer.s3.bucket: my-bucket
+      fileServer.s3.region: eu-west-1
+      fileServer.s3.accessKey: mykey
+      fileServer.s3.secretKey: mysecret
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.region=eu-west-1"
+
+  - it: should include cache.max.bytes in s3 mode
+    set:
+      fileServer.storageMode: s3
+      fileServer.s3.bucket: my-bucket
+      fileServer.s3.accessKey: mykey
+      fileServer.s3.secretKey: mysecret
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "cache\\.max\\.bytes=1073741824"
+
+  - it: should use custom cacheMaxBytes
+    set:
+      fileServer.storageMode: s3
+      fileServer.s3.bucket: my-bucket
+      fileServer.s3.accessKey: mykey
+      fileServer.s3.secretKey: mysecret
+      fileServer.s3.cacheMaxBytes: 536870912
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "cache\\.max\\.bytes=536870912"
+
+  - it: should include s3.prefix when set
+    set:
+      fileServer.storageMode: s3
+      fileServer.s3.bucket: my-bucket
+      fileServer.s3.accessKey: mykey
+      fileServer.s3.secretKey: mysecret
+      fileServer.s3.prefix: myprefix/
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.prefix=myprefix/"
+
+  - it: should not include s3.prefix when not set
+    set:
+      fileServer.storageMode: s3
+      fileServer.s3.bucket: my-bucket
+      fileServer.s3.accessKey: mykey
+      fileServer.s3.secretKey: mysecret
+    asserts:
+      - notMatchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.prefix="
+
+  - it: should auto-configure endpoint from in-cluster minio when storageMode is s3
+    set:
+      fileServer.storageMode: s3
+      minio.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.endpoint=http://RELEASE-NAME-herddb-minio:9000"
+
+  - it: should auto-configure bucket from minio when storageMode is s3 and bucket not set
+    set:
+      fileServer.storageMode: s3
+      minio.enabled: true
+      minio.bucket: herddb-pages
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.bucket=herddb-pages"
+
+  - it: should auto-configure credentials from minio when storageMode is s3
+    set:
+      fileServer.storageMode: s3
+      minio.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.access\\.key=minioadmin"
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.secret\\.key=minioadmin"
+
+  - it: should prefer explicit s3 endpoint over minio auto-config
+    set:
+      fileServer.storageMode: s3
+      fileServer.s3.endpoint: http://external-minio:9000
+      minio.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.endpoint=http://external-minio:9000"
+      - notMatchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.endpoint=http://RELEASE-NAME-herddb-minio:9000"
+
+  - it: should prefer explicit s3 credentials over minio auto-config
+    set:
+      fileServer.storageMode: s3
+      fileServer.s3.accessKey: customkey
+      fileServer.s3.secretKey: customsecret
+      minio.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.access\\.key=customkey"
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.secret\\.key=customsecret"
+      - notMatchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.access\\.key=minioadmin"

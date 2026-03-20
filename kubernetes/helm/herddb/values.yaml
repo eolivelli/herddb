@@ -38,6 +38,23 @@ server:
 fileServer:
   replicaCount: 2
   port: 9846
+  # Storage backend: "local" (default) or "s3"
+  storageMode: local
+  # S3 / MinIO configuration (used when storageMode=s3)
+  s3:
+    # Endpoint URL — leave empty for AWS S3, set for MinIO or compatible services.
+    # When minio.enabled=true this is auto-set to the in-cluster MinIO service.
+    endpoint: ""
+    # Bucket name. When minio.enabled=true defaults to minio.bucket.
+    bucket: ""
+    region: "us-east-1"
+    # Credentials. When minio.enabled=true defaults to minio.adminUser/adminPassword.
+    accessKey: ""
+    secretKey: ""
+    # Optional key prefix within the bucket
+    prefix: ""
+    # Local disk cache size in bytes (default 1 GB). The PVC is always used as cache dir.
+    cacheMaxBytes: 1073741824
   storage:
     size: 10Gi
     storageClass: ""
@@ -48,6 +65,27 @@ fileServer:
     limits:
       memory: "1Gi"
       cpu: "4"
+
+# Optional in-cluster MinIO instance (single-replica, for development / testing).
+# When enabled together with fileServer.storageMode=s3, the file server is
+# automatically pre-configured to connect to this instance.
+minio:
+  enabled: false
+  adminUser: minioadmin
+  adminPassword: minioadmin
+  port: 9000
+  # Bucket created on startup (used as default s3.bucket for the file server)
+  bucket: herddb-pages
+  storage:
+    size: 10Gi
+    storageClass: ""
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "0.5"
+    limits:
+      memory: "512Mi"
+      cpu: "0.5"
 
 # Tools pod — sleep + pre-configured CLI for kubectl exec
 tools:

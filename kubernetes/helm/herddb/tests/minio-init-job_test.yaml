@@ -1,0 +1,97 @@
+suite: MinIO init Job
+templates:
+  - templates/minio-init-job.yaml
+tests:
+  - it: should not render when minio is disabled (default)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render when minio is enabled
+    set:
+      minio.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Job
+
+  - it: should have post-install hook annotation
+    set:
+      minio.enabled: true
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: post-install,post-upgrade
+
+  - it: should have hook-delete-policy annotation
+    set:
+      minio.enabled: true
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation,hook-succeeded
+
+  - it: should use the minio mc image
+    set:
+      minio.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: quay.io/minio/mc:latest
+
+  - it: should have OnFailure restart policy
+    set:
+      minio.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.restartPolicy
+          value: OnFailure
+
+  - it: should reference the minio clusterip service in the script
+    set:
+      minio.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "RELEASE-NAME-herddb-minio:9000"
+
+  - it: should create the configured bucket
+    set:
+      minio.enabled: true
+      minio.bucket: herddb-pages
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "local/herddb-pages"
+
+  - it: should use custom bucket name
+    set:
+      minio.enabled: true
+      minio.bucket: my-custom-bucket
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "local/my-custom-bucket"
+
+  - it: should use configured admin credentials
+    set:
+      minio.enabled: true
+      minio.adminUser: myadmin
+      minio.adminPassword: mypassword
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "myadmin"
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "mypassword"
+
+  - it: should use custom minio port
+    set:
+      minio.enabled: true
+      minio.port: 9100
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "RELEASE-NAME-herddb-minio:9100"

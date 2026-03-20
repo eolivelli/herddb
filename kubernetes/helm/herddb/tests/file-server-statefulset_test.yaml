@@ -44,6 +44,29 @@ tests:
           path: spec.template.spec.containers[0].args
           content: "--data-dir=/opt/herddb/filedata"
 
+  - it: should pass config file path as CLI arg
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "/opt/herddb/conf/fileserver.properties"
+
+  - it: should mount config volume at /opt/herddb/conf
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: config
+            mountPath: /opt/herddb/conf
+
+  - it: should include config volume sourced from configmap
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: config
+            configMap:
+              name: RELEASE-NAME-herddb-file-server-config
+
   - it: should expose grpc port 9846
     asserts:
       - contains:

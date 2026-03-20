@@ -33,6 +33,7 @@
     <maven.build.timestamp.format>yyyyMMddHHmmss</maven.build.timestamp.format>
     <image.port>7000</image.port>
     <image.port2>9845</image.port2>
+    <image.port3>9846</image.port3>
     <image.workdir>/opt/herddb</image.workdir>
     <image.currentVersion>${project.version}</image.currentVersion>
     <image.server.image.registry />
@@ -127,6 +128,7 @@
                 <ports>
                   <port>${image.port}</port>
                   <port>${image.port2}</port>
+                  <port>${image.port3}</port>
                 </ports>
                 <labels>
                   <org.herddb.maintainer>HerdDB Community</org.herddb.maintainer>

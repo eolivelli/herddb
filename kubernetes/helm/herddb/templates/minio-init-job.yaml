@@ -1,0 +1,39 @@
+{{- if .Values.minio.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "herddb.fullname" . }}-minio-init
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio-init
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        {{- include "herddb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: minio-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              MINIO_URL="http://{{ include "herddb.fullname" . }}-minio:{{ .Values.minio.port }}"
+              echo "Waiting for MinIO at ${MINIO_URL}..."
+              until mc alias set local "${MINIO_URL}" "{{ .Values.minio.adminUser }}" "{{ .Values.minio.adminPassword }}"; do
+                echo "MinIO not ready yet, retrying in 5s..."
+                sleep 5
+              done
+              mc mb --ignore-existing "local/{{ .Values.minio.bucket }}"
+              echo "Bucket '{{ .Values.minio.bucket }}' is ready."
+{{- end }}
