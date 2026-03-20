@@ -109,6 +109,8 @@ public class RemoteFileServerMain {
         int port = Integer.parseInt(configuration.getProperty("port", "9846"));
         String bindHost = configuration.getProperty("bind.host", "0.0.0.0");
         String dataDir = configuration.getProperty("data.dir", "fileserver_" + port);
+        int ioThreads = Integer.parseInt(configuration.getProperty("io.threads",
+                String.valueOf(Runtime.getRuntime().availableProcessors())));
 
         // Per-port PID file so multiple instances can coexist on the same host
         System.setProperty("pidfile", "file-server-" + port + ".java.pid");
@@ -137,7 +139,7 @@ public class RemoteFileServerMain {
         java.nio.file.Path dataDirPath = Paths.get(dataDir).toAbsolutePath();
         System.out.println("Starting RemoteFileServer on " + bindHost + ":" + port + ", data dir: " + dataDirPath);
 
-        runningServer = new RemoteFileServer(bindHost, port, dataDirPath);
+        runningServer = new RemoteFileServer(bindHost, port, dataDirPath, ioThreads);
         try {
             runningServer.start();
             shutdownLatch.await();
