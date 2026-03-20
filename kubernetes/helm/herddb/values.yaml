@@ -37,7 +37,7 @@ server:
 # RemoteFileServer (gRPC page storage)
 fileServer:
   replicaCount: 2
-  port: 9845
+  port: 9846
   storage:
     size: 10Gi
     storageClass: ""

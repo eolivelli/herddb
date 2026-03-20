@@ -36,7 +36,7 @@ tests:
     asserts:
       - contains:
           path: spec.template.spec.containers[0].args
-          content: "--port=9845"
+          content: "--port=9846"
 
   - it: should pass data-dir as CLI arg
     asserts:
@@ -44,13 +44,13 @@ tests:
           path: spec.template.spec.containers[0].args
           content: "--data-dir=/opt/herddb/filedata"
 
-  - it: should expose grpc port 9845
+  - it: should expose grpc port 9846
     asserts:
       - contains:
           path: spec.template.spec.containers[0].ports
           content:
             name: grpc
-            containerPort: 9845
+            containerPort: 9846
             protocol: TCP
 
   - it: should have one volumeClaimTemplate

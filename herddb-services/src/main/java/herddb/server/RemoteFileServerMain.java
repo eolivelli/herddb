@@ -106,7 +106,7 @@ public class RemoteFileServerMain {
             }
         }
 
-        int port = Integer.parseInt(configuration.getProperty("port", "9845"));
+        int port = Integer.parseInt(configuration.getProperty("port", "9846"));
         String bindHost = configuration.getProperty("bind.host", "0.0.0.0");
         String dataDir = configuration.getProperty("data.dir", "fileserver_" + port);
 
