@@ -70,12 +70,16 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
 
     @Override
     public void writeFile(WriteFileRequest request, StreamObserver<WriteFileResponse> responseObserver) {
+        long start = System.nanoTime();
         try {
             Path target = resolvePath(request.getPath());
             Files.createDirectories(target.getParent());
             Path tmp = target.getParent().resolve(target.getFileName() + ".tmp");
-            Files.write(tmp, request.getContent().toByteArray());
+            byte[] content = request.getContent().toByteArray();
+            Files.write(tmp, content);
             Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            LOGGER.log(Level.INFO, "writeFile path={0} size={1} time={2}ms",
+                    new Object[]{request.getPath(), content.length, elapsedMs(start)});
             responseObserver.onNext(WriteFileResponse.newBuilder().setOk(true).build());
             responseObserver.onCompleted();
         } catch (IOException e) {
@@ -86,12 +90,17 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
 
     @Override
     public void readFile(ReadFileRequest request, StreamObserver<ReadFileResponse> responseObserver) {
+        long start = System.nanoTime();
         try {
             Path target = resolvePath(request.getPath());
             if (!Files.exists(target)) {
+                LOGGER.log(Level.INFO, "readFile path={0} size=0 found=false time={1}ms",
+                        new Object[]{request.getPath(), elapsedMs(start)});
                 responseObserver.onNext(ReadFileResponse.newBuilder().setFound(false).build());
             } else {
                 byte[] content = Files.readAllBytes(target);
+                LOGGER.log(Level.INFO, "readFile path={0} size={1} time={2}ms",
+                        new Object[]{request.getPath(), content.length, elapsedMs(start)});
                 responseObserver.onNext(ReadFileResponse.newBuilder()
                         .setFound(true)
                         .setContent(ByteString.copyFrom(content))
@@ -106,9 +115,13 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
 
     @Override
     public void deleteFile(DeleteFileRequest request, StreamObserver<DeleteFileResponse> responseObserver) {
+        long start = System.nanoTime();
         try {
             Path target = resolvePath(request.getPath());
+            long size = Files.exists(target) ? Files.size(target) : 0;
             boolean deleted = Files.deleteIfExists(target);
+            LOGGER.log(Level.INFO, "deleteFile path={0} size={1} deleted={2} time={3}ms",
+                    new Object[]{request.getPath(), size, deleted, elapsedMs(start)});
             responseObserver.onNext(DeleteFileResponse.newBuilder().setDeleted(deleted).build());
             responseObserver.onCompleted();
         } catch (IOException e) {
@@ -119,10 +132,13 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
 
     @Override
     public void listFiles(ListFilesRequest request, StreamObserver<ListFilesResponse> responseObserver) {
+        long start = System.nanoTime();
         try {
             String prefix = request.getPrefix();
             List<String> found = new ArrayList<>();
             collectMatchingPaths(baseDirectory, prefix, found);
+            LOGGER.log(Level.INFO, "listFiles prefix={0} count={1} time={2}ms",
+                    new Object[]{prefix, found.size(), elapsedMs(start)});
             responseObserver.onNext(ListFilesResponse.newBuilder().addAllPaths(found).build());
             responseObserver.onCompleted();
         } catch (IOException e) {
@@ -133,6 +149,7 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
 
     @Override
     public void deleteByPrefix(DeleteByPrefixRequest request, StreamObserver<DeleteByPrefixResponse> responseObserver) {
+        long start = System.nanoTime();
         try {
             String prefix = request.getPrefix();
             List<String> found = new ArrayList<>();
@@ -144,12 +161,18 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
                     count++;
                 }
             }
+            LOGGER.log(Level.INFO, "deleteByPrefix prefix={0} deletedCount={1} time={2}ms",
+                    new Object[]{prefix, count, elapsedMs(start)});
             responseObserver.onNext(DeleteByPrefixResponse.newBuilder().setDeletedCount(count).build());
             responseObserver.onCompleted();
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "deleteByPrefix failed for prefix " + request.getPrefix(), e);
             responseObserver.onError(Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
         }
+    }
+
+    private static long elapsedMs(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000;
     }
 
     private void collectMatchingPaths(Path base, String prefix, List<String> results) throws IOException {
