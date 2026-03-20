@@ -47,7 +47,7 @@ public class VectorBench {
         // Phase 2: Drop table (if requested)
         if (config.dropTable) {
             System.out.println("Dropping table " + config.tableName + "...");
-            try (Connection conn = DriverManager.getConnection(config.jdbcUrl, config.username, config.password);
+            try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
                  Statement stmt = conn.createStatement()) {
                 stmt.execute("DROP TABLE IF EXISTS " + config.tableName);
             }
@@ -56,7 +56,7 @@ public class VectorBench {
 
         // Phase 3: Schema creation
         System.out.println("Creating table " + config.tableName + "...");
-        try (Connection conn = DriverManager.getConnection(config.jdbcUrl, config.username, config.password);
+        try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
              Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE TABLE IF NOT EXISTS " + config.tableName
                     + " (id int primary key, vec floata not null)");
@@ -103,7 +103,7 @@ public class VectorBench {
             // Verify row count matches ingested records
             if (!config.skipVerify) {
                 long expectedRows = ingestMetrics.getCount();
-                try (Connection conn = DriverManager.getConnection(config.jdbcUrl, config.username, config.password);
+                try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
                      Statement stmt = conn.createStatement();
                      java.sql.ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM " + config.tableName)) {
                     rs.next();
@@ -121,11 +121,22 @@ public class VectorBench {
             System.out.println();
         }
 
+        // Phase 4b: Checkpoint after ingestion
+        if (config.checkpoint && !config.skipIngest) {
+            System.out.println("=== CHECKPOINT (post-ingest) ===");
+            long t = System.nanoTime();
+            try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+                 Statement stmt = conn.createStatement()) {
+                stmt.execute("EXECUTE CHECKPOINT 'herd'");
+            }
+            System.out.printf("Checkpoint done in %.1fs%n%n", (System.nanoTime() - t) / 1e9);
+        }
+
         // Phase 5: Index creation
         if (!config.skipIndex) {
             System.out.println("=== INDEX CREATION ===");
             long indexStart = System.nanoTime();
-            try (Connection conn = DriverManager.getConnection(config.jdbcUrl, config.username, config.password);
+            try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
                  Statement stmt = conn.createStatement()) {
                 String indexSql = "CREATE VECTOR INDEX vidx ON " + config.tableName + "(vec)"
                         + " WITH m=" + config.indexM
@@ -139,6 +150,17 @@ public class VectorBench {
         } else {
             System.out.println("Skipping index creation.");
             System.out.println();
+        }
+
+        // Phase 5b: Checkpoint after index creation
+        if (config.checkpoint && !config.skipIndex) {
+            System.out.println("=== CHECKPOINT (post-index) ===");
+            long t = System.nanoTime();
+            try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+                 Statement stmt = conn.createStatement()) {
+                stmt.execute("EXECUTE CHECKPOINT 'herd'");
+            }
+            System.out.printf("Checkpoint done in %.1fs%n%n", (System.nanoTime() - t) / 1e9);
         }
 
         // Phase 6: Queries

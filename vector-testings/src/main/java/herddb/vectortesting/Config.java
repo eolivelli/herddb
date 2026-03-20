@@ -30,6 +30,8 @@ public class Config {
     boolean skipIndex = false;
     boolean skipVerify = false;
     boolean dropTable = false;
+    boolean checkpoint = false;
+    int clientTimeoutSeconds = 7200; // 2 hours
 
     private static Options buildOptions() {
         Options opts = new Options();
@@ -52,6 +54,8 @@ public class Config {
         opts.addOption(null, "skip-index", false, "Skip index creation");
         opts.addOption(null, "skip-verify", false, "Skip row count verification after ingestion");
         opts.addOption(null, "drop-table", false, "Drop table before starting");
+        opts.addOption(null, "checkpoint", false, "Force checkpoint after ingestion and after index creation");
+        opts.addOption(null, "client-timeout", true, "Client request timeout in seconds (default: 7200)");
         opts.addOption(null, "config", true, "Path to properties file");
         opts.addOption("h", "help", false, "Show help");
         return opts;
@@ -99,6 +103,8 @@ public class Config {
         if (cmd.hasOption("skip-index")) cfg.skipIndex = true;
         if (cmd.hasOption("skip-verify")) cfg.skipVerify = true;
         if (cmd.hasOption("drop-table")) cfg.dropTable = true;
+        if (cmd.hasOption("checkpoint")) cfg.checkpoint = true;
+        if (cmd.hasOption("client-timeout")) cfg.clientTimeoutSeconds = Integer.parseInt(cmd.getOptionValue("client-timeout"));
 
         return cfg;
     }
@@ -123,6 +129,15 @@ public class Config {
         if (props.containsKey("skip-index")) skipIndex = Boolean.parseBoolean(props.getProperty("skip-index"));
         if (props.containsKey("skip-verify")) skipVerify = Boolean.parseBoolean(props.getProperty("skip-verify"));
         if (props.containsKey("drop-table")) dropTable = Boolean.parseBoolean(props.getProperty("drop-table"));
+        if (props.containsKey("checkpoint")) checkpoint = Boolean.parseBoolean(props.getProperty("checkpoint"));
+        if (props.containsKey("client-timeout")) clientTimeoutSeconds = Integer.parseInt(props.getProperty("client-timeout"));
+    }
+
+    /** Returns the JDBC URL with client.timeout embedded as a query parameter. */
+    String effectiveJdbcUrl() {
+        long timeoutMs = (long) clientTimeoutSeconds * 1000;
+        String sep = jdbcUrl.contains("?") ? "&" : "?";
+        return jdbcUrl + sep + "client.timeout=" + timeoutMs;
     }
 
     private static DatasetLoader.DatasetPreset parseDataset(String value) {
@@ -153,6 +168,8 @@ public class Config {
                 + ", skipIndex=" + skipIndex
                 + ", skipVerify=" + skipVerify
                 + ", dropTable=" + dropTable
+                + ", checkpoint=" + checkpoint
+                + ", clientTimeoutSeconds=" + clientTimeoutSeconds
                 + '}';
     }
 }

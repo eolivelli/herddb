@@ -30,7 +30,7 @@ public class QueryWorker implements Runnable {
     public void run() {
         String sql = "SELECT id FROM " + config.tableName
                 + " ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT " + config.topK;
-        try (Connection conn = DriverManager.getConnection(config.jdbcUrl, config.username, config.password)) {
+        try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password)) {
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 for (int i = startIdx; i < endIdx; i++) {
                     long start = System.nanoTime();

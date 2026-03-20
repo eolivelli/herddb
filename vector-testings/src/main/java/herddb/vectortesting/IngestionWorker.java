@@ -28,7 +28,7 @@ public class IngestionWorker implements Runnable {
     @Override
     public void run() {
         String sql = "INSERT INTO " + config.tableName + "(id, vec) VALUES(?, ?)";
-        try (Connection conn = DriverManager.getConnection(config.jdbcUrl, config.username, config.password)) {
+        try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password)) {
             conn.setAutoCommit(false);
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 int batchCount = 0;
