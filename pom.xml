@@ -111,6 +111,8 @@
         <libs.grpc>1.68.2</libs.grpc>
         <libs.protobuf>3.25.5</libs.protobuf>
         <libs.caffeine>3.1.8</libs.caffeine>
+        <libs.awssdk>2.25.70</libs.awssdk>
+        <libs.testcontainers>1.19.7</libs.testcontainers>
     </properties>
 
     <dependencies>
@@ -509,6 +511,20 @@
                 <groupId>com.github.ben-manes.caffeine</groupId>
                 <artifactId>caffeine</artifactId>
                 <version>${libs.caffeine}</version>
+            </dependency>
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${libs.awssdk}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${libs.testcontainers}</version>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
         </dependencies>
     </dependencyManagement>

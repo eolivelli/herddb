@@ -139,7 +139,7 @@ public class RemoteFileServerMain {
         java.nio.file.Path dataDirPath = Paths.get(dataDir).toAbsolutePath();
         System.out.println("Starting RemoteFileServer on " + bindHost + ":" + port + ", data dir: " + dataDirPath);
 
-        runningServer = new RemoteFileServer(bindHost, port, dataDirPath, ioThreads);
+        runningServer = new RemoteFileServer(bindHost, port, dataDirPath, ioThreads, configuration);
         try {
             runningServer.start();
             shutdownLatch.await();
