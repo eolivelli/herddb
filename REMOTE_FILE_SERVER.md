@@ -21,8 +21,8 @@ HerdDB Server (DBManager)
         │     │           └── {ledger}.{offset}.checkpoint
         └── RemoteFileServiceClient
               ├── ConsistentHashRouter (Murmur3)
-              ├── gRPC channel → RemoteFileServer A  (port 9845)
-              └── gRPC channel → RemoteFileServer B  (port 9846)
+              ├── gRPC channel → RemoteFileServer A  (port 9846)
+              └── gRPC channel → RemoteFileServer B  (port 9847)
 ```
 
 ### Remote path convention
@@ -134,8 +134,8 @@ To run HerdDB with remote page storage, set `server.mode=remote-file-service` in
 server.mode=remote-file-service
 
 # Comma-separated list of RemoteFileServer addresses (host:port)
-# Default: localhost:9845
-remote.file.servers=host1:9845,host2:9845
+# Default: localhost:9846
+remote.file.servers=host1:9846,host2:9846
 
 # Local directory for metadata (checkpoint files, schemas, transactions)
 server.data.dir=data
@@ -149,7 +149,7 @@ All other standalone-mode settings apply (commit log dir, metadata dir, etc.). T
 ### Starting a RemoteFileServer
 
 ```java
-RemoteFileServer server = new RemoteFileServer("0.0.0.0", 9845, Paths.get("/data/remote"));
+RemoteFileServer server = new RemoteFileServer("0.0.0.0", 9846, Paths.get("/data/remote"));
 server.start();
 // ...
 server.stop();
@@ -158,7 +158,7 @@ server.stop();
 Or from the command line (once a launcher is added):
 
 ```
-java -cp herddb-remote-file-service.jar herddb.remote.RemoteFileServer --port 9845 --dir /data/remote
+java -cp herddb-remote-file-service.jar herddb.remote.RemoteFileServer --port 9846 --dir /data/remote
 ```
 
 ---
