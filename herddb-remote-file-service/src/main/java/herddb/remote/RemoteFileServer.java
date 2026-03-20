@@ -24,7 +24,11 @@ import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -40,12 +44,19 @@ public class RemoteFileServer implements AutoCloseable {
     private final String host;
     private final int port;
     private final Path dataDirectory;
+    private final int ioThreads;
     private Server server;
+    private ExecutorService metadataExecutor;
 
-    public RemoteFileServer(String host, int port, Path dataDirectory) {
+    public RemoteFileServer(String host, int port, Path dataDirectory, int ioThreads) {
         this.host = host;
         this.port = port;
         this.dataDirectory = dataDirectory;
+        this.ioThreads = ioThreads;
+    }
+
+    public RemoteFileServer(String host, int port, Path dataDirectory) {
+        this(host, port, dataDirectory, Runtime.getRuntime().availableProcessors());
     }
 
     public RemoteFileServer(int port, Path dataDirectory) {
@@ -53,13 +64,21 @@ public class RemoteFileServer implements AutoCloseable {
     }
 
     public void start() throws IOException {
-        RemoteFileServiceImpl serviceImpl = new RemoteFileServiceImpl(dataDirectory);
+        AtomicInteger threadId = new AtomicInteger();
+        ThreadFactory threadFactory = r -> {
+            Thread t = new Thread(r, "remote-file-meta-" + threadId.getAndIncrement());
+            t.setDaemon(true);
+            return t;
+        };
+        metadataExecutor = Executors.newFixedThreadPool(ioThreads, threadFactory);
+
+        RemoteFileServiceImpl serviceImpl = new RemoteFileServiceImpl(dataDirectory, metadataExecutor);
         server = ServerBuilder.forPort(port)
                 .addService(serviceImpl)
                 .build()
                 .start();
-        LOGGER.log(Level.INFO, "RemoteFileServer started on port {0}, data dir: {1}",
-                new Object[]{port, dataDirectory});
+        LOGGER.log(Level.INFO, "RemoteFileServer started on port {0}, data dir: {1}, io threads: {2}",
+                new Object[]{port, dataDirectory, ioThreads});
     }
 
     public int getPort() {
@@ -78,6 +97,10 @@ public class RemoteFileServer implements AutoCloseable {
         if (server != null) {
             server.shutdown().awaitTermination(30, TimeUnit.SECONDS);
             LOGGER.log(Level.INFO, "RemoteFileServer stopped");
+        }
+        if (metadataExecutor != null) {
+            metadataExecutor.shutdown();
+            metadataExecutor.awaitTermination(30, TimeUnit.SECONDS);
         }
     }
 

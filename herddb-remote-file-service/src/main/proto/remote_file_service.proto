@@ -27,7 +27,7 @@ service RemoteFileService {
     rpc WriteFile (WriteFileRequest) returns (WriteFileResponse);
     rpc ReadFile (ReadFileRequest) returns (ReadFileResponse);
     rpc DeleteFile (DeleteFileRequest) returns (DeleteFileResponse);
-    rpc ListFiles (ListFilesRequest) returns (ListFilesResponse);
+    rpc ListFiles (ListFilesRequest) returns (stream ListFilesEntry);
     rpc DeleteByPrefix (DeleteByPrefixRequest) returns (DeleteByPrefixResponse);
 }
 
@@ -37,7 +37,7 @@ message WriteFileRequest {
 }
 
 message WriteFileResponse {
-    bool ok = 1;
+    int64 written_size = 1;
 }
 
 message ReadFileRequest {
@@ -61,8 +61,8 @@ message ListFilesRequest {
     string prefix = 1;
 }
 
-message ListFilesResponse {
-    repeated string paths = 1;
+message ListFilesEntry {
+    string path = 1;
 }
 
 message DeleteByPrefixRequest {

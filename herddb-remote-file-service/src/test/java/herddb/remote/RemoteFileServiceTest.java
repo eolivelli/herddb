@@ -22,14 +22,16 @@ package herddb.remote;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import com.google.protobuf.ByteString;
 import herddb.remote.proto.DeleteByPrefixRequest;
 import herddb.remote.proto.DeleteByPrefixResponse;
 import herddb.remote.proto.DeleteFileRequest;
 import herddb.remote.proto.DeleteFileResponse;
+import herddb.remote.proto.ListFilesEntry;
 import herddb.remote.proto.ListFilesRequest;
-import herddb.remote.proto.ListFilesResponse;
 import herddb.remote.proto.ReadFileRequest;
 import herddb.remote.proto.ReadFileResponse;
 import herddb.remote.proto.RemoteFileServiceGrpc;
@@ -38,7 +40,10 @@ import herddb.remote.proto.WriteFileResponse;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.junit.After;
 import org.junit.Before;
@@ -47,7 +52,7 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 /**
- * Tests for RemoteFileService via raw gRPC stubs.
+ * Tests for RemoteFileService via raw gRPC stubs and async client APIs.
  *
  * @author enrico.olivelli
  */
@@ -85,7 +90,7 @@ public class RemoteFileServiceTest {
                 .setPath("ts1/uuid1/data/1.page")
                 .setContent(ByteString.copyFrom(data))
                 .build());
-        assertTrue(writeResp.getOk());
+        assertEquals(data.length, writeResp.getWrittenSize());
 
         ReadFileResponse readResp = stub.readFile(ReadFileRequest.newBuilder()
                 .setPath("ts1/uuid1/data/1.page")
@@ -144,10 +149,12 @@ public class RemoteFileServiceTest {
                 .setContent(ByteString.copyFromUtf8("c"))
                 .build());
 
-        ListFilesResponse listResp = stub.listFiles(ListFilesRequest.newBuilder()
+        // Server-streaming: blocking stub returns an Iterator
+        Iterator<ListFilesEntry> it = stub.listFiles(ListFilesRequest.newBuilder()
                 .setPrefix("ts1/uuid1/data/")
                 .build());
-        List<String> paths = listResp.getPathsList();
+        List<String> paths = new ArrayList<>();
+        it.forEachRemaining(entry -> paths.add(entry.getPath()));
         assertEquals(2, paths.size());
         assertTrue(paths.stream().allMatch(p -> p.startsWith("ts1/uuid1/data/")));
     }
@@ -173,11 +180,51 @@ public class RemoteFileServiceTest {
         assertEquals(2, resp.getDeletedCount());
 
         // ts1/uuid4/data/1.page still exists
-        ListFilesResponse listResp = stub.listFiles(ListFilesRequest.newBuilder()
+        Iterator<ListFilesEntry> it = stub.listFiles(ListFilesRequest.newBuilder()
                 .setPrefix("ts1/")
                 .build());
-        List<String> remaining = listResp.getPathsList();
+        List<String> remaining = new ArrayList<>();
+        it.forEachRemaining(entry -> remaining.add(entry.getPath()));
         assertEquals(1, remaining.size());
         assertTrue(remaining.get(0).startsWith("ts1/uuid4/"));
+    }
+
+    @Test
+    public void testAsyncClientApis() throws Exception {
+        List<String> servers = List.of("localhost:" + server.getPort());
+        try (RemoteFileServiceClient client = new RemoteFileServiceClient(servers)) {
+            byte[] data = "async test data".getBytes(StandardCharsets.UTF_8);
+
+            // Async write
+            CompletableFuture<Long> writeFuture = client.writeFileAsync("async/test/1.page", data);
+            long writtenSize = writeFuture.get(5, TimeUnit.SECONDS);
+            assertEquals(data.length, writtenSize);
+
+            // Async read
+            CompletableFuture<byte[]> readFuture = client.readFileAsync("async/test/1.page");
+            byte[] content = readFuture.get(5, TimeUnit.SECONDS);
+            assertNotNull(content);
+            assertEquals("async test data", new String(content, StandardCharsets.UTF_8));
+
+            // Async read missing
+            CompletableFuture<byte[]> missingFuture = client.readFileAsync("async/missing.page");
+            assertNull(missingFuture.get(5, TimeUnit.SECONDS));
+
+            // Async list
+            CompletableFuture<List<String>> listFuture = client.listFilesAsync("async/test/");
+            List<String> listed = listFuture.get(5, TimeUnit.SECONDS);
+            assertEquals(1, listed.size());
+            assertEquals("async/test/1.page", listed.get(0));
+
+            // Async delete
+            CompletableFuture<Boolean> deleteFuture = client.deleteFileAsync("async/test/1.page");
+            assertTrue(deleteFuture.get(5, TimeUnit.SECONDS));
+
+            // Async deleteByPrefix
+            client.writeFileAsync("pfx/a.page", "a".getBytes()).get(5, TimeUnit.SECONDS);
+            client.writeFileAsync("pfx/b.page", "b".getBytes()).get(5, TimeUnit.SECONDS);
+            CompletableFuture<Integer> delPfxFuture = client.deleteByPrefixAsync("pfx/");
+            assertEquals(2, (int) delPfxFuture.get(5, TimeUnit.SECONDS));
+        }
     }
 }
