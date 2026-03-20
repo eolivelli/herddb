@@ -325,6 +325,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
     }
 
     private DataStorageManager buildDataStorageManager(String nodeId) {
+        LOGGER.log(Level.INFO, "Local storage manager mode is {0}, for nodeId {1}", new Object[] {mode, nodeId});
         switch (mode) {
             case ServerConfiguration.PROPERTY_MODE_LOCAL:
                 return new MemoryDataStorageManager();
@@ -347,6 +348,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 int diskswapThreshold = configuration.getInt(ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS, ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS_DEFAULT);
                 String remoteServers = configuration.getString(ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS, ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
                 List<String> servers = Arrays.asList(remoteServers.split(","));
+                LOGGER.log(Level.INFO, "Remote file services are {0}", servers);
                 try {
                     Class<?> clientClass = Class.forName("herddb.remote.RemoteFileServiceClient");
                     Object client = clientClass.getConstructor(List.class).newInstance(servers);
