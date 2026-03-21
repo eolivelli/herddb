@@ -42,10 +42,13 @@ public class MySQLTransport implements CustomTransport {
     public static final int PROPERTY_MYSQL_PORT_DEFAULT = 3307;
     public static final String PROPERTY_MYSQL_HOST = "mysql.protocol.host";
     public static final String PROPERTY_MYSQL_HOST_DEFAULT = "0.0.0.0";
+    public static final String PROPERTY_MYSQL_SOCKET = "mysql.protocol.socket";
+    public static final String PROPERTY_MYSQL_SOCKET_DEFAULT = "";
 
     private boolean enabled;
     private String host;
     private int port;
+    private String socketPath;
     private MySQLServer mysqlServer;
     private HerdDBMySQLCommandHandler handler;
 
@@ -58,10 +61,13 @@ public class MySQLTransport implements CustomTransport {
         }
         this.host = configuration.getString(PROPERTY_MYSQL_HOST, PROPERTY_MYSQL_HOST_DEFAULT);
         this.port = configuration.getInt(PROPERTY_MYSQL_PORT, PROPERTY_MYSQL_PORT_DEFAULT);
+        this.socketPath = configuration.getString(PROPERTY_MYSQL_SOCKET, PROPERTY_MYSQL_SOCKET_DEFAULT);
         this.handler = new HerdDBMySQLCommandHandler(manager, server.getUserManager());
-        this.mysqlServer = new MySQLServer(host, port, handler);
-        LOGGER.log(Level.INFO, "MySQL protocol transport initialized on {0}:{1}",
-                new Object[]{host, port});
+        this.mysqlServer = new MySQLServer(host, port,
+                socketPath.isEmpty() ? null : socketPath, handler);
+        LOGGER.log(Level.INFO, "MySQL protocol transport initialized on {0}:{1}{2}",
+                new Object[]{host, port,
+                        socketPath.isEmpty() ? "" : ", unix socket: " + socketPath});
     }
 
     @Override

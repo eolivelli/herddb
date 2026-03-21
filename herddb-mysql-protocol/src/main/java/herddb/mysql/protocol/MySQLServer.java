@@ -25,15 +25,20 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.epoll.Epoll;
+import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.epoll.EpollServerDomainSocketChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.unix.DomainSocketAddress;
+import java.io.File;
 import java.net.InetSocketAddress;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
  * MySQL protocol server backed by Netty.
+ * Supports both TCP and Unix domain socket listeners.
  */
 public class MySQLServer {
 
@@ -41,20 +46,40 @@ public class MySQLServer {
 
     private final String host;
     private final int port;
+    private final String socketPath;
     private final MySQLCommandHandler commandHandler;
 
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel serverChannel;
 
+    private EventLoopGroup unixBossGroup;
+    private EventLoopGroup unixWorkerGroup;
+    private Channel unixServerChannel;
+
     public MySQLServer(String host, int port, MySQLCommandHandler commandHandler) {
+        this(host, port, null, commandHandler);
+    }
+
+    public MySQLServer(String host, int port, String socketPath, MySQLCommandHandler commandHandler) {
         this.host = host;
         this.port = port;
+        this.socketPath = socketPath;
         this.commandHandler = commandHandler;
     }
 
+    private ChannelInitializer<Channel> newChannelInitializer() {
+        return new ChannelInitializer<Channel>() {
+            @Override
+            protected void initChannel(Channel ch) throws Exception {
+                ch.pipeline().addLast(new MySQLPacketDecoder());
+                ch.pipeline().addLast(new MySQLConnectionHandler(commandHandler));
+            }
+        };
+    }
+
     /**
-     * Start the server and bind to the configured host/port.
+     * Start the server and bind to the configured host/port and optional Unix socket.
      *
      * @throws InterruptedException if interrupted while binding
      */
@@ -65,19 +90,43 @@ public class MySQLServer {
         ServerBootstrap bootstrap = new ServerBootstrap();
         bootstrap.group(bossGroup, workerGroup)
                 .channel(NioServerSocketChannel.class)
-                .childHandler(new ChannelInitializer<SocketChannel>() {
-                    @Override
-                    protected void initChannel(SocketChannel ch) throws Exception {
-                        ch.pipeline().addLast(new MySQLPacketDecoder());
-                        ch.pipeline().addLast(new MySQLConnectionHandler(commandHandler));
-                    }
-                })
+                .childHandler(newChannelInitializer())
                 .childOption(ChannelOption.SO_KEEPALIVE, true)
                 .childOption(ChannelOption.TCP_NODELAY, true);
 
         serverChannel = bootstrap.bind(host, port).sync().channel();
         LOG.log(Level.INFO, "MySQL protocol server started on {0}:{1}",
                 new Object[]{host, getPort()});
+
+        if (socketPath != null && !socketPath.isEmpty()) {
+            startUnixSocket();
+        }
+    }
+
+    private void startUnixSocket() throws InterruptedException {
+        if (!Epoll.isAvailable()) {
+            LOG.log(Level.WARNING,
+                    "Unix domain socket requested at {0} but epoll is not available: {1}",
+                    new Object[]{socketPath, Epoll.unavailabilityCause()});
+            return;
+        }
+
+        // Delete stale socket file if it exists
+        File socketFile = new File(socketPath);
+        if (socketFile.exists()) {
+            socketFile.delete();
+        }
+
+        unixBossGroup = new EpollEventLoopGroup(1);
+        unixWorkerGroup = new EpollEventLoopGroup();
+
+        ServerBootstrap unixBootstrap = new ServerBootstrap();
+        unixBootstrap.group(unixBossGroup, unixWorkerGroup)
+                .channel(EpollServerDomainSocketChannel.class)
+                .childHandler(newChannelInitializer());
+
+        unixServerChannel = unixBootstrap.bind(new DomainSocketAddress(socketPath)).sync().channel();
+        LOG.log(Level.INFO, "MySQL protocol server listening on Unix socket {0}", socketPath);
     }
 
     /**
@@ -92,9 +141,31 @@ public class MySQLServer {
     }
 
     /**
+     * Get the Unix domain socket path, or null if not configured.
+     */
+    public String getSocketPath() {
+        return socketPath;
+    }
+
+    /**
      * Stop the server and release all resources.
      */
     public void close() {
+        if (unixServerChannel != null) {
+            unixServerChannel.close().syncUninterruptibly();
+        }
+        if (unixBossGroup != null) {
+            unixBossGroup.shutdownGracefully();
+        }
+        if (unixWorkerGroup != null) {
+            unixWorkerGroup.shutdownGracefully();
+        }
+        if (socketPath != null) {
+            File socketFile = new File(socketPath);
+            if (socketFile.exists()) {
+                socketFile.delete();
+            }
+        }
         if (serverChannel != null) {
             serverChannel.close().syncUninterruptibly();
         }
