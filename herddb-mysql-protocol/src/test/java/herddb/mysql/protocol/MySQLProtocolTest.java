@@ -174,4 +174,44 @@ public class MySQLProtocolTest {
         conn.close();
         assertTrue(conn.isClosed());
     }
+
+    @Test
+    public void testAuthenticationRejected() throws Exception {
+        // Start a server that rejects all auth attempts
+        MySQLCommandHandler rejectHandler = new MySQLCommandHandler() {
+            @Override
+            public boolean authenticate(String username, byte[] scrambledPassword, byte[] challenge, String database) {
+                return false;
+            }
+
+            @Override
+            public CompletableFuture<QueryResult> executeQuery(long connectionId, String sql) {
+                return CompletableFuture.completedFuture(
+                        new OkResult(0, 0, ServerStatusFlags.SERVER_STATUS_AUTOCOMMIT));
+            }
+
+            @Override
+            public void useDatabase(long connectionId, String database) {
+            }
+
+            @Override
+            public void connectionClosed(long connectionId) {
+            }
+        };
+
+        MySQLServer rejectServer = new MySQLServer("localhost", 0, rejectHandler);
+        try {
+            rejectServer.start();
+            int rejectPort = rejectServer.getPort();
+            String url = "jdbc:mysql://localhost:" + rejectPort + "/test?useSSL=false&allowPublicKeyRetrieval=true&useServerPrepStmts=false";
+            try {
+                DriverManager.getConnection(url, "sa", "wrongpassword");
+                fail("Should have thrown SQLException for rejected auth");
+            } catch (SQLException e) {
+                assertTrue(e.getMessage().contains("Access denied"));
+            }
+        } finally {
+            rejectServer.close();
+        }
+    }
 }

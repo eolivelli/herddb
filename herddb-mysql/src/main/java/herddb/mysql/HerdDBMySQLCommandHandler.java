@@ -96,7 +96,11 @@ public class HerdDBMySQLCommandHandler implements MySQLCommandHandler {
                 return false;
             }
             if (scrambledPassword == null || scrambledPassword.length == 0) {
-                return expectedPassword.isEmpty();
+                if (expectedPassword.isEmpty()) {
+                    return true;
+                }
+                LOGGER.log(Level.WARNING, "Authentication failed for user {0}: no password provided", username);
+                return false;
             }
             // mysql_native_password: client sends SHA1(password) XOR SHA1(seed + SHA1(SHA1(password)))
             byte[] expected = computeMySQLNativePasswordScramble(challenge, expectedPassword);
