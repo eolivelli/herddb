@@ -46,7 +46,7 @@ CONFIGFILE=conf/server.properties
 sed -i 's/server.mode=standalone/server.mode=remote-file-service/g' $CONFIGFILE
 sed -i 's/#http.enable=true/http.enable=false/g' $CONFIGFILE
 sed -i 's/server.halt.on.tablespace.boot.error=true/server.halt.on.tablespace.boot.error=false/g' $CONFIGFILE
-export JAVA_OPTS="-XX:+UseG1GC -Duser.language=en -Xmx5g -Xms5g -Dio.netty.maxDirectMemory=0 -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=2g -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$SERVER1DIR/server-heapdump.hprof"
+export JAVA_OPTS="-XX:+UseG1GC -Duser.language=en -Xmx7g -Xms7g -Dio.netty.maxDirectMemory=0 -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$SERVER1DIR/server-heapdump.hprof"
 bin/service server start
 cd ../..
 
