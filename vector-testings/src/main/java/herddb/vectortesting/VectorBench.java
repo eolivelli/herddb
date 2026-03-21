@@ -15,8 +15,41 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class VectorBench {
+
+    @FunctionalInterface
+    interface SqlTask { void run() throws Exception; }
+
+    private static void runWithProgress(String label, SqlTask task) throws Exception {
+        System.out.println(label);
+        char[] spinner = {'|', '/', '-', '\\'};
+        int[] spinIdx = {0};
+        long startNs = System.nanoTime();
+        Exception[] err = {null};
+
+        Thread worker = new Thread(() -> {
+            try { task.run(); }
+            catch (Exception e) { err[0] = e; }
+        });
+        worker.start();
+
+        while (worker.isAlive()) {
+            double elapsed = (System.nanoTime() - startNs) / 1e9;
+            int filled = Math.min(40, (int)(elapsed / 5));
+            String bar = "=".repeat(filled) + " ".repeat(40 - filled);
+            System.out.printf("\r  [%s] %c %.0fs...", bar, spinner[spinIdx[0] % 4], elapsed);
+            System.out.flush();
+            spinIdx[0]++;
+            worker.join(500);
+        }
+
+        double totalSecs = (System.nanoTime() - startNs) / 1e9;
+        System.out.printf("\r  [%s] done in %.1fs%n", "=".repeat(40), totalSecs);
+
+        if (err[0] != null) throw err[0];
+    }
 
     public static void main(String[] args) throws Exception {
         Config config = Config.parse(args);
@@ -68,7 +101,7 @@ public class VectorBench {
         if (!config.skipIngest) {
             System.out.println("=== INGESTION PHASE ===");
             MetricsCollector ingestMetrics = new MetricsCollector();
-            long ingestStart = System.nanoTime();
+            AtomicReference<String> ingestStatus = new AtomicReference<>("");
 
             BlockingQueue<float[]> ingestQueue = new ArrayBlockingQueue<>(1000);
             AtomicBoolean producerDone = new AtomicBoolean(false);
@@ -76,7 +109,7 @@ public class VectorBench {
 
             ExecutorService ingestPool = Executors.newFixedThreadPool(config.ingestThreads);
             for (int t = 0; t < config.ingestThreads; t++) {
-                ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId, ingestMetrics));
+                ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId, ingestMetrics, ingestStatus));
             }
 
             try (DatasetLoader.VectorStream stream = loader.streamBaseVectors(actualRows)) {
@@ -89,11 +122,20 @@ public class VectorBench {
                 ingestQueue.put(new float[0]); // poison pills
             }
             ingestPool.shutdown();
-            ingestPool.awaitTermination(24, TimeUnit.HOURS);
 
-            long ingestWall = System.nanoTime() - ingestStart;
-            double ingestSecs = ingestWall / 1_000_000_000.0;
-            System.out.println();
+            long ingestStart = System.nanoTime();
+            char[] ingestSpinner = {'|', '/', '-', '\\'};
+            int ingestSpin = 0;
+            while (!ingestPool.awaitTermination(500, TimeUnit.MILLISECONDS)) {
+                double elapsed = (System.nanoTime() - ingestStart) / 1e9;
+                int filled = Math.min(40, (int)(elapsed / 5));
+                String bar = "=".repeat(filled) + " ".repeat(40 - filled);
+                System.out.printf("\r  [%s] %c %.0fs | %s", bar, ingestSpinner[ingestSpin++ % 4], elapsed, ingestStatus.get());
+                System.out.flush();
+            }
+            double ingestSecs = (System.nanoTime() - ingestStart) / 1e9;
+            System.out.printf("\r  [%s] done in %.1fs%n", "=".repeat(40), ingestSecs);
+
             System.out.printf("=== INGESTION RESULTS ===%n");
             System.out.printf("Rows: %d | Wall time: %.1fs | Throughput: %.0f ops/s%n",
                     ingestMetrics.getCount(), ingestSecs, ingestMetrics.getCount() / ingestSecs);
@@ -123,30 +165,29 @@ public class VectorBench {
 
         // Phase 4b: Checkpoint after ingestion
         if (config.checkpoint && !config.skipIngest) {
-            System.out.println("=== CHECKPOINT (post-ingest) ===");
-            long t = System.nanoTime();
-            try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
-                 Statement stmt = conn.createStatement()) {
-                stmt.execute("EXECUTE CHECKPOINT 'herd'");
-            }
-            System.out.printf("Checkpoint done in %.1fs%n%n", (System.nanoTime() - t) / 1e9);
+            runWithProgress("=== CHECKPOINT (post-ingest) ===", () -> {
+                try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+                     Statement stmt = conn.createStatement()) {
+                    stmt.execute("EXECUTE CHECKPOINT 'herd'");
+                }
+            });
+            System.out.println();
         }
 
         // Phase 5: Index creation
         if (!config.skipIndex) {
-            System.out.println("=== INDEX CREATION ===");
-            long indexStart = System.nanoTime();
-            try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
-                 Statement stmt = conn.createStatement()) {
-                String indexSql = "CREATE VECTOR INDEX vidx ON " + config.tableName + "(vec)"
-                        + " WITH m=" + config.indexM
-                        + " beamWidth=" + config.indexBeamWidth
-                        + " similarity=euclidean fusedPQ=true";
-                System.out.println("Executing: " + indexSql);
-                stmt.execute(indexSql);
-            }
-            long indexWall = System.nanoTime() - indexStart;
-            System.out.printf("Index creation time: %.1fs%n%n", indexWall / 1_000_000_000.0);
+            String indexSql = "CREATE VECTOR INDEX vidx ON " + config.tableName + "(vec)"
+                    + " WITH m=" + config.indexM
+                    + " beamWidth=" + config.indexBeamWidth
+                    + " similarity=euclidean fusedPQ=true";
+            System.out.println("Executing: " + indexSql);
+            runWithProgress("=== INDEX CREATION ===", () -> {
+                try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+                     Statement stmt = conn.createStatement()) {
+                    stmt.execute(indexSql);
+                }
+            });
+            System.out.println();
         } else {
             System.out.println("Skipping index creation.");
             System.out.println();
@@ -154,13 +195,13 @@ public class VectorBench {
 
         // Phase 5b: Checkpoint after index creation
         if (config.checkpoint && !config.skipIndex) {
-            System.out.println("=== CHECKPOINT (post-index) ===");
-            long t = System.nanoTime();
-            try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
-                 Statement stmt = conn.createStatement()) {
-                stmt.execute("EXECUTE CHECKPOINT 'herd'");
-            }
-            System.out.printf("Checkpoint done in %.1fs%n%n", (System.nanoTime() - t) / 1e9);
+            runWithProgress("=== CHECKPOINT (post-index) ===", () -> {
+                try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+                     Statement stmt = conn.createStatement()) {
+                    stmt.execute("EXECUTE CHECKPOINT 'herd'");
+                }
+            });
+            System.out.println();
         }
 
         // Phase 6: Queries
@@ -168,21 +209,30 @@ public class VectorBench {
         int actualQueries = Math.min(config.queryCount, queryVectors.size());
         MetricsCollector queryMetrics = new MetricsCollector();
         List<List<Integer>> queryResults = new ArrayList<>(Collections.nCopies(actualQueries, null));
+        AtomicReference<String> queryStatus = new AtomicReference<>("");
 
-        long queryStart = System.nanoTime();
         ExecutorService queryPool = Executors.newFixedThreadPool(config.queryThreads);
         int qChunk = actualQueries / config.queryThreads;
         for (int t = 0; t < config.queryThreads; t++) {
             int start = t * qChunk;
             int end = (t == config.queryThreads - 1) ? actualQueries : start + qChunk;
-            queryPool.submit(new QueryWorker(config, queryVectors, start, end, queryMetrics, queryResults));
+            queryPool.submit(new QueryWorker(config, queryVectors, start, end, queryMetrics, queryResults, queryStatus));
         }
         queryPool.shutdown();
-        queryPool.awaitTermination(24, TimeUnit.HOURS);
 
-        long queryWall = System.nanoTime() - queryStart;
-        double querySecs = queryWall / 1_000_000_000.0;
-        System.out.println();
+        long queryStart = System.nanoTime();
+        char[] querySpinner = {'|', '/', '-', '\\'};
+        int querySpin = 0;
+        while (!queryPool.awaitTermination(500, TimeUnit.MILLISECONDS)) {
+            double elapsed = (System.nanoTime() - queryStart) / 1e9;
+            int filled = Math.min(40, (int)(elapsed / 5));
+            String bar = "=".repeat(filled) + " ".repeat(40 - filled);
+            System.out.printf("\r  [%s] %c %.0fs | %s", bar, querySpinner[querySpin++ % 4], elapsed, queryStatus.get());
+            System.out.flush();
+        }
+        double querySecs = (System.nanoTime() - queryStart) / 1e9;
+        System.out.printf("\r  [%s] done in %.1fs%n", "=".repeat(40), querySecs);
+
         System.out.printf("=== QUERY RESULTS ===%n");
         System.out.printf("Queries: %d | Wall time: %.1fs | Throughput: %.0f qps%n",
                 queryMetrics.getCount(), querySecs, queryMetrics.getCount() / querySecs);

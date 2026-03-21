@@ -132,7 +132,7 @@ public class VectorIndexManager extends AbstractIndexManager {
     static final int MIN_VECTORS_FOR_FUSED_PQ = 256;
 
     /** Number of threads used for parallel index rebuild. */
-    private static final int REBUILD_THREADS = Integer.getInteger("herddb.vectorindex.rebuild.threads", 4);
+    private static final int REBUILD_THREADS = Integer.getInteger("herddb.vectorindex.rebuild.threads", 8);
 
     private static final ThreadFactory DAEMON_THREAD_FACTORY = r -> {
         Thread t = new Thread(r, "vector-index-rebuild");

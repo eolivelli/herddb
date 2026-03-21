@@ -6,6 +6,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class QueryWorker implements Runnable {
 
@@ -15,15 +16,17 @@ public class QueryWorker implements Runnable {
     private final int endIdx;
     private final MetricsCollector metrics;
     private final List<List<Integer>> allResults;
+    private final AtomicReference<String> statusLine;
 
     public QueryWorker(Config config, List<float[]> queryVectors, int startIdx, int endIdx,
-                       MetricsCollector metrics, List<List<Integer>> allResults) {
+                       MetricsCollector metrics, List<List<Integer>> allResults, AtomicReference<String> statusLine) {
         this.config = config;
         this.queryVectors = queryVectors;
         this.startIdx = startIdx;
         this.endIdx = endIdx;
         this.metrics = metrics;
         this.allResults = allResults;
+        this.statusLine = statusLine;
     }
 
     @Override
@@ -47,7 +50,14 @@ public class QueryWorker implements Runnable {
 
                     long total = metrics.getCount();
                     if (total % 100 == 0) {
-                        System.out.println("  Executed " + total + " queries...");
+                        MetricsCollector.Stats s = metrics.computeStats();
+                        statusLine.set(String.format("Executed %d queries | mean: %.2f ms | p50: %.2f ms | p95: %.2f ms | p99: %.2f ms | max: %.2f ms",
+                                total,
+                                s.meanNanos() / 1_000_000.0,
+                                s.p50Nanos() / 1_000_000.0,
+                                s.p95Nanos() / 1_000_000.0,
+                                s.p99Nanos() / 1_000_000.0,
+                                s.maxNanos() / 1_000_000.0));
                     }
                 }
             }
