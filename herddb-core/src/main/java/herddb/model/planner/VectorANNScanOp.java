@@ -63,6 +63,8 @@ public class VectorANNScanOp implements PlannerOp {
     private final Predicate predicate;
     private final Projection scanProjection;
     private final Projection innerProjection;
+    private final CompiledSQLExpression limitExpr;
+    private final CompiledSQLExpression offsetExpr;
 
     public VectorANNScanOp(
             String tableSpace,
@@ -74,6 +76,22 @@ public class VectorANNScanOp implements PlannerOp {
             Projection scanProjection,
             Projection innerProjection
     ) {
+        this(tableSpace, tableDef, columnName, queryVectorExpr, fallback,
+                predicate, scanProjection, innerProjection, null, null);
+    }
+
+    private VectorANNScanOp(
+            String tableSpace,
+            Table tableDef,
+            String columnName,
+            CompiledSQLExpression queryVectorExpr,
+            PlannerOp fallback,
+            Predicate predicate,
+            Projection scanProjection,
+            Projection innerProjection,
+            CompiledSQLExpression limitExpr,
+            CompiledSQLExpression offsetExpr
+    ) {
         this.tableSpace = tableSpace;
         this.tableDef = tableDef;
         this.columnName = columnName;
@@ -82,6 +100,24 @@ public class VectorANNScanOp implements PlannerOp {
         this.predicate = predicate;
         this.scanProjection = scanProjection;
         this.innerProjection = innerProjection;
+        this.limitExpr = limitExpr;
+        this.offsetExpr = offsetExpr;
+    }
+
+    public Predicate getPredicate() {
+        return predicate;
+    }
+
+    public boolean hasLimit() {
+        return limitExpr != null;
+    }
+
+    /**
+     * Returns a new VectorANNScanOp with limit/offset pushed down into the scan.
+     */
+    public VectorANNScanOp withLimit(CompiledSQLExpression limitExpr, CompiledSQLExpression offsetExpr) {
+        return new VectorANNScanOp(tableSpace, tableDef, columnName, queryVectorExpr,
+                fallback, predicate, scanProjection, innerProjection, limitExpr, offsetExpr);
     }
 
     @Override
@@ -119,7 +155,22 @@ public class VectorANNScanOp implements PlannerOp {
         Object qvObj = queryVectorExpr.evaluate(DataAccessor.NULL, context);
         float[] queryVector = (float[]) RecordSerializer.convert(ColumnTypes.FLOATARRAY, qvObj);
 
-        List<Map.Entry<Bytes, Float>> annResults = vim.search(queryVector, Integer.MAX_VALUE);
+        int topK;
+        int limit = -1;
+        int offset = 0;
+        if (limitExpr != null) {
+            limit = ((Number) limitExpr.evaluate(DataAccessor.NULL, context)).intValue();
+            offset = offsetExpr != null
+                    ? ((Number) offsetExpr.evaluate(DataAccessor.NULL, context)).intValue() : 0;
+            topK = limit + offset;
+            if (topK <= 0) {
+                topK = Integer.MAX_VALUE;
+            }
+        } else {
+            topK = Integer.MAX_VALUE;
+        }
+
+        List<Map.Entry<Bytes, Float>> annResults = vim.search(queryVector, topK);
 
         Transaction transaction = tableSpaceManager.getTransaction(transactionContext.transactionId);
         String[] fieldNames = (innerProjection != null) ? innerProjection.getFieldNames()
@@ -128,6 +179,8 @@ public class VectorANNScanOp implements PlannerOp {
         MaterializedRecordSet recordSet = tableSpaceManager.getDbmanager().getRecordSetFactory()
                 .createRecordSet(fieldNames, cols);
 
+        int skipped = 0;
+        int added = 0;
         for (Map.Entry<Bytes, Float> entry : annResults) {
             Bytes pk = entry.getKey();
             GetStatement get = new GetStatement(tableSpace, tableDef.name, pk, null, false);
@@ -139,10 +192,18 @@ public class VectorANNScanOp implements PlannerOp {
             if (predicate != null && !predicate.evaluate(record, context)) {
                 continue;
             }
+            if (limitExpr != null && skipped < offset) {
+                skipped++;
+                continue;
+            }
             DataAccessor fullRow = record.getDataAccessor(tableDef);
             DataAccessor scanRow = (scanProjection != null) ? scanProjection.map(fullRow, context) : fullRow;
             DataAccessor projectedRow = (innerProjection != null) ? innerProjection.map(scanRow, context) : scanRow;
             recordSet.add(projectedRow);
+            added++;
+            if (limit > 0 && added >= limit) {
+                break;
+            }
         }
 
         recordSet.writeFinished();

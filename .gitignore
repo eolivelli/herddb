@@ -36,3 +36,7 @@ vector-testings/datasets/
 
 # Mac
 **/.DS_Store
+
+
+# Claude
+.claude/

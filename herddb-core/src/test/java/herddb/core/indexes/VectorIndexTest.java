@@ -1167,6 +1167,82 @@ public class VectorIndexTest {
         }
     }
 
+    /**
+     * Verifies that ORDER BY ann_of() + LIMIT works correctly with vector index,
+     * including with OFFSET.
+     */
+    @Test
+    public void testVectorLimitPushdown() throws Exception {
+
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+
+        final float[] vecX = {1.0f, 0.0f, 0.0f};
+        final float[] vecY = {0.0f, 1.0f, 0.0f};
+        final float[] vecZ = {0.0f, 0.0f, 1.0f};
+
+        final float[] query = {0.05f, 0.99f, 0.0f};
+        normalize(query);
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                    Arrays.asList(1, vecX));
+            executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                    Arrays.asList(2, vecY));
+            executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                    Arrays.asList(3, vecZ));
+
+            // LIMIT 2 without WHERE
+            try (DataScanner scan = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 2",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals(2, results.size());
+                assertEquals(2, results.get(0).get("id")); // vecY closest
+            }
+
+            // LIMIT 1 without WHERE
+            try (DataScanner scan = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 1",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals(1, results.size());
+                assertEquals(2, results.get(0).get("id"));
+            }
+
+            // LIMIT 1 OFFSET 1 without WHERE — should skip the top result
+            try (DataScanner scan = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 1 OFFSET 1",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals(1, results.size());
+                // Should get the second-closest result (not id=2 which is the closest)
+                assertTrue("Should not be the top result", ((int) results.get(0).get("id")) != 2);
+            }
+        }
+    }
+
     // ---- helpers ----
 
     private static void normalize(float[] v) {

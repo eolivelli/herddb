@@ -1172,9 +1172,17 @@ public class CalcitePlanner extends AbstractSQLPlanner {
                             }
                             PlannerOp fallback = new SortOp(normalInput, annDirs, annFields, annNullLastDirs);
 
-                            return new VectorANNScanOp(annTableSpace, annTable, columnName,
+                            PlannerOp result = new VectorANNScanOp(annTableSpace, annTable, columnName,
                                     queryVecExpr, fallback, annPredicate,
                                     scanProjection, innerProjection);
+                            // If Calcite fused LIMIT into the Sort node, wrap with LimitOp
+                            if (op.fetch != null) {
+                                CompiledSQLExpression maxRows = SQLExpressionCompiler.compileExpression(op.fetch);
+                                CompiledSQLExpression offset = op.offset != null
+                                        ? SQLExpressionCompiler.compileExpression(op.offset) : null;
+                                result = new LimitOp(result, maxRows, offset);
+                            }
+                            return result;
                         }
                     }
                 }
@@ -1199,7 +1207,15 @@ public class CalcitePlanner extends AbstractSQLPlanner {
                     || nullDirection == RelFieldCollation.NullDirection.UNSPECIFIED;
             fields[i++] = index;
         }
-        return new SortOp(input, directions, fields, nullLastdirections);
+        PlannerOp sortResult = new SortOp(input, directions, fields, nullLastdirections);
+        // If Calcite fused LIMIT into the Sort node, wrap with LimitOp
+        if (op.fetch != null) {
+            CompiledSQLExpression maxRows = SQLExpressionCompiler.compileExpression(op.fetch);
+            CompiledSQLExpression offset = op.offset != null
+                    ? SQLExpressionCompiler.compileExpression(op.offset) : null;
+            sortResult = new LimitOp(sortResult, maxRows, offset);
+        }
+        return sortResult;
 
     }
 

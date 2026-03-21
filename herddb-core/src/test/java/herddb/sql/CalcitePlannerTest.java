@@ -55,6 +55,7 @@ import herddb.model.commands.ScanStatement;
 import herddb.model.planner.BindableTableScanOp;
 import herddb.model.planner.DeleteOp;
 import herddb.model.planner.InsertOp;
+import herddb.model.planner.LimitedSortOp;
 import herddb.model.planner.LimitedSortedBindableTableScanOp;
 import herddb.model.planner.PlannerOp;
 import herddb.model.planner.ProjectOp;
@@ -859,6 +860,128 @@ public class CalcitePlannerTest {
         Assert.assertTrue("expecting " + aClass + " but found " + plan.getClass(),
                 plan.getClass().equals(aClass));
         return (T) plan;
+    }
+
+    @Test
+    public void limitedSortOpPlanTest() throws Exception {
+        String nodeId = "localhost";
+        try (DBManager manager = new DBManager("localhost", new MemoryMetadataStorageManager(), new MemoryDataStorageManager(), new MemoryCommitLogManager(), null, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement("tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.tsql (k1 string primary key, n1 int, s1 string)", Collections.emptyList());
+            execute(manager, "CREATE TABLE tblspace1.tsql2 (k2 string primary key, n2 int, s2 string)", Collections.emptyList());
+
+            // JOIN + ORDER BY + LIMIT: SortOp can't merge into a table scan → LimitedSortOp
+            if (manager.isFullSQLSupportEnabled()) {
+                assertInstanceOf(plan(manager,
+                        "SELECT a.n1, b.n2 FROM tblspace1.tsql a"
+                                + " JOIN tblspace1.tsql2 b ON a.k1 = b.k2"
+                                + " ORDER BY a.n1 LIMIT 5"),
+                        LimitedSortOp.class);
+            }
+        }
+    }
+
+    @Test
+    public void limitedSortOpCorrectnessTest() throws Exception {
+        String nodeId = "localhost";
+        try (DBManager manager = new DBManager("localhost", new MemoryMetadataStorageManager(), new MemoryDataStorageManager(), new MemoryCommitLogManager(), null, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement("tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (k1 string primary key, n1 int)", Collections.emptyList());
+            execute(manager, "CREATE TABLE tblspace1.t2 (k2 string primary key, n2 int)", Collections.emptyList());
+            for (int i = 0; i < 10; i++) {
+                execute(manager, "INSERT INTO tblspace1.t1 (k1, n1) values(?, ?)",
+                        Arrays.asList("k" + i, i), TransactionContext.NO_TRANSACTION);
+                execute(manager, "INSERT INTO tblspace1.t2 (k2, n2) values(?, ?)",
+                        Arrays.asList("k" + i, i * 10), TransactionContext.NO_TRANSACTION);
+            }
+
+            if (manager.isFullSQLSupportEnabled()) {
+                // JOIN + ORDER BY n1 ASC + LIMIT 3
+                try (DataScanner scan = scan(manager,
+                        "SELECT a.n1, b.n2 FROM tblspace1.t1 a"
+                                + " JOIN tblspace1.t2 b ON a.k1 = b.k2"
+                                + " ORDER BY a.n1 LIMIT 3",
+                        Collections.emptyList())) {
+                    List<DataAccessor> results = scan.consume();
+                    assertEquals(3, results.size());
+                    assertEquals(0, results.get(0).get("n1"));
+                    assertEquals(1, results.get(1).get("n1"));
+                    assertEquals(2, results.get(2).get("n1"));
+                }
+
+                // JOIN + ORDER BY n1 DESC + LIMIT 2
+                try (DataScanner scan = scan(manager,
+                        "SELECT a.n1, b.n2 FROM tblspace1.t1 a"
+                                + " JOIN tblspace1.t2 b ON a.k1 = b.k2"
+                                + " ORDER BY a.n1 DESC LIMIT 2",
+                        Collections.emptyList())) {
+                    List<DataAccessor> results = scan.consume();
+                    assertEquals(2, results.size());
+                    assertEquals(9, results.get(0).get("n1"));
+                    assertEquals(8, results.get(1).get("n1"));
+                }
+
+                // JOIN + ORDER BY + LIMIT with OFFSET
+                try (DataScanner scan = scan(manager,
+                        "SELECT a.n1 FROM tblspace1.t1 a"
+                                + " JOIN tblspace1.t2 b ON a.k1 = b.k2"
+                                + " ORDER BY a.n1 LIMIT 3 OFFSET 2",
+                        Collections.emptyList())) {
+                    List<DataAccessor> results = scan.consume();
+                    assertEquals(3, results.size());
+                    assertEquals(2, results.get(0).get("n1"));
+                    assertEquals(3, results.get(1).get("n1"));
+                    assertEquals(4, results.get(2).get("n1"));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void multiColumnOrderByTest() throws Exception {
+        String nodeId = "localhost";
+        try (DBManager manager = new DBManager("localhost", new MemoryMetadataStorageManager(), new MemoryDataStorageManager(), new MemoryCommitLogManager(), null, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement("tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.tsql (k1 string primary key, n1 int, s1 string)", Collections.emptyList());
+            execute(manager, "INSERT INTO tblspace1.tsql (k1,n1,s1) values('c',1,'x')", Collections.emptyList());
+            execute(manager, "INSERT INTO tblspace1.tsql (k1,n1,s1) values('a',1,'y')", Collections.emptyList());
+            execute(manager, "INSERT INTO tblspace1.tsql (k1,n1,s1) values('b',2,'z')", Collections.emptyList());
+            execute(manager, "INSERT INTO tblspace1.tsql (k1,n1,s1) values('d',2,'w')", Collections.emptyList());
+
+            // Multi-column ORDER BY: n1 ASC, k1 ASC
+            try (DataScanner scan = scan(manager, "SELECT k1, n1 FROM tblspace1.tsql ORDER BY n1, k1", Collections.emptyList())) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals(4, results.size());
+                // n1=1: a, c; n1=2: b, d
+                assertEquals(RawString.of("a"), results.get(0).get("k1"));
+                assertEquals(RawString.of("c"), results.get(1).get("k1"));
+                assertEquals(RawString.of("b"), results.get(2).get("k1"));
+                assertEquals(RawString.of("d"), results.get(3).get("k1"));
+            }
+
+            // Multi-column ORDER BY: n1 DESC, k1 ASC
+            try (DataScanner scan = scan(manager, "SELECT k1, n1 FROM tblspace1.tsql ORDER BY n1 DESC, k1 ASC", Collections.emptyList())) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals(4, results.size());
+                // n1=2: b, d; n1=1: a, c
+                assertEquals(RawString.of("b"), results.get(0).get("k1"));
+                assertEquals(RawString.of("d"), results.get(1).get("k1"));
+                assertEquals(RawString.of("a"), results.get(2).get("k1"));
+                assertEquals(RawString.of("c"), results.get(3).get("k1"));
+            }
+        }
     }
 
     @Test

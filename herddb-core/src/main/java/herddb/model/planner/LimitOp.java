@@ -116,6 +116,14 @@ public class LimitOp implements PlannerOp, ScanLimits {
             ScanStatement statement = op.getStatement();
             statement.setLimits(this);
             return new LimitedBindableTableScanOp(statement);
+        } else if (input instanceof SortOp) {
+            SortOp sortOp = (SortOp) input;
+            return new LimitedSortOp(sortOp.getInput(), sortOp, maxRows, offset);
+        } else if (input instanceof VectorANNScanOp) {
+            VectorANNScanOp vecOp = (VectorANNScanOp) input;
+            if (vecOp.getPredicate() == null && !vecOp.hasLimit()) {
+                return vecOp.withLimit(maxRows, offset);
+            }
         }
         return this;
     }

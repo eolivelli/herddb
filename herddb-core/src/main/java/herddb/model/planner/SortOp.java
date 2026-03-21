@@ -163,9 +163,11 @@ public class SortOp implements PlannerOp, TupleComparator {
             int index = fields[i];
             Object value1 = o1.get(index);
             Object value2 = o2.get(index);
-            return compareValues(i, value1, value2);
+            int result = compareValues(i, value1, value2);
+            if (result != 0) {
+                return result;
+            }
         }
-        // no columns ?
         return 0;
     }
 
@@ -239,6 +241,18 @@ public class SortOp implements PlannerOp, TupleComparator {
 
     public PlannerOp getInput() {
         return input;
+    }
+
+    public boolean[] getDirections() {
+        return directions;
+    }
+
+    public int[] getFields() {
+        return fields;
+    }
+
+    public boolean[] getNullLastDirections() {
+        return nullLastDirections;
     }
 
 }
