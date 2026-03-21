@@ -50,6 +50,7 @@ import io.github.jbellis.jvector.graph.SearchResult;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.MapRandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.OnHeapGraphIndex;
+import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.diversity.VamanaDiversityProvider;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexWriter;
@@ -202,7 +203,7 @@ public class VectorIndexManager extends AbstractIndexManager {
     private final AtomicBoolean dirty = new AtomicBoolean(true);
 
     private volatile int dimension = 0;
-    private volatile MapRandomAccessVectorValues mravv = null;
+    private volatile RandomAccessVectorValues mravv = null;
     private volatile GraphIndexBuilder builder = null;
 
     // -------------------------------------------------------------------------
@@ -508,26 +509,37 @@ public class VectorIndexManager extends AbstractIndexManager {
                 DAEMON_THREAD_FACTORY,
                 new ThreadPoolExecutor.CallerRunsPolicy());
         AtomicReference<Throwable> error = new AtomicReference<>();
-        // Use local maps during rebuild to avoid populating pkToNode (not needed during rebuild)
-        ConcurrentHashMap<Integer, VectorFloat<?>> rebuildVectors = new ConcurrentHashMap<>();
-        ConcurrentHashMap<Integer, Bytes> rebuildNodeToPk = new ConcurrentHashMap<>();
+        // Use file-backed storage for vectors and BLink-backed storage for nodeToPk
+        // to avoid unbounded heap usage during rebuild.
+        // FileBackedVectorValues is lazily initialized when dimension is discovered from first non-null vector.
+        String rebuildStoreName = index.uuid + "_rebuild_nodetopk_" + System.nanoTime();
+        dataStorageManager.initIndex(tableSpaceUUID, rebuildStoreName);
+        long pageSize = memoryManager.getMaxLogicalPageSize();
+        BLink<Bytes, Bytes> rebuildNodeToPk = new BLink<>(pageSize, BytesBytesSizeEvaluator.INSTANCE,
+                memoryManager.getIndexPageReplacementPolicy(),
+                new BytesBytesStorage(rebuildStoreName));
+        final AtomicReference<FileBackedVectorValues> rebuildVectorsRef = new AtomicReference<>();
         try {
             tableManager.scanForIndexRebuild(r -> {
+                if (error.get() != null) {
+                    throw new DataStorageManagerException("error during rebuild", error.get());
+                }
                 herddb.utils.DataAccessor values = r.getDataAccessor(table);
                 Bytes key = RecordSerializer.serializeIndexKey(values, table, table.primaryKey);
                 Bytes indexKey = RecordSerializer.serializeIndexKey(values, index, index.columnNames);
                 if (builder == null) {
                     // Single-threaded until builder is initialized (typically first non-null vector)
                     try {
-                        rebuildInsert(key, indexKey, rebuildVectors, rebuildNodeToPk);
+                        rebuildInsert(key, indexKey, rebuildVectorsRef, rebuildNodeToPk, currentTableSize);
                     } catch (Throwable t) {
                         error.compareAndSet(null, t);
                     }
                 } else {
                     executor.execute(() -> {
                         try {
-                            rebuildInsert(key, indexKey, rebuildVectors, rebuildNodeToPk);
+                            rebuildInsert(key, indexKey, rebuildVectorsRef, rebuildNodeToPk, currentTableSize);
                         } catch (Throwable t) {
+                            LOGGER.log(Level.SEVERE, "rebuild failed", t);
                             error.compareAndSet(null, t);
                         }
                     });
@@ -536,9 +548,10 @@ public class VectorIndexManager extends AbstractIndexManager {
                 if (value % 100000 == 0) {
                     long elapsed = System.currentTimeMillis() - start;
                     long percent = (value * 100) / currentTableSize;
+                    FileBackedVectorValues fbv = rebuildVectorsRef.get();
                     LOGGER.log(Level.INFO,
                             "rebuild vector index {0} in progress, indexed {1} records ({2}%), started {3} ms ago: {4} nodes",
-                            new Object[]{index.name, value, percent, elapsed, rebuildVectors.size()});
+                            new Object[]{index.name, value, percent, elapsed, fbv != null ? fbv.size() : 0});
                 }
             });
             executor.shutdown();
@@ -552,7 +565,8 @@ public class VectorIndexManager extends AbstractIndexManager {
         } finally {
             executor.shutdownNow();
         }
-        int rebuildCount = rebuildNodeToPk.size();
+        FileBackedVectorValues rebuildVectors = rebuildVectorsRef.get();
+        int rebuildCount = (int) rebuildNodeToPk.size();
         // Build FusedPQ directly if conditions are met, avoiding duplicate work at next checkpoint
         if (fusedPQ && dimension >= MIN_DIM_FOR_FUSED_PQ
                 && rebuildCount >= MIN_VECTORS_FOR_FUSED_PQ && builder != null) {
@@ -584,9 +598,6 @@ public class VectorIndexManager extends AbstractIndexManager {
                 loadFusedPQFormat(reloadMapFile, reloadGraphFile,
                         dimension, nextNodeId.get(), beamWidth, neighborOverflow, alpha);
 
-                // Clear temporary rebuild maps
-                rebuildVectors.clear();
-                rebuildNodeToPk.clear();
                 dirty.set(false);
 
                 LOGGER.log(Level.INFO,
@@ -594,16 +605,72 @@ public class VectorIndexManager extends AbstractIndexManager {
                         new Object[]{index.name, System.currentTimeMillis() - start, rebuildCount});
             } catch (IOException e) {
                 throw new DataStorageManagerException("Failed to write FusedPQ during rebuild", e);
+            } finally {
+                closeRebuildVectors(rebuildVectors);
+                closeRebuildNodeToPk(rebuildNodeToPk, rebuildStoreName);
             }
         } else {
-            // Small dataset or FusedPQ not applicable: populate instance fields, let checkpoint() handle
-            this.nodeToPk.putAll(rebuildNodeToPk);
-            this.vectors.putAll(rebuildVectors);
-            dirty.set(true);
-            long elapsed = System.currentTimeMillis() - start;
-            LOGGER.log(Level.INFO,
-                    "rebuilt vector index {0} in {1} ms: {2} nodes",
-                    new Object[]{index.name, elapsed, rebuildCount});
+            try {
+                // Small dataset or FusedPQ not applicable: populate instance fields, let checkpoint() handle
+                try (Stream<Map.Entry<Bytes, Bytes>> scanStream =
+                        rebuildNodeToPk.scan(Bytes.EMPTY_ARRAY, Bytes.POSITIVE_INFINITY)) {
+                    scanStream.forEach(e -> {
+                        int nodeId = bytesToOrdinal(e.getKey());
+                        Bytes pk = e.getValue();
+                        this.nodeToPk.put(nodeId, pk);
+                        if (rebuildVectors != null) {
+                            this.vectors.put(nodeId, rebuildVectors.getVector(nodeId));
+                        }
+                    });
+                }
+                // Re-create mravv wrapping the instance vectors map so that
+                // the live search path and future inserts use the correct backing store
+                if (dimension > 0 && builder != null) {
+                    this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
+                    BuildScoreProvider bsp =
+                            BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+                    OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
+                    try {
+                        builder.close();
+                    } catch (IOException e) {
+                        // ignore
+                    }
+                    this.builder = new GraphIndexBuilder(
+                            bsp, dimension, graph,
+                            beamWidth, neighborOverflow, alpha,
+                            REFINE_FINAL_GRAPH,
+                            PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
+                }
+                dirty.set(true);
+                long elapsed = System.currentTimeMillis() - start;
+                LOGGER.log(Level.INFO,
+                        "rebuilt vector index {0} in {1} ms: {2} nodes",
+                        new Object[]{index.name, elapsed, rebuildCount});
+            } finally {
+                closeRebuildVectors(rebuildVectors);
+                closeRebuildNodeToPk(rebuildNodeToPk, rebuildStoreName);
+            }
+        }
+    }
+
+    private void closeRebuildNodeToPk(BLink<Bytes, Bytes> rebuildNodeToPk, String storeName) {
+        if (rebuildNodeToPk != null) {
+            rebuildNodeToPk.close();
+        }
+        try {
+            dataStorageManager.dropIndex(tableSpaceUUID, storeName);
+        } catch (DataStorageManagerException e) {
+            LOGGER.log(Level.WARNING, "Failed to clean up rebuild BLink storage " + storeName, e);
+        }
+    }
+
+    private static void closeRebuildVectors(FileBackedVectorValues rebuildVectors) {
+        if (rebuildVectors != null) {
+            try {
+                rebuildVectors.close();
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to close rebuild vectors file", e);
+            }
         }
     }
 
@@ -700,7 +767,7 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
 
             graphPageIds = writeFusedPQGraph(allVectors, allNodeToPk, dimension);
-            mapPageIds = writeFusedPQMapData(allVectors, allNodeToPk);
+            mapPageIds = writeFusedPQMapData(new MapRandomAccessVectorValues(allVectors, dimension), allNodeToPk);
             totalNodes = allNodeToPk.size();
         } else {
             // Simple format: only serialize live builder
@@ -885,7 +952,7 @@ public class VectorIndexManager extends AbstractIndexManager {
      * instead of rebuilding it from scratch. Used by rebuild() to avoid building the graph twice.
      */
     private List<Long> writeFusedPQGraph(OnHeapGraphIndex existingGraph,
-                                          MapRandomAccessVectorValues existingMravv,
+                                          RandomAccessVectorValues existingMravv,
                                           int dim) throws IOException, DataStorageManagerException {
         // Compute PQ: subspaces = dim/4, exactly 256 clusters (FusedPQ requirement)
         int pqSubspaces = Math.max(1, dim / 4);
@@ -920,7 +987,7 @@ public class VectorIndexManager extends AbstractIndexManager {
      * ordinals after OnDiskGraphIndexWriter renumbers them). We store the renumbered
      * ordinals so load can reconstruct the on-disk ordinal → pk mapping.
      */
-    private List<Long> writeFusedPQMapData(ConcurrentHashMap<Integer, VectorFloat<?>> allVectors,
+    private List<Long> writeFusedPQMapData(RandomAccessVectorValues allVectors,
                                             ConcurrentHashMap<Integer, Bytes> allNodeToPk)
             throws IOException, DataStorageManagerException {
         // Compute sequential renumbering so we know what ordinals will be on disk
@@ -943,7 +1010,53 @@ public class VectorIndexManager extends AbstractIndexManager {
                     int newOrdinal = oldToNew.get(oldId);
                     Bytes pk = allNodeToPk.get(oldId);
                     byte[] pkBytes = pk.to_array();
-                    VectorFloat<?> vec = allVectors.get(oldId);
+                    VectorFloat<?> vec = allVectors.getVector(oldId);
+
+                    writeInt(bos, newOrdinal);
+                    writeInt(bos, pkBytes.length);
+                    bos.write(pkBytes);
+                    int floatCount = vec.length();
+                    writeInt(bos, floatCount);
+                    for (int j = 0; j < floatCount; j++) {
+                        int bits = Float.floatToIntBits(vec.get(j));
+                        writeInt(bos, bits);
+                    }
+                }
+            }
+            return writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
+        } finally {
+            Files.deleteIfExists(mapTmpFile);
+        }
+    }
+
+    private List<Long> writeFusedPQMapData(RandomAccessVectorValues allVectors,
+                                            BLink<Bytes, Bytes> allNodeToPk)
+            throws IOException, DataStorageManagerException {
+        // Scan BLink to get sorted ordinals (BLink keys are ordinalToBytes, which sorts correctly)
+        List<Integer> sortedNodeIds = new ArrayList<>();
+        try (Stream<Map.Entry<Bytes, Bytes>> scanStream =
+                allNodeToPk.scan(Bytes.EMPTY_ARRAY, Bytes.POSITIVE_INFINITY)) {
+            scanStream.forEach(e -> sortedNodeIds.add(bytesToOrdinal(e.getKey())));
+        }
+
+        // Compute sequential renumbering
+        Map<Integer, Integer> oldToNew = new java.util.HashMap<>();
+        for (int i = 0; i < sortedNodeIds.size(); i++) {
+            oldToNew.put(sortedNodeIds.get(i), i);
+        }
+
+        Path mapTmpFile = Files.createTempFile("herddb-vector-map-", ".tmp");
+        try {
+            try (BufferedOutputStream bos = new BufferedOutputStream(
+                    new FileOutputStream(mapTmpFile.toFile()), CHUNK_SIZE)) {
+                int entryCount = sortedNodeIds.size();
+                writeInt(bos, entryCount);
+
+                for (int oldId : sortedNodeIds) {
+                    int newOrdinal = oldToNew.get(oldId);
+                    Bytes pk = allNodeToPk.search(ordinalToBytes(oldId));
+                    byte[] pkBytes = pk.to_array();
+                    VectorFloat<?> vec = allVectors.getVector(oldId);
 
                     writeInt(bos, newOrdinal);
                     writeInt(bos, pkBytes.length);
@@ -1204,8 +1317,9 @@ public class VectorIndexManager extends AbstractIndexManager {
      * and {@code dirty} flag, and uses caller-provided maps instead of instance fields.
      */
     private void rebuildInsert(Bytes key, Bytes indexKey,
-                               ConcurrentHashMap<Integer, VectorFloat<?>> rebuildVectors,
-                               ConcurrentHashMap<Integer, Bytes> rebuildNodeToPk) {
+                               AtomicReference<FileBackedVectorValues> rebuildVectorsRef,
+                               BLink<Bytes, Bytes> rebuildNodeToPk,
+                               long expectedSize) {
         if (indexKey == null) {
             return;
         }
@@ -1214,7 +1328,19 @@ public class VectorIndexManager extends AbstractIndexManager {
             return;
         }
         if (dimension == 0) {
-            initBuilderForDimension(floats.length, rebuildVectors);
+            try {
+                FileBackedVectorValues fbv = new FileBackedVectorValues(
+                        floats.length, Math.max(expectedSize, 16),
+                        java.nio.file.Paths.get(System.getProperty("java.io.tmpdir")));
+                rebuildVectorsRef.set(fbv);
+                initBuilderForDimension(floats.length, fbv);
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException("Failed to create file-backed vector storage", e);
+            }
+        }
+        FileBackedVectorValues rebuildVectors = rebuildVectorsRef.get();
+        if (rebuildVectors == null) {
+            return;
         }
         if (floats.length != dimension) {
             LOGGER.log(Level.WARNING,
@@ -1224,8 +1350,8 @@ public class VectorIndexManager extends AbstractIndexManager {
         }
         VectorFloat<?> vec = VTS.createFloatVector(floats);
         int nodeId = nextNodeId.getAndIncrement();
-        rebuildVectors.put(nodeId, vec);
-        rebuildNodeToPk.put(nodeId, key);
+        rebuildVectors.putVector(nodeId, vec);
+        rebuildNodeToPk.insert(ordinalToBytes(nodeId), key);
         builder.addGraphNode(nodeId, vec);
     }
 
@@ -1340,6 +1466,17 @@ public class VectorIndexManager extends AbstractIndexManager {
         if (this.dimension == 0) {
             this.dimension = dim;
             this.mravv = new MapRandomAccessVectorValues(vectorsMap, dim);
+            BuildScoreProvider bsp =
+                    BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+            this.builder = new GraphIndexBuilder(
+                    bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+        }
+    }
+
+    private synchronized void initBuilderForDimension(int dim, RandomAccessVectorValues ravv) {
+        if (this.dimension == 0) {
+            this.dimension = dim;
+            this.mravv = ravv;
             BuildScoreProvider bsp =
                     BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
             this.builder = new GraphIndexBuilder(

@@ -157,17 +157,20 @@ public class VectorBench {
             // Verify row count matches ingested records
             if (!config.skipVerify) {
                 long expectedRows = ingestMetrics.getCount();
-                try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
-                     Statement stmt = conn.createStatement();
-                     java.sql.ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM " + config.tableName)) {
-                    rs.next();
-                    long actualCount = rs.getLong(1);
-                    if (actualCount != expectedRows) {
-                        throw new IllegalStateException("Row count mismatch after ingestion: expected "
-                                + expectedRows + " but table has " + actualCount);
+                long[] actualCount = {0};
+                runWithProgress("=== VERIFICATION (COUNT) ===", () -> {
+                    try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+                         Statement stmt = conn.createStatement();
+                         java.sql.ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM " + config.tableName)) {
+                        rs.next();
+                        actualCount[0] = rs.getLong(1);
                     }
-                    System.out.printf("Verification OK: %d rows in table%n", actualCount);
+                });
+                if (actualCount[0] != expectedRows) {
+                    throw new IllegalStateException("Row count mismatch after ingestion: expected "
+                            + expectedRows + " but table has " + actualCount[0]);
                 }
+                System.out.printf("Verification OK: %d rows in table%n", actualCount[0]);
             }
             System.out.println();
         } else {
