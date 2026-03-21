@@ -65,7 +65,7 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
                         responseObserver.onError(
                                 Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
                     } else {
-                        LOGGER.log(Level.INFO, "writeFile path={0} size={1} time={2}ms",
+                        LOGGER.log(Level.FINE, "writeFile path={0} size={1} time={2}ms",
                                 new Object[]{request.getPath(), content.length, elapsedMs(start)});
                         responseObserver.onNext(WriteFileResponse.newBuilder()
                                 .setWrittenSize(content.length)
@@ -91,7 +91,7 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
                         responseObserver.onCompleted();
                     } else {
                         byte[] content = result.content();
-                        LOGGER.log(Level.INFO, "readFile path={0} size={1} time={2}ms",
+                        LOGGER.log(Level.FINE, "readFile path={0} size={1} time={2}ms",
                                 new Object[]{request.getPath(), content.length, elapsedMs(start)});
                         responseObserver.onNext(ReadFileResponse.newBuilder()
                                 .setFound(true)

@@ -16,8 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
-set -x xtrace
+set -x
 
 FILESERVERDIR=$(realpath target/fileserver)
 SERVER1DIR=$(realpath target/server1)
@@ -33,19 +32,21 @@ echo "Unzipping FileServer in $FILESERVERDIR"
 unzip -q $ZIP -d $FILESERVERDIR
 unzip -q $ZIP -d $SERVER1DIR
 
-# Start the file server
+# Start the file server (1GB heap)
 cd $FILESERVERDIR/herddb*
+export JAVA_OPTS="-XX:+UseG1GC -Dio.netty.maxDirectMemory=0 -Duser.language=en -Xmx1g -Xms1g -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$FILESERVERDIR/fileserver-heapdump.hprof"
 bin/service file-server start
 cd ../..
 
 sleep 1
 
-# Start HerdDB server in remote-file-service mode
+# Start HerdDB server in remote-file-service mode (6GB heap)
 cd $SERVER1DIR/herddb*
 CONFIGFILE=conf/server.properties
 sed -i 's/server.mode=standalone/server.mode=remote-file-service/g' $CONFIGFILE
 sed -i 's/#http.enable=true/http.enable=false/g' $CONFIGFILE
 sed -i 's/server.halt.on.tablespace.boot.error=true/server.halt.on.tablespace.boot.error=false/g' $CONFIGFILE
+export JAVA_OPTS="-XX:+UseG1GC -Duser.language=en -Xmx5g -Xms5g -Dio.netty.maxDirectMemory=0 -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=2g -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$SERVER1DIR/server-heapdump.hprof"
 bin/service server start
 cd ../..
 

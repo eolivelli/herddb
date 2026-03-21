@@ -1865,7 +1865,7 @@ public class TableSpaceManager {
                         writeLockTimeout, readLockTimeout);
                 break;
             case Index.TYPE_VECTOR:
-                indexManager = new VectorIndexManager(index, tableManager, log, dataStorageManager, this, tableSpaceUUID, transaction,
+                indexManager = new VectorIndexManager(index, dbmanager.getMemoryManager(), tableManager, log, dataStorageManager, this, tableSpaceUUID, transaction,
                         writeLockTimeout, readLockTimeout);
                 break;
             default:

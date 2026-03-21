@@ -44,6 +44,10 @@ import herddb.model.TransactionContext;
 import herddb.model.commands.CreateIndexStatement;
 import herddb.model.commands.CreateTableSpaceStatement;
 import herddb.model.commands.CreateTableStatement;
+import herddb.model.planner.PlannerOp;
+import herddb.model.planner.ProjectOp;
+import herddb.model.planner.VectorANNScanOp;
+import herddb.sql.TranslatedQuery;
 import herddb.utils.DataAccessor;
 
 import org.junit.Rule;
@@ -1164,6 +1168,8 @@ public class VectorIndexTest {
             VectorIndexManager vim = (VectorIndexManager)
                     manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
             assertEquals("node count after rebuild", expectedNodeCount, vim.getNodeCount());
+            // rebuild should not populate pkToNode (optimization: not needed during rebuild)
+            assertEquals("pkToNode should be empty after rebuild", 0, vim.getPkToNodeSize());
         }
     }
 
@@ -1243,6 +1249,88 @@ public class VectorIndexTest {
         }
     }
 
+    /**
+     * Verifies that the execution plan for ORDER BY ann_of() DESC LIMIT k
+     * uses VectorANNScanOp with limit pushed down, not a brute-force SortOp.
+     */
+    @Test
+    public void testVectorIndexUsedInPlan() throws Exception {
+
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+
+        final float[] vecX = {1.0f, 0.0f, 0.0f};
+        final float[] vecY = {0.0f, 1.0f, 0.0f};
+        final float[] vecZ = {0.0f, 0.0f, 1.0f};
+
+        final float[] query = {0.05f, 0.99f, 0.0f};
+        normalize(query);
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                    Arrays.asList(1, vecX));
+            executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                    Arrays.asList(2, vecY));
+            executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                    Arrays.asList(3, vecZ));
+
+            // Verify the plan contains VectorANNScanOp with limit pushed down
+            String sql = "SELECT id FROM tblspace1.t1"
+                    + " ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT 2";
+            TranslatedQuery translated = manager.getPlanner().translate(
+                    TableSpace.DEFAULT, sql, Arrays.asList((Object) query),
+                    true, true, true, -1);
+            PlannerOp root = translated.plan.originalRoot;
+
+            // The root should be ProjectOp(VectorANNScanOp) after optimization
+            // (LimitOp was optimized away by pushing limit into VectorANNScanOp)
+            VectorANNScanOp vecOp = findVectorANNScanOp(root);
+            assertNotNull("Plan must contain VectorANNScanOp, but got: " + root, vecOp);
+            assertTrue("Limit must be pushed into VectorANNScanOp", vecOp.hasLimit());
+
+            // Also verify execution correctness
+            try (DataScanner scan = scan(manager, sql, Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals(2, results.size());
+                assertEquals("top result must be id=2", 2, results.get(0).get("id"));
+            }
+        }
+    }
+
+    /**
+     * Walk the plan tree to find a VectorANNScanOp node.
+     */
+    private static VectorANNScanOp findVectorANNScanOp(PlannerOp op) {
+        if (op instanceof VectorANNScanOp) {
+            return (VectorANNScanOp) op;
+        }
+        if (op instanceof ProjectOp) {
+            return findVectorANNScanOp(((ProjectOp) op).getInput());
+        }
+        return null;
+    }
+
     // ---- helpers ----
 
     private static void normalize(float[] v) {
@@ -1250,6 +1338,170 @@ public class VectorIndexTest {
         for (float f : v) norm += f * f;
         norm = (float) Math.sqrt(norm);
         if (norm > 0) for (int i = 0; i < v.length; i++) v[i] /= norm;
+    }
+
+    /**
+     * Tests that rebuild() builds FusedPQ directly when conditions are met (dim >= 8, vectors >= 256),
+     * avoiding duplicate work at the next checkpoint.
+     */
+    @Test
+    public void testRebuildBuildsFusedPQDirectly() throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+        final int numRows = 300;
+        final int dimension = 16;
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            // Insert enough rows for FusedPQ (>= 256, dim >= 8)
+            for (int i = 1; i <= numRows; i++) {
+                float[] vec = randomVec(dimension, i);
+                executeUpdate(manager,
+                        "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, vec));
+            }
+
+            // Drop and recreate index to trigger rebuild
+            execute(manager, "DROP INDEX tblspace1.vidx", Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            // Rebuild should have written FusedPQ directly
+            assertEquals("all nodes should be on-disk after FusedPQ rebuild", numRows, vim.getOnDiskNodeCount());
+            assertEquals("no live nodes after FusedPQ rebuild", 0, vim.getLiveNodeCount());
+            assertEquals("vectors map should be empty after FusedPQ rebuild", 0, vim.getVectorsMapSize());
+            assertEquals("pkToNode should be empty after rebuild", 0, vim.getPkToNodeSize());
+
+            // Verify ANN search returns correct results
+            float[] query = randomVec(dimension, 1); // should match row id=1 best
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse("search should return results", results.isEmpty());
+                assertEquals("top result should be id=1", 1, results.get(0).get("id"));
+            }
+        }
+    }
+
+    /**
+     * Tests BLink-backed on-disk maps: checkpoint to FusedPQ, insert more, checkpoint again,
+     * then restart and verify everything loads correctly.
+     */
+    @Test
+    public void testBLinkBackedOnDiskMaps() throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 16;
+        final int batch1 = 300;
+        final int batch2 = 50;
+
+        // Phase 1: insert batch1, checkpoint → FusedPQ, insert batch2, checkpoint again
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            // Batch 1: enough for FusedPQ
+            for (int i = 1; i <= batch1; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            // Checkpoint → FusedPQ
+            manager.checkpoint();
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals("on-disk nodes after first checkpoint", batch1, vim.getOnDiskNodeCount());
+            assertEquals("live nodes after first checkpoint", 0, vim.getLiveNodeCount());
+
+            // Search works after first checkpoint
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse("search should return results", results.isEmpty());
+                assertEquals("top result should be id=1", 1, results.get(0).get("id"));
+            }
+
+            // Batch 2: more inserts
+            for (int i = batch1 + 1; i <= batch1 + batch2; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            // Checkpoint again → merged FusedPQ
+            manager.checkpoint();
+            assertEquals("on-disk nodes after second checkpoint", batch1 + batch2, vim.getOnDiskNodeCount());
+            assertEquals("live nodes after second checkpoint", 0, vim.getLiveNodeCount());
+        }
+
+        // Phase 2: restart and verify
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10000);
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals("on-disk nodes after restart", batch1 + batch2, vim.getOnDiskNodeCount());
+
+            // Search works after restart
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse("search should return results after restart", results.isEmpty());
+                assertEquals("top result should be id=1 after restart", 1, results.get(0).get("id"));
+            }
+        }
     }
 
     private static float[] randomVec(int dim, int seed) {

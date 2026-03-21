@@ -22,9 +22,15 @@ package herddb.index.vector;
 import herddb.codec.RecordSerializer;
 import herddb.core.AbstractIndexManager;
 import herddb.core.AbstractTableManager;
+import herddb.core.MemoryManager;
 import herddb.core.PostCheckpointAction;
 import herddb.core.TableSpaceManager;
 import herddb.index.IndexOperation;
+import herddb.index.blink.BLink;
+import herddb.index.blink.BLinkIndexDataStorage;
+
+import herddb.index.blink.BytesBytesSizeEvaluator;
+import herddb.index.blink.BytesLongSizeEvaluator;
 import herddb.log.CommitLog;
 import herddb.log.LogSequenceNumber;
 import herddb.model.Index;
@@ -83,11 +89,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -156,6 +164,8 @@ public class VectorIndexManager extends AbstractIndexManager {
     private final boolean fusedPQ;
     private final VectorSimilarityFunction similarityFunction;
 
+    private final MemoryManager memoryManager;
+
     /** Maximum bytes per persisted page chunk (1 MB). */
     static final int CHUNK_SIZE = 1_048_576;
 
@@ -208,17 +218,18 @@ public class VectorIndexManager extends AbstractIndexManager {
     /** ReaderSupplier backed by onDiskGraphFile; must be closed before deleting the file. */
     private volatile ReaderSupplier onDiskReaderSupplier = null;
 
-    /** on-disk sequential ordinal → primary-key bytes */
-    private final ConcurrentHashMap<Integer, Bytes> onDiskNodeToPk = new ConcurrentHashMap<>();
+    /** on-disk sequential ordinal (as 4-byte big-endian Bytes) → primary-key bytes. BLink-backed for paging. */
+    private volatile BLink<Bytes, Bytes> onDiskNodeToPk = null;
 
-    /** primary-key bytes → on-disk sequential ordinal */
-    private final ConcurrentHashMap<Bytes, Integer> onDiskPkToNode = new ConcurrentHashMap<>();
+    /** primary-key bytes → on-disk sequential ordinal (as Long). BLink-backed for paging. */
+    private volatile BLink<Bytes, Long> onDiskPkToNode = null;
 
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
 
     public VectorIndexManager(Index index,
+                               MemoryManager memoryManager,
                                AbstractTableManager tableManager,
                                CommitLog log,
                                DataStorageManager dataStorageManager,
@@ -229,6 +240,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                                int readLockTimeout) {
         super(index, tableManager, dataStorageManager, tableSpaceUUID, log,
                 transaction, writeLockTimeout, readLockTimeout);
+        this.memoryManager = memoryManager;
         Map<String, String> props = index.properties;
         this.m = intProp(props, PROP_M, DEFAULT_M);
         this.beamWidth = intProp(props, PROP_BEAM_WIDTH, DEFAULT_BEAM_WIDTH);
@@ -431,6 +443,9 @@ public class VectorIndexManager extends AbstractIndexManager {
                                       int dim, int savedNextNodeId,
                                       int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
             throws IOException {
+        // Create fresh BLink instances for on-disk maps
+        createOnDiskBLinks();
+
         // Map data stores (newOrdinal, pk, vector) — newOrdinals are sequential 0..N-1
         try (FileChannel mapCh = FileChannel.open(mapFile, StandardOpenOption.READ)) {
             ByteBuffer mapBuf = mapCh.map(FileChannel.MapMode.READ_ONLY, 0, mapCh.size());
@@ -445,8 +460,8 @@ public class VectorIndexManager extends AbstractIndexManager {
                 // skip vector floats (not needed for on-disk graph; vectors are stored inline)
                 mapBuf.position(mapBuf.position() + floatCount * Float.BYTES);
                 Bytes pk = Bytes.from_array(pkData);
-                onDiskNodeToPk.put(ordinal, pk);
-                onDiskPkToNode.put(pk, ordinal);
+                onDiskNodeToPk.insert(ordinalToBytes(ordinal), pk);
+                onDiskPkToNode.insert(pk, (long) ordinal);
                 if (ordinal > maxOrdinal) {
                     maxOrdinal = ordinal;
                 }
@@ -472,7 +487,7 @@ public class VectorIndexManager extends AbstractIndexManager {
 
         LOGGER.log(Level.INFO,
                 "loaded vector index {0} (FusedPQ): {1} on-disk nodes, dimension {2}",
-                new Object[]{index.name, onDiskNodeToPk.size(), dim});
+                new Object[]{index.name, onDiskNodeToPkSize(), dim});
         return true;
     }
 
@@ -486,9 +501,16 @@ public class VectorIndexManager extends AbstractIndexManager {
         resetState();
         Table table = tableManager.getTable();
         AtomicLong count = new AtomicLong();
-        ExecutorService executor = Executors.newFixedThreadPool(REBUILD_THREADS, DAEMON_THREAD_FACTORY);
-        Semaphore semaphore = new Semaphore(REBUILD_THREADS);
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                REBUILD_THREADS, REBUILD_THREADS,
+                0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(REBUILD_THREADS),
+                DAEMON_THREAD_FACTORY,
+                new ThreadPoolExecutor.CallerRunsPolicy());
         AtomicReference<Throwable> error = new AtomicReference<>();
+        // Use local maps during rebuild to avoid populating pkToNode (not needed during rebuild)
+        ConcurrentHashMap<Integer, VectorFloat<?>> rebuildVectors = new ConcurrentHashMap<>();
+        ConcurrentHashMap<Integer, Bytes> rebuildNodeToPk = new ConcurrentHashMap<>();
         try {
             tableManager.scanForIndexRebuild(r -> {
                 herddb.utils.DataAccessor values = r.getDataAccessor(table);
@@ -497,19 +519,16 @@ public class VectorIndexManager extends AbstractIndexManager {
                 if (builder == null) {
                     // Single-threaded until builder is initialized (typically first non-null vector)
                     try {
-                        recordInserted(key, indexKey);
+                        rebuildInsert(key, indexKey, rebuildVectors, rebuildNodeToPk);
                     } catch (Throwable t) {
                         error.compareAndSet(null, t);
                     }
                 } else {
-                    semaphore.acquireUninterruptibly();
-                    executor.submit(() -> {
+                    executor.execute(() -> {
                         try {
-                            recordInserted(key, indexKey);
+                            rebuildInsert(key, indexKey, rebuildVectors, rebuildNodeToPk);
                         } catch (Throwable t) {
                             error.compareAndSet(null, t);
-                        } finally {
-                            semaphore.release();
                         }
                     });
                 }
@@ -519,23 +538,73 @@ public class VectorIndexManager extends AbstractIndexManager {
                     long percent = (value * 100) / currentTableSize;
                     LOGGER.log(Level.INFO,
                             "rebuild vector index {0} in progress, indexed {1} records ({2}%), started {3} ms ago: {4} nodes",
-                            new Object[]{index.name, value, percent, elapsed, vectors.size()});
+                            new Object[]{index.name, value, percent, elapsed, rebuildVectors.size()});
                 }
             });
-            // Drain: acquire all permits to ensure all submitted tasks completed
-            for (int i = 0; i < REBUILD_THREADS; i++) {
-                semaphore.acquireUninterruptibly();
-            }
+            executor.shutdown();
+            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
             if (error.get() != null) {
                 throw new DataStorageManagerException(error.get());
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new DataStorageManagerException("rebuild interrupted", e);
         } finally {
             executor.shutdownNow();
         }
-        long elapsed = System.currentTimeMillis() - start;
-        LOGGER.log(Level.INFO,
-                "rebuilt vector index {0} in {1} ms: {2} nodes",
-                new Object[]{index.name, elapsed, vectors.size()});
+        int rebuildCount = rebuildNodeToPk.size();
+        // Build FusedPQ directly if conditions are met, avoiding duplicate work at next checkpoint
+        if (fusedPQ && dimension >= MIN_DIM_FOR_FUSED_PQ
+                && rebuildCount >= MIN_VECTORS_FOR_FUSED_PQ && builder != null) {
+            try {
+                builder.cleanup();
+                OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
+                List<Long> graphPageIds = writeFusedPQGraph(graph, mravv, dimension);
+                List<Long> mapPageIds = writeFusedPQMapData(rebuildVectors, rebuildNodeToPk);
+                LogSequenceNumber lsn = log.getLastSequenceNumber();
+                persistIndexStatus(graphPageIds, mapPageIds, rebuildCount, true, lsn, false);
+
+                // Close old builder before loading FusedPQ format
+                GraphIndexBuilder oldBuilder = this.builder;
+                if (oldBuilder != null) {
+                    try {
+                        oldBuilder.close();
+                    } catch (IOException e) {
+                        // ignore
+                    }
+                }
+                this.builder = null;
+                this.mravv = null;
+
+                // Reload from persisted pages into on-disk state
+                Path reloadMapFile = readChunksToTempFile(
+                        mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
+                Path reloadGraphFile = readChunksToTempFile(
+                        graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
+                loadFusedPQFormat(reloadMapFile, reloadGraphFile,
+                        dimension, nextNodeId.get(), beamWidth, neighborOverflow, alpha);
+
+                // Clear temporary rebuild maps
+                rebuildVectors.clear();
+                rebuildNodeToPk.clear();
+                dirty.set(false);
+
+                LOGGER.log(Level.INFO,
+                        "rebuilt vector index {0} in {1} ms: {2} nodes (FusedPQ written directly)",
+                        new Object[]{index.name, System.currentTimeMillis() - start, rebuildCount});
+            } catch (IOException e) {
+                throw new DataStorageManagerException("Failed to write FusedPQ during rebuild", e);
+            }
+        } else {
+            // Small dataset or FusedPQ not applicable: populate instance fields, let checkpoint() handle
+            this.nodeToPk.putAll(rebuildNodeToPk);
+            this.vectors.putAll(rebuildVectors);
+            dirty.set(true);
+            long elapsed = System.currentTimeMillis() - start;
+            LOGGER.log(Level.INFO,
+                    "rebuilt vector index {0} in {1} ms: {2} nodes",
+                    new Object[]{index.name, elapsed, rebuildCount});
+        }
     }
 
     @Override
@@ -557,7 +626,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         }
 
         boolean hasLiveNodes = builder != null && !nodeToPk.isEmpty();
-        boolean hasOnDiskNodes = !onDiskNodeToPk.isEmpty();
+        boolean hasOnDiskNodes = onDiskNodeToPkSize() > 0;
 
         if (!hasLiveNodes && !hasOnDiskNodes && builder == null && onDiskGraph == null) {
             // Nothing indexed yet – persist empty metadata
@@ -581,7 +650,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         }
 
         // Count total active vectors (on-disk + live)
-        int totalActiveVectors = onDiskNodeToPk.size() + nodeToPk.size();
+        int totalActiveVectors = (int) onDiskNodeToPkSize() + nodeToPk.size();
 
         // Decide whether to use FusedPQ for this checkpoint
         // Requirements: fusedPQ enabled, dimension >= 8, and enough vectors for 256 PQ clusters
@@ -616,19 +685,17 @@ public class VectorIndexManager extends AbstractIndexManager {
 
             // Include on-disk nodes that haven't been deleted
             // We need their vectors; re-read from on-disk graph inline vectors
-            if (onDiskGraph != null) {
-                try (OnDiskGraphIndex.View view = onDiskGraph.getView()) {
-                    for (Map.Entry<Integer, Bytes> e : onDiskNodeToPk.entrySet()) {
-                        int ordinal = e.getKey();
+            if (onDiskGraph != null && onDiskNodeToPk != null) {
+                try (OnDiskGraphIndex.View view = onDiskGraph.getView();
+                     Stream<Map.Entry<Bytes, Bytes>> scanStream =
+                             onDiskNodeToPk.scan(Bytes.EMPTY_ARRAY, Bytes.POSITIVE_INFINITY)) {
+                    scanStream.forEach(e -> {
+                        int ordinal = bytesToOrdinal(e.getKey());
                         Bytes pk = e.getValue();
                         VectorFloat<?> vec = view.getVector(ordinal);
-                        // Assign a new nodeId for this vector in the merged set
-                        // Use ordinal offset to avoid collisions with live inserts
-                        // Strategy: use a reserved range for on-disk nodes
-                        // Since live nextNodeId starts at maxOnDiskOrdinal+1, we just use ordinal directly
                         allVectors.put(ordinal, vec);
                         allNodeToPk.put(ordinal, pk);
-                    }
+                    });
                 }
             }
 
@@ -665,46 +732,9 @@ public class VectorIndexManager extends AbstractIndexManager {
             totalNodes = nodeToPk.size();
         }
 
-        // ---- Build metadata ----
-        int metaSize = useFusedPQ
-                ? 30 + 4 + graphPageIds.size() * 8 + 4 + mapPageIds.size() * 8  // v2: +1 byte for fusedPQ flag
-                : 29 + 4 + graphPageIds.size() * 8 + 4 + mapPageIds.size() * 8; // v1
-
-        ByteBuffer metaBuf = ByteBuffer.allocate(metaSize);
-        if (useFusedPQ) {
-            metaBuf.putInt(METADATA_VERSION_FUSEDPQ);
-        } else {
-            metaBuf.putInt(METADATA_VERSION_SIMPLE);
-        }
-        metaBuf.putInt(dimension);
-        metaBuf.putInt(m);
-        metaBuf.putInt(beamWidth);
-        metaBuf.putFloat(neighborOverflow);
-        metaBuf.putFloat(alpha);
-        metaBuf.put((byte) (ADD_HIERARCHY ? 1 : 0));
-        if (useFusedPQ) {
-            metaBuf.put((byte) 1); // fusedPQ flag
-        }
-        metaBuf.putInt(nextNodeId.get());
-        metaBuf.putInt(graphPageIds.size());
-        for (long id : graphPageIds) {
-            metaBuf.putLong(id);
-        }
-        metaBuf.putInt(mapPageIds.size());
-        for (long id : mapPageIds) {
-            metaBuf.putLong(id);
-        }
-
-        Set<Long> activePages = new HashSet<>();
-        activePages.addAll(graphPageIds);
-        activePages.addAll(mapPageIds);
-
-        IndexStatus indexStatus = new IndexStatus(
-                index.name, sequenceNumber,
-                newPageId.get(), activePages, metaBuf.array());
-
         List<PostCheckpointAction> result = new ArrayList<>();
-        result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, indexStatus, pin));
+        result.addAll(persistIndexStatus(graphPageIds, mapPageIds, totalNodes,
+                useFusedPQ, sequenceNumber, pin));
 
         // After a successful FusedPQ checkpoint, reload from the bytes just written
         // so that the on-disk graph is ready and live state is cleared.
@@ -728,8 +758,7 @@ public class VectorIndexManager extends AbstractIndexManager {
             vectors.clear();
             pkToNode.clear();
             nodeToPk.clear();
-            onDiskNodeToPk.clear();
-            onDiskPkToNode.clear();
+            closeOnDiskBLinks();
             this.builder = null;
             this.onDiskGraph = null;
             closeAndDeleteOnDiskGraphFile();
@@ -748,6 +777,53 @@ public class VectorIndexManager extends AbstractIndexManager {
                 "checkpoint vector index {0}: {1} nodes, {2} graph pages, {3} map pages, fusedPQ={4}",
                 new Object[]{index.name, totalNodes, graphPageIds.size(), mapPageIds.size(), useFusedPQ});
         return result;
+    }
+
+    /**
+     * Builds index metadata and persists it via the data storage manager.
+     */
+    private List<PostCheckpointAction> persistIndexStatus(
+            List<Long> graphPageIds, List<Long> mapPageIds,
+            int totalNodes, boolean useFusedPQ,
+            LogSequenceNumber sequenceNumber, boolean pin) throws DataStorageManagerException {
+        int metaSize = useFusedPQ
+                ? 30 + 4 + graphPageIds.size() * 8 + 4 + mapPageIds.size() * 8
+                : 29 + 4 + graphPageIds.size() * 8 + 4 + mapPageIds.size() * 8;
+
+        ByteBuffer metaBuf = ByteBuffer.allocate(metaSize);
+        if (useFusedPQ) {
+            metaBuf.putInt(METADATA_VERSION_FUSEDPQ);
+        } else {
+            metaBuf.putInt(METADATA_VERSION_SIMPLE);
+        }
+        metaBuf.putInt(dimension);
+        metaBuf.putInt(m);
+        metaBuf.putInt(beamWidth);
+        metaBuf.putFloat(neighborOverflow);
+        metaBuf.putFloat(alpha);
+        metaBuf.put((byte) (ADD_HIERARCHY ? 1 : 0));
+        if (useFusedPQ) {
+            metaBuf.put((byte) 1);
+        }
+        metaBuf.putInt(nextNodeId.get());
+        metaBuf.putInt(graphPageIds.size());
+        for (long id : graphPageIds) {
+            metaBuf.putLong(id);
+        }
+        metaBuf.putInt(mapPageIds.size());
+        for (long id : mapPageIds) {
+            metaBuf.putLong(id);
+        }
+
+        Set<Long> activePages = new HashSet<>();
+        activePages.addAll(graphPageIds);
+        activePages.addAll(mapPageIds);
+
+        IndexStatus indexStatus = new IndexStatus(
+                index.name, sequenceNumber,
+                newPageId.get(), activePages, metaBuf.array());
+
+        return dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, indexStatus, pin);
     }
 
     /**
@@ -801,6 +877,40 @@ public class VectorIndexManager extends AbstractIndexManager {
             } catch (IOException e) {
                 // ignore
             }
+        }
+    }
+
+    /**
+     * Writes an already-built graph as FusedPQ on-disk format, reusing the existing graph
+     * instead of rebuilding it from scratch. Used by rebuild() to avoid building the graph twice.
+     */
+    private List<Long> writeFusedPQGraph(OnHeapGraphIndex existingGraph,
+                                          MapRandomAccessVectorValues existingMravv,
+                                          int dim) throws IOException, DataStorageManagerException {
+        // Compute PQ: subspaces = dim/4, exactly 256 clusters (FusedPQ requirement)
+        int pqSubspaces = Math.max(1, dim / 4);
+        ProductQuantization pq = ProductQuantization.compute(existingMravv, pqSubspaces, 256, true);
+        PQVectors pqv = pq.encodeAll(existingMravv, PhysicalCoreExecutor.pool());
+
+        // Write to temp file
+        Path tempFile = Files.createTempFile("herddb-vector-", ".idx");
+        try {
+            try (OnDiskGraphIndexWriter writer = new OnDiskGraphIndexWriter.Builder(existingGraph, tempFile)
+                    .with(new FusedPQ(existingGraph.maxDegree(), pq))
+                    .with(new InlineVectors(dim))
+                    .build()) {
+                ImmutableGraphIndex.View view = existingGraph.getView();
+                EnumMap<FeatureId, IntFunction<io.github.jbellis.jvector.graph.disk.feature.Feature.State>> suppliers =
+                        new EnumMap<>(FeatureId.class);
+                suppliers.put(FeatureId.FUSED_PQ,
+                        ordinal -> new FusedPQ.State(view, pqv, ordinal));
+                suppliers.put(FeatureId.INLINE_VECTORS,
+                        ordinal -> new InlineVectors.State(existingMravv.getVector(ordinal)));
+                writer.write(suppliers);
+            }
+            return writeChunks(tempFile, TYPE_VECTOR_GRAPHCHUNK);
+        } finally {
+            Files.deleteIfExists(tempFile);
         }
     }
 
@@ -1054,9 +1164,13 @@ public class VectorIndexManager extends AbstractIndexManager {
             return;
         }
         // Check on-disk nodes first
-        Integer onDiskOrdinal = onDiskPkToNode.remove(key);
+        BLink<Bytes, Long> p2n = this.onDiskPkToNode;
+        Long onDiskOrdinal = p2n != null ? p2n.delete(key) : null;
         if (onDiskOrdinal != null) {
-            onDiskNodeToPk.remove(onDiskOrdinal);
+            BLink<Bytes, Bytes> n2p = this.onDiskNodeToPk;
+            if (n2p != null) {
+                n2p.delete(ordinalToBytes(onDiskOrdinal.intValue()));
+            }
             dirty.set(true);
             // No need to mark deleted in OnDiskGraphIndex — filtered at search time
         }
@@ -1082,6 +1196,37 @@ public class VectorIndexManager extends AbstractIndexManager {
             throws DataStorageManagerException {
         recordDeleted(key, indexKeyRemoved);
         recordInserted(key, indexKeyAdded);
+    }
+
+    /**
+     * Optimized insert used during rebuild only.
+     * Unlike {@link #recordInserted}, this skips {@code pkToNode} (not needed during rebuild)
+     * and {@code dirty} flag, and uses caller-provided maps instead of instance fields.
+     */
+    private void rebuildInsert(Bytes key, Bytes indexKey,
+                               ConcurrentHashMap<Integer, VectorFloat<?>> rebuildVectors,
+                               ConcurrentHashMap<Integer, Bytes> rebuildNodeToPk) {
+        if (indexKey == null) {
+            return;
+        }
+        float[] floats = indexKey.to_float_array();
+        if (floats.length == 0) {
+            return;
+        }
+        if (dimension == 0) {
+            initBuilderForDimension(floats.length, rebuildVectors);
+        }
+        if (floats.length != dimension) {
+            LOGGER.log(Level.WARNING,
+                    "vector dimension mismatch on insert: expected {0} but got {1}, skipping",
+                    new Object[]{dimension, floats.length});
+            return;
+        }
+        VectorFloat<?> vec = VTS.createFloatVector(floats);
+        int nodeId = nextNodeId.getAndIncrement();
+        rebuildVectors.put(nodeId, vec);
+        rebuildNodeToPk.put(nodeId, key);
+        builder.addGraphNode(nodeId, vec);
     }
 
     @Override
@@ -1114,7 +1259,7 @@ public class VectorIndexManager extends AbstractIndexManager {
 
         // --- Search on-disk graph (FusedPQ) ---
         OnDiskGraphIndex odg = this.onDiskGraph;
-        if (odg != null && !onDiskNodeToPk.isEmpty()) {
+        if (odg != null && onDiskNodeToPkSize() > 0) {
             searchOnDiskGraph(odg, qv, topK, results);
         }
 
@@ -1140,12 +1285,17 @@ public class VectorIndexManager extends AbstractIndexManager {
 
     private void searchOnDiskGraph(OnDiskGraphIndex odg, VectorFloat<?> qv, int topK,
                                     List<Map.Entry<Bytes, Float>> results) {
-        Set<Integer> activeOrdinals = onDiskNodeToPk.keySet();
-        int k = Math.min(topK, activeOrdinals.size());
+        BLink<Bytes, Bytes> n2p = this.onDiskNodeToPk;
+        if (n2p == null) {
+            return;
+        }
+        int activeCount = (int) n2p.size();
+        int k = Math.min(topK, activeCount);
         if (k == 0) {
             return;
         }
-        Bits acceptBits = activeOrdinals::contains;
+        // Accept ordinals that exist in the BLink (not deleted)
+        Bits acceptBits = ordinal -> n2p.search(ordinalToBytes(ordinal)) != null;
         try {
             GraphSearcher searcher = new GraphSearcher(odg);
             OnDiskGraphIndex.View view = (OnDiskGraphIndex.View) searcher.getView();
@@ -1156,7 +1306,7 @@ public class VectorIndexManager extends AbstractIndexManager {
             DefaultSearchScoreProvider ssp = new DefaultSearchScoreProvider(approxSF, reranker);
             SearchResult sr = searcher.search(ssp, k, acceptBits);
             for (SearchResult.NodeScore ns : sr.getNodes()) {
-                Bytes pk = onDiskNodeToPk.get(ns.node);
+                Bytes pk = n2p.search(ordinalToBytes(ns.node));
                 if (pk != null) {
                     results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
                 }
@@ -1183,9 +1333,13 @@ public class VectorIndexManager extends AbstractIndexManager {
     // -------------------------------------------------------------------------
 
     private synchronized void initBuilderForDimension(int dim) {
+        initBuilderForDimension(dim, vectors);
+    }
+
+    private synchronized void initBuilderForDimension(int dim, Map<Integer, VectorFloat<?>> vectorsMap) {
         if (this.dimension == 0) {
             this.dimension = dim;
-            this.mravv = new MapRandomAccessVectorValues(vectors, dim);
+            this.mravv = new MapRandomAccessVectorValues(vectorsMap, dim);
             BuildScoreProvider bsp =
                     BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
             this.builder = new GraphIndexBuilder(
@@ -1213,8 +1367,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         vectors.clear();
         pkToNode.clear();
         nodeToPk.clear();
-        onDiskNodeToPk.clear();
-        onDiskPkToNode.clear();
+        closeOnDiskBLinks();
         nextNodeId.set(0);
         dimension = 0;
         builder = null;
@@ -1245,11 +1398,324 @@ public class VectorIndexManager extends AbstractIndexManager {
     }
 
     // -------------------------------------------------------------------------
+    // BLink helpers for on-disk ordinal ↔ PK maps
+    // -------------------------------------------------------------------------
+
+    static Bytes ordinalToBytes(int ordinal) {
+        byte[] buf = new byte[4];
+        buf[0] = (byte) (ordinal >>> 24);
+        buf[1] = (byte) (ordinal >>> 16);
+        buf[2] = (byte) (ordinal >>> 8);
+        buf[3] = (byte) ordinal;
+        return Bytes.from_array(buf);
+    }
+
+    static int bytesToOrdinal(Bytes b) {
+        byte[] d = b.to_array();
+        return ((d[0] & 0xFF) << 24) | ((d[1] & 0xFF) << 16) | ((d[2] & 0xFF) << 8) | (d[3] & 0xFF);
+    }
+
+    private void createOnDiskBLinks() {
+        long pageSize = memoryManager.getMaxLogicalPageSize();
+        String nodeToPkName = index.uuid + "_nodetopk";
+        String pkToNodeName = index.uuid + "_pktonode";
+        try {
+            dataStorageManager.initIndex(tableSpaceUUID, nodeToPkName);
+            dataStorageManager.initIndex(tableSpaceUUID, pkToNodeName);
+        } catch (DataStorageManagerException e) {
+            throw new RuntimeException("Failed to init BLink storage for vector index " + index.name, e);
+        }
+        this.onDiskNodeToPk = new BLink<>(pageSize, BytesBytesSizeEvaluator.INSTANCE,
+                memoryManager.getIndexPageReplacementPolicy(),
+                new BytesBytesStorage(nodeToPkName));
+        this.onDiskPkToNode = new BLink<>(pageSize, BytesLongSizeEvaluator.INSTANCE,
+                memoryManager.getIndexPageReplacementPolicy(),
+                new BytesLongStorage(pkToNodeName));
+    }
+
+    private void closeOnDiskBLinks() {
+        BLink<Bytes, Bytes> n2p = this.onDiskNodeToPk;
+        if (n2p != null) {
+            n2p.close();
+            this.onDiskNodeToPk = null;
+        }
+        BLink<Bytes, Long> p2n = this.onDiskPkToNode;
+        if (p2n != null) {
+            p2n.close();
+            this.onDiskPkToNode = null;
+        }
+    }
+
+    private long onDiskNodeToPkSize() {
+        BLink<Bytes, Bytes> n2p = this.onDiskNodeToPk;
+        return n2p != null ? n2p.size() : 0;
+    }
+
+    private long onDiskPkToNodeSize() {
+        BLink<Bytes, Long> p2n = this.onDiskPkToNode;
+        return p2n != null ? p2n.size() : 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // BLink data storage implementations (disk-backed via DataStorageManager)
+    // -------------------------------------------------------------------------
+
+    private static final byte NODE_PAGE_END_BLOCK = 0;
+    private static final byte NODE_PAGE_KEY_VALUE_BLOCK = 1;
+    private static final byte NODE_PAGE_INF_BLOCK = 2;
+    private static final byte BLINK_INNER_NODE_PAGE = 1;
+    private static final byte BLINK_LEAF_NODE_PAGE = 2;
+
+    /**
+     * BLink storage for {@code BLink<Bytes, Long>} (pkToNode map).
+     * Follows the same pattern as {@code BLinkKeyToPageIndex.BLinkIndexDataStorageImpl}.
+     */
+    private final class BytesLongStorage implements BLinkIndexDataStorage<Bytes, Long> {
+        private final String storeName;
+
+        BytesLongStorage(String storeName) {
+            this.storeName = storeName;
+        }
+
+        @Override
+        public void loadNodePage(long pageId, Map<Bytes, Long> data) throws IOException {
+            loadPage(pageId, BLINK_INNER_NODE_PAGE, data);
+        }
+
+        @Override
+        public void loadLeafPage(long pageId, Map<Bytes, Long> data) throws IOException {
+            loadPage(pageId, BLINK_LEAF_NODE_PAGE, data);
+        }
+
+        private void loadPage(long pageId, byte type, Map<Bytes, Long> map) throws IOException {
+            dataStorageManager.readIndexPage(tableSpaceUUID, storeName, pageId, in -> {
+                long version = in.readVLong();
+                long flags = in.readVLong();
+                if (version != 1 || flags != 0) {
+                    throw new IOException("Corrupted BLink page " + pageId);
+                }
+                byte rtype = in.readByte();
+                if (rtype != type) {
+                    throw new IOException("Wrong page type " + rtype + " expected " + type);
+                }
+                byte block;
+                while ((block = in.readByte()) != NODE_PAGE_END_BLOCK) {
+                    switch (block) {
+                        case NODE_PAGE_KEY_VALUE_BLOCK:
+                            map.put(in.readBytes(), in.readVLong());
+                            break;
+                        case NODE_PAGE_INF_BLOCK:
+                            map.put(Bytes.POSITIVE_INFINITY, in.readVLong());
+                            break;
+                        default:
+                            throw new IOException("Wrong block type " + block);
+                    }
+                }
+                return map;
+            });
+        }
+
+        @Override
+        public long createNodePage(Map<Bytes, Long> data) throws IOException {
+            return writePage(NEW_PAGE, data, BLINK_INNER_NODE_PAGE);
+        }
+
+        @Override
+        public long createLeafPage(Map<Bytes, Long> data) throws IOException {
+            return writePage(NEW_PAGE, data, BLINK_LEAF_NODE_PAGE);
+        }
+
+        @Override
+        public void overwriteNodePage(long pageId, Map<Bytes, Long> data) throws IOException {
+            writePage(pageId, data, BLINK_INNER_NODE_PAGE);
+        }
+
+        @Override
+        public void overwriteLeafPage(long pageId, Map<Bytes, Long> data) throws IOException {
+            writePage(pageId, data, BLINK_LEAF_NODE_PAGE);
+        }
+
+        private long writePage(long pageId, Map<Bytes, Long> data, byte type) throws IOException {
+            if (pageId == NEW_PAGE) {
+                pageId = newPageId.getAndIncrement();
+            }
+            dataStorageManager.writeIndexPage(tableSpaceUUID, storeName, pageId, out -> {
+                out.writeVLong(1);
+                out.writeVLong(0);
+                out.writeByte(type);
+                data.forEach((x, y) -> {
+                    try {
+                        if (x == Bytes.POSITIVE_INFINITY) {
+                            out.writeByte(NODE_PAGE_INF_BLOCK);
+                            out.writeVLong(y);
+                        } else {
+                            out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
+                            out.writeArray(x.to_array());
+                            out.writeVLong(y);
+                        }
+                    } catch (IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                });
+                out.writeByte(NODE_PAGE_END_BLOCK);
+            });
+            return pageId;
+        }
+    }
+
+    /**
+     * BLink storage for {@code BLink<Bytes, Bytes>} (nodeToPk map).
+     */
+    private final class BytesBytesStorage implements BLinkIndexDataStorage<Bytes, Bytes> {
+        private final String storeName;
+
+        BytesBytesStorage(String storeName) {
+            this.storeName = storeName;
+        }
+
+        @Override
+        public void loadNodePage(long pageId, Map<Bytes, Long> data) throws IOException {
+            loadNodePageImpl(pageId, data);
+        }
+
+        private void loadNodePageImpl(long pageId, Map<Bytes, Long> data) throws IOException {
+            dataStorageManager.readIndexPage(tableSpaceUUID, storeName, pageId, in -> {
+                long version = in.readVLong();
+                long flags = in.readVLong();
+                if (version != 1 || flags != 0) {
+                    throw new IOException("Corrupted BLink page " + pageId);
+                }
+                byte rtype = in.readByte();
+                if (rtype != BLINK_INNER_NODE_PAGE) {
+                    throw new IOException("Wrong page type " + rtype + " expected " + BLINK_INNER_NODE_PAGE);
+                }
+                byte block;
+                while ((block = in.readByte()) != NODE_PAGE_END_BLOCK) {
+                    switch (block) {
+                        case NODE_PAGE_KEY_VALUE_BLOCK:
+                            data.put(in.readBytes(), in.readVLong());
+                            break;
+                        case NODE_PAGE_INF_BLOCK:
+                            data.put(Bytes.POSITIVE_INFINITY, in.readVLong());
+                            break;
+                        default:
+                            throw new IOException("Wrong block type " + block);
+                    }
+                }
+                return data;
+            });
+        }
+
+        @Override
+        public void loadLeafPage(long pageId, Map<Bytes, Bytes> data) throws IOException {
+            dataStorageManager.readIndexPage(tableSpaceUUID, storeName, pageId, in -> {
+                long version = in.readVLong();
+                long flags = in.readVLong();
+                if (version != 1 || flags != 0) {
+                    throw new IOException("Corrupted BLink page " + pageId);
+                }
+                byte rtype = in.readByte();
+                if (rtype != BLINK_LEAF_NODE_PAGE) {
+                    throw new IOException("Wrong page type " + rtype + " expected " + BLINK_LEAF_NODE_PAGE);
+                }
+                byte block;
+                while ((block = in.readByte()) != NODE_PAGE_END_BLOCK) {
+                    switch (block) {
+                        case NODE_PAGE_KEY_VALUE_BLOCK:
+                            data.put(in.readBytes(), in.readBytes());
+                            break;
+                        case NODE_PAGE_INF_BLOCK:
+                            data.put(Bytes.POSITIVE_INFINITY, in.readBytes());
+                            break;
+                        default:
+                            throw new IOException("Wrong block type " + block);
+                    }
+                }
+                return data;
+            });
+        }
+
+        @Override
+        public long createNodePage(Map<Bytes, Long> data) throws IOException {
+            return writeNodePage(NEW_PAGE, data);
+        }
+
+        @Override
+        public long createLeafPage(Map<Bytes, Bytes> data) throws IOException {
+            return writeLeafPage(NEW_PAGE, data);
+        }
+
+        @Override
+        public void overwriteNodePage(long pageId, Map<Bytes, Long> data) throws IOException {
+            writeNodePage(pageId, data);
+        }
+
+        @Override
+        public void overwriteLeafPage(long pageId, Map<Bytes, Bytes> data) throws IOException {
+            writeLeafPage(pageId, data);
+        }
+
+        private long writeNodePage(long pageId, Map<Bytes, Long> data) throws IOException {
+            if (pageId == NEW_PAGE) {
+                pageId = newPageId.getAndIncrement();
+            }
+            dataStorageManager.writeIndexPage(tableSpaceUUID, storeName, pageId, out -> {
+                out.writeVLong(1);
+                out.writeVLong(0);
+                out.writeByte(BLINK_INNER_NODE_PAGE);
+                data.forEach((x, y) -> {
+                    try {
+                        if (x == Bytes.POSITIVE_INFINITY) {
+                            out.writeByte(NODE_PAGE_INF_BLOCK);
+                            out.writeVLong(y);
+                        } else {
+                            out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
+                            out.writeArray(x.to_array());
+                            out.writeVLong(y);
+                        }
+                    } catch (IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                });
+                out.writeByte(NODE_PAGE_END_BLOCK);
+            });
+            return pageId;
+        }
+
+        private long writeLeafPage(long pageId, Map<Bytes, Bytes> data) throws IOException {
+            if (pageId == NEW_PAGE) {
+                pageId = newPageId.getAndIncrement();
+            }
+            dataStorageManager.writeIndexPage(tableSpaceUUID, storeName, pageId, out -> {
+                out.writeVLong(1);
+                out.writeVLong(0);
+                out.writeByte(BLINK_LEAF_NODE_PAGE);
+                data.forEach((x, y) -> {
+                    try {
+                        if (x == Bytes.POSITIVE_INFINITY) {
+                            out.writeByte(NODE_PAGE_INF_BLOCK);
+                            out.writeArray(y.to_array());
+                        } else {
+                            out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
+                            out.writeArray(x.to_array());
+                            out.writeArray(y.to_array());
+                        }
+                    } catch (IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                });
+                out.writeByte(NODE_PAGE_END_BLOCK);
+            });
+            return pageId;
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Accessors for tests
     // -------------------------------------------------------------------------
 
     public int getNodeCount() {
-        return nodeToPk.size() + onDiskNodeToPk.size();
+        return nodeToPk.size() + (int) onDiskNodeToPkSize();
     }
 
     public int getDimension() {
@@ -1269,6 +1735,10 @@ public class VectorIndexManager extends AbstractIndexManager {
     }
 
     public int getOnDiskNodeCount() {
-        return onDiskNodeToPk.size();
+        return (int) onDiskNodeToPkSize();
+    }
+
+    public int getPkToNodeSize() {
+        return pkToNode.size();
     }
 }

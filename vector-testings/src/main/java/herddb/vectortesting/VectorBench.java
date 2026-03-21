@@ -107,10 +107,29 @@ public class VectorBench {
             AtomicBoolean producerDone = new AtomicBoolean(false);
             AtomicLong rowId = new AtomicLong(0);
 
+            long ingestStart = System.nanoTime();
+
             ExecutorService ingestPool = Executors.newFixedThreadPool(config.ingestThreads);
             for (int t = 0; t < config.ingestThreads; t++) {
                 ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId, ingestMetrics, ingestStatus));
             }
+
+            // Progress display thread runs during the entire ingestion
+            char[] ingestSpinner = {'|', '/', '-', '\\'};
+            AtomicBoolean ingestDone = new AtomicBoolean(false);
+            Thread progressThread = new Thread(() -> {
+                int spin = 0;
+                while (!ingestDone.get()) {
+                    double elapsed = (System.nanoTime() - ingestStart) / 1e9;
+                    int filled = Math.min(40, (int)(elapsed / 5));
+                    String bar = "=".repeat(filled) + " ".repeat(40 - filled);
+                    System.out.printf("\r  [%s] %c %.0fs | %s", bar, ingestSpinner[spin++ % 4], elapsed, ingestStatus.get());
+                    System.out.flush();
+                    try { Thread.sleep(500); } catch (InterruptedException e) { break; }
+                }
+            });
+            progressThread.setDaemon(true);
+            progressThread.start();
 
             try (DatasetLoader.VectorStream stream = loader.streamBaseVectors(actualRows)) {
                 for (float[] vec : stream) {
@@ -122,17 +141,10 @@ public class VectorBench {
                 ingestQueue.put(new float[0]); // poison pills
             }
             ingestPool.shutdown();
+            ingestPool.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
 
-            long ingestStart = System.nanoTime();
-            char[] ingestSpinner = {'|', '/', '-', '\\'};
-            int ingestSpin = 0;
-            while (!ingestPool.awaitTermination(500, TimeUnit.MILLISECONDS)) {
-                double elapsed = (System.nanoTime() - ingestStart) / 1e9;
-                int filled = Math.min(40, (int)(elapsed / 5));
-                String bar = "=".repeat(filled) + " ".repeat(40 - filled);
-                System.out.printf("\r  [%s] %c %.0fs | %s", bar, ingestSpinner[ingestSpin++ % 4], elapsed, ingestStatus.get());
-                System.out.flush();
-            }
+            ingestDone.set(true);
+            progressThread.join();
             double ingestSecs = (System.nanoTime() - ingestStart) / 1e9;
             System.out.printf("\r  [%s] done in %.1fs%n", "=".repeat(40), ingestSecs);
 

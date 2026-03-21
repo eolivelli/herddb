@@ -1108,81 +1108,11 @@ public class CalcitePlanner extends AbstractSQLPlanner {
                         && projectExprs.get(sortFieldIdx) instanceof RexCall) {
                     RexCall annOfCall = (RexCall) projectExprs.get(sortFieldIdx);
                     if ("ANN_OF".equalsIgnoreCase(annOfCall.getOperator().getName())
-                            && annOfCall.getOperands().size() == 2
-                            && innerProject.getInput() instanceof BindableTableScan) {
-                        BindableTableScan bts = (BindableTableScan) innerProject.getInput();
-                        RexNode colRef = annOfCall.getOperands().get(0);
-                        if (colRef instanceof RexInputRef) {
-                            int colIdx = ((RexInputRef) colRef).getIndex();
-                            String columnName = bts.getRowType().getFieldList()
-                                    .get(colIdx).getName().toLowerCase(Locale.ROOT);
-                            String annTableSpace = bts.getTable().getQualifiedName().get(0);
-                            TableImpl annTableImpl = (TableImpl) bts.getTable()
-                                    .unwrap(org.apache.calcite.schema.Table.class);
-                            Table annTable = annTableImpl.tableManager.getTable();
-
-                            CompiledSQLExpression queryVecExpr =
-                                    SQLExpressionCompiler.compileExpression(annOfCall.getOperands().get(1));
-
-                            // Compile WHERE predicate from bts.filters
-                            SQLRecordPredicate annPredicate = null;
-                            if (!bts.filters.isEmpty()) {
-                                CompiledSQLExpression where;
-                                if (bts.filters.size() == 1) {
-                                    where = SQLExpressionCompiler.compileExpression(bts.filters.get(0));
-                                } else {
-                                    CompiledSQLExpression[] ops = new CompiledSQLExpression[bts.filters.size()];
-                                    int k = 0;
-                                    for (RexNode expr : bts.filters) {
-                                        ops[k++] = SQLExpressionCompiler.compileExpression(expr);
-                                    }
-                                    where = new CompiledMultiAndExpression(ops);
-                                }
-                                annPredicate = new SQLRecordPredicate(annTable, null, where);
-                            }
-
-                            // Scan projection: maps full table row → bts output schema
-                            RelDataType btsRowType = bts.getRowType();
-                            List<RexNode> scanProjExprs = new ArrayList<>(bts.projects.size());
-                            int k = 0;
-                            for (int fieldpos : bts.projects) {
-                                scanProjExprs.add(new RexInputRef(fieldpos,
-                                        btsRowType.getFieldList().get(k++).getType()));
-                            }
-                            Projection scanProjection = buildProjection(
-                                    scanProjExprs, btsRowType, true, annTable.columns);
-
-                            // Inner projection: maps bts output → final schema (including ann_of column)
-                            Projection innerProjection = buildProjection(
-                                    projectExprs, innerProject.getRowType(), false, null);
-
-                            // Build brute-force fallback SortOp
-                            PlannerOp normalInput = convertRelNode(op.getInput(), rowType, false, false);
-                            boolean[] annDirs = new boolean[annFcs.size()];
-                            boolean[] annNullLastDirs = new boolean[annFcs.size()];
-                            int[] annFields = new int[annFcs.size()];
-                            int ai = 0;
-                            for (RelFieldCollation col : annFcs) {
-                                RelFieldCollation.Direction dir = col.getDirection();
-                                annDirs[ai] = dir == RelFieldCollation.Direction.ASCENDING
-                                        || dir == RelFieldCollation.Direction.STRICTLY_ASCENDING;
-                                annNullLastDirs[ai] = col.nullDirection == RelFieldCollation.NullDirection.LAST
-                                        || col.nullDirection == RelFieldCollation.NullDirection.UNSPECIFIED;
-                                annFields[ai++] = col.getFieldIndex();
-                            }
-                            PlannerOp fallback = new SortOp(normalInput, annDirs, annFields, annNullLastDirs);
-
-                            PlannerOp result = new VectorANNScanOp(annTableSpace, annTable, columnName,
-                                    queryVecExpr, fallback, annPredicate,
-                                    scanProjection, innerProjection);
-                            // If Calcite fused LIMIT into the Sort node, wrap with LimitOp
-                            if (op.fetch != null) {
-                                CompiledSQLExpression maxRows = SQLExpressionCompiler.compileExpression(op.fetch);
-                                CompiledSQLExpression offset = op.offset != null
-                                        ? SQLExpressionCompiler.compileExpression(op.offset) : null;
-                                result = new LimitOp(result, maxRows, offset);
-                            }
-                            return result;
+                            && annOfCall.getOperands().size() == 2) {
+                        PlannerOp annResult = tryBuildVectorANNPlan(
+                                op, innerProject, annOfCall, annFcs, projectExprs, rowType);
+                        if (annResult != null) {
+                            return annResult;
                         }
                     }
                 }
@@ -1217,6 +1147,133 @@ public class CalcitePlanner extends AbstractSQLPlanner {
         }
         return sortResult;
 
+    }
+
+    /**
+     * Tries to build a VectorANNScanOp from a Sort(Project(scan)) pattern.
+     * Supports both BindableTableScan and EnumerableTableScan as the leaf scan node.
+     *
+     * @return the VectorANNScanOp (possibly wrapped in LimitOp), or null if the pattern doesn't match
+     */
+    private PlannerOp tryBuildVectorANNPlan(
+            EnumerableSort op,
+            EnumerableProject innerProject,
+            RexCall annOfCall,
+            List<RelFieldCollation> annFcs,
+            List<RexNode> projectExprs,
+            RelDataType rowType
+    ) throws StatementExecutionException {
+
+        RelNode scanNode = innerProject.getInput();
+        RexNode colRef = annOfCall.getOperands().get(0);
+        // Unwrap CAST if Calcite added an implicit type cast around the column reference
+        if (colRef instanceof RexCall) {
+            RexCall castCall = (RexCall) colRef;
+            if (castCall.getKind() == org.apache.calcite.sql.SqlKind.CAST
+                    && castCall.getOperands().size() == 1) {
+                colRef = castCall.getOperands().get(0);
+            }
+        }
+        if (!(colRef instanceof RexInputRef)) {
+            return null;
+        }
+        int colIdx = ((RexInputRef) colRef).getIndex();
+
+        // Extract table info from either BindableTableScan or EnumerableTableScan
+        String annTableSpace;
+        Table annTable;
+        String columnName;
+        SQLRecordPredicate annPredicate = null;
+        Projection scanProjection = null;
+
+        if (scanNode instanceof BindableTableScan) {
+            BindableTableScan bts = (BindableTableScan) scanNode;
+            columnName = bts.getRowType().getFieldList()
+                    .get(colIdx).getName().toLowerCase(Locale.ROOT);
+            annTableSpace = bts.getTable().getQualifiedName().get(0);
+            TableImpl annTableImpl = (TableImpl) bts.getTable()
+                    .unwrap(org.apache.calcite.schema.Table.class);
+            annTable = annTableImpl.tableManager.getTable();
+
+            // Compile WHERE predicate from bts.filters
+            if (!bts.filters.isEmpty()) {
+                CompiledSQLExpression where;
+                if (bts.filters.size() == 1) {
+                    where = SQLExpressionCompiler.compileExpression(bts.filters.get(0));
+                } else {
+                    CompiledSQLExpression[] ops = new CompiledSQLExpression[bts.filters.size()];
+                    int k = 0;
+                    for (RexNode expr : bts.filters) {
+                        ops[k++] = SQLExpressionCompiler.compileExpression(expr);
+                    }
+                    where = new CompiledMultiAndExpression(ops);
+                }
+                annPredicate = new SQLRecordPredicate(annTable, null, where);
+            }
+
+            // Scan projection: maps full table row → bts output schema
+            RelDataType btsRowType = bts.getRowType();
+            List<RexNode> scanProjExprs = new ArrayList<>(bts.projects.size());
+            int k = 0;
+            for (int fieldpos : bts.projects) {
+                scanProjExprs.add(new RexInputRef(fieldpos,
+                        btsRowType.getFieldList().get(k++).getType()));
+            }
+            scanProjection = buildProjection(
+                    scanProjExprs, btsRowType, true, annTable.columns);
+
+        } else if (scanNode instanceof EnumerableTableScan) {
+            EnumerableTableScan ets = (EnumerableTableScan) scanNode;
+            columnName = ets.getRowType().getFieldList()
+                    .get(colIdx).getName().toLowerCase(Locale.ROOT);
+            annTableSpace = ets.getTable().getQualifiedName().get(0);
+            TableImpl annTableImpl = (TableImpl) ets.getTable()
+                    .unwrap(org.apache.calcite.schema.Table.class);
+            annTable = annTableImpl.tableManager.getTable();
+            // EnumerableTableScan has no filters and no column pruning;
+            // scanProjection stays null (identity)
+
+        } else {
+            return null;
+        }
+
+        CompiledSQLExpression queryVecExpr =
+                SQLExpressionCompiler.compileExpression(annOfCall.getOperands().get(1));
+
+        // Inner projection: maps scan output → final schema (including ann_of column)
+        Projection innerProjection = buildProjection(
+                projectExprs, innerProject.getRowType(), false, null);
+
+        // Build brute-force fallback SortOp
+        PlannerOp normalInput = convertRelNode(op.getInput(), rowType, false, false);
+        boolean[] annDirs = new boolean[annFcs.size()];
+        boolean[] annNullLastDirs = new boolean[annFcs.size()];
+        int[] annFields = new int[annFcs.size()];
+        int ai = 0;
+        for (RelFieldCollation col : annFcs) {
+            RelFieldCollation.Direction dir = col.getDirection();
+            annDirs[ai] = dir == RelFieldCollation.Direction.ASCENDING
+                    || dir == RelFieldCollation.Direction.STRICTLY_ASCENDING;
+            annNullLastDirs[ai] = col.nullDirection == RelFieldCollation.NullDirection.LAST
+                    || col.nullDirection == RelFieldCollation.NullDirection.UNSPECIFIED;
+            annFields[ai++] = col.getFieldIndex();
+        }
+        PlannerOp fallback = new SortOp(normalInput, annDirs, annFields, annNullLastDirs);
+
+        PlannerOp result = new VectorANNScanOp(annTableSpace, annTable, columnName,
+                queryVecExpr, fallback, annPredicate,
+                scanProjection, innerProjection);
+        // If Calcite fused LIMIT into the Sort node, wrap with LimitOp
+        // and optimize immediately so that the limit is pushed into
+        // VectorANNScanOp (LimitOp.optimize() won't be called later
+        // because ProjectOp.optimize() does not recurse into children).
+        if (op.fetch != null) {
+            CompiledSQLExpression maxRows = SQLExpressionCompiler.compileExpression(op.fetch);
+            CompiledSQLExpression offset = op.offset != null
+                    ? SQLExpressionCompiler.compileExpression(op.offset) : null;
+            result = new LimitOp(result, maxRows, offset).optimize();
+        }
+        return result;
     }
 
     private PlannerOp planInterpreter(EnumerableInterpreter op, RelDataType rowType, boolean returnValues) {

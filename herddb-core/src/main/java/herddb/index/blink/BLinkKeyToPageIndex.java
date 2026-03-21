@@ -30,7 +30,7 @@ import herddb.index.KeyToPageIndex;
 import herddb.index.PrimaryIndexPrefixScan;
 import herddb.index.PrimaryIndexRangeScan;
 import herddb.index.PrimaryIndexSeek;
-import herddb.index.blink.BLink.SizeEvaluator;
+
 import herddb.index.blink.BLinkMetadata.BLinkNodeMetadata;
 import herddb.log.LogSequenceNumber;
 import herddb.model.ColumnTypes;
@@ -309,7 +309,7 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
 
         if (LogSequenceNumber.START_OF_TIME.equals(sequenceNumber)) {
             /* Empty index (booting from the start) */
-            tree = new BLink<>(pageSize, SizeEvaluatorImpl.INSTANCE,
+            tree = new BLink<>(pageSize, BytesLongSizeEvaluator.INSTANCE,
                     memoryManager.getPKPageReplacementPolicy(), indexDataStorage);
             if (!created) {
                 LOGGER.log(Level.INFO, "loaded empty index {0}", new Object[]{indexName});
@@ -319,7 +319,7 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
             try {
                 BLinkMetadata<Bytes> metadata = MetadataSerializer.INSTANCE.read(status.indexData);
 
-                tree = new BLink<>(pageSize, SizeEvaluatorImpl.INSTANCE,
+                tree = new BLink<>(pageSize, BytesLongSizeEvaluator.INSTANCE,
                         memoryManager.getPKPageReplacementPolicy(), indexDataStorage,
                         metadata);
             } catch (IOException e) {
@@ -387,63 +387,7 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
         return tree;
     }
 
-    private static class SizeEvaluatorImpl implements SizeEvaluator<Bytes, Long> {
 
-        /**
-         * <pre>
-         * java.lang.Long object internals:
-         *  OFFSET  SIZE   TYPE DESCRIPTION                               VALUE
-         *       0    12        (object header)                           N/A
-         *      12     4        (alignment/padding gap)
-         *      16     8   long Long.value                                N/A
-         * Instance size: 24 bytes
-         * Space losses: 4 bytes internal + 0 bytes external = 4 bytes total
-         * </pre>
-         */
-        private static final long DATA_SIZE = 24L;
-
-        /**
-         * Singleton INSTANCE
-         */
-        public static final SizeEvaluator<Bytes, Long> INSTANCE = new SizeEvaluatorImpl();
-
-        /**
-         * Private constructor, use Singleton instance {@link #INSTANCE}
-         */
-        private SizeEvaluatorImpl() {
-        }
-
-        @Override
-        public long evaluateKey(Bytes key) {
-            return key.getEstimatedSize();
-        }
-
-        @Override
-        public boolean isValueSizeConstant() {
-            return true;
-        }
-
-        @Override
-        public long constantValueSize() throws UnsupportedOperationException {
-            return DATA_SIZE;
-        }
-
-        @Override
-        public long evaluateValue(Long value) {
-            return DATA_SIZE;
-        }
-
-        @Override
-        public long evaluateAll(Bytes key, Long value) {
-            return key.getEstimatedSize() + DATA_SIZE;
-        }
-
-        @Override
-        public Bytes getPosiviveInfinityKey() {
-            return Bytes.POSITIVE_INFINITY;
-        }
-
-    }
 
     public static final class MetadataSerializer {
 

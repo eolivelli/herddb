@@ -32,6 +32,8 @@ import herddb.model.GetResult;
 import herddb.model.Predicate;
 import herddb.model.Projection;
 import herddb.model.Record;
+import herddb.model.DataScannerException;
+import herddb.model.LimitedDataScanner;
 import herddb.model.ScanResult;
 import herddb.model.StatementEvaluationContext;
 import herddb.model.StatementExecutionException;
@@ -146,7 +148,23 @@ public class VectorANNScanOp implements PlannerOp {
         VectorIndexManager vim = findVectorIndex(tableSpaceManager);
         if (vim == null) {
             if (fallback != null) {
-                return fallback.execute(tableSpaceManager, transactionContext, context, lockRequired, forWrite);
+                StatementExecutionResult fallbackResult = fallback.execute(
+                        tableSpaceManager, transactionContext, context, lockRequired, forWrite);
+                // When limit was pushed into this op (LimitOp removed), apply
+                // limit/offset to the fallback result as well.
+                if (limitExpr != null) {
+                    try {
+                        ScanResult sr = (ScanResult) fallbackResult;
+                        int lim = ((Number) limitExpr.evaluate(DataAccessor.NULL, context)).intValue();
+                        int off = offsetExpr != null
+                                ? ((Number) offsetExpr.evaluate(DataAccessor.NULL, context)).intValue() : 0;
+                        return new ScanResult(sr.transactionId,
+                                new LimitedDataScanner(sr.dataScanner, lim, off, context));
+                    } catch (DataScannerException ex) {
+                        throw new StatementExecutionException(ex);
+                    }
+                }
+                return fallbackResult;
             } else {
                 throw new StatementExecutionException("No vector index found for column '" + columnName + "' on table " + tableDef.name);
             }
