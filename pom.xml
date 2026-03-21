@@ -655,6 +655,8 @@
                 <module>herddb-jdbc</module>
                 <module>herddb-collections</module>
                 <module>herddb-ui</module>
+                <module>herddb-mysql-protocol</module>
+                <module>herddb-mysql</module>
                 <module>herddb-services</module>
                 <module>herddb-cli</module>
                 <module>herddb-bench</module>
@@ -757,6 +759,8 @@
                 <module>herddb-core</module>
                 <module>herddb-jdbc</module>
                 <module>herddb-collections</module>
+                <module>herddb-mysql-protocol</module>
+                <module>herddb-mysql</module>
                 <module>herddb-cli</module>
             </modules>
             <distributionManagement>
@@ -860,6 +864,8 @@
                 <module>herddb-core</module>
                 <module>herddb-jdbc</module>
                 <module>herddb-collections</module>
+                <module>herddb-mysql-protocol</module>
+                <module>herddb-mysql</module>
                 <module>herddb-services</module>
                 <module>herddb-cli</module>
                 <module>herddb-ui</module>

@@ -55,10 +55,12 @@ import java.lang.reflect.Constructor;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.ServiceLoader;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -85,6 +87,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
     private final Path tmpDirectory;
     private final ServerHostData serverHostData;
     private final Map<Long, ServerSideConnectionPeer> connections = new ConcurrentHashMap<>();
+    private final List<CustomTransport> customTransports = new ArrayList<>();
     private final String mode;
     private final MetadataStorageManager metadataStorageManager;
     private final CommitLogManager commitLogManager;
@@ -244,6 +247,12 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
 
         this.networkServer = buildChannelAcceptor();
         this.networkServer.setAcceptor(this);
+
+        for (CustomTransport transport : ServiceLoader.load(CustomTransport.class)) {
+            LOGGER.log(Level.INFO, "Initializing custom transport: {0}", transport.getClass().getName());
+            transport.init(configuration, manager, this);
+            customTransports.add(transport);
+        }
 
         switch (mode) {
             case ServerConfiguration.PROPERTY_MODE_LOCAL:
@@ -433,6 +442,9 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         }
         this.manager.start();
         this.networkServer.start();
+        for (CustomTransport transport : customTransports) {
+            transport.start();
+        }
     }
 
     public void waitForStandaloneBoot() throws Exception {
@@ -455,6 +467,13 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
 
     @Override
     public void close() throws Exception {
+        for (CustomTransport transport : customTransports) {
+            try {
+                transport.close();
+            } catch (Throwable error) {
+                LOGGER.log(Level.SEVERE, "error while stopping custom transport " + transport.getClass().getName(), error);
+            }
+        }
         try {
             networkServer.close();
         } catch (Throwable error) {
