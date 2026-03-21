@@ -22,7 +22,6 @@ package herddb.utils;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.netty.util.internal.PlatformDependent;
-import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 
@@ -152,21 +151,38 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
             throw new IllegalArgumentException("Invalid byte array length");
         }
         int floatCount = length / 4;
-        ByteBuffer wrappedBuffer = ByteBuffer.wrap(buffer, offset, length);
         float[] result = new float[floatCount];
-        for (int i = 0; i < floatCount; i++) {
-            result[i] = wrappedBuffer.getFloat();
+        if (HAS_UNSAFE && UNALIGNED) {
+            for (int i = 0; i < floatCount; i++) {
+                int v = PlatformDependent.getInt(buffer, offset);
+                if (!BIG_ENDIAN_NATIVE_ORDER) {
+                    v = Integer.reverseBytes(v);
+                }
+                result[i] = Float.intBitsToFloat(v);
+                offset += 4;
+            }
+        } else {
+            for (int i = 0; i < floatCount; i++) {
+                int v = (buffer[offset] & 0xff) << 24
+                        | (buffer[offset + 1] & 0xff) << 16
+                        | (buffer[offset + 2] & 0xff) << 8
+                        | buffer[offset + 3] & 0xff;
+                result[i] = Float.intBitsToFloat(v);
+                offset += 4;
+            }
         }
         return result;
     }
 
     public static Bytes from_float_array(float[] floatArray) {
         int length = floatArray.length;
-        ByteBuffer buffer = ByteBuffer.allocate(length * 4); // Each float is 4 bytes
+        byte[] res = new byte[length * 4];
+        int offset = 0;
         for (float f : floatArray) {
-            buffer.putFloat(f);
+            putInt(res, offset, Float.floatToRawIntBits(f));
+            offset += 4;
         }
-        return new Bytes(buffer.array());
+        return new Bytes(res);
     }
 
     public static Bytes from_int(int value) {

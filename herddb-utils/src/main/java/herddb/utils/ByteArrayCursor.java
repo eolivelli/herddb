@@ -23,9 +23,11 @@ package herddb.utils;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.netty.util.Recycler;
 import io.netty.util.Recycler.Handle;
+import io.netty.util.internal.PlatformDependent;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
+import java.nio.ByteOrder;
 
 /**
  * This utility class enables accessing a byte[] while leveraging
@@ -36,6 +38,10 @@ import java.io.IOException;
  */
 @SuppressFBWarnings({"EI_EXPOSE_REP", "EI_EXPOSE_REP2"})
 public class ByteArrayCursor implements Closeable {
+
+    private static final boolean UNALIGNED = PlatformDependent.isUnaligned();
+    private static final boolean HAS_UNSAFE = PlatformDependent.hasUnsafe();
+    private static final boolean BIG_ENDIAN_NATIVE_ORDER = ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN;
 
     private static final Recycler<ByteArrayCursor> RECYCLER = new Recycler<ByteArrayCursor>() {
 
@@ -331,9 +337,26 @@ public class ByteArrayCursor implements Closeable {
             /* NULL array */
             return null;
         }
+        int byteLen = len * 4;
+        checkReadable(byteLen);
         float[] result = new float[len];
-        for (int i = 0; i < len; i++) {
-            result[i] = readFloat();
+        if (HAS_UNSAFE && UNALIGNED) {
+            for (int i = 0; i < len; i++) {
+                int v = PlatformDependent.getInt(array, position);
+                if (!BIG_ENDIAN_NATIVE_ORDER) {
+                    v = Integer.reverseBytes(v);
+                }
+                result[i] = Float.intBitsToFloat(v);
+                position += 4;
+            }
+        } else {
+            for (int i = 0; i < len; i++) {
+                int ch1 = array[position++] & 0xff;
+                int ch2 = array[position++] & 0xff;
+                int ch3 = array[position++] & 0xff;
+                int ch4 = array[position++] & 0xff;
+                result[i] = Float.intBitsToFloat((ch1 << 24) | (ch2 << 16) | (ch3 << 8) | ch4);
+            }
         }
         return result;
     }
