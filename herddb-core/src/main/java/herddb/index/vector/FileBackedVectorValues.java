@@ -71,6 +71,10 @@ public class FileBackedVectorValues implements RandomAccessVectorValues, Closeab
     private volatile MappedByteBuffer[] segments;
     private volatile long mappedSize;
 
+    // Per-copy reusable buffer to avoid allocations in getVector (null for original instances)
+    private final float[] sharedBuffer;
+    private final VectorFloat<?> sharedVector;
+
     /**
      * @param dimension    vector dimension
      * @param expectedSize expected number of vectors (used for initial file allocation)
@@ -95,13 +99,15 @@ public class FileBackedVectorValues implements RandomAccessVectorValues, Closeab
         raf.setLength(initialSize);
         this.mappedSize = initialSize;
         this.segments = mapSegments(initialSize);
+        this.sharedBuffer = null;
+        this.sharedVector = null;
     }
 
-    // Constructor for copy() — shares the same file
+    // Constructor for copy() — shares the same file, optionally with a reusable read buffer
     private FileBackedVectorValues(int dimension, Path filePath, RandomAccessFile raf,
                                     FileChannel channel, AtomicInteger count,
                                     MappedByteBuffer[] segments, long mappedSize,
-                                    int maxSegmentSize) {
+                                    int maxSegmentSize, boolean shared) {
         this.dimension = dimension;
         this.vectorByteSize = (long) dimension * Float.BYTES;
         this.maxSegmentSize = maxSegmentSize;
@@ -111,6 +117,13 @@ public class FileBackedVectorValues implements RandomAccessVectorValues, Closeab
         this.count = count;
         this.segments = segments;
         this.mappedSize = mappedSize;
+        if (shared) {
+            this.sharedBuffer = new float[dimension];
+            this.sharedVector = VTS.createFloatVector(sharedBuffer);
+        } else {
+            this.sharedBuffer = null;
+            this.sharedVector = null;
+        }
     }
 
     private MappedByteBuffer[] mapSegments(long totalSize) throws IOException {
@@ -195,7 +208,7 @@ public class FileBackedVectorValues implements RandomAccessVectorValues, Closeab
     @Override
     public VectorFloat<?> getVector(int nodeId) {
         long offset = (long) nodeId * vectorByteSize;
-        float[] floats = new float[dimension];
+        float[] floats = sharedBuffer != null ? sharedBuffer : new float[dimension];
         MappedByteBuffer[] segs = segments;
         for (int i = 0; i < dimension; i++) {
             long pos = offset + (long) i * Float.BYTES;
@@ -203,19 +216,18 @@ public class FileBackedVectorValues implements RandomAccessVectorValues, Closeab
             int segOffset = (int) (pos % maxSegmentSize);
             floats[i] = segs[segIndex].getFloat(segOffset);
         }
-        return VTS.createFloatVector(floats);
+        return sharedVector != null ? sharedVector : VTS.createFloatVector(floats);
     }
 
     @Override
     public boolean isValueShared() {
-        return false;
+        return sharedBuffer != null;
     }
 
     @Override
     public RandomAccessVectorValues copy() {
-        // Non-shared, so safe to return a lightweight wrapper over the same data
         return new FileBackedVectorValues(dimension, filePath, raf, channel, count,
-                segments, mappedSize, maxSegmentSize);
+                segments, mappedSize, maxSegmentSize, true);
     }
 
     @Override
