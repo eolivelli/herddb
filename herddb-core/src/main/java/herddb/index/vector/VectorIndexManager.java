@@ -42,7 +42,6 @@ import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
 import herddb.utils.Bytes;
-import io.github.jbellis.jvector.disk.ByteBufferReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.graph.GraphSearcher;
 import io.github.jbellis.jvector.graph.ImmutableGraphIndex;
@@ -71,16 +70,15 @@ import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 import java.util.AbstractMap;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Arrays;
@@ -393,18 +391,19 @@ public class VectorIndexManager extends AbstractIndexManager {
                                      int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
             throws IOException {
         // Restore pk/vector maps from temp file
-        try (FileChannel mapCh = FileChannel.open(mapFile, StandardOpenOption.READ)) {
-            ByteBuffer mapBuf = mapCh.map(FileChannel.MapMode.READ_ONLY, 0, mapCh.size());
-            int entryCount = mapBuf.getInt();
+        // Use DataInputStream to avoid Integer.MAX_VALUE limit of MappedByteBuffer
+        try (DataInputStream dis = new DataInputStream(
+                new BufferedInputStream(new FileInputStream(mapFile.toFile()), CHUNK_SIZE))) {
+            int entryCount = dis.readInt();
             for (int i = 0; i < entryCount; i++) {
-                int nodeId = mapBuf.getInt();
-                int pkLen = mapBuf.getInt();
+                int nodeId = dis.readInt();
+                int pkLen = dis.readInt();
                 byte[] pkData = new byte[pkLen];
-                mapBuf.get(pkData);
-                int floatCount = mapBuf.getInt();
+                dis.readFully(pkData);
+                int floatCount = dis.readInt();
                 float[] floats = new float[floatCount];
                 for (int j = 0; j < floatCount; j++) {
-                    floats[j] = mapBuf.getFloat();
+                    floats[j] = dis.readFloat();
                 }
                 Bytes pk = Bytes.from_array(pkData);
                 VectorFloat<?> vec = VTS.createFloatVector(floats);
@@ -418,9 +417,8 @@ public class VectorIndexManager extends AbstractIndexManager {
         this.mravv = new MapRandomAccessVectorValues(vectors, dim);
 
         // Load OnHeapGraphIndex from temp file
-        try (FileChannel graphCh = FileChannel.open(graphFile, StandardOpenOption.READ)) {
-            ByteBuffer graphBuf = graphCh.map(FileChannel.MapMode.READ_ONLY, 0, graphCh.size());
-            ByteBufferReader reader = new ByteBufferReader(graphBuf);
+        // Use SegmentedMappedReader to avoid Integer.MAX_VALUE limit of MappedByteBuffer
+        try (SegmentedMappedReader reader = new SegmentedMappedReader(graphFile)) {
 
             BuildScoreProvider bsp =
                     BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
@@ -448,18 +446,19 @@ public class VectorIndexManager extends AbstractIndexManager {
         createOnDiskBLinks();
 
         // Map data stores (newOrdinal, pk, vector) — newOrdinals are sequential 0..N-1
-        try (FileChannel mapCh = FileChannel.open(mapFile, StandardOpenOption.READ)) {
-            ByteBuffer mapBuf = mapCh.map(FileChannel.MapMode.READ_ONLY, 0, mapCh.size());
-            int entryCount = mapBuf.getInt();
+        // Use DataInputStream to avoid Integer.MAX_VALUE limit of MappedByteBuffer
+        try (DataInputStream dis = new DataInputStream(
+                new BufferedInputStream(new FileInputStream(mapFile.toFile()), CHUNK_SIZE))) {
+            int entryCount = dis.readInt();
             int maxOrdinal = -1;
             for (int i = 0; i < entryCount; i++) {
-                int ordinal = mapBuf.getInt();
-                int pkLen = mapBuf.getInt();
+                int ordinal = dis.readInt();
+                int pkLen = dis.readInt();
                 byte[] pkData = new byte[pkLen];
-                mapBuf.get(pkData);
-                int floatCount = mapBuf.getInt();
+                dis.readFully(pkData);
+                int floatCount = dis.readInt();
                 // skip vector floats (not needed for on-disk graph; vectors are stored inline)
-                mapBuf.position(mapBuf.position() + floatCount * Float.BYTES);
+                skipFully(dis, (long) floatCount * Float.BYTES);
                 Bytes pk = Bytes.from_array(pkData);
                 onDiskNodeToPk.insert(ordinalToBytes(ordinal), pk);
                 onDiskPkToNode.insert(pk, (long) ordinal);
@@ -474,7 +473,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         Files.deleteIfExists(mapFile);
 
         // Load OnDiskGraphIndex from temp file (file stays alive for graph's lifetime)
-        ReaderSupplier readerSupplier = new io.github.jbellis.jvector.disk.SimpleMappedReader.Supplier(graphFile);
+        ReaderSupplier readerSupplier = new SegmentedMappedReader.Supplier(graphFile);
         this.onDiskGraph = OnDiskGraphIndex.load(readerSupplier);
         this.onDiskReaderSupplier = readerSupplier;
         this.onDiskGraphFile = graphFile;
@@ -1072,6 +1071,19 @@ public class VectorIndexManager extends AbstractIndexManager {
             return writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
         } finally {
             Files.deleteIfExists(mapTmpFile);
+        }
+    }
+
+    private static void skipFully(DataInputStream dis, long n) throws IOException {
+        while (n > 0) {
+            int skipped = dis.skipBytes((int) Math.min(n, Integer.MAX_VALUE));
+            if (skipped <= 0) {
+                // skipBytes may return 0; fall back to reading a byte
+                dis.readByte();
+                n--;
+            } else {
+                n -= skipped;
+            }
         }
     }
 
