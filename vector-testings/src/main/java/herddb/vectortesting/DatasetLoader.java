@@ -333,6 +333,13 @@ public class DatasetLoader {
     enum VecFormat { FVECS, BVECS }
 
     enum DatasetPreset {
+        SIFT10K(
+                "siftsmall",
+                "ftp://ftp.irisa.fr/local/texmex/corpus/siftsmall.tar.gz",
+                "siftsmall_base.fvecs", VecFormat.FVECS,
+                "siftsmall_query.fvecs", VecFormat.FVECS,
+                "siftsmall_groundtruth.ivecs"
+        ),
         SIFT1M(
                 "sift",
                 "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz",
@@ -346,6 +353,13 @@ public class DatasetLoader {
                 "bigann_base.bvecs", VecFormat.BVECS,
                 "bigann_query.bvecs", VecFormat.BVECS,
                 "bigann_gnd/idx_10000000.ivecs"
+        ),
+        GIST1M(
+                "gist",
+                "ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz",
+                "gist_base.fvecs", VecFormat.FVECS,
+                "gist_query.fvecs", VecFormat.FVECS,
+                "gist_groundtruth.ivecs"
         ),
         BIGANN(
                 "bigann",

@@ -40,7 +40,7 @@ public class Config {
         opts.addOption(null, "password", true, "Password (default: empty)");
         opts.addOption(null, "table", true, "Table name (default: vector_bench)");
         opts.addOption(null, "dataset-dir", true, "Dataset download/cache directory (default: ./datasets)");
-        opts.addOption(null, "dataset", true, "Dataset preset: sift1m, sift10m, bigann (default: sift1m)");
+        opts.addOption(null, "dataset", true, "Dataset preset: sift10k, sift1m, gist1m, sift10m, bigann (default: sift1m)");
         opts.addOption(null, "dataset-url", true, "Override dataset download URL");
         opts.addOption("n", "rows", true, "Number of rows to ingest (default: 100000, cycles dataset if larger)");
         opts.addOption(null, "ingest-threads", true, "Ingestion parallelism (default: 4)");
@@ -142,11 +142,13 @@ public class Config {
 
     private static DatasetLoader.DatasetPreset parseDataset(String value) {
         return switch (value.toLowerCase()) {
+            case "sift10k", "siftsmall" -> DatasetLoader.DatasetPreset.SIFT10K;
             case "sift1m", "sift" -> DatasetLoader.DatasetPreset.SIFT1M;
+            case "gist1m", "gist" -> DatasetLoader.DatasetPreset.GIST1M;
             case "sift10m" -> DatasetLoader.DatasetPreset.SIFT10M;
             case "bigann", "sift1b" -> DatasetLoader.DatasetPreset.BIGANN;
             default -> throw new IllegalArgumentException("Unknown dataset: " + value
-                    + ". Supported: sift1m, sift10m, bigann");
+                    + ". Supported: sift10k, sift1m, gist1m, sift10m, bigann");
         };
     }
 
