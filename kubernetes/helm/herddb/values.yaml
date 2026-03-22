@@ -38,6 +38,7 @@ server:
 fileServer:
   replicaCount: 2
   port: 9846
+  httpPort: 9847
   # Storage backend: "local" (default) or "s3"
   storageMode: local
   # S3 / MinIO configuration (used when storageMode=s3)

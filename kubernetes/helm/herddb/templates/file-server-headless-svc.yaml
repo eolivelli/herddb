@@ -14,3 +14,6 @@ spec:
     - name: grpc
       port: {{ .Values.fileServer.port }}
       targetPort: grpc
+    - name: http
+      port: {{ .Values.fileServer.httpPort }}
+      targetPort: http

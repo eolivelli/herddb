@@ -37,3 +37,6 @@ data:
     {{- end }}
     cache.max.bytes={{ .Values.fileServer.s3.cacheMaxBytes | int64 }}
     {{- end }}
+    http.enable=true
+    http.port={{ .Values.fileServer.httpPort }}
+    http.host=0.0.0.0
