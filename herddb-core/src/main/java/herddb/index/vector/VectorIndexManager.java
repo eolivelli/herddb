@@ -154,6 +154,7 @@ public class VectorIndexManager extends AbstractIndexManager {
     public static final String PROP_ALPHA = "alpha";
     public static final String PROP_FUSED_PQ = "fusedPQ";
     public static final String PROP_SIMILARITY = "similarity";
+    public static final String PROP_MAX_SEGMENT_SIZE = "maxSegmentSize";
 
     /* instance hyper-parameters (read from index properties) */
     private final int m;
@@ -162,6 +163,7 @@ public class VectorIndexManager extends AbstractIndexManager {
     private final float alpha;
     private final boolean fusedPQ;
     private final VectorSimilarityFunction similarityFunction;
+    private final long maxSegmentSize;
 
     private final MemoryManager memoryManager;
 
@@ -205,23 +207,14 @@ public class VectorIndexManager extends AbstractIndexManager {
     private volatile GraphIndexBuilder builder = null;
 
     // -------------------------------------------------------------------------
-    // On-disk state – loaded from FusedPQ checkpoint
+    // On-disk state – multiple segments, each containing an independent FusedPQ graph
     // -------------------------------------------------------------------------
 
-    /** Loaded on-disk graph (FusedPQ format). Null if not using FusedPQ or not yet checkpointed. */
-    private volatile OnDiskGraphIndex onDiskGraph = null;
+    /** On-disk segments. CopyOnWriteArrayList for safe concurrent search during checkpoint. */
+    private volatile List<VectorSegment> segments = new java.util.concurrent.CopyOnWriteArrayList<>();
 
-    /** Temp file holding the on-disk graph data (kept alive as the ReaderSupplier source). */
-    private volatile Path onDiskGraphFile = null;
-
-    /** ReaderSupplier backed by onDiskGraphFile; must be closed before deleting the file. */
-    private volatile ReaderSupplier onDiskReaderSupplier = null;
-
-    /** on-disk sequential ordinal (as 4-byte big-endian Bytes) → primary-key bytes. BLink-backed for paging. */
-    private volatile BLink<Bytes, Bytes> onDiskNodeToPk = null;
-
-    /** primary-key bytes → on-disk sequential ordinal (as Long). BLink-backed for paging. */
-    private volatile BLink<Bytes, Long> onDiskPkToNode = null;
+    /** Counter for assigning unique segment IDs. */
+    private final AtomicInteger nextSegmentId = new AtomicInteger(0);
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -236,7 +229,8 @@ public class VectorIndexManager extends AbstractIndexManager {
                                String tableSpaceUUID,
                                long transaction,
                                int writeLockTimeout,
-                               int readLockTimeout) {
+                               int readLockTimeout,
+                               long serverMaxSegmentSize) {
         super(index, tableManager, dataStorageManager, tableSpaceUUID, log,
                 transaction, writeLockTimeout, readLockTimeout);
         this.memoryManager = memoryManager;
@@ -247,6 +241,8 @@ public class VectorIndexManager extends AbstractIndexManager {
         this.alpha = floatProp(props, PROP_ALPHA, DEFAULT_ALPHA);
         this.fusedPQ = boolProp(props, PROP_FUSED_PQ, true);
         this.similarityFunction = parseSimilarity(props.getOrDefault(PROP_SIMILARITY, "cosine"));
+        // Per-index override takes precedence over server config
+        this.maxSegmentSize = longProp(props, PROP_MAX_SEGMENT_SIZE, serverMaxSegmentSize);
     }
 
     private static int intProp(Map<String, String> props, String key, int defaultVal) {
@@ -257,6 +253,11 @@ public class VectorIndexManager extends AbstractIndexManager {
     private static float floatProp(Map<String, String> props, String key, float defaultVal) {
         String v = props.get(key);
         return v == null ? defaultVal : Float.parseFloat(v);
+    }
+
+    private static long longProp(Map<String, String> props, String key, long defaultVal) {
+        String v = props.get(key);
+        return v == null ? defaultVal : Long.parseLong(v);
     }
 
     private static boolean boolProp(Map<String, String> props, String key, boolean defaultVal) {
@@ -322,11 +323,15 @@ public class VectorIndexManager extends AbstractIndexManager {
         }
     }
 
+    /** Metadata version for multi-segment format. */
+    private static final int METADATA_VERSION_MULTI_SEGMENT = 3;
+
     private boolean loadFromStatus(IndexStatus status) throws IOException, DataStorageManagerException {
         ByteBuffer metaBuf = ByteBuffer.wrap(status.indexData);
 
         int version = metaBuf.getInt();
-        if (version != METADATA_VERSION_SIMPLE && version != METADATA_VERSION_FUSEDPQ) {
+        if (version != METADATA_VERSION_SIMPLE && version != METADATA_VERSION_FUSEDPQ
+                && version != METADATA_VERSION_MULTI_SEGMENT) {
             LOGGER.log(Level.SEVERE,
                     "unsupported vector index metadata version {0} for {1}, rebuilding",
                     new Object[]{version, index.name});
@@ -347,6 +352,14 @@ public class VectorIndexManager extends AbstractIndexManager {
 
         int savedNextNodeId = metaBuf.getInt();
 
+        this.dimension = dim;
+        newPageId.set(status.newPageId);
+
+        if (version == METADATA_VERSION_MULTI_SEGMENT) {
+            return loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+        }
+
+        // Legacy single-segment format (v1 or v2)
         int numGraphChunks = metaBuf.getInt();
         long[] graphChunkPageIds = new long[numGraphChunks];
         for (int i = 0; i < numGraphChunks; i++) {
@@ -359,22 +372,32 @@ public class VectorIndexManager extends AbstractIndexManager {
             mapChunkPageIds[i] = metaBuf.getLong();
         }
 
-        // Empty index case (no inserts ever happened)
         if (dim == 0 || numGraphChunks == 0) {
             LOGGER.log(Level.INFO, "vector index {0} is empty, no rebuild needed", index.name);
             return true;
         }
 
-        // --- Load map and graph chunks into temp files ---
         Path mapFile = readChunksToTempFile(mapChunkPageIds, TYPE_VECTOR_MAPCHUNK);
         Path graphFile = readChunksToTempFile(graphChunkPageIds, TYPE_VECTOR_GRAPHCHUNK);
 
-        this.dimension = dim;
-        newPageId.set(status.newPageId);
-
         if (savedFusedPQ) {
-            return loadFusedPQFormat(mapFile, graphFile,
-                    dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+            VectorSegment seg = new VectorSegment(0);
+            seg.estimatedSizeBytes = (long) numGraphChunks * CHUNK_SIZE;
+            seg.graphPageIds = toLongList(graphChunkPageIds);
+            seg.mapPageIds = toLongList(mapChunkPageIds);
+            boolean ok = loadFusedPQSegment(seg, mapFile, graphFile, dim, savedNextNodeId);
+            if (ok) {
+                segments.add(seg);
+                nextSegmentId.set(1);
+                // Compute nextNodeId from max ordinal in the segment
+                int maxOrd = -1;
+                try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
+                    maxOrd = stream.mapToInt(e -> bytesToOrdinal(e.getKey())).max().orElse(-1);
+                }
+                this.nextNodeId.set(maxOrd + 1);
+                initEmptyLiveBuilder(dim, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+            }
+            return ok;
         } else {
             try {
                 return loadSimpleFormat(mapFile, graphFile,
@@ -384,6 +407,116 @@ public class VectorIndexManager extends AbstractIndexManager {
                 Files.deleteIfExists(graphFile);
             }
         }
+    }
+
+    private boolean loadMultiSegmentFormat(ByteBuffer metaBuf, int dim, int savedNextNodeId,
+                                            int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
+            throws IOException, DataStorageManagerException {
+        int numSegments = metaBuf.getInt();
+
+        if (dim == 0 || numSegments == 0) {
+            LOGGER.log(Level.INFO, "vector index {0} is empty (multi-segment), no rebuild needed", index.name);
+            return true;
+        }
+
+        int maxSegId = -1;
+        for (int s = 0; s < numSegments; s++) {
+            int segId = metaBuf.getInt();
+            long estimatedSize = metaBuf.getLong();
+            int numGraphChunks = metaBuf.getInt();
+            long[] graphChunkPageIds = new long[numGraphChunks];
+            for (int i = 0; i < numGraphChunks; i++) {
+                graphChunkPageIds[i] = metaBuf.getLong();
+            }
+            int numMapChunks = metaBuf.getInt();
+            long[] mapChunkPageIds = new long[numMapChunks];
+            for (int i = 0; i < numMapChunks; i++) {
+                mapChunkPageIds[i] = metaBuf.getLong();
+            }
+
+            Path mapFile = readChunksToTempFile(mapChunkPageIds, TYPE_VECTOR_MAPCHUNK);
+            Path graphFile = readChunksToTempFile(graphChunkPageIds, TYPE_VECTOR_GRAPHCHUNK);
+
+            VectorSegment seg = new VectorSegment(segId);
+            seg.estimatedSizeBytes = estimatedSize;
+            seg.graphPageIds = toLongList(graphChunkPageIds);
+            seg.mapPageIds = toLongList(mapChunkPageIds);
+            if (!loadFusedPQSegment(seg, mapFile, graphFile, dim, savedNextNodeId)) {
+                return false;
+            }
+            segments.add(seg);
+            if (segId > maxSegId) {
+                maxSegId = segId;
+            }
+        }
+        nextSegmentId.set(maxSegId + 1);
+
+        // Compute nextNodeId from max ordinal across all segments
+        int maxOrd = -1;
+        for (VectorSegment seg : segments) {
+            try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
+                int segMax = stream.mapToInt(e -> bytesToOrdinal(e.getKey())).max().orElse(-1);
+                if (segMax > maxOrd) {
+                    maxOrd = segMax;
+                }
+            }
+        }
+        this.nextNodeId.set(maxOrd + 1);
+
+        initEmptyLiveBuilder(dim, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+
+        LOGGER.log(Level.INFO,
+                "loaded vector index {0} (multi-segment): {1} segments, dimension {2}",
+                new Object[]{index.name, numSegments, dim});
+        return true;
+    }
+
+    /**
+     * Loads a single FusedPQ segment from map and graph temp files.
+     * The segment's BLinks and graph are populated. On success returns true.
+     */
+    private boolean loadFusedPQSegment(VectorSegment seg, Path mapFile, Path graphFile,
+                                        int dim, int savedNextNodeId) throws IOException {
+        createSegmentBLinks(seg);
+
+        try (DataInputStream dis = new DataInputStream(
+                new BufferedInputStream(new FileInputStream(mapFile.toFile()), CHUNK_SIZE))) {
+            int entryCount = dis.readInt();
+            int maxOrdinal = -1;
+            for (int i = 0; i < entryCount; i++) {
+                int ordinal = dis.readInt();
+                int pkLen = dis.readInt();
+                byte[] pkData = new byte[pkLen];
+                dis.readFully(pkData);
+                int floatCount = dis.readInt();
+                skipFully(dis, (long) floatCount * Float.BYTES);
+                Bytes pk = Bytes.from_array(pkData);
+                seg.onDiskNodeToPk.insert(ordinalToBytes(ordinal), pk);
+                seg.onDiskPkToNode.insert(pk, (long) ordinal);
+                if (ordinal > maxOrdinal) {
+                    maxOrdinal = ordinal;
+                }
+            }
+        }
+        Files.deleteIfExists(mapFile);
+
+        ReaderSupplier readerSupplier = new SegmentedMappedReader.Supplier(graphFile);
+        seg.onDiskGraph = OnDiskGraphIndex.load(readerSupplier);
+        seg.onDiskReaderSupplier = readerSupplier;
+        seg.onDiskGraphFile = graphFile;
+
+        LOGGER.log(Level.INFO,
+                "loaded vector segment {0} for index {1}: {2} nodes",
+                new Object[]{seg.segmentId, index.name, seg.size()});
+        return true;
+    }
+
+    private void initEmptyLiveBuilder(int dim, int bw, float no, float a) {
+        this.mravv = new MapRandomAccessVectorValues(vectors, dim);
+        BuildScoreProvider bsp =
+                BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+        this.builder = new GraphIndexBuilder(
+                bsp, dim, m, bw, no, a, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
     }
 
     private boolean loadSimpleFormat(Path mapFile, Path graphFile,
@@ -438,58 +571,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         return true;
     }
 
-    private boolean loadFusedPQFormat(Path mapFile, Path graphFile,
-                                      int dim, int savedNextNodeId,
-                                      int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
-            throws IOException {
-        // Create fresh BLink instances for on-disk maps
-        createOnDiskBLinks();
-
-        // Map data stores (newOrdinal, pk, vector) — newOrdinals are sequential 0..N-1
-        // Use DataInputStream to avoid Integer.MAX_VALUE limit of MappedByteBuffer
-        try (DataInputStream dis = new DataInputStream(
-                new BufferedInputStream(new FileInputStream(mapFile.toFile()), CHUNK_SIZE))) {
-            int entryCount = dis.readInt();
-            int maxOrdinal = -1;
-            for (int i = 0; i < entryCount; i++) {
-                int ordinal = dis.readInt();
-                int pkLen = dis.readInt();
-                byte[] pkData = new byte[pkLen];
-                dis.readFully(pkData);
-                int floatCount = dis.readInt();
-                // skip vector floats (not needed for on-disk graph; vectors are stored inline)
-                skipFully(dis, (long) floatCount * Float.BYTES);
-                Bytes pk = Bytes.from_array(pkData);
-                onDiskNodeToPk.insert(ordinalToBytes(ordinal), pk);
-                onDiskPkToNode.insert(pk, (long) ordinal);
-                if (ordinal > maxOrdinal) {
-                    maxOrdinal = ordinal;
-                }
-            }
-            // Live inserts start after the loaded on-disk ordinals
-            this.nextNodeId.set(maxOrdinal + 1);
-        }
-        // Map file fully consumed
-        Files.deleteIfExists(mapFile);
-
-        // Load OnDiskGraphIndex from temp file (file stays alive for graph's lifetime)
-        ReaderSupplier readerSupplier = new SegmentedMappedReader.Supplier(graphFile);
-        this.onDiskGraph = OnDiskGraphIndex.load(readerSupplier);
-        this.onDiskReaderSupplier = readerSupplier;
-        this.onDiskGraphFile = graphFile;
-
-        // Create an empty live builder for new inserts
-        this.mravv = new MapRandomAccessVectorValues(vectors, dim);
-        BuildScoreProvider bsp =
-                BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
-        this.builder = new GraphIndexBuilder(
-                bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
-
-        LOGGER.log(Level.INFO,
-                "loaded vector index {0} (FusedPQ): {1} on-disk nodes, dimension {2}",
-                new Object[]{index.name, onDiskNodeToPkSize(), dim});
-        return true;
-    }
+    // loadFusedPQFormat removed — replaced by loadFusedPQSegment + multi-segment support
 
     @Override
     public void rebuild() throws DataStorageManagerException {
@@ -575,9 +657,15 @@ public class VectorIndexManager extends AbstractIndexManager {
                 List<Long> graphPageIds = writeFusedPQGraph(graph, mravv, dimension);
                 List<Long> mapPageIds = writeFusedPQMapData(rebuildVectors, rebuildNodeToPk);
                 LogSequenceNumber lsn = log.getLastSequenceNumber();
-                persistIndexStatus(graphPageIds, mapPageIds, rebuildCount, true, lsn, false);
+                long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
 
-                // Close old builder before loading FusedPQ format
+                // Build single-segment result
+                int segId = nextSegmentId.getAndIncrement();
+                List<SegmentWriteResult> segResults = new ArrayList<>();
+                segResults.add(new SegmentWriteResult(segId, graphPageIds, mapPageIds, estimatedSize, Collections.emptyList()));
+                persistIndexStatusMultiSegment(Collections.emptyList(), segResults, lsn, false);
+
+                // Close old builder before loading segment
                 GraphIndexBuilder oldBuilder = this.builder;
                 if (oldBuilder != null) {
                     try {
@@ -589,13 +677,18 @@ public class VectorIndexManager extends AbstractIndexManager {
                 this.builder = null;
                 this.mravv = null;
 
-                // Reload from persisted pages into on-disk state
+                // Reload from persisted pages
                 Path reloadMapFile = readChunksToTempFile(
                         mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
                 Path reloadGraphFile = readChunksToTempFile(
                         graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
-                loadFusedPQFormat(reloadMapFile, reloadGraphFile,
-                        dimension, nextNodeId.get(), beamWidth, neighborOverflow, alpha);
+                VectorSegment seg = new VectorSegment(segId);
+                seg.estimatedSizeBytes = estimatedSize;
+                seg.graphPageIds = graphPageIds;
+                seg.mapPageIds = mapPageIds;
+                loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, dimension, nextNodeId.get());
+                segments.add(seg);
+                initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
 
                 dirty.set(false);
 
@@ -686,7 +779,8 @@ public class VectorIndexManager extends AbstractIndexManager {
     private List<PostCheckpointAction> doCheckpoint(LogSequenceNumber sequenceNumber, boolean pin)
             throws IOException, DataStorageManagerException {
 
-        if (!dirty.get()) {
+        boolean anySegmentDirty = segments.stream().anyMatch(s -> s.dirty);
+        if (!dirty.get() && !anySegmentDirty) {
             LOGGER.log(Level.FINE, "checkpoint vector index {0}: skipped (no changes)", index.name);
             return Collections.emptyList();
         }
@@ -694,8 +788,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         boolean hasLiveNodes = builder != null && !nodeToPk.isEmpty();
         boolean hasOnDiskNodes = onDiskNodeToPkSize() > 0;
 
-        if (!hasLiveNodes && !hasOnDiskNodes && builder == null && onDiskGraph == null) {
-            // Nothing indexed yet – persist empty metadata
+        if (!hasLiveNodes && !hasOnDiskNodes && builder == null && segments.isEmpty()) {
             IndexStatus emptyStatus = new IndexStatus(
                     index.name, sequenceNumber, newPageId.get(), new HashSet<>(), new byte[0]);
             List<PostCheckpointAction> result = new ArrayList<>();
@@ -715,140 +808,368 @@ public class VectorIndexManager extends AbstractIndexManager {
             return result;
         }
 
-        // Count total active vectors (on-disk + live)
+        // Count total active vectors
         int totalActiveVectors = (int) onDiskNodeToPkSize() + nodeToPk.size();
 
-        // Decide whether to use FusedPQ for this checkpoint
-        // Requirements: fusedPQ enabled, dimension >= 8, and enough vectors for 256 PQ clusters
+        // If all vectors deleted but segments still exist, clean up and save empty
+        if (totalActiveVectors == 0 && !segments.isEmpty()) {
+            for (VectorSegment seg : segments) {
+                seg.close();
+            }
+            segments = new java.util.concurrent.CopyOnWriteArrayList<>();
+            nextSegmentId.set(0);
+            IndexStatus emptyStatus = new IndexStatus(
+                    index.name, sequenceNumber, newPageId.get(), new HashSet<>(), new byte[0]);
+            List<PostCheckpointAction> result = new ArrayList<>();
+            result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, emptyStatus, pin));
+            dirty.set(false);
+            LOGGER.log(Level.INFO, "checkpoint vector index {0}: all vectors deleted, saving empty", index.name);
+            return result;
+        }
+
         boolean useFusedPQ = fusedPQ
                 && dimension >= MIN_DIM_FOR_FUSED_PQ
                 && totalActiveVectors >= MIN_VECTORS_FOR_FUSED_PQ;
 
-        List<Long> graphPageIds;
-        List<Long> mapPageIds;
-        int totalNodes;
+        if (!useFusedPQ) {
+            // If we have on-disk segments, materialize their data into live state first
+            if (!segments.isEmpty()) {
+                // Collect all data from segments into live maps
+                ConcurrentHashMap<Integer, VectorFloat<?>> allVectors = new ConcurrentHashMap<>();
+                ConcurrentHashMap<Integer, Bytes> allNodeToPk = new ConcurrentHashMap<>();
+                int seqId = 0;
+                // Existing live data
+                for (Map.Entry<Integer, Bytes> e : nodeToPk.entrySet()) {
+                    VectorFloat<?> vec = vectors.get(e.getKey());
+                    if (vec != null) {
+                        allVectors.put(seqId, vec);
+                        allNodeToPk.put(seqId, e.getValue());
+                        seqId++;
+                    }
+                }
+                // Segment data
+                for (VectorSegment seg : segments) {
+                    if (seg.onDiskGraph != null) {
+                        try (OnDiskGraphIndex.View view = seg.onDiskGraph.getView();
+                             Stream<Map.Entry<Bytes, Bytes>> scanStream = seg.scanNodeToPk()) {
+                            List<Map.Entry<Bytes, Bytes>> entries = scanStream.collect(java.util.stream.Collectors.toList());
+                            for (Map.Entry<Bytes, Bytes> e : entries) {
+                                int ordinal = bytesToOrdinal(e.getKey());
+                                VectorFloat<?> vec = view.getVector(ordinal);
+                                allVectors.put(seqId, vec);
+                                allNodeToPk.put(seqId, e.getValue());
+                                seqId++;
+                            }
+                        }
+                    }
+                    seg.close();
+                }
+                segments = new java.util.concurrent.CopyOnWriteArrayList<>();
+                nextSegmentId.set(0);
 
-        if (useFusedPQ) {
-            // --- Build a merged graph: on-disk data + live inserts ---
-            // For simplicity, we materialize all active vectors into a single in-memory graph,
-            // then write it as a FusedPQ on-disk format.
-            ConcurrentHashMap<Integer, VectorFloat<?>> allVectors = new ConcurrentHashMap<>();
-            ConcurrentHashMap<Integer, Bytes> allNodeToPk = new ConcurrentHashMap<>();
+                // Replace live state with merged data and rebuild the builder
+                vectors.clear();
+                vectors.putAll(allVectors);
+                nodeToPk.clear();
+                nodeToPk.putAll(allNodeToPk);
+                pkToNode.clear();
+                for (Map.Entry<Integer, Bytes> e : allNodeToPk.entrySet()) {
+                    pkToNode.put(e.getValue(), e.getKey());
+                }
+                nextNodeId.set(seqId);
 
-            // Include live inserts (from current builder)
-            if (builder != null) {
+                // Rebuild the graph builder from scratch
+                GraphIndexBuilder oldBuilder = this.builder;
+                if (oldBuilder != null) {
+                    try { oldBuilder.close(); } catch (IOException e) { /* ignore */ }
+                }
+                this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
+                BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+                this.builder = new GraphIndexBuilder(
+                        bsp, dimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+                for (Map.Entry<Integer, VectorFloat<?>> e : allVectors.entrySet()) {
+                    builder.addGraphNode(e.getKey(), e.getValue());
+                }
                 builder.cleanup();
             }
-            // Only include vectors for nodes that are still live (not deleted)
-            for (Map.Entry<Integer, Bytes> e : nodeToPk.entrySet()) {
-                int nid = e.getKey();
-                VectorFloat<?> vec = vectors.get(nid);
-                if (vec != null) {
-                    allVectors.put(nid, vec);
-                    allNodeToPk.put(nid, e.getValue());
+            return doCheckpointSimple(sequenceNumber, pin);
+        }
+
+        // --- FusedPQ multi-segment checkpoint ---
+        return doCheckpointFusedPQ(sequenceNumber, pin);
+    }
+
+    private List<PostCheckpointAction> doCheckpointSimple(LogSequenceNumber sequenceNumber, boolean pin)
+            throws IOException, DataStorageManagerException {
+        if (builder != null) {
+            builder.cleanup();
+        }
+        vectors.keySet().retainAll(nodeToPk.keySet());
+
+        List<Long> graphPageIds;
+        Path graphTmpFile = Files.createTempFile("herddb-vector-graph-", ".tmp");
+        try {
+            if (builder != null) {
+                try (DataOutputStream graphDos = new DataOutputStream(
+                        new BufferedOutputStream(new FileOutputStream(graphTmpFile.toFile()), CHUNK_SIZE))) {
+                    ((OnHeapGraphIndex) builder.getGraph()).save(graphDos);
                 }
             }
+            graphPageIds = writeChunks(graphTmpFile, TYPE_VECTOR_GRAPHCHUNK);
+        } finally {
+            Files.deleteIfExists(graphTmpFile);
+        }
+        List<Long> mapPageIds;
+        Path mapTmpFile = serializeMapDataToFile(vectors, nodeToPk);
+        try {
+            mapPageIds = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
+        } finally {
+            Files.deleteIfExists(mapTmpFile);
+        }
+        int totalNodes = nodeToPk.size();
 
-            // Include on-disk nodes that haven't been deleted
-            // We need their vectors; re-read from on-disk graph inline vectors
-            if (onDiskGraph != null && onDiskNodeToPk != null) {
-                try (OnDiskGraphIndex.View view = onDiskGraph.getView();
-                     Stream<Map.Entry<Bytes, Bytes>> scanStream =
-                             onDiskNodeToPk.scan(Bytes.EMPTY_ARRAY, Bytes.POSITIVE_INFINITY)) {
+        List<PostCheckpointAction> result = new ArrayList<>();
+        result.addAll(persistIndexStatusSimple(graphPageIds, mapPageIds, totalNodes, false, sequenceNumber, pin));
+        dirty.set(false);
+        LOGGER.log(Level.INFO,
+                "checkpoint vector index {0}: {1} nodes (simple), {2} graph pages, {3} map pages",
+                new Object[]{index.name, totalNodes, graphPageIds.size(), mapPageIds.size()});
+        return result;
+    }
+
+    private List<PostCheckpointAction> doCheckpointFusedPQ(LogSequenceNumber sequenceNumber, boolean pin)
+            throws IOException, DataStorageManagerException {
+
+        if (builder != null) {
+            builder.cleanup();
+        }
+
+        // Classify segments: sealed (large + clean) vs mergeable
+        List<VectorSegment> sealedSegments = new ArrayList<>();
+        List<VectorSegment> mergeableSegments = new ArrayList<>();
+        for (VectorSegment seg : segments) {
+            if (seg.isSealed(maxSegmentSize)) {
+                sealedSegments.add(seg);
+            } else {
+                mergeableSegments.add(seg);
+            }
+        }
+
+        // Collect all vectors from mergeable segments + live inserts into sequential lists.
+        // We use sequential 0-based IDs because MapRandomAccessVectorValues and PQ require it.
+        List<VectorFloat<?>> poolVectorsList = new ArrayList<>();
+        List<Bytes> poolPkList = new ArrayList<>();
+
+        // Live inserts
+        for (Map.Entry<Integer, Bytes> e : nodeToPk.entrySet()) {
+            VectorFloat<?> vec = vectors.get(e.getKey());
+            if (vec != null) {
+                poolVectorsList.add(vec);
+                poolPkList.add(e.getValue());
+            }
+        }
+
+        // Vectors from mergeable segments
+        for (VectorSegment seg : mergeableSegments) {
+            if (seg.onDiskGraph != null) {
+                try (OnDiskGraphIndex.View view = seg.onDiskGraph.getView();
+                     Stream<Map.Entry<Bytes, Bytes>> scanStream = seg.scanNodeToPk()) {
                     scanStream.forEach(e -> {
                         int ordinal = bytesToOrdinal(e.getKey());
                         Bytes pk = e.getValue();
                         VectorFloat<?> vec = view.getVector(ordinal);
-                        allVectors.put(ordinal, vec);
-                        allNodeToPk.put(ordinal, pk);
+                        poolVectorsList.add(vec);
+                        poolPkList.add(pk);
                     });
                 }
             }
-
-            graphPageIds = writeFusedPQGraph(allVectors, allNodeToPk, dimension);
-            mapPageIds = writeFusedPQMapData(new MapRandomAccessVectorValues(allVectors, dimension), allNodeToPk);
-            totalNodes = allNodeToPk.size();
-        } else {
-            // Simple format: only serialize live builder
-            if (builder != null) {
-                builder.cleanup();
-            }
-            // Purge orphan vectors (deleted nodes whose vectors were kept for the builder)
-            vectors.keySet().retainAll(nodeToPk.keySet());
-
-            // For simple format: write graph to temp file then chunk it
-            Path graphTmpFile = Files.createTempFile("herddb-vector-graph-", ".tmp");
-            try {
-                if (builder != null) {
-                    try (DataOutputStream graphDos = new DataOutputStream(
-                            new BufferedOutputStream(new FileOutputStream(graphTmpFile.toFile()), CHUNK_SIZE))) {
-                        ((OnHeapGraphIndex) builder.getGraph()).save(graphDos);
-                    }
-                }
-                graphPageIds = writeChunks(graphTmpFile, TYPE_VECTOR_GRAPHCHUNK);
-            } finally {
-                Files.deleteIfExists(graphTmpFile);
-            }
-            Path mapTmpFile = serializeMapDataToFile(vectors, nodeToPk);
-            try {
-                mapPageIds = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
-            } finally {
-                Files.deleteIfExists(mapTmpFile);
-            }
-            totalNodes = nodeToPk.size();
         }
 
-        List<PostCheckpointAction> result = new ArrayList<>();
-        result.addAll(persistIndexStatus(graphPageIds, mapPageIds, totalNodes,
-                useFusedPQ, sequenceNumber, pin));
+        // If the pool is too small for FusedPQ but we have sealed segments,
+        // unseal the smallest sealed segment and merge its data into the pool.
+        while (poolVectorsList.size() < MIN_VECTORS_FOR_FUSED_PQ && !sealedSegments.isEmpty()) {
+            // Find smallest sealed segment
+            VectorSegment smallest = sealedSegments.stream()
+                    .min((a, b) -> Long.compare(a.estimatedSizeBytes, b.estimatedSizeBytes))
+                    .get();
+            sealedSegments.remove(smallest);
+            mergeableSegments.add(smallest);
+            if (smallest.onDiskGraph != null) {
+                try (OnDiskGraphIndex.View view = smallest.onDiskGraph.getView();
+                     Stream<Map.Entry<Bytes, Bytes>> scanStream = smallest.scanNodeToPk()) {
+                    scanStream.forEach(e -> {
+                        int ordinal = bytesToOrdinal(e.getKey());
+                        VectorFloat<?> vec = view.getVector(ordinal);
+                        poolVectorsList.add(vec);
+                        poolPkList.add(e.getValue());
+                    });
+                }
+            }
+        }
 
-        // After a successful FusedPQ checkpoint, reload from the bytes just written
-        // so that the on-disk graph is ready and live state is cleared.
-        if (useFusedPQ) {
+        // If pool is still too small for FusedPQ (total < 256), skip writing segments
+        if (poolVectorsList.size() < MIN_VECTORS_FOR_FUSED_PQ && poolVectorsList.size() > 0) {
+            // Fall back: close all segments, materialize into live state, let simple path handle
+            for (VectorSegment seg : mergeableSegments) { seg.close(); }
+            for (VectorSegment seg : sealedSegments) { seg.close(); }
+            segments = new java.util.concurrent.CopyOnWriteArrayList<>();
+            // Rebuild live state from pool
+            vectors.clear(); nodeToPk.clear(); pkToNode.clear();
+            for (int i = 0; i < poolVectorsList.size(); i++) {
+                vectors.put(i, poolVectorsList.get(i));
+                nodeToPk.put(i, poolPkList.get(i));
+                pkToNode.put(poolPkList.get(i), i);
+            }
+            nextNodeId.set(poolVectorsList.size());
+            nextSegmentId.set(0);
             GraphIndexBuilder oldBuilder = this.builder;
-            if (oldBuilder != null) {
-                try {
-                    oldBuilder.close();
-                } catch (IOException e) {
-                    // ignore
-                }
+            if (oldBuilder != null) { try { oldBuilder.close(); } catch (IOException e) { /* ignore */ } }
+            this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
+            BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+            this.builder = new GraphIndexBuilder(bsp, dimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+            for (Map.Entry<Integer, VectorFloat<?>> e : vectors.entrySet()) {
+                builder.addGraphNode(e.getKey(), e.getValue());
             }
-            OnDiskGraphIndex oldOdg = this.onDiskGraph;
-            if (oldOdg != null) {
-                try {
-                    oldOdg.close();
-                } catch (Exception e) {
-                    // ignore
-                }
-            }
-            vectors.clear();
-            pkToNode.clear();
-            nodeToPk.clear();
-            closeOnDiskBLinks();
-            this.builder = null;
-            this.onDiskGraph = null;
-            closeAndDeleteOnDiskGraphFile();
-
-            // Reconstruct from persisted pages via temp files
-            Path reloadMapFile = readChunksToTempFile(
-                    mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
-            Path reloadGraphFile = readChunksToTempFile(
-                    graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
-            loadFusedPQFormat(reloadMapFile, reloadGraphFile,
-                    dimension, nextNodeId.get(), beamWidth, neighborOverflow, alpha);
+            builder.cleanup();
+            return doCheckpointSimple(sequenceNumber, pin);
         }
+
+        // Estimate avgBytesPerVector from largest existing segment
+        long avgBytesPerVector = (long) dimension * Float.BYTES * 2; // default heuristic
+        for (VectorSegment seg : segments) {
+            long segSize = seg.size();
+            if (segSize > 0 && seg.estimatedSizeBytes > 0) {
+                avgBytesPerVector = seg.estimatedSizeBytes / segSize;
+                break;
+            }
+        }
+
+        // Partition pool into segment-sized groups
+        int maxNodesPerSegment = (int) Math.max(MIN_VECTORS_FOR_FUSED_PQ,
+                maxSegmentSize / Math.max(1, avgBytesPerVector));
+
+        List<SegmentWriteResult> newSegmentResults = new ArrayList<>();
+        int start = 0;
+        while (start < poolVectorsList.size()) {
+            int end = Math.min(start + maxNodesPerSegment, poolVectorsList.size());
+
+            // If the remaining tail after this partition is too small for FusedPQ, include it here
+            if (end < poolVectorsList.size()
+                    && (poolVectorsList.size() - end) < MIN_VECTORS_FOR_FUSED_PQ) {
+                end = poolVectorsList.size();
+            }
+
+            // Build sequential 0-based maps for this partition
+            ConcurrentHashMap<Integer, VectorFloat<?>> partVectors = new ConcurrentHashMap<>();
+            ConcurrentHashMap<Integer, Bytes> partNodeToPk = new ConcurrentHashMap<>();
+            for (int i = start; i < end; i++) {
+                int seqId = i - start;
+                partVectors.put(seqId, poolVectorsList.get(i));
+                partNodeToPk.put(seqId, poolPkList.get(i));
+            }
+
+            int segId = nextSegmentId.getAndIncrement();
+            List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, dimension);
+            List<Long> mapPageIds = writeFusedPQMapData(
+                    new MapRandomAccessVectorValues(partVectors, dimension), partNodeToPk);
+            long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
+            newSegmentResults.add(new SegmentWriteResult(segId, graphPageIds, mapPageIds, estimatedSize,
+                    Collections.emptyList()));
+
+            start = end;
+        }
+
+        // If pool was empty, we might have no new segments
+        // Persist multi-segment metadata
+        List<PostCheckpointAction> result = new ArrayList<>();
+        result.addAll(persistIndexStatusMultiSegment(sealedSegments, newSegmentResults, sequenceNumber, pin));
+
+        // Close old builder and mergeable segments
+        GraphIndexBuilder oldBuilder = this.builder;
+        if (oldBuilder != null) {
+            try {
+                oldBuilder.close();
+            } catch (IOException e) {
+                // ignore
+            }
+        }
+        for (VectorSegment seg : mergeableSegments) {
+            seg.close();
+        }
+
+        // Clear live state
+        vectors.clear();
+        pkToNode.clear();
+        nodeToPk.clear();
+        this.builder = null;
+
+        // Build new segments list: sealed (kept) + newly written (loaded)
+        List<VectorSegment> newSegments = new java.util.concurrent.CopyOnWriteArrayList<>();
+        for (VectorSegment sealed : sealedSegments) {
+            sealed.dirty = false;
+            newSegments.add(sealed);
+        }
+        for (SegmentWriteResult swr : newSegmentResults) {
+            Path reloadMapFile = readChunksToTempFile(
+                    swr.mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
+            Path reloadGraphFile = readChunksToTempFile(
+                    swr.graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
+            VectorSegment seg = new VectorSegment(swr.segmentId);
+            seg.estimatedSizeBytes = swr.estimatedSizeBytes;
+            seg.graphPageIds = swr.graphPageIds;
+            seg.mapPageIds = swr.mapPageIds;
+            loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, dimension, nextNodeId.get());
+            newSegments.add(seg);
+        }
+
+        // Atomic swap for concurrent search safety
+        this.segments = newSegments;
+
+        // Re-create empty live builder
+        initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
+
+        // Recompute nextNodeId from all segments
+        int maxOrd = -1;
+        for (VectorSegment seg : segments) {
+            try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
+                int segMax = stream.mapToInt(e -> bytesToOrdinal(e.getKey())).max().orElse(-1);
+                if (segMax > maxOrd) {
+                    maxOrd = segMax;
+                }
+            }
+        }
+        this.nextNodeId.set(maxOrd + 1);
 
         dirty.set(false);
+        int totalNodes = (int) onDiskNodeToPkSize();
         LOGGER.log(Level.INFO,
-                "checkpoint vector index {0}: {1} nodes, {2} graph pages, {3} map pages, fusedPQ={4}",
-                new Object[]{index.name, totalNodes, graphPageIds.size(), mapPageIds.size(), useFusedPQ});
+                "checkpoint vector index {0}: {1} nodes across {2} segments (FusedPQ)",
+                new Object[]{index.name, totalNodes, segments.size()});
         return result;
     }
 
+    /** Holds the result of writing a single segment during checkpoint. */
+    private static class SegmentWriteResult {
+        final int segmentId;
+        final List<Long> graphPageIds;
+        final List<Long> mapPageIds;
+        final long estimatedSizeBytes;
+        final List<Integer> nodeIds;
+
+        SegmentWriteResult(int segmentId, List<Long> graphPageIds, List<Long> mapPageIds,
+                           long estimatedSizeBytes, List<Integer> nodeIds) {
+            this.segmentId = segmentId;
+            this.graphPageIds = graphPageIds;
+            this.mapPageIds = mapPageIds;
+            this.estimatedSizeBytes = estimatedSizeBytes;
+            this.nodeIds = nodeIds;
+        }
+    }
+
     /**
-     * Builds index metadata and persists it via the data storage manager.
+     * Persists index status for simple (non-FusedPQ) format.
      */
-    private List<PostCheckpointAction> persistIndexStatus(
+    private List<PostCheckpointAction> persistIndexStatusSimple(
             List<Long> graphPageIds, List<Long> mapPageIds,
             int totalNodes, boolean useFusedPQ,
             LogSequenceNumber sequenceNumber, boolean pin) throws DataStorageManagerException {
@@ -857,11 +1178,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                 : 29 + 4 + graphPageIds.size() * 8 + 4 + mapPageIds.size() * 8;
 
         ByteBuffer metaBuf = ByteBuffer.allocate(metaSize);
-        if (useFusedPQ) {
-            metaBuf.putInt(METADATA_VERSION_FUSEDPQ);
-        } else {
-            metaBuf.putInt(METADATA_VERSION_SIMPLE);
-        }
+        metaBuf.putInt(useFusedPQ ? METADATA_VERSION_FUSEDPQ : METADATA_VERSION_SIMPLE);
         metaBuf.putInt(dimension);
         metaBuf.putInt(m);
         metaBuf.putInt(beamWidth);
@@ -884,6 +1201,78 @@ public class VectorIndexManager extends AbstractIndexManager {
         Set<Long> activePages = new HashSet<>();
         activePages.addAll(graphPageIds);
         activePages.addAll(mapPageIds);
+
+        IndexStatus indexStatus = new IndexStatus(
+                index.name, sequenceNumber,
+                newPageId.get(), activePages, metaBuf.array());
+
+        return dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, indexStatus, pin);
+    }
+
+    /**
+     * Persists index status for multi-segment FusedPQ format (version 3).
+     */
+    private List<PostCheckpointAction> persistIndexStatusMultiSegment(
+            List<VectorSegment> sealedSegments, List<SegmentWriteResult> newSegmentResults,
+            LogSequenceNumber sequenceNumber, boolean pin) throws DataStorageManagerException {
+
+        int totalSegments = sealedSegments.size() + newSegmentResults.size();
+
+        // Header: version(4) + dim(4) + m(4) + bw(4) + no(4) + alpha(4) + hier(1) + fusedPQ(1) + nextNodeId(4) + numSegments(4) = 34
+        int metaSize = 34;
+        // Per segment: segId(4) + estimatedSize(8) + numGraphChunks(4) + graphPageIds(8*N) + numMapChunks(4) + mapPageIds(8*N)
+        for (VectorSegment seg : sealedSegments) {
+            metaSize += 4 + 8 + 4 + seg.graphPageIds.size() * 8 + 4 + seg.mapPageIds.size() * 8;
+        }
+        for (SegmentWriteResult swr : newSegmentResults) {
+            metaSize += 4 + 8 + 4 + swr.graphPageIds.size() * 8 + 4 + swr.mapPageIds.size() * 8;
+        }
+
+        ByteBuffer metaBuf = ByteBuffer.allocate(metaSize);
+        metaBuf.putInt(METADATA_VERSION_MULTI_SEGMENT);
+        metaBuf.putInt(dimension);
+        metaBuf.putInt(m);
+        metaBuf.putInt(beamWidth);
+        metaBuf.putFloat(neighborOverflow);
+        metaBuf.putFloat(alpha);
+        metaBuf.put((byte) (ADD_HIERARCHY ? 1 : 0));
+        metaBuf.put((byte) 1); // fusedPQ
+        metaBuf.putInt(nextNodeId.get());
+        metaBuf.putInt(totalSegments);
+
+        Set<Long> activePages = new HashSet<>();
+
+        // Write sealed segments
+        for (VectorSegment seg : sealedSegments) {
+            metaBuf.putInt(seg.segmentId);
+            metaBuf.putLong(seg.estimatedSizeBytes);
+            metaBuf.putInt(seg.graphPageIds.size());
+            for (long id : seg.graphPageIds) {
+                metaBuf.putLong(id);
+                activePages.add(id);
+            }
+            metaBuf.putInt(seg.mapPageIds.size());
+            for (long id : seg.mapPageIds) {
+                metaBuf.putLong(id);
+                activePages.add(id);
+            }
+        }
+
+        // Write new segments
+        for (SegmentWriteResult swr : newSegmentResults) {
+            metaBuf.putInt(swr.segmentId);
+            metaBuf.putLong(swr.estimatedSizeBytes);
+            metaBuf.putInt(swr.graphPageIds.size());
+            for (long id : swr.graphPageIds) {
+                metaBuf.putLong(id);
+                activePages.add(id);
+            }
+            metaBuf.putInt(swr.mapPageIds.size());
+            for (long id : swr.mapPageIds) {
+                metaBuf.putLong(id);
+                activePages.add(id);
+            }
+        }
 
         IndexStatus indexStatus = new IndexStatus(
                 index.name, sequenceNumber,
@@ -1240,16 +1629,10 @@ public class VectorIndexManager extends AbstractIndexManager {
                         "error closing vector index builder for " + index.name, e);
             }
         }
-        OnDiskGraphIndex odg = this.onDiskGraph;
-        if (odg != null) {
-            try {
-                odg.close();
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING,
-                        "error closing on-disk graph index for " + index.name, e);
-            }
+        for (VectorSegment seg : segments) {
+            seg.close();
         }
-        closeAndDeleteOnDiskGraphFile();
+        segments = new java.util.concurrent.CopyOnWriteArrayList<>();
     }
 
     // -------------------------------------------------------------------------
@@ -1288,16 +1671,12 @@ public class VectorIndexManager extends AbstractIndexManager {
         if (indexKey == null) {
             return;
         }
-        // Check on-disk nodes first
-        BLink<Bytes, Long> p2n = this.onDiskPkToNode;
-        Long onDiskOrdinal = p2n != null ? p2n.delete(key) : null;
-        if (onDiskOrdinal != null) {
-            BLink<Bytes, Bytes> n2p = this.onDiskNodeToPk;
-            if (n2p != null) {
-                n2p.delete(ordinalToBytes(onDiskOrdinal.intValue()));
+        // Check on-disk segments first
+        for (VectorSegment seg : segments) {
+            if (seg.deletePk(key)) {
+                dirty.set(true);
+                break;
             }
-            dirty.set(true);
-            // No need to mark deleted in OnDiskGraphIndex — filtered at search time
         }
         // Check live nodes
         Integer nodeId = pkToNode.remove(key);
@@ -1309,8 +1688,6 @@ public class VectorIndexManager extends AbstractIndexManager {
         GraphIndexBuilder b = builder;
         if (b != null) {
             b.markNodeDeleted(nodeId);
-            // Vector kept in map until builder.cleanup() purges the deleted node,
-            // because the builder may still visit this node during neighbor search.
         } else {
             vectors.remove(nodeId);
         }
@@ -1395,13 +1772,14 @@ public class VectorIndexManager extends AbstractIndexManager {
         List<Map.Entry<Bytes, Float>> results = new ArrayList<>();
         VectorFloat<?> qv = VTS.createFloatVector(queryVector);
 
-        // --- Search on-disk graph (FusedPQ) ---
-        OnDiskGraphIndex odg = this.onDiskGraph;
-        if (odg != null && onDiskNodeToPkSize() > 0) {
-            searchOnDiskGraph(odg, qv, topK, results);
+        // Search all on-disk segments
+        // Take a snapshot of the segments list for safe concurrent access
+        List<VectorSegment> currentSegments = this.segments;
+        for (VectorSegment seg : currentSegments) {
+            seg.search(qv, topK, similarityFunction, results);
         }
 
-        // --- Search live in-memory builder ---
+        // Search live in-memory builder
         GraphIndexBuilder b = builder;
         if (b != null && !nodeToPk.isEmpty()) {
             int k = Math.min(topK, nodeToPk.size());
@@ -1419,39 +1797,6 @@ public class VectorIndexManager extends AbstractIndexManager {
         // Merge and sort by score descending, take top-K
         results.sort((a, b2) -> Float.compare(b2.getValue(), a.getValue()));
         return results.size() <= topK ? results : results.subList(0, topK);
-    }
-
-    private void searchOnDiskGraph(OnDiskGraphIndex odg, VectorFloat<?> qv, int topK,
-                                    List<Map.Entry<Bytes, Float>> results) {
-        BLink<Bytes, Bytes> n2p = this.onDiskNodeToPk;
-        if (n2p == null) {
-            return;
-        }
-        int activeCount = (int) n2p.size();
-        int k = Math.min(topK, activeCount);
-        if (k == 0) {
-            return;
-        }
-        // Accept ordinals that exist in the BLink (not deleted)
-        Bits acceptBits = ordinal -> n2p.search(ordinalToBytes(ordinal)) != null;
-        try {
-            GraphSearcher searcher = new GraphSearcher(odg);
-            OnDiskGraphIndex.View view = (OnDiskGraphIndex.View) searcher.getView();
-            io.github.jbellis.jvector.graph.similarity.ScoreFunction.ApproximateScoreFunction approxSF =
-                    view.approximateScoreFunctionFor(qv, similarityFunction);
-            io.github.jbellis.jvector.graph.similarity.ScoreFunction.ExactScoreFunction reranker =
-                    view.rerankerFor(qv, similarityFunction);
-            DefaultSearchScoreProvider ssp = new DefaultSearchScoreProvider(approxSF, reranker);
-            SearchResult sr = searcher.search(ssp, k, acceptBits);
-            for (SearchResult.NodeScore ns : sr.getNodes()) {
-                Bytes pk = n2p.search(ordinalToBytes(ns.node));
-                if (pk != null) {
-                    results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
-                }
-            }
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "error searching on-disk graph for " + index.name, e);
-        }
     }
 
     // -------------------------------------------------------------------------
@@ -1505,45 +1850,18 @@ public class VectorIndexManager extends AbstractIndexManager {
                 // ignore on reset
             }
         }
-        OnDiskGraphIndex odg = this.onDiskGraph;
-        if (odg != null) {
-            try {
-                odg.close();
-            } catch (Exception e) {
-                // ignore on reset
-            }
+        for (VectorSegment seg : segments) {
+            seg.close();
         }
+        segments = new java.util.concurrent.CopyOnWriteArrayList<>();
         vectors.clear();
         pkToNode.clear();
         nodeToPk.clear();
-        closeOnDiskBLinks();
         nextNodeId.set(0);
+        nextSegmentId.set(0);
         dimension = 0;
         builder = null;
         mravv = null;
-        onDiskGraph = null;
-        closeAndDeleteOnDiskGraphFile();
-    }
-
-    private void closeAndDeleteOnDiskGraphFile() {
-        ReaderSupplier rs = this.onDiskReaderSupplier;
-        if (rs != null) {
-            try {
-                rs.close();
-            } catch (Exception e) {
-                // ignore
-            }
-            this.onDiskReaderSupplier = null;
-        }
-        Path f = this.onDiskGraphFile;
-        if (f != null) {
-            try {
-                Files.deleteIfExists(f);
-            } catch (IOException e) {
-                // ignore
-            }
-            this.onDiskGraphFile = null;
-        }
     }
 
     // -------------------------------------------------------------------------
@@ -1564,45 +1882,39 @@ public class VectorIndexManager extends AbstractIndexManager {
         return ((d[0] & 0xFF) << 24) | ((d[1] & 0xFF) << 16) | ((d[2] & 0xFF) << 8) | (d[3] & 0xFF);
     }
 
-    private void createOnDiskBLinks() {
+    private void createSegmentBLinks(VectorSegment seg) {
         long pageSize = memoryManager.getMaxLogicalPageSize();
-        String nodeToPkName = index.uuid + "_nodetopk";
-        String pkToNodeName = index.uuid + "_pktonode";
+        String nodeToPkName = index.uuid + "_seg" + seg.segmentId + "_nodetopk";
+        String pkToNodeName = index.uuid + "_seg" + seg.segmentId + "_pktonode";
         try {
             dataStorageManager.initIndex(tableSpaceUUID, nodeToPkName);
             dataStorageManager.initIndex(tableSpaceUUID, pkToNodeName);
         } catch (DataStorageManagerException e) {
-            throw new RuntimeException("Failed to init BLink storage for vector index " + index.name, e);
+            throw new RuntimeException("Failed to init BLink storage for vector index " + index.name
+                    + " segment " + seg.segmentId, e);
         }
-        this.onDiskNodeToPk = new BLink<>(pageSize, BytesBytesSizeEvaluator.INSTANCE,
+        seg.onDiskNodeToPk = new BLink<>(pageSize, BytesBytesSizeEvaluator.INSTANCE,
                 memoryManager.getIndexPageReplacementPolicy(),
                 new BytesBytesStorage(nodeToPkName));
-        this.onDiskPkToNode = new BLink<>(pageSize, BytesLongSizeEvaluator.INSTANCE,
+        seg.onDiskPkToNode = new BLink<>(pageSize, BytesLongSizeEvaluator.INSTANCE,
                 memoryManager.getIndexPageReplacementPolicy(),
                 new BytesLongStorage(pkToNodeName));
     }
 
-    private void closeOnDiskBLinks() {
-        BLink<Bytes, Bytes> n2p = this.onDiskNodeToPk;
-        if (n2p != null) {
-            n2p.close();
-            this.onDiskNodeToPk = null;
-        }
-        BLink<Bytes, Long> p2n = this.onDiskPkToNode;
-        if (p2n != null) {
-            p2n.close();
-            this.onDiskPkToNode = null;
-        }
-    }
-
     private long onDiskNodeToPkSize() {
-        BLink<Bytes, Bytes> n2p = this.onDiskNodeToPk;
-        return n2p != null ? n2p.size() : 0;
+        long total = 0;
+        for (VectorSegment seg : segments) {
+            total += seg.size();
+        }
+        return total;
     }
 
-    private long onDiskPkToNodeSize() {
-        BLink<Bytes, Long> p2n = this.onDiskPkToNode;
-        return p2n != null ? p2n.size() : 0;
+    private static List<Long> toLongList(long[] arr) {
+        List<Long> list = new ArrayList<>(arr.length);
+        for (long v : arr) {
+            list.add(v);
+        }
+        return list;
     }
 
     // -------------------------------------------------------------------------
@@ -1889,5 +2201,13 @@ public class VectorIndexManager extends AbstractIndexManager {
 
     public int getPkToNodeSize() {
         return pkToNode.size();
+    }
+
+    public int getSegmentCount() {
+        return segments.size();
+    }
+
+    public long getMaxSegmentSize() {
+        return maxSegmentSize;
     }
 }

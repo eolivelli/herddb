@@ -34,6 +34,7 @@ import herddb.file.FileCommitLogManager;
 import herddb.file.FileDataStorageManager;
 import herddb.file.FileMetadataStorageManager;
 import herddb.index.vector.VectorIndexManager;
+import herddb.server.ServerConfiguration;
 import herddb.model.ColumnTypes;
 import herddb.model.DataScanner;
 import herddb.model.Index;
@@ -1501,6 +1502,534 @@ public class VectorIndexTest {
                 assertFalse("search should return results after restart", results.isEmpty());
                 assertEquals("top result should be id=1 after restart", 1, results.get(0).get("id"));
             }
+        }
+    }
+
+    // =========================================================================
+    // Multi-segment tests
+    // =========================================================================
+
+    private DBManager createManagerWithMaxSegmentSize(String nodeId, Path metadataPath, Path dataPath,
+                                                       Path logsPath, Path tmoDir, long maxSegmentSize) {
+        ServerConfiguration config = new ServerConfiguration();
+        config.set(ServerConfiguration.PROPERTY_VECTOR_MAX_SEGMENT_SIZE, maxSegmentSize);
+        return new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null, config, null);
+    }
+
+    @Test
+    public void testMultiSegmentCheckpointRestart() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final int numRows = 500;
+        // Very small maxSegmentSize to force multiple segments
+        final long maxSegmentSize = 1024 * 50; // 50KB
+
+        float[] queryVector = randomVec(dimension, 1);
+
+        // Phase 1: insert + checkpoint
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= numRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals(numRows, vim.getNodeCount());
+
+            manager.checkpoint();
+
+            // After checkpoint, should have multiple segments
+            assertTrue("expected multiple segments with small maxSegmentSize, got " + vim.getSegmentCount(),
+                    vim.getSegmentCount() >= 1);
+            assertEquals(numRows, vim.getNodeCount());
+        }
+
+        // Phase 2: restart and verify
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10000);
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertNotNull(vim);
+            assertEquals("node count after restart", numRows, vim.getNodeCount());
+
+            List<Map.Entry<herddb.utils.Bytes, Float>> results = vim.search(queryVector, 5);
+            assertEquals("expected 5 results", 5, results.size());
+            for (int i = 0; i < results.size() - 1; i++) {
+                assertTrue("scores must be descending",
+                        results.get(i).getValue() >= results.get(i + 1).getValue());
+            }
+        }
+    }
+
+    @Test
+    public void testMultiSegmentSearch() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final long maxSegmentSize = 1024 * 50;
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            // Insert batch 1 and checkpoint
+            for (int i = 1; i <= 300; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+            manager.checkpoint();
+
+            // Insert batch 2 (live inserts, not yet checkpointed)
+            for (int i = 301; i <= 350; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals(350, vim.getNodeCount());
+
+            // Search should find vectors from both on-disk segments AND live builder
+            List<Map.Entry<herddb.utils.Bytes, Float>> results = vim.search(randomVec(dimension, 1), 10);
+            assertEquals(10, results.size());
+        }
+    }
+
+    @Test
+    public void testMultiSegmentDeleteAcrossSegments() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final long maxSegmentSize = 1024 * 50;
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= 300; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+            manager.checkpoint();
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals(300, vim.getNodeCount());
+
+            // Delete some rows
+            for (int i = 1; i <= 50; i++) {
+                executeUpdate(manager, "DELETE FROM tblspace1.t1 WHERE id=?", Arrays.asList(i));
+            }
+
+            assertEquals(250, vim.getNodeCount());
+
+            // Checkpoint again — segments with deletes should be rewritten
+            manager.checkpoint();
+            assertEquals(250, vim.getNodeCount());
+
+            // Verify deleted vectors not in search results
+            List<Map.Entry<herddb.utils.Bytes, Float>> results = vim.search(randomVec(dimension, 1), 300);
+            assertEquals(250, results.size());
+        }
+    }
+
+    @Test
+    public void testMultiSegmentRecovery() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final int numRows = 500;
+        final long maxSegmentSize = 1024 * 50;
+
+        // Phase 1: create, insert, checkpoint
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= numRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+            manager.checkpoint();
+        }
+
+        // Phase 2: restart and verify all segments loaded
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10000);
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertNotNull(vim);
+            assertEquals(numRows, vim.getNodeCount());
+            assertTrue("should have segments after recovery", vim.getSegmentCount() >= 1);
+
+            // Search works correctly
+            List<Map.Entry<herddb.utils.Bytes, Float>> results = vim.search(randomVec(dimension, 42), 10);
+            assertEquals(10, results.size());
+        }
+    }
+
+    @Test
+    public void testMultiSegmentRebuild() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final int numRows = 300;
+        final long maxSegmentSize = 1024 * 50;
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= numRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            // Create index after data — triggers rebuild
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals(numRows, vim.getNodeCount());
+
+            // Verify search works after rebuild
+            List<Map.Entry<herddb.utils.Bytes, Float>> results = vim.search(randomVec(dimension, 1), 5);
+            assertEquals(5, results.size());
+        }
+    }
+
+    @Test
+    public void testMultiSegmentEmptyCheckpoint() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final long maxSegmentSize = 1024 * 50;
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            // Insert and checkpoint
+            for (int i = 1; i <= 300; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+            manager.checkpoint();
+
+            // Delete ALL vectors
+            for (int i = 1; i <= 300; i++) {
+                executeUpdate(manager, "DELETE FROM tblspace1.t1 WHERE id=?", Arrays.asList(i));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals(0, vim.getNodeCount());
+
+            // Checkpoint with empty index
+            manager.checkpoint();
+            assertEquals(0, vim.getNodeCount());
+        }
+
+        // Restart and verify clean empty state
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10000);
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertNotNull(vim);
+            assertEquals(0, vim.getNodeCount());
+        }
+    }
+
+    @Test
+    public void testMultiSegmentMultipleCheckpoints() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final long maxSegmentSize = 1024 * 50;
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            // Cycle 1: insert + checkpoint
+            for (int i = 1; i <= 300; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+            manager.checkpoint();
+            assertEquals(300, vim.getNodeCount());
+
+            // Cycle 2: insert more + checkpoint
+            for (int i = 301; i <= 400; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+            manager.checkpoint();
+            assertEquals(400, vim.getNodeCount());
+
+            // Cycle 3: delete + checkpoint
+            for (int i = 1; i <= 100; i++) {
+                executeUpdate(manager, "DELETE FROM tblspace1.t1 WHERE id=?", Arrays.asList(i));
+            }
+            manager.checkpoint();
+            assertEquals(300, vim.getNodeCount());
+
+            // Verify search correctness
+            List<Map.Entry<herddb.utils.Bytes, Float>> results = vim.search(randomVec(dimension, 200), 10);
+            assertEquals(10, results.size());
+        }
+    }
+
+    @Test
+    public void testSingleSegmentWhenUnderLimit() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final int numRows = 300;
+
+        // Default maxSegmentSize (50GB) — should never split
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= numRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+            manager.checkpoint();
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals(numRows, vim.getNodeCount());
+            assertEquals("should have exactly 1 segment with default maxSegmentSize", 1, vim.getSegmentCount());
+        }
+    }
+
+    @Test
+    public void testMaxSegmentSizeFromServerConfig() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final long customMaxSegmentSize = 1024 * 100; // 100KB
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, customMaxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= 300; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+            manager.checkpoint();
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals(300, vim.getNodeCount());
+            assertEquals("maxSegmentSize should come from server config",
+                    customMaxSegmentSize, vim.getMaxSegmentSize());
+        }
+    }
+
+    @Test
+    public void testMultiSegmentHybridMergePolicy() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final long maxSegmentSize = 1024 * 50;
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            // First batch: create initial segments
+            for (int i = 1; i <= 300; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+            manager.checkpoint();
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            int segCountAfterFirst = vim.getSegmentCount();
+            int nodeCountAfterFirst = vim.getNodeCount();
+            assertEquals(300, nodeCountAfterFirst);
+
+            // Add a small batch (should create new live data)
+            for (int i = 301; i <= 350; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+            manager.checkpoint();
+
+            // Total node count should be preserved
+            assertEquals(350, vim.getNodeCount());
+
+            // Verify search correctness
+            List<Map.Entry<herddb.utils.Bytes, Float>> results = vim.search(randomVec(dimension, 1), 10);
+            assertEquals(10, results.size());
         }
     }
 

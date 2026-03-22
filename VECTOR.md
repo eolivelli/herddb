@@ -169,7 +169,7 @@ recordInserted(pk, indexKeyBytes)
   → builder.addGraphNode(nodeId, vectorFloat)
 ```
 
-### Checkpoint — legacy path (fusedPQ=false, or dim < 8, or < 256 vectors)
+### Checkpoint — simple path (fusedPQ=false, or dim < 8, or < 256 vectors)
 
 ```
 builder.cleanup()

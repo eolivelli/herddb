@@ -1865,8 +1865,11 @@ public class TableSpaceManager {
                         writeLockTimeout, readLockTimeout);
                 break;
             case Index.TYPE_VECTOR:
+                long vectorMaxSegmentSize = dbmanager.getServerConfiguration().getLong(
+                        ServerConfiguration.PROPERTY_VECTOR_MAX_SEGMENT_SIZE,
+                        ServerConfiguration.PROPERTY_VECTOR_MAX_SEGMENT_SIZE_DEFAULT);
                 indexManager = new VectorIndexManager(index, dbmanager.getMemoryManager(), tableManager, log, dataStorageManager, this, tableSpaceUUID, transaction,
-                        writeLockTimeout, readLockTimeout);
+                        writeLockTimeout, readLockTimeout, vectorMaxSegmentSize);
                 break;
             default:
                 throw new DataStorageManagerException("invalid NON-UNIQUE index type " + index.type);
