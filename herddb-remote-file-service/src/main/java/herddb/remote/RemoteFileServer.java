@@ -39,6 +39,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.apache.bookkeeper.stats.NullStatsLogger;
+import org.apache.bookkeeper.stats.StatsLogger;
+import org.apache.bookkeeper.stats.prometheus.PrometheusMetricsProvider;
+import org.apache.bookkeeper.stats.prometheus.PrometheusServlet;
+import org.apache.commons.configuration.PropertiesConfiguration;
+import org.eclipse.jetty.server.ServerConnector;
+import org.eclipse.jetty.servlet.ServletContextHandler;
+import org.eclipse.jetty.servlet.ServletHolder;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
@@ -67,6 +75,8 @@ public class RemoteFileServer implements AutoCloseable {
     private Server server;
     private ExecutorService metadataExecutor;
     private ObjectStorage objectStorage;
+    private PrometheusMetricsProvider statsProvider;
+    private org.eclipse.jetty.server.Server httpServer;
 
     public RemoteFileServer(String host, int port, Path dataDirectory, int ioThreads, Properties config) {
         this.host = host;
@@ -104,11 +114,42 @@ public class RemoteFileServer implements AutoCloseable {
             objectStorage = new LocalObjectStorage(dataDirectory, metadataExecutor);
         }
 
-        RemoteFileServiceImpl serviceImpl = new RemoteFileServiceImpl(objectStorage);
+        // Initialize metrics
+        statsProvider = new PrometheusMetricsProvider();
+        PropertiesConfiguration statsConfig = new PropertiesConfiguration();
+        statsConfig.setProperty(PrometheusMetricsProvider.PROMETHEUS_STATS_HTTP_ENABLE, false);
+        statsProvider.start(statsConfig);
+        StatsLogger statsLogger = statsProvider.getStatsLogger("");
+
+        RemoteFileServiceImpl serviceImpl = new RemoteFileServiceImpl(objectStorage, statsLogger);
         server = ServerBuilder.forPort(port)
                 .addService(serviceImpl)
                 .build()
                 .start();
+
+        // Start HTTP server for metrics
+        boolean httpEnabled = Boolean.parseBoolean(config.getProperty("http.enable", "false"));
+        if (httpEnabled) {
+            int httpPort = Integer.parseInt(config.getProperty("http.port", "9846"));
+            String httpHost = config.getProperty("http.host", "0.0.0.0");
+            try {
+                httpServer = new org.eclipse.jetty.server.Server();
+                ServerConnector connector = new ServerConnector(httpServer);
+                connector.setPort(httpPort);
+                connector.setHost(httpHost);
+                httpServer.addConnector(connector);
+                ServletContextHandler context = new ServletContextHandler(ServletContextHandler.GZIP);
+                context.setContextPath("/");
+                context.addServlet(new ServletHolder(new PrometheusServlet(statsProvider)), "/metrics");
+                httpServer.setHandler(context);
+                httpServer.start();
+                LOGGER.log(Level.INFO, "Metrics HTTP server started on {0}:{1}",
+                        new Object[]{httpHost, httpPort});
+            } catch (Exception e) {
+                throw new IOException("Failed to start metrics HTTP server", e);
+            }
+        }
+
         LOGGER.log(Level.INFO, "RemoteFileServer started on port {0}, storage: {1}, io threads: {2}",
                 new Object[]{port, storageMode, ioThreads});
     }
@@ -177,6 +218,16 @@ public class RemoteFileServer implements AutoCloseable {
     }
 
     public void stop() throws InterruptedException {
+        if (httpServer != null) {
+            try {
+                httpServer.stop();
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Error stopping metrics HTTP server", e);
+            }
+        }
+        if (statsProvider != null) {
+            statsProvider.stop();
+        }
         if (server != null) {
             server.shutdown().awaitTermination(30, TimeUnit.SECONDS);
             LOGGER.log(Level.INFO, "RemoteFileServer stopped");
@@ -192,6 +243,13 @@ public class RemoteFileServer implements AutoCloseable {
                 LOGGER.log(Level.WARNING, "Error closing objectStorage", e);
             }
         }
+    }
+
+    public int getHttpPort() {
+        if (httpServer != null) {
+            return ((ServerConnector) httpServer.getConnectors()[0]).getLocalPort();
+        }
+        return -1;
     }
 
     @Override

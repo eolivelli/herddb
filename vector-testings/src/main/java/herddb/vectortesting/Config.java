@@ -31,7 +31,7 @@ public class Config {
     boolean skipVerify = false;
     boolean dropTable = false;
     boolean checkpoint = false;
-    int clientTimeoutSeconds = 7200; // 2 hours
+    int clientTimeoutSeconds = 7200 * 4; // 8 hours
 
     private static Options buildOptions() {
         Options opts = new Options();
