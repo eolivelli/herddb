@@ -11,11 +11,15 @@ import java.io.InputStream;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.zip.GZIPInputStream;
+
+import io.jhdf.HdfFile;
+import io.jhdf.api.Dataset;
 
 public class DatasetLoader {
 
@@ -64,10 +68,23 @@ public class DatasetLoader {
             if (!archive.renameTo(baseFileGz)) {
                 throw new IOException("Failed to move " + archive + " to " + baseFileGz);
             }
+        } else {
+            // Plain file (e.g. HDF5) — move into the dataset subdirectory
+            File target = new File(dir, archiveName);
+            if (!archive.renameTo(target)) {
+                // renameTo can fail across filesystems, fall back to copy
+                Files.copy(archive.toPath(), target.toPath());
+                archive.delete();
+            }
         }
     }
 
     public void ensureQueryAndGroundTruth() throws IOException {
+        // For HDF5 datasets, query and ground truth are inside the same file
+        if (preset.baseFormat == VecFormat.HDF5) {
+            return;
+        }
+
         File dir = getDatasetSubDir();
 
         // For BIGANN/SIFT10M, query and ground truth are separate downloads
@@ -149,7 +166,44 @@ public class DatasetLoader {
         return new BufferedInputStream(new FileInputStream(file));
     }
 
+    // ---- HDF5 loading ----
+
+    private File getHdf5File() {
+        return new File(getDatasetSubDir(), preset.baseFile);
+    }
+
+    private List<float[]> loadHdf5Vectors(String datasetPath, int maxVectors) {
+        try (HdfFile hdf = new HdfFile(getHdf5File().toPath())) {
+            Dataset ds = hdf.getDatasetByPath(datasetPath);
+            float[][] data = (float[][]) ds.getData();
+            int count = Math.min(maxVectors, data.length);
+            List<float[]> vectors = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                vectors.add(data[i]);
+            }
+            return vectors;
+        }
+    }
+
+    private List<int[]> loadHdf5GroundTruth(int maxVectors) {
+        try (HdfFile hdf = new HdfFile(getHdf5File().toPath())) {
+            Dataset ds = hdf.getDatasetByPath("neighbors");
+            int[][] data = (int[][]) ds.getData();
+            int count = Math.min(maxVectors, data.length);
+            List<int[]> result = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                result.add(data[i]);
+            }
+            return result;
+        }
+    }
+
+    // ---- public loading API ----
+
     public List<float[]> loadBaseVectors(int maxVectors) throws IOException {
+        if (preset.baseFormat == VecFormat.HDF5) {
+            return loadHdf5Vectors("train", maxVectors);
+        }
         File file = new File(getDatasetSubDir(), preset.baseFile);
         if (preset.baseFormat == VecFormat.BVECS) {
             return loadBvecs(openInputStream(file), maxVectors);
@@ -161,6 +215,9 @@ public class DatasetLoader {
     public interface VectorStream extends Iterable<float[]>, Closeable {}
 
     public VectorStream streamBaseVectors(int maxVectors) throws IOException {
+        if (preset.baseFormat == VecFormat.HDF5) {
+            return streamHdf5Vectors(maxVectors);
+        }
         File file = new File(getDatasetSubDir(), preset.baseFile);
         InputStream in = openInputStream(file);
         DataInputStream dis = new DataInputStream(in);
@@ -236,7 +293,47 @@ public class DatasetLoader {
         };
     }
 
+    private VectorStream streamHdf5Vectors(int maxVectors) {
+        // Load all vectors from HDF5 into memory, then stream from the array
+        HdfFile hdf = new HdfFile(getHdf5File().toPath());
+        Dataset ds = hdf.getDatasetByPath("train");
+        float[][] data = (float[][]) ds.getData();
+        int total = Math.min(maxVectors, data.length);
+        System.out.println("  Loaded " + total + " vectors from HDF5 into memory");
+        return new VectorStream() {
+            @Override
+            public void close() throws IOException {
+                hdf.close();
+            }
+
+            @Override
+            public Iterator<float[]> iterator() {
+                return new Iterator<float[]>() {
+                    private int idx = 0;
+
+                    @Override
+                    public boolean hasNext() {
+                        return idx < total;
+                    }
+
+                    @Override
+                    public float[] next() {
+                        if (!hasNext()) throw new NoSuchElementException();
+                        float[] v = data[idx++];
+                        if (idx % 1_000_000 == 0) {
+                            System.out.println("  Streamed " + idx + " vectors...");
+                        }
+                        return v;
+                    }
+                };
+            }
+        };
+    }
+
     public List<float[]> loadQueryVectors(int maxVectors) throws IOException {
+        if (preset.baseFormat == VecFormat.HDF5) {
+            return loadHdf5Vectors("test", maxVectors);
+        }
         File file = new File(getDatasetSubDir(), preset.queryFile);
         if (preset.queryFormat == VecFormat.BVECS) {
             return loadBvecs(openInputStream(file), maxVectors);
@@ -246,6 +343,9 @@ public class DatasetLoader {
     }
 
     public List<int[]> loadGroundTruth(int maxVectors) throws IOException {
+        if (preset.baseFormat == VecFormat.HDF5) {
+            return loadHdf5GroundTruth(maxVectors);
+        }
         File file = new File(getDatasetSubDir(), preset.groundTruthFile);
         return loadIvecs(openInputStream(file), maxVectors);
     }
@@ -330,7 +430,7 @@ public class DatasetLoader {
         return ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
     }
 
-    enum VecFormat { FVECS, BVECS }
+    enum VecFormat { FVECS, BVECS, HDF5 }
 
     enum DatasetPreset {
         SIFT10K(
@@ -338,35 +438,56 @@ public class DatasetLoader {
                 "ftp://ftp.irisa.fr/local/texmex/corpus/siftsmall.tar.gz",
                 "siftsmall_base.fvecs", VecFormat.FVECS,
                 "siftsmall_query.fvecs", VecFormat.FVECS,
-                "siftsmall_groundtruth.ivecs"
+                "siftsmall_groundtruth.ivecs",
+                "euclidean"
         ),
         SIFT1M(
                 "sift",
                 "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz",
                 "sift_base.fvecs", VecFormat.FVECS,
                 "sift_query.fvecs", VecFormat.FVECS,
-                "sift_groundtruth.ivecs"
+                "sift_groundtruth.ivecs",
+                "euclidean"
         ),
         SIFT10M(
                 "bigann",
                 "ftp://ftp.irisa.fr/local/texmex/corpus/bigann_base.bvecs.gz",
                 "bigann_base.bvecs", VecFormat.BVECS,
                 "bigann_query.bvecs", VecFormat.BVECS,
-                "bigann_gnd/idx_10000000.ivecs"
+                "bigann_gnd/idx_10000000.ivecs",
+                "euclidean"
         ),
         GIST1M(
                 "gist",
                 "ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz",
                 "gist_base.fvecs", VecFormat.FVECS,
                 "gist_query.fvecs", VecFormat.FVECS,
-                "gist_groundtruth.ivecs"
+                "gist_groundtruth.ivecs",
+                "euclidean"
         ),
         BIGANN(
                 "bigann",
                 "ftp://ftp.irisa.fr/local/texmex/corpus/bigann_base.bvecs.gz",
                 "bigann_base.bvecs", VecFormat.BVECS,
                 "bigann_query.bvecs", VecFormat.BVECS,
-                "bigann_gnd/idx_1000000000.ivecs"
+                "bigann_gnd/idx_1000000000.ivecs",
+                "euclidean"
+        ),
+        GLOVE_100(
+                "glove-100",
+                "http://ann-benchmarks.com/glove-100-angular.hdf5",
+                "glove-100-angular.hdf5", VecFormat.HDF5,
+                null, VecFormat.HDF5,
+                null,
+                "cosine"
+        ),
+        DEEP_IMAGE_96(
+                "deep-image-96",
+                "http://ann-benchmarks.com/deep-image-96-angular.hdf5",
+                "deep-image-96-angular.hdf5", VecFormat.HDF5,
+                null, VecFormat.HDF5,
+                null,
+                "cosine"
         );
 
         final String subDir;
@@ -376,11 +497,12 @@ public class DatasetLoader {
         final String queryFile;
         final VecFormat queryFormat;
         final String groundTruthFile;
+        final String similarity;
 
         DatasetPreset(String subDir, String defaultUrl,
                       String baseFile, VecFormat baseFormat,
                       String queryFile, VecFormat queryFormat,
-                      String groundTruthFile) {
+                      String groundTruthFile, String similarity) {
             this.subDir = subDir;
             this.defaultUrl = defaultUrl;
             this.baseFile = baseFile;
@@ -388,6 +510,7 @@ public class DatasetLoader {
             this.queryFile = queryFile;
             this.queryFormat = queryFormat;
             this.groundTruthFile = groundTruthFile;
+            this.similarity = similarity;
         }
     }
 }

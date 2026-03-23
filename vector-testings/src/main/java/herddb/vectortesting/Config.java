@@ -32,6 +32,7 @@ public class Config {
     boolean dropTable = false;
     boolean checkpoint = false;
     int clientTimeoutSeconds = 7200 * 4; // 8 hours
+    String similarity = null; // null = use dataset default
 
     private static Options buildOptions() {
         Options opts = new Options();
@@ -40,7 +41,7 @@ public class Config {
         opts.addOption(null, "password", true, "Password (default: empty)");
         opts.addOption(null, "table", true, "Table name (default: vector_bench)");
         opts.addOption(null, "dataset-dir", true, "Dataset download/cache directory (default: ./datasets)");
-        opts.addOption(null, "dataset", true, "Dataset preset: sift10k, sift1m, gist1m, sift10m, bigann (default: sift1m)");
+        opts.addOption(null, "dataset", true, "Dataset preset: sift10k, sift1m, gist1m, sift10m, bigann, glove100, deep-image-96 (default: sift1m)");
         opts.addOption(null, "dataset-url", true, "Override dataset download URL");
         opts.addOption("n", "rows", true, "Number of rows to ingest (default: 100000, cycles dataset if larger)");
         opts.addOption(null, "ingest-threads", true, "Ingestion parallelism (default: 4)");
@@ -55,6 +56,7 @@ public class Config {
         opts.addOption(null, "skip-verify", false, "Skip row count verification after ingestion");
         opts.addOption(null, "drop-table", false, "Drop table before starting");
         opts.addOption(null, "checkpoint", false, "Force checkpoint after ingestion and after index creation");
+        opts.addOption(null, "similarity", true, "Similarity function: euclidean, cosine, dot (default: from dataset)");
         opts.addOption(null, "client-timeout", true, "Client request timeout in seconds (default: 7200)");
         opts.addOption(null, "config", true, "Path to properties file");
         opts.addOption("h", "help", false, "Show help");
@@ -104,6 +106,7 @@ public class Config {
         if (cmd.hasOption("skip-verify")) cfg.skipVerify = true;
         if (cmd.hasOption("drop-table")) cfg.dropTable = true;
         if (cmd.hasOption("checkpoint")) cfg.checkpoint = true;
+        if (cmd.hasOption("similarity")) cfg.similarity = cmd.getOptionValue("similarity");
         if (cmd.hasOption("client-timeout")) cfg.clientTimeoutSeconds = Integer.parseInt(cmd.getOptionValue("client-timeout"));
 
         return cfg;
@@ -130,7 +133,13 @@ public class Config {
         if (props.containsKey("skip-verify")) skipVerify = Boolean.parseBoolean(props.getProperty("skip-verify"));
         if (props.containsKey("drop-table")) dropTable = Boolean.parseBoolean(props.getProperty("drop-table"));
         if (props.containsKey("checkpoint")) checkpoint = Boolean.parseBoolean(props.getProperty("checkpoint"));
+        if (props.containsKey("similarity")) similarity = props.getProperty("similarity");
         if (props.containsKey("client-timeout")) clientTimeoutSeconds = Integer.parseInt(props.getProperty("client-timeout"));
+    }
+
+    /** Returns the similarity function: CLI override if set, otherwise dataset default. */
+    String effectiveSimilarity() {
+        return similarity != null ? similarity : dataset.similarity;
     }
 
     /** Returns the JDBC URL with client.timeout embedded as a query parameter. */
@@ -147,8 +156,10 @@ public class Config {
             case "gist1m", "gist" -> DatasetLoader.DatasetPreset.GIST1M;
             case "sift10m" -> DatasetLoader.DatasetPreset.SIFT10M;
             case "bigann", "sift1b" -> DatasetLoader.DatasetPreset.BIGANN;
+            case "glove100", "glove-100", "glove" -> DatasetLoader.DatasetPreset.GLOVE_100;
+            case "deep-image-96", "deep-image", "deepimage" -> DatasetLoader.DatasetPreset.DEEP_IMAGE_96;
             default -> throw new IllegalArgumentException("Unknown dataset: " + value
-                    + ". Supported: sift10k, sift1m, gist1m, sift10m, bigann");
+                    + ". Supported: sift10k, sift1m, gist1m, sift10m, bigann, glove100, deep-image-96");
         };
     }
 
@@ -166,6 +177,8 @@ public class Config {
                 + ", topK=" + topK
                 + ", indexM=" + indexM
                 + ", beamWidth=" + indexBeamWidth
+                + ", similarity=" + effectiveSimilarity()
+                + (similarity != null ? " (override)" : " (dataset default)")
                 + ", skipIngest=" + skipIngest
                 + ", skipIndex=" + skipIndex
                 + ", skipVerify=" + skipVerify

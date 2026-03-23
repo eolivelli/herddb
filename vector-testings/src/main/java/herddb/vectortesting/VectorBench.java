@@ -194,7 +194,7 @@ public class VectorBench {
             String indexSql = "CREATE VECTOR INDEX vidx ON " + config.tableName + "(vec)"
                     + " WITH m=" + config.indexM
                     + " beamWidth=" + config.indexBeamWidth
-                    + " similarity=euclidean fusedPQ=true";
+                    + " similarity=" + config.effectiveSimilarity() + " fusedPQ=true";
             System.out.println("Executing: " + indexSql);
             runWithProgress("=== INDEX CREATION ===", () -> {
                 try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
