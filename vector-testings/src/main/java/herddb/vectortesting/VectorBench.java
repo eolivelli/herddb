@@ -111,7 +111,7 @@ public class VectorBench {
 
             ExecutorService ingestPool = Executors.newFixedThreadPool(config.ingestThreads);
             for (int t = 0; t < config.ingestThreads; t++) {
-                ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId, ingestMetrics, ingestStatus));
+                ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId, ingestMetrics, ingestStatus, ingestStart));
             }
 
             // Progress display thread runs during the entire ingestion
