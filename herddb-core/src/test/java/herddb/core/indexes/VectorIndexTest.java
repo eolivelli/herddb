@@ -2033,6 +2033,506 @@ public class VectorIndexTest {
         }
     }
 
+    // =========================================================================
+    // Multi-segment rebuild tests
+    // =========================================================================
+
+    /**
+     * Test 1: Rebuild with small maxSegmentSize creates multiple segments.
+     * Verifies segments survive checkpoint + restart.
+     */
+    @Test
+    public void testRebuildCreatesMultipleSegments() throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+        final int numRows = 1000;
+        final int dimension = 16;
+        // 20KB: threshold = max(256, 20480/(16*4*2)) = 256, so ~3 segments from 1000 rows
+        final long maxSegmentSize = 1024 * 20;
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= numRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            // Drop and recreate to trigger rebuild
+            execute(manager, "DROP INDEX tblspace1.vidx", Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            assertTrue("expected multiple segments, got " + vim.getSegmentCount(),
+                    vim.getSegmentCount() >= 2);
+            assertEquals("total nodes", numRows, vim.getNodeCount());
+
+            // Verify search works
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse("search should return results", results.isEmpty());
+                assertEquals("top result should be id=1", 1, results.get(0).get("id"));
+            }
+
+            // Checkpoint + restart
+            manager.checkpoint();
+        }
+
+        // Restart and verify segments survive
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10000);
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            assertTrue("segments should survive restart, got " + vim.getSegmentCount(),
+                    vim.getSegmentCount() >= 2);
+            assertEquals(numRows, vim.getNodeCount());
+
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse(results.isEmpty());
+                assertEquals(1, results.get(0).get("id"));
+            }
+        }
+    }
+
+    /**
+     * Test 2: Search accuracy across rebuild-created segments.
+     */
+    @Test
+    public void testRebuildMultiSegmentSearchAccuracy() throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+        final int numRows = 1000;
+        final int dimension = 16;
+        final long maxSegmentSize = 1024 * 20;
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= numRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            // Drop and recreate to trigger rebuild
+            execute(manager, "DROP INDEX tblspace1.vidx", Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            // Query with several different seeds and check top-1 accuracy
+            for (int seed : new int[]{1, 50, 100, 300, 500}) {
+                float[] query = randomVec(dimension, seed);
+                try (DataScanner scanner = scan(manager,
+                        "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                        Arrays.asList((Object) query))) {
+                    List<DataAccessor> results = scanner.consume();
+                    assertEquals("should return 5 results", 5, results.size());
+                    assertEquals("top result for seed=" + seed + " should match", seed, results.get(0).get("id"));
+                }
+            }
+        }
+    }
+
+    /**
+     * Test 3: Rebuild with all vectors fitting in one batch (under threshold).
+     */
+    @Test
+    public void testRebuildSingleSegmentWhenUnderThreshold() throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+        final int numRows = 300;
+        final int dimension = 16;
+
+        // Use default large maxSegmentSize so everything fits in one segment
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= numRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            execute(manager, "DROP INDEX tblspace1.vidx", Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            assertEquals("should have exactly 1 segment", 1, vim.getSegmentCount());
+            assertEquals(numRows, vim.getOnDiskNodeCount());
+            assertEquals(0, vim.getLiveNodeCount());
+
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse(results.isEmpty());
+                assertEquals(1, results.get(0).get("id"));
+            }
+        }
+    }
+
+    /**
+     * Test 4: Rebuild with zero vectors (empty table).
+     */
+    @Test
+    public void testRebuildZeroVectors() throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            // Drop and recreate with empty table
+            execute(manager, "DROP INDEX tblspace1.vidx", Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            assertEquals(0, vim.getOnDiskNodeCount());
+            assertEquals(0, vim.getLiveNodeCount());
+        }
+    }
+
+    /**
+     * Test 5: Rebuild where final batch is smaller than MIN_VECTORS_FOR_FUSED_PQ.
+     */
+    @Test
+    public void testRebuildSmallFinalBatch() throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+        // With 20KB maxSegmentSize and dim=16, threshold = 256.
+        // 380 rows = 1 full batch (256) + 1 small batch (124, below 256 → kept as live)
+        final int numRows = 380;
+        final int dimension = 16;
+        final long maxSegmentSize = 1024 * 20;
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= numRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            execute(manager, "DROP INDEX tblspace1.vidx", Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            assertEquals("total nodes", numRows, vim.getNodeCount());
+            assertTrue("expected at least 1 segment, got " + vim.getSegmentCount(),
+                    vim.getSegmentCount() >= 1);
+            assertTrue("expected some live nodes from small final batch",
+                    vim.getLiveNodeCount() > 0);
+
+            // Verify search works across all segments including small final batch
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse(results.isEmpty());
+                assertEquals(1, results.get(0).get("id"));
+            }
+        }
+    }
+
+    /**
+     * Test 6: Rebuild with dimension < MIN_DIM_FOR_FUSED_PQ (FusedPQ not applicable).
+     */
+    @Test
+    public void testRebuildFusedPQNotApplicable() throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+        final int numRows = 300;
+        final int dimension = 4; // below MIN_DIM_FOR_FUSED_PQ (8)
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= numRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            execute(manager, "DROP INDEX tblspace1.vidx", Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            // With dim=4, FusedPQ is not applicable, so vectors stay in live state
+            assertEquals(0, vim.getSegmentCount());
+            assertEquals(0, vim.getOnDiskNodeCount());
+            assertTrue("live nodes should have data", vim.getLiveNodeCount() > 0);
+
+            // Verify search still works
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse(results.isEmpty());
+                assertEquals(1, results.get(0).get("id"));
+            }
+        }
+    }
+
+    /**
+     * Test 7: Rebuild with mixed null/non-null vectors and small maxSegmentSize.
+     */
+    @Test
+    public void testRebuildMultiSegmentWithNullableVectors() throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+        final int totalRows = 1200;
+        final int dimension = 16;
+        final long maxSegmentSize = 1024 * 20;
+        // Every 4th row gets a null vector
+        final int expectedNonNull = totalRows - (totalRows / 4);
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= totalRows; i++) {
+                if (i % 4 == 0) {
+                    executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, null)",
+                            Arrays.asList(i));
+                } else {
+                    executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                            Arrays.asList(i, randomVec(dimension, i)));
+                }
+            }
+
+            execute(manager, "DROP INDEX tblspace1.vidx", Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            assertEquals("node count should match non-null rows", expectedNonNull, vim.getNodeCount());
+            assertTrue("expected multiple segments", vim.getSegmentCount() >= 2);
+
+            // Verify search works
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse(results.isEmpty());
+                assertEquals(1, results.get(0).get("id"));
+            }
+        }
+    }
+
+    /**
+     * Test 8: Multi-segment rebuild followed by incremental inserts and checkpoint.
+     */
+    @Test
+    public void testRebuildMultiSegmentThenInsertAndCheckpoint() throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+        final int initialRows = 1000;
+        final int additionalRows = 100;
+        final int dimension = 16;
+        final long maxSegmentSize = 1024 * 20;
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= initialRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            // Trigger rebuild
+            execute(manager, "DROP INDEX tblspace1.vidx", Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            int segmentsAfterRebuild = vim.getSegmentCount();
+            assertTrue("expected multiple segments after rebuild", segmentsAfterRebuild >= 2);
+
+            // Insert additional rows
+            for (int i = initialRows + 1; i <= initialRows + additionalRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            // Checkpoint to merge live data
+            manager.checkpoint();
+
+            vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals("total nodes after insert+checkpoint",
+                    initialRows + additionalRows, vim.getNodeCount());
+
+            // Search should find results from both rebuild and new inserts
+            float[] query = randomVec(dimension, initialRows + 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse(results.isEmpty());
+                assertEquals("should find newly inserted row",
+                        initialRows + 1, results.get(0).get("id"));
+            }
+        }
+    }
+
     private static float[] randomVec(int dim, int seed) {
         float[] v = new float[dim];
         float norm = 0;

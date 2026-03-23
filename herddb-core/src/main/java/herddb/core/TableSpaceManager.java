@@ -142,6 +142,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.apache.bookkeeper.stats.Gauge;
 import org.apache.bookkeeper.stats.OpStatsLogger;
 import org.apache.bookkeeper.stats.StatsLogger;
 
@@ -158,6 +159,14 @@ public class TableSpaceManager {
 
     final StatsLogger tablespaceStasLogger;
     final OpStatsLogger checkpointTimeStats;
+
+    private Gauge<Long> tableCountGauge;
+    private Gauge<Integer> indexCountGauge;
+    private Gauge<Long> totalTableSizeGauge;
+    private Gauge<Integer> totalLoadedPagesGauge;
+    private Gauge<Long> totalBuffersUsedMemoryGauge;
+    private Gauge<Long> totalKeysUsedMemoryGauge;
+    private Gauge<Integer> totalDirtyPagesGauge;
 
     private final MetadataStorageManager metadataStorageManager;
     private final DataStorageManager dataStorageManager;
@@ -218,7 +227,59 @@ public class TableSpaceManager {
         this.virtual = virtual;
         this.tablespaceStasLogger = this.dbmanager.getStatsLogger().scope(this.tableSpaceName);
         this.checkpointTimeStats = this.tablespaceStasLogger.getOpStatsLogger("checkpointTime");
+        registerTableSpaceMetrics();
         this.dataStorageManager.tableSpaceMetadataUpdated(tableSpaceUUID, expectedReplicaCount);
+    }
+
+    private void registerTableSpaceMetrics() {
+        this.tableCountGauge = new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return 0L; }
+            @Override public Long getSample() {
+                return tables.values().stream().filter(t -> !t.isSystemTable()).count();
+            }
+        };
+        tablespaceStasLogger.registerGauge("table_count", tableCountGauge);
+        this.indexCountGauge = new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return indexes.size(); }
+        };
+        tablespaceStasLogger.registerGauge("index_count", indexCountGauge);
+        this.totalTableSizeGauge = new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return 0L; }
+            @Override public Long getSample() { return stats.getTablesize(); }
+        };
+        tablespaceStasLogger.registerGauge("total_table_size", totalTableSizeGauge);
+        this.totalLoadedPagesGauge = new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return stats.getLoadedpages(); }
+        };
+        tablespaceStasLogger.registerGauge("total_loaded_pages", totalLoadedPagesGauge);
+        this.totalBuffersUsedMemoryGauge = new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return 0L; }
+            @Override public Long getSample() { return stats.getBuffersUsedMemory(); }
+        };
+        tablespaceStasLogger.registerGauge("total_buffers_used_memory", totalBuffersUsedMemoryGauge);
+        this.totalKeysUsedMemoryGauge = new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return 0L; }
+            @Override public Long getSample() { return stats.getKeysUsedMemory(); }
+        };
+        tablespaceStasLogger.registerGauge("total_keys_used_memory", totalKeysUsedMemoryGauge);
+        this.totalDirtyPagesGauge = new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return stats.getDirtypages(); }
+        };
+        tablespaceStasLogger.registerGauge("total_dirty_pages", totalDirtyPagesGauge);
+    }
+
+    private void unregisterTableSpaceMetrics() {
+        tablespaceStasLogger.unregisterGauge("table_count", tableCountGauge);
+        tablespaceStasLogger.unregisterGauge("index_count", indexCountGauge);
+        tablespaceStasLogger.unregisterGauge("total_table_size", totalTableSizeGauge);
+        tablespaceStasLogger.unregisterGauge("total_loaded_pages", totalLoadedPagesGauge);
+        tablespaceStasLogger.unregisterGauge("total_buffers_used_memory", totalBuffersUsedMemoryGauge);
+        tablespaceStasLogger.unregisterGauge("total_keys_used_memory", totalKeysUsedMemoryGauge);
+        tablespaceStasLogger.unregisterGauge("total_dirty_pages", totalDirtyPagesGauge);
+        dbmanager.getStatsLogger().removeScope(tableSpaceName, tablespaceStasLogger);
     }
 
     private void bootSystemTables() {
@@ -1868,8 +1929,11 @@ public class TableSpaceManager {
                 long vectorMaxSegmentSize = dbmanager.getServerConfiguration().getLong(
                         ServerConfiguration.PROPERTY_VECTOR_MAX_SEGMENT_SIZE,
                         ServerConfiguration.PROPERTY_VECTOR_MAX_SEGMENT_SIZE_DEFAULT);
+                StatsLogger vectorMetrics = tablespaceStasLogger
+                        .scope("table_" + index.table)
+                        .scope("vidx_" + index.name);
                 indexManager = new VectorIndexManager(index, dbmanager.getMemoryManager(), tableManager, log, dataStorageManager, this, tableSpaceUUID, transaction,
-                        writeLockTimeout, readLockTimeout, vectorMaxSegmentSize);
+                        writeLockTimeout, readLockTimeout, vectorMaxSegmentSize, vectorMetrics);
                 break;
             default:
                 throw new DataStorageManagerException("invalid NON-UNIQUE index type " + index.type);
@@ -1970,6 +2034,7 @@ public class TableSpaceManager {
         if (useJmx) {
             JMXUtils.unregisterTableSpaceManagerStatsMXBean(tableSpaceName);
         }
+        unregisterTableSpaceMetrics();
     }
 
     public boolean isClosed() {

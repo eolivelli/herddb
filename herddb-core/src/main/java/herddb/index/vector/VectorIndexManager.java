@@ -104,6 +104,9 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
 
+import org.apache.bookkeeper.stats.Gauge;
+import org.apache.bookkeeper.stats.StatsLogger;
+
 /**
  * Vector index manager backed by jvector (OnHeapGraphIndex / HNSW-style).
  * Supports only FLOATARRAY columns and does not support UNIQUE constraint.
@@ -230,7 +233,8 @@ public class VectorIndexManager extends AbstractIndexManager {
                                long transaction,
                                int writeLockTimeout,
                                int readLockTimeout,
-                               long serverMaxSegmentSize) {
+                               long serverMaxSegmentSize,
+                               StatsLogger statsLogger) {
         super(index, tableManager, dataStorageManager, tableSpaceUUID, log,
                 transaction, writeLockTimeout, readLockTimeout);
         this.memoryManager = memoryManager;
@@ -243,6 +247,44 @@ public class VectorIndexManager extends AbstractIndexManager {
         this.similarityFunction = parseSimilarity(props.getOrDefault(PROP_SIMILARITY, "cosine"));
         // Per-index override takes precedence over server config
         this.maxSegmentSize = longProp(props, PROP_MAX_SEGMENT_SIZE, serverMaxSegmentSize);
+        registerMetrics(statsLogger);
+    }
+
+    private void registerMetrics(StatsLogger statsLogger) {
+        statsLogger.registerGauge("node_count", new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return getNodeCount(); }
+        });
+        statsLogger.registerGauge("live_node_count", new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return getLiveNodeCount(); }
+        });
+        statsLogger.registerGauge("ondisk_node_count", new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return getOnDiskNodeCount(); }
+        });
+        statsLogger.registerGauge("segment_count", new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return getSegmentCount(); }
+        });
+        statsLogger.registerGauge("dimension", new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return getDimension(); }
+        });
+        statsLogger.registerGauge("estimated_size_bytes", new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return 0L; }
+            @Override public Long getSample() { return getEstimatedSizeBytes(); }
+        });
+        statsLogger.registerGauge("live_vectors_memory_bytes", new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return 0L; }
+            @Override public Long getSample() {
+                return (long) vectors.size() * dimension * Float.BYTES;
+            }
+        });
+        statsLogger.registerGauge("dirty", new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return dirty.get() ? 1 : 0; }
+        });
     }
 
     private static int intProp(Map<String, String> props, String key, int defaultVal) {
@@ -583,23 +625,36 @@ public class VectorIndexManager extends AbstractIndexManager {
         resetState();
         Table table = tableManager.getTable();
         AtomicLong count = new AtomicLong();
-        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+        // Mutable locals: reassigned when a batch is flushed mid-scan
+        ThreadPoolExecutor[] executorHolder = {new ThreadPoolExecutor(
                 REBUILD_THREADS, REBUILD_THREADS,
                 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(REBUILD_THREADS),
                 DAEMON_THREAD_FACTORY,
-                new ThreadPoolExecutor.CallerRunsPolicy());
+                new ThreadPoolExecutor.CallerRunsPolicy())};
         AtomicReference<Throwable> error = new AtomicReference<>();
         // Use file-backed storage for vectors and BLink-backed storage for nodeToPk
         // to avoid unbounded heap usage during rebuild.
         // FileBackedVectorValues is lazily initialized when dimension is discovered from first non-null vector.
-        String rebuildStoreName = index.uuid + "_rebuild_nodetopk_" + System.nanoTime();
-        dataStorageManager.initIndex(tableSpaceUUID, rebuildStoreName);
+        String[] rebuildStoreNameHolder = {index.uuid + "_rebuild_nodetopk_" + System.nanoTime()};
+        dataStorageManager.initIndex(tableSpaceUUID, rebuildStoreNameHolder[0]);
         long pageSize = memoryManager.getMaxLogicalPageSize();
-        BLink<Bytes, Bytes> rebuildNodeToPk = new BLink<>(pageSize, BytesBytesSizeEvaluator.INSTANCE,
+        BLink<Bytes, Bytes>[] rebuildNodeToPkHolder = new BLink[]{new BLink<>(pageSize, BytesBytesSizeEvaluator.INSTANCE,
                 memoryManager.getIndexPageReplacementPolicy(),
-                new BytesBytesStorage(rebuildStoreName));
+                new BytesBytesStorage(rebuildStoreNameHolder[0]))};
         final AtomicReference<FileBackedVectorValues> rebuildVectorsRef = new AtomicReference<>();
+
+        // Multi-segment rebuild state
+        AtomicInteger batchNodeCount = new AtomicInteger(0);
+        AtomicInteger maxNodesPerSegmentRef = new AtomicInteger(Integer.MAX_VALUE);
+        List<SegmentWriteResult> completedSegments = new ArrayList<>();
+        // Track all BLink store names for cleanup on error
+        List<String> allRebuildStoreNames = new ArrayList<>();
+        allRebuildStoreNames.add(rebuildStoreNameHolder[0]);
+        // Track all FileBackedVectorValues for deferred cleanup
+        // (background threads in ForkJoinPool may still reference them after flush)
+        List<FileBackedVectorValues> allRebuildVectors = new ArrayList<>();
+
         try {
             tableManager.scanForIndexRebuild(r -> {
                 if (error.get() != null) {
@@ -611,32 +666,94 @@ public class VectorIndexManager extends AbstractIndexManager {
                 if (builder == null) {
                     // Single-threaded until builder is initialized (typically first non-null vector)
                     try {
-                        rebuildInsert(key, indexKey, rebuildVectorsRef, rebuildNodeToPk, currentTableSize);
+                        rebuildInsert(key, indexKey, rebuildVectorsRef, rebuildNodeToPkHolder[0],
+                                currentTableSize, batchNodeCount, maxNodesPerSegmentRef);
                     } catch (Throwable t) {
                         error.compareAndSet(null, t);
                     }
                 } else {
-                    executor.execute(() -> {
+                    executorHolder[0].execute(() -> {
                         try {
-                            rebuildInsert(key, indexKey, rebuildVectorsRef, rebuildNodeToPk, currentTableSize);
+                            rebuildInsert(key, indexKey, rebuildVectorsRef, rebuildNodeToPkHolder[0],
+                                    currentTableSize, batchNodeCount, maxNodesPerSegmentRef);
                         } catch (Throwable t) {
                             LOGGER.log(Level.SEVERE, "rebuild failed", t);
                             error.compareAndSet(null, t);
                         }
                     });
                 }
+
+                // Check if current batch reached the segment threshold
+                if (batchNodeCount.get() >= maxNodesPerSegmentRef.get()
+                        && dimension > 0 && fusedPQ && dimension >= MIN_DIM_FOR_FUSED_PQ
+                        && builder != null) {
+                    try {
+                        // Drain thread pool before flushing
+                        executorHolder[0].shutdown();
+                        executorHolder[0].awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+                        if (error.get() != null) {
+                            throw new DataStorageManagerException("error during rebuild", error.get());
+                        }
+
+                        int batchSize = batchNodeCount.get();
+                        if (batchSize >= MIN_VECTORS_FOR_FUSED_PQ) {
+                            SegmentWriteResult swr = flushRebuildBatch(
+                                    rebuildVectorsRef.get(), rebuildNodeToPkHolder[0], batchSize);
+                            completedSegments.add(swr);
+
+                            // Defer close of FileBackedVectorValues (background threads may still reference it)
+                            FileBackedVectorValues oldFbv = rebuildVectorsRef.getAndSet(null);
+                            if (oldFbv != null) {
+                                allRebuildVectors.add(oldFbv);
+                            }
+                            closeRebuildNodeToPk(rebuildNodeToPkHolder[0], rebuildStoreNameHolder[0]);
+
+                            // Create new batch resources
+                            rebuildStoreNameHolder[0] = index.uuid + "_rebuild_nodetopk_" + System.nanoTime();
+                            dataStorageManager.initIndex(tableSpaceUUID, rebuildStoreNameHolder[0]);
+                            allRebuildStoreNames.add(rebuildStoreNameHolder[0]);
+                            rebuildNodeToPkHolder[0] = new BLink<>(pageSize, BytesBytesSizeEvaluator.INSTANCE,
+                                    memoryManager.getIndexPageReplacementPolicy(),
+                                    new BytesBytesStorage(rebuildStoreNameHolder[0]));
+                            nextNodeId.set(0);
+                            batchNodeCount.set(0);
+
+                            // Re-init builder with fresh file-backed storage
+                            initNewRebuildBatch(rebuildVectorsRef, currentTableSize);
+
+                            LOGGER.log(Level.INFO,
+                                    "rebuild vector index {0}: starting new batch (segment threshold: {1} vectors)",
+                                    new Object[]{index.name, maxNodesPerSegmentRef.get()});
+                        }
+
+                        // New thread pool for next batch
+                        executorHolder[0] = new ThreadPoolExecutor(
+                                REBUILD_THREADS, REBUILD_THREADS,
+                                0L, TimeUnit.MILLISECONDS,
+                                new ArrayBlockingQueue<>(REBUILD_THREADS),
+                                DAEMON_THREAD_FACTORY,
+                                new ThreadPoolExecutor.CallerRunsPolicy());
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new DataStorageManagerException("rebuild interrupted during segment flush", e);
+                    } catch (IOException e) {
+                        throw new DataStorageManagerException("Failed to flush segment during rebuild", e);
+                    }
+                }
+
                 long value = count.incrementAndGet();
                 if (value % 100000 == 0) {
                     long elapsed = System.currentTimeMillis() - start;
                     long percent = (value * 100) / currentTableSize;
                     FileBackedVectorValues fbv = rebuildVectorsRef.get();
                     LOGGER.log(Level.INFO,
-                            "rebuild vector index {0} in progress, indexed {1} records ({2}%), started {3} ms ago: {4} nodes",
-                            new Object[]{index.name, value, percent, elapsed, fbv != null ? fbv.size() : 0});
+                            "rebuild vector index {0} in progress, indexed {1} records ({2}%), started {3} ms ago: {4} nodes, {5} segments flushed",
+                            new Object[]{index.name, value, percent, elapsed,
+                                    fbv != null ? fbv.size() : 0, completedSegments.size()});
                 }
             });
-            executor.shutdown();
-            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+            executorHolder[0].shutdown();
+            executorHolder[0].awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
             if (error.get() != null) {
                 throw new DataStorageManagerException(error.get());
             }
@@ -644,28 +761,44 @@ public class VectorIndexManager extends AbstractIndexManager {
             Thread.currentThread().interrupt();
             throw new DataStorageManagerException("rebuild interrupted", e);
         } finally {
-            executor.shutdownNow();
+            executorHolder[0].shutdownNow();
         }
         FileBackedVectorValues rebuildVectors = rebuildVectorsRef.get();
-        int rebuildCount = (int) rebuildNodeToPk.size();
-        // Build FusedPQ directly if conditions are met, avoiding duplicate work at next checkpoint
-        if (fusedPQ && dimension >= MIN_DIM_FOR_FUSED_PQ
-                && rebuildCount >= MIN_VECTORS_FOR_FUSED_PQ && builder != null) {
+        int remainingBatchCount = batchNodeCount.get();
+
+        if (!completedSegments.isEmpty()) {
+            // Multi-segment rebuild path: at least one segment was already flushed
             try {
-                builder.cleanup();
-                OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
-                List<Long> graphPageIds = writeFusedPQGraph(graph, mravv, dimension);
-                List<Long> mapPageIds = writeFusedPQMapData(rebuildVectors, rebuildNodeToPk);
-                LogSequenceNumber lsn = log.getLastSequenceNumber();
-                long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
+                // Flush remaining batch if non-empty
+                if (remainingBatchCount > 0 && builder != null) {
+                    if (remainingBatchCount >= MIN_VECTORS_FOR_FUSED_PQ) {
+                        SegmentWriteResult swr = flushRebuildBatch(
+                                rebuildVectors, rebuildNodeToPkHolder[0], remainingBatchCount);
+                        completedSegments.add(swr);
+                    } else {
+                        // Small final batch (< MIN_VECTORS_FOR_FUSED_PQ): keep as live state.
+                        // These vectors will be merged into segments at the next checkpoint.
+                        LOGGER.log(Level.INFO,
+                                "rebuild vector index {0}: final batch has {1} vectors (below {2}), keeping as live state",
+                                new Object[]{index.name, remainingBatchCount, MIN_VECTORS_FOR_FUSED_PQ});
+                        try (Stream<Map.Entry<Bytes, Bytes>> scanStream =
+                                rebuildNodeToPkHolder[0].scan(Bytes.EMPTY_ARRAY, Bytes.POSITIVE_INFINITY)) {
+                            scanStream.forEach(e -> {
+                                int nodeId = bytesToOrdinal(e.getKey());
+                                Bytes pk = e.getValue();
+                                this.nodeToPk.put(nodeId, pk);
+                                this.pkToNode.put(pk, nodeId);
+                                if (rebuildVectors != null) {
+                                    this.vectors.put(nodeId, rebuildVectors.getVector(nodeId));
+                                }
+                            });
+                        }
+                    }
+                }
 
-                // Build single-segment result
-                int segId = nextSegmentId.getAndIncrement();
-                List<SegmentWriteResult> segResults = new ArrayList<>();
-                segResults.add(new SegmentWriteResult(segId, graphPageIds, mapPageIds, estimatedSize, Collections.emptyList()));
-                persistIndexStatusMultiSegment(Collections.emptyList(), segResults, lsn, false);
-
-                // Close old builder before loading segment
+                // Close builder from the last batch (it references FileBackedVectorValues
+                // that will be closed soon, so we must not reuse it)
+                boolean hasLiveData = !vectors.isEmpty();
                 GraphIndexBuilder oldBuilder = this.builder;
                 if (oldBuilder != null) {
                     try {
@@ -677,70 +810,162 @@ public class VectorIndexManager extends AbstractIndexManager {
                 this.builder = null;
                 this.mravv = null;
 
-                // Reload from persisted pages
-                Path reloadMapFile = readChunksToTempFile(
-                        mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
-                Path reloadGraphFile = readChunksToTempFile(
-                        graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
-                VectorSegment seg = new VectorSegment(segId);
-                seg.estimatedSizeBytes = estimatedSize;
-                seg.graphPageIds = graphPageIds;
-                seg.mapPageIds = mapPageIds;
-                loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, dimension, nextNodeId.get());
-                segments.add(seg);
-                initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
+                LogSequenceNumber lsn = log.getLastSequenceNumber();
+                persistIndexStatusMultiSegment(Collections.emptyList(), completedSegments, lsn, false);
 
-                dirty.set(false);
+                // Load all segments
+                List<VectorSegment> newSegments = new java.util.concurrent.CopyOnWriteArrayList<>();
+                for (SegmentWriteResult swr : completedSegments) {
+                    Path reloadMapFile = readChunksToTempFile(
+                            swr.mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
+                    Path reloadGraphFile = readChunksToTempFile(
+                            swr.graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
+                    VectorSegment seg = new VectorSegment(swr.segmentId);
+                    seg.estimatedSizeBytes = swr.estimatedSizeBytes;
+                    seg.graphPageIds = swr.graphPageIds;
+                    seg.mapPageIds = swr.mapPageIds;
+                    loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, dimension, Integer.MAX_VALUE);
+                    newSegments.add(seg);
+                }
+                this.segments = newSegments;
 
+                if (hasLiveData) {
+                    // Small final batch kept as live state: build fresh graph from live vectors.
+                    // We don't reuse the old builder's graph to avoid references to
+                    // FileBackedVectorValues that will be closed.
+                    initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
+                    for (Map.Entry<Integer, VectorFloat<?>> entry : vectors.entrySet()) {
+                        builder.addGraphNode(entry.getKey(), entry.getValue());
+                    }
+                    // nextNodeId already reflects the live batch node IDs
+                    dirty.set(true);
+                } else {
+                    // Recompute nextNodeId from all segments
+                    int maxOrd = -1;
+                    for (VectorSegment seg : segments) {
+                        try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
+                            int segMax = stream.mapToInt(e -> bytesToOrdinal(e.getKey())).max().orElse(-1);
+                            if (segMax > maxOrd) {
+                                maxOrd = segMax;
+                            }
+                        }
+                    }
+                    this.nextNodeId.set(maxOrd + 1);
+                    initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
+                    dirty.set(false);
+                }
+
+                int totalNodes = (int) onDiskNodeToPkSize() + vectors.size();
                 LOGGER.log(Level.INFO,
-                        "rebuilt vector index {0} in {1} ms: {2} nodes (FusedPQ written directly)",
-                        new Object[]{index.name, System.currentTimeMillis() - start, rebuildCount});
+                        "rebuilt vector index {0} in {1} ms: {2} nodes across {3} segments, {4} live (FusedPQ multi-segment)",
+                        new Object[]{index.name, System.currentTimeMillis() - start, totalNodes,
+                                segments.size(), vectors.size()});
             } catch (IOException e) {
                 throw new DataStorageManagerException("Failed to write FusedPQ during rebuild", e);
             } finally {
                 closeRebuildVectors(rebuildVectors);
-                closeRebuildNodeToPk(rebuildNodeToPk, rebuildStoreName);
+                for (FileBackedVectorValues fbv : allRebuildVectors) {
+                    closeRebuildVectors(fbv);
+                }
+                closeRebuildNodeToPk(rebuildNodeToPkHolder[0], rebuildStoreNameHolder[0]);
             }
         } else {
-            try {
-                // Small dataset or FusedPQ not applicable: populate instance fields, let checkpoint() handle
-                try (Stream<Map.Entry<Bytes, Bytes>> scanStream =
-                        rebuildNodeToPk.scan(Bytes.EMPTY_ARRAY, Bytes.POSITIVE_INFINITY)) {
-                    scanStream.forEach(e -> {
-                        int nodeId = bytesToOrdinal(e.getKey());
-                        Bytes pk = e.getValue();
-                        this.nodeToPk.put(nodeId, pk);
-                        if (rebuildVectors != null) {
-                            this.vectors.put(nodeId, rebuildVectors.getVector(nodeId));
-                        }
-                    });
-                }
-                // Re-create mravv wrapping the instance vectors map so that
-                // the live search path and future inserts use the correct backing store
-                if (dimension > 0 && builder != null) {
-                    this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
-                    BuildScoreProvider bsp =
-                            BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+            // Single-batch path: no segments flushed during scan
+            int rebuildCount = (int) rebuildNodeToPkHolder[0].size();
+            // Build FusedPQ directly if conditions are met, avoiding duplicate work at next checkpoint
+            if (fusedPQ && dimension >= MIN_DIM_FOR_FUSED_PQ
+                    && rebuildCount >= MIN_VECTORS_FOR_FUSED_PQ && builder != null) {
+                try {
+                    builder.cleanup();
                     OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
-                    try {
-                        builder.close();
-                    } catch (IOException e) {
-                        // ignore
+                    List<Long> graphPageIds = writeFusedPQGraph(graph, mravv, dimension);
+                    List<Long> mapPageIds = writeFusedPQMapData(rebuildVectors, rebuildNodeToPkHolder[0]);
+                    LogSequenceNumber lsn = log.getLastSequenceNumber();
+                    long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
+
+                    // Build single-segment result
+                    int segId = nextSegmentId.getAndIncrement();
+                    List<SegmentWriteResult> segResults = new ArrayList<>();
+                    segResults.add(new SegmentWriteResult(segId, graphPageIds, mapPageIds, estimatedSize, Collections.emptyList()));
+                    persistIndexStatusMultiSegment(Collections.emptyList(), segResults, lsn, false);
+
+                    // Close old builder before loading segment
+                    GraphIndexBuilder oldBuilder = this.builder;
+                    if (oldBuilder != null) {
+                        try {
+                            oldBuilder.close();
+                        } catch (IOException e) {
+                            // ignore
+                        }
                     }
-                    this.builder = new GraphIndexBuilder(
-                            bsp, dimension, graph,
-                            beamWidth, neighborOverflow, alpha,
-                            REFINE_FINAL_GRAPH,
-                            PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
+                    this.builder = null;
+                    this.mravv = null;
+
+                    // Reload from persisted pages
+                    Path reloadMapFile = readChunksToTempFile(
+                            mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
+                    Path reloadGraphFile = readChunksToTempFile(
+                            graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
+                    VectorSegment seg = new VectorSegment(segId);
+                    seg.estimatedSizeBytes = estimatedSize;
+                    seg.graphPageIds = graphPageIds;
+                    seg.mapPageIds = mapPageIds;
+                    loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, dimension, nextNodeId.get());
+                    segments.add(seg);
+                    initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
+
+                    dirty.set(false);
+
+                    LOGGER.log(Level.INFO,
+                            "rebuilt vector index {0} in {1} ms: {2} nodes (FusedPQ written directly)",
+                            new Object[]{index.name, System.currentTimeMillis() - start, rebuildCount});
+                } catch (IOException e) {
+                    throw new DataStorageManagerException("Failed to write FusedPQ during rebuild", e);
+                } finally {
+                    closeRebuildVectors(rebuildVectors);
+                    closeRebuildNodeToPk(rebuildNodeToPkHolder[0], rebuildStoreNameHolder[0]);
                 }
-                dirty.set(true);
-                long elapsed = System.currentTimeMillis() - start;
-                LOGGER.log(Level.INFO,
-                        "rebuilt vector index {0} in {1} ms: {2} nodes",
-                        new Object[]{index.name, elapsed, rebuildCount});
-            } finally {
-                closeRebuildVectors(rebuildVectors);
-                closeRebuildNodeToPk(rebuildNodeToPk, rebuildStoreName);
+            } else {
+                try {
+                    // Small dataset or FusedPQ not applicable: populate instance fields, let checkpoint() handle
+                    try (Stream<Map.Entry<Bytes, Bytes>> scanStream =
+                            rebuildNodeToPkHolder[0].scan(Bytes.EMPTY_ARRAY, Bytes.POSITIVE_INFINITY)) {
+                        scanStream.forEach(e -> {
+                            int nodeId = bytesToOrdinal(e.getKey());
+                            Bytes pk = e.getValue();
+                            this.nodeToPk.put(nodeId, pk);
+                            if (rebuildVectors != null) {
+                                this.vectors.put(nodeId, rebuildVectors.getVector(nodeId));
+                            }
+                        });
+                    }
+                    // Re-create mravv wrapping the instance vectors map so that
+                    // the live search path and future inserts use the correct backing store
+                    if (dimension > 0 && builder != null) {
+                        this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
+                        BuildScoreProvider bsp =
+                                BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+                        OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
+                        try {
+                            builder.close();
+                        } catch (IOException e) {
+                            // ignore
+                        }
+                        this.builder = new GraphIndexBuilder(
+                                bsp, dimension, graph,
+                                beamWidth, neighborOverflow, alpha,
+                                REFINE_FINAL_GRAPH,
+                                PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
+                    }
+                    dirty.set(true);
+                    long elapsed = System.currentTimeMillis() - start;
+                    LOGGER.log(Level.INFO,
+                            "rebuilt vector index {0} in {1} ms: {2} nodes",
+                            new Object[]{index.name, elapsed, rebuildCount});
+                } finally {
+                    closeRebuildVectors(rebuildVectors);
+                    closeRebuildNodeToPk(rebuildNodeToPkHolder[0], rebuildStoreNameHolder[0]);
+                }
             }
         }
     }
@@ -764,6 +989,54 @@ public class VectorIndexManager extends AbstractIndexManager {
                 LOGGER.log(Level.WARNING, "Failed to close rebuild vectors file", e);
             }
         }
+    }
+
+    /**
+     * Flushes the current rebuild batch as a FusedPQ segment.
+     * Called during rebuild when the batch reaches maxNodesPerSegment.
+     */
+    private SegmentWriteResult flushRebuildBatch(
+            FileBackedVectorValues batchVectors,
+            BLink<Bytes, Bytes> batchNodeToPk,
+            int batchSize) throws IOException, DataStorageManagerException {
+        builder.cleanup();
+        OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
+        List<Long> graphPageIds = writeFusedPQGraph(graph, mravv, dimension);
+        List<Long> mapPageIds = writeFusedPQMapData(batchVectors, batchNodeToPk);
+        long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
+        int segId = nextSegmentId.getAndIncrement();
+
+        // Close builder after writing
+        try {
+            builder.close();
+        } catch (IOException e) {
+            // ignore
+        }
+        this.builder = null;
+        this.mravv = null;
+
+        LOGGER.log(Level.INFO,
+                "rebuild vector index {0}: segment {1} declared full ({2} vectors, ~{3} bytes)",
+                new Object[]{index.name, segId, batchSize, estimatedSize});
+
+        return new SegmentWriteResult(segId, graphPageIds, mapPageIds, estimatedSize, Collections.emptyList());
+    }
+
+    /**
+     * Re-initializes builder and file-backed storage for a new rebuild batch.
+     */
+    private void initNewRebuildBatch(
+            AtomicReference<FileBackedVectorValues> rebuildVectorsRef,
+            long expectedSize) throws IOException {
+        FileBackedVectorValues fbv = FileBackedVectorValues.create(
+                dimension, Math.max(expectedSize, 16),
+                java.nio.file.Paths.get(System.getProperty("java.io.tmpdir")));
+        rebuildVectorsRef.set(fbv);
+        this.mravv = fbv;
+        BuildScoreProvider bsp =
+                BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+        this.builder = new GraphIndexBuilder(
+                bsp, dimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
     }
 
     @Override
@@ -1704,11 +1977,16 @@ public class VectorIndexManager extends AbstractIndexManager {
      * Optimized insert used during rebuild only.
      * Unlike {@link #recordInserted}, this skips {@code pkToNode} (not needed during rebuild)
      * and {@code dirty} flag, and uses caller-provided maps instead of instance fields.
+     *
+     * @param batchNodeCount if non-null, incremented after each successful insert
+     * @param maxNodesPerSegmentRef if non-null, computed lazily after dimension is discovered
      */
     private void rebuildInsert(Bytes key, Bytes indexKey,
                                AtomicReference<FileBackedVectorValues> rebuildVectorsRef,
                                BLink<Bytes, Bytes> rebuildNodeToPk,
-                               long expectedSize) {
+                               long expectedSize,
+                               AtomicInteger batchNodeCount,
+                               AtomicInteger maxNodesPerSegmentRef) {
         if (indexKey == null) {
             return;
         }
@@ -1718,13 +1996,20 @@ public class VectorIndexManager extends AbstractIndexManager {
         }
         if (dimension == 0) {
             try {
-                FileBackedVectorValues fbv = new FileBackedVectorValues(
+                FileBackedVectorValues fbv = FileBackedVectorValues.create(
                         floats.length, Math.max(expectedSize, 16),
                         java.nio.file.Paths.get(System.getProperty("java.io.tmpdir")));
                 rebuildVectorsRef.set(fbv);
                 initBuilderForDimension(floats.length, fbv);
             } catch (IOException e) {
                 throw new java.io.UncheckedIOException("Failed to create file-backed vector storage", e);
+            }
+            // Compute maxNodesPerSegment now that dimension is known
+            if (maxNodesPerSegmentRef != null) {
+                long avgBytesPerVector = (long) dimension * Float.BYTES * 2;
+                int computed = (int) Math.max(MIN_VECTORS_FOR_FUSED_PQ,
+                        maxSegmentSize / Math.max(1, avgBytesPerVector));
+                maxNodesPerSegmentRef.compareAndSet(Integer.MAX_VALUE, computed);
             }
         }
         FileBackedVectorValues rebuildVectors = rebuildVectorsRef.get();
@@ -1742,6 +2027,9 @@ public class VectorIndexManager extends AbstractIndexManager {
         rebuildVectors.putVector(nodeId, vec);
         rebuildNodeToPk.insert(ordinalToBytes(nodeId), key);
         builder.addGraphNode(nodeId, vec);
+        if (batchNodeCount != null) {
+            batchNodeCount.incrementAndGet();
+        }
     }
 
     @Override
@@ -2209,5 +2497,13 @@ public class VectorIndexManager extends AbstractIndexManager {
 
     public long getMaxSegmentSize() {
         return maxSegmentSize;
+    }
+
+    public long getEstimatedSizeBytes() {
+        long total = 0;
+        for (VectorSegment seg : segments) {
+            total += seg.estimatedSizeBytes;
+        }
+        return total;
     }
 }

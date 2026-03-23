@@ -327,7 +327,7 @@ public final class ServerConfiguration {
     public static final String PROPERTY_PLANNER_TYPE_DEFAULT = System.getProperty("herdddb.defaultplannertype", PLANNER_TYPE_CALCITE);
 
     public static final String PROPERTY_VECTOR_MAX_SEGMENT_SIZE = "server.vector.max.segment.size";
-    public static final long PROPERTY_VECTOR_MAX_SEGMENT_SIZE_DEFAULT = 50L * 1024 * 1024 * 1024; // 50GB
+    public static final long PROPERTY_VECTOR_MAX_SEGMENT_SIZE_DEFAULT = 10L * 1024 * 1024 * 1024; // 10GB
 
     public static final String PROPERTY_PLANNER_WAITFORTABLESPACE_TIMEOUT = "server.planner.waitfortablespace.timeout";
     public static final int PROPERTY_PLANNER_WAITFORTABLESPACE_TIMEOUT_DEFAULT = SystemProperties.getIntSystemProperty("herddb.planner.waitfortablespacetimeout", 60000);

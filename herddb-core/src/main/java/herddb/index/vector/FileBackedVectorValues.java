@@ -20,21 +20,11 @@
 package herddb.index.vector;
 
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
-import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
-import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.io.RandomAccessFile;
-import java.io.UncheckedIOException;
-import java.nio.MappedByteBuffer;
-import java.nio.channels.FileChannel;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A disk-backed {@link RandomAccessVectorValues} that stores vectors in a temporary file.
@@ -43,15 +33,18 @@ import java.util.concurrent.atomic.AtomicInteger;
  * {@code N * dimension * Float.BYTES}. This allows lock-free concurrent writes since
  * each nodeId maps to a unique, non-overlapping region.
  * <p>
- * Reads use memory-mapped I/O for performance. The file is mapped in segments of up to
- * {@link #DEFAULT_MAX_SEGMENT_SIZE} bytes each, to stay within the {@code Integer.MAX_VALUE}
- * limit of a single {@link MappedByteBuffer}. The file grows automatically if the
- * initial capacity is exceeded.
+ * Two implementations are available:
+ * <ul>
+ *   <li>{@link MmapFileBackedVectorValues} — memory-mapped I/O (fast but consumes virtual memory / page cache)</li>
+ *   <li>{@link ChannelFileBackedVectorValues} — positional read/write via FileChannel (lower memory footprint)</li>
+ * </ul>
+ * The implementation is selected by the system property {@code herddb.vectorindex.file.usemmap}
+ * (default {@code false}).
  */
-public class FileBackedVectorValues implements RandomAccessVectorValues, Closeable {
+public abstract class FileBackedVectorValues implements RandomAccessVectorValues, Closeable {
 
-    private static final VectorTypeSupport VTS =
-            VectorizationProvider.getInstance().getVectorTypeSupport();
+    static final String USE_MMAP_PROPERTY = "herddb.vectorindex.file.usemmap";
+    static final boolean USE_MMAP = Boolean.getBoolean(USE_MMAP_PROPERTY);
 
     /**
      * Default maximum size per mapped segment. Must be &lt;= Integer.MAX_VALUE.
@@ -59,189 +52,37 @@ public class FileBackedVectorValues implements RandomAccessVectorValues, Closeab
      */
     static final int DEFAULT_MAX_SEGMENT_SIZE = 1 << 30; // 1 GiB
 
-    private final int dimension;
-    private final long vectorByteSize;
-    private final int maxSegmentSize;
-    private final Path filePath;
-    private final RandomAccessFile raf;
-    private final FileChannel channel;
-    private AtomicInteger count = new AtomicInteger();
-
-    // Guarded by synchronized(this) for remapping
-    private volatile MappedByteBuffer[] segments;
-    private volatile long mappedSize;
-
-    // Per-copy reusable buffer to avoid allocations in getVector (null for original instances)
-    private final float[] sharedBuffer;
-    private final VectorFloat<?> sharedVector;
-
     /**
+     * Creates a new file-backed vector storage using the default I/O mode.
+     *
      * @param dimension    vector dimension
      * @param expectedSize expected number of vectors (used for initial file allocation)
      * @param tempDir      directory for the temporary file
      */
-    public FileBackedVectorValues(int dimension, long expectedSize, Path tempDir) throws IOException {
-        this(dimension, expectedSize, tempDir, DEFAULT_MAX_SEGMENT_SIZE);
+    public static FileBackedVectorValues create(int dimension, long expectedSize, Path tempDir) throws IOException {
+        return create(dimension, expectedSize, tempDir, DEFAULT_MAX_SEGMENT_SIZE, USE_MMAP);
     }
 
     /**
-     * Package-private constructor allowing custom segment size (for testing).
+     * Creates a new file-backed vector storage with explicit I/O mode selection.
      */
-    FileBackedVectorValues(int dimension, long expectedSize, Path tempDir, int maxSegmentSize) throws IOException {
-        this.dimension = dimension;
-        this.vectorByteSize = (long) dimension * Float.BYTES;
-        this.maxSegmentSize = maxSegmentSize;
-        this.filePath = Files.createTempFile(tempDir, "vec-rebuild-", ".tmp");
-        this.raf = new RandomAccessFile(filePath.toFile(), "rw");
-        this.channel = raf.getChannel();
-
-        long initialSize = Math.max(expectedSize, 16) * vectorByteSize;
-        raf.setLength(initialSize);
-        this.mappedSize = initialSize;
-        this.segments = mapSegments(initialSize);
-        this.sharedBuffer = null;
-        this.sharedVector = null;
-    }
-
-    // Constructor for copy() — shares the same file, optionally with a reusable read buffer
-    private FileBackedVectorValues(int dimension, Path filePath, RandomAccessFile raf,
-                                    FileChannel channel, AtomicInteger count,
-                                    MappedByteBuffer[] segments, long mappedSize,
-                                    int maxSegmentSize, boolean shared) {
-        this.dimension = dimension;
-        this.vectorByteSize = (long) dimension * Float.BYTES;
-        this.maxSegmentSize = maxSegmentSize;
-        this.filePath = filePath;
-        this.raf = raf;
-        this.channel = channel;
-        this.count = count;
-        this.segments = segments;
-        this.mappedSize = mappedSize;
-        if (shared) {
-            this.sharedBuffer = new float[dimension];
-            this.sharedVector = VTS.createFloatVector(sharedBuffer);
+    static FileBackedVectorValues create(int dimension, long expectedSize, Path tempDir,
+                                          int maxSegmentSize, boolean useMmap) throws IOException {
+        if (useMmap) {
+            return new MmapFileBackedVectorValues(dimension, expectedSize, tempDir, maxSegmentSize);
         } else {
-            this.sharedBuffer = null;
-            this.sharedVector = null;
+            return new ChannelFileBackedVectorValues(dimension, expectedSize, tempDir);
         }
-    }
-
-    private MappedByteBuffer[] mapSegments(long totalSize) throws IOException {
-        List<MappedByteBuffer> segs = new ArrayList<>();
-        long offset = 0;
-        while (offset < totalSize) {
-            long remaining = totalSize - offset;
-            int segSize = (int) Math.min(remaining, maxSegmentSize);
-            segs.add(channel.map(FileChannel.MapMode.READ_WRITE, offset, segSize));
-            offset += segSize;
-        }
-        return segs.toArray(new MappedByteBuffer[0]);
     }
 
     /**
      * Store a vector at the given nodeId position.
      * Thread-safe: each nodeId maps to a unique file region.
      */
-    public void putVector(int nodeId, VectorFloat<?> vec) {
-        long offset = (long) nodeId * vectorByteSize;
-        long requiredSize = offset + vectorByteSize;
-
-        if (requiredSize > mappedSize) {
-            growFile(requiredSize);
-        }
-
-        MappedByteBuffer[] segs = segments;
-        for (int i = 0; i < dimension; i++) {
-            long pos = offset + (long) i * Float.BYTES;
-            int segIndex = (int) (pos / maxSegmentSize);
-            int segOffset = (int) (pos % maxSegmentSize);
-            segs[segIndex].putFloat(segOffset, vec.get(i));
-        }
-        count.incrementAndGet();
-    }
+    public abstract void putVector(int nodeId, VectorFloat<?> vec);
 
     /**
      * Store a vector from a float array at the given nodeId position.
      */
-    public void putVector(int nodeId, float[] floats) {
-        long offset = (long) nodeId * vectorByteSize;
-        long requiredSize = offset + vectorByteSize;
-
-        if (requiredSize > mappedSize) {
-            growFile(requiredSize);
-        }
-
-        MappedByteBuffer[] segs = segments;
-        for (int i = 0; i < dimension; i++) {
-            long pos = offset + (long) i * Float.BYTES;
-            int segIndex = (int) (pos / maxSegmentSize);
-            int segOffset = (int) (pos % maxSegmentSize);
-            segs[segIndex].putFloat(segOffset, floats[i]);
-        }
-        count.incrementAndGet();
-    }
-
-    private synchronized void growFile(long requiredSize) {
-        if (requiredSize <= mappedSize) {
-            return; // another thread already grew
-        }
-        try {
-            long newSize = Math.max(requiredSize, mappedSize * 2);
-            raf.setLength(newSize);
-            this.segments = mapSegments(newSize);
-            this.mappedSize = newSize;
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to grow vector file", e);
-        }
-    }
-
-    @Override
-    public int size() {
-        return count.get();
-    }
-
-    @Override
-    public int dimension() {
-        return dimension;
-    }
-
-    @Override
-    public VectorFloat<?> getVector(int nodeId) {
-        long offset = (long) nodeId * vectorByteSize;
-        float[] floats = sharedBuffer != null ? sharedBuffer : new float[dimension];
-        MappedByteBuffer[] segs = segments;
-        for (int i = 0; i < dimension; i++) {
-            long pos = offset + (long) i * Float.BYTES;
-            int segIndex = (int) (pos / maxSegmentSize);
-            int segOffset = (int) (pos % maxSegmentSize);
-            floats[i] = segs[segIndex].getFloat(segOffset);
-        }
-        return sharedVector != null ? sharedVector : VTS.createFloatVector(floats);
-    }
-
-    @Override
-    public boolean isValueShared() {
-        return sharedBuffer != null;
-    }
-
-    @Override
-    public RandomAccessVectorValues copy() {
-        return new FileBackedVectorValues(dimension, filePath, raf, channel, count,
-                segments, mappedSize, maxSegmentSize, true);
-    }
-
-    @Override
-    public void close() throws IOException {
-        // Force unmap is not strictly possible via public API, but the GC will handle it.
-        // We close the channel and delete the file.
-        try {
-            channel.close();
-        } finally {
-            try {
-                raf.close();
-            } finally {
-                Files.deleteIfExists(filePath);
-            }
-        }
-    }
+    public abstract void putVector(int nodeId, float[] floats);
 }

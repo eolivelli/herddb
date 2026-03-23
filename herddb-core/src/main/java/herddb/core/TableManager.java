@@ -120,6 +120,7 @@ import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.bookkeeper.stats.Counter;
+import org.apache.bookkeeper.stats.Gauge;
 import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
@@ -271,6 +272,13 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
     private volatile boolean closed;
 
+    private StatsLogger tableStatsLogger;
+    private Gauge<Long> tableSizeGauge;
+    private Gauge<Integer> loadedPagesGauge;
+    private Gauge<Long> buffersUsedMemoryGauge;
+    private Gauge<Long> keysUsedMemoryGauge;
+    private Gauge<Integer> dirtyPagesGauge;
+
     private final ConcurrentHashMap<String, String> childForeignKeyQueries = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> parentForeignKeyQueries = new ConcurrentHashMap<>();
 
@@ -352,9 +360,52 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
         @Override
         public long getKeysUsedMemory() {
+            if (closed) {
+                return 0;
+            }
             return keyToPage.getUsedMemory();
         }
 
+    }
+
+    private void registerTableMetrics(StatsLogger tableMetrics) {
+        this.tableStatsLogger = tableMetrics;
+        this.tableSizeGauge = new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return 0L; }
+            @Override public Long getSample() { return stats.getTablesize(); }
+        };
+        tableMetrics.registerGauge("table_size", tableSizeGauge);
+        this.loadedPagesGauge = new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return stats.getLoadedpages(); }
+        };
+        tableMetrics.registerGauge("loaded_pages", loadedPagesGauge);
+        this.buffersUsedMemoryGauge = new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return 0L; }
+            @Override public Long getSample() { return stats.getBuffersUsedMemory(); }
+        };
+        tableMetrics.registerGauge("buffers_used_memory", buffersUsedMemoryGauge);
+        this.keysUsedMemoryGauge = new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return 0L; }
+            @Override public Long getSample() { return stats.getKeysUsedMemory(); }
+        };
+        tableMetrics.registerGauge("keys_used_memory", keysUsedMemoryGauge);
+        this.dirtyPagesGauge = new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return stats.getDirtypages(); }
+        };
+        tableMetrics.registerGauge("dirty_pages", dirtyPagesGauge);
+    }
+
+    private void unregisterTableMetrics() {
+        if (tableStatsLogger != null) {
+            tableStatsLogger.unregisterGauge("table_size", tableSizeGauge);
+            tableStatsLogger.unregisterGauge("loaded_pages", loadedPagesGauge);
+            tableStatsLogger.unregisterGauge("buffers_used_memory", buffersUsedMemoryGauge);
+            tableStatsLogger.unregisterGauge("keys_used_memory", keysUsedMemoryGauge);
+            tableStatsLogger.unregisterGauge("dirty_pages", dirtyPagesGauge);
+            tableSpaceManager.tablespaceStasLogger.removeScope("table_" + table.name, tableStatsLogger);
+        }
     }
 
     TableManager(
@@ -410,6 +461,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
         StatsLogger tableMetrics = tableSpaceManager.tablespaceStasLogger.scope("table_" + table.name);
         this.checkpointProcessedDirtyRecords = tableMetrics.getCounter("checkpoint_processed_dirty_records");
+        registerTableMetrics(tableMetrics);
         int[] pkTypes = new int[table.primaryKey.length];
         for (int i = 0; i < table.primaryKey.length; i++) {
             Column col = table.getColumn(table.primaryKey[i]);
@@ -2472,6 +2524,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     public void close() {
 
         closed = true;
+        unregisterTableMetrics();
 
         // unload all pages
         final List<DataPage> unload = pages.values().stream()

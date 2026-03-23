@@ -26,32 +26,54 @@ import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.*;
 
+@RunWith(Parameterized.class)
 public class FileBackedVectorValuesTest {
 
     private static final VectorTypeSupport VTS =
             VectorizationProvider.getInstance().getVectorTypeSupport();
 
+    @Parameterized.Parameters(name = "useMmap={0}")
+    public static Collection<Object[]> data() {
+        return Arrays.asList(new Object[][]{{true}, {false}});
+    }
+
+    @Parameterized.Parameter
+    public boolean useMmap;
+
     @Rule
     public TemporaryFolder tempFolder = new TemporaryFolder();
+
+    private FileBackedVectorValues createFBV(int dimension, long expectedSize, Path tempDir) throws Exception {
+        return FileBackedVectorValues.create(dimension, expectedSize, tempDir,
+                FileBackedVectorValues.DEFAULT_MAX_SEGMENT_SIZE, useMmap);
+    }
+
+    private FileBackedVectorValues createFBV(int dimension, long expectedSize, Path tempDir,
+                                              int maxSegmentSize) throws Exception {
+        return FileBackedVectorValues.create(dimension, expectedSize, tempDir, maxSegmentSize, useMmap);
+    }
 
     @Test
     public void testPutGetRoundtrip() throws Exception {
         int dimension = 4;
         Path tempDir = tempFolder.getRoot().toPath();
 
-        try (FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, 10, tempDir)) {
+        try (FileBackedVectorValues fbv = createFBV(dimension, 10, tempDir)) {
             float[] v0 = {1.0f, 2.0f, 3.0f, 4.0f};
             float[] v1 = {5.0f, 6.0f, 7.0f, 8.0f};
             float[] v2 = {-1.0f, 0.0f, 0.5f, -0.5f};
@@ -74,7 +96,7 @@ public class FileBackedVectorValuesTest {
         int dimension = 3;
         Path tempDir = tempFolder.getRoot().toPath();
 
-        try (FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, 5, tempDir)) {
+        try (FileBackedVectorValues fbv = createFBV(dimension, 5, tempDir)) {
             float[] data = {10.0f, 20.0f, 30.0f};
             VectorFloat<?> vec = VTS.createFloatVector(data);
             fbv.putVector(0, vec);
@@ -90,7 +112,7 @@ public class FileBackedVectorValuesTest {
         int numThreads = 8;
         Path tempDir = tempFolder.getRoot().toPath();
 
-        try (FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, numVectors, tempDir)) {
+        try (FileBackedVectorValues fbv = createFBV(dimension, numVectors, tempDir)) {
             ExecutorService executor = Executors.newFixedThreadPool(numThreads);
             CountDownLatch startLatch = new CountDownLatch(1);
             List<Future<?>> futures = new ArrayList<>();
@@ -138,7 +160,7 @@ public class FileBackedVectorValuesTest {
         // Start with capacity for only 2 vectors
         Path tempDir = tempFolder.getRoot().toPath();
 
-        try (FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, 2, tempDir)) {
+        try (FileBackedVectorValues fbv = createFBV(dimension, 2, tempDir)) {
             // Insert 100 vectors — well beyond initial capacity
             for (int i = 0; i < 100; i++) {
                 float[] data = new float[dimension];
@@ -168,7 +190,7 @@ public class FileBackedVectorValuesTest {
         Path tempDir = tempFolder.getRoot().toPath();
         Path filePath;
 
-        FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, 10, tempDir);
+        FileBackedVectorValues fbv = createFBV(dimension, 10, tempDir);
         fbv.putVector(0, new float[]{1, 2, 3, 4});
 
         // Find the temp file
@@ -184,7 +206,7 @@ public class FileBackedVectorValuesTest {
         int dimension = 2;
         Path tempDir = tempFolder.getRoot().toPath();
 
-        try (FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, 5, tempDir)) {
+        try (FileBackedVectorValues fbv = createFBV(dimension, 5, tempDir)) {
             assertFalse(fbv.isValueShared());
         }
     }
@@ -194,7 +216,7 @@ public class FileBackedVectorValuesTest {
         int dimension = 3;
         Path tempDir = tempFolder.getRoot().toPath();
 
-        try (FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, 5, tempDir)) {
+        try (FileBackedVectorValues fbv = createFBV(dimension, 5, tempDir)) {
             fbv.putVector(0, new float[]{1, 2, 3});
 
             RandomAccessVectorValues copy = fbv.copy();
@@ -213,7 +235,7 @@ public class FileBackedVectorValuesTest {
         Path tempDir = tempFolder.getRoot().toPath();
         int numVectors = 20; // will require ~7 segments
 
-        try (FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, numVectors, tempDir, maxSegmentSize)) {
+        try (FileBackedVectorValues fbv = createFBV(dimension, numVectors, tempDir, maxSegmentSize)) {
             for (int i = 0; i < numVectors; i++) {
                 float[] data = new float[dimension];
                 for (int d = 0; d < dimension; d++) {
@@ -256,7 +278,7 @@ public class FileBackedVectorValuesTest {
         Path tempDir = tempFolder.getRoot().toPath();
 
         // Start with small expectedSize so the file must grow and remap with multiple segments
-        try (FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, 2, tempDir, maxSegmentSize)) {
+        try (FileBackedVectorValues fbv = createFBV(dimension, 2, tempDir, maxSegmentSize)) {
             // Insert well beyond initial capacity
             for (int i = 0; i < 50; i++) {
                 fbv.putVector(i, new float[]{i, i + 0.5f});
@@ -282,7 +304,7 @@ public class FileBackedVectorValuesTest {
         int maxSegmentSize = 24;
         Path tempDir = tempFolder.getRoot().toPath();
 
-        try (FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, 10, tempDir, maxSegmentSize)) {
+        try (FileBackedVectorValues fbv = createFBV(dimension, 10, tempDir, maxSegmentSize)) {
             float[] v0 = {1.0f, 2.0f, 3.0f, 4.0f};
             float[] v1 = {5.0f, 6.0f, 7.0f, 8.0f};
             float[] v2 = {9.0f, 10.0f, 11.0f, 12.0f};
@@ -306,7 +328,7 @@ public class FileBackedVectorValuesTest {
         int numThreads = 8;
         Path tempDir = tempFolder.getRoot().toPath();
 
-        try (FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, numVectors, tempDir, maxSegmentSize)) {
+        try (FileBackedVectorValues fbv = createFBV(dimension, numVectors, tempDir, maxSegmentSize)) {
             ExecutorService executor = Executors.newFixedThreadPool(numThreads);
             CountDownLatch startLatch = new CountDownLatch(1);
             List<Future<?>> futures = new ArrayList<>();
@@ -352,7 +374,7 @@ public class FileBackedVectorValuesTest {
         int dimension = 2;
         Path tempDir = tempFolder.getRoot().toPath();
 
-        try (FileBackedVectorValues fbv = new FileBackedVectorValues(dimension, 2, tempDir)) {
+        try (FileBackedVectorValues fbv = createFBV(dimension, 2, tempDir)) {
             // Insert at non-sequential positions
             fbv.putVector(0, new float[]{1, 2});
             fbv.putVector(50, new float[]{3, 4});
@@ -361,6 +383,41 @@ public class FileBackedVectorValuesTest {
             assertArrayEquals(new float[]{1, 2}, toFloatArray(fbv.getVector(0)), 0.0001f);
             assertArrayEquals(new float[]{3, 4}, toFloatArray(fbv.getVector(50)), 0.0001f);
             assertArrayEquals(new float[]{5, 6}, toFloatArray(fbv.getVector(100)), 0.0001f);
+        }
+    }
+
+    @Test
+    public void testThreadLocalBufferResizeAcrossDimensions() throws Exception {
+        if (useMmap) {
+            // ThreadLocal buffer optimization only applies to Channel impl
+            return;
+        }
+        Path tempDir = tempFolder.getRoot().toPath();
+
+        // Step 1: small dimension — seeds the ThreadLocal with a small buffer
+        try (FileBackedVectorValues fbv = createFBV(2, 5, tempDir)) {
+            float[] v = {1.0f, 2.0f};
+            fbv.putVector(0, v);
+            assertArrayEquals(v, toFloatArray(fbv.getVector(0)), 0.0001f);
+        }
+
+        // Step 2: large dimension — ThreadLocal buffer must grow
+        try (FileBackedVectorValues fbv = createFBV(8, 5, tempDir)) {
+            float[] v = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+            fbv.putVector(0, v);
+            assertArrayEquals(v, toFloatArray(fbv.getVector(0)), 0.0001f);
+
+            // Also test putVector with VectorFloat
+            VectorFloat<?> vec = VTS.createFloatVector(v);
+            fbv.putVector(1, vec);
+            assertArrayEquals(v, toFloatArray(fbv.getVector(1)), 0.0001f);
+        }
+
+        // Step 3: small dimension again — ThreadLocal buffer is oversized, limit must constrain
+        try (FileBackedVectorValues fbv = createFBV(3, 5, tempDir)) {
+            float[] v = {10.0f, 20.0f, 30.0f};
+            fbv.putVector(0, v);
+            assertArrayEquals(v, toFloatArray(fbv.getVector(0)), 0.0001f);
         }
     }
 

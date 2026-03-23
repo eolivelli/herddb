@@ -114,6 +114,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
+import org.apache.bookkeeper.stats.Gauge;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.apache.bookkeeper.stats.StatsLogger;
 
@@ -167,6 +168,7 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
     private final AtomicLong lastCheckPointTs = new AtomicLong(System.currentTimeMillis());
 
     private final RunningStatementsStats runningStatements;
+    private Gauge<Integer> activeTablespacesGauge;
     private final ExecutorService followersThreadPool;
 
     public DBManager(
@@ -216,6 +218,12 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
             this.mainStatsLogger = statsLogger;
         }
         this.runningStatements = new RunningStatementsStats(this.mainStatsLogger);
+        new BufferPoolMemoryStats(this.mainStatsLogger);
+        this.activeTablespacesGauge = new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() { return tablesSpaces.size(); }
+        };
+        this.mainStatsLogger.registerGauge("active_tablespaces", activeTablespacesGauge);
         this.nodeId = nodeId;
         this.virtualTableSpaceId = makeVirtualTableSpaceManagerId(nodeId);
         this.hostData = hostData != null ? hostData : new ServerHostData("localhost", 7000, "", false, new HashMap<>());
@@ -957,6 +965,7 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
         if (serverConfiguration.getBoolean(ServerConfiguration.PROPERTY_JMX_ENABLE, ServerConfiguration.PROPERTY_JMX_ENABLE_DEFAULT)) {
             JMXUtils.unregisterDBManagerStatsMXBean();
         }
+        mainStatsLogger.unregisterGauge("active_tablespaces", activeTablespacesGauge);
         callbacksExecutor.shutdownNow();
 
         // lastly give a chance to not "leak" even if not critical (ie not keep used instances after close())
