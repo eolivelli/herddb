@@ -1909,7 +1909,7 @@ public class VectorIndexTest {
         final int dimension = 8;
         final int numRows = 300;
 
-        // Default maxSegmentSize (50GB) — should never split
+        // Default maxSegmentSize (2GB) — should never split with only 300 rows
         try (DBManager manager = new DBManager(nodeId,
                 new FileMetadataStorageManager(metadataPath),
                 new FileDataStorageManager(dataPath),
