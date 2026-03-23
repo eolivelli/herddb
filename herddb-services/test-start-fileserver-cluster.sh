@@ -34,7 +34,8 @@ unzip -q $ZIP -d $SERVER1DIR
 
 # Start the file server (1GB heap)
 cd $FILESERVERDIR/herddb*
-export JAVA_OPTS="-XX:+UseG1GC -Dio.netty.maxDirectMemory=0 -Duser.language=en -Xmx1g -Xms1g -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$FILESERVERDIR/fileserver-heapdump.hprof"
+mkdir -p tmp
+export JAVA_OPTS="-XX:+UseG1GC -Dio.netty.maxDirectMemory=0 -Duser.language=en -Xmx1g -Xms1g -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$FILESERVERDIR/fileserver-heapdump.hprof -Djava.io.tmpdir=$(pwd)/tmp"
 bin/service file-server start
 cd ../..
 
@@ -42,11 +43,12 @@ sleep 1
 
 # Start HerdDB server in remote-file-service mode (6GB heap)
 cd $SERVER1DIR/herddb*
+mkdir -p tmp
 CONFIGFILE=conf/server.properties
 sed -i 's/server.mode=standalone/server.mode=remote-file-service/g' $CONFIGFILE
 sed -i 's/#http.enable=true/http.enable=true/g' $CONFIGFILE
 sed -i 's/server.halt.on.tablespace.boot.error=false/server.halt.on.tablespace.boot.error=false/g' $CONFIGFILE
-export JAVA_OPTS="-XX:+UseG1GC -Duser.language=en -Xmx6g -Xms6g -Dio.netty.maxDirectMemory=0 -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$SERVER1DIR/server-heapdump.hprof"
+export JAVA_OPTS="-XX:+UseG1GC -Dherddb.vectorindex.rebuild.threads=12 -Duser.language=en -Xmx12g -Xms12g -Dio.netty.maxDirectMemory=0 -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$SERVER1DIR/server-heapdump.hprof -Djava.io.tmpdir=$(pwd)/tmp"
 bin/service server start
 cd ../..
 
