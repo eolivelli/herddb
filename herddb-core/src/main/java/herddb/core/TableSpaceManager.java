@@ -239,40 +239,80 @@ public class TableSpaceManager {
 
     private void registerTableSpaceMetrics() {
         this.tableCountGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
                 return tables.values().stream().filter(t -> !t.isSystemTable()).count();
             }
         };
         tablespaceStasLogger.registerGauge("table_count", tableCountGauge);
         this.indexCountGauge = new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return indexes.size(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return indexes.size();
+            }
         };
         tablespaceStasLogger.registerGauge("index_count", indexCountGauge);
         this.totalTableSizeGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getTablesize(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getTablesize();
+            }
         };
         tablespaceStasLogger.registerGauge("total_table_size", totalTableSizeGauge);
         this.totalLoadedPagesGauge = new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return stats.getLoadedpages(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return stats.getLoadedpages();
+            }
         };
         tablespaceStasLogger.registerGauge("total_loaded_pages", totalLoadedPagesGauge);
         this.totalBuffersUsedMemoryGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getBuffersUsedMemory(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getBuffersUsedMemory();
+            }
         };
         tablespaceStasLogger.registerGauge("total_buffers_used_memory", totalBuffersUsedMemoryGauge);
         this.totalKeysUsedMemoryGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getKeysUsedMemory(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getKeysUsedMemory();
+            }
         };
         tablespaceStasLogger.registerGauge("total_keys_used_memory", totalKeysUsedMemoryGauge);
         this.totalDirtyPagesGauge = new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return stats.getDirtypages(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return stats.getDirtypages();
+            }
         };
         tablespaceStasLogger.registerGauge("total_dirty_pages", totalDirtyPagesGauge);
     }

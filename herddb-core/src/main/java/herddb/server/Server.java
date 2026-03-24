@@ -363,8 +363,8 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                     Constructor<?> ctor = storageClass.getConstructor(Path.class, Path.class, int.class, clientClass);
                     return (DataStorageManager) ctor.newInstance(dataDirectory, tmpDirectory, diskswapThreshold, client);
                 } catch (ReflectiveOperationException e) {
-                    throw new RuntimeException("Cannot create RemoteFileDataStorageManager. " +
-                            "Ensure herddb-remote-file-service is on the classpath.", e);
+                    throw new RuntimeException("Cannot create RemoteFileDataStorageManager. "
+                            + "Ensure herddb-remote-file-service is on the classpath.", e);
                 }
             }
             default:

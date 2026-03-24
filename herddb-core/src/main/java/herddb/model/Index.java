@@ -21,7 +21,6 @@
 package herddb.model;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
-import herddb.model.ColumnTypes;
 import herddb.utils.ExtendedDataInputStream;
 import herddb.utils.ExtendedDataOutputStream;
 import herddb.utils.SimpleByteArrayInputStream;

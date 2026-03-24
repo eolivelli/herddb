@@ -1,3 +1,22 @@
+/*
+ Licensed to Diennea S.r.l. under one
+ or more contributor license agreements. See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership. Diennea S.r.l. licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
+
+ http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied.  See the License for the
+ specific language governing permissions and limitations
+ under the License.
+
+ */
 package herddb.vectortesting;
 
 import java.sql.Connection;
@@ -30,13 +49,19 @@ public class IngestionWorker implements Runnable {
     }
 
     private static String formatEta(double seconds) {
-        if (seconds <= 0) return "N/A";
+        if (seconds <= 0) {
+            return "N/A";
+        }
         long s = (long) seconds;
         long h = s / 3600;
         long m = (s % 3600) / 60;
         long sec = s % 60;
-        if (h > 0) return String.format("%dh%02dm%02ds", h, m, sec);
-        if (m > 0) return String.format("%dm%02ds", m, sec);
+        if (h > 0) {
+            return String.format("%dh%02dm%02ds", h, m, sec);
+        }
+        if (m > 0) {
+            return String.format("%dm%02ds", m, sec);
+        }
         return String.format("%ds", sec);
     }
 
@@ -48,17 +73,22 @@ public class IngestionWorker implements Runnable {
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 int batchCount = 0;
                 long lastCommitTime = System.currentTimeMillis();
-                final long MAX_COMMIT_INTERVAL_MS = 30_000; // 30 seconds
+                final long maxCommitIntervalMs = 30_000; // 30 seconds
                 long totalCommitTimeNanos = 0;
                 long commitCount = 0;
                 long lastCommitDurationNanos = 0;
                 while (true) {
                     float[] vec = queue.poll(100, TimeUnit.MILLISECONDS);
                     if (vec == null) {
-                        if (done.get() && queue.isEmpty()) break;
-                        else continue;
+                        if (done.get() && queue.isEmpty()) {
+                            break;
+                        } else {
+                            continue;
+                        }
                     }
-                    if (vec.length == 0) break; // poison pill
+                    if (vec.length == 0) {
+                        break; // poison pill
+                    }
                     long id = rowId.getAndIncrement();
                     long start = System.nanoTime();
                     ps.setLong(1, id);
@@ -67,7 +97,7 @@ public class IngestionWorker implements Runnable {
                     batchCount++;
 
                     long now = System.currentTimeMillis();
-                    if (batchCount >= config.batchSize || (batchCount > 0 && now - lastCommitTime >= MAX_COMMIT_INTERVAL_MS)) {
+                    if (batchCount >= config.batchSize || (batchCount > 0 && now - lastCommitTime >= maxCommitIntervalMs)) {
                         long commitStart = System.nanoTime();
                         conn.commit();
                         lastCommitDurationNanos = System.nanoTime() - commitStart;

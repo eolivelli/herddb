@@ -25,7 +25,6 @@ import static herddb.core.TestUtils.scan;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
-
 import herddb.core.DBManager;
 import herddb.file.FileCommitLogManager;
 import herddb.file.FileDataStorageManager;
@@ -37,15 +36,13 @@ import herddb.model.TransactionContext;
 import herddb.model.commands.CreateTableSpaceStatement;
 import herddb.server.ServerConfiguration;
 import herddb.utils.DataAccessor;
-
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
-
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 /**
  * Tests ORDER BY ann_of() support in JSQLParserPlanner.
@@ -215,8 +212,14 @@ public class VectorIndexJSQLParserPlannerTest {
 
     private static void normalize(float[] v) {
         float norm = 0;
-        for (float f : v) norm += f * f;
+        for (float f : v) {
+            norm += f * f;
+        }
         norm = (float) Math.sqrt(norm);
-        if (norm > 0) for (int i = 0; i < v.length; i++) v[i] /= norm;
+        if (norm > 0) {
+            for (int i = 0; i < v.length; i++) {
+                v[i] /= norm;
+            }
+        }
     }
 }

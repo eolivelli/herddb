@@ -371,28 +371,58 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     private void registerTableMetrics(StatsLogger tableMetrics) {
         this.tableStatsLogger = tableMetrics;
         this.tableSizeGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getTablesize(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getTablesize();
+            }
         };
         tableMetrics.registerGauge("table_size", tableSizeGauge);
         this.loadedPagesGauge = new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return stats.getLoadedpages(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return stats.getLoadedpages();
+            }
         };
         tableMetrics.registerGauge("loaded_pages", loadedPagesGauge);
         this.buffersUsedMemoryGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getBuffersUsedMemory(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getBuffersUsedMemory();
+            }
         };
         tableMetrics.registerGauge("buffers_used_memory", buffersUsedMemoryGauge);
         this.keysUsedMemoryGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getKeysUsedMemory(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getKeysUsedMemory();
+            }
         };
         tableMetrics.registerGauge("keys_used_memory", keysUsedMemoryGauge);
         this.dirtyPagesGauge = new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return stats.getDirtypages(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return stats.getDirtypages();
+            }
         };
         tableMetrics.registerGauge("dirty_pages", dirtyPagesGauge);
     }

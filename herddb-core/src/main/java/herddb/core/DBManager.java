@@ -59,12 +59,12 @@ import herddb.model.TableSpaceDoesNotExistException;
 import herddb.model.TableSpaceReplicaState;
 import herddb.model.TransactionContext;
 import herddb.model.commands.AlterTableSpaceStatement;
+import herddb.model.commands.CheckpointStatement;
 import herddb.model.commands.CreateTableSpaceStatement;
 import herddb.model.commands.DropTableSpaceStatement;
 import herddb.model.commands.GetStatement;
 import herddb.model.commands.ScanStatement;
 import herddb.model.commands.TableConsistencyCheckStatement;
-import herddb.model.commands.CheckpointStatement;
 import herddb.model.commands.TableSpaceConsistencyCheckStatement;
 import herddb.network.Channel;
 import herddb.network.ServerHostData;
@@ -220,8 +220,14 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
         this.runningStatements = new RunningStatementsStats(this.mainStatsLogger);
         new BufferPoolMemoryStats(this.mainStatsLogger);
         this.activeTablespacesGauge = new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return tablesSpaces.size(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return tablesSpaces.size();
+            }
         };
         this.mainStatsLogger.registerGauge("active_tablespaces", activeTablespacesGauge);
         this.nodeId = nodeId;

@@ -24,11 +24,9 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
-
 import com.google.protobuf.ByteString;
 import herddb.remote.proto.DeleteByPrefixRequest;
 import herddb.remote.proto.DeleteFileRequest;
-import herddb.remote.proto.ListFilesEntry;
 import herddb.remote.proto.ListFilesRequest;
 import herddb.remote.proto.ReadFileRequest;
 import herddb.remote.proto.ReadFileResponse;

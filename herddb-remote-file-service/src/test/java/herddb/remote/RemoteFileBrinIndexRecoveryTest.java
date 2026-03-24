@@ -26,7 +26,6 @@ import herddb.core.DBManager;
 import herddb.file.FileCommitLogManager;
 import herddb.file.FileMetadataStorageManager;
 import herddb.index.SecondaryIndexSeek;
-import herddb.index.brin.BRINIndexManager;
 import herddb.model.ColumnTypes;
 import herddb.model.DataScanner;
 import herddb.model.Index;

@@ -28,7 +28,6 @@ import herddb.core.TableSpaceManager;
 import herddb.index.IndexOperation;
 import herddb.index.blink.BLink;
 import herddb.index.blink.BLinkIndexDataStorage;
-
 import herddb.index.blink.BytesBytesSizeEvaluator;
 import herddb.index.blink.BytesLongSizeEvaluator;
 import herddb.log.CommitLog;
@@ -43,31 +42,28 @@ import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
 import herddb.utils.Bytes;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
+import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.GraphSearcher;
 import io.github.jbellis.jvector.graph.ImmutableGraphIndex;
-import io.github.jbellis.jvector.graph.SearchResult;
-import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.MapRandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.OnHeapGraphIndex;
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
-import io.github.jbellis.jvector.graph.diversity.VamanaDiversityProvider;
+import io.github.jbellis.jvector.graph.SearchResult;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexWriter;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.FusedPQ;
 import io.github.jbellis.jvector.graph.disk.feature.InlineVectors;
+import io.github.jbellis.jvector.graph.diversity.VamanaDiversityProvider;
 import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
-import io.github.jbellis.jvector.graph.similarity.DefaultSearchScoreProvider;
-import io.github.jbellis.jvector.quantization.ProductQuantization;
 import io.github.jbellis.jvector.quantization.PQVectors;
+import io.github.jbellis.jvector.quantization.ProductQuantization;
 import io.github.jbellis.jvector.util.Bits;
 import io.github.jbellis.jvector.util.PhysicalCoreExecutor;
-import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
+import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
-
-import java.util.AbstractMap;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
@@ -79,18 +75,16 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -104,7 +98,6 @@ import java.util.function.IntFunction;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
-
 import org.apache.bookkeeper.stats.Gauge;
 import org.apache.bookkeeper.stats.StatsLogger;
 
@@ -256,38 +249,84 @@ public class VectorIndexManager extends AbstractIndexManager {
 
     private void registerMetrics(StatsLogger statsLogger) {
         statsLogger.registerGauge("node_count", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return getNodeCount(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return getNodeCount();
+            }
         });
         statsLogger.registerGauge("live_node_count", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return getLiveNodeCount(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return getLiveNodeCount();
+            }
         });
         statsLogger.registerGauge("ondisk_node_count", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return getOnDiskNodeCount(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return getOnDiskNodeCount();
+            }
         });
         statsLogger.registerGauge("segment_count", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return getSegmentCount(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return getSegmentCount();
+            }
         });
         statsLogger.registerGauge("dimension", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return getDimension(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return getDimension();
+            }
         });
         statsLogger.registerGauge("estimated_size_bytes", new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return getEstimatedSizeBytes(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return getEstimatedSizeBytes();
+            }
         });
         statsLogger.registerGauge("live_vectors_memory_bytes", new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
                 return (long) vectors.size() * dimension * Float.BYTES;
             }
         });
         statsLogger.registerGauge("dirty", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return dirty.get() ? 1 : 0; }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return dirty.get() ? 1 : 0;
+            }
         });
     }
 
@@ -1193,7 +1232,11 @@ public class VectorIndexManager extends AbstractIndexManager {
                 // Rebuild the graph builder from scratch
                 GraphIndexBuilder oldBuilder = this.builder;
                 if (oldBuilder != null) {
-                    try { oldBuilder.close(); } catch (IOException e) { /* ignore */ }
+                    try {
+                        oldBuilder.close();
+                    } catch (IOException e) {
+                        // ignore
+                    }
                 }
                 this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
                 BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
@@ -1322,11 +1365,17 @@ public class VectorIndexManager extends AbstractIndexManager {
         // If pool is still too small for FusedPQ (total < 256), skip writing segments
         if (poolVectorsList.size() < MIN_VECTORS_FOR_FUSED_PQ && poolVectorsList.size() > 0) {
             // Fall back: close all segments, materialize into live state, let simple path handle
-            for (VectorSegment seg : mergeableSegments) { seg.close(); }
-            for (VectorSegment seg : sealedSegments) { seg.close(); }
+            for (VectorSegment seg : mergeableSegments) {
+                seg.close();
+            }
+            for (VectorSegment seg : sealedSegments) {
+                seg.close();
+            }
             segments = new java.util.concurrent.CopyOnWriteArrayList<>();
             // Rebuild live state from pool
-            vectors.clear(); nodeToPk.clear(); pkToNode.clear();
+            vectors.clear();
+            nodeToPk.clear();
+            pkToNode.clear();
             for (int i = 0; i < poolVectorsList.size(); i++) {
                 vectors.put(i, poolVectorsList.get(i));
                 nodeToPk.put(i, poolPkList.get(i));
@@ -1335,7 +1384,13 @@ public class VectorIndexManager extends AbstractIndexManager {
             nextNodeId.set(poolVectorsList.size());
             nextSegmentId.set(0);
             GraphIndexBuilder oldBuilder = this.builder;
-            if (oldBuilder != null) { try { oldBuilder.close(); } catch (IOException e) { /* ignore */ } }
+            if (oldBuilder != null) {
+                try {
+                    oldBuilder.close();
+                } catch (IOException e) {
+                    // ignore
+                }
+            }
             this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
             BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
             this.builder = new GraphIndexBuilder(bsp, dimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
@@ -1810,8 +1865,8 @@ public class VectorIndexManager extends AbstractIndexManager {
                             int type = in.readVInt();
                             if (type != expectedChunkType) {
                                 throw new IOException(
-                                        "page " + pageId + ": expected type " +
-                                                expectedChunkType + " but got " + type);
+                                        "page " + pageId + ": expected type "
+                                                + expectedChunkType + " but got " + type);
                             }
                             int len = in.readVInt();
                             byte[] data = new byte[len];

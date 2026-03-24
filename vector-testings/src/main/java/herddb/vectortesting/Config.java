@@ -1,3 +1,22 @@
+/*
+ Licensed to Diennea S.r.l. under one
+ or more contributor license agreements. See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership. Diennea S.r.l. licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
+
+ http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied.  See the License for the
+ specific language governing permissions and limitations
+ under the License.
+
+ */
 package herddb.vectortesting;
 
 import java.io.FileInputStream;
@@ -86,55 +105,143 @@ public class Config {
         }
 
         // CLI overrides
-        if (cmd.hasOption("url")) cfg.jdbcUrl = cmd.getOptionValue("url");
-        if (cmd.hasOption("user")) cfg.username = cmd.getOptionValue("user");
-        if (cmd.hasOption("password")) cfg.password = cmd.getOptionValue("password");
-        if (cmd.hasOption("table")) cfg.tableName = cmd.getOptionValue("table");
-        if (cmd.hasOption("dataset-dir")) cfg.datasetDir = cmd.getOptionValue("dataset-dir");
-        if (cmd.hasOption("dataset")) cfg.dataset = parseDataset(cmd.getOptionValue("dataset"));
-        if (cmd.hasOption("dataset-url")) cfg.datasetUrl = cmd.getOptionValue("dataset-url");
-        if (cmd.hasOption("rows")) cfg.numRows = Integer.parseInt(cmd.getOptionValue("rows"));
-        if (cmd.hasOption("ingest-threads")) cfg.ingestThreads = Integer.parseInt(cmd.getOptionValue("ingest-threads"));
-        if (cmd.hasOption("batch-size")) cfg.batchSize = Integer.parseInt(cmd.getOptionValue("batch-size"));
-        if (cmd.hasOption("query-threads")) cfg.queryThreads = Integer.parseInt(cmd.getOptionValue("query-threads"));
-        if (cmd.hasOption("queries")) cfg.queryCount = Integer.parseInt(cmd.getOptionValue("queries"));
-        if (cmd.hasOption("k")) cfg.topK = Integer.parseInt(cmd.getOptionValue("k"));
-        if (cmd.hasOption("m")) cfg.indexM = Integer.parseInt(cmd.getOptionValue("m"));
-        if (cmd.hasOption("beam-width")) cfg.indexBeamWidth = Integer.parseInt(cmd.getOptionValue("beam-width"));
-        if (cmd.hasOption("skip-ingest")) cfg.skipIngest = true;
-        if (cmd.hasOption("skip-index")) cfg.skipIndex = true;
-        if (cmd.hasOption("skip-verify")) cfg.skipVerify = true;
-        if (cmd.hasOption("drop-table")) cfg.dropTable = true;
-        if (cmd.hasOption("checkpoint")) cfg.checkpoint = true;
-        if (cmd.hasOption("similarity")) cfg.similarity = cmd.getOptionValue("similarity");
-        if (cmd.hasOption("client-timeout")) cfg.clientTimeoutSeconds = Integer.parseInt(cmd.getOptionValue("client-timeout"));
+        if (cmd.hasOption("url")) {
+            cfg.jdbcUrl = cmd.getOptionValue("url");
+        }
+        if (cmd.hasOption("user")) {
+            cfg.username = cmd.getOptionValue("user");
+        }
+        if (cmd.hasOption("password")) {
+            cfg.password = cmd.getOptionValue("password");
+        }
+        if (cmd.hasOption("table")) {
+            cfg.tableName = cmd.getOptionValue("table");
+        }
+        if (cmd.hasOption("dataset-dir")) {
+            cfg.datasetDir = cmd.getOptionValue("dataset-dir");
+        }
+        if (cmd.hasOption("dataset")) {
+            cfg.dataset = parseDataset(cmd.getOptionValue("dataset"));
+        }
+        if (cmd.hasOption("dataset-url")) {
+            cfg.datasetUrl = cmd.getOptionValue("dataset-url");
+        }
+        if (cmd.hasOption("rows")) {
+            cfg.numRows = Integer.parseInt(cmd.getOptionValue("rows"));
+        }
+        if (cmd.hasOption("ingest-threads")) {
+            cfg.ingestThreads = Integer.parseInt(cmd.getOptionValue("ingest-threads"));
+        }
+        if (cmd.hasOption("batch-size")) {
+            cfg.batchSize = Integer.parseInt(cmd.getOptionValue("batch-size"));
+        }
+        if (cmd.hasOption("query-threads")) {
+            cfg.queryThreads = Integer.parseInt(cmd.getOptionValue("query-threads"));
+        }
+        if (cmd.hasOption("queries")) {
+            cfg.queryCount = Integer.parseInt(cmd.getOptionValue("queries"));
+        }
+        if (cmd.hasOption("k")) {
+            cfg.topK = Integer.parseInt(cmd.getOptionValue("k"));
+        }
+        if (cmd.hasOption("m")) {
+            cfg.indexM = Integer.parseInt(cmd.getOptionValue("m"));
+        }
+        if (cmd.hasOption("beam-width")) {
+            cfg.indexBeamWidth = Integer.parseInt(cmd.getOptionValue("beam-width"));
+        }
+        if (cmd.hasOption("skip-ingest")) {
+            cfg.skipIngest = true;
+        }
+        if (cmd.hasOption("skip-index")) {
+            cfg.skipIndex = true;
+        }
+        if (cmd.hasOption("skip-verify")) {
+            cfg.skipVerify = true;
+        }
+        if (cmd.hasOption("drop-table")) {
+            cfg.dropTable = true;
+        }
+        if (cmd.hasOption("checkpoint")) {
+            cfg.checkpoint = true;
+        }
+        if (cmd.hasOption("similarity")) {
+            cfg.similarity = cmd.getOptionValue("similarity");
+        }
+        if (cmd.hasOption("client-timeout")) {
+            cfg.clientTimeoutSeconds = Integer.parseInt(cmd.getOptionValue("client-timeout"));
+        }
 
         return cfg;
     }
 
     private void applyProperties(Properties props) {
-        if (props.containsKey("url")) jdbcUrl = props.getProperty("url");
-        if (props.containsKey("user")) username = props.getProperty("user");
-        if (props.containsKey("password")) password = props.getProperty("password");
-        if (props.containsKey("table")) tableName = props.getProperty("table");
-        if (props.containsKey("dataset-dir")) datasetDir = props.getProperty("dataset-dir");
-        if (props.containsKey("dataset")) dataset = parseDataset(props.getProperty("dataset"));
-        if (props.containsKey("dataset-url")) datasetUrl = props.getProperty("dataset-url");
-        if (props.containsKey("rows")) numRows = Integer.parseInt(props.getProperty("rows"));
-        if (props.containsKey("ingest-threads")) ingestThreads = Integer.parseInt(props.getProperty("ingest-threads"));
-        if (props.containsKey("batch-size")) batchSize = Integer.parseInt(props.getProperty("batch-size"));
-        if (props.containsKey("query-threads")) queryThreads = Integer.parseInt(props.getProperty("query-threads"));
-        if (props.containsKey("queries")) queryCount = Integer.parseInt(props.getProperty("queries"));
-        if (props.containsKey("k")) topK = Integer.parseInt(props.getProperty("k"));
-        if (props.containsKey("m")) indexM = Integer.parseInt(props.getProperty("m"));
-        if (props.containsKey("beam-width")) indexBeamWidth = Integer.parseInt(props.getProperty("beam-width"));
-        if (props.containsKey("skip-ingest")) skipIngest = Boolean.parseBoolean(props.getProperty("skip-ingest"));
-        if (props.containsKey("skip-index")) skipIndex = Boolean.parseBoolean(props.getProperty("skip-index"));
-        if (props.containsKey("skip-verify")) skipVerify = Boolean.parseBoolean(props.getProperty("skip-verify"));
-        if (props.containsKey("drop-table")) dropTable = Boolean.parseBoolean(props.getProperty("drop-table"));
-        if (props.containsKey("checkpoint")) checkpoint = Boolean.parseBoolean(props.getProperty("checkpoint"));
-        if (props.containsKey("similarity")) similarity = props.getProperty("similarity");
-        if (props.containsKey("client-timeout")) clientTimeoutSeconds = Integer.parseInt(props.getProperty("client-timeout"));
+        if (props.containsKey("url")) {
+            jdbcUrl = props.getProperty("url");
+        }
+        if (props.containsKey("user")) {
+            username = props.getProperty("user");
+        }
+        if (props.containsKey("password")) {
+            password = props.getProperty("password");
+        }
+        if (props.containsKey("table")) {
+            tableName = props.getProperty("table");
+        }
+        if (props.containsKey("dataset-dir")) {
+            datasetDir = props.getProperty("dataset-dir");
+        }
+        if (props.containsKey("dataset")) {
+            dataset = parseDataset(props.getProperty("dataset"));
+        }
+        if (props.containsKey("dataset-url")) {
+            datasetUrl = props.getProperty("dataset-url");
+        }
+        if (props.containsKey("rows")) {
+            numRows = Integer.parseInt(props.getProperty("rows"));
+        }
+        if (props.containsKey("ingest-threads")) {
+            ingestThreads = Integer.parseInt(props.getProperty("ingest-threads"));
+        }
+        if (props.containsKey("batch-size")) {
+            batchSize = Integer.parseInt(props.getProperty("batch-size"));
+        }
+        if (props.containsKey("query-threads")) {
+            queryThreads = Integer.parseInt(props.getProperty("query-threads"));
+        }
+        if (props.containsKey("queries")) {
+            queryCount = Integer.parseInt(props.getProperty("queries"));
+        }
+        if (props.containsKey("k")) {
+            topK = Integer.parseInt(props.getProperty("k"));
+        }
+        if (props.containsKey("m")) {
+            indexM = Integer.parseInt(props.getProperty("m"));
+        }
+        if (props.containsKey("beam-width")) {
+            indexBeamWidth = Integer.parseInt(props.getProperty("beam-width"));
+        }
+        if (props.containsKey("skip-ingest")) {
+            skipIngest = Boolean.parseBoolean(props.getProperty("skip-ingest"));
+        }
+        if (props.containsKey("skip-index")) {
+            skipIndex = Boolean.parseBoolean(props.getProperty("skip-index"));
+        }
+        if (props.containsKey("skip-verify")) {
+            skipVerify = Boolean.parseBoolean(props.getProperty("skip-verify"));
+        }
+        if (props.containsKey("drop-table")) {
+            dropTable = Boolean.parseBoolean(props.getProperty("drop-table"));
+        }
+        if (props.containsKey("checkpoint")) {
+            checkpoint = Boolean.parseBoolean(props.getProperty("checkpoint"));
+        }
+        if (props.containsKey("similarity")) {
+            similarity = props.getProperty("similarity");
+        }
+        if (props.containsKey("client-timeout")) {
+            clientTimeoutSeconds = Integer.parseInt(props.getProperty("client-timeout"));
+        }
     }
 
     /** Returns the similarity function: CLI override if set, otherwise dataset default. */

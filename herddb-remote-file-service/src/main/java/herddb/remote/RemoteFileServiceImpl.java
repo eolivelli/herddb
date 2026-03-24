@@ -20,7 +20,6 @@
 
 package herddb.remote;
 
-import com.google.protobuf.ByteString;
 import com.google.protobuf.UnsafeByteOperations;
 import herddb.remote.proto.DeleteByPrefixRequest;
 import herddb.remote.proto.DeleteByPrefixResponse;
@@ -41,7 +40,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.bookkeeper.stats.Counter;
-import org.apache.bookkeeper.stats.Gauge;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.apache.bookkeeper.stats.OpStatsLogger;
 import org.apache.bookkeeper.stats.StatsLogger;

@@ -1,3 +1,22 @@
+/*
+ Licensed to Diennea S.r.l. under one
+ or more contributor license agreements. See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership. Diennea S.r.l. licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
+
+ http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied.  See the License for the
+ specific language governing permissions and limitations
+ under the License.
+
+ */
 package herddb.vectortesting;
 
 import java.sql.Connection;
@@ -20,7 +39,9 @@ import java.util.concurrent.atomic.AtomicReference;
 public class VectorBench {
 
     @FunctionalInterface
-    interface SqlTask { void run() throws Exception; }
+    interface SqlTask {
+        void run() throws Exception;
+    }
 
     private static void runWithProgress(String label, SqlTask task) throws Exception {
         System.out.println(label);
@@ -30,14 +51,17 @@ public class VectorBench {
         Exception[] err = {null};
 
         Thread worker = new Thread(() -> {
-            try { task.run(); }
-            catch (Exception e) { err[0] = e; }
+            try {
+                task.run();
+            } catch (Exception e) {
+                err[0] = e;
+            }
         });
         worker.start();
 
         while (worker.isAlive()) {
             double elapsed = (System.nanoTime() - startNs) / 1e9;
-            int filled = Math.min(40, (int)(elapsed / 5));
+            int filled = Math.min(40, (int) (elapsed / 5));
             String bar = "=".repeat(filled) + " ".repeat(40 - filled);
             System.out.printf("\r  [%s] %c %.0fs...", bar, spinner[spinIdx[0] % 4], elapsed);
             System.out.flush();
@@ -48,7 +72,9 @@ public class VectorBench {
         double totalSecs = (System.nanoTime() - startNs) / 1e9;
         System.out.printf("\r  [%s] done in %.1fs%n", "=".repeat(40), totalSecs);
 
-        if (err[0] != null) throw err[0];
+        if (err[0] != null) {
+            throw err[0];
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -128,11 +154,15 @@ public class VectorBench {
                 int spin = 0;
                 while (!ingestDone.get()) {
                     double elapsed = (System.nanoTime() - ingestStart) / 1e9;
-                    int filled = Math.min(40, (int)(elapsed / 5));
+                    int filled = Math.min(40, (int) (elapsed / 5));
                     String bar = "=".repeat(filled) + " ".repeat(40 - filled);
                     System.out.printf("\r  [%s] %c %.0fs | %s", bar, ingestSpinner[spin++ % 4], elapsed, ingestStatus.get());
                     System.out.flush();
-                    try { Thread.sleep(500); } catch (InterruptedException e) { break; }
+                    try {
+                        Thread.sleep(500);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
                 }
             });
             progressThread.setDaemon(true);
@@ -250,7 +280,7 @@ public class VectorBench {
         int querySpin = 0;
         while (!queryPool.awaitTermination(500, TimeUnit.MILLISECONDS)) {
             double elapsed = (System.nanoTime() - queryStart) / 1e9;
-            int filled = Math.min(40, (int)(elapsed / 5));
+            int filled = Math.min(40, (int) (elapsed / 5));
             String bar = "=".repeat(filled) + " ".repeat(40 - filled);
             System.out.printf("\r  [%s] %c %.0fs | %s", bar, querySpinner[querySpin++ % 4], elapsed, queryStatus.get());
             System.out.flush();
@@ -295,7 +325,9 @@ public class VectorBench {
         int count = Math.min(results.size(), groundTruth.size());
         for (int i = 0; i < count; i++) {
             List<Integer> result = results.get(i);
-            if (result == null) continue;
+            if (result == null) {
+                continue;
+            }
             int[] truth = groundTruth.get(i);
             Set<Integer> truthSet = new HashSet<>();
             for (int j = 0; j < Math.min(k, truth.length); j++) {

@@ -21,7 +21,6 @@ package herddb.index.vector;
 
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
-
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Path;

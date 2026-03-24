@@ -19,6 +19,7 @@
 
 package herddb.index.vector;
 
+import static herddb.index.vector.VectorIndexManager.ordinalToBytes;
 import herddb.index.blink.BLink;
 import herddb.utils.Bytes;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
@@ -29,7 +30,6 @@ import io.github.jbellis.jvector.graph.similarity.DefaultSearchScoreProvider;
 import io.github.jbellis.jvector.util.Bits;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
-
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -40,9 +40,6 @@ import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
-
-import static herddb.index.vector.VectorIndexManager.bytesToOrdinal;
-import static herddb.index.vector.VectorIndexManager.ordinalToBytes;
 
 /**
  * Encapsulates the state of a single on-disk vector index segment.
