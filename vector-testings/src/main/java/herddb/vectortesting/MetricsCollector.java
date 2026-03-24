@@ -35,7 +35,7 @@ public class MetricsCollector {
     }
 
     private static int percentileIndex(int size, int percentile) {
-        return Math.min(size - 1, (int) (size * percentile / 100.0));
+        return Math.min(size - 1, (int) ((long) size * percentile / 100.0));
     }
 
     public record Stats(long count, double meanNanos, long p50Nanos, long p95Nanos, long p99Nanos, long maxNanos) {

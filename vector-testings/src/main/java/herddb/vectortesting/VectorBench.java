@@ -64,7 +64,14 @@ public class VectorBench {
         System.out.println("Loading query vectors...");
         loader.ensureQueryAndGroundTruth();
         List<float[]> queryVectors = loader.loadQueryVectors(config.queryCount);
-        System.out.println("Loaded " + queryVectors.size() + " query vectors");
+        System.out.println("Loaded " + queryVectors.size() + " query vectors from dataset");
+
+        // Cycle query vectors if requested count exceeds dataset size
+        if (config.queryCount > queryVectors.size()) {
+            int originalSize = queryVectors.size();
+            queryVectors = cycleVectors(queryVectors, config.queryCount);
+            System.out.println("Cycling " + originalSize + " query vectors to reach " + config.queryCount + " queries");
+        }
 
         List<int[]> groundTruth = null;
         try {
@@ -221,7 +228,10 @@ public class VectorBench {
 
         // Phase 6: Queries
         System.out.println("=== QUERY PHASE ===");
-        int actualQueries = Math.min(config.queryCount, queryVectors.size());
+        String queryTemplate = "SELECT id FROM " + config.tableName
+                + " ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT " + config.topK;
+        System.out.println("Query template: " + queryTemplate);
+        int actualQueries = queryVectors.size();
         MetricsCollector queryMetrics = new MetricsCollector();
         List<List<Integer>> queryResults = new ArrayList<>(Collections.nCopies(actualQueries, null));
         AtomicReference<String> queryStatus = new AtomicReference<>("");
@@ -256,12 +266,27 @@ public class VectorBench {
 
         // Phase 7: Recall
         if (groundTruth != null && !groundTruth.isEmpty()) {
-            double recall = computeRecall(queryResults, groundTruth, config.topK);
-            System.out.printf("%nRecall@%d: %.4f%n", config.topK, recall);
+            // Only compute recall for queries that have ground truth (non-cycled portion)
+            List<List<Integer>> recallResults = queryResults.subList(0, Math.min(queryResults.size(), groundTruth.size()));
+            double recall = computeRecall(recallResults, groundTruth, config.topK);
+            System.out.printf("%nRecall@%d: %.4f (computed on %d queries with ground truth)%n",
+                    config.topK, recall, recallResults.size());
         }
 
         System.out.println("\nBenchmark complete.");
         System.exit(0);
+    }
+
+    static <T> List<T> cycleVectors(List<T> vectors, int targetCount) {
+        if (targetCount <= vectors.size()) {
+            return vectors;
+        }
+        List<T> cycled = new ArrayList<>(targetCount);
+        int originalSize = vectors.size();
+        for (int i = 0; i < targetCount; i++) {
+            cycled.add(vectors.get(i % originalSize));
+        }
+        return cycled;
     }
 
     private static double computeRecall(List<List<Integer>> results, List<int[]> groundTruth, int k) {

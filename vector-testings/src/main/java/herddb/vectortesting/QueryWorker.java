@@ -44,6 +44,11 @@ public class QueryWorker implements Runnable {
                             ids.add(rs.getInt(1));
                         }
                     }
+                    if (ids.size() != config.topK) {
+                        System.err.println("FATAL: query " + i + " returned " + ids.size()
+                                + " results, expected " + config.topK);
+			System.exit(1);
+                    }
                     long elapsed = System.nanoTime() - start;
                     metrics.record(elapsed);
                     allResults.set(i, ids);
