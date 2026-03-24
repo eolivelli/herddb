@@ -100,6 +100,11 @@
             <artifactId>testcontainers</artifactId>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-jdk14</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -145,6 +150,9 @@
                         <include>**/*Test.java</include>
                         <include>**/*IT.java</include>
                     </includes>
+                    <environmentVariables>
+                        <DOCKER_API_VERSION>1.43</DOCKER_API_VERSION>
+                    </environmentVariables>
                 </configuration>
             </plugin>
         </plugins>

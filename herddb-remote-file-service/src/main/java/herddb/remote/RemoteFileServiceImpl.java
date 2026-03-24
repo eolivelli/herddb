@@ -21,6 +21,7 @@
 package herddb.remote;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.UnsafeByteOperations;
 import herddb.remote.proto.DeleteByPrefixRequest;
 import herddb.remote.proto.DeleteByPrefixResponse;
 import herddb.remote.proto.DeleteFileRequest;
@@ -167,7 +168,7 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
                                 new Object[]{request.getPath(), content.length, elapsedMs(start)});
                         responseObserver.onNext(ReadFileResponse.newBuilder()
                                 .setFound(true)
-                                .setContent(ByteString.copyFrom(content))
+                                .setContent(UnsafeByteOperations.unsafeWrap(content))
                                 .build());
                         responseObserver.onCompleted();
                     }

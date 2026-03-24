@@ -24,7 +24,7 @@ import com.google.common.hash.HashFunction;
 import com.google.common.hash.Hashing;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
-import java.util.SortedMap;
+import java.util.Map;
 import java.util.TreeMap;
 
 /**
@@ -39,7 +39,7 @@ public class ConsistentHashRouter {
     @SuppressWarnings("deprecation")
     private static final HashFunction HASH_FUNCTION = Hashing.murmur3_32();
 
-    private final SortedMap<Integer, String> ring = new TreeMap<>();
+    private final TreeMap<Integer, String> ring = new TreeMap<>();
     private final List<String> servers;
 
     public ConsistentHashRouter(List<String> servers) {
@@ -63,9 +63,8 @@ public class ConsistentHashRouter {
             throw new IllegalStateException("Hash ring is empty");
         }
         int hash = hash(path);
-        SortedMap<Integer, String> tail = ring.tailMap(hash);
-        int key = tail.isEmpty() ? ring.firstKey() : tail.firstKey();
-        return ring.get(key);
+        Map.Entry<Integer, String> entry = ring.ceilingEntry(hash);
+        return entry != null ? entry.getValue() : ring.firstEntry().getValue();
     }
 
     public List<String> getServers() {

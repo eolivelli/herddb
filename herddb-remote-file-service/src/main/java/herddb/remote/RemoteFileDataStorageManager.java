@@ -139,7 +139,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
     // Page serialization (matches FileDataStorageManager format)
     // -------------------------------------------------------------------------
 
-    private static byte[] serializeDataPage(Collection<Record> records) throws IOException {
+    private static VisibleByteArrayOutputStream serializeDataPage(Collection<Record> records) throws IOException {
         VisibleByteArrayOutputStream oo = new VisibleByteArrayOutputStream(4096);
         try (ExtendedDataOutputStream out = new ExtendedDataOutputStream(oo)) {
             out.writeVLong(1); // version
@@ -154,7 +154,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
             out.writeLong(hash);
             out.flush();
         }
-        return oo.toByteArray();
+        return oo;
     }
 
     private static List<Record> deserializeDataPage(byte[] data) throws IOException, DataStorageManagerException {
@@ -175,7 +175,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
         }
     }
 
-    private static byte[] serializeIndexPage(DataWriter writer) throws IOException {
+    private static VisibleByteArrayOutputStream serializeIndexPage(DataWriter writer) throws IOException {
         VisibleByteArrayOutputStream oo = new VisibleByteArrayOutputStream(4096);
         try (ExtendedDataOutputStream out = new ExtendedDataOutputStream(oo)) {
             out.writeVLong(1); // version
@@ -186,7 +186,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
             out.writeLong(hash);
             out.flush();
         }
-        return oo.toByteArray();
+        return oo;
     }
 
     private static <X> X deserializeIndexPage(byte[] data, DataReader<X> reader)
@@ -226,8 +226,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
             Collection<Record> newPage) throws DataStorageManagerException {
         String path = remoteDataPagePath(tableSpace, uuid, pageId);
         try {
-            byte[] data = serializeDataPage(newPage);
-            client.writeFile(path, data);
+            VisibleByteArrayOutputStream oo = serializeDataPage(newPage);
+            client.writeFile(path, oo.getBuffer(), 0, oo.size());
         } catch (IOException e) {
             throw new DataStorageManagerException("Error writing remote data page: " + path, e);
         }
@@ -253,8 +253,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
     public void writeIndexPage(String tableSpace, String uuid, long pageId, DataWriter writer) {
         String path = remoteIndexPagePath(tableSpace, uuid, pageId);
         try {
-            byte[] data = serializeIndexPage(writer);
-            client.writeFile(path, data);
+            VisibleByteArrayOutputStream oo = serializeIndexPage(writer);
+            client.writeFile(path, oo.getBuffer(), 0, oo.size());
         } catch (IOException e) {
             throw new RuntimeException("Error writing remote index page: " + path, e);
         }
