@@ -2533,6 +2533,91 @@ public class VectorIndexTest {
         }
     }
 
+    /**
+     * Regression test: checkpoint immediately after rebuild must not erase the index.
+     * Before the fix, a concurrent checkpoint could see partially-updated state
+     * (builder=null, segments empty) and persist an empty index.
+     */
+    @Test
+    public void testCheckpointAfterRebuildDoesNotEraseIndex() throws Exception {
+        Path dataPath = folder.newFolder().toPath();
+        Path logsPath = folder.newFolder().toPath();
+        Path metadataPath = folder.newFolder().toPath();
+        Path tmoDir = folder.newFolder().toPath();
+
+        final String nodeId = "localhost";
+        final int numRows = 500;
+        final int dimension = 16;
+        final long maxSegmentSize = 1024 * 20; // force multi-segment rebuild
+
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= numRows; i++) {
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            // Drop and recreate to trigger rebuild
+            execute(manager, "DROP INDEX tblspace1.vidx", Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertTrue("index should have nodes after rebuild, got " + vim.getNodeCount(),
+                    vim.getNodeCount() > 0);
+
+            // Checkpoint immediately after rebuild — this is the scenario that
+            // previously caused the race condition and erased the index.
+            manager.checkpoint();
+
+            // Verify the index still has data after checkpoint
+            assertTrue("index should have nodes after checkpoint, got " + vim.getNodeCount(),
+                    vim.getNodeCount() > 0);
+
+            // Verify search still works
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse("search should return results after checkpoint", results.isEmpty());
+            }
+        }
+
+        // Restart and verify the index survives
+        try (DBManager manager = createManagerWithMaxSegmentSize(
+                nodeId, metadataPath, dataPath, logsPath, tmoDir, maxSegmentSize)) {
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10000);
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertTrue("index should have nodes after restart, got " + vim.getNodeCount(),
+                    vim.getNodeCount() > 0);
+
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse("search should return results after restart", results.isEmpty());
+            }
+        }
+    }
+
     private static float[] randomVec(int dim, int seed) {
         float[] v = new float[dim];
         float norm = 0;

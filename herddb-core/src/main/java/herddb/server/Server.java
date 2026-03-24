@@ -349,9 +349,16 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 String remoteServers = configuration.getString(ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS, ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
                 List<String> servers = Arrays.asList(remoteServers.split(","));
                 LOGGER.log(Level.INFO, "Remote file services are {0}", servers);
+                Map<String, Object> clientConfig = new HashMap<>();
+                clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT,
+                        configuration.getLong(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT,
+                                ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT_DEFAULT));
+                clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
+                        configuration.getInt(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
+                                ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT));
                 try {
                     Class<?> clientClass = Class.forName("herddb.remote.RemoteFileServiceClient");
-                    Object client = clientClass.getConstructor(List.class).newInstance(servers);
+                    Object client = clientClass.getConstructor(List.class, Map.class).newInstance(servers, clientConfig);
                     Class<?> storageClass = Class.forName("herddb.remote.RemoteFileDataStorageManager");
                     Constructor<?> ctor = storageClass.getConstructor(Path.class, Path.class, int.class, clientClass);
                     return (DataStorageManager) ctor.newInstance(dataDirectory, tmpDirectory, diskswapThreshold, client);

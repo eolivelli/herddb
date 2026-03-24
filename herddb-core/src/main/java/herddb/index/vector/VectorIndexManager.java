@@ -99,6 +99,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.IntFunction;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -218,6 +219,9 @@ public class VectorIndexManager extends AbstractIndexManager {
 
     /** Counter for assigning unique segment IDs. */
     private final AtomicInteger nextSegmentId = new AtomicInteger(0);
+
+    /** Protects rebuild/checkpoint from seeing partially-updated in-memory state. */
+    private final ReentrantLock stateLock = new ReentrantLock();
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -796,24 +800,12 @@ public class VectorIndexManager extends AbstractIndexManager {
                     }
                 }
 
-                // Close builder from the last batch (it references FileBackedVectorValues
-                // that will be closed soon, so we must not reuse it)
-                boolean hasLiveData = !vectors.isEmpty();
-                GraphIndexBuilder oldBuilder = this.builder;
-                if (oldBuilder != null) {
-                    try {
-                        oldBuilder.close();
-                    } catch (IOException e) {
-                        // ignore
-                    }
-                }
-                this.builder = null;
-                this.mravv = null;
-
+                // Persist segments to storage before acquiring the state lock,
+                // so we don't hold the lock during I/O to the remote file service.
                 LogSequenceNumber lsn = log.getLastSequenceNumber();
                 persistIndexStatusMultiSegment(Collections.emptyList(), completedSegments, lsn, false);
 
-                // Load all segments
+                // Pre-load all segments from persisted pages (I/O heavy, done outside lock)
                 List<VectorSegment> newSegments = new java.util.concurrent.CopyOnWriteArrayList<>();
                 for (SegmentWriteResult swr : completedSegments) {
                     Path reloadMapFile = readChunksToTempFile(
@@ -827,32 +819,51 @@ public class VectorIndexManager extends AbstractIndexManager {
                     loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, dimension, Integer.MAX_VALUE);
                     newSegments.add(seg);
                 }
-                this.segments = newSegments;
 
-                if (hasLiveData) {
-                    // Small final batch kept as live state: build fresh graph from live vectors.
-                    // We don't reuse the old builder's graph to avoid references to
-                    // FileBackedVectorValues that will be closed.
-                    initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
-                    for (Map.Entry<Integer, VectorFloat<?>> entry : vectors.entrySet()) {
-                        builder.addGraphNode(entry.getKey(), entry.getValue());
-                    }
-                    // nextNodeId already reflects the live batch node IDs
-                    dirty.set(true);
-                } else {
-                    // Recompute nextNodeId from all segments
-                    int maxOrd = -1;
-                    for (VectorSegment seg : segments) {
-                        try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
-                            int segMax = stream.mapToInt(e -> bytesToOrdinal(e.getKey())).max().orElse(-1);
-                            if (segMax > maxOrd) {
-                                maxOrd = segMax;
-                            }
+                // Swap in-memory state atomically under the lock so that a
+                // concurrent checkpoint() never sees a partially-updated state.
+                stateLock.lock();
+                try {
+                    // Close builder from the last batch (it references FileBackedVectorValues
+                    // that will be closed soon, so we must not reuse it)
+                    boolean hasLiveData = !vectors.isEmpty();
+                    GraphIndexBuilder oldBuilder = this.builder;
+                    if (oldBuilder != null) {
+                        try {
+                            oldBuilder.close();
+                        } catch (IOException e) {
+                            // ignore
                         }
                     }
-                    this.nextNodeId.set(maxOrd + 1);
-                    initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
-                    dirty.set(false);
+
+                    this.segments = newSegments;
+                    this.builder = null;
+                    this.mravv = null;
+
+                    if (hasLiveData) {
+                        // Small final batch kept as live state: build fresh graph from live vectors.
+                        initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
+                        for (Map.Entry<Integer, VectorFloat<?>> entry : vectors.entrySet()) {
+                            builder.addGraphNode(entry.getKey(), entry.getValue());
+                        }
+                        dirty.set(true);
+                    } else {
+                        // Recompute nextNodeId from all segments
+                        int maxOrd = -1;
+                        for (VectorSegment seg : segments) {
+                            try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
+                                int segMax = stream.mapToInt(e -> bytesToOrdinal(e.getKey())).max().orElse(-1);
+                                if (segMax > maxOrd) {
+                                    maxOrd = segMax;
+                                }
+                            }
+                        }
+                        this.nextNodeId.set(maxOrd + 1);
+                        initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
+                        dirty.set(false);
+                    }
+                } finally {
+                    stateLock.unlock();
                 }
 
                 int totalNodes = (int) onDiskNodeToPkSize() + vectors.size();
@@ -889,32 +900,36 @@ public class VectorIndexManager extends AbstractIndexManager {
                     segResults.add(new SegmentWriteResult(segId, graphPageIds, mapPageIds, estimatedSize, Collections.emptyList()));
                     persistIndexStatusMultiSegment(Collections.emptyList(), segResults, lsn, false);
 
-                    // Close old builder before loading segment
-                    GraphIndexBuilder oldBuilder = this.builder;
-                    if (oldBuilder != null) {
-                        try {
-                            oldBuilder.close();
-                        } catch (IOException e) {
-                            // ignore
-                        }
-                    }
-                    this.builder = null;
-                    this.mravv = null;
-
-                    // Reload from persisted pages
+                    // Pre-load segment from persisted pages (I/O heavy, outside lock)
                     Path reloadMapFile = readChunksToTempFile(
                             mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
                     Path reloadGraphFile = readChunksToTempFile(
                             graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
-                    VectorSegment seg = new VectorSegment(segId);
-                    seg.estimatedSizeBytes = estimatedSize;
-                    seg.graphPageIds = graphPageIds;
-                    seg.mapPageIds = mapPageIds;
-                    loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, dimension, nextNodeId.get());
-                    segments.add(seg);
-                    initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
+                    VectorSegment newSeg = new VectorSegment(segId);
+                    newSeg.estimatedSizeBytes = estimatedSize;
+                    newSeg.graphPageIds = graphPageIds;
+                    newSeg.mapPageIds = mapPageIds;
+                    loadFusedPQSegment(newSeg, reloadMapFile, reloadGraphFile, dimension, nextNodeId.get());
 
-                    dirty.set(false);
+                    // Swap state atomically under the lock
+                    stateLock.lock();
+                    try {
+                        GraphIndexBuilder oldBuilder = this.builder;
+                        if (oldBuilder != null) {
+                            try {
+                                oldBuilder.close();
+                            } catch (IOException e) {
+                                // ignore
+                            }
+                        }
+                        this.builder = null;
+                        this.mravv = null;
+                        segments.add(newSeg);
+                        initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
+                        dirty.set(false);
+                    } finally {
+                        stateLock.unlock();
+                    }
 
                     LOGGER.log(Level.INFO,
                             "rebuilt vector index {0} in {1} ms: {2} nodes (FusedPQ written directly)",
@@ -928,36 +943,50 @@ public class VectorIndexManager extends AbstractIndexManager {
             } else {
                 try {
                     // Small dataset or FusedPQ not applicable: populate instance fields, let checkpoint() handle
+                    // Collect data from rebuild BLink before acquiring lock
+                    ConcurrentHashMap<Integer, Bytes> rebuildNodeToPkMap = new ConcurrentHashMap<>();
+                    ConcurrentHashMap<Integer, VectorFloat<?>> rebuildVectorsMap = new ConcurrentHashMap<>();
                     try (Stream<Map.Entry<Bytes, Bytes>> scanStream =
                             rebuildNodeToPkHolder[0].scan(Bytes.EMPTY_ARRAY, Bytes.POSITIVE_INFINITY)) {
                         scanStream.forEach(e -> {
                             int nodeId = bytesToOrdinal(e.getKey());
                             Bytes pk = e.getValue();
-                            this.nodeToPk.put(nodeId, pk);
+                            rebuildNodeToPkMap.put(nodeId, pk);
                             if (rebuildVectors != null) {
-                                this.vectors.put(nodeId, rebuildVectors.getVector(nodeId));
+                                rebuildVectorsMap.put(nodeId, rebuildVectors.getVector(nodeId));
                             }
                         });
                     }
-                    // Re-create mravv wrapping the instance vectors map so that
-                    // the live search path and future inserts use the correct backing store
-                    if (dimension > 0 && builder != null) {
-                        this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
-                        BuildScoreProvider bsp =
-                                BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
-                        OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
-                        try {
-                            builder.close();
-                        } catch (IOException e) {
-                            // ignore
+
+                    // Swap state atomically under the lock
+                    stateLock.lock();
+                    try {
+                        for (Map.Entry<Integer, Bytes> e : rebuildNodeToPkMap.entrySet()) {
+                            this.nodeToPk.put(e.getKey(), e.getValue());
                         }
-                        this.builder = new GraphIndexBuilder(
-                                bsp, dimension, graph,
-                                beamWidth, neighborOverflow, alpha,
-                                REFINE_FINAL_GRAPH,
-                                PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
+                        this.vectors.putAll(rebuildVectorsMap);
+                        // Re-create mravv wrapping the instance vectors map so that
+                        // the live search path and future inserts use the correct backing store
+                        if (dimension > 0 && builder != null) {
+                            this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
+                            BuildScoreProvider bsp =
+                                    BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+                            OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
+                            try {
+                                builder.close();
+                            } catch (IOException e) {
+                                // ignore
+                            }
+                            this.builder = new GraphIndexBuilder(
+                                    bsp, dimension, graph,
+                                    beamWidth, neighborOverflow, alpha,
+                                    REFINE_FINAL_GRAPH,
+                                    PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
+                        }
+                        dirty.set(true);
+                    } finally {
+                        stateLock.unlock();
                     }
-                    dirty.set(true);
                     long elapsed = System.currentTimeMillis() - start;
                     LOGGER.log(Level.INFO,
                             "rebuilt vector index {0} in {1} ms: {2} nodes",
@@ -1050,6 +1079,16 @@ public class VectorIndexManager extends AbstractIndexManager {
     }
 
     private List<PostCheckpointAction> doCheckpoint(LogSequenceNumber sequenceNumber, boolean pin)
+            throws IOException, DataStorageManagerException {
+        stateLock.lock();
+        try {
+            return doCheckpointUnderLock(sequenceNumber, pin);
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    private List<PostCheckpointAction> doCheckpointUnderLock(LogSequenceNumber sequenceNumber, boolean pin)
             throws IOException, DataStorageManagerException {
 
         boolean anySegmentDirty = segments.stream().anyMatch(s -> s.dirty);
@@ -1806,12 +1845,12 @@ public class VectorIndexManager extends AbstractIndexManager {
             byte[] buf = new byte[CHUNK_SIZE];
             int bytesRead;
             while ((bytesRead = bis.read(buf, 0, CHUNK_SIZE)) > 0) {
-                final byte[] chunk = Arrays.copyOf(buf, bytesRead);
+                final int len = bytesRead;
                 long pageId = newPageId.getAndIncrement();
                 dataStorageManager.writeIndexPage(tableSpaceUUID, index.uuid, pageId, out -> {
                     out.writeVInt(chunkType);
-                    out.writeVInt(chunk.length);
-                    out.write(chunk);
+                    out.writeVInt(len);
+                    out.write(buf, 0, len);
                 });
                 pageIds.add(pageId);
             }
@@ -1836,13 +1875,13 @@ public class VectorIndexManager extends AbstractIndexManager {
             return pageIds;
         }
         for (int offset = 0; offset < data.length; offset += CHUNK_SIZE) {
+            final int off = offset;
             final int len = Math.min(CHUNK_SIZE, data.length - offset);
-            final byte[] chunk = Arrays.copyOfRange(data, offset, offset + len);
             long pageId = newPageId.getAndIncrement();
             dataStorageManager.writeIndexPage(tableSpaceUUID, index.uuid, pageId, out -> {
                 out.writeVInt(chunkType);
-                out.writeVInt(chunk.length);
-                out.write(chunk);
+                out.writeVInt(len);
+                out.write(data, off, len);
             });
             pageIds.add(pageId);
         }

@@ -29,6 +29,7 @@ import java.io.RandomAccessFile;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -130,12 +131,11 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
             growFile(requiredSize);
         }
 
-        float[] tmp = new float[dimension];
-        for (int i = 0; i < dimension; i++) {
-            tmp[i] = vec.get(i);
-        }
         ByteBuffer buf = getOrAllocateBuffer();
-        buf.asFloatBuffer().put(tmp);
+        FloatBuffer fb = buf.asFloatBuffer();
+        for (int i = 0; i < dimension; i++) {
+            fb.put(vec.get(i));
+        }
         writeFullyAt(buf, offset);
         count.incrementAndGet();
     }
