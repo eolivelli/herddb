@@ -1960,22 +1960,27 @@ public class VectorIndexManager extends AbstractIndexManager {
         if (floats.length == 0) {
             return;
         }
-        if (dimension == 0) {
-            initBuilderForDimension(floats.length);
+        stateLock.lock();
+        try {
+            if (dimension == 0) {
+                initBuilderForDimension(floats.length);
+            }
+            if (floats.length != dimension) {
+                LOGGER.log(Level.WARNING,
+                        "vector dimension mismatch on insert: expected {0} but got {1}, skipping",
+                        new Object[]{dimension, floats.length});
+                return;
+            }
+            VectorFloat<?> vec = VTS.createFloatVector(floats);
+            int nodeId = nextNodeId.getAndIncrement();
+            vectors.put(nodeId, vec);
+            pkToNode.put(key, nodeId);
+            nodeToPk.put(nodeId, key);
+            builder.addGraphNode(nodeId, vec);
+            dirty.set(true);
+        } finally {
+            stateLock.unlock();
         }
-        if (floats.length != dimension) {
-            LOGGER.log(Level.WARNING,
-                    "vector dimension mismatch on insert: expected {0} but got {1}, skipping",
-                    new Object[]{dimension, floats.length});
-            return;
-        }
-        VectorFloat<?> vec = VTS.createFloatVector(floats);
-        int nodeId = nextNodeId.getAndIncrement();
-        vectors.put(nodeId, vec);
-        pkToNode.put(key, nodeId);
-        nodeToPk.put(nodeId, key);
-        builder.addGraphNode(nodeId, vec);
-        dirty.set(true);
     }
 
     @Override
@@ -1983,25 +1988,30 @@ public class VectorIndexManager extends AbstractIndexManager {
         if (indexKey == null) {
             return;
         }
-        // Check on-disk segments first
-        for (VectorSegment seg : segments) {
-            if (seg.deletePk(key)) {
-                dirty.set(true);
-                break;
+        stateLock.lock();
+        try {
+            // Check on-disk segments first
+            for (VectorSegment seg : segments) {
+                if (seg.deletePk(key)) {
+                    dirty.set(true);
+                    break;
+                }
             }
-        }
-        // Check live nodes
-        Integer nodeId = pkToNode.remove(key);
-        if (nodeId == null) {
-            return;
-        }
-        nodeToPk.remove(nodeId);
-        dirty.set(true);
-        GraphIndexBuilder b = builder;
-        if (b != null) {
-            b.markNodeDeleted(nodeId);
-        } else {
-            vectors.remove(nodeId);
+            // Check live nodes
+            Integer nodeId = pkToNode.remove(key);
+            if (nodeId == null) {
+                return;
+            }
+            nodeToPk.remove(nodeId);
+            dirty.set(true);
+            GraphIndexBuilder b = builder;
+            if (b != null) {
+                b.markNodeDeleted(nodeId);
+            } else {
+                vectors.remove(nodeId);
+            }
+        } finally {
+            stateLock.unlock();
         }
     }
 
