@@ -37,6 +37,13 @@ jobs:
           path: ~/.m2
           key: 'cache'
           restore-keys: 'cache'
+      - name: 'Checkout jvector'
+        uses: actions/checkout@v2
+        with:
+          repository: datastax/jvector
+          path: jvector
+      - name: 'Build jvector'
+        run: mvn -B install -DskipTests -Drat.skip=true --file jvector/pom.xml && rm -rf jvector
       - name: 'Build with Maven'
         run: mvn -B checkstyle:check apache-rat:check install -DskipTests spotbugs:check -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins
       - name: 'Remove Snapshots Before Caching'
