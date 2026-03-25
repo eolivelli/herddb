@@ -245,11 +245,7 @@ public class CalcitePlanner extends AbstractSQLPlanner {
         if (parameters == null) {
             parameters = Collections.emptyList();
         }
-        String cacheKey = "scan:" + scan
-                + ",defaultTableSpace:" + defaultTableSpace
-                + ",query:" + query
-                + ",returnValues:" + returnValues
-                + ",maxRows:" + maxRows;
+        String cacheKey = allowCache ? PlansCache.buildCacheKey(scan, defaultTableSpace, query, returnValues, maxRows) : null;
         boolean forceAcquireWriteLock;
         if (query.endsWith(" FOR UPDATE") // this looks very hacky
                 && query.substring(0, 6).toLowerCase().equals("select")) {

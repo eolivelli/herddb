@@ -375,11 +375,7 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
         if (query.startsWith("SHOW")) {
             return calculateShowCreateTable(query, defaultTableSpace, parameters, manager);
         }
-        String cacheKey = "scan:" + scan
-                + ",defaultTableSpace:" + defaultTableSpace
-                + ",query:" + query
-                + ",returnValues:" + returnValues
-                + ",maxRows:" + maxRows;
+        String cacheKey = allowCache ? PlansCache.buildCacheKey(scan, defaultTableSpace, query, returnValues, maxRows) : null;
         try {
             boolean forceAcquireWriteLock;
             if (query.endsWith(" FOR UPDATE") // this looks very hacky

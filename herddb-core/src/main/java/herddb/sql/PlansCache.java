@@ -95,4 +95,19 @@ public class PlansCache {
         this.cache.invalidateAll();
     }
 
+    /**
+     * Builds a compact cache key for a query plan.
+     * Format: scan|defaultTableSpace|query|returnValues|maxRows
+     * Booleans are encoded as '1' (true) or '0' (false).
+     */
+    public static String buildCacheKey(boolean scan, String defaultTableSpace, String query, boolean returnValues, int maxRows) {
+        return new StringBuilder(query.length() + defaultTableSpace.length() + 10)
+                .append(scan ? '1' : '0').append('|')
+                .append(defaultTableSpace).append('|')
+                .append(query).append('|')
+                .append(returnValues ? '1' : '0').append('|')
+                .append(maxRows)
+                .toString();
+    }
+
 }
