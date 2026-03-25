@@ -67,6 +67,16 @@ class SegmentedMappedReader implements RandomAccessReader {
         this.position = 0;
     }
 
+    /**
+     * Lightweight constructor that shares pre-mapped segments.
+     */
+    private SegmentedMappedReader(MappedByteBuffer[] segments, int maxSegmentSize, long fileSize) {
+        this.segments = segments;
+        this.maxSegmentSize = maxSegmentSize;
+        this.fileSize = fileSize;
+        this.position = 0;
+    }
+
     private byte readByte() {
         int segIndex = (int) (position / maxSegmentSize);
         int segOffset = (int) (position % maxSegmentSize);
@@ -181,25 +191,45 @@ class SegmentedMappedReader implements RandomAccessReader {
     }
 
     /**
-     * A {@link ReaderSupplier} that creates {@link SegmentedMappedReader} instances,
-     * replacing {@code SimpleMappedReader.Supplier} for files that may exceed 2 GB.
+     * A {@link ReaderSupplier} that eagerly maps the file once and returns
+     * lightweight {@link SegmentedMappedReader} instances sharing the same
+     * {@link MappedByteBuffer} segments.  Each reader has its own mutable
+     * {@code position} so concurrent use is safe.
      */
     static class Supplier implements ReaderSupplier {
 
-        private final Path path;
+        private volatile MappedByteBuffer[] cachedSegments;
+        private final int maxSegmentSize;
+        private final long fileSize;
 
-        Supplier(Path path) {
-            this.path = path;
+        Supplier(Path path) throws IOException {
+            this(path, DEFAULT_MAX_SEGMENT_SIZE);
+        }
+
+        Supplier(Path path, int maxSegmentSize) throws IOException {
+            this.maxSegmentSize = maxSegmentSize;
+            try (FileChannel ch = FileChannel.open(path, StandardOpenOption.READ)) {
+                this.fileSize = ch.size();
+                List<MappedByteBuffer> segs = new ArrayList<>();
+                long offset = 0;
+                while (offset < fileSize) {
+                    long remaining = fileSize - offset;
+                    int segSize = (int) Math.min(remaining, maxSegmentSize);
+                    segs.add(ch.map(FileChannel.MapMode.READ_ONLY, offset, segSize));
+                    offset += segSize;
+                }
+                this.cachedSegments = segs.toArray(new MappedByteBuffer[0]);
+            }
         }
 
         @Override
-        public RandomAccessReader get() throws IOException {
-            return new SegmentedMappedReader(path);
+        public RandomAccessReader get() {
+            return new SegmentedMappedReader(cachedSegments, maxSegmentSize, fileSize);
         }
 
         @Override
         public void close() {
-            // nothing to close; each reader maps independently
+            cachedSegments = null;
         }
     }
 }

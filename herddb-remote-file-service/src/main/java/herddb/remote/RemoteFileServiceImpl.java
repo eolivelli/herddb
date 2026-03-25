@@ -212,13 +212,20 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
                         responseObserver.onError(
                                 Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
                     } else {
-                        for (String path : paths) {
-                            responseObserver.onNext(ListFilesEntry.newBuilder().setPath(path).build());
+                        try {
+                            for (String path : paths) {
+                                responseObserver.onNext(ListFilesEntry.newBuilder().setPath(path).build());
+                            }
+                            listLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                            LOGGER.log(Level.INFO, "listFiles prefix={0} count={1} time={2}ms",
+                                    new Object[]{request.getPrefix(), paths.size(), elapsedMs(start)});
+                            responseObserver.onCompleted();
+                        } catch (Exception streamError) {
+                            listErrors.inc();
+                            listLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                            LOGGER.log(Level.WARNING, "listFiles streaming failed for prefix " + request.getPrefix()
+                                    + " after " + elapsedMs(start) + "ms (sent " + paths.size() + " entries)", streamError);
                         }
-                        listLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.INFO, "listFiles prefix={0} count={1} time={2}ms",
-                                new Object[]{request.getPrefix(), paths.size(), elapsedMs(start)});
-                        responseObserver.onCompleted();
                     }
                 });
     }

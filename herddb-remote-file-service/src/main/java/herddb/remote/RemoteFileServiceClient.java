@@ -67,7 +67,7 @@ public class RemoteFileServiceClient implements AutoCloseable {
     public static final String CONFIG_CLIENT_RETRIES = "remote.file.client.retries";
 
     private static final long DEFAULT_CLIENT_TIMEOUT_SECONDS = 1800; // 30 minutes
-    private static final int DEFAULT_CLIENT_RETRIES = 3;
+    private static final int DEFAULT_CLIENT_RETRIES = 10;
 
     private final ConsistentHashRouter router;
     private final Map<String, ManagedChannel> channels;

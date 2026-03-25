@@ -237,6 +237,39 @@ public class SegmentedMappedReaderTest {
     }
 
     @Test
+    public void testSupplierCachesMappedSegments() throws IOException {
+        // Verify that the Supplier eagerly maps the file once and subsequent
+        // get() calls return lightweight readers sharing the same data.
+        int segmentSize = 16;
+        Path file = tempFolder.newFile("test.bin").toPath();
+        try (DataOutputStream dos = new DataOutputStream(new FileOutputStream(file.toFile()))) {
+            for (int i = 0; i < 20; i++) {
+                dos.writeInt(i);
+            }
+        }
+
+        try (SegmentedMappedReader.Supplier supplier = new SegmentedMappedReader.Supplier(file, segmentSize)) {
+            // Get multiple readers — they should all work correctly
+            for (int iter = 0; iter < 5; iter++) {
+                try (RandomAccessReader r = supplier.get()) {
+                    for (int i = 0; i < 20; i++) {
+                        assertEquals("iter=" + iter + " i=" + i, i, r.readInt());
+                    }
+                }
+            }
+
+            // Concurrent independent reads
+            try (RandomAccessReader r1 = supplier.get();
+                 RandomAccessReader r2 = supplier.get()) {
+                r1.seek(40); // int at index 10
+                r2.seek(0);
+                assertEquals(10, r1.readInt());
+                assertEquals(0, r2.readInt());
+            }
+        }
+    }
+
+    @Test
     public void testSupplierReturnsIndependentReaders() throws IOException {
         Path file = tempFolder.newFile("test.bin").toPath();
         try (DataOutputStream dos = new DataOutputStream(new FileOutputStream(file.toFile()))) {

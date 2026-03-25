@@ -525,25 +525,66 @@ public class VectorIndexManager extends AbstractIndexManager {
                                         int dim, int savedNextNodeId) throws IOException {
         createSegmentBLinks(seg);
 
+        // First pass: read all entries into temp lists to compute sizes
+        int entryCount;
+        int maxOrdinal = -1;
+        int totalPkBytes = 0;
+        int[] tempOrdinals;
+        int[] tempPkOffsets;
+        int[] tempPkLengths;
+        byte[] allPkData;
+
         try (DataInputStream dis = new DataInputStream(
                 new BufferedInputStream(new FileInputStream(mapFile.toFile()), CHUNK_SIZE))) {
-            int entryCount = dis.readInt();
-            int maxOrdinal = -1;
+            entryCount = dis.readInt();
+            tempOrdinals = new int[entryCount];
+            tempPkLengths = new int[entryCount];
+            // Collect all PK bytes into a growable buffer
+            java.io.ByteArrayOutputStream pkBuf = new java.io.ByteArrayOutputStream(entryCount * 8);
             for (int i = 0; i < entryCount; i++) {
                 int ordinal = dis.readInt();
                 int pkLen = dis.readInt();
-                byte[] pkData = new byte[pkLen];
-                dis.readFully(pkData);
+                byte[] pkBytes = new byte[pkLen];
+                dis.readFully(pkBytes);
                 int floatCount = dis.readInt();
                 skipFully(dis, (long) floatCount * Float.BYTES);
-                Bytes pk = Bytes.from_array(pkData);
-                seg.onDiskNodeToPk.insert(ordinalToBytes(ordinal), pk);
+
+                tempOrdinals[i] = ordinal;
+                tempPkLengths[i] = pkLen;
+                pkBuf.write(pkBytes);
+                totalPkBytes += pkLen;
+
+                Bytes pk = Bytes.from_array(pkBytes);
                 seg.onDiskPkToNode.insert(pk, (long) ordinal);
                 if (ordinal > maxOrdinal) {
                     maxOrdinal = ordinal;
                 }
             }
+            allPkData = pkBuf.toByteArray();
         }
+
+        // Build compact cache arrays
+        if (maxOrdinal >= 0) {
+            int cacheSize = maxOrdinal + 1;
+            int[] offsets = new int[cacheSize];
+            int[] lengths = new int[cacheSize];
+            java.util.Arrays.fill(offsets, -1);
+            int pos = 0;
+            for (int i = 0; i < entryCount; i++) {
+                offsets[tempOrdinals[i]] = pos;
+                lengths[tempOrdinals[i]] = tempPkLengths[i];
+                pos += tempPkLengths[i];
+            }
+            seg.pkData = allPkData;
+            seg.pkOffsets = offsets;
+            seg.pkLengths = lengths;
+        } else {
+            seg.pkData = new byte[0];
+            seg.pkOffsets = new int[0];
+            seg.pkLengths = new int[0];
+        }
+        seg.liveCount = entryCount;
+
         Files.deleteIfExists(mapFile);
 
         ReaderSupplier readerSupplier = new SegmentedMappedReader.Supplier(graphFile);
@@ -2095,15 +2136,20 @@ public class VectorIndexManager extends AbstractIndexManager {
      * @return list of (primaryKey, score) pairs ordered best-first;
      *         may be shorter than topK if the index has fewer live nodes
      */
-    public List<Map.Entry<Bytes, Float>> search(float[] queryVector, int topK) {
+    public List<Map.Entry<Bytes, Float>> search(float[] queryVector, int topK)
+            throws StatementExecutionException {
         List<Map.Entry<Bytes, Float>> results = new ArrayList<>();
         VectorFloat<?> qv = VTS.createFloatVector(queryVector);
 
         // Search all on-disk segments
         // Take a snapshot of the segments list for safe concurrent access
         List<VectorSegment> currentSegments = this.segments;
-        for (VectorSegment seg : currentSegments) {
-            seg.search(qv, topK, similarityFunction, results);
+        try {
+            for (VectorSegment seg : currentSegments) {
+                seg.search(qv, topK, similarityFunction, results);
+            }
+        } catch (Exception | OutOfMemoryError e) {
+            throw new StatementExecutionException("vector index search failed: " + e.getMessage(), e);
         }
 
         // Search live in-memory builder
@@ -2211,18 +2257,13 @@ public class VectorIndexManager extends AbstractIndexManager {
 
     private void createSegmentBLinks(VectorSegment seg) {
         long pageSize = memoryManager.getMaxLogicalPageSize();
-        String nodeToPkName = index.uuid + "_seg" + seg.segmentId + "_nodetopk";
         String pkToNodeName = index.uuid + "_seg" + seg.segmentId + "_pktonode";
         try {
-            dataStorageManager.initIndex(tableSpaceUUID, nodeToPkName);
             dataStorageManager.initIndex(tableSpaceUUID, pkToNodeName);
         } catch (DataStorageManagerException e) {
             throw new RuntimeException("Failed to init BLink storage for vector index " + index.name
                     + " segment " + seg.segmentId, e);
         }
-        seg.onDiskNodeToPk = new BLink<>(pageSize, BytesBytesSizeEvaluator.INSTANCE,
-                memoryManager.getIndexPageReplacementPolicy(),
-                new BytesBytesStorage(nodeToPkName));
         seg.onDiskPkToNode = new BLink<>(pageSize, BytesLongSizeEvaluator.INSTANCE,
                 memoryManager.getIndexPageReplacementPolicy(),
                 new BytesLongStorage(pkToNodeName));
