@@ -63,7 +63,7 @@ public class UnloadDirtyPageTest {
 
             manager.checkpoint();
 
-            assertEquals(2, manager.getTableSpaceManager("tblspace1")
+            assertEquals(3, manager.getTableSpaceManager("tblspace1")
                     .getTableManager("tsql").getStats().getLoadedpages());
 
             try (DataScanner scan = scan(manager, "SELECT * FROM tblspace1.tsql where k1 = 'mykey4'", Collections.emptyList())) {
@@ -98,7 +98,7 @@ public class UnloadDirtyPageTest {
 
             manager.checkpoint();
 
-            assertEquals(2, manager.getTableSpaceManager("tblspace1")
+            assertEquals(3, manager.getTableSpaceManager("tblspace1")
                     .getTableManager("tsql").getStats().getLoadedpages());
 
             try (DataScanner scan = scan(manager, "SELECT * FROM tblspace1.tsql where k1 = 'mykey4'", Collections.emptyList())) {

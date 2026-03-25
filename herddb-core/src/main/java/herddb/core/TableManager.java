@@ -820,7 +820,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         LOGGER.log(Level.FINER, "creating mutable page table {0}, pageId={1} with {2} records, {3} logical page size",
                 new Object[]{table.name, newId, expectedSize, initiaPageSize});
 
-        final DataPage newPage = new DataPage(this, newId, maxLogicalPageSize, initiaPageSize, new HashMap<Bytes, Record>(expectedSize), false);
+        final DataPage newPage = new DataPage(this, newId, maxLogicalPageSize, initiaPageSize, new ConcurrentHashMap<>(expectedSize), false);
 
         pages.put(newId, newPage);
 
@@ -899,7 +899,23 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                  * For similar reason we replace the page only if there actually is a page in the first place. If
                  * a concurrent thread flushed and removed the page we don't want to add it again.
                  */
-                pages.computeIfPresent(page.pageId, (i, p) -> p.toImmutable());
+                /*
+                 * Convert the page to immutable and capture the new immutable instance.
+                 * We must add the immutable instance (not the original) to pageReplacementPolicy so
+                 * that close() can remove it: close() iterates pages.values() and calls remove(),
+                 * which uses page.metadata — the metadata is set on whichever object is passed to add().
+                 *
+                 * Only add to the replacement policy if the page was not already registered there
+                 * (page.metadata == null). Pages that were added by allocateLivePage when they filled up
+                 * already have metadata set; adding the immutable copy again would throw "Added a page twice".
+                 */
+                final DataPage immutablePage = pages.computeIfPresent(page.pageId, (i, p) -> p.toImmutable());
+                if (immutablePage != null && page.metadata == null) {
+                    final Page.Metadata unloadMeta = pageReplacementPolicy.add(immutablePage);
+                    if (unloadMeta != null) {
+                        unloadMeta.owner.unload(unloadMeta.pageId);
+                    }
+                }
                 return;
 
             case ALREADY_FLUSHED:
@@ -1098,6 +1114,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
                 page.writable = false;
 
+                /*
+                 * Register the page in pageSet while still holding the write lock (when keepPageInMemory=true
+                 * the lock is released right after this block). This prevents a race where a concurrent DML
+                 * thread sees page.writable=false but the page is not yet in pageSet, which would cause an
+                 * IllegalStateException in setPageDirty.
+                 */
+                if (keepPageInMemory) {
+                    pageSet.pageCreated(page.pageId, page);
+                }
+
             } finally {
 
                 /* Fast unlock if we must keep the page in memory */
@@ -1108,8 +1134,10 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
             dataStorageManager.writePage(tableSpaceUUID, table.uuid, page.pageId, page.getRecordsForFlush());
 
-            /* Set the page as a fully active page */
-            pageSet.pageCreated(page.pageId, page);
+            /* Set the page as a fully active page (when not kept in memory, done after I/O under write lock) */
+            if (!keepPageInMemory) {
+                pageSet.pageCreated(page.pageId, page);
+            }
 
             if (keepPageInMemory) {
                 /* If we must keep the page in memory we "covert" the page to immutable */
@@ -2188,7 +2216,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         final Record previous;
         if (indexes == null) {
             /* We don't need the page if isn't loaded or isn't a mutable new page */
-            page = newPages.get(pageId);
+            DataPage foundPage = newPages.get(pageId);
+            if (foundPage == null) {
+                /* The page may be a building page (non-blocking checkpoint compaction) that is
+                 * in 'pages' but not in 'newPages'. Treat it like a mutable new page. */
+                final DataPage candidate = pages.get(pageId);
+                if (candidate != null && !candidate.immutable) {
+                    foundPage = candidate;
+                }
+            }
+            page = foundPage;
 
             if (page != null) {
                 pageReplacementPolicy.pageHit(page);
@@ -2275,7 +2312,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         boolean insertedInSamePage = false;
         if (indexes == null) {
             /* We don't need the page if isn't loaded or isn't a mutable new page*/
-            prevPage = newPages.get(prevPageId);
+            DataPage foundPrevPage = newPages.get(prevPageId);
+            if (foundPrevPage == null) {
+                /* The page may be a building page (non-blocking checkpoint compaction) that is
+                 * in 'pages' but not in 'newPages'. Treat it like a mutable new page. */
+                final DataPage candidate = pages.get(prevPageId);
+                if (candidate != null && !candidate.immutable) {
+                    foundPrevPage = candidate;
+                }
+            }
+            prevPage = foundPrevPage;
 
             if (prevPage != null) {
                 pageReplacementPolicy.pageHit(prevPage);
