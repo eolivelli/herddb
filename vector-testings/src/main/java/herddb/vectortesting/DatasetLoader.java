@@ -5,10 +5,14 @@ import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URI;
 import java.net.URL;
+import java.net.URLConnection;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
@@ -17,8 +21,11 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.zip.GZIPInputStream;
+import java.time.Duration;
 
 import io.jhdf.HdfFile;
+import org.apache.commons.net.ftp.FTP;
+import org.apache.commons.net.ftp.FTPClient;
 import io.jhdf.api.Dataset;
 
 public class DatasetLoader {
@@ -123,20 +130,163 @@ public class DatasetLoader {
         }
     }
 
+    private static final int MAX_DOWNLOAD_RETRIES = 10;
+
     private void downloadFile(String urlStr, File dest) throws IOException {
         dest.getParentFile().mkdirs();
+        File part = new File(dest.getParent(), dest.getName() + ".part");
+        boolean success = false;
+        IOException lastException = null;
+        for (int attempt = 0; attempt <= MAX_DOWNLOAD_RETRIES; attempt++) {
+            if (attempt > 0) {
+                System.out.printf("  Retry %d/%d after error: %s%n",
+                        attempt, MAX_DOWNLOAD_RETRIES, lastException.getMessage());
+            }
+            try {
+                downloadFileAttempt(urlStr, part);
+                success = true;
+                break;
+            } catch (IOException e) {
+                lastException = e;
+            }
+        }
+        if (!success) {
+            throw new IOException("Download failed after " + MAX_DOWNLOAD_RETRIES
+                    + " retries", lastException);
+        }
+        if (!part.renameTo(dest)) {
+            Files.copy(part.toPath(), dest.toPath());
+            part.delete();
+        }
+    }
+
+    private void downloadFileAttempt(String urlStr, File part) throws IOException {
+        long resumeFrom = part.exists() ? part.length() : 0;
+        if (resumeFrom > 0) {
+            System.out.printf("  Resuming download from %.1f MB%n",
+                    resumeFrom / (1024.0 * 1024.0));
+        }
+
+        if (urlStr.startsWith("ftp://")) {
+            downloadFileAttemptFtp(urlStr, part, resumeFrom);
+        } else {
+            downloadFileAttemptHttp(urlStr, part, resumeFrom);
+        }
+    }
+
+    private void downloadFileAttemptHttp(String urlStr, File part, long resumeFrom) throws IOException {
         URL url = new URL(urlStr);
-        try (InputStream in = new BufferedInputStream(url.openStream());
-             FileOutputStream out = new FileOutputStream(dest)) {
-            byte[] buf = new byte[8192];
-            int read;
-            long total = 0;
-            while ((read = in.read(buf)) != -1) {
-                out.write(buf, 0, read);
-                total += read;
-                if (total % (50 * 1024 * 1024) == 0) {
-                    System.out.printf("  Downloaded %.1f MB%n", total / (1024.0 * 1024.0));
+        URLConnection conn = url.openConnection();
+        conn.setConnectTimeout(30_000);
+        conn.setReadTimeout(60_000);
+
+        long totalFileSize = -1;
+        boolean appending = false;
+
+        if (conn instanceof HttpURLConnection) {
+            HttpURLConnection http = (HttpURLConnection) conn;
+            if (resumeFrom > 0) {
+                http.setRequestProperty("Range", "bytes=" + resumeFrom + "-");
+            }
+            http.connect();
+            int status = http.getResponseCode();
+            if (status == 206) {
+                long remaining = http.getContentLengthLong();
+                totalFileSize = remaining >= 0 ? resumeFrom + remaining : -1;
+                appending = true;
+            } else if (status == 200) {
+                if (resumeFrom > 0) {
+                    System.out.println("  Server doesn't support resume, restarting download...");
+                    part.delete();
+                    resumeFrom = 0;
                 }
+                totalFileSize = http.getContentLengthLong();
+                appending = false;
+            } else {
+                throw new IOException("HTTP " + status + " downloading " + urlStr);
+            }
+        } else {
+            // Unknown protocol — no resume support
+            if (resumeFrom > 0) {
+                System.out.println("  Cannot resume this download, restarting...");
+                part.delete();
+                resumeFrom = 0;
+            }
+            conn.connect();
+            totalFileSize = conn.getContentLengthLong();
+            appending = false;
+        }
+
+        try (InputStream in = new BufferedInputStream(conn.getInputStream(), 256 * 1024);
+             FileOutputStream fos = new FileOutputStream(part, appending);
+             BufferedOutputStream out = new BufferedOutputStream(fos, 256 * 1024)) {
+            transferStream(in, out, resumeFrom, totalFileSize);
+        }
+    }
+
+    private void downloadFileAttemptFtp(String urlStr, File part, long resumeFrom) throws IOException {
+        URI uri = URI.create(urlStr);
+        FTPClient ftp = new FTPClient();
+        ftp.setConnectTimeout(30_000);
+        ftp.setDataTimeout(Duration.ofMillis(60_000));
+        ftp.connect(uri.getHost(), uri.getPort() < 0 ? 21 : uri.getPort());
+        ftp.login("anonymous", "anonymous@example.com");
+        ftp.enterLocalPassiveMode();
+        ftp.setFileType(FTP.BINARY_FILE_TYPE);
+        if (resumeFrom > 0) {
+            ftp.setRestartOffset(resumeFrom);
+        }
+        String sizeReply = ftp.getSize(uri.getPath());
+        long totalFileSize = -1;
+        if (sizeReply != null) {
+            try { totalFileSize = Long.parseLong(sizeReply.trim()); } catch (NumberFormatException ignored) {}
+        }
+        InputStream ftpStream = ftp.retrieveFileStream(uri.getPath());
+        if (ftpStream == null) {
+            ftp.disconnect();
+            throw new IOException("FTP retrieve failed: " + ftp.getReplyString());
+        }
+        try (InputStream in = new BufferedInputStream(ftpStream, 256 * 1024);
+             FileOutputStream fos = new FileOutputStream(part, resumeFrom > 0);
+             BufferedOutputStream out = new BufferedOutputStream(fos, 256 * 1024)) {
+            transferStream(in, out, resumeFrom, totalFileSize);
+        } finally {
+            ftp.completePendingCommand();
+            ftp.logout();
+            ftp.disconnect();
+        }
+    }
+
+    private void transferStream(InputStream in, BufferedOutputStream out,
+                                long resumeFrom, long totalFileSize) throws IOException {
+        byte[] buf = new byte[65536];
+        int read;
+        long total = resumeFrom;
+        long intervalStart = System.currentTimeMillis();
+        long intervalBytes = 0;
+        long nextPrint = ((resumeFrom / (50L * 1024 * 1024)) + 1) * 50L * 1024 * 1024;
+
+        while ((read = in.read(buf)) != -1) {
+            out.write(buf, 0, read);
+            total += read;
+            intervalBytes += read;
+
+            if (total >= nextPrint) {
+                long now = System.currentTimeMillis();
+                double elapsedSec = Math.max((now - intervalStart) / 1000.0, 0.001);
+                double mbps = (intervalBytes / (1024.0 * 1024.0)) / elapsedSec;
+                if (totalFileSize > 0) {
+                    double pct = 100.0 * total / totalFileSize;
+                    System.out.printf("  Downloaded %.1f / %.1f MB (%.1f%%) — %.2f MB/s%n",
+                            total / (1024.0 * 1024.0), totalFileSize / (1024.0 * 1024.0),
+                            pct, mbps);
+                } else {
+                    System.out.printf("  Downloaded %.1f MB — %.2f MB/s%n",
+                            total / (1024.0 * 1024.0), mbps);
+                }
+                intervalStart = now;
+                intervalBytes = 0;
+                nextPrint += 50L * 1024 * 1024;
             }
         }
     }
