@@ -215,13 +215,28 @@ public class DatasetLoader {
     public interface VectorStream extends Iterable<float[]>, Closeable {}
 
     public VectorStream streamBaseVectors(int maxVectors) throws IOException {
+        return streamBaseVectors(0, maxVectors);
+    }
+
+    /**
+     * Stream up to {@code maxVectors} base vectors, skipping the first {@code skipVectors}.
+     * Row IDs should start from {@code skipVectors} when resuming ingestion.
+     */
+    public VectorStream streamBaseVectors(int skipVectors, int maxVectors) throws IOException {
         if (preset.baseFormat == VecFormat.HDF5) {
-            return streamHdf5Vectors(maxVectors);
+            return streamHdf5Vectors(skipVectors, maxVectors);
         }
         File file = new File(getDatasetSubDir(), preset.baseFile);
         InputStream in = openInputStream(file);
         DataInputStream dis = new DataInputStream(in);
         VecFormat format = preset.baseFormat;
+
+        if (skipVectors > 0) {
+            System.out.println("  Skipping " + skipVectors + " vectors to resume from position " + skipVectors + "...");
+            skipVecsInStream(dis, format, skipVectors);
+            System.out.println("  Skip complete.");
+        }
+
         return new VectorStream() {
             @Override
             public void close() throws IOException {
@@ -293,13 +308,37 @@ public class DatasetLoader {
         };
     }
 
+    /** Skip {@code count} vectors in-place from a DataInputStream of FVECS or BVECS format. */
+    private static void skipVecsInStream(DataInputStream dis, VecFormat format, int count) throws IOException {
+        for (int i = 0; i < count; i++) {
+            int dim = readLittleEndianInt(dis);
+            long bytesToSkip = (format == VecFormat.BVECS) ? dim : (long) dim * 4;
+            long remaining = bytesToSkip;
+            while (remaining > 0) {
+                long skipped = dis.skip(remaining);
+                if (skipped <= 0) {
+                    throw new IOException("Unexpected end of stream while skipping vector " + i);
+                }
+                remaining -= skipped;
+            }
+            if ((i + 1) % 1_000_000 == 0) {
+                System.out.println("  Skipped " + (i + 1) + " vectors...");
+            }
+        }
+    }
+
     private VectorStream streamHdf5Vectors(int maxVectors) {
+        return streamHdf5Vectors(0, maxVectors);
+    }
+
+    private VectorStream streamHdf5Vectors(int skipVectors, int maxVectors) {
         // Load all vectors from HDF5 into memory, then stream from the array
         HdfFile hdf = new HdfFile(getHdf5File().toPath());
         Dataset ds = hdf.getDatasetByPath("train");
         float[][] data = (float[][]) ds.getData();
-        int total = Math.min(maxVectors, data.length);
-        System.out.println("  Loaded " + total + " vectors from HDF5 into memory");
+        int start = Math.min(skipVectors, data.length);
+        int end = Math.min(start + maxVectors, data.length);
+        System.out.println("  Loaded " + data.length + " vectors from HDF5 into memory, streaming [" + start + ", " + end + ")");
         return new VectorStream() {
             @Override
             public void close() throws IOException {
@@ -309,19 +348,19 @@ public class DatasetLoader {
             @Override
             public Iterator<float[]> iterator() {
                 return new Iterator<float[]>() {
-                    private int idx = 0;
+                    private int idx = start;
 
                     @Override
                     public boolean hasNext() {
-                        return idx < total;
+                        return idx < end;
                     }
 
                     @Override
                     public float[] next() {
                         if (!hasNext()) throw new NoSuchElementException();
                         float[] v = data[idx++];
-                        if (idx % 1_000_000 == 0) {
-                            System.out.println("  Streamed " + idx + " vectors...");
+                        if ((idx - start) % 1_000_000 == 0) {
+                            System.out.println("  Streamed " + (idx - start) + " vectors...");
                         }
                         return v;
                     }

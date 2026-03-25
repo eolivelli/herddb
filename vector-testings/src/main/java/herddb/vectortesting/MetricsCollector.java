@@ -2,6 +2,7 @@ package herddb.vectortesting;
 
 import java.util.Arrays;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
 public class MetricsCollector {
@@ -12,12 +13,12 @@ public class MetricsCollector {
 
     private final LongAdder count = new LongAdder();
     private final long[] reservoir = new long[MAX_SAMPLES];
-    private final LongAdder samplesStored = new LongAdder();
+    private final AtomicLong samplesStored = new AtomicLong(0);
 
     public void record(long nanos) {
         long n = count.longValue() + 1; // approximate position before increment
         count.increment();
-        long stored = samplesStored.longValue();
+        long stored = samplesStored.get();
         if (stored < MAX_SAMPLES) {
             // Fill reservoir sequentially until full
             long idx = samplesStored.getAndIncrement(); // may race, but bounded by MAX_SAMPLES
@@ -38,7 +39,7 @@ public class MetricsCollector {
     }
 
     public Stats computeStats() {
-        int size = (int) Math.min(samplesStored.sum(), MAX_SAMPLES);
+        int size = (int) Math.min(samplesStored.get(), MAX_SAMPLES);
         if (size == 0) {
             return new Stats(0, 0, 0, 0, 0, 0);
         }

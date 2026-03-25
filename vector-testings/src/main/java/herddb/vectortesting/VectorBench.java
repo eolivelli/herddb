@@ -106,13 +106,21 @@ public class VectorBench {
 
         // Phase 4: Ingestion
         if (!config.skipIngest) {
+            int toIngest = actualRows - config.resumeFrom;
+            if (toIngest <= 0) {
+                System.out.println("resumeFrom (" + config.resumeFrom + ") >= rows (" + actualRows + "), nothing to ingest.");
+                System.out.println();
+            } else {
             System.out.println("=== INGESTION PHASE ===");
+            if (config.resumeFrom > 0) {
+                System.out.println("Resuming from position " + config.resumeFrom + ", ingesting " + toIngest + " rows.");
+            }
             MetricsCollector ingestMetrics = new MetricsCollector();
             AtomicReference<String> ingestStatus = new AtomicReference<>("");
 
             BlockingQueue<float[]> ingestQueue = new ArrayBlockingQueue<>(1000);
             AtomicBoolean producerDone = new AtomicBoolean(false);
-            AtomicLong rowId = new AtomicLong(0);
+            AtomicLong rowId = new AtomicLong(config.resumeFrom);
 
             long ingestStart = System.nanoTime();
 
@@ -142,7 +150,7 @@ public class VectorBench {
             progressThread.setDaemon(true);
             progressThread.start();
 
-            try (DatasetLoader.VectorStream stream = loader.streamBaseVectors(actualRows)) {
+            try (DatasetLoader.VectorStream stream = loader.streamBaseVectors(config.resumeFrom, toIngest)) {
                 for (float[] vec : stream) {
                     ingestQueue.put(vec);
                 }
@@ -167,7 +175,7 @@ public class VectorBench {
 
             // Verify row count matches ingested records
             if (!config.skipVerify) {
-                long expectedRows = ingestMetrics.getCount();
+                long expectedRows = config.resumeFrom + ingestMetrics.getCount();
                 long[] actualCount = {0};
                 runWithProgress("=== VERIFICATION (COUNT) ===", () -> {
                     try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
@@ -184,6 +192,7 @@ public class VectorBench {
                 System.out.printf("Verification OK: %d rows in table%n", actualCount[0]);
             }
             System.out.println();
+            } // end toIngest > 0
         } else {
             System.out.println("Skipping ingestion phase.");
             System.out.println();
