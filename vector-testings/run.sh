@@ -16,4 +16,5 @@ if [ -z "$JAR" ]; then
     exit 1
 fi
 
-exec java -jar "$JAR" "$@"
+JAVA_HEAP="${VECTORBENCH_HEAP:--Xms2g -Xmx8g}"
+exec java $JAVA_HEAP -jar "$JAR" "$@"

@@ -1,17 +1,36 @@
 package herddb.vectortesting;
 
 import java.util.Arrays;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.LongAdder;
 
 public class MetricsCollector {
 
+    // Reservoir sampling: keep at most MAX_SAMPLES latency values so that memory
+    // usage stays bounded even when ingesting hundreds of millions of rows.
+    private static final int MAX_SAMPLES = 100_000;
+
     private final LongAdder count = new LongAdder();
-    private final ConcurrentLinkedQueue<Long> latenciesNanos = new ConcurrentLinkedQueue<>();
+    private final long[] reservoir = new long[MAX_SAMPLES];
+    private final LongAdder samplesStored = new LongAdder();
 
     public void record(long nanos) {
+        long n = count.longValue() + 1; // approximate position before increment
         count.increment();
-        latenciesNanos.add(nanos);
+        long stored = samplesStored.longValue();
+        if (stored < MAX_SAMPLES) {
+            // Fill reservoir sequentially until full
+            long idx = samplesStored.getAndIncrement(); // may race, but bounded by MAX_SAMPLES
+            if (idx < MAX_SAMPLES) {
+                reservoir[(int) idx] = nanos;
+            }
+        } else {
+            // Reservoir sampling: replace a random slot with probability MAX_SAMPLES/n
+            long slot = ThreadLocalRandom.current().nextLong(n);
+            if (slot < MAX_SAMPLES) {
+                reservoir[(int) slot] = nanos;
+            }
+        }
     }
 
     public long getCount() {
@@ -19,18 +38,20 @@ public class MetricsCollector {
     }
 
     public Stats computeStats() {
-        long[] sorted = latenciesNanos.stream().mapToLong(Long::longValue).sorted().toArray();
-        if (sorted.length == 0) {
+        int size = (int) Math.min(samplesStored.sum(), MAX_SAMPLES);
+        if (size == 0) {
             return new Stats(0, 0, 0, 0, 0, 0);
         }
+        long[] sorted = Arrays.copyOf(reservoir, size);
+        Arrays.sort(sorted);
         double mean = Arrays.stream(sorted).average().orElse(0);
         return new Stats(
-                sorted.length,
+                count.sum(),
                 mean,
-                sorted[percentileIndex(sorted.length, 50)],
-                sorted[percentileIndex(sorted.length, 95)],
-                sorted[percentileIndex(sorted.length, 99)],
-                sorted[sorted.length - 1]
+                sorted[percentileIndex(size, 50)],
+                sorted[percentileIndex(size, 95)],
+                sorted[percentileIndex(size, 99)],
+                sorted[size - 1]
         );
     }
 

@@ -13,7 +13,7 @@ public class Config {
 
     String jdbcUrl = "jdbc:herddb:server:localhost:7000";
     String username = "sa";
-    String password = "";
+    String password = "hdb";
     String tableName = "vector_bench";
     String datasetDir = "./datasets";
     String datasetUrl = null; // null means use preset default
@@ -38,7 +38,7 @@ public class Config {
         Options opts = new Options();
         opts.addOption("u", "url", true, "JDBC URL (default: jdbc:herddb:server:localhost:7000)");
         opts.addOption(null, "user", true, "Username (default: sa)");
-        opts.addOption(null, "password", true, "Password (default: empty)");
+        opts.addOption(null, "password", true, "Password (default: hdb)");
         opts.addOption(null, "table", true, "Table name (default: vector_bench)");
         opts.addOption(null, "dataset-dir", true, "Dataset download/cache directory (default: ./datasets)");
         opts.addOption(null, "dataset", true, "Dataset preset: sift10k, sift1m, gist1m, sift10m, bigann, glove100, deep-image-96 (default: sift1m)");

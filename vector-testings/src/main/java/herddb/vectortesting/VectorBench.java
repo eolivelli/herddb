@@ -126,11 +126,15 @@ public class VectorBench {
             AtomicBoolean ingestDone = new AtomicBoolean(false);
             Thread progressThread = new Thread(() -> {
                 int spin = 0;
+                Runtime rt = Runtime.getRuntime();
                 while (!ingestDone.get()) {
                     double elapsed = (System.nanoTime() - ingestStart) / 1e9;
                     int filled = Math.min(40, (int)(elapsed / 5));
                     String bar = "=".repeat(filled) + " ".repeat(40 - filled);
-                    System.out.printf("\r  [%s] %c %.0fs | %s", bar, ingestSpinner[spin++ % 4], elapsed, ingestStatus.get());
+                    long usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+                    long maxMb = rt.maxMemory() / (1024 * 1024);
+                    System.out.printf("\r  [%s] %c %.0fs | heap: %d/%d MB | %s",
+                            bar, ingestSpinner[spin++ % 4], elapsed, usedMb, maxMb, ingestStatus.get());
                     System.out.flush();
                     try { Thread.sleep(500); } catch (InterruptedException e) { break; }
                 }
