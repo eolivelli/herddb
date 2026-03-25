@@ -228,6 +228,7 @@ public class DatasetLoader {
         URI uri = URI.create(urlStr);
         FTPClient ftp = new FTPClient();
         ftp.setConnectTimeout(30_000);
+        ftp.setDefaultTimeout(60_000);
         ftp.setDataTimeout(Duration.ofMillis(60_000));
         ftp.connect(uri.getHost(), uri.getPort() < 0 ? 21 : uri.getPort());
         ftp.login("anonymous", "anonymous@example.com");
