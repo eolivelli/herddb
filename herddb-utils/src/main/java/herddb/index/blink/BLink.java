@@ -37,6 +37,7 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.ArrayDeque;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -86,6 +87,11 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
      * Debug flag to remove some logs and checks during normal operations
      */
     private static final boolean DEBUG = false;
+
+    @SuppressWarnings("rawtypes")
+    private static final ThreadLocal<ArrayDeque> TL_DESCENT = ThreadLocal.withInitial(ArrayDeque::new);
+    @SuppressWarnings("rawtypes")
+    private static final ThreadLocal<ArrayDeque> TL_MAINTENANCE = ThreadLocal.withInitial(ArrayDeque::new);
 
     private static final Logger LOGGER = Logger.getLogger(BLink.class.getName());
 
@@ -698,11 +704,14 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
 //        normalize(n, descent, 1);
 //        unlock(n, writelock)
 //    end;
+    @SuppressWarnings("unchecked")
     public boolean insert(K v, V e, V expected) {
 
         Node<K, V> n;
-        Deque<ResultCouple<K, V>> descent = new LinkedList<>();
-        Queue<CriticJob> maintenance = new LinkedList<>();
+        Deque<ResultCouple<K, V>> descent = TL_DESCENT.get();
+        descent.clear();
+        Queue<CriticJob> maintenance = TL_MAINTENANCE.get();
+        maintenance.clear();
 
         try {
 
@@ -737,11 +746,14 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
         return added;
     }
 
+    @SuppressWarnings("unchecked")
     public V insert(K v, V e) {
 
         Node<K, V> n;
-        Deque<ResultCouple<K, V>> descent = new LinkedList<>();
-        Queue<CriticJob> maintenance = new LinkedList<>();
+        Deque<ResultCouple<K, V>> descent = TL_DESCENT.get();
+        descent.clear();
+        Queue<CriticJob> maintenance = TL_MAINTENANCE.get();
+        maintenance.clear();
 
         try {
 
@@ -785,11 +797,14 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
 //        delete := remove-key(v, n); {decisive}
 //        nornialize(n, descent, 1); unlock(n, writelock)
 //    end;
+    @SuppressWarnings("unchecked")
     public V delete(K v) {
 
         Node<K, V> n;
-        Deque<ResultCouple<K, V>> descent = new LinkedList<>();
-        Queue<CriticJob> maintenance = new LinkedList<>();
+        Deque<ResultCouple<K, V>> descent = TL_DESCENT.get();
+        descent.clear();
+        Queue<CriticJob> maintenance = TL_MAINTENANCE.get();
+        maintenance.clear();
 
         try {
 
@@ -1421,7 +1436,7 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
 
     @SuppressWarnings("unchecked")
     private Deque<ResultCouple<K, V>> clone(Deque<ResultCouple<K, V>> descent) {
-        return (Deque<ResultCouple<K, V>>) ((LinkedList<ResultCouple<K, V>>) descent).clone();
+        return (Deque<ResultCouple<K, V>>) ((ArrayDeque<ResultCouple<K, V>>) descent).clone();
     }
 
     /*

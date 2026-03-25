@@ -63,6 +63,9 @@ public final class RecordSerializer {
 
     private static final int INITIAL_BUFFER_SIZE = SystemProperties.getIntSystemProperty("herddb.serializer.initbufsize", 1024);
 
+    private static final ThreadLocal<VisibleByteArrayOutputStream> TL_BUFFER =
+            ThreadLocal.withInitial(() -> new VisibleByteArrayOutputStream(INITIAL_BUFFER_SIZE));
+
     public static Object deserialize(Bytes data, int type) {
         switch (type) {
             case ColumnTypes.BYTEARRAY:
@@ -853,7 +856,8 @@ public final class RecordSerializer {
             }
             return serialize(v, c.type);
         } else {
-            VisibleByteArrayOutputStream key = new VisibleByteArrayOutputStream(columns.length * Long.BYTES);
+            VisibleByteArrayOutputStream key = TL_BUFFER.get();
+            key.reset();
             // beware that we can serialize even only a part of the PK, for instance of a prefix index scan
             try (ExtendedDataOutputStream doo_key = new ExtendedDataOutputStream(key)) {
                 int i = 0;
@@ -872,7 +876,7 @@ public final class RecordSerializer {
             } catch (IOException err) {
                 throw new RuntimeException(err);
             }
-            return key.toByteArrayNoCopy();
+            return key.toByteArray();
         }
     }
 
@@ -998,7 +1002,8 @@ public final class RecordSerializer {
     }
 
     public static byte[] serializeValueRaw(Map<String, Object> record, Table table, int expectedSize) {
-        VisibleByteArrayOutputStream value = new VisibleByteArrayOutputStream(expectedSize <= 0 ? INITIAL_BUFFER_SIZE : expectedSize);
+        VisibleByteArrayOutputStream value = TL_BUFFER.get();
+        value.reset();
         try (ExtendedDataOutputStream doo = new ExtendedDataOutputStream(value)) {
             for (Column c : table.columns) {
                 Object v = record.get(c.name);
@@ -1011,14 +1016,15 @@ public final class RecordSerializer {
             throw new RuntimeException(err);
         }
 
-        return value.toByteArrayNoCopy();
+        return value.toByteArray();
     }
 
     public static byte[] buildRecord(
             int expectedSize, Table table,
             Function<String, Object> evaluator
     ) {
-        VisibleByteArrayOutputStream value = new VisibleByteArrayOutputStream(expectedSize <= 0 ? INITIAL_BUFFER_SIZE : expectedSize);
+        VisibleByteArrayOutputStream value = TL_BUFFER.get();
+        value.reset();
         try (ExtendedDataOutputStream doo = new ExtendedDataOutputStream(value)) {
             for (Column c : table.columns) {
                 if (!table.isPrimaryKeyColumn(c.name)) {
@@ -1033,7 +1039,7 @@ public final class RecordSerializer {
             throw new RuntimeException(err);
         }
 
-        return value.toByteArrayNoCopy();
+        return value.toByteArray();
     }
 
     public static Record toRecord(Map<String, Object> record, Table table) {

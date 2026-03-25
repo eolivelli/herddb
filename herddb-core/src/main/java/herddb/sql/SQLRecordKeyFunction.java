@@ -100,6 +100,24 @@ public class SQLRecordKeyFunction extends RecordFunction {
         }
         final DataAccessor prevRecord = previous == null ? DataAccessor.NULL : previous.getDataAccessor(tableContext.getTable());
 
+        if (fullPrimaryKey && columns.length == 1) {
+            herddb.model.Column c = columns[0];
+            Object value = expressions.get(0).evaluate(prevRecord, context);
+            if (value == null) {
+                throw new InvalidNullValueForKeyException("error while converting primary key, key column " + c.name + " cannot be null");
+            }
+            try {
+                value = RecordSerializer.convert(c.type, value);
+            } catch (StatementExecutionException err) {
+                throw new StatementExecutionException("error on column " + c.name + " (" + ColumnTypes.typeToString(c.type) + "):" + err.getMessage(), err);
+            }
+            byte[] result = RecordSerializer.serialize(value, c.type);
+            if (isConstant) {
+                statementEvaluationContext.cacheConstant(this, result);
+            }
+            return result;
+        }
+
         Map<String, Object> pk = new HashMap<>();
         for (int i = 0; i < columns.length; i++) {
             herddb.model.Column c = columns[i];
