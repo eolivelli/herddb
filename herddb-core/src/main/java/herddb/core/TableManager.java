@@ -2250,8 +2250,13 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         }
 
         if (page == null || page.immutable) {
-            /* Unloaded or immutable, set it as dirty */
-            pageSet.setPageDirty(pageId, previous);
+            /* Unloaded or immutable, set it as dirty.
+             * Skip if page is not in pageSet: this happens during crash recovery when keyToPage
+             * references an unflushed DML page (P5) that was captured in the PK checkpoint but
+             * never persisted to storage. The WAL replay will re-apply the delete correctly. */
+            if (page != null || pageSet.containsActivePage(pageId)) {
+                pageSet.setPageDirty(pageId, previous);
+            }
         } else {
             /* Mutable page, need to check if still modifiable or already unloaded */
             final Lock lock = page.pageLock.readLock();
@@ -2347,8 +2352,14 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         }
 
         if (prevPage == null || prevPage.immutable) {
-            /* Unloaded or immutable, set it as dirty */
-            pageSet.setPageDirty(prevPageId, previous);
+            /* Unloaded or immutable, set it as dirty.
+             * Skip if page is not in pageSet: this happens during crash recovery when keyToPage
+             * references an unflushed DML page (P5) that was captured in the PK checkpoint but
+             * never persisted to storage. The WAL replay will re-insert the record into the
+             * current DML page below. */
+            if (prevPage != null || pageSet.containsActivePage(prevPageId)) {
+                pageSet.setPageDirty(prevPageId, previous);
+            }
         } else {
             /* Mutable page, need to check if still modifiable or already unloaded */
             final Lock lock = prevPage.pageLock.readLock();
