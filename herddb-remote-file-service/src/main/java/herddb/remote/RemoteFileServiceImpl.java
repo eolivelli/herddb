@@ -225,6 +225,13 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
                             listLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
                             LOGGER.log(Level.WARNING, "listFiles streaming failed for prefix " + request.getPrefix()
                                     + " after " + elapsedMs(start) + "ms (sent " + paths.size() + " entries)", streamError);
+                            try {
+                                responseObserver.onError(
+                                        Status.INTERNAL.withDescription(streamError.getMessage()).withCause(streamError)
+                                                .asRuntimeException());
+                            } catch (Exception ignored) {
+                                // stream may already be closed; nothing more we can do
+                            }
                         }
                     }
                 });

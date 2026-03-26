@@ -49,9 +49,11 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -71,6 +73,19 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
     private final RemoteFileServiceClient client;
     private final Path tmpDir;
     private final int swapThreshold;
+
+    /**
+     * Tracks the set of active data page IDs as of the last successful tableCheckpoint per
+     * "{tableSpace}/{uuid}" key. Used to compute the stale-page diff without a full remote listFiles.
+     * Populated on the first checkpoint after boot (via listFiles fallback); subsequent checkpoints
+     * use the diff path.  Entries are evicted when a table or tablespace is dropped.
+     */
+    private final ConcurrentHashMap<String, Set<Long>> lastCheckpointedDataPages = new ConcurrentHashMap<>();
+
+    /**
+     * Same as {@link #lastCheckpointedDataPages} but for index pages.
+     */
+    private final ConcurrentHashMap<String, Set<Long>> lastCheckpointedIndexPages = new ConcurrentHashMap<>();
 
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
@@ -305,18 +320,38 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
         final Map<Long, Integer> pins = pinTableAndGetPages(tableSpace, uuid, tableStatus, pin);
         long maxPageId = tableStatus.activePages.keySet().stream()
                 .max(Comparator.naturalOrder()).orElse(Long.MAX_VALUE);
+        Set<Long> currentActivePages = tableStatus.activePages.keySet();
+        String key = tableSpace + "/" + uuid;
 
-        List<String> remotePages = client.listFiles(remoteDataPrefix(tableSpace, uuid));
-        for (String remotePath : remotePages) {
-            long pageId = pageIdFromRemotePath(remotePath);
-            if (pageId > 0
-                    && !pins.containsKey(pageId)
-                    && !tableStatus.activePages.containsKey(pageId)
-                    && pageId < maxPageId) {
-                result.add(new RemoteDeletePageAction(tableSpace, uuid,
-                        "delete remote page " + pageId, remotePath, client));
+        Set<Long> previousActivePages = lastCheckpointedDataPages.get(key);
+        if (previousActivePages != null) {
+            // Fast path: diff against the previous checkpoint — no remote listing needed
+            for (Long pageId : previousActivePages) {
+                if (!pins.containsKey(pageId)
+                        && !currentActivePages.contains(pageId)
+                        && pageId < maxPageId) {
+                    result.add(new RemoteDeletePageAction(tableSpace, uuid,
+                            "delete remote page " + pageId,
+                            remoteDataPagePath(tableSpace, uuid, pageId), client));
+                }
+            }
+        } else {
+            // First checkpoint after boot: enumerate all remote files to find orphans
+            LOGGER.log(Level.INFO, "tableCheckpoint {0}/{1}: using full remote listing (first checkpoint after boot)",
+                    new Object[]{tableSpace, uuid});
+            List<String> remotePages = client.listFiles(remoteDataPrefix(tableSpace, uuid));
+            for (String remotePath : remotePages) {
+                long pageId = pageIdFromRemotePath(remotePath);
+                if (pageId > 0
+                        && !pins.containsKey(pageId)
+                        && !currentActivePages.contains(pageId)
+                        && pageId < maxPageId) {
+                    result.add(new RemoteDeletePageAction(tableSpace, uuid,
+                            "delete remote page " + pageId, remotePath, client));
+                }
             }
         }
+        lastCheckpointedDataPages.put(key, new HashSet<>(currentActivePages));
         return result;
     }
 
@@ -329,18 +364,38 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
         final Map<Long, Integer> pins = pinIndexAndGetPages(tableSpace, uuid, indexStatus, pin);
         long maxPageId = indexStatus.activePages.stream()
                 .max(Comparator.naturalOrder()).orElse(Long.MAX_VALUE);
+        Set<Long> currentActivePages = indexStatus.activePages;
+        String key = tableSpace + "/" + uuid;
 
-        List<String> remotePages = client.listFiles(remoteIndexPrefix(tableSpace, uuid));
-        for (String remotePath : remotePages) {
-            long pageId = pageIdFromRemotePath(remotePath);
-            if (pageId > 0
-                    && !pins.containsKey(pageId)
-                    && !indexStatus.activePages.contains(pageId)
-                    && pageId < maxPageId) {
-                result.add(new RemoteDeletePageAction(tableSpace, uuid,
-                        "delete remote index page " + pageId, remotePath, client));
+        Set<Long> previousActivePages = lastCheckpointedIndexPages.get(key);
+        if (previousActivePages != null) {
+            // Fast path: diff against the previous checkpoint — no remote listing needed
+            for (Long pageId : previousActivePages) {
+                if (!pins.containsKey(pageId)
+                        && !currentActivePages.contains(pageId)
+                        && pageId < maxPageId) {
+                    result.add(new RemoteDeletePageAction(tableSpace, uuid,
+                            "delete remote index page " + pageId,
+                            remoteIndexPagePath(tableSpace, uuid, pageId), client));
+                }
+            }
+        } else {
+            // First checkpoint after boot: enumerate all remote files to find orphans
+            LOGGER.log(Level.INFO, "indexCheckpoint {0}/{1}: using full remote listing (first checkpoint after boot)",
+                    new Object[]{tableSpace, uuid});
+            List<String> remotePages = client.listFiles(remoteIndexPrefix(tableSpace, uuid));
+            for (String remotePath : remotePages) {
+                long pageId = pageIdFromRemotePath(remotePath);
+                if (pageId > 0
+                        && !pins.containsKey(pageId)
+                        && !currentActivePages.contains(pageId)
+                        && pageId < maxPageId) {
+                    result.add(new RemoteDeletePageAction(tableSpace, uuid,
+                            "delete remote index page " + pageId, remotePath, client));
+                }
             }
         }
+        lastCheckpointedIndexPages.put(key, new HashSet<>(currentActivePages));
         return result;
     }
 
@@ -385,24 +440,30 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
     public void dropTable(String tableSpace, String uuid) throws DataStorageManagerException {
         localMetadataManager.dropTable(tableSpace, uuid);
         client.deleteByPrefix(remoteDataPrefix(tableSpace, uuid));
+        lastCheckpointedDataPages.remove(tableSpace + "/" + uuid);
     }
 
     @Override
     public void dropIndex(String tableSpace, String uuid) throws DataStorageManagerException {
         localMetadataManager.dropIndex(tableSpace, uuid);
         client.deleteByPrefix(remoteIndexPrefix(tableSpace, uuid));
+        lastCheckpointedIndexPages.remove(tableSpace + "/" + uuid);
     }
 
     @Override
     public void truncateIndex(String tableSpace, String uuid) throws DataStorageManagerException {
         localMetadataManager.truncateIndex(tableSpace, uuid);
         client.deleteByPrefix(remoteIndexPrefix(tableSpace, uuid));
+        lastCheckpointedIndexPages.remove(tableSpace + "/" + uuid);
     }
 
     @Override
     public void eraseTablespaceData(String tableSpace) throws DataStorageManagerException {
         localMetadataManager.eraseTablespaceData(tableSpace);
         client.deleteByPrefix(remoteTablespacePrefix(tableSpace));
+        String prefix = tableSpace + "/";
+        lastCheckpointedDataPages.keySet().removeIf(k -> k.startsWith(prefix));
+        lastCheckpointedIndexPages.keySet().removeIf(k -> k.startsWith(prefix));
     }
 
     @Override

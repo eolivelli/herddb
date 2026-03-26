@@ -24,6 +24,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.core.PageSet;
+import herddb.core.PostCheckpointAction;
 import herddb.log.LogSequenceNumber;
 import herddb.model.Record;
 import herddb.storage.FullTableScanConsumer;
@@ -229,5 +230,141 @@ public class RemoteFileDataStorageManagerBasicTest {
         // Page 1 still readable
         List<Record> records = storage.readPage("ts1", "uuid1", 1L);
         assertEquals(1, records.size());
+    }
+
+    /**
+     * Verifies that stale pages from a previous checkpoint are scheduled for deletion on the
+     * second checkpoint using the in-memory diff (no remote listFiles needed after the first
+     * checkpoint).
+     *
+     * Scenario:
+     *   1. Write pages 1, 2, 3.
+     *   2. First checkpoint: active = {1, 2, 3}. Triggers listFiles fallback; no stale pages.
+     *   3. Write page 4.
+     *   4. Second checkpoint: active = {2, 3, 4}. Page 1 is stale; diff path used.
+     *      A RemoteDeletePageAction for page 1 must be returned.
+     *   5. Execute PostCheckpointActions → page 1 is deleted remotely.
+     *   6. Third checkpoint: active = {3, 4}. Pages 1 and 2 become stale.
+     *      Page 1 is already gone (idempotent delete); page 2 deletion is returned.
+     */
+    @Test
+    public void testTableCheckpointInMemoryDiffDeletesStalePages() throws Exception {
+        storage.initTablespace("ts1");
+        storage.initTable("ts1", "uuid1");
+
+        // Write pages 1, 2, 3
+        for (int p = 1; p <= 3; p++) {
+            storage.writePage("ts1", "uuid1", p, Collections.singletonList(
+                    new Record(Bytes.from_string("k" + p), Bytes.from_string("v" + p))));
+        }
+
+        LogSequenceNumber lsn1 = new LogSequenceNumber(1, 1);
+        Map<Long, PageSet.DataPageMetaData> activePages1 = new HashMap<>();
+        activePages1.put(1L, makeMeta());
+        activePages1.put(2L, makeMeta());
+        activePages1.put(3L, makeMeta());
+        TableStatus status1 = new TableStatus("uuid1", lsn1, Bytes.longToByteArray(4L), 4L, activePages1);
+
+        // First checkpoint — listFiles fallback; pages 1, 2, 3 are all active → no stale pages
+        List<PostCheckpointAction> actions1 = storage.tableCheckpoint("ts1", "uuid1", status1, false);
+        for (PostCheckpointAction a : actions1) {
+            a.run();
+        }
+
+        // All three pages still readable
+        assertNotNull(storage.readPage("ts1", "uuid1", 1L));
+        assertNotNull(storage.readPage("ts1", "uuid1", 2L));
+        assertNotNull(storage.readPage("ts1", "uuid1", 3L));
+
+        // Write page 4
+        storage.writePage("ts1", "uuid1", 4L, Collections.singletonList(
+                new Record(Bytes.from_string("k4"), Bytes.from_string("v4"))));
+
+        LogSequenceNumber lsn2 = new LogSequenceNumber(1, 2);
+        Map<Long, PageSet.DataPageMetaData> activePages2 = new HashMap<>();
+        activePages2.put(2L, makeMeta());
+        activePages2.put(3L, makeMeta());
+        activePages2.put(4L, makeMeta());
+        TableStatus status2 = new TableStatus("uuid1", lsn2, Bytes.longToByteArray(5L), 5L, activePages2);
+
+        // Second checkpoint — diff path: page 1 is stale and must be scheduled for deletion
+        List<PostCheckpointAction> actions2 = storage.tableCheckpoint("ts1", "uuid1", status2, false);
+        long staleCount2 = actions2.stream()
+                .filter(a -> a.description.contains("page 1"))
+                .count();
+        assertTrue("Expected a delete action for stale page 1; got actions: " + actions2, staleCount2 >= 1);
+
+        // Execute actions → page 1 deleted remotely
+        for (PostCheckpointAction a : actions2) {
+            a.run();
+        }
+        // Pages 2, 3, 4 still accessible
+        assertNotNull(storage.readPage("ts1", "uuid1", 2L));
+        assertNotNull(storage.readPage("ts1", "uuid1", 3L));
+        assertNotNull(storage.readPage("ts1", "uuid1", 4L));
+
+        // Third checkpoint: active = {3, 4} → pages 1 and 2 should be scheduled for deletion
+        // (page 1 is already gone — delete is idempotent)
+        LogSequenceNumber lsn3 = new LogSequenceNumber(1, 3);
+        Map<Long, PageSet.DataPageMetaData> activePages3 = new HashMap<>();
+        activePages3.put(3L, makeMeta());
+        activePages3.put(4L, makeMeta());
+        TableStatus status3 = new TableStatus("uuid1", lsn3, Bytes.longToByteArray(6L), 6L, activePages3);
+
+        List<PostCheckpointAction> actions3 = storage.tableCheckpoint("ts1", "uuid1", status3, false);
+        long staleCount3page2 = actions3.stream()
+                .filter(a -> a.description.contains("page 2"))
+                .count();
+        assertTrue("Expected a delete action for stale page 2 in third checkpoint", staleCount3page2 >= 1);
+        for (PostCheckpointAction a : actions3) {
+            a.run();
+        }
+        // Pages 3, 4 still accessible
+        assertNotNull(storage.readPage("ts1", "uuid1", 3L));
+        assertNotNull(storage.readPage("ts1", "uuid1", 4L));
+    }
+
+    /**
+     * Verifies that when the file server is unavailable after the first checkpoint,
+     * subsequent checkpoints still succeed using the in-memory diff path (no listFiles call).
+     */
+    @Test
+    public void testTableCheckpointSucceedsWithoutServerAfterFirstCheckpoint() throws Exception {
+        storage.initTablespace("ts1");
+        storage.initTable("ts1", "uuid1");
+
+        storage.writePage("ts1", "uuid1", 1L, Collections.singletonList(
+                new Record(Bytes.from_string("k1"), Bytes.from_string("v1"))));
+        storage.writePage("ts1", "uuid1", 2L, Collections.singletonList(
+                new Record(Bytes.from_string("k2"), Bytes.from_string("v2"))));
+
+        LogSequenceNumber lsn1 = new LogSequenceNumber(1, 1);
+        Map<Long, PageSet.DataPageMetaData> activePages1 = new HashMap<>();
+        activePages1.put(1L, makeMeta());
+        activePages1.put(2L, makeMeta());
+        TableStatus status1 = new TableStatus("uuid1", lsn1, Bytes.longToByteArray(3L), 3L, activePages1);
+
+        // First checkpoint — populates in-memory state via listFiles fallback
+        List<PostCheckpointAction> actions1 = storage.tableCheckpoint("ts1", "uuid1", status1, false);
+        for (PostCheckpointAction a : actions1) {
+            a.run();
+        }
+
+        // Stop the file server — subsequent listFiles calls would fail
+        server.stop();
+
+        // Second checkpoint — must use the diff path, not listFiles; page 1 becomes stale
+        LogSequenceNumber lsn2 = new LogSequenceNumber(1, 2);
+        Map<Long, PageSet.DataPageMetaData> activePages2 = new HashMap<>();
+        activePages2.put(2L, makeMeta());
+        TableStatus status2 = new TableStatus("uuid1", lsn2, Bytes.longToByteArray(3L), 3L, activePages2);
+
+        // Must NOT throw even though the file server is gone
+        List<PostCheckpointAction> actions2 = storage.tableCheckpoint("ts1", "uuid1", status2, false);
+        long staleCount = actions2.stream()
+                .filter(a -> a.description.contains("page 1"))
+                .count();
+        assertTrue("Expected a delete action for stale page 1", staleCount >= 1);
+        // Note: tearDown calls server.stop() (idempotent) and client.close() which are safe here.
     }
 }
