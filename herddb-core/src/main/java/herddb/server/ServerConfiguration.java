@@ -64,7 +64,7 @@ public final class ServerConfiguration {
     public static final long PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT_DEFAULT = 1800; // 30 minutes, in seconds
 
     public static final String PROPERTY_REMOTE_FILE_CLIENT_RETRIES = "remote.file.client.retries";
-    public static final int PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT = 2;
+    public static final int PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT = 10;
 
     public static final String PROPERTY_BASEDIR = "server.base.dir";
     public static final String PROPERTY_BASEDIR_DEFAULT = "dbdata";
