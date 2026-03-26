@@ -30,7 +30,6 @@ import herddb.index.KeyToPageIndex;
 import herddb.index.PrimaryIndexPrefixScan;
 import herddb.index.PrimaryIndexRangeScan;
 import herddb.index.PrimaryIndexSeek;
-
 import herddb.index.blink.BLinkMetadata.BLinkNodeMetadata;
 import herddb.log.LogSequenceNumber;
 import herddb.model.ColumnTypes;

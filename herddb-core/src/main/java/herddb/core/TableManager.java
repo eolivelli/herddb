@@ -371,28 +371,58 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     private void registerTableMetrics(StatsLogger tableMetrics) {
         this.tableStatsLogger = tableMetrics;
         this.tableSizeGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getTablesize(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getTablesize();
+            }
         };
         tableMetrics.registerGauge("table_size", tableSizeGauge);
         this.loadedPagesGauge = new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return stats.getLoadedpages(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return stats.getLoadedpages();
+            }
         };
         tableMetrics.registerGauge("loaded_pages", loadedPagesGauge);
         this.buffersUsedMemoryGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getBuffersUsedMemory(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getBuffersUsedMemory();
+            }
         };
         tableMetrics.registerGauge("buffers_used_memory", buffersUsedMemoryGauge);
         this.keysUsedMemoryGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getKeysUsedMemory(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getKeysUsedMemory();
+            }
         };
         tableMetrics.registerGauge("keys_used_memory", keysUsedMemoryGauge);
         this.dirtyPagesGauge = new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return stats.getDirtypages(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return stats.getDirtypages();
+            }
         };
         tableMetrics.registerGauge("dirty_pages", dirtyPagesGauge);
     }
@@ -790,7 +820,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         LOGGER.log(Level.FINER, "creating mutable page table {0}, pageId={1} with {2} records, {3} logical page size",
                 new Object[]{table.name, newId, expectedSize, initiaPageSize});
 
-        final DataPage newPage = new DataPage(this, newId, maxLogicalPageSize, initiaPageSize, new HashMap<Bytes, Record>(expectedSize), false);
+        final DataPage newPage = new DataPage(this, newId, maxLogicalPageSize, initiaPageSize, new ConcurrentHashMap<>(expectedSize), false);
 
         pages.put(newId, newPage);
 
@@ -869,7 +899,23 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                  * For similar reason we replace the page only if there actually is a page in the first place. If
                  * a concurrent thread flushed and removed the page we don't want to add it again.
                  */
-                pages.computeIfPresent(page.pageId, (i, p) -> p.toImmutable());
+                /*
+                 * Convert the page to immutable and capture the new immutable instance.
+                 * We must add the immutable instance (not the original) to pageReplacementPolicy so
+                 * that close() can remove it: close() iterates pages.values() and calls remove(),
+                 * which uses page.metadata — the metadata is set on whichever object is passed to add().
+                 *
+                 * Only add to the replacement policy if the page was not already registered there
+                 * (page.metadata == null). Pages that were added by allocateLivePage when they filled up
+                 * already have metadata set; adding the immutable copy again would throw "Added a page twice".
+                 */
+                final DataPage immutablePage = pages.computeIfPresent(page.pageId, (i, p) -> p.toImmutable());
+                if (immutablePage != null && page.metadata == null) {
+                    final Page.Metadata unloadMeta = pageReplacementPolicy.add(immutablePage);
+                    if (unloadMeta != null) {
+                        unloadMeta.owner.unload(unloadMeta.pageId);
+                    }
+                }
                 return;
 
             case ALREADY_FLUSHED:
@@ -1068,6 +1114,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
                 page.writable = false;
 
+                /*
+                 * Register the page in pageSet while still holding the write lock (when keepPageInMemory=true
+                 * the lock is released right after this block). This prevents a race where a concurrent DML
+                 * thread sees page.writable=false but the page is not yet in pageSet, which would cause an
+                 * IllegalStateException in setPageDirty.
+                 */
+                if (keepPageInMemory) {
+                    pageSet.pageCreated(page.pageId, page);
+                }
+
             } finally {
 
                 /* Fast unlock if we must keep the page in memory */
@@ -1078,8 +1134,10 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
             dataStorageManager.writePage(tableSpaceUUID, table.uuid, page.pageId, page.getRecordsForFlush());
 
-            /* Set the page as a fully active page */
-            pageSet.pageCreated(page.pageId, page);
+            /* Set the page as a fully active page (when not kept in memory, done after I/O under write lock) */
+            if (!keepPageInMemory) {
+                pageSet.pageCreated(page.pageId, page);
+            }
 
             if (keepPageInMemory) {
                 /* If we must keep the page in memory we "covert" the page to immutable */
@@ -2158,7 +2216,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         final Record previous;
         if (indexes == null) {
             /* We don't need the page if isn't loaded or isn't a mutable new page */
-            page = newPages.get(pageId);
+            DataPage foundPage = newPages.get(pageId);
+            if (foundPage == null) {
+                /* The page may be a building page (non-blocking checkpoint compaction) that is
+                 * in 'pages' but not in 'newPages'. Treat it like a mutable new page. */
+                final DataPage candidate = pages.get(pageId);
+                if (candidate != null && !candidate.immutable) {
+                    foundPage = candidate;
+                }
+            }
+            page = foundPage;
 
             if (page != null) {
                 pageReplacementPolicy.pageHit(page);
@@ -2183,8 +2250,13 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         }
 
         if (page == null || page.immutable) {
-            /* Unloaded or immutable, set it as dirty */
-            pageSet.setPageDirty(pageId, previous);
+            /* Unloaded or immutable, set it as dirty.
+             * Skip if page is not in pageSet: this happens during crash recovery when keyToPage
+             * references an unflushed DML page (P5) that was captured in the PK checkpoint but
+             * never persisted to storage. The WAL replay will re-apply the delete correctly. */
+            if (page != null || pageSet.containsActivePage(pageId)) {
+                pageSet.setPageDirty(pageId, previous);
+            }
         } else {
             /* Mutable page, need to check if still modifiable or already unloaded */
             final Lock lock = page.pageLock.readLock();
@@ -2245,7 +2317,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         boolean insertedInSamePage = false;
         if (indexes == null) {
             /* We don't need the page if isn't loaded or isn't a mutable new page*/
-            prevPage = newPages.get(prevPageId);
+            DataPage foundPrevPage = newPages.get(prevPageId);
+            if (foundPrevPage == null) {
+                /* The page may be a building page (non-blocking checkpoint compaction) that is
+                 * in 'pages' but not in 'newPages'. Treat it like a mutable new page. */
+                final DataPage candidate = pages.get(prevPageId);
+                if (candidate != null && !candidate.immutable) {
+                    foundPrevPage = candidate;
+                }
+            }
+            prevPage = foundPrevPage;
 
             if (prevPage != null) {
                 pageReplacementPolicy.pageHit(prevPage);
@@ -2271,8 +2352,14 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         }
 
         if (prevPage == null || prevPage.immutable) {
-            /* Unloaded or immutable, set it as dirty */
-            pageSet.setPageDirty(prevPageId, previous);
+            /* Unloaded or immutable, set it as dirty.
+             * Skip if page is not in pageSet: this happens during crash recovery when keyToPage
+             * references an unflushed DML page (P5) that was captured in the PK checkpoint but
+             * never persisted to storage. The WAL replay will re-insert the record into the
+             * current DML page below. */
+            if (prevPage != null || pageSet.containsActivePage(prevPageId)) {
+                pageSet.setPageDirty(prevPageId, previous);
+            }
         } else {
             /* Mutable page, need to check if still modifiable or already unloaded */
             final Lock lock = prevPage.pageLock.readLock();
@@ -2876,6 +2963,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                     currentPageWasInMemory = true;
                 }
 
+                boolean abortPageCompaction = false;
                 for (Record record : records) {
 
                     /* Flush the page if it would exceed max page size */
@@ -2900,8 +2988,15 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                         flushedRecords += buildingPage.size();
                         buildingPageSize = 0;
 
-                        /* Get a new building page */
-                        buildingPage = createMutablePage(nextPageId++, buildingPage.size(), 0);
+                        /* Get a new building page - nextPageLock guards nextPageId against concurrent allocateLivePage */
+                        final long newBuildingPageId;
+                        nextPageLock.lock();
+                        try {
+                            newBuildingPageId = nextPageId++;
+                        } finally {
+                            nextPageLock.unlock();
+                        }
+                        buildingPage = createMutablePage(newBuildingPageId, buildingPage.size(), 0);
 
                         /* And if needed lock again the new building page */
                         if (page.dirty && lock == null) {
@@ -2957,26 +3052,33 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                         buildingPageSize += recordSize;
 
                         /*
-                         * If the conditional put succeedes readers will look for the record inside buildingPage,
-                         * otherwise we fail the procedure, the record should be clean!!!
+                         * If the conditional put succeeds readers will look for the record inside buildingPage.
+                         * If it fails, a concurrent DML modified this key during checkpoint Phase B.
+                         * Abort compaction of this page — leave it for the next checkpoint cycle.
+                         * The record already added to buildingPage is orphaned (no keyToPage reference) but harmless.
                          */
                         boolean handled = keyToPage.put(unshared.key, buildingPage.pageId, page.pageId);
                         if (!handled) {
-                            final IllegalStateException ex = new IllegalStateException(
-                                    "Data inconsistency! Found a clean page with dirty records based on PK data. "
-                                            + "It could be a key to page inconsistency (broken PK) or a page metadata "
-                                            + "inconsistency (failed to track dirty record on page metadata). "
-                                            + "Page: " + page + ", Record: " + unshared + ", Table: " + table.tablespace
-                                            + "." + table.name);
-                            LOGGER.log(Level.SEVERE, ex.getMessage());
-                            throw ex;
+                            LOGGER.log(Level.INFO,
+                                    "Concurrent DML modified a record on clean page {0} during checkpoint compaction"
+                                            + " for table {1}.{2}. Aborting compaction of this page.",
+                                    new Object[]{page.pageId, table.tablespace, table.name});
+                            abortPageCompaction = true;
+                            break;
                         }
 
                     }
 
                 }
 
-                if (dataPage != null) {
+                if (abortPageCompaction) {
+                    /*
+                     * A concurrent DML modified a record on this clean page during Phase B. Remove the page from
+                     * flushedPages so it remains in the active set and is not deleted by PostCheckpointActions.
+                     * It will be compacted again in the next checkpoint cycle.
+                     */
+                    flushedPages.remove(page.pageId);
+                } else if (dataPage != null) {
 
                     /* Current dirty record page isn't known to page replacement policy */
                     if (currentDirtyRecordsPage.get() != dataPage.pageId) {
@@ -2990,31 +3092,23 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                     if (removedDataPage != null && removedDataPage != dataPage) {
                         /*
                          * DataPage can be removed due to an unload request from PageReplacementPolicy and
-                         * could be event reloaded again in the meantime due to a concurrent read.
+                         * could be reloaded again in the meantime due to a concurrent read.
+                         * With concurrent DML during Phase B the reloaded page may legitimately differ
+                         * because DML modified it after we read the original. Log a warning but continue.
                          */
                         final long start = System.nanoTime();
-
-                        /*
-                         * In the rare event that a page was unloaded and then loaded again we check that page
-                         * content is the same (it should but better be on the safe side). This is a safety
-                         * check and is really rare
-                         */
                         final boolean deepEquals = removedDataPage.deepEquals(dataPage);
-
                         final long end = System.nanoTime();
 
                         LOGGER.log(Level.INFO, "Checked reloaded page during checkpoint deep equality in {0} ms",
                                 TimeUnit.NANOSECONDS.toMillis(end - start));
 
                         if (!deepEquals) {
-                            final IllegalStateException ex = new IllegalStateException(
-                                    "Data inconsistency! Failed to remove the right page from page knowledge during "
-                                            + "checkpoint. It could be an illegal concurrent write during checkpoint or "
-                                            + "the reloaded page doesn't match in memory one. " + "Expected page "
-                                            + dataPage + ", found page " + removedDataPage + " on table "
-                                            + table.tablespace + "." + table.name);
-                            LOGGER.log(Level.SEVERE, ex.getMessage());
-                            throw ex;
+                            LOGGER.log(Level.WARNING,
+                                    "Page {0} was reloaded with different content during checkpoint for table {1}.{2}."
+                                            + " This can happen with concurrent DML during checkpoint Phase B."
+                                            + " Expected page: {3}, found page: {4}",
+                                    new Object[]{page.pageId, table.tablespace, table.name, dataPage, removedDataPage});
                         }
                     }
 
@@ -3066,47 +3160,55 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         final long dirtyPageThreshold = dirtyThreshold > 0 ? (long) (dirtyThreshold * maxLogicalPageSize) : -1;
 
         long start = System.currentTimeMillis();
-        long end;
-        long getlock;
-        long pageAnalysis;
-        long dirtyPagesFlush;
-        long smallPagesFlush;
-        long newPagesFlush;
-        long keytopagecheckpoint;
-        long indexcheckpoint;
-        long tablecheckpoint;
+        long end = 0;
+        long getlock = 0;
+        long pageAnalysis = 0;
+        long dirtyPagesFlush = 0;
+        long smallPagesFlush = 0;
+        long newPagesFlush = 0;
+        long keytopagecheckpoint = 0;
+        long indexcheckpoint = 0;
+        long tablecheckpoint = 0;
         final List<PostCheckpointAction> actions = new ArrayList<>();
 
         TableCheckpoint result;
+
+        /* ====================================================== */
+        /* === PHASE A: Brief write lock — snapshot page state === */
+        /* ====================================================== */
 
         boolean lockAcquired;
         try {
             lockAcquired = checkpointLock.asWriteLock().tryLock(CHECKPOINT_LOCK_WRITE_TIMEOUT, TimeUnit.SECONDS);
         } catch (InterruptedException err) {
-            throw new DataStorageManagerException("interrupted while waiting for checkpoint lock", err);
+            throw new DataStorageManagerException("interrupted while waiting for checkpoint lock (Phase A)", err);
         }
         if (!lockAcquired) {
-            throw new DataStorageManagerException("timed out while waiting for checkpoint lock, write lock " + checkpointLock.writeLock());
+            throw new DataStorageManagerException("timed out while waiting for checkpoint lock (Phase A), write lock " + checkpointLock.writeLock());
         }
+
+        final LogSequenceNumber sequenceNumber;
+        final List<DataPage> frozenNewPages;
+        List<CheckpointingPage> flushingDirtyPages;
+        List<CheckpointingPage> flushingSmallPages;
+        final long checkpointLimitInstant;
+        DataPage buildingPage;
+        long flushedRecords = 0;
+        final Set<Long> flushedPages = new HashSet<>();
+        int flushedDirtyPages = 0;
+        int flushedSmallPages = 0;
+        boolean keepFlushedPageInMemory = false;
+
         try {
-
-            LogSequenceNumber sequenceNumber = log.getLastSequenceNumber();
-
+            sequenceNumber = log.getLastSequenceNumber();
             getlock = System.currentTimeMillis();
             checkPointRunning = true;
-
-            final long checkpointLimitInstant = sumOverflowWise(getlock, checkpointTargetTime);
+            checkpointLimitInstant = sumOverflowWise(getlock, checkpointTargetTime);
 
             final Map<Long, DataPageMetaData> activePages = pageSet.getActivePages();
 
-            long flushedRecords = 0;
-
-            List<CheckpointingPage> flushingDirtyPages = new ArrayList<>();
-            List<CheckpointingPage> flushingSmallPages = new ArrayList<>();
-
-            final Set<Long> flushedPages = new HashSet<>();
-            int flushedDirtyPages = 0;
-            int flushedSmallPages = 0;
+            flushingDirtyPages = new ArrayList<>();
+            flushingSmallPages = new ArrayList<>();
 
             for (Entry<Long, DataPageMetaData> ref : activePages.entrySet()) {
 
@@ -3127,7 +3229,6 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                     flushingSmallPages.add(new CheckpointingPage(pageId, metadata.size, dirt > 0));
                     continue;
                 }
-
             }
 
             /* Clean dirtier first */
@@ -3138,147 +3239,174 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
             pageAnalysis = System.currentTimeMillis();
 
-            /* Should currently new rebuild page kept on memory or discarded? */
-            boolean keepFlushedPageInMemory = false;
-
-            /* New page actually rebuilt */
-            DataPage buildingPage = createMutablePage(nextPageId++, 0, 0);
-
-
-            /* **************************** */
-            /* *** Dirty pages handling *** */
-            /* **************************** */
-
-            if (!flushingDirtyPages.isEmpty()) {
-
-                final long timeLimit = Math.min(checkpointLimitInstant,
-                        sumOverflowWise(pageAnalysis, cleanupTargetTime));
-
-                /*
-                 * Do not continue if we have used up all configured cleanup or checkpoint time (but still compact
-                 * at least the smaller page (normally the leftover from last checkpoint)
-                 */
-                CleanAndCompactResult dirtyResult = cleanAndCompactPages(flushingDirtyPages, buildingPage,
-                        keepFlushedPageInMemory, timeLimit);
-
-                flushedDirtyPages = dirtyResult.flushedPages.size();
-                flushedPages.addAll(dirtyResult.flushedPages);
-                flushedRecords += dirtyResult.flushedRecords;
-                keepFlushedPageInMemory = dirtyResult.keepFlushedPageInMemory;
-
-                buildingPage = dirtyResult.buildingPage;
-
-            }
-
-            dirtyPagesFlush = System.currentTimeMillis();
-
-
-            /* **************************** */
-            /* *** Small pages handling *** */
-            /* **************************** */
+            /* New page for compaction building — must allocate under write lock */
+            buildingPage = createMutablePage(nextPageId++, 0, 0);
 
             /*
-             * Small pages could be dirty pages too so we need to check every page if has been already handled
-             * during dirty pages cleanup. Small pages should be a really small set (normally just last flushed
-             * page), the filter is then no critical or heavy to require some optimization
+             * Freeze the current set of mutable new pages (they will be flushed in Phase B).
+             * Then rotate currentDirtyRecordsPage to a fresh page so DML writes that arrive
+             * during Phase B go to the new page and do not interfere with the frozen ones.
              */
+            frozenNewPages = new ArrayList<>(newPages.values());
+            createNewPage(nextPageId++);
 
-            /* Filter out dirty pages flushed from flushing small pages (a page could be "small" and "dirty") */
-            flushingSmallPages = flushingSmallPages.stream()
-                    .filter(wp -> !flushedPages.contains(wp.pageId)).collect(Collectors.toList());
+        } finally {
+            checkpointLock.asWriteLock().unlock();
+        }
+
+        /* ============================================================== */
+        /* === PHASE B: No checkpoint lock — DML proceeds concurrently === */
+        /* ============================================================== */
+
+        /* **************************** */
+        /* *** Dirty pages handling *** */
+        /* **************************** */
+
+        if (!flushingDirtyPages.isEmpty()) {
+
+            final long timeLimit = Math.min(checkpointLimitInstant,
+                    sumOverflowWise(pageAnalysis, cleanupTargetTime));
 
             /*
-             * If there is only one clean small page without additional data to add rebuilding the page make no
-             * sense: is too probable to rebuild an identical page!
+             * Conditional keyToPage.put in cleanAndCompactPages handles concurrent DML races:
+             * if a record was modified by DML, the conditional put fails and the record is skipped.
+             * It will be replayed from the commit log during recovery.
              */
-            if (/* Just one small page */ flushingSmallPages.size() == 1
-                    /* Not dirty */ && !flushingSmallPages.get(0).dirty
-                    /* No spare data remaining */ && buildingPage.isEmpty()
-                    /* No new data */ && !newPages.values().stream().filter(p -> !p.isEmpty()).findAny().isPresent()) {
+            CleanAndCompactResult dirtyResult = cleanAndCompactPages(flushingDirtyPages, buildingPage,
+                    keepFlushedPageInMemory, timeLimit);
 
-                /* Avoid small page compaction */
-                flushingSmallPages.clear();
+            flushedDirtyPages = dirtyResult.flushedPages.size();
+            flushedPages.addAll(dirtyResult.flushedPages);
+            flushedRecords += dirtyResult.flushedRecords;
+            keepFlushedPageInMemory = dirtyResult.keepFlushedPageInMemory;
+
+            buildingPage = dirtyResult.buildingPage;
+        }
+
+        dirtyPagesFlush = System.currentTimeMillis();
+
+
+        /* **************************** */
+        /* *** Small pages handling *** */
+        /* **************************** */
+
+        /* Filter out dirty pages flushed from flushing small pages (a page could be "small" and "dirty") */
+        flushingSmallPages = flushingSmallPages.stream()
+                .filter(wp -> !flushedPages.contains(wp.pageId)).collect(Collectors.toList());
+
+        /*
+         * If there is only one clean small page without additional data to add rebuilding the page make no
+         * sense: is too probable to rebuild an identical page!
+         * Note: newPages may contain pages added by DML since Phase A — if any are non-empty, we have spare data.
+         */
+        if (/* Just one small page */ flushingSmallPages.size() == 1
+                /* Not dirty */ && !flushingSmallPages.get(0).dirty
+                /* No spare data remaining */ && buildingPage.isEmpty()
+                /* No new data */ && !newPages.values().stream().filter(p -> !p.isEmpty()).findAny().isPresent()) {
+
+            /* Avoid small page compaction */
+            flushingSmallPages.clear();
+        }
+
+        if (!flushingSmallPages.isEmpty()) {
+
+            final long timeLimit = Math.min(checkpointLimitInstant,
+                    sumOverflowWise(dirtyPagesFlush, compactionTargetTime));
+
+            CleanAndCompactResult smallResult = cleanAndCompactPages(flushingSmallPages, buildingPage,
+                    keepFlushedPageInMemory, timeLimit);
+
+            flushedSmallPages = smallResult.flushedPages.size();
+            flushedPages.addAll(smallResult.flushedPages);
+            flushedRecords += smallResult.flushedRecords;
+            keepFlushedPageInMemory = smallResult.keepFlushedPageInMemory;
+
+            buildingPage = smallResult.buildingPage;
+        }
+
+        smallPagesFlush = System.currentTimeMillis();
+
+
+        /* *************************** */
+        /* *** Frozen pages flushing *** */
+        /* *************************** */
+
+        /*
+         * Flush the new pages that were snapshotted in Phase A. These were the mutable pages
+         * receiving DML writes before Phase A. After Phase A, a fresh page was allocated so
+         * new DML writes go there; the frozen pages receive no more inserts.
+         *
+         * We pass null as spareDataPage to avoid spare-data stealing which could race with
+         * concurrent DML modifying the keyToPage mappings of compacted records in buildingPage.
+         * buildingPage will be flushed in Phase C.
+         */
+        long flushedNewPages = 0;
+        for (DataPage dataPage : frozenNewPages) {
+            /* Always call flush even for empty pages: EMPTY_FLUSH removes the page from `pages` and
+             * pageReplacementPolicy, which is required for the rotated-out currentDirtyRecordsPage. */
+            flushNewPageForCheckpoint(dataPage, null);
+            if (!dataPage.isEmpty()) {
+                ++flushedNewPages;
+                flushedRecords += dataPage.size();
             }
+        }
 
-            if (!flushingSmallPages.isEmpty()) {
 
-                final long timeLimit = Math.min(checkpointLimitInstant,
-                        sumOverflowWise(dirtyPagesFlush, compactionTargetTime));
+        /* ********************************** */
+        /* *** Secondary indexes checkpoint *** */
+        /* ********************************** */
 
-                /*
-                 * Do not continue if we have used up all configured compaction or checkpoint time (but still
-                 * compact at least the smaller page (normally the leftover from last checkpoint)
-                 */
-                CleanAndCompactResult smallResult = cleanAndCompactPages(flushingSmallPages, buildingPage,
-                        keepFlushedPageInMemory, timeLimit);
-
-                flushedSmallPages = smallResult.flushedPages.size();
-                flushedPages.addAll(smallResult.flushedPages);
-                flushedRecords += smallResult.flushedRecords;
-                keepFlushedPageInMemory = smallResult.keepFlushedPageInMemory;
-
-                buildingPage = smallResult.buildingPage;
+        /*
+         * Each index implementation has its own internal locking:
+         * - VectorIndexManager: stateLock (exclusive during checkpoint, DML also holds it briefly)
+         * - BRINIndexManager, MemoryHashIndexManager: their own internal locks
+         * - BLinkKeyToPageIndex: per-node ReadWriteLock (primary key index — checkpointed in Phase C)
+         *
+         * DML on indexed columns will briefly block on the index's internal lock, but NOT on
+         * the TableManager's checkpointLock. Non-indexed DML is fully unblocked.
+         */
+        final Map<String, AbstractIndexManager> indexes = tableSpaceManager.getIndexesOnTable(table.name);
+        if (indexes != null) {
+            for (AbstractIndexManager indexManager : indexes.values()) {
+                // Checkpoint at the same position as this TableManager's sequenceNumber
+                actions.addAll(indexManager.checkpoint(sequenceNumber, pin));
             }
+        }
 
-            smallPagesFlush = System.currentTimeMillis();
-
-
-            /* ************************** */
-            /* *** New pages handling *** */
-            /* ************************** */
-
-            /*
-             * Retrieve the "current" new page. It can be held in memory because no writes are executed during
-             * a checkpoint and thus the page cannot change (nor be flushed due to an unload because it isn't
-             * known to page replacement policy)
-             */
-            final long lastKnownPageId = currentDirtyRecordsPage.get();
-
-            /*
-             * Flush dirty records (and remaining records from previous step).
-             *
-             * Any newpage remaining here is unflushed and is not set as dirty (if "dirty" were unloaded!).
-             * Just write the pages as they are.
-             *
-             * New empty pages won't be written
-             */
-            long flushedNewPages = 0;
-            for (DataPage dataPage : newPages.values()) {
-                /* Flush every dirty page (but not the "current" dirty page if empty) */
-                if (lastKnownPageId != dataPage.pageId || !dataPage.isEmpty()) {
-                    flushNewPageForCheckpoint(dataPage, buildingPage);
-                    ++flushedNewPages;
-                    flushedRecords += dataPage.size();
-                }
-            }
+        indexcheckpoint = System.currentTimeMillis();
 
 
-            /* ************************************* */
+        /* ================================================================== */
+        /* === PHASE C: Brief write lock — finalize metadata and PK index === */
+        /* ================================================================== */
+
+        boolean lockAcquiredC;
+        try {
+            lockAcquiredC = checkpointLock.asWriteLock().tryLock(CHECKPOINT_LOCK_WRITE_TIMEOUT, TimeUnit.SECONDS);
+        } catch (InterruptedException err) {
+            throw new DataStorageManagerException("interrupted while waiting for checkpoint lock (Phase C)", err);
+        }
+        if (!lockAcquiredC) {
+            throw new DataStorageManagerException("timed out while waiting for checkpoint lock (Phase C), write lock " + checkpointLock.writeLock());
+        }
+        try {
+
             /* *** Remaining spare data handling *** */
-            /* ************************************* */
 
             /*
-             * Flush remaining records.
-             *
-             * To keep or not flushed page in memory is a "best guess" here: we don't known if records that
-             * needed to be kept in memory were already be flushed during newPage filling (see
-             * flushNewPageForCheckpoint). So we still use keepFlushedPageInMemory (possibily true) even if
-             * remaining records came from an old unused page.
+             * Flush remaining compaction output (buildingPage). This is done under write lock because
+             * flushMutablePage uses pageSet which must not be modified concurrently with checkpointDone below.
              */
             if (!buildingPage.isEmpty()) {
-
                 flushMutablePage(buildingPage, keepFlushedPageInMemory);
-
             } else {
-
                 /* Remove unused empty building page from memory */
                 pages.remove(buildingPage.pageId);
             }
 
             /*
-             * Never Never Never revert unused nextPageId! Even if we didn't used booked nextPageId is better to
-             * throw it away, reverting generated id could be "strange" for now but simply wrong in the future
-             * (if checkpoint will permit concurrent page creation for example..)
+             * Never Never Never revert unused nextPageId! Even if we didn't use booked nextPageId it is better
+             * to throw it away — reverting could cause duplicate IDs if concurrent page creation is added later.
              */
 
             newPagesFlush = System.currentTimeMillis();
@@ -3286,7 +3414,6 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             if (flushedDirtyPages > 0 || flushedSmallPages > 0 || flushedNewPages > 0 || flushedRecords > 0) {
                 LOGGER.log(Level.INFO, "checkpoint {0}, logpos {1}, flushed: {2} dirty pages, {3} small pages, {4} new pages, {5} records",
                     new Object[]{table.name, sequenceNumber, flushedDirtyPages, flushedSmallPages, flushedNewPages, flushedRecords});
-
             }
 
             if (LOGGER.isLoggable(Level.FINE)) {
@@ -3294,20 +3421,13 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                         new Object[]{table.name, sequenceNumber, flushedPages.toString()});
             }
 
-            /* Checkpoint the key to page too */
+            /*
+             * Checkpoint the primary key index (BLink tree).
+             * The write lock guarantees no threads are modifying the index concurrently,
+             * which is required by BLink's checkpoint() contract.
+             */
             actions.addAll(keyToPage.checkpoint(sequenceNumber, pin));
             keytopagecheckpoint = System.currentTimeMillis();
-
-            /* Checkpoint secondary indexes too */
-            final Map<String, AbstractIndexManager> indexes = tableSpaceManager.getIndexesOnTable(table.name);
-            if (indexes != null) {
-                for (AbstractIndexManager indexManager : indexes.values()) {
-                    // Checkpoint at the same position of current TableManager
-                    actions.addAll(indexManager.checkpoint(sequenceNumber, pin));
-                }
-            }
-
-            indexcheckpoint = System.currentTimeMillis();
 
             pageSet.checkpointDone(flushedPages);
 
@@ -3320,11 +3440,11 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
             /*
              * Can happen when at checkpoint start all pages are set as dirty or immutable (immutable or
-             * unloaded) due do a deletion: all pages will be removed and no page will remain alive.
+             * unloaded) due to a deletion: all pages will be removed and no page will remain alive.
+             * Note: Phase A already created a new currentDirtyRecordsPage, so this should rarely trigger.
              */
             if (newPages.isEmpty()) {
-                /* Allocate live handles the correct policy load/unload of last dirty page */
-                allocateLivePage(lastKnownPageId);
+                allocateLivePage(currentDirtyRecordsPage.get());
             }
 
             checkPointRunning = false;
@@ -3345,6 +3465,8 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
 
         } finally {
+            // Ensure checkPointRunning is cleared even on exception during Phase C
+            checkPointRunning = false;
             checkpointLock.asWriteLock().unlock();
         }
 

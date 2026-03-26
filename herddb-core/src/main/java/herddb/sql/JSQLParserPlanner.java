@@ -2087,20 +2087,30 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
             throws StatementExecutionException {
 
         List<OrderByElement> orderByElements = plainSelect.getOrderByElements();
-        if (orderByElements == null || orderByElements.size() != 1) return null;
+        if (orderByElements == null || orderByElements.size() != 1) {
+            return null;
+        }
 
         OrderByElement obe = orderByElements.get(0);
         Expression expr = obe.getExpression();
-        if (!(expr instanceof net.sf.jsqlparser.expression.Function)) return null;
+        if (!(expr instanceof net.sf.jsqlparser.expression.Function)) {
+            return null;
+        }
 
         net.sf.jsqlparser.expression.Function func =
                 (net.sf.jsqlparser.expression.Function) expr;
-        if (!BuiltinFunctions.NAME_ANN_OF.equalsIgnoreCase(func.getName())) return null;
+        if (!BuiltinFunctions.NAME_ANN_OF.equalsIgnoreCase(func.getName())) {
+            return null;
+        }
         if (func.getParameters() == null
-                || func.getParameters().getExpressions().size() != 2) return null;
+                || func.getParameters().getExpressions().size() != 2) {
+            return null;
+        }
 
         Expression firstArg = func.getParameters().getExpressions().get(0);
-        if (!(firstArg instanceof net.sf.jsqlparser.schema.Column)) return null;
+        if (!(firstArg instanceof net.sf.jsqlparser.schema.Column)) {
+            return null;
+        }
         String columnName = fixMySqlBackTicks(
                 ((net.sf.jsqlparser.schema.Column) firstArg).getColumnName().toLowerCase());
 

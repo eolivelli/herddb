@@ -26,15 +26,12 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-
-import herddb.codec.RecordSerializer;
 import herddb.core.AbstractIndexManager;
 import herddb.core.DBManager;
 import herddb.file.FileCommitLogManager;
 import herddb.file.FileDataStorageManager;
 import herddb.file.FileMetadataStorageManager;
 import herddb.index.vector.VectorIndexManager;
-import herddb.server.ServerConfiguration;
 import herddb.model.ColumnTypes;
 import herddb.model.DataScanner;
 import herddb.model.Index;
@@ -42,24 +39,21 @@ import herddb.model.StatementEvaluationContext;
 import herddb.model.Table;
 import herddb.model.TableSpace;
 import herddb.model.TransactionContext;
-import herddb.model.commands.CreateIndexStatement;
 import herddb.model.commands.CreateTableSpaceStatement;
-import herddb.model.commands.CreateTableStatement;
 import herddb.model.planner.PlannerOp;
 import herddb.model.planner.ProjectOp;
 import herddb.model.planner.VectorANNScanOp;
+import herddb.server.ServerConfiguration;
 import herddb.sql.TranslatedQuery;
 import herddb.utils.DataAccessor;
-
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
-
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 /**
  * Integration tests for the vector index (jvector-backed).
@@ -1336,9 +1330,15 @@ public class VectorIndexTest {
 
     private static void normalize(float[] v) {
         float norm = 0;
-        for (float f : v) norm += f * f;
+        for (float f : v) {
+            norm += f * f;
+        }
         norm = (float) Math.sqrt(norm);
-        if (norm > 0) for (int i = 0; i < v.length; i++) v[i] /= norm;
+        if (norm > 0) {
+            for (int i = 0; i < v.length; i++) {
+                v[i] /= norm;
+            }
+        }
     }
 
     /**

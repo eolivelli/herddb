@@ -136,6 +136,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.BiConsumer;
 import java.util.logging.Level;
@@ -179,6 +180,11 @@ public class TableSpaceManager {
     private final ConcurrentHashMap<String, AbstractIndexManager> indexes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Map<String, AbstractIndexManager>> indexesByTable = new ConcurrentHashMap<>();
     private final StampedLock generalLock = new StampedLock();
+    /**
+     * Serializes concurrent checkpoint calls. When tryLock fails a checkpoint is already running — the new call
+     * is skipped (returns null). This prevents two slow checkpoint loops from running simultaneously.
+     */
+    private final ReentrantLock checkpointMutex = new ReentrantLock();
     private final AtomicLong newTransactionId = new AtomicLong();
     private final DBManager dbmanager;
     private volatile FollowerThread followerThread;
@@ -233,40 +239,80 @@ public class TableSpaceManager {
 
     private void registerTableSpaceMetrics() {
         this.tableCountGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
                 return tables.values().stream().filter(t -> !t.isSystemTable()).count();
             }
         };
         tablespaceStasLogger.registerGauge("table_count", tableCountGauge);
         this.indexCountGauge = new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return indexes.size(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return indexes.size();
+            }
         };
         tablespaceStasLogger.registerGauge("index_count", indexCountGauge);
         this.totalTableSizeGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getTablesize(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getTablesize();
+            }
         };
         tablespaceStasLogger.registerGauge("total_table_size", totalTableSizeGauge);
         this.totalLoadedPagesGauge = new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return stats.getLoadedpages(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return stats.getLoadedpages();
+            }
         };
         tablespaceStasLogger.registerGauge("total_loaded_pages", totalLoadedPagesGauge);
         this.totalBuffersUsedMemoryGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getBuffersUsedMemory(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getBuffersUsedMemory();
+            }
         };
         tablespaceStasLogger.registerGauge("total_buffers_used_memory", totalBuffersUsedMemoryGauge);
         this.totalKeysUsedMemoryGauge = new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return stats.getKeysUsedMemory(); }
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return stats.getKeysUsedMemory();
+            }
         };
         tablespaceStasLogger.registerGauge("total_keys_used_memory", totalKeysUsedMemoryGauge);
         this.totalDirtyPagesGauge = new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return stats.getDirtypages(); }
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return stats.getDirtypages();
+            }
         };
         tablespaceStasLogger.registerGauge("total_dirty_pages", totalDirtyPagesGauge);
     }
@@ -2114,63 +2160,143 @@ public class TableSpaceManager {
         try {
             List<PostCheckpointAction> actions = new ArrayList<>();
 
-            long lockStamp = 0;
-            if (!alreadLocked) {
-                lockStamp = acquireWriteLock("checkpoint");
-            }
-            try {
-                logSequenceNumber = log.getLastSequenceNumber();
+            if (alreadLocked) {
+                /*
+                 * alreadLocked=true path: caller (e.g. dumpTableSpace) already holds generalLock write.
+                 * Keep original single-lock behavior — no concurrent DML allowed during this checkpoint.
+                 */
+                try {
+                    logSequenceNumber = log.getLastSequenceNumber();
 
-                if (logSequenceNumber.isStartOfTime()) {
-                    LOGGER.log(Level.INFO, "{0} checkpoint {1} at {2}. skipped (no write ever issued to log)", new Object[]{nodeId, tableSpaceName, logSequenceNumber});
-                    return new TableSpaceCheckpoint(logSequenceNumber, checkpointsTableNameSequenceNumber);
-                }
-                LOGGER.log(Level.INFO, "{0} checkpoint start {1} at {2}", new Object[]{nodeId, tableSpaceName, logSequenceNumber});
-                if (actualLogSequenceNumber == null) {
-                    throw new DataStorageManagerException("actualLogSequenceNumber cannot be null");
-                }
-                // TODO: transactions checkpoint is not atomic
-                Collection<Transaction> currentTransactions = new ArrayList<>(transactions.values());
-                for (Transaction t : currentTransactions) {
-                    LogSequenceNumber txLsn = t.lastSequenceNumber;
-                    if (txLsn != null && txLsn.after(logSequenceNumber)) {
-                        LOGGER.log(Level.SEVERE, "Found transaction {0} with LSN {1} in the future", new Object[]{t.transactionId, txLsn});
+                    if (logSequenceNumber.isStartOfTime()) {
+                        LOGGER.log(Level.INFO, "{0} checkpoint {1} at {2}. skipped (no write ever issued to log)", new Object[]{nodeId, tableSpaceName, logSequenceNumber});
+                        return new TableSpaceCheckpoint(logSequenceNumber, checkpointsTableNameSequenceNumber);
                     }
-                }
-                actions.addAll(dataStorageManager.writeTransactionsAtCheckpoint(tableSpaceUUID, logSequenceNumber, currentTransactions));
-                actions.addAll(writeTablesOnDataStorageManager(new CommitLogResult(logSequenceNumber, false, true), true));
+                    LOGGER.log(Level.INFO, "{0} checkpoint start {1} at {2}", new Object[]{nodeId, tableSpaceName, logSequenceNumber});
+                    if (actualLogSequenceNumber == null) {
+                        throw new DataStorageManagerException("actualLogSequenceNumber cannot be null");
+                    }
+                    Collection<Transaction> currentTransactions = new ArrayList<>(transactions.values());
+                    for (Transaction t : currentTransactions) {
+                        LogSequenceNumber txLsn = t.lastSequenceNumber;
+                        if (txLsn != null && txLsn.after(logSequenceNumber)) {
+                            LOGGER.log(Level.SEVERE, "Found transaction {0} with LSN {1} in the future", new Object[]{t.transactionId, txLsn});
+                        }
+                    }
+                    actions.addAll(dataStorageManager.writeTransactionsAtCheckpoint(tableSpaceUUID, logSequenceNumber, currentTransactions));
+                    actions.addAll(writeTablesOnDataStorageManager(new CommitLogResult(logSequenceNumber, false, true), true));
 
-                // we checkpoint all data to disk and save the actual log sequence number
-                for (AbstractTableManager tableManager : tables.values()) {
-                    // each TableManager will save its own checkpoint sequence number (on TableStatus) and upon recovery will replay only actions with log position after the actual table-local checkpoint
-                    // remember that the checkpoint for a table can last "minutes" and we do not want to stop the world
-
-                    if (!tableManager.isSystemTable()) {
-                        TableCheckpoint checkpoint = full ? tableManager.fullCheckpoint(pin) : tableManager.checkpoint(pin);
-
-                        if (checkpoint != null) {
-                            LOGGER.log(Level.INFO, "checkpoint done for table {0}.{1} (pin: {2})", new Object[]{tableSpaceName, tableManager.getTable().name, pin});
-                            actions.addAll(checkpoint.actions);
-                            checkpointsTableNameSequenceNumber.put(checkpoint.tableName, checkpoint.sequenceNumber);
-                            if (afterTableCheckPointAction != null) {
-                                afterTableCheckPointAction.run();
+                    for (AbstractTableManager tableManager : tables.values()) {
+                        if (!tableManager.isSystemTable()) {
+                            TableCheckpoint checkpoint = full ? tableManager.fullCheckpoint(pin) : tableManager.checkpoint(pin);
+                            if (checkpoint != null) {
+                                LOGGER.log(Level.INFO, "checkpoint done for table {0}.{1} (pin: {2})", new Object[]{tableSpaceName, tableManager.getTable().name, pin});
+                                actions.addAll(checkpoint.actions);
+                                checkpointsTableNameSequenceNumber.put(checkpoint.tableName, checkpoint.sequenceNumber);
+                                if (afterTableCheckPointAction != null) {
+                                    afterTableCheckPointAction.run();
+                                }
                             }
                         }
                     }
+
+                    actions.addAll(dataStorageManager.writeCheckpointSequenceNumber(tableSpaceUUID, logSequenceNumber));
+                    if (leader) {
+                        log.dropOldLedgers(logSequenceNumber);
+                    }
+                    _logSequenceNumber = log.getLastSequenceNumber();
+                } catch (DataStorageManagerException | LogNotAvailableException ex) {
+                    throw ex;
                 }
-
-                // we are sure that all data as been flushed. upon recovery we will replay the log starting from this position
-                actions.addAll(dataStorageManager.writeCheckpointSequenceNumber(tableSpaceUUID, logSequenceNumber));
-
-                /* Indexes checkpoint is handled by TableManagers */
-                if (leader) {
-                    log.dropOldLedgers(logSequenceNumber);
+            } else {
+                /*
+                 * Normal (non-dump) checkpoint path.
+                 *
+                 * checkpointMutex serializes concurrent checkpoint calls: if another checkpoint is already
+                 * running, skip this one rather than queuing — periodic checkpoints fire frequently enough
+                 * that the next trigger will catch up.
+                 *
+                 * Phase A  (brief write lock): snapshot LSN, transactions, table schemas.
+                 *           Releases generalLock so DML can proceed immediately after.
+                 * Phase B  (no lock): per-table checkpoint — the slow part.
+                 *           DML proceeds freely; concurrent DDL (table create/drop) is handled gracefully.
+                 * Phase C  (no tablespace lock): write checkpoint sequence number, drop old ledgers.
+                 */
+                if (!checkpointMutex.tryLock()) {
+                    LOGGER.log(Level.INFO, "Checkpoint for tablespace {0} skipped. Another checkpoint is already running", tableSpaceName);
+                    return null;
                 }
+                try {
+                    List<AbstractTableManager> tablesToCheckpoint;
 
-                _logSequenceNumber = log.getLastSequenceNumber();
-            } finally {
-                if (!alreadLocked) {
-                    releaseWriteLock(lockStamp, "checkpoint");
+                    /* *** Phase A: brief write lock *** */
+                    long lockStamp = acquireWriteLock("checkpoint");
+                    try {
+                        logSequenceNumber = log.getLastSequenceNumber();
+
+                        if (logSequenceNumber.isStartOfTime()) {
+                            LOGGER.log(Level.INFO, "{0} checkpoint {1} at {2}. skipped (no write ever issued to log)", new Object[]{nodeId, tableSpaceName, logSequenceNumber});
+                            return new TableSpaceCheckpoint(logSequenceNumber, checkpointsTableNameSequenceNumber);
+                        }
+                        LOGGER.log(Level.INFO, "{0} checkpoint start {1} at {2}", new Object[]{nodeId, tableSpaceName, logSequenceNumber});
+                        if (actualLogSequenceNumber == null) {
+                            throw new DataStorageManagerException("actualLogSequenceNumber cannot be null");
+                        }
+                        // TODO: transactions checkpoint is not atomic
+                        Collection<Transaction> currentTransactions = new ArrayList<>(transactions.values());
+                        for (Transaction t : currentTransactions) {
+                            LogSequenceNumber txLsn = t.lastSequenceNumber;
+                            if (txLsn != null && txLsn.after(logSequenceNumber)) {
+                                LOGGER.log(Level.SEVERE, "Found transaction {0} with LSN {1} in the future", new Object[]{t.transactionId, txLsn});
+                            }
+                        }
+                        actions.addAll(dataStorageManager.writeTransactionsAtCheckpoint(tableSpaceUUID, logSequenceNumber, currentTransactions));
+                        actions.addAll(writeTablesOnDataStorageManager(new CommitLogResult(logSequenceNumber, false, true), true));
+
+                        // Snapshot tables now so Phase B iterates a stable list; concurrent DDL that creates/drops
+                        // tables after this point is handled: new tables replay from logSequenceNumber on recovery;
+                        // dropped tables are caught by the try/catch in Phase B.
+                        tablesToCheckpoint = new ArrayList<>(tables.values());
+                    } finally {
+                        releaseWriteLock(lockStamp, "checkpoint");
+                        // DML can proceed from here
+                    }
+
+                    /* *** Phase B: per-table checkpoint — no tablespace write lock held *** */
+                    for (AbstractTableManager tableManager : tablesToCheckpoint) {
+                        // each TableManager will save its own checkpoint sequence number (on TableStatus) and upon
+                        // recovery will replay only actions with log position after the actual table-local checkpoint
+                        if (!tableManager.isSystemTable()) {
+                            try {
+                                TableCheckpoint checkpoint = full ? tableManager.fullCheckpoint(pin) : tableManager.checkpoint(pin);
+                                if (checkpoint != null) {
+                                    LOGGER.log(Level.INFO, "checkpoint done for table {0}.{1} (pin: {2})", new Object[]{tableSpaceName, tableManager.getTable().name, pin});
+                                    actions.addAll(checkpoint.actions);
+                                    checkpointsTableNameSequenceNumber.put(checkpoint.tableName, checkpoint.sequenceNumber);
+                                    if (afterTableCheckPointAction != null) {
+                                        afterTableCheckPointAction.run();
+                                    }
+                                }
+                            } catch (DataStorageManagerException | LogNotAvailableException ex) {
+                                // Table may have been dropped by a concurrent DDL between Phase A snapshot and here.
+                                LOGGER.log(Level.WARNING, "Checkpoint of table {0}.{1} failed (table may have been dropped concurrently): {2}",
+                                        new Object[]{tableSpaceName, tableManager.getTable().name, ex});
+                            }
+                        }
+                    }
+
+                    /* *** Phase C: write checkpoint marker — no tablespace lock needed *** */
+                    // we are sure that all data has been flushed. upon recovery we will replay the log starting from this position
+                    actions.addAll(dataStorageManager.writeCheckpointSequenceNumber(tableSpaceUUID, logSequenceNumber));
+
+                    /* Indexes checkpoint is handled by TableManagers */
+                    if (leader) {
+                        log.dropOldLedgers(logSequenceNumber);
+                    }
+
+                    _logSequenceNumber = log.getLastSequenceNumber();
+                } finally {
+                    checkpointMutex.unlock();
                 }
             }
 

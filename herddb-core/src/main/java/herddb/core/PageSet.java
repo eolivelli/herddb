@@ -102,6 +102,10 @@ public final class PageSet {
         return activePages.size();
     }
 
+    boolean containsActivePage(Long pageId) {
+        return activePages.containsKey(pageId);
+    }
+
     void truncate() {
         activePages.clear();
     }

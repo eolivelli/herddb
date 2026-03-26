@@ -21,8 +21,8 @@
 package herddb.remote;
 
 import herddb.core.DBManager;
-import herddb.model.DataScanner;
 import herddb.model.DMLStatementExecutionResult;
+import herddb.model.DataScanner;
 import herddb.model.ScanResult;
 import herddb.model.StatementExecutionException;
 import herddb.model.TableSpace;

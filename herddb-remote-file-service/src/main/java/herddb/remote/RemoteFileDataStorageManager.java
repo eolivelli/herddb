@@ -32,7 +32,6 @@ import herddb.model.Index;
 import herddb.model.Record;
 import herddb.model.Table;
 import herddb.model.Transaction;
-import herddb.server.ServerConfiguration;
 import herddb.storage.DataPageDoesNotExistException;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
