@@ -114,7 +114,7 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
     private ByteBuffer getOrAllocateBuffer() {
         ByteBuffer buf = BUFFER_CACHE.get();
         if (buf == null || buf.capacity() < vectorByteSize) {
-            buf = ByteBuffer.allocate((int) vectorByteSize).order(ByteOrder.nativeOrder());
+            buf = ByteBuffer.allocateDirect((int) vectorByteSize).order(ByteOrder.nativeOrder());
             BUFFER_CACHE.set(buf);
         }
         buf.clear().limit((int) vectorByteSize);
