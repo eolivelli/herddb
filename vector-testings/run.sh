@@ -34,4 +34,30 @@ if [ -z "$JAR" ]; then
 fi
 
 JAVA_HEAP="${VECTORBENCH_HEAP:--Xms2g -Xmx8g}"
-exec java $JAVA_HEAP -jar "$JAR" "$@"
+LOG_FILE="$SCRIPT_DIR/vectorbench.log"
+PID_FILE="$SCRIPT_DIR/vectorbench.pid"
+
+# Check for --background flag
+BACKGROUND=false
+ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--background" ]; then
+        BACKGROUND=true
+    else
+        ARGS+=("$arg")
+    fi
+done
+
+if [ "$BACKGROUND" = true ]; then
+    echo "Starting VectorBench in background..."
+    echo "Log file: $LOG_FILE"
+    echo "PID file: $PID_FILE"
+    nohup java $JAVA_HEAP -jar "$JAR" "${ARGS[@]}" > "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    echo "PID: $(cat "$PID_FILE")"
+    echo "Use $SCRIPT_DIR/stop.sh to stop the benchmark."
+    echo "Use 'tail -f $LOG_FILE' to follow progress."
+else
+    echo "Logging output to $LOG_FILE"
+    java $JAVA_HEAP -jar "$JAR" "${ARGS[@]}" 2>&1 | tee "$LOG_FILE"
+fi

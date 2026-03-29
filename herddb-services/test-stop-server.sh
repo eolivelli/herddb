@@ -1,4 +1,4 @@
-set -x
+#/bin/bash
 # Licensed to Diennea S.r.l. under one
 # or more contributor license agreements. See the NOTICE file
 # distributed with this work for additional information
@@ -15,5 +15,13 @@ set -x
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-#
-./run.sh --password hdb --batch-size 10000 --ingest-threads 12 --dataset sift10m -n 10000000 --checkpoint --drop-table "$@"
+
+set -x xtrace
+
+SERVER1DIR=$(realpath target/server1)
+
+# Stop the HerdDB server
+cd $SERVER1DIR/herddb* 2>/dev/null && bin/service server stop; cd ../..
+
+# Remove directories
+rm -Rf $SERVER1DIR

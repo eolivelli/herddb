@@ -18,34 +18,20 @@
 
 set -x
 
-FILESERVERDIR=$(realpath target/fileserver)
 SERVER1DIR=$(realpath target/server1)
 ZIP=$(ls target/herddb-service*zip)
 
 echo "Installing $ZIP"
-rm -Rf $FILESERVERDIR
 rm -Rf $SERVER1DIR
-mkdir $FILESERVERDIR
 mkdir $SERVER1DIR
 
-echo "Unzipping FileServer in $FILESERVERDIR"
-unzip -q $ZIP -d $FILESERVERDIR
+echo "Unzipping Server in $SERVER1DIR"
 unzip -q $ZIP -d $SERVER1DIR
 
-# Start the file server (1GB heap)
-cd $FILESERVERDIR/herddb*
-mkdir -p tmp
-export JAVA_OPTS="-XX:+UseG1GC -Dio.netty.maxDirectMemory=0 -Duser.language=en -Xmx1g -Xms1g -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$FILESERVERDIR/fileserver-heapdump.hprof -Djava.io.tmpdir=$(pwd)/tmp"
-bin/service file-server start
-cd ../..
-
-sleep 1
-
-# Start HerdDB server in remote-file-service mode (6GB heap)
+# Start HerdDB server in standalone mode (6GB heap)
 cd $SERVER1DIR/herddb*
 mkdir -p tmp
 CONFIGFILE=conf/server.properties
-sed -i 's/server.mode=standalone/server.mode=remote-file-service/g' $CONFIGFILE
 sed -i 's/#http.enable=true/http.enable=true/g' $CONFIGFILE
 sed -i 's/server.halt.on.tablespace.boot.error=false/server.halt.on.tablespace.boot.error=false/g' $CONFIGFILE
 export JAVA_OPTS="-XX:+UseG1GC -Djdk.attach.allowAttachSelf=true -Dherddb.vectorindex.rebuild.threads=24 -Duser.language=en -Xmx30g -Xms30g -Dio.netty.maxDirectMemory=0 -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$SERVER1DIR/server-heapdump.hprof -Djava.io.tmpdir=$(pwd)/tmp"

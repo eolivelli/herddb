@@ -43,7 +43,8 @@ public class VectorBench {
         void run() throws Exception;
     }
 
-    private static void runWithProgress(String label, SqlTask task) throws Exception {
+    /** Runs a task with a progress spinner and returns elapsed wall-clock seconds. */
+    private static double runWithProgress(String label, SqlTask task) throws Exception {
         System.out.println(label);
         char[] spinner = {'|', '/', '-', '\\'};
         int[] spinIdx = {0};
@@ -75,13 +76,28 @@ public class VectorBench {
         if (err[0] != null) {
             throw err[0];
         }
+        return totalSecs;
     }
 
     public static void main(String[] args) throws Exception {
+        long benchmarkStartNs = System.nanoTime();
         Config config = Config.parse(args);
         System.out.println("Vector Benchmark Configuration:");
         System.out.println(config);
         System.out.println();
+
+        // Summary accumulators
+        double ingestionWallSecs = -1, indexWallSecs = -1, queryWallSecs = -1;
+        double checkpointPostIngestSecs = -1, checkpointPostIndexSecs = -1;
+        long ingestionRows = 0;
+        double ingestionThroughput = 0;
+        MetricsCollector.Stats ingestionLatency = null;
+        long queriesRun = 0;
+        double queryThroughput = 0;
+        MetricsCollector.Stats queryLatency = null;
+        double recall = -1;
+        int recallK = config.topK;
+        int recallQueries = 0;
 
         // Phase 1: Dataset
         DatasetLoader loader = new DatasetLoader(config.datasetDir, config.dataset, config.datasetUrl);
@@ -129,6 +145,22 @@ public class VectorBench {
         }
         System.out.println("Table ready.");
         System.out.println();
+
+        // Phase 4a: Index creation before ingestion (if requested)
+        if (config.indexBeforeIngest && !config.skipIndex) {
+            String indexSql = "CREATE VECTOR INDEX vidx ON " + config.tableName + "(vec)"
+                    + " WITH m=" + config.indexM
+                    + " beamWidth=" + config.indexBeamWidth
+                    + " similarity=" + config.effectiveSimilarity() + " fusedPQ=true";
+            System.out.println("Executing (pre-ingest): " + indexSql);
+            indexWallSecs = runWithProgress("=== INDEX CREATION (pre-ingest) ===", () -> {
+                try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+                     Statement stmt = conn.createStatement()) {
+                    stmt.execute(indexSql);
+                }
+            });
+            System.out.println();
+        }
 
         // Phase 4: Ingestion
         if (!config.skipIngest) {
@@ -197,11 +229,16 @@ public class VectorBench {
             double ingestSecs = (System.nanoTime() - ingestStart) / 1e9;
             System.out.printf("\r  [%s] done in %.1fs%n", "=".repeat(40), ingestSecs);
 
+            ingestionWallSecs = ingestSecs;
+            ingestionRows = ingestMetrics.getCount();
+            ingestionThroughput = ingestionRows / ingestSecs;
+            ingestionLatency = ingestMetrics.computeStats();
+
             System.out.printf("=== INGESTION RESULTS ===%n");
             System.out.printf("Rows: %d | Wall time: %.1fs | Throughput: %.0f ops/s%n",
-                    ingestMetrics.getCount(), ingestSecs, ingestMetrics.getCount() / ingestSecs);
+                    ingestionRows, ingestSecs, ingestionThroughput);
             System.out.printf("Threads: %d | Batch size: %d%n", config.ingestThreads, config.batchSize);
-            ingestMetrics.computeStats().print("INGESTION LATENCY");
+            ingestionLatency.print("INGESTION LATENCY");
 
             // Verify row count matches ingested records
             if (!config.skipVerify) {
@@ -230,7 +267,7 @@ public class VectorBench {
 
         // Phase 4b: Checkpoint after ingestion
         if (config.checkpoint && !config.skipIngest) {
-            runWithProgress("=== CHECKPOINT (post-ingest) ===", () -> {
+            checkpointPostIngestSecs = runWithProgress("=== CHECKPOINT (post-ingest) ===", () -> {
                 try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
                      Statement stmt = conn.createStatement()) {
                     stmt.execute("EXECUTE CHECKPOINT 'herd'");
@@ -239,28 +276,28 @@ public class VectorBench {
             System.out.println();
         }
 
-        // Phase 5: Index creation
-        if (!config.skipIndex) {
+        // Phase 5: Index creation (post-ingest, unless already created before ingestion)
+        if (!config.skipIndex && !config.indexBeforeIngest) {
             String indexSql = "CREATE VECTOR INDEX vidx ON " + config.tableName + "(vec)"
                     + " WITH m=" + config.indexM
                     + " beamWidth=" + config.indexBeamWidth
                     + " similarity=" + config.effectiveSimilarity() + " fusedPQ=true";
             System.out.println("Executing: " + indexSql);
-            runWithProgress("=== INDEX CREATION ===", () -> {
+            indexWallSecs = runWithProgress("=== INDEX CREATION ===", () -> {
                 try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
                      Statement stmt = conn.createStatement()) {
                     stmt.execute(indexSql);
                 }
             });
             System.out.println();
-        } else {
+        } else if (config.skipIndex) {
             System.out.println("Skipping index creation.");
             System.out.println();
         }
 
         // Phase 5b: Checkpoint after index creation
-        if (config.checkpoint && !config.skipIndex) {
-            runWithProgress("=== CHECKPOINT (post-index) ===", () -> {
+        if (config.checkpoint && !config.skipIndex && !config.indexBeforeIngest) {
+            checkpointPostIndexSecs = runWithProgress("=== CHECKPOINT (post-index) ===", () -> {
                 try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
                      Statement stmt = conn.createStatement()) {
                     stmt.execute("EXECUTE CHECKPOINT 'herd'");
@@ -301,23 +338,110 @@ public class VectorBench {
         double querySecs = (System.nanoTime() - queryStart) / 1e9;
         System.out.printf("\r  [%s] done in %.1fs%n", "=".repeat(40), querySecs);
 
+        queryWallSecs = querySecs;
+        queriesRun = queryMetrics.getCount();
+        queryThroughput = queriesRun / querySecs;
+        queryLatency = queryMetrics.computeStats();
+
         System.out.printf("=== QUERY RESULTS ===%n");
         System.out.printf("Queries: %d | Wall time: %.1fs | Throughput: %.0f qps%n",
-                queryMetrics.getCount(), querySecs, queryMetrics.getCount() / querySecs);
+                queriesRun, querySecs, queryThroughput);
         System.out.printf("Threads: %d | Top-K: %d%n", config.queryThreads, config.topK);
-        queryMetrics.computeStats().print("QUERY LATENCY");
+        queryLatency.print("QUERY LATENCY");
 
         // Phase 7: Recall
         if (groundTruth != null && !groundTruth.isEmpty()) {
             // Only compute recall for queries that have ground truth (non-cycled portion)
             List<List<Integer>> recallResults = queryResults.subList(0, Math.min(queryResults.size(), groundTruth.size()));
-            double recall = computeRecall(recallResults, groundTruth, config.topK);
+            recall = computeRecall(recallResults, groundTruth, config.topK);
+            recallQueries = recallResults.size();
             System.out.printf("%nRecall@%d: %.4f (computed on %d queries with ground truth)%n",
-                    config.topK, recall, recallResults.size());
+                    config.topK, recall, recallQueries);
         }
+
+        // Final summary
+        double totalWallSecs = (System.nanoTime() - benchmarkStartNs) / 1e9;
+        printSummary(config, ingestionWallSecs, ingestionRows, ingestionThroughput, ingestionLatency,
+                checkpointPostIngestSecs, indexWallSecs, checkpointPostIndexSecs,
+                queryWallSecs, queriesRun, queryThroughput, queryLatency,
+                recall, recallK, recallQueries, totalWallSecs);
 
         System.out.println("\nBenchmark complete.");
         System.exit(0);
+    }
+
+    /**
+     * Prints a structured summary of the benchmark run.
+     * Each phase is printed as a line of space-separated key=value pairs,
+     * making it easy to parse programmatically (e.g. grep/awk) while remaining human-readable.
+     */
+    private static void printSummary(Config config,
+                                     double ingestionWallSecs, long ingestionRows, double ingestionThroughput,
+                                     MetricsCollector.Stats ingestionLatency,
+                                     double checkpointPostIngestSecs,
+                                     double indexWallSecs,
+                                     double checkpointPostIndexSecs,
+                                     double queryWallSecs, long queriesRun, double queryThroughput,
+                                     MetricsCollector.Stats queryLatency,
+                                     double recall, int recallK, int recallQueries,
+                                     double totalWallSecs) {
+        System.out.println();
+        System.out.println("========================================");
+        System.out.println("          BENCHMARK SUMMARY");
+        System.out.println("========================================");
+        System.out.printf("dataset=%s rows=%d similarity=%s%n",
+                config.dataset, config.numRows, config.effectiveSimilarity());
+        System.out.println("----------------------------------------");
+
+        if (ingestionWallSecs >= 0 && ingestionLatency != null) {
+            System.out.printf("phase=ingestion wall_time_s=%.1f rows=%d throughput_ops=%.0f " +
+                            "threads=%d batch_size=%d " +
+                            "latency_mean_ms=%.2f latency_p50_ms=%.2f latency_p95_ms=%.2f " +
+                            "latency_p99_ms=%.2f latency_max_ms=%.2f%n",
+                    ingestionWallSecs, ingestionRows, ingestionThroughput,
+                    config.ingestThreads, config.batchSize,
+                    ingestionLatency.meanNanos() / 1e6, ingestionLatency.p50Nanos() / 1e6,
+                    ingestionLatency.p95Nanos() / 1e6, ingestionLatency.p99Nanos() / 1e6,
+                    ingestionLatency.maxNanos() / 1e6);
+        } else {
+            System.out.println("phase=ingestion status=skipped");
+        }
+
+        if (checkpointPostIngestSecs >= 0) {
+            System.out.printf("phase=checkpoint_post_ingest wall_time_s=%.1f%n", checkpointPostIngestSecs);
+        }
+
+        if (indexWallSecs >= 0) {
+            System.out.printf("phase=index_creation wall_time_s=%.1f m=%d beam_width=%d%n",
+                    indexWallSecs, config.indexM, config.indexBeamWidth);
+        } else {
+            System.out.println("phase=index_creation status=skipped");
+        }
+
+        if (checkpointPostIndexSecs >= 0) {
+            System.out.printf("phase=checkpoint_post_index wall_time_s=%.1f%n", checkpointPostIndexSecs);
+        }
+
+        if (queryLatency != null) {
+            StringBuilder sb = new StringBuilder();
+            sb.append(String.format("phase=query wall_time_s=%.1f queries=%d throughput_qps=%.0f " +
+                            "threads=%d top_k=%d " +
+                            "latency_mean_ms=%.2f latency_p50_ms=%.2f latency_p95_ms=%.2f " +
+                            "latency_p99_ms=%.2f latency_max_ms=%.2f",
+                    queryWallSecs, queriesRun, queryThroughput,
+                    config.queryThreads, config.topK,
+                    queryLatency.meanNanos() / 1e6, queryLatency.p50Nanos() / 1e6,
+                    queryLatency.p95Nanos() / 1e6, queryLatency.p99Nanos() / 1e6,
+                    queryLatency.maxNanos() / 1e6));
+            if (recall >= 0) {
+                sb.append(String.format(" recall@%d=%.4f recall_queries=%d", recallK, recall, recallQueries));
+            }
+            System.out.println(sb);
+        }
+
+        System.out.println("----------------------------------------");
+        System.out.printf("total_wall_time_s=%.1f%n", totalWallSecs);
+        System.out.println("========================================");
     }
 
     static <T> List<T> cycleVectors(List<T> vectors, int targetCount) {

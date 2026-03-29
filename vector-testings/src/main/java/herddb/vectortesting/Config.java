@@ -52,6 +52,7 @@ public class Config {
     boolean checkpoint = false;
     int clientTimeoutSeconds = 7200 * 4; // 8 hours
     String similarity = null; // null = use dataset default
+    boolean indexBeforeIngest = false;
     int resumeFrom = 0; // skip first N vectors; row IDs start from N
 
     private static Options buildOptions() {
@@ -78,6 +79,7 @@ public class Config {
         opts.addOption(null, "checkpoint", false, "Force checkpoint after ingestion and after index creation");
         opts.addOption(null, "similarity", true, "Similarity function: euclidean, cosine, dot (default: from dataset)");
         opts.addOption(null, "client-timeout", true, "Client request timeout in seconds (default: 7200)");
+        opts.addOption(null, "index-before-ingest", false, "Create vector index before ingestion instead of after");
         opts.addOption(null, "resume-from", true, "Skip first N vectors and start row IDs from N (default: 0)");
         opts.addOption(null, "config", true, "Path to properties file");
         opts.addOption("h", "help", false, "Show help");
@@ -129,6 +131,7 @@ public class Config {
         if (cmd.hasOption("checkpoint")) cfg.checkpoint = true;
         if (cmd.hasOption("similarity")) cfg.similarity = cmd.getOptionValue("similarity");
         if (cmd.hasOption("client-timeout")) cfg.clientTimeoutSeconds = Integer.parseInt(cmd.getOptionValue("client-timeout"));
+        if (cmd.hasOption("index-before-ingest")) cfg.indexBeforeIngest = true;
         if (cmd.hasOption("resume-from")) cfg.resumeFrom = Integer.parseInt(cmd.getOptionValue("resume-from"));
 
         return cfg;
@@ -157,6 +160,7 @@ public class Config {
         if (props.containsKey("checkpoint")) checkpoint = Boolean.parseBoolean(props.getProperty("checkpoint"));
         if (props.containsKey("similarity")) similarity = props.getProperty("similarity");
         if (props.containsKey("client-timeout")) clientTimeoutSeconds = Integer.parseInt(props.getProperty("client-timeout"));
+        if (props.containsKey("index-before-ingest")) indexBeforeIngest = Boolean.parseBoolean(props.getProperty("index-before-ingest"));
         if (props.containsKey("resume-from")) resumeFrom = Integer.parseInt(props.getProperty("resume-from"));
     }
 
@@ -203,6 +207,7 @@ public class Config {
                 + ", similarity=" + effectiveSimilarity()
                 + (similarity != null ? " (override)" : " (dataset default)")
                 + (resumeFrom > 0 ? ", resumeFrom=" + resumeFrom : "")
+                + ", indexBeforeIngest=" + indexBeforeIngest
                 + ", skipIngest=" + skipIngest
                 + ", skipIndex=" + skipIndex
                 + ", skipVerify=" + skipVerify
