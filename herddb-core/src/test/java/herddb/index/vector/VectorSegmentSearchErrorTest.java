@@ -19,19 +19,17 @@
 
 package herddb.index.vector;
 
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import herddb.utils.Bytes;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
-import org.junit.Test;
-
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import org.junit.Test;
 
 /**
  * Tests that VectorSegment.search propagates errors instead of silently

@@ -394,10 +394,10 @@ public class VectorBench {
         System.out.println("----------------------------------------");
 
         if (ingestionWallSecs >= 0 && ingestionLatency != null) {
-            System.out.printf("phase=ingestion wall_time_s=%.1f rows=%d throughput_ops=%.0f " +
-                            "threads=%d batch_size=%d " +
-                            "latency_mean_ms=%.2f latency_p50_ms=%.2f latency_p95_ms=%.2f " +
-                            "latency_p99_ms=%.2f latency_max_ms=%.2f%n",
+            System.out.printf("phase=ingestion wall_time_s=%.1f rows=%d throughput_ops=%.0f "
+                            + "threads=%d batch_size=%d "
+                            + "latency_mean_ms=%.2f latency_p50_ms=%.2f latency_p95_ms=%.2f "
+                            + "latency_p99_ms=%.2f latency_max_ms=%.2f%n",
                     ingestionWallSecs, ingestionRows, ingestionThroughput,
                     config.ingestThreads, config.batchSize,
                     ingestionLatency.meanNanos() / 1e6, ingestionLatency.p50Nanos() / 1e6,
@@ -424,10 +424,10 @@ public class VectorBench {
 
         if (queryLatency != null) {
             StringBuilder sb = new StringBuilder();
-            sb.append(String.format("phase=query wall_time_s=%.1f queries=%d throughput_qps=%.0f " +
-                            "threads=%d top_k=%d " +
-                            "latency_mean_ms=%.2f latency_p50_ms=%.2f latency_p95_ms=%.2f " +
-                            "latency_p99_ms=%.2f latency_max_ms=%.2f",
+            sb.append(String.format("phase=query wall_time_s=%.1f queries=%d throughput_qps=%.0f "
+                            + "threads=%d top_k=%d "
+                            + "latency_mean_ms=%.2f latency_p50_ms=%.2f latency_p95_ms=%.2f "
+                            + "latency_p99_ms=%.2f latency_max_ms=%.2f",
                     queryWallSecs, queriesRun, queryThroughput,
                     config.queryThreads, config.topK,
                     queryLatency.meanNanos() / 1e6, queryLatency.p50Nanos() / 1e6,

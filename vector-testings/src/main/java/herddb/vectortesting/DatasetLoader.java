@@ -22,11 +22,11 @@ package herddb.vectortesting;
 import io.jhdf.HdfFile;
 import io.jhdf.api.Dataset;
 import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -37,13 +37,12 @@ import java.net.URLConnection;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.zip.GZIPInputStream;
-import java.time.Duration;
-
 import org.apache.commons.net.ftp.FTP;
 import org.apache.commons.net.ftp.FTPClient;
 
@@ -259,7 +258,10 @@ public class DatasetLoader {
         String sizeReply = ftp.getSize(uri.getPath());
         long totalFileSize = -1;
         if (sizeReply != null) {
-            try { totalFileSize = Long.parseLong(sizeReply.trim()); } catch (NumberFormatException ignored) {}
+            try {
+                totalFileSize = Long.parseLong(sizeReply.trim());
+            } catch (NumberFormatException ignored) {
+            }
         }
         InputStream ftpStream = ftp.retrieveFileStream(uri.getPath());
         if (ftpStream == null) {

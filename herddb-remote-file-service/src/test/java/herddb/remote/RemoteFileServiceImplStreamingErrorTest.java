@@ -22,7 +22,6 @@ package herddb.remote;
 
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-
 import herddb.remote.proto.ListFilesEntry;
 import herddb.remote.proto.ListFilesRequest;
 import herddb.remote.storage.LocalObjectStorage;
