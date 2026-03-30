@@ -422,6 +422,59 @@ public class FileBackedVectorValuesTest {
         }
     }
 
+    @Test
+    public void testDenseFileCompactness() throws Exception {
+        if (useMmap) {
+            // Dense layout only applies to Channel impl
+            return;
+        }
+        int dimension = 4;
+        int numVectors = 50;
+        Path tempDir = tempFolder.getRoot().toPath();
+
+        try (FileBackedVectorValues fbv = createFBV(dimension, numVectors, tempDir)) {
+            for (int i = 0; i < numVectors; i++) {
+                float[] data = new float[dimension];
+                for (int d = 0; d < dimension; d++) {
+                    data[d] = i + d * 0.1f;
+                }
+                fbv.putVector(i, data);
+            }
+
+            // With sparse nodeIds the file would be dense: all written data contiguous
+            // Verify all vectors survive
+            for (int i = 0; i < numVectors; i++) {
+                float[] expected = new float[dimension];
+                for (int d = 0; d < dimension; d++) {
+                    expected[d] = i + d * 0.1f;
+                }
+                assertArrayEquals("Mismatch at nodeId " + i, expected,
+                        toFloatArray(fbv.getVector(i)), 0.0001f);
+            }
+        }
+    }
+
+    @Test
+    public void testOutOfOrderNodeIds() throws Exception {
+        int dimension = 3;
+        Path tempDir = tempFolder.getRoot().toPath();
+
+        try (FileBackedVectorValues fbv = createFBV(dimension, 10, tempDir)) {
+            // Insert out of order
+            fbv.putVector(5, new float[]{50, 51, 52});
+            fbv.putVector(2, new float[]{20, 21, 22});
+            fbv.putVector(8, new float[]{80, 81, 82});
+            fbv.putVector(0, new float[]{0, 1, 2});
+
+            assertEquals(4, fbv.size());
+
+            assertArrayEquals(new float[]{50, 51, 52}, toFloatArray(fbv.getVector(5)), 0.0001f);
+            assertArrayEquals(new float[]{20, 21, 22}, toFloatArray(fbv.getVector(2)), 0.0001f);
+            assertArrayEquals(new float[]{80, 81, 82}, toFloatArray(fbv.getVector(8)), 0.0001f);
+            assertArrayEquals(new float[]{0, 1, 2}, toFloatArray(fbv.getVector(0)), 0.0001f);
+        }
+    }
+
     private float[] toFloatArray(VectorFloat<?> vec) {
         float[] result = new float[vec.length()];
         for (int i = 0; i < result.length; i++) {

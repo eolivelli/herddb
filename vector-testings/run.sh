@@ -33,7 +33,7 @@ if [ -z "$JAR" ]; then
     exit 1
 fi
 
-JAVA_HEAP="${VECTORBENCH_HEAP:--Xms2g -Xmx8g}"
+JAVA_HEAP="${VECTORBENCH_HEAP:--Xms1g -Xmx2g}"
 LOG_FILE="$SCRIPT_DIR/vectorbench.log"
 PID_FILE="$SCRIPT_DIR/vectorbench.pid"
 

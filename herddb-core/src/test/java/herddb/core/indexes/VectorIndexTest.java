@@ -2618,6 +2618,207 @@ public class VectorIndexTest {
         }
     }
 
+    /**
+     * Concurrent inserts from multiple threads with interleaved checkpoints.
+     * Validates that the vector index handles concurrent recordInserted() calls
+     * correctly and that checkpoint doesn't corrupt the index.
+     */
+    @Test
+    public void testConcurrentInsertsAndCheckpoint() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 16;
+        final int numThreads = 8;
+        final int rowsPerThread = 50;
+        final int totalRows = numThreads * rowsPerThread;
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            // Launch concurrent inserters using transactions (batch + commit)
+            java.util.concurrent.atomic.AtomicReference<Throwable> error = new java.util.concurrent.atomic.AtomicReference<>();
+            java.util.concurrent.CountDownLatch startLatch = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch doneLatch = new java.util.concurrent.CountDownLatch(numThreads);
+
+            for (int t = 0; t < numThreads; t++) {
+                final int threadId = t;
+                new Thread(() -> {
+                    try {
+                        startLatch.await();
+                        int base = threadId * rowsPerThread;
+                        // Insert in small batches within auto-transactions
+                        for (int i = 1; i <= rowsPerThread; i++) {
+                            int id = base + i;
+                            executeUpdate(manager,
+                                    "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                                    Arrays.asList(id, randomVec(dimension, id)));
+                        }
+                    } catch (Throwable ex) {
+                        error.compareAndSet(null, ex);
+                    } finally {
+                        doneLatch.countDown();
+                    }
+                }, "inserter-" + t).start();
+            }
+
+            // Launch a checkpoint thread that runs concurrently with inserts
+            java.util.concurrent.atomic.AtomicBoolean checkpointDone = new java.util.concurrent.atomic.AtomicBoolean(false);
+            Thread checkpointThread = new Thread(() -> {
+                try {
+                    startLatch.await();
+                    while (!checkpointDone.get()) {
+                        manager.checkpoint();
+                        Thread.sleep(10);
+                    }
+                } catch (InterruptedException ie) {
+                    // expected
+                } catch (Throwable ex) {
+                    error.compareAndSet(null, ex);
+                }
+            }, "checkpointer");
+            checkpointThread.start();
+
+            // Go!
+            startLatch.countDown();
+            doneLatch.await();
+            checkpointDone.set(true);
+            checkpointThread.join(10000);
+
+            // Final checkpoint
+            manager.checkpoint();
+
+            if (error.get() != null) {
+                throw new AssertionError("Concurrent operation failed", error.get());
+            }
+
+            // Verify all rows are present
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals("all rows should be indexed", totalRows, vim.getNodeCount());
+
+            // Verify search works
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse("search should return results", results.isEmpty());
+                assertEquals("top result should be id=1", 1, results.get(0).get("id"));
+            }
+        }
+    }
+
+    /**
+     * Concurrent transactional inserts (batch + commit) from multiple threads.
+     * Each thread opens a transaction, inserts a batch, then commits.
+     * This exercises the onTransactionCommit → recordInserted path concurrently.
+     */
+    @Test
+    public void testConcurrentTransactionalInserts() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 16;
+        final int numThreads = 8;
+        final int rowsPerThread = 50;
+        final int batchSize = 10;
+        final int totalRows = numThreads * rowsPerThread;
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            java.util.concurrent.atomic.AtomicReference<Throwable> error = new java.util.concurrent.atomic.AtomicReference<>();
+            java.util.concurrent.CountDownLatch startLatch = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch doneLatch = new java.util.concurrent.CountDownLatch(numThreads);
+
+            for (int t = 0; t < numThreads; t++) {
+                final int threadId = t;
+                new Thread(() -> {
+                    try {
+                        startLatch.await();
+                        int base = threadId * rowsPerThread;
+                        // Insert in batches using explicit transactions (BEGIN / INSERT... / COMMIT)
+                        for (int batch = 0; batch < rowsPerThread / batchSize; batch++) {
+                            long txId = herddb.core.TestUtils.beginTransaction(manager, "tblspace1");
+                            for (int i = 0; i < batchSize; i++) {
+                                int id = base + batch * batchSize + i + 1;
+                                herddb.core.TestUtils.execute(manager, "tblspace1",
+                                        "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                                        Arrays.asList(id, randomVec(dimension, id)),
+                                        new TransactionContext(txId));
+                            }
+                            herddb.core.TestUtils.commitTransaction(manager, "tblspace1", txId);
+                        }
+                    } catch (Throwable ex) {
+                        error.compareAndSet(null, ex);
+                    } finally {
+                        doneLatch.countDown();
+                    }
+                }, "tx-inserter-" + t).start();
+            }
+
+            startLatch.countDown();
+            doneLatch.await();
+
+            if (error.get() != null) {
+                throw new AssertionError("Concurrent transactional insert failed", error.get());
+            }
+
+            manager.checkpoint();
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals("all rows should be indexed", totalRows, vim.getNodeCount());
+
+            // Verify search works and returns correct results
+            float[] query = randomVec(dimension, 1);
+            try (DataScanner scanner = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 5",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scanner.consume();
+                assertFalse("search should return results", results.isEmpty());
+                assertEquals("top result should be id=1", 1, results.get(0).get("id"));
+            }
+        }
+    }
+
     private static float[] randomVec(int dim, int seed) {
         float[] v = new float[dim];
         float norm = 0;

@@ -93,7 +93,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.IntFunction;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -213,8 +213,11 @@ public class VectorIndexManager extends AbstractIndexManager {
     /** Counter for assigning unique segment IDs. */
     private final AtomicInteger nextSegmentId = new AtomicInteger(0);
 
-    /** Protects rebuild/checkpoint from seeing partially-updated in-memory state. */
-    private final ReentrantLock stateLock = new ReentrantLock();
+    /** Protects rebuild/checkpoint from seeing partially-updated in-memory state.
+     *  DML operations (recordInserted/recordDeleted) acquire the read lock (shared),
+     *  allowing concurrent inserts. Checkpoint and rebuild state-swaps acquire the
+     *  write lock (exclusive). */
+    private final ReentrantReadWriteLock stateLock = new ReentrantReadWriteLock();
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -902,7 +905,7 @@ public class VectorIndexManager extends AbstractIndexManager {
 
                 // Swap in-memory state atomically under the lock so that a
                 // concurrent checkpoint() never sees a partially-updated state.
-                stateLock.lock();
+                stateLock.writeLock().lock();
                 try {
                     // Close builder from the last batch (it references FileBackedVectorValues
                     // that will be closed soon, so we must not reuse it)
@@ -943,7 +946,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                         dirty.set(false);
                     }
                 } finally {
-                    stateLock.unlock();
+                    stateLock.writeLock().unlock();
                 }
 
                 int totalNodes = (int) onDiskNodeToPkSize() + vectors.size();
@@ -992,7 +995,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                     loadFusedPQSegment(newSeg, reloadMapFile, reloadGraphFile, dimension, nextNodeId.get());
 
                     // Swap state atomically under the lock
-                    stateLock.lock();
+                    stateLock.writeLock().lock();
                     try {
                         GraphIndexBuilder oldBuilder = this.builder;
                         if (oldBuilder != null) {
@@ -1008,7 +1011,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                         initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
                         dirty.set(false);
                     } finally {
-                        stateLock.unlock();
+                        stateLock.writeLock().unlock();
                     }
 
                     LOGGER.log(Level.INFO,
@@ -1039,7 +1042,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                     }
 
                     // Swap state atomically under the lock
-                    stateLock.lock();
+                    stateLock.writeLock().lock();
                     try {
                         for (Map.Entry<Integer, Bytes> e : rebuildNodeToPkMap.entrySet()) {
                             this.nodeToPk.put(e.getKey(), e.getValue());
@@ -1065,7 +1068,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                         }
                         dirty.set(true);
                     } finally {
-                        stateLock.unlock();
+                        stateLock.writeLock().unlock();
                     }
                     long elapsed = System.currentTimeMillis() - start;
                     LOGGER.log(Level.INFO,
@@ -1160,11 +1163,11 @@ public class VectorIndexManager extends AbstractIndexManager {
 
     private List<PostCheckpointAction> doCheckpoint(LogSequenceNumber sequenceNumber, boolean pin)
             throws IOException, DataStorageManagerException {
-        stateLock.lock();
+        stateLock.writeLock().lock();
         try {
             return doCheckpointUnderLock(sequenceNumber, pin);
         } finally {
-            stateLock.unlock();
+            stateLock.writeLock().unlock();
         }
     }
 
@@ -2056,7 +2059,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         if (floats.length == 0) {
             return;
         }
-        stateLock.lock();
+        stateLock.readLock().lock();
         try {
             if (dimension == 0) {
                 initBuilderForDimension(floats.length);
@@ -2075,7 +2078,7 @@ public class VectorIndexManager extends AbstractIndexManager {
             builder.addGraphNode(nodeId, vec);
             dirty.set(true);
         } finally {
-            stateLock.unlock();
+            stateLock.readLock().unlock();
         }
     }
 
@@ -2084,7 +2087,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         if (indexKey == null) {
             return;
         }
-        stateLock.lock();
+        stateLock.readLock().lock();
         try {
             // Check on-disk segments first
             for (VectorSegment seg : segments) {
@@ -2107,7 +2110,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                 vectors.remove(nodeId);
             }
         } finally {
-            stateLock.unlock();
+            stateLock.readLock().unlock();
         }
     }
 
@@ -2259,23 +2262,26 @@ public class VectorIndexManager extends AbstractIndexManager {
 
     private synchronized void initBuilderForDimension(int dim, Map<Integer, VectorFloat<?>> vectorsMap) {
         if (this.dimension == 0) {
-            this.dimension = dim;
             this.mravv = new MapRandomAccessVectorValues(vectorsMap, dim);
             BuildScoreProvider bsp =
                     BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
             this.builder = new GraphIndexBuilder(
                     bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+            // Set dimension LAST: concurrent readers check dimension != 0 to skip init,
+            // so builder must be visible before dimension becomes non-zero.
+            this.dimension = dim;
         }
     }
 
     private synchronized void initBuilderForDimension(int dim, RandomAccessVectorValues ravv) {
         if (this.dimension == 0) {
-            this.dimension = dim;
             this.mravv = ravv;
             BuildScoreProvider bsp =
                     BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
             this.builder = new GraphIndexBuilder(
                     bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+            // Set dimension LAST (see above)
+            this.dimension = dim;
         }
     }
 
