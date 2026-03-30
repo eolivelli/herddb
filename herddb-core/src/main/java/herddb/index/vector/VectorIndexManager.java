@@ -85,6 +85,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -181,14 +182,17 @@ public class VectorIndexManager extends AbstractIndexManager {
     // In-memory state – LIVE inserts (new since last checkpoint)
     // -------------------------------------------------------------------------
 
-    /** nodeId → vector (for scoring during incremental inserts after load) */
-    private final ConcurrentHashMap<Integer, VectorFloat<?>> vectors = new ConcurrentHashMap<>();
+    /** nodeId → vector (for scoring during incremental inserts after load).
+     *  Volatile: swapped to a new empty map in Phase A of checkpoint. */
+    private volatile ConcurrentHashMap<Integer, VectorFloat<?>> vectors = new ConcurrentHashMap<>();
 
-    /** primary-key bytes → jvector node ID (live inserts only) */
-    private final ConcurrentHashMap<Bytes, Integer> pkToNode = new ConcurrentHashMap<>();
+    /** primary-key bytes → jvector node ID (live inserts only).
+     *  Volatile: swapped in Phase A of checkpoint. */
+    private volatile ConcurrentHashMap<Bytes, Integer> pkToNode = new ConcurrentHashMap<>();
 
-    /** jvector node ID → primary-key bytes (live inserts only) */
-    private final ConcurrentHashMap<Integer, Bytes> nodeToPk = new ConcurrentHashMap<>();
+    /** jvector node ID → primary-key bytes (live inserts only).
+     *  Volatile: swapped in Phase A of checkpoint. */
+    private volatile ConcurrentHashMap<Integer, Bytes> nodeToPk = new ConcurrentHashMap<>();
 
     /** Monotonically increasing node-ID counter. */
     private final AtomicInteger nextNodeId = new AtomicInteger(0);
@@ -202,6 +206,28 @@ public class VectorIndexManager extends AbstractIndexManager {
     private volatile int dimension = 0;
     private volatile RandomAccessVectorValues mravv = null;
     private volatile GraphIndexBuilder builder = null;
+
+    // -------------------------------------------------------------------------
+    // Frozen state – snapshot captured in Phase A of checkpoint, searchable during Phase B
+    // -------------------------------------------------------------------------
+
+    /** Frozen builder from Phase A — searched during Phase B, closed in Phase C. */
+    private volatile GraphIndexBuilder frozenBuilder;
+    /** Frozen RAVV from Phase A — used for search during Phase B. */
+    private volatile RandomAccessVectorValues frozenMravv;
+    /** Frozen nodeToPk from Phase A — used for PK resolution during Phase B search. */
+    private volatile ConcurrentHashMap<Integer, Bytes> frozenNodeToPk;
+
+    /** PKs deleted during Phase B that may exist in frozen state or mergeable segments being rewritten.
+     *  Non-null only during Phase B. */
+    private volatile Set<Bytes> pendingCheckpointDeletes;
+
+    /** Max live vectors allowed during Phase B before back-pressure kicks in.
+     *  When reached, recordInserted blocks until Phase C completes. */
+    private volatile int liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
+
+    /** Signaled when Phase C completes. DML threads wait on this if live cap is exceeded. */
+    private volatile CountDownLatch checkpointPhaseComplete;
 
     // -------------------------------------------------------------------------
     // On-disk state – multiple segments, each containing an independent FusedPQ graph
@@ -1151,6 +1177,18 @@ public class VectorIndexManager extends AbstractIndexManager {
                 bsp, dimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
     }
 
+    // -------------------------------------------------------------------------
+    // Test hook: called during Phase B of checkpoint (after Phase A releases write lock).
+    // Package-private for testing concurrent DML during checkpoint.
+    // -------------------------------------------------------------------------
+    private volatile Runnable checkpointPhaseBHook;
+
+    /** Sets a hook that runs during Phase B of checkpoint (after Phase A releases the write lock).
+     *  For testing concurrent DML during checkpoint. */
+    public void setCheckpointPhaseBHook(Runnable hook) {
+        this.checkpointPhaseBHook = hook;
+    }
+
     @Override
     public List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin)
             throws DataStorageManagerException {
@@ -1161,145 +1199,147 @@ public class VectorIndexManager extends AbstractIndexManager {
         }
     }
 
+    /**
+     * Checkpoint dispatcher: uses single-lock for simple format (< 256 vectors, always fast),
+     * and three-phase for FusedPQ format (can be slow, needs concurrent DML).
+     */
     private List<PostCheckpointAction> doCheckpoint(LogSequenceNumber sequenceNumber, boolean pin)
             throws IOException, DataStorageManagerException {
+
+        // First, determine under write lock whether we need FusedPQ or simple
         stateLock.writeLock().lock();
         try {
-            return doCheckpointUnderLock(sequenceNumber, pin);
-        } finally {
-            stateLock.writeLock().unlock();
-        }
-    }
-
-    private List<PostCheckpointAction> doCheckpointUnderLock(LogSequenceNumber sequenceNumber, boolean pin)
-            throws IOException, DataStorageManagerException {
-
-        boolean anySegmentDirty = segments.stream().anyMatch(s -> s.dirty);
-        if (!dirty.get() && !anySegmentDirty) {
-            LOGGER.log(Level.FINE, "checkpoint vector index {0}: skipped (no changes)", index.name);
-            return Collections.emptyList();
-        }
-
-        boolean hasLiveNodes = builder != null && !nodeToPk.isEmpty();
-        boolean hasOnDiskNodes = onDiskNodeToPkSize() > 0;
-
-        if (!hasLiveNodes && !hasOnDiskNodes && builder == null && segments.isEmpty()) {
-            IndexStatus emptyStatus = new IndexStatus(
-                    index.name, sequenceNumber, newPageId.get(), new HashSet<>(), new byte[0]);
-            List<PostCheckpointAction> result = new ArrayList<>();
-            result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, emptyStatus, pin));
-            dirty.set(false);
-            LOGGER.log(Level.INFO, "checkpoint vector index {0}: empty", index.name);
-            return result;
-        }
-
-        if (dimension == 0) {
-            IndexStatus emptyStatus = new IndexStatus(
-                    index.name, sequenceNumber, newPageId.get(), new HashSet<>(), new byte[0]);
-            List<PostCheckpointAction> result = new ArrayList<>();
-            result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, emptyStatus, pin));
-            dirty.set(false);
-            LOGGER.log(Level.INFO, "checkpoint vector index {0}: empty dimension", index.name);
-            return result;
-        }
-
-        // Count total active vectors
-        int totalActiveVectors = (int) onDiskNodeToPkSize() + nodeToPk.size();
-
-        // If all vectors deleted but segments still exist, clean up and save empty
-        if (totalActiveVectors == 0 && !segments.isEmpty()) {
-            for (VectorSegment seg : segments) {
-                seg.close();
+            boolean anySegmentDirty = segments.stream().anyMatch(s -> s.dirty);
+            if (!dirty.get() && !anySegmentDirty) {
+                LOGGER.log(Level.FINE, "checkpoint vector index {0}: skipped (no changes)", index.name);
+                return Collections.emptyList();
             }
-            segments = new java.util.concurrent.CopyOnWriteArrayList<>();
-            nextSegmentId.set(0);
-            IndexStatus emptyStatus = new IndexStatus(
-                    index.name, sequenceNumber, newPageId.get(), new HashSet<>(), new byte[0]);
-            List<PostCheckpointAction> result = new ArrayList<>();
-            result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, emptyStatus, pin));
-            dirty.set(false);
-            LOGGER.log(Level.INFO, "checkpoint vector index {0}: all vectors deleted, saving empty", index.name);
-            return result;
-        }
 
-        boolean useFusedPQ = fusedPQ
-                && dimension >= MIN_DIM_FOR_FUSED_PQ
-                && totalActiveVectors >= MIN_VECTORS_FOR_FUSED_PQ;
+            boolean hasLiveNodes = builder != null && !nodeToPk.isEmpty();
+            boolean hasOnDiskNodes = onDiskNodeToPkSize() > 0;
 
-        if (!useFusedPQ) {
-            // If we have on-disk segments, materialize their data into live state first
-            if (!segments.isEmpty()) {
-                // Collect all data from segments into live maps
-                ConcurrentHashMap<Integer, VectorFloat<?>> allVectors = new ConcurrentHashMap<>();
-                ConcurrentHashMap<Integer, Bytes> allNodeToPk = new ConcurrentHashMap<>();
-                int seqId = 0;
-                // Existing live data
-                for (Map.Entry<Integer, Bytes> e : nodeToPk.entrySet()) {
-                    VectorFloat<?> vec = vectors.get(e.getKey());
-                    if (vec != null) {
-                        allVectors.put(seqId, vec);
-                        allNodeToPk.put(seqId, e.getValue());
-                        seqId++;
-                    }
-                }
-                // Segment data
+            if (!hasLiveNodes && !hasOnDiskNodes && builder == null && segments.isEmpty()) {
+                IndexStatus emptyStatus = new IndexStatus(
+                        index.name, sequenceNumber, newPageId.get(), new HashSet<>(), new byte[0]);
+                List<PostCheckpointAction> result = new ArrayList<>();
+                result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, emptyStatus, pin));
+                dirty.set(false);
+                LOGGER.log(Level.INFO, "checkpoint vector index {0}: empty", index.name);
+                return result;
+            }
+
+            if (dimension == 0) {
+                IndexStatus emptyStatus = new IndexStatus(
+                        index.name, sequenceNumber, newPageId.get(), new HashSet<>(), new byte[0]);
+                List<PostCheckpointAction> result = new ArrayList<>();
+                result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, emptyStatus, pin));
+                dirty.set(false);
+                LOGGER.log(Level.INFO, "checkpoint vector index {0}: empty dimension", index.name);
+                return result;
+            }
+
+            int totalActiveVectors = (int) onDiskNodeToPkSize() + nodeToPk.size();
+
+            if (totalActiveVectors == 0 && !segments.isEmpty()) {
                 for (VectorSegment seg : segments) {
-                    if (seg.onDiskGraph != null) {
-                        try (OnDiskGraphIndex.View view = seg.onDiskGraph.getView();
-                             Stream<Map.Entry<Bytes, Bytes>> scanStream = seg.scanNodeToPk()) {
-                            List<Map.Entry<Bytes, Bytes>> entries = scanStream.collect(java.util.stream.Collectors.toList());
-                            for (Map.Entry<Bytes, Bytes> e : entries) {
-                                int ordinal = bytesToOrdinal(e.getKey());
-                                VectorFloat<?> vec = view.getVector(ordinal);
-                                allVectors.put(seqId, vec);
-                                allNodeToPk.put(seqId, e.getValue());
-                                seqId++;
-                            }
-                        }
-                    }
                     seg.close();
                 }
                 segments = new java.util.concurrent.CopyOnWriteArrayList<>();
                 nextSegmentId.set(0);
-
-                // Replace live state with merged data and rebuild the builder
-                vectors.clear();
-                vectors.putAll(allVectors);
-                nodeToPk.clear();
-                nodeToPk.putAll(allNodeToPk);
-                pkToNode.clear();
-                for (Map.Entry<Integer, Bytes> e : allNodeToPk.entrySet()) {
-                    pkToNode.put(e.getValue(), e.getKey());
-                }
-                nextNodeId.set(seqId);
-
-                // Rebuild the graph builder from scratch
-                GraphIndexBuilder oldBuilder = this.builder;
-                if (oldBuilder != null) {
-                    try {
-                        oldBuilder.close();
-                    } catch (IOException e) {
-                        // ignore
-                    }
-                }
-                this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
-                BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
-                this.builder = new GraphIndexBuilder(
-                        bsp, dimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
-                for (Map.Entry<Integer, VectorFloat<?>> e : allVectors.entrySet()) {
-                    builder.addGraphNode(e.getKey(), e.getValue());
-                }
-                builder.cleanup();
+                IndexStatus emptyStatus = new IndexStatus(
+                        index.name, sequenceNumber, newPageId.get(), new HashSet<>(), new byte[0]);
+                List<PostCheckpointAction> result = new ArrayList<>();
+                result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, emptyStatus, pin));
+                dirty.set(false);
+                LOGGER.log(Level.INFO, "checkpoint vector index {0}: all vectors deleted, saving empty", index.name);
+                return result;
             }
-            return doCheckpointSimple(sequenceNumber, pin);
+
+            boolean useFusedPQ = fusedPQ
+                    && dimension >= MIN_DIM_FOR_FUSED_PQ
+                    && totalActiveVectors >= MIN_VECTORS_FOR_FUSED_PQ;
+
+            if (!useFusedPQ) {
+                // Simple format: small index (< 256 vectors), checkpoint is fast.
+                // Use single-lock approach — data stays in live maps.
+                return doCheckpointSimpleUnderLock(sequenceNumber, pin);
+            }
+        } finally {
+            stateLock.writeLock().unlock();
         }
 
-        // --- FusedPQ multi-segment checkpoint ---
-        return doCheckpointFusedPQ(sequenceNumber, pin);
+        // FusedPQ path: use three-phase checkpoint
+        return doCheckpointFusedPQThreePhase(sequenceNumber, pin);
     }
 
-    private List<PostCheckpointAction> doCheckpointSimple(LogSequenceNumber sequenceNumber, boolean pin)
+    /**
+     * Simple format checkpoint — runs entirely under write lock.
+     * Used for small indexes (< 256 vectors) where checkpoint is always fast.
+     * Data remains in live maps after checkpoint for continued in-memory search.
+     * Must be called with stateLock.writeLock() held.
+     */
+    private List<PostCheckpointAction> doCheckpointSimpleUnderLock(LogSequenceNumber sequenceNumber, boolean pin)
             throws IOException, DataStorageManagerException {
+        // If we have on-disk segments, materialize their data into live state first
+        if (!segments.isEmpty()) {
+            ConcurrentHashMap<Integer, VectorFloat<?>> allVectors = new ConcurrentHashMap<>();
+            ConcurrentHashMap<Integer, Bytes> allNodeToPk = new ConcurrentHashMap<>();
+            int seqId = 0;
+            for (Map.Entry<Integer, Bytes> e : nodeToPk.entrySet()) {
+                VectorFloat<?> vec = vectors.get(e.getKey());
+                if (vec != null) {
+                    allVectors.put(seqId, vec);
+                    allNodeToPk.put(seqId, e.getValue());
+                    seqId++;
+                }
+            }
+            for (VectorSegment seg : segments) {
+                if (seg.onDiskGraph != null) {
+                    try (OnDiskGraphIndex.View view = seg.onDiskGraph.getView();
+                         Stream<Map.Entry<Bytes, Bytes>> scanStream = seg.scanNodeToPk()) {
+                        List<Map.Entry<Bytes, Bytes>> entries = scanStream.collect(java.util.stream.Collectors.toList());
+                        for (Map.Entry<Bytes, Bytes> e : entries) {
+                            int ordinal = bytesToOrdinal(e.getKey());
+                            VectorFloat<?> vec = view.getVector(ordinal);
+                            allVectors.put(seqId, vec);
+                            allNodeToPk.put(seqId, e.getValue());
+                            seqId++;
+                        }
+                    }
+                }
+                seg.close();
+            }
+            segments = new java.util.concurrent.CopyOnWriteArrayList<>();
+            nextSegmentId.set(0);
+
+            vectors.clear();
+            vectors.putAll(allVectors);
+            nodeToPk.clear();
+            nodeToPk.putAll(allNodeToPk);
+            pkToNode.clear();
+            for (Map.Entry<Integer, Bytes> e : allNodeToPk.entrySet()) {
+                pkToNode.put(e.getValue(), e.getKey());
+            }
+            nextNodeId.set(seqId);
+
+            GraphIndexBuilder oldBuilder = this.builder;
+            if (oldBuilder != null) {
+                try {
+                    oldBuilder.close();
+                } catch (IOException e) {
+                    // ignore
+                }
+            }
+            this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
+            BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+            this.builder = new GraphIndexBuilder(
+                    bsp, dimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+            for (Map.Entry<Integer, VectorFloat<?>> e : allVectors.entrySet()) {
+                builder.addGraphNode(e.getKey(), e.getValue());
+            }
+            builder.cleanup();
+        }
+
         if (builder != null) {
             builder.cleanup();
         }
@@ -1336,39 +1376,303 @@ public class VectorIndexManager extends AbstractIndexManager {
         return result;
     }
 
-    private List<PostCheckpointAction> doCheckpointFusedPQ(LogSequenceNumber sequenceNumber, boolean pin)
+    /**
+     * Three-phase FusedPQ checkpoint:
+     * <ul>
+     *   <li><b>Phase A</b> (brief write lock): snapshot live state, swap to new empty maps/builder</li>
+     *   <li><b>Phase B</b> (no lock): build graphs, compute PQ, write to disk</li>
+     *   <li><b>Phase C</b> (brief write lock): load new segments, apply pending deletes, swap segments</li>
+     * </ul>
+     */
+    private List<PostCheckpointAction> doCheckpointFusedPQThreePhase(LogSequenceNumber sequenceNumber, boolean pin)
             throws IOException, DataStorageManagerException {
 
-        if (builder != null) {
-            builder.cleanup();
+        // =====================================================================
+        // Phase A: snapshot + swap (brief write lock)
+        // =====================================================================
+        ConcurrentHashMap<Integer, VectorFloat<?>> snapshotVectors;
+        ConcurrentHashMap<Bytes, Integer> snapshotPkToNode;
+        ConcurrentHashMap<Integer, Bytes> snapshotNodeToPk;
+        GraphIndexBuilder snapshotBuilder;
+        RandomAccessVectorValues snapshotMravv;
+        List<VectorSegment> sealedSegments;
+        List<VectorSegment> mergeableSegments;
+        int snapshotDimension;
+
+        stateLock.writeLock().lock();
+        try {
+            snapshotDimension = dimension;
+
+            // Snapshot live state
+            snapshotVectors = this.vectors;
+            snapshotPkToNode = this.pkToNode;
+            snapshotNodeToPk = this.nodeToPk;
+            snapshotBuilder = this.builder;
+            snapshotMravv = this.mravv;
+
+            // Classify segments
+            sealedSegments = new ArrayList<>();
+            mergeableSegments = new ArrayList<>();
+            for (VectorSegment seg : segments) {
+                if (seg.isSealed(maxSegmentSize)) {
+                    sealedSegments.add(seg);
+                } else {
+                    mergeableSegments.add(seg);
+                }
+            }
+
+            // Set up frozen state for search during Phase B
+            this.frozenBuilder = snapshotBuilder;
+            this.frozenMravv = snapshotMravv;
+            this.frozenNodeToPk = snapshotNodeToPk;
+            this.pendingCheckpointDeletes = ConcurrentHashMap.newKeySet();
+            this.checkpointPhaseComplete = new CountDownLatch(1);
+            this.liveVectorCapDuringCheckpoint = Math.max(10000, snapshotNodeToPk.size() / 2);
+
+            // Swap to new empty live state — DML proceeds immediately after write lock release
+            this.vectors = new ConcurrentHashMap<>();
+            this.pkToNode = new ConcurrentHashMap<>();
+            this.nodeToPk = new ConcurrentHashMap<>();
+            initEmptyLiveBuilder(snapshotDimension, beamWidth, neighborOverflow, alpha);
+            dirty.set(false);
+
+            LOGGER.log(Level.INFO,
+                    "checkpoint vector index {0} Phase A: snapshotted {1} live + {2} on-disk vectors, "
+                            + "{3} sealed + {4} mergeable segments",
+                    new Object[]{index.name, snapshotNodeToPk.size(), onDiskNodeToPkSize(),
+                            sealedSegments.size(), mergeableSegments.size()});
+        } finally {
+            stateLock.writeLock().unlock();
         }
 
-        // Classify segments: sealed (large + clean) vs mergeable
-        List<VectorSegment> sealedSegments = new ArrayList<>();
-        List<VectorSegment> mergeableSegments = new ArrayList<>();
-        for (VectorSegment seg : segments) {
-            if (seg.isSealed(maxSegmentSize)) {
-                sealedSegments.add(seg);
+        // =====================================================================
+        // Phase B: build graphs, write to disk (NO lock)
+        // =====================================================================
+        List<PostCheckpointAction> result = new ArrayList<>();
+        List<SegmentWriteResult> newSegmentResults;
+        try {
+            // Test hook for concurrent DML testing
+            Runnable hook = checkpointPhaseBHook;
+            if (hook != null) {
+                hook.run();
+            }
+
+            newSegmentResults = doCheckpointFusedPQPhaseB(
+                    snapshotVectors, snapshotNodeToPk, snapshotBuilder,
+                    snapshotDimension, sealedSegments, mergeableSegments,
+                    sequenceNumber, pin, result);
+        } catch (IOException | RuntimeException e) {
+            // Phase B failed — restore frozen state back to live
+            recoverFromPhaseBFailure(snapshotVectors, snapshotPkToNode, snapshotNodeToPk,
+                    snapshotBuilder, snapshotMravv);
+            throw e;
+        }
+
+        // =====================================================================
+        // Phase C: load segments, swap, cleanup (brief write lock)
+        // =====================================================================
+        stateLock.writeLock().lock();
+        try {
+            // Close frozen builder (frees graph memory)
+            if (snapshotBuilder != null) {
+                try {
+                    snapshotBuilder.close();
+                } catch (IOException e) {
+                    // ignore
+                }
+            }
+
+            if (newSegmentResults != null) {
+                // Close mergeable segments (frees off-heap mmap + BLink) BEFORE loading new ones
+                for (VectorSegment seg : mergeableSegments) {
+                    seg.close();
+                }
+
+                // Load new segments from storage
+                List<VectorSegment> newSegments = new java.util.concurrent.CopyOnWriteArrayList<>();
+                for (VectorSegment sealed : sealedSegments) {
+                    sealed.dirty = false;
+                    newSegments.add(sealed);
+                }
+                for (SegmentWriteResult swr : newSegmentResults) {
+                    Path reloadMapFile = readChunksToTempFile(
+                            swr.mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
+                    Path reloadGraphFile = readChunksToTempFile(
+                            swr.graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
+                    VectorSegment seg = new VectorSegment(swr.segmentId);
+                    seg.estimatedSizeBytes = swr.estimatedSizeBytes;
+                    seg.graphPageIds = swr.graphPageIds;
+                    seg.mapPageIds = swr.mapPageIds;
+                    loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, snapshotDimension, nextNodeId.get());
+                    newSegments.add(seg);
+                }
+
+                // Apply pending deletes to newly loaded segments
+                Set<Bytes> pending = this.pendingCheckpointDeletes;
+                if (pending != null) {
+                    for (Bytes pk : pending) {
+                        for (VectorSegment seg : newSegments) {
+                            if (seg.deletePk(pk)) {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Atomic swap
+                this.segments = newSegments;
+
+                // Recompute nextNodeId: max of segment ordinals vs current nextNodeId
+                int maxOrd = -1;
+                for (VectorSegment seg : newSegments) {
+                    try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
+                        int segMax = stream.mapToInt(e2 -> bytesToOrdinal(e2.getKey())).max().orElse(-1);
+                        if (segMax > maxOrd) {
+                            maxOrd = segMax;
+                        }
+                    }
+                }
+                this.nextNodeId.set(Math.max(maxOrd + 1, nextNodeId.get()));
+
+                int totalNodes = (int) onDiskNodeToPkSize() + nodeToPk.size();
+                LOGGER.log(Level.INFO,
+                        "checkpoint vector index {0} Phase C: {1} nodes across {2} segments (FusedPQ), "
+                                + "{3} new live inserts during checkpoint",
+                        new Object[]{index.name, totalNodes, newSegments.size(), nodeToPk.size()});
             } else {
-                mergeableSegments.add(seg);
+                // FusedPQ fell back to simple path in Phase B
+                // Segments were already cleared in Phase B
+                int totalNodes = nodeToPk.size() + (int) onDiskNodeToPkSize();
+                LOGGER.log(Level.INFO,
+                        "checkpoint vector index {0} Phase C: {1} nodes (simple fallback)",
+                        new Object[]{index.name, totalNodes});
+            }
+
+            // Clear frozen state
+            this.frozenBuilder = null;
+            this.frozenMravv = null;
+            this.frozenNodeToPk = null;
+            this.pendingCheckpointDeletes = null;
+            this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
+
+            dirty.set(nodeToPk.size() > 0); // dirty if new inserts arrived during Phase B
+        } finally {
+            // Signal waiting DML threads before releasing write lock
+            CountDownLatch latch = this.checkpointPhaseComplete;
+            this.checkpointPhaseComplete = null;
+            stateLock.writeLock().unlock();
+            if (latch != null) {
+                latch.countDown();
             }
         }
 
-        // Collect all vectors from mergeable segments + live inserts into sequential lists.
-        // We use sequential 0-based IDs because MapRandomAccessVectorValues and PQ require it.
+        return result;
+    }
+
+    /**
+     * Recovers from a Phase B failure by merging frozen state back into live state.
+     */
+    private void recoverFromPhaseBFailure(
+            ConcurrentHashMap<Integer, VectorFloat<?>> snapshotVectors,
+            ConcurrentHashMap<Bytes, Integer> snapshotPkToNode,
+            ConcurrentHashMap<Integer, Bytes> snapshotNodeToPk,
+            GraphIndexBuilder snapshotBuilder,
+            RandomAccessVectorValues snapshotMravv) {
+        stateLock.writeLock().lock();
+        try {
+            LOGGER.log(Level.WARNING,
+                    "checkpoint vector index {0}: Phase B failed, restoring frozen state", index.name);
+
+            // Merge any new DML that happened during Phase B back into the snapshot maps
+            ConcurrentHashMap<Integer, VectorFloat<?>> currentVectors = this.vectors;
+            ConcurrentHashMap<Bytes, Integer> currentPkToNode = this.pkToNode;
+            ConcurrentHashMap<Integer, Bytes> currentNodeToPk = this.nodeToPk;
+
+            snapshotVectors.putAll(currentVectors);
+            snapshotPkToNode.putAll(currentPkToNode);
+            snapshotNodeToPk.putAll(currentNodeToPk);
+
+            // Close the new empty builder
+            GraphIndexBuilder newBuilder = this.builder;
+            if (newBuilder != null) {
+                try {
+                    newBuilder.close();
+                } catch (IOException e) {
+                    // ignore
+                }
+            }
+
+            // Restore the snapshot as the live state
+            this.vectors = snapshotVectors;
+            this.pkToNode = snapshotPkToNode;
+            this.nodeToPk = snapshotNodeToPk;
+            this.builder = snapshotBuilder;
+            this.mravv = snapshotMravv;
+
+            // Re-add new DML nodes to the restored builder
+            if (snapshotBuilder != null) {
+                for (Map.Entry<Integer, VectorFloat<?>> e : currentVectors.entrySet()) {
+                    if (!snapshotNodeToPk.containsKey(e.getKey())
+                            || snapshotNodeToPk.get(e.getKey()) != currentNodeToPk.get(e.getKey())) {
+                        // This was a new insert during Phase B — skip re-adding to builder
+                        // as we already merged maps, we just need the graph node
+                        try {
+                            snapshotBuilder.addGraphNode(e.getKey(), e.getValue());
+                        } catch (Exception ex) {
+                            LOGGER.log(Level.WARNING, "Failed to re-add node during recovery", ex);
+                        }
+                    }
+                }
+            }
+
+            // Clear frozen state
+            this.frozenBuilder = null;
+            this.frozenMravv = null;
+            this.frozenNodeToPk = null;
+            this.pendingCheckpointDeletes = null;
+            this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
+            dirty.set(true);
+        } finally {
+            CountDownLatch latch = this.checkpointPhaseComplete;
+            this.checkpointPhaseComplete = null;
+            stateLock.writeLock().unlock();
+            if (latch != null) {
+                latch.countDown();
+            }
+        }
+    }
+
+    /**
+     * Phase B for FusedPQ checkpoint. Runs without any lock.
+     * Returns the list of SegmentWriteResults to be loaded in Phase C.
+     */
+    private List<SegmentWriteResult> doCheckpointFusedPQPhaseB(
+            ConcurrentHashMap<Integer, VectorFloat<?>> snapshotVectors,
+            ConcurrentHashMap<Integer, Bytes> snapshotNodeToPk,
+            GraphIndexBuilder snapshotBuilder,
+            int snapshotDimension,
+            List<VectorSegment> sealedSegments,
+            List<VectorSegment> mergeableSegments,
+            LogSequenceNumber sequenceNumber, boolean pin,
+            List<PostCheckpointAction> resultActions)
+            throws IOException, DataStorageManagerException {
+
+        if (snapshotBuilder != null) {
+            snapshotBuilder.cleanup();
+        }
+
+        // Collect all vectors from snapshot live state + mergeable segments into sequential lists
         List<VectorFloat<?>> poolVectorsList = new ArrayList<>();
         List<Bytes> poolPkList = new ArrayList<>();
 
-        // Live inserts
-        for (Map.Entry<Integer, Bytes> e : nodeToPk.entrySet()) {
-            VectorFloat<?> vec = vectors.get(e.getKey());
+        for (Map.Entry<Integer, Bytes> e : snapshotNodeToPk.entrySet()) {
+            VectorFloat<?> vec = snapshotVectors.get(e.getKey());
             if (vec != null) {
                 poolVectorsList.add(vec);
                 poolPkList.add(e.getValue());
             }
         }
 
-        // Vectors from mergeable segments
         for (VectorSegment seg : mergeableSegments) {
             if (seg.onDiskGraph != null) {
                 try (OnDiskGraphIndex.View view = seg.onDiskGraph.getView();
@@ -1384,10 +1688,8 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
         }
 
-        // If the pool is too small for FusedPQ but we have sealed segments,
-        // unseal the smallest sealed segment and merge its data into the pool.
+        // If pool too small for FusedPQ, unseal smallest sealed segments
         while (poolVectorsList.size() < MIN_VECTORS_FOR_FUSED_PQ && !sealedSegments.isEmpty()) {
-            // Find smallest sealed segment
             VectorSegment smallest = sealedSegments.stream()
                     .min((a, b) -> Long.compare(a.estimatedSizeBytes, b.estimatedSizeBytes))
                     .get();
@@ -1406,56 +1708,90 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
         }
 
-        // If pool is still too small for FusedPQ (total < 256), skip writing segments
+        // If pool still too small, fall back to simple path
         if (poolVectorsList.size() < MIN_VECTORS_FOR_FUSED_PQ && poolVectorsList.size() > 0) {
-            // Fall back: close all segments, materialize into live state, let simple path handle
+            // Close all segments
             for (VectorSegment seg : mergeableSegments) {
                 seg.close();
             }
             for (VectorSegment seg : sealedSegments) {
                 seg.close();
             }
-            segments = new java.util.concurrent.CopyOnWriteArrayList<>();
-            // Rebuild live state from pool
-            vectors.clear();
-            nodeToPk.clear();
-            pkToNode.clear();
+            stateLock.writeLock().lock();
+            try {
+                segments = new java.util.concurrent.CopyOnWriteArrayList<>();
+                nextSegmentId.set(0);
+            } finally {
+                stateLock.writeLock().unlock();
+            }
+
+            // Build maps from pool for simple checkpoint
+            ConcurrentHashMap<Integer, VectorFloat<?>> poolVecs = new ConcurrentHashMap<>();
+            ConcurrentHashMap<Integer, Bytes> poolNodeToPk = new ConcurrentHashMap<>();
             for (int i = 0; i < poolVectorsList.size(); i++) {
-                vectors.put(i, poolVectorsList.get(i));
-                nodeToPk.put(i, poolPkList.get(i));
-                pkToNode.put(poolPkList.get(i), i);
+                poolVecs.put(i, poolVectorsList.get(i));
+                poolNodeToPk.put(i, poolPkList.get(i));
             }
-            nextNodeId.set(poolVectorsList.size());
-            nextSegmentId.set(0);
-            GraphIndexBuilder oldBuilder = this.builder;
-            if (oldBuilder != null) {
-                try {
-                    oldBuilder.close();
-                } catch (IOException e) {
-                    // ignore
+            MapRandomAccessVectorValues poolMravv = new MapRandomAccessVectorValues(poolVecs, snapshotDimension);
+            BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(poolMravv, similarityFunction);
+            GraphIndexBuilder poolBuilder = new GraphIndexBuilder(
+                    bsp, snapshotDimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+            for (Map.Entry<Integer, VectorFloat<?>> e : poolVecs.entrySet()) {
+                poolBuilder.addGraphNode(e.getKey(), e.getValue());
+            }
+            poolBuilder.cleanup();
+
+            // Write simple checkpoint
+            List<Long> graphPageIds;
+            Path graphTmpFile = Files.createTempFile("herddb-vector-graph-", ".tmp");
+            try {
+                try (DataOutputStream graphDos = new DataOutputStream(
+                        new BufferedOutputStream(new FileOutputStream(graphTmpFile.toFile()), CHUNK_SIZE))) {
+                    ((OnHeapGraphIndex) poolBuilder.getGraph()).save(graphDos);
                 }
+                graphPageIds = writeChunks(graphTmpFile, TYPE_VECTOR_GRAPHCHUNK);
+            } finally {
+                Files.deleteIfExists(graphTmpFile);
             }
-            this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
-            BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
-            this.builder = new GraphIndexBuilder(bsp, dimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
-            for (Map.Entry<Integer, VectorFloat<?>> e : vectors.entrySet()) {
-                builder.addGraphNode(e.getKey(), e.getValue());
+            List<Long> mapPageIds;
+            Path mapTmpFile = serializeMapDataToFile(poolVecs, poolNodeToPk);
+            try {
+                mapPageIds = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
+            } finally {
+                Files.deleteIfExists(mapTmpFile);
             }
-            builder.cleanup();
-            return doCheckpointSimple(sequenceNumber, pin);
+            try {
+                poolBuilder.close();
+            } catch (IOException e) {
+                // ignore
+            }
+            resultActions.addAll(persistIndexStatusSimple(graphPageIds, mapPageIds,
+                    poolNodeToPk.size(), false, sequenceNumber, pin));
+            LOGGER.log(Level.INFO,
+                    "checkpoint vector index {0}: {1} nodes (simple fallback from FusedPQ)",
+                    new Object[]{index.name, poolNodeToPk.size()});
+            return null; // Signal to Phase C: simple path was used, no segments to load
         }
 
-        // Estimate avgBytesPerVector from largest existing segment
-        long avgBytesPerVector = (long) dimension * Float.BYTES * 2; // default heuristic
-        for (VectorSegment seg : segments) {
+        // Estimate avgBytesPerVector from existing segments
+        long avgBytesPerVector = (long) snapshotDimension * Float.BYTES * 2;
+        for (VectorSegment seg : mergeableSegments) {
             long segSize = seg.size();
             if (segSize > 0 && seg.estimatedSizeBytes > 0) {
                 avgBytesPerVector = seg.estimatedSizeBytes / segSize;
                 break;
             }
         }
+        if (avgBytesPerVector == (long) snapshotDimension * Float.BYTES * 2) {
+            for (VectorSegment seg : sealedSegments) {
+                long segSize = seg.size();
+                if (segSize > 0 && seg.estimatedSizeBytes > 0) {
+                    avgBytesPerVector = seg.estimatedSizeBytes / segSize;
+                    break;
+                }
+            }
+        }
 
-        // Partition pool into segment-sized groups
         int maxNodesPerSegment = (int) Math.max(MIN_VECTORS_FOR_FUSED_PQ,
                 maxSegmentSize / Math.max(1, avgBytesPerVector));
 
@@ -1464,13 +1800,11 @@ public class VectorIndexManager extends AbstractIndexManager {
         while (start < poolVectorsList.size()) {
             int end = Math.min(start + maxNodesPerSegment, poolVectorsList.size());
 
-            // If the remaining tail after this partition is too small for FusedPQ, include it here
             if (end < poolVectorsList.size()
                     && (poolVectorsList.size() - end) < MIN_VECTORS_FOR_FUSED_PQ) {
                 end = poolVectorsList.size();
             }
 
-            // Build sequential 0-based maps for this partition
             ConcurrentHashMap<Integer, VectorFloat<?>> partVectors = new ConcurrentHashMap<>();
             ConcurrentHashMap<Integer, Bytes> partNodeToPk = new ConcurrentHashMap<>();
             for (int i = start; i < end; i++) {
@@ -1480,9 +1814,9 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
 
             int segId = nextSegmentId.getAndIncrement();
-            List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, dimension);
+            List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, snapshotDimension);
             List<Long> mapPageIds = writeFusedPQMapData(
-                    new MapRandomAccessVectorValues(partVectors, dimension), partNodeToPk);
+                    new MapRandomAccessVectorValues(partVectors, snapshotDimension), partNodeToPk);
             long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
             newSegmentResults.add(new SegmentWriteResult(segId, graphPageIds, mapPageIds, estimatedSize,
                     Collections.emptyList()));
@@ -1490,73 +1824,9 @@ public class VectorIndexManager extends AbstractIndexManager {
             start = end;
         }
 
-        // If pool was empty, we might have no new segments
-        // Persist multi-segment metadata
-        List<PostCheckpointAction> result = new ArrayList<>();
-        result.addAll(persistIndexStatusMultiSegment(sealedSegments, newSegmentResults, sequenceNumber, pin));
+        resultActions.addAll(persistIndexStatusMultiSegment(sealedSegments, newSegmentResults, sequenceNumber, pin));
 
-        // Close old builder and mergeable segments
-        GraphIndexBuilder oldBuilder = this.builder;
-        if (oldBuilder != null) {
-            try {
-                oldBuilder.close();
-            } catch (IOException e) {
-                // ignore
-            }
-        }
-        for (VectorSegment seg : mergeableSegments) {
-            seg.close();
-        }
-
-        // Clear live state
-        vectors.clear();
-        pkToNode.clear();
-        nodeToPk.clear();
-        this.builder = null;
-
-        // Build new segments list: sealed (kept) + newly written (loaded)
-        List<VectorSegment> newSegments = new java.util.concurrent.CopyOnWriteArrayList<>();
-        for (VectorSegment sealed : sealedSegments) {
-            sealed.dirty = false;
-            newSegments.add(sealed);
-        }
-        for (SegmentWriteResult swr : newSegmentResults) {
-            Path reloadMapFile = readChunksToTempFile(
-                    swr.mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
-            Path reloadGraphFile = readChunksToTempFile(
-                    swr.graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
-            VectorSegment seg = new VectorSegment(swr.segmentId);
-            seg.estimatedSizeBytes = swr.estimatedSizeBytes;
-            seg.graphPageIds = swr.graphPageIds;
-            seg.mapPageIds = swr.mapPageIds;
-            loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, dimension, nextNodeId.get());
-            newSegments.add(seg);
-        }
-
-        // Atomic swap for concurrent search safety
-        this.segments = newSegments;
-
-        // Re-create empty live builder
-        initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
-
-        // Recompute nextNodeId from all segments
-        int maxOrd = -1;
-        for (VectorSegment seg : segments) {
-            try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
-                int segMax = stream.mapToInt(e -> bytesToOrdinal(e.getKey())).max().orElse(-1);
-                if (segMax > maxOrd) {
-                    maxOrd = segMax;
-                }
-            }
-        }
-        this.nextNodeId.set(maxOrd + 1);
-
-        dirty.set(false);
-        int totalNodes = (int) onDiskNodeToPkSize();
-        LOGGER.log(Level.INFO,
-                "checkpoint vector index {0}: {1} nodes across {2} segments (FusedPQ)",
-                new Object[]{index.name, totalNodes, segments.size()});
-        return result;
+        return newSegmentResults;
     }
 
     /** Holds the result of writing a single segment during checkpoint. */
@@ -2040,6 +2310,26 @@ public class VectorIndexManager extends AbstractIndexManager {
                         "error closing vector index builder for " + index.name, e);
             }
         }
+        // Close frozen builder if checkpoint was in progress
+        GraphIndexBuilder fb = this.frozenBuilder;
+        if (fb != null) {
+            try {
+                fb.close();
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING,
+                        "error closing frozen vector index builder for " + index.name, e);
+            }
+            this.frozenBuilder = null;
+            this.frozenMravv = null;
+            this.frozenNodeToPk = null;
+        }
+        this.pendingCheckpointDeletes = null;
+        this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
+        CountDownLatch latch = this.checkpointPhaseComplete;
+        if (latch != null) {
+            latch.countDown();
+            this.checkpointPhaseComplete = null;
+        }
         for (VectorSegment seg : segments) {
             seg.close();
         }
@@ -2059,6 +2349,19 @@ public class VectorIndexManager extends AbstractIndexManager {
         if (floats.length == 0) {
             return;
         }
+
+        // Back-pressure: if checkpoint Phase B is active and live cap exceeded,
+        // wait for Phase C to complete before proceeding.
+        CountDownLatch latch = checkpointPhaseComplete;
+        if (latch != null && nodeToPk.size() >= liveVectorCapDuringCheckpoint) {
+            try {
+                latch.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new DataStorageManagerException("interrupted waiting for checkpoint", e);
+            }
+        }
+
         stateLock.readLock().lock();
         try {
             if (dimension == 0) {
@@ -2095,6 +2398,12 @@ public class VectorIndexManager extends AbstractIndexManager {
                     dirty.set(true);
                     break;
                 }
+            }
+            // Track delete for Phase B awareness: if a checkpoint is in progress,
+            // the PK may exist in frozen state or in mergeable segments being rewritten.
+            Set<Bytes> pending = pendingCheckpointDeletes;
+            if (pending != null) {
+                pending.add(key);
             }
             // Check live nodes
             Integer nodeId = pkToNode.remove(key);
@@ -2235,6 +2544,31 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
         }
 
+        // Search frozen builder (during Phase B of checkpoint)
+        GraphIndexBuilder fb = frozenBuilder;
+        ConcurrentHashMap<Integer, Bytes> fNodeToPk = frozenNodeToPk;
+        if (fb != null && fNodeToPk != null && !fNodeToPk.isEmpty()) {
+            RandomAccessVectorValues fMravv = frozenMravv;
+            if (fMravv != null) {
+                int k = Math.min(topK, fNodeToPk.size());
+                try {
+                    ImmutableGraphIndex graph = fb.getGraph();
+                    SearchResult result = GraphSearcher.search(
+                            qv, k, fMravv, similarityFunction, graph, Bits.ALL);
+                    Set<Bytes> pending = pendingCheckpointDeletes;
+                    for (SearchResult.NodeScore ns : result.getNodes()) {
+                        Bytes pk = fNodeToPk.get(ns.node);
+                        if (pk != null && (pending == null || !pending.contains(pk))) {
+                            results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+                        }
+                    }
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING,
+                            "error searching frozen builder for " + index.name, e);
+                }
+            }
+        }
+
         // Merge and sort by score descending, take top-K
         results.sort((a, b2) -> Float.compare(b2.getValue(), a.getValue()));
         return results.size() <= topK ? results : results.subList(0, topK);
@@ -2293,6 +2627,25 @@ public class VectorIndexManager extends AbstractIndexManager {
             } catch (IOException e) {
                 // ignore on reset
             }
+        }
+        // Clean up frozen state if checkpoint was in progress
+        GraphIndexBuilder fb = this.frozenBuilder;
+        if (fb != null) {
+            try {
+                fb.close();
+            } catch (IOException e) {
+                // ignore on reset
+            }
+        }
+        frozenBuilder = null;
+        frozenMravv = null;
+        frozenNodeToPk = null;
+        pendingCheckpointDeletes = null;
+        liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
+        CountDownLatch latch = this.checkpointPhaseComplete;
+        if (latch != null) {
+            latch.countDown();
+            this.checkpointPhaseComplete = null;
         }
         for (VectorSegment seg : segments) {
             seg.close();
@@ -2615,7 +2968,9 @@ public class VectorIndexManager extends AbstractIndexManager {
     // -------------------------------------------------------------------------
 
     public int getNodeCount() {
-        return nodeToPk.size() + (int) onDiskNodeToPkSize();
+        ConcurrentHashMap<Integer, Bytes> frozen = frozenNodeToPk;
+        int frozenCount = frozen != null ? frozen.size() : 0;
+        return nodeToPk.size() + frozenCount + (int) onDiskNodeToPkSize();
     }
 
     public int getDimension() {
@@ -2627,11 +2982,19 @@ public class VectorIndexManager extends AbstractIndexManager {
     }
 
     public int getVectorsMapSize() {
-        return vectors.size();
+        ConcurrentHashMap<Integer, VectorFloat<?>> frozenVecs = null;
+        ConcurrentHashMap<Integer, Bytes> frozen = frozenNodeToPk;
+        if (frozen != null) {
+            // During Phase B, vectors field has been swapped. Approximate frozen vectors size.
+            frozenVecs = null; // We don't keep a frozen vectors ref, but frozenNodeToPk size is equivalent
+        }
+        return vectors.size() + (frozen != null ? frozen.size() : 0);
     }
 
     public int getLiveNodeCount() {
-        return nodeToPk.size();
+        ConcurrentHashMap<Integer, Bytes> frozen = frozenNodeToPk;
+        int frozenCount = frozen != null ? frozen.size() : 0;
+        return nodeToPk.size() + frozenCount;
     }
 
     public int getOnDiskNodeCount() {

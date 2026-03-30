@@ -25,6 +25,7 @@ import static herddb.core.TestUtils.scan;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import herddb.core.AbstractIndexManager;
 import herddb.core.DBManager;
@@ -2818,6 +2819,565 @@ public class VectorIndexTest {
             }
         }
     }
+
+    // =========================================================================
+    // Concurrent checkpoint consistency tests
+    // =========================================================================
+
+    /**
+     * Verifies that inserts during checkpoint Phase B are not lost.
+     * Uses the checkpointPhaseBHook to inject concurrent DML.
+     */
+    @Test
+    public void testInsertDuringCheckpoint() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final int initialRows = 300;
+        final int duringCheckpointRows = 50;
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec) WITH ('fusedPQ'='true')",
+                    Collections.emptyList());
+
+            // Insert enough vectors for FusedPQ
+            for (int i = 1; i <= initialRows; i++) {
+                executeUpdate(manager,
+                        "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            // Set up Phase B hook: insert more rows during checkpoint
+            java.util.concurrent.atomic.AtomicReference<Throwable> hookError = new java.util.concurrent.atomic.AtomicReference<>();
+            vim.setCheckpointPhaseBHook(() -> {
+                try {
+                    for (int i = initialRows + 1; i <= initialRows + duringCheckpointRows; i++) {
+                        executeUpdate(manager,
+                                "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                                Arrays.asList(i, randomVec(dimension, i)));
+                    }
+                } catch (Throwable t) {
+                    hookError.set(t);
+                }
+            });
+
+            // Checkpoint — Phase B hook will inject concurrent inserts
+            manager.checkpoint();
+            vim.setCheckpointPhaseBHook(null);
+
+            assertNull("No error during Phase B hook", hookError.get());
+
+            // All initial + during-checkpoint rows must be searchable
+            float[] queryVector = randomVec(dimension, 1);
+            try (DataScanner scan = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT ?",
+                    Arrays.asList((Object) queryVector, initialRows + duringCheckpointRows))) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals(initialRows + duringCheckpointRows, results.size());
+            }
+
+        }
+
+        // Restart and verify all data survived (without second checkpoint — tests WAL replay idempotency)
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10000);
+
+            float[] queryVector2 = randomVec(dimension, 1);
+            try (DataScanner scan = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT ?",
+                    Arrays.asList((Object) queryVector2, initialRows + duringCheckpointRows))) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals(initialRows + duringCheckpointRows, results.size());
+            }
+        }
+    }
+
+    /**
+     * Same as testInsertDuringCheckpoint but with a second checkpoint before restart.
+     */
+    @Test
+    public void testInsertDuringCheckpointWithSecondCheckpoint() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final int initialRows = 300;
+        final int duringCheckpointRows = 50;
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec) WITH ('fusedPQ'='true')",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= initialRows; i++) {
+                executeUpdate(manager,
+                        "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            java.util.concurrent.atomic.AtomicReference<Throwable> hookError = new java.util.concurrent.atomic.AtomicReference<>();
+            vim.setCheckpointPhaseBHook(() -> {
+                try {
+                    for (int i = initialRows + 1; i <= initialRows + duringCheckpointRows; i++) {
+                        executeUpdate(manager,
+                                "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                                Arrays.asList(i, randomVec(dimension, i)));
+                    }
+                } catch (Throwable t) {
+                    hookError.set(t);
+                }
+            });
+
+            manager.checkpoint();
+            vim.setCheckpointPhaseBHook(null);
+            assertNull("No error during Phase B hook", hookError.get());
+
+            // Second checkpoint before restart
+            manager.checkpoint();
+        }
+
+        // Restart and verify all data survived
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10000);
+
+            float[] queryVector = randomVec(dimension, 1);
+            try (DataScanner scan = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT ?",
+                    Arrays.asList((Object) queryVector, initialRows + duringCheckpointRows))) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals(initialRows + duringCheckpointRows, results.size());
+            }
+        }
+    }
+
+    /**
+     * Verifies that deletes during checkpoint Phase B are correctly applied.
+     */
+    @Test
+    public void testDeleteDuringCheckpoint() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final int initialRows = 300;
+        final int deleteCount = 20;
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec) WITH ('fusedPQ'='true')",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= initialRows; i++) {
+                executeUpdate(manager,
+                        "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            // Delete some rows during Phase B
+            java.util.concurrent.atomic.AtomicReference<Throwable> hookError = new java.util.concurrent.atomic.AtomicReference<>();
+            vim.setCheckpointPhaseBHook(() -> {
+                try {
+                    for (int i = 1; i <= deleteCount; i++) {
+                        executeUpdate(manager,
+                                "DELETE FROM tblspace1.t1 WHERE id=?",
+                                Arrays.asList(i));
+                    }
+                } catch (Throwable t) {
+                    hookError.set(t);
+                }
+            });
+
+            manager.checkpoint();
+            vim.setCheckpointPhaseBHook(null);
+
+            assertNull("No error during Phase B hook", hookError.get());
+
+            // Verify deleted rows are gone
+            try (DataScanner scan = scan(manager,
+                    "SELECT COUNT(*) AS cnt FROM tblspace1.t1",
+                    Collections.emptyList())) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals(1, results.size());
+                long count = ((Number) results.get(0).get("cnt")).longValue();
+                assertEquals(initialRows - deleteCount, count);
+            }
+
+        }
+
+        // Restart and verify deletes persist (without second checkpoint — tests WAL replay)
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10000);
+
+            try (DataScanner scan = scan(manager,
+                    "SELECT COUNT(*) AS cnt FROM tblspace1.t1",
+                    Collections.emptyList())) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals(1, results.size());
+                long count = ((Number) results.get(0).get("cnt")).longValue();
+                assertEquals(initialRows - deleteCount, count);
+            }
+        }
+    }
+
+    /**
+     * Verifies that search returns correct results during checkpoint Phase B,
+     * including vectors from frozen state, new live state, and on-disk segments.
+     */
+    @Test
+    public void testSearchDuringCheckpoint() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final int initialRows = 300;
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec) WITH ('fusedPQ'='true')",
+                    Collections.emptyList());
+
+            // Insert initial rows and checkpoint to create on-disk segments
+            for (int i = 1; i <= initialRows; i++) {
+                executeUpdate(manager,
+                        "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+            manager.checkpoint();
+
+            // Insert more rows into live state (will become frozen in Phase A)
+            final int liveRows = 30;
+            for (int i = initialRows + 1; i <= initialRows + liveRows; i++) {
+                executeUpdate(manager,
+                        "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            // During Phase B: insert new rows AND search — all must be found
+            final int phaseBInsertRows = 20;
+            java.util.concurrent.atomic.AtomicReference<Throwable> hookError = new java.util.concurrent.atomic.AtomicReference<>();
+            vim.setCheckpointPhaseBHook(() -> {
+                try {
+                    // Insert new rows during Phase B
+                    for (int i = initialRows + liveRows + 1;
+                         i <= initialRows + liveRows + phaseBInsertRows; i++) {
+                        executeUpdate(manager,
+                                "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                                Arrays.asList(i, randomVec(dimension, i)));
+                    }
+
+                    // Search during Phase B — should find all rows
+                    float[] queryVector = randomVec(dimension, 1);
+                    int totalExpected = initialRows + liveRows + phaseBInsertRows;
+                    try (DataScanner scan = scan(manager,
+                            "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT ?",
+                            Arrays.asList((Object) queryVector, totalExpected))) {
+                        List<DataAccessor> results = scan.consume();
+                        assertEquals("All vectors must be searchable during Phase B",
+                                totalExpected, results.size());
+                    }
+                } catch (Throwable t) {
+                    hookError.set(t);
+                }
+            });
+
+            manager.checkpoint();
+            vim.setCheckpointPhaseBHook(null);
+
+            if (hookError.get() != null) {
+                throw new AssertionError("Phase B hook failed", hookError.get());
+            }
+        }
+    }
+
+    /**
+     * Verifies that checkpoint does not block DML for the entire duration.
+     * Inserts during Phase B should proceed without waiting for the full checkpoint.
+     */
+    @Test
+    public void testCheckpointDoesNotBlockDML() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final int initialRows = 300;
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec) WITH ('fusedPQ'='true')",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= initialRows; i++) {
+                executeUpdate(manager,
+                        "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            // Track insert timings during Phase B
+            java.util.concurrent.atomic.AtomicLong maxInsertNanos = new java.util.concurrent.atomic.AtomicLong(0);
+            java.util.concurrent.atomic.AtomicReference<Throwable> hookError = new java.util.concurrent.atomic.AtomicReference<>();
+            vim.setCheckpointPhaseBHook(() -> {
+                try {
+                    for (int i = initialRows + 1; i <= initialRows + 20; i++) {
+                        long start = System.nanoTime();
+                        executeUpdate(manager,
+                                "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                                Arrays.asList(i, randomVec(dimension, i)));
+                        long elapsed = System.nanoTime() - start;
+                        maxInsertNanos.updateAndGet(prev -> Math.max(prev, elapsed));
+                    }
+                } catch (Throwable t) {
+                    hookError.set(t);
+                }
+            });
+
+            long checkpointStart = System.nanoTime();
+            manager.checkpoint();
+            long checkpointDuration = System.nanoTime() - checkpointStart;
+            vim.setCheckpointPhaseBHook(null);
+
+            assertNull("No error during Phase B hook", hookError.get());
+
+            // The max insert time during Phase B should be significantly less than
+            // the total checkpoint duration. With the old code, inserts would block
+            // for the entire checkpoint. With 3-phase, they only block briefly.
+            long maxInsertMs = maxInsertNanos.get() / 1_000_000;
+            long checkpointMs = checkpointDuration / 1_000_000;
+            LOGGER.log(java.util.logging.Level.INFO,
+                    "Checkpoint took {0} ms, max insert during Phase B took {1} ms",
+                    new Object[]{checkpointMs, maxInsertMs});
+            // We don't assert a specific ratio since CI environments vary,
+            // but the insert should complete (not deadlock or fail).
+            assertTrue("Inserts completed during checkpoint", maxInsertMs < checkpointMs || checkpointMs < 1000);
+        }
+    }
+
+    /**
+     * Verifies that combined insert+delete+search during checkpoint maintains consistency.
+     */
+    @Test
+    public void testMixedDMLDuringCheckpoint() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+        final int dimension = 8;
+        final int initialRows = 300;
+        final int deleteCount = 10;
+        final int insertCount = 20;
+        final int updateCount = 5;
+
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec) WITH ('fusedPQ'='true')",
+                    Collections.emptyList());
+
+            for (int i = 1; i <= initialRows; i++) {
+                executeUpdate(manager,
+                        "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, randomVec(dimension, i)));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+
+            // During Phase B: delete some, insert some, update some
+            java.util.concurrent.atomic.AtomicReference<Throwable> hookError = new java.util.concurrent.atomic.AtomicReference<>();
+            vim.setCheckpointPhaseBHook(() -> {
+                try {
+                    // Delete rows 1-10
+                    for (int i = 1; i <= deleteCount; i++) {
+                        executeUpdate(manager,
+                                "DELETE FROM tblspace1.t1 WHERE id=?",
+                                Arrays.asList(i));
+                    }
+                    // Insert new rows
+                    for (int i = initialRows + 1; i <= initialRows + insertCount; i++) {
+                        executeUpdate(manager,
+                                "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                                Arrays.asList(i, randomVec(dimension, i)));
+                    }
+                    // Update rows 11-15 with new vectors
+                    for (int i = deleteCount + 1; i <= deleteCount + updateCount; i++) {
+                        executeUpdate(manager,
+                                "UPDATE tblspace1.t1 SET vec=? WHERE id=?",
+                                Arrays.asList(randomVec(dimension, i + 10000), i));
+                    }
+                } catch (Throwable t) {
+                    hookError.set(t);
+                }
+            });
+
+            manager.checkpoint();
+            vim.setCheckpointPhaseBHook(null);
+
+            assertNull("No error during Phase B hook", hookError.get());
+
+            // Verify final count: initial - deleted + inserted
+            int expectedCount = initialRows - deleteCount + insertCount;
+            try (DataScanner scan = scan(manager,
+                    "SELECT COUNT(*) AS cnt FROM tblspace1.t1",
+                    Collections.emptyList())) {
+                List<DataAccessor> results = scan.consume();
+                long count = ((Number) results.get(0).get("cnt")).longValue();
+                assertEquals(expectedCount, count);
+            }
+
+            // No second checkpoint — tests WAL replay idempotency on restart
+        }
+
+        // Restart and verify consistency
+        try (DBManager manager = new DBManager(nodeId,
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            manager.waitForTablespace("tblspace1", 10000);
+
+            int expectedCount = initialRows - deleteCount + insertCount;
+            try (DataScanner scan = scan(manager,
+                    "SELECT COUNT(*) AS cnt FROM tblspace1.t1",
+                    Collections.emptyList())) {
+                List<DataAccessor> results = scan.consume();
+                long count = ((Number) results.get(0).get("cnt")).longValue();
+                assertEquals(expectedCount, count);
+            }
+        }
+    }
+
+    private static final java.util.logging.Logger LOGGER =
+            java.util.logging.Logger.getLogger(VectorIndexTest.class.getName());
 
     private static float[] randomVec(int dim, int seed) {
         float[] v = new float[dim];

@@ -2132,7 +2132,21 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                         transaction.registerDeleteOnTable(this.table.name, key, writeResult);
                     }
                 } else {
-                    applyDelete(key);
+                    try {
+                        applyDelete(key);
+                    } catch (IllegalStateException e) {
+                        if (recovery) {
+                            // During recovery, the key may already have been deleted if it was
+                            // deleted during the table checkpoint's Phase B, or the page may
+                            // not exist if it was never flushed. Safe to skip.
+                            LOGGER.log(Level.FINE,
+                                    "{0}.{1} recovery: skipping delete for key {2}: {3}",
+                                    new Object[]{table.tablespace, table.name, key, e.getMessage()});
+                            keyToPage.remove(key);
+                        } else {
+                            throw e;
+                        }
+                    }
                 }
                 break;
             }
@@ -2153,7 +2167,22 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                         transaction.registerRecordUpdate(this.table.name, key, value, writeResult);
                     }
                 } else {
-                    applyUpdate(key, value);
+                    try {
+                        applyUpdate(key, value);
+                    } catch (IllegalStateException e) {
+                        if (recovery) {
+                            // During recovery, the key may have been updated during the table
+                            // checkpoint's Phase B. The page data may not have been flushed.
+                            // Re-insert with the updated value.
+                            LOGGER.log(Level.FINE,
+                                    "{0}.{1} recovery: re-applying update for key {2} as delete+insert",
+                                    new Object[]{table.tablespace, table.name, key});
+                            keyToPage.remove(key);
+                            applyInsert(key, value, false);
+                        } else {
+                            throw e;
+                        }
+                    }
                 }
                 break;
             }
@@ -2174,7 +2203,25 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                         transaction.registerInsertOnTable(table.name, key, value, writeResult);
                     }
                 } else {
-                    applyInsert(key, value, false);
+                    try {
+                        applyInsert(key, value, false);
+                    } catch (IllegalStateException e) {
+                        if (recovery && e.getMessage() != null && e.getMessage().contains("already present")) {
+                            // During recovery, a key may already be present in keyToPage if it was
+                            // inserted during the table checkpoint's Phase B (after the checkpoint
+                            // LSN was captured but before the keyToPage checkpoint in Phase C).
+                            // The data page may not have been flushed, so we must remove the stale
+                            // keyToPage entry and re-insert with the correct data.
+                            LOGGER.log(Level.FINE,
+                                    "{0}.{1} recovery: re-inserting key {2} "
+                                            + "(stale keyToPage entry from concurrent checkpoint)",
+                                    new Object[]{table.tablespace, table.name, key});
+                            keyToPage.remove(key);
+                            applyInsert(key, value, false);
+                        } else {
+                            throw e;
+                        }
+                    }
                 }
                 break;
             }
@@ -2241,11 +2288,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         } else {
             /* We really need the page for update index old values */
             page = loadPageToMemory(pageId, false);
-            previous = page.get(key);
-
-            if (previous == null) {
-                throw new IllegalStateException("corrupted PK: old page " + pageId + " for deleted record at " + key
-                        + " was not found in table " + table.tablespace + "." + table.name);
+            if (page == null) {
+                // Page was never flushed to disk — can happen if the key was inserted
+                // during a concurrent checkpoint Phase B and the page wasn't persisted.
+                previous = null;
+            } else {
+                previous = page.get(key);
+                if (previous == null) {
+                    throw new IllegalStateException("corrupted PK: old page " + pageId + " for deleted record at " + key
+                            + " was not found in table " + table.tablespace + "." + table.name);
+                }
             }
         }
 
@@ -2343,11 +2395,19 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         } else {
             /* We really need the page for update index old values */
             prevPage = loadPageToMemory(prevPageId, false);
-            previous = prevPage.get(key);
-
-            if (previous == null) {
-                throw new IllegalStateException("corrupted PK: old page " + prevPageId + " for updated record at " + key
-                        + " was not found in table" + table.tablespace + "." + table.name);
+            if (prevPage == null) {
+                // Page was never flushed to disk — can happen if the key was inserted
+                // during a concurrent checkpoint Phase B and the page wasn't persisted.
+                // We need the old record for index updates, so signal the caller to
+                // handle this as a delete+insert instead.
+                throw new IllegalStateException("page " + prevPageId + " for updated record at " + key
+                        + " was not flushed to disk in table " + table.tablespace + "." + table.name);
+            } else {
+                previous = prevPage.get(key);
+                if (previous == null) {
+                    throw new IllegalStateException("corrupted PK: old page " + prevPageId + " for updated record at " + key
+                            + " was not found in table" + table.tablespace + "." + table.name);
+                }
             }
         }
 
