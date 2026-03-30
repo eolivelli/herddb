@@ -3020,4 +3020,32 @@ public class VectorIndexManager extends AbstractIndexManager {
         }
         return total;
     }
+
+    public int getM() {
+        return m;
+    }
+
+    public int getBeamWidth() {
+        return beamWidth;
+    }
+
+    public float getNeighborOverflow() {
+        return neighborOverflow;
+    }
+
+    public float getAlpha() {
+        return alpha;
+    }
+
+    public String getSimilarityFunction() {
+        return similarityFunction.name();
+    }
+
+    public boolean isDirty() {
+        return dirty.get();
+    }
+
+    public boolean isCheckpointActive() {
+        return frozenBuilder != null;
+    }
 }
