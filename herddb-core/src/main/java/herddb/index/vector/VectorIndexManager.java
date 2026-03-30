@@ -153,6 +153,7 @@ public class VectorIndexManager extends AbstractIndexManager {
     public static final String PROP_FUSED_PQ = "fusedPQ";
     public static final String PROP_SIMILARITY = "similarity";
     public static final String PROP_MAX_SEGMENT_SIZE = "maxSegmentSize";
+    public static final String PROP_MAX_LIVE_GRAPH_SIZE = "maxLiveGraphSize";
 
     /* instance hyper-parameters (read from index properties) */
     private final int m;
@@ -162,6 +163,7 @@ public class VectorIndexManager extends AbstractIndexManager {
     private final boolean fusedPQ;
     private final VectorSimilarityFunction similarityFunction;
     private final long maxSegmentSize;
+    private final int maxLiveGraphSize;
 
     private final MemoryManager memoryManager;
 
@@ -182,17 +184,10 @@ public class VectorIndexManager extends AbstractIndexManager {
     // In-memory state – LIVE inserts (new since last checkpoint)
     // -------------------------------------------------------------------------
 
-    /** nodeId → vector (for scoring during incremental inserts after load).
-     *  Volatile: swapped to a new empty map in Phase A of checkpoint. */
-    private volatile ConcurrentHashMap<Integer, VectorFloat<?>> vectors = new ConcurrentHashMap<>();
-
-    /** primary-key bytes → jvector node ID (live inserts only).
-     *  Volatile: swapped in Phase A of checkpoint. */
-    private volatile ConcurrentHashMap<Bytes, Integer> pkToNode = new ConcurrentHashMap<>();
-
-    /** jvector node ID → primary-key bytes (live inserts only).
-     *  Volatile: swapped in Phase A of checkpoint. */
-    private volatile ConcurrentHashMap<Integer, Bytes> nodeToPk = new ConcurrentHashMap<>();
+    /** All live graph shards. The LAST element is the active (unsealed) shard.
+     *  Sealed shards are read-only (searched but not modified).
+     *  Volatile: entire list swapped atomically during checkpoint Phase A. */
+    private volatile List<LiveGraphShard> liveShards = new ArrayList<>();
 
     /** Monotonically increasing node-ID counter. */
     private final AtomicInteger nextNodeId = new AtomicInteger(0);
@@ -204,19 +199,13 @@ public class VectorIndexManager extends AbstractIndexManager {
     private final AtomicBoolean dirty = new AtomicBoolean(true);
 
     private volatile int dimension = 0;
-    private volatile RandomAccessVectorValues mravv = null;
-    private volatile GraphIndexBuilder builder = null;
 
     // -------------------------------------------------------------------------
     // Frozen state – snapshot captured in Phase A of checkpoint, searchable during Phase B
     // -------------------------------------------------------------------------
 
-    /** Frozen builder from Phase A — searched during Phase B, closed in Phase C. */
-    private volatile GraphIndexBuilder frozenBuilder;
-    /** Frozen RAVV from Phase A — used for search during Phase B. */
-    private volatile RandomAccessVectorValues frozenMravv;
-    /** Frozen nodeToPk from Phase A — used for PK resolution during Phase B search. */
-    private volatile ConcurrentHashMap<Integer, Bytes> frozenNodeToPk;
+    /** Frozen shards from Phase A — searched during Phase B, closed in Phase C. */
+    private volatile List<LiveGraphShard> frozenShards;
 
     /** PKs deleted during Phase B that may exist in frozen state or mergeable segments being rewritten.
      *  Non-null only during Phase B. */
@@ -273,6 +262,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         this.similarityFunction = parseSimilarity(props.getOrDefault(PROP_SIMILARITY, "cosine"));
         // Per-index override takes precedence over server config
         this.maxSegmentSize = longProp(props, PROP_MAX_SEGMENT_SIZE, serverMaxSegmentSize);
+        this.maxLiveGraphSize = intProp(props, PROP_MAX_LIVE_GRAPH_SIZE, 0);
         registerMetrics(statsLogger);
     }
 
@@ -344,7 +334,21 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
             @Override
             public Long getSample() {
-                return (long) vectors.size() * dimension * Float.BYTES;
+                long total = 0;
+                for (LiveGraphShard shard : liveShards) {
+                    total += (long) shard.vectors.size() * dimension * Float.BYTES;
+                }
+                return total;
+            }
+        });
+        statsLogger.registerGauge("live_shard_count", new Gauge<Integer>() {
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return getLiveShardCount();
             }
         });
         statsLogger.registerGauge("dirty", new Gauge<Integer>() {
@@ -377,6 +381,76 @@ public class VectorIndexManager extends AbstractIndexManager {
     private static boolean boolProp(Map<String, String> props, String key, boolean defaultVal) {
         String v = props.get(key);
         return v == null ? defaultVal : Boolean.parseBoolean(v);
+    }
+
+    /**
+     * Returns the effective maximum live graph size per shard.
+     * If configured (> 0), returns the configured value. Otherwise auto-computes
+     * based on HNSW parameters: 50_000 / sqrt(m * beamWidth / 1600), clamped [10_000, 100_000].
+     */
+    int computeEffectiveMaxLiveGraphSize() {
+        if (maxLiveGraphSize > 0) {
+            return maxLiveGraphSize;
+        }
+        double factor = Math.sqrt((double) m * beamWidth / 1600.0);
+        int computed = (int) (50_000 / Math.max(factor, 0.5));
+        return Math.max(10_000, Math.min(100_000, computed));
+    }
+
+    private LiveGraphShard createEmptyLiveShard(int dim, int bw, float no, float a) {
+        ConcurrentHashMap<Integer, VectorFloat<?>> vecs = new ConcurrentHashMap<>();
+        ConcurrentHashMap<Bytes, Integer> p2n = new ConcurrentHashMap<>();
+        ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>();
+        MapRandomAccessVectorValues ravv = new MapRandomAccessVectorValues(vecs, dim);
+        BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(ravv, similarityFunction);
+        GraphIndexBuilder b = new GraphIndexBuilder(
+                bsp, dim, m, bw, no, a, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+        return new LiveGraphShard(vecs, p2n, n2p, ravv, b);
+    }
+
+    /**
+     * Rotates the live graph shard if the active shard has reached the max size.
+     * Synchronized to avoid duplicate rotation by concurrent threads.
+     * Must be called with stateLock.readLock() held.
+     */
+    private synchronized LiveGraphShard rotateLiveShard() {
+        List<LiveGraphShard> shards = this.liveShards;
+        LiveGraphShard active = shards.get(shards.size() - 1);
+        if (active.nodeToPk.size() < computeEffectiveMaxLiveGraphSize()) {
+            return active; // already rotated by another thread
+        }
+
+        LiveGraphShard newShard = createEmptyLiveShard(dimension, beamWidth, neighborOverflow, alpha);
+        List<LiveGraphShard> newList = new ArrayList<>(shards);
+        newList.add(newShard);
+        this.liveShards = newList;
+
+        LOGGER.log(Level.INFO,
+                "vector index {0}: rotated live graph shard, now {1} shards ({2} vectors in sealed shard)",
+                new Object[]{index.name, newList.size(), active.nodeToPk.size()});
+
+        return newShard;
+    }
+
+    /** Returns the builder from the active (last) shard, or null if no shards exist. */
+    private GraphIndexBuilder activeBuilder() {
+        List<LiveGraphShard> shards = this.liveShards;
+        return shards.isEmpty() ? null : shards.get(shards.size() - 1).builder;
+    }
+
+    /** Returns the MRAVV from the active (last) shard, or null if no shards exist. */
+    private RandomAccessVectorValues activeMravv() {
+        List<LiveGraphShard> shards = this.liveShards;
+        return shards.isEmpty() ? null : shards.get(shards.size() - 1).mravv;
+    }
+
+    /** Returns the total number of live vectors across all shards. */
+    private int totalLiveSize() {
+        int total = 0;
+        for (LiveGraphShard shard : liveShards) {
+            total += shard.nodeToPk.size();
+        }
+        return total;
     }
 
     private static VectorSimilarityFunction parseSimilarity(String value) {
@@ -509,7 +583,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                     maxOrd = stream.mapToInt(e -> bytesToOrdinal(e.getKey())).max().orElse(-1);
                 }
                 this.nextNodeId.set(maxOrd + 1);
-                initEmptyLiveBuilder(dim, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+                initEmptyLiveShards(dim, savedBeamWidth, savedNeighborOverflow, savedAlpha);
             }
             return ok;
         } else {
@@ -577,7 +651,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         }
         this.nextNodeId.set(maxOrd + 1);
 
-        initEmptyLiveBuilder(dim, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+        initEmptyLiveShards(dim, savedBeamWidth, savedNeighborOverflow, savedAlpha);
 
         LOGGER.log(Level.INFO,
                 "loaded vector index {0} (multi-segment): {1} segments, dimension {2}",
@@ -666,20 +740,19 @@ public class VectorIndexManager extends AbstractIndexManager {
         return true;
     }
 
-    private void initEmptyLiveBuilder(int dim, int bw, float no, float a) {
-        this.mravv = new MapRandomAccessVectorValues(vectors, dim);
-        BuildScoreProvider bsp =
-                BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
-        this.builder = new GraphIndexBuilder(
-                bsp, dim, m, bw, no, a, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+    private void initEmptyLiveShards(int dim, int bw, float no, float a) {
+        LiveGraphShard shard = createEmptyLiveShard(dim, bw, no, a);
+        this.liveShards = new ArrayList<>(Collections.singletonList(shard));
     }
 
     private boolean loadSimpleFormat(Path mapFile, Path graphFile,
                                      int dim, int savedNextNodeId,
                                      int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
             throws IOException {
-        // Restore pk/vector maps from temp file
-        // Use DataInputStream to avoid Integer.MAX_VALUE limit of MappedByteBuffer
+        // Restore pk/vector maps from temp file into a single live shard
+        ConcurrentHashMap<Integer, VectorFloat<?>> vecs = new ConcurrentHashMap<>();
+        ConcurrentHashMap<Bytes, Integer> p2n = new ConcurrentHashMap<>();
+        ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>();
         try (DataInputStream dis = new DataInputStream(
                 new BufferedInputStream(new FileInputStream(mapFile.toFile()), CHUNK_SIZE))) {
             int entryCount = dis.readInt();
@@ -695,34 +768,37 @@ public class VectorIndexManager extends AbstractIndexManager {
                 }
                 Bytes pk = Bytes.from_array(pkData);
                 VectorFloat<?> vec = VTS.createFloatVector(floats);
-                vectors.put(nodeId, vec);
-                pkToNode.put(pk, nodeId);
-                nodeToPk.put(nodeId, pk);
+                vecs.put(nodeId, vec);
+                p2n.put(pk, nodeId);
+                n2p.put(nodeId, pk);
             }
         }
 
         this.nextNodeId.set(savedNextNodeId);
-        this.mravv = new MapRandomAccessVectorValues(vectors, dim);
+        MapRandomAccessVectorValues ravv = new MapRandomAccessVectorValues(vecs, dim);
 
         // Load OnHeapGraphIndex from temp file
-        // Use SegmentedMappedReader to avoid Integer.MAX_VALUE limit of MappedByteBuffer
+        GraphIndexBuilder loadedBuilder;
         try (SegmentedMappedReader reader = new SegmentedMappedReader(graphFile)) {
 
             BuildScoreProvider bsp =
-                    BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
+                    BuildScoreProvider.randomAccessScoreProvider(ravv, similarityFunction);
             VamanaDiversityProvider diversityProvider = new VamanaDiversityProvider(bsp, savedAlpha);
             OnHeapGraphIndex loadedGraph =
                     OnHeapGraphIndex.load(reader, dim, savedNeighborOverflow, diversityProvider);
-            this.builder = new GraphIndexBuilder(
+            loadedBuilder = new GraphIndexBuilder(
                     bsp, dim, loadedGraph,
                     savedBeamWidth, savedNeighborOverflow, savedAlpha,
                     REFINE_FINAL_GRAPH,
                     PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
         }
 
+        LiveGraphShard shard = new LiveGraphShard(vecs, p2n, n2p, ravv, loadedBuilder);
+        this.liveShards = new ArrayList<>(Collections.singletonList(shard));
+
         LOGGER.log(Level.INFO,
                 "loaded vector index {0} (simple): {1} nodes, dimension {2}",
-                new Object[]{index.name, vectors.size(), dim});
+                new Object[]{index.name, vecs.size(), dim});
         return true;
     }
 
@@ -776,7 +852,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                 herddb.utils.DataAccessor values = r.getDataAccessor(table);
                 Bytes key = RecordSerializer.serializeIndexKey(values, table, table.primaryKey);
                 Bytes indexKey = RecordSerializer.serializeIndexKey(values, index, index.columnNames);
-                if (builder == null) {
+                if (activeBuilder() == null) {
                     // Single-threaded until builder is initialized (typically first non-null vector)
                     try {
                         rebuildInsert(key, indexKey, rebuildVectorsRef, rebuildNodeToPkHolder[0],
@@ -799,7 +875,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                 // Check if current batch reached the segment threshold
                 if (batchNodeCount.get() >= maxNodesPerSegmentRef.get()
                         && dimension > 0 && fusedPQ && dimension >= MIN_DIM_FOR_FUSED_PQ
-                        && builder != null) {
+                        && activeBuilder() != null) {
                     try {
                         // Drain thread pool before flushing
                         executorHolder[0].shutdown();
@@ -881,9 +957,12 @@ public class VectorIndexManager extends AbstractIndexManager {
 
         if (!completedSegments.isEmpty()) {
             // Multi-segment rebuild path: at least one segment was already flushed
+            ConcurrentHashMap<Integer, VectorFloat<?>> rebuildLiveVectors = null;
+            ConcurrentHashMap<Integer, Bytes> rebuildLiveNodeToPk = null;
+            ConcurrentHashMap<Bytes, Integer> rebuildLivePkToNode = null;
             try {
                 // Flush remaining batch if non-empty
-                if (remainingBatchCount > 0 && builder != null) {
+                if (remainingBatchCount > 0 && activeBuilder() != null) {
                     if (remainingBatchCount >= MIN_VECTORS_FOR_FUSED_PQ) {
                         SegmentWriteResult swr = flushRebuildBatch(
                                 rebuildVectors, rebuildNodeToPkHolder[0], remainingBatchCount);
@@ -894,18 +973,27 @@ public class VectorIndexManager extends AbstractIndexManager {
                         LOGGER.log(Level.INFO,
                                 "rebuild vector index {0}: final batch has {1} vectors (below {2}), keeping as live state",
                                 new Object[]{index.name, remainingBatchCount, MIN_VECTORS_FOR_FUSED_PQ});
+                        // Collect data to merge into live shard later (under write lock)
+                        ConcurrentHashMap<Integer, VectorFloat<?>> tmpVectors = new ConcurrentHashMap<>();
+                        ConcurrentHashMap<Integer, Bytes> tmpNodeToPk = new ConcurrentHashMap<>();
+                        ConcurrentHashMap<Bytes, Integer> tmpPkToNode = new ConcurrentHashMap<>();
                         try (Stream<Map.Entry<Bytes, Bytes>> scanStream =
                                 rebuildNodeToPkHolder[0].scan(Bytes.EMPTY_ARRAY, Bytes.POSITIVE_INFINITY)) {
                             scanStream.forEach(e -> {
                                 int nodeId = bytesToOrdinal(e.getKey());
                                 Bytes pk = e.getValue();
-                                this.nodeToPk.put(nodeId, pk);
-                                this.pkToNode.put(pk, nodeId);
+                                tmpNodeToPk.put(nodeId, pk);
+                                tmpPkToNode.put(pk, nodeId);
                                 if (rebuildVectors != null) {
-                                    this.vectors.put(nodeId, rebuildVectors.getVector(nodeId));
+                                    tmpVectors.put(nodeId, rebuildVectors.getVector(nodeId));
                                 }
                             });
                         }
+                        // These will be picked up when building the live shard below
+                        // Store temporarily in a local variable referenced in the lock block
+                        rebuildLiveVectors = tmpVectors;
+                        rebuildLiveNodeToPk = tmpNodeToPk;
+                        rebuildLivePkToNode = tmpPkToNode;
                     }
                 }
 
@@ -935,25 +1023,29 @@ public class VectorIndexManager extends AbstractIndexManager {
                 try {
                     // Close builder from the last batch (it references FileBackedVectorValues
                     // that will be closed soon, so we must not reuse it)
-                    boolean hasLiveData = !vectors.isEmpty();
-                    GraphIndexBuilder oldBuilder = this.builder;
-                    if (oldBuilder != null) {
-                        try {
-                            oldBuilder.close();
-                        } catch (IOException e) {
-                            // ignore
+                    boolean hasLiveData = rebuildLiveVectors != null && !rebuildLiveVectors.isEmpty();
+                    for (LiveGraphShard shard : liveShards) {
+                        if (shard.builder != null) {
+                            try {
+                                shard.builder.close();
+                            } catch (IOException e) {
+                                // ignore
+                            }
                         }
                     }
 
                     this.segments = newSegments;
-                    this.builder = null;
-                    this.mravv = null;
+                    this.liveShards = new ArrayList<>();
 
                     if (hasLiveData) {
                         // Small final batch kept as live state: build fresh graph from live vectors.
-                        initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
-                        for (Map.Entry<Integer, VectorFloat<?>> entry : vectors.entrySet()) {
-                            builder.addGraphNode(entry.getKey(), entry.getValue());
+                        initEmptyLiveShards(dimension, beamWidth, neighborOverflow, alpha);
+                        LiveGraphShard liveShard = liveShards.get(0);
+                        liveShard.vectors.putAll(rebuildLiveVectors);
+                        liveShard.nodeToPk.putAll(rebuildLiveNodeToPk);
+                        liveShard.pkToNode.putAll(rebuildLivePkToNode);
+                        for (Map.Entry<Integer, VectorFloat<?>> entry : rebuildLiveVectors.entrySet()) {
+                            liveShard.builder.addGraphNode(entry.getKey(), entry.getValue());
                         }
                         dirty.set(true);
                     } else {
@@ -968,18 +1060,18 @@ public class VectorIndexManager extends AbstractIndexManager {
                             }
                         }
                         this.nextNodeId.set(maxOrd + 1);
-                        initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
+                        initEmptyLiveShards(dimension, beamWidth, neighborOverflow, alpha);
                         dirty.set(false);
                     }
                 } finally {
                     stateLock.writeLock().unlock();
                 }
 
-                int totalNodes = (int) onDiskNodeToPkSize() + vectors.size();
+                int totalNodes = (int) onDiskNodeToPkSize() + totalLiveSize();
                 LOGGER.log(Level.INFO,
                         "rebuilt vector index {0} in {1} ms: {2} nodes across {3} segments, {4} live (FusedPQ multi-segment)",
                         new Object[]{index.name, System.currentTimeMillis() - start, totalNodes,
-                                segments.size(), vectors.size()});
+                                segments.size(), totalLiveSize()});
             } catch (IOException e) {
                 throw new DataStorageManagerException("Failed to write FusedPQ during rebuild", e);
             } finally {
@@ -993,12 +1085,13 @@ public class VectorIndexManager extends AbstractIndexManager {
             // Single-batch path: no segments flushed during scan
             int rebuildCount = (int) rebuildNodeToPkHolder[0].size();
             // Build FusedPQ directly if conditions are met, avoiding duplicate work at next checkpoint
+            GraphIndexBuilder rb = activeBuilder();
             if (fusedPQ && dimension >= MIN_DIM_FOR_FUSED_PQ
-                    && rebuildCount >= MIN_VECTORS_FOR_FUSED_PQ && builder != null) {
+                    && rebuildCount >= MIN_VECTORS_FOR_FUSED_PQ && rb != null) {
                 try {
-                    builder.cleanup();
-                    OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
-                    List<Long> graphPageIds = writeFusedPQGraph(graph, mravv, dimension);
+                    rb.cleanup();
+                    OnHeapGraphIndex graph = (OnHeapGraphIndex) rb.getGraph();
+                    List<Long> graphPageIds = writeFusedPQGraph(graph, activeMravv(), dimension);
                     List<Long> mapPageIds = writeFusedPQMapData(rebuildVectors, rebuildNodeToPkHolder[0]);
                     LogSequenceNumber lsn = log.getLastSequenceNumber();
                     long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
@@ -1023,18 +1116,18 @@ public class VectorIndexManager extends AbstractIndexManager {
                     // Swap state atomically under the lock
                     stateLock.writeLock().lock();
                     try {
-                        GraphIndexBuilder oldBuilder = this.builder;
-                        if (oldBuilder != null) {
-                            try {
-                                oldBuilder.close();
-                            } catch (IOException e) {
-                                // ignore
+                        for (LiveGraphShard shard : liveShards) {
+                            if (shard.builder != null) {
+                                try {
+                                    shard.builder.close();
+                                } catch (IOException e) {
+                                    // ignore
+                                }
                             }
                         }
-                        this.builder = null;
-                        this.mravv = null;
+                        this.liveShards = new ArrayList<>();
                         segments.add(newSeg);
-                        initEmptyLiveBuilder(dimension, beamWidth, neighborOverflow, alpha);
+                        initEmptyLiveShards(dimension, beamWidth, neighborOverflow, alpha);
                         dirty.set(false);
                     } finally {
                         stateLock.writeLock().unlock();
@@ -1051,7 +1144,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                 }
             } else {
                 try {
-                    // Small dataset or FusedPQ not applicable: populate instance fields, let checkpoint() handle
+                    // Small dataset or FusedPQ not applicable: populate live shard, let checkpoint() handle
                     // Collect data from rebuild BLink before acquiring lock
                     ConcurrentHashMap<Integer, Bytes> rebuildNodeToPkMap = new ConcurrentHashMap<>();
                     ConcurrentHashMap<Integer, VectorFloat<?>> rebuildVectorsMap = new ConcurrentHashMap<>();
@@ -1070,27 +1163,46 @@ public class VectorIndexManager extends AbstractIndexManager {
                     // Swap state atomically under the lock
                     stateLock.writeLock().lock();
                     try {
-                        for (Map.Entry<Integer, Bytes> e : rebuildNodeToPkMap.entrySet()) {
-                            this.nodeToPk.put(e.getKey(), e.getValue());
-                        }
-                        this.vectors.putAll(rebuildVectorsMap);
-                        // Re-create mravv wrapping the instance vectors map so that
-                        // the live search path and future inserts use the correct backing store
-                        if (dimension > 0 && builder != null) {
-                            this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
-                            BuildScoreProvider bsp =
-                                    BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
-                            OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
-                            try {
-                                builder.close();
-                            } catch (IOException e) {
-                                // ignore
+                        // Close old shard builders
+                        for (LiveGraphShard shard : liveShards) {
+                            if (shard.builder != null) {
+                                try {
+                                    shard.builder.close();
+                                } catch (IOException e) {
+                                    // ignore
+                                }
                             }
-                            this.builder = new GraphIndexBuilder(
-                                    bsp, dimension, graph,
+                        }
+                        // Create fresh shard with rebuild data
+                        // Note: pkToNode is intentionally NOT populated during rebuild (optimization)
+                        // Save the rebuild graph before closing old shards
+                        GraphIndexBuilder rebuildBuilder = activeBuilder();
+                        OnHeapGraphIndex rebuildGraph = (dimension > 0 && rebuildBuilder != null)
+                                ? (OnHeapGraphIndex) rebuildBuilder.getGraph() : null;
+                        for (LiveGraphShard shard2 : liveShards) {
+                            if (shard2.builder != null) {
+                                try { shard2.builder.close(); } catch (IOException e) { /* ignore */ }
+                            }
+                        }
+                        if (dimension > 0 && rebuildGraph != null) {
+                            ConcurrentHashMap<Integer, VectorFloat<?>> vecs = new ConcurrentHashMap<>(rebuildVectorsMap);
+                            ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>(rebuildNodeToPkMap);
+                            MapRandomAccessVectorValues newMravv = new MapRandomAccessVectorValues(vecs, dimension);
+                            BuildScoreProvider bsp =
+                                    BuildScoreProvider.randomAccessScoreProvider(newMravv, similarityFunction);
+                            GraphIndexBuilder newBuilder = new GraphIndexBuilder(
+                                    bsp, dimension, rebuildGraph,
                                     beamWidth, neighborOverflow, alpha,
                                     REFINE_FINAL_GRAPH,
                                     PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
+                            LiveGraphShard updatedShard = new LiveGraphShard(
+                                    vecs, new ConcurrentHashMap<>(), n2p, newMravv, newBuilder);
+                            this.liveShards = new ArrayList<>(Collections.singletonList(updatedShard));
+                        } else {
+                            initEmptyLiveShards(dimension, beamWidth, neighborOverflow, alpha);
+                            LiveGraphShard liveShard = liveShards.get(0);
+                            liveShard.vectors.putAll(rebuildVectorsMap);
+                            liveShard.nodeToPk.putAll(rebuildNodeToPkMap);
                         }
                         dirty.set(true);
                     } finally {
@@ -1137,21 +1249,22 @@ public class VectorIndexManager extends AbstractIndexManager {
             FileBackedVectorValues batchVectors,
             BLink<Bytes, Bytes> batchNodeToPk,
             int batchSize) throws IOException, DataStorageManagerException {
-        builder.cleanup();
-        OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
-        List<Long> graphPageIds = writeFusedPQGraph(graph, mravv, dimension);
+        GraphIndexBuilder b = activeBuilder();
+        RandomAccessVectorValues ravv = activeMravv();
+        b.cleanup();
+        OnHeapGraphIndex graph = (OnHeapGraphIndex) b.getGraph();
+        List<Long> graphPageIds = writeFusedPQGraph(graph, ravv, dimension);
         List<Long> mapPageIds = writeFusedPQMapData(batchVectors, batchNodeToPk);
         long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
         int segId = nextSegmentId.getAndIncrement();
 
         // Close builder after writing
         try {
-            builder.close();
+            b.close();
         } catch (IOException e) {
             // ignore
         }
-        this.builder = null;
-        this.mravv = null;
+        this.liveShards = new ArrayList<>();
 
         LOGGER.log(Level.INFO,
                 "rebuild vector index {0}: segment {1} declared full ({2} vectors, ~{3} bytes)",
@@ -1170,11 +1283,13 @@ public class VectorIndexManager extends AbstractIndexManager {
                 dimension, Math.max(expectedSize, 16),
                 java.nio.file.Paths.get(System.getProperty("java.io.tmpdir")));
         rebuildVectorsRef.set(fbv);
-        this.mravv = fbv;
         BuildScoreProvider bsp =
-                BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
-        this.builder = new GraphIndexBuilder(
+                BuildScoreProvider.randomAccessScoreProvider(fbv, similarityFunction);
+        GraphIndexBuilder b = new GraphIndexBuilder(
                 bsp, dimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+        LiveGraphShard shard = new LiveGraphShard(
+                new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), fbv, b);
+        this.liveShards = new ArrayList<>(Collections.singletonList(shard));
     }
 
     // -------------------------------------------------------------------------
@@ -1215,10 +1330,11 @@ public class VectorIndexManager extends AbstractIndexManager {
                 return Collections.emptyList();
             }
 
-            boolean hasLiveNodes = builder != null && !nodeToPk.isEmpty();
+            int totalLiveVectors = totalLiveSize();
+            boolean hasLiveNodes = totalLiveVectors > 0;
             boolean hasOnDiskNodes = onDiskNodeToPkSize() > 0;
 
-            if (!hasLiveNodes && !hasOnDiskNodes && builder == null && segments.isEmpty()) {
+            if (!hasLiveNodes && !hasOnDiskNodes && liveShards.isEmpty() && segments.isEmpty()) {
                 IndexStatus emptyStatus = new IndexStatus(
                         index.name, sequenceNumber, newPageId.get(), new HashSet<>(), new byte[0]);
                 List<PostCheckpointAction> result = new ArrayList<>();
@@ -1238,7 +1354,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                 return result;
             }
 
-            int totalActiveVectors = (int) onDiskNodeToPkSize() + nodeToPk.size();
+            int totalActiveVectors = (int) onDiskNodeToPkSize() + totalLiveVectors;
 
             if (totalActiveVectors == 0 && !segments.isEmpty()) {
                 for (VectorSegment seg : segments) {
@@ -1280,19 +1396,21 @@ public class VectorIndexManager extends AbstractIndexManager {
      */
     private List<PostCheckpointAction> doCheckpointSimpleUnderLock(LogSequenceNumber sequenceNumber, boolean pin)
             throws IOException, DataStorageManagerException {
-        // If we have on-disk segments, materialize their data into live state first
-        if (!segments.isEmpty()) {
-            ConcurrentHashMap<Integer, VectorFloat<?>> allVectors = new ConcurrentHashMap<>();
-            ConcurrentHashMap<Integer, Bytes> allNodeToPk = new ConcurrentHashMap<>();
-            int seqId = 0;
-            for (Map.Entry<Integer, Bytes> e : nodeToPk.entrySet()) {
-                VectorFloat<?> vec = vectors.get(e.getKey());
+        // Collect all vectors from all live shards + on-disk segments into a single set
+        ConcurrentHashMap<Integer, VectorFloat<?>> allVectors = new ConcurrentHashMap<>();
+        ConcurrentHashMap<Integer, Bytes> allNodeToPk = new ConcurrentHashMap<>();
+        int seqId = 0;
+        for (LiveGraphShard shard : liveShards) {
+            for (Map.Entry<Integer, Bytes> e : shard.nodeToPk.entrySet()) {
+                VectorFloat<?> vec = shard.vectors.get(e.getKey());
                 if (vec != null) {
                     allVectors.put(seqId, vec);
                     allNodeToPk.put(seqId, e.getValue());
                     seqId++;
                 }
             }
+        }
+        if (!segments.isEmpty()) {
             for (VectorSegment seg : segments) {
                 if (seg.onDiskGraph != null) {
                     try (OnDiskGraphIndex.View view = seg.onDiskGraph.getView();
@@ -1311,61 +1429,54 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
             segments = new java.util.concurrent.CopyOnWriteArrayList<>();
             nextSegmentId.set(0);
+        }
 
-            vectors.clear();
-            vectors.putAll(allVectors);
-            nodeToPk.clear();
-            nodeToPk.putAll(allNodeToPk);
-            pkToNode.clear();
-            for (Map.Entry<Integer, Bytes> e : allNodeToPk.entrySet()) {
-                pkToNode.put(e.getValue(), e.getKey());
-            }
-            nextNodeId.set(seqId);
-
-            GraphIndexBuilder oldBuilder = this.builder;
-            if (oldBuilder != null) {
+        // Close all existing shard builders
+        for (LiveGraphShard shard : liveShards) {
+            if (shard.builder != null) {
                 try {
-                    oldBuilder.close();
+                    shard.builder.close();
                 } catch (IOException e) {
                     // ignore
                 }
             }
-            this.mravv = new MapRandomAccessVectorValues(vectors, dimension);
-            BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
-            this.builder = new GraphIndexBuilder(
-                    bsp, dimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
-            for (Map.Entry<Integer, VectorFloat<?>> e : allVectors.entrySet()) {
-                builder.addGraphNode(e.getKey(), e.getValue());
-            }
-            builder.cleanup();
         }
 
-        if (builder != null) {
-            builder.cleanup();
+        // Rebuild a single shard with all data
+        nextNodeId.set(seqId);
+        LiveGraphShard newShard = createEmptyLiveShard(dimension, beamWidth, neighborOverflow, alpha);
+        newShard.vectors.putAll(allVectors);
+        for (Map.Entry<Integer, Bytes> e : allNodeToPk.entrySet()) {
+            newShard.nodeToPk.put(e.getKey(), e.getValue());
+            newShard.pkToNode.put(e.getValue(), e.getKey());
         }
-        vectors.keySet().retainAll(nodeToPk.keySet());
+        for (Map.Entry<Integer, VectorFloat<?>> e : allVectors.entrySet()) {
+            newShard.builder.addGraphNode(e.getKey(), e.getValue());
+        }
+        newShard.builder.cleanup();
+        this.liveShards = new ArrayList<>(Collections.singletonList(newShard));
+
+        newShard.vectors.keySet().retainAll(newShard.nodeToPk.keySet());
 
         List<Long> graphPageIds;
         Path graphTmpFile = Files.createTempFile("herddb-vector-graph-", ".tmp");
         try {
-            if (builder != null) {
-                try (DataOutputStream graphDos = new DataOutputStream(
-                        new BufferedOutputStream(new FileOutputStream(graphTmpFile.toFile()), CHUNK_SIZE))) {
-                    ((OnHeapGraphIndex) builder.getGraph()).save(graphDos);
-                }
+            try (DataOutputStream graphDos = new DataOutputStream(
+                    new BufferedOutputStream(new FileOutputStream(graphTmpFile.toFile()), CHUNK_SIZE))) {
+                ((OnHeapGraphIndex) newShard.builder.getGraph()).save(graphDos);
             }
             graphPageIds = writeChunks(graphTmpFile, TYPE_VECTOR_GRAPHCHUNK);
         } finally {
             Files.deleteIfExists(graphTmpFile);
         }
         List<Long> mapPageIds;
-        Path mapTmpFile = serializeMapDataToFile(vectors, nodeToPk);
+        Path mapTmpFile = serializeMapDataToFile(newShard.vectors, newShard.nodeToPk);
         try {
             mapPageIds = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
         } finally {
             Files.deleteIfExists(mapTmpFile);
         }
-        int totalNodes = nodeToPk.size();
+        int totalNodes = newShard.nodeToPk.size();
 
         List<PostCheckpointAction> result = new ArrayList<>();
         result.addAll(persistIndexStatusSimple(graphPageIds, mapPageIds, totalNodes, false, sequenceNumber, pin));
@@ -1390,11 +1501,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         // =====================================================================
         // Phase A: snapshot + swap (brief write lock)
         // =====================================================================
-        ConcurrentHashMap<Integer, VectorFloat<?>> snapshotVectors;
-        ConcurrentHashMap<Bytes, Integer> snapshotPkToNode;
-        ConcurrentHashMap<Integer, Bytes> snapshotNodeToPk;
-        GraphIndexBuilder snapshotBuilder;
-        RandomAccessVectorValues snapshotMravv;
+        List<LiveGraphShard> snapshotShards;
         List<VectorSegment> sealedSegments;
         List<VectorSegment> mergeableSegments;
         int snapshotDimension;
@@ -1403,12 +1510,8 @@ public class VectorIndexManager extends AbstractIndexManager {
         try {
             snapshotDimension = dimension;
 
-            // Snapshot live state
-            snapshotVectors = this.vectors;
-            snapshotPkToNode = this.pkToNode;
-            snapshotNodeToPk = this.nodeToPk;
-            snapshotBuilder = this.builder;
-            snapshotMravv = this.mravv;
+            // Snapshot all live shards
+            snapshotShards = this.liveShards;
 
             // Classify segments
             sealedSegments = new ArrayList<>();
@@ -1422,24 +1525,23 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
 
             // Set up frozen state for search during Phase B
-            this.frozenBuilder = snapshotBuilder;
-            this.frozenMravv = snapshotMravv;
-            this.frozenNodeToPk = snapshotNodeToPk;
+            this.frozenShards = snapshotShards;
             this.pendingCheckpointDeletes = ConcurrentHashMap.newKeySet();
             this.checkpointPhaseComplete = new CountDownLatch(1);
-            this.liveVectorCapDuringCheckpoint = Math.max(10000, snapshotNodeToPk.size() / 2);
+            int totalSnapshotSize = 0;
+            for (LiveGraphShard shard : snapshotShards) {
+                totalSnapshotSize += shard.nodeToPk.size();
+            }
+            this.liveVectorCapDuringCheckpoint = Math.max(10000, totalSnapshotSize / 2);
 
             // Swap to new empty live state — DML proceeds immediately after write lock release
-            this.vectors = new ConcurrentHashMap<>();
-            this.pkToNode = new ConcurrentHashMap<>();
-            this.nodeToPk = new ConcurrentHashMap<>();
-            initEmptyLiveBuilder(snapshotDimension, beamWidth, neighborOverflow, alpha);
+            initEmptyLiveShards(snapshotDimension, beamWidth, neighborOverflow, alpha);
             dirty.set(false);
 
             LOGGER.log(Level.INFO,
-                    "checkpoint vector index {0} Phase A: snapshotted {1} live + {2} on-disk vectors, "
-                            + "{3} sealed + {4} mergeable segments",
-                    new Object[]{index.name, snapshotNodeToPk.size(), onDiskNodeToPkSize(),
+                    "checkpoint vector index {0} Phase A: snapshotted {1} live shards ({2} vectors) + {3} on-disk vectors, "
+                            + "{4} sealed + {5} mergeable segments",
+                    new Object[]{index.name, snapshotShards.size(), totalSnapshotSize, onDiskNodeToPkSize(),
                             sealedSegments.size(), mergeableSegments.size()});
         } finally {
             stateLock.writeLock().unlock();
@@ -1458,13 +1560,12 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
 
             newSegmentResults = doCheckpointFusedPQPhaseB(
-                    snapshotVectors, snapshotNodeToPk, snapshotBuilder,
+                    snapshotShards,
                     snapshotDimension, sealedSegments, mergeableSegments,
                     sequenceNumber, pin, result);
         } catch (IOException | RuntimeException e) {
             // Phase B failed — restore frozen state back to live
-            recoverFromPhaseBFailure(snapshotVectors, snapshotPkToNode, snapshotNodeToPk,
-                    snapshotBuilder, snapshotMravv);
+            recoverFromPhaseBFailure(snapshotShards);
             throw e;
         }
 
@@ -1473,12 +1574,14 @@ public class VectorIndexManager extends AbstractIndexManager {
         // =====================================================================
         stateLock.writeLock().lock();
         try {
-            // Close frozen builder (frees graph memory)
-            if (snapshotBuilder != null) {
-                try {
-                    snapshotBuilder.close();
-                } catch (IOException e) {
-                    // ignore
+            // Close frozen shard builders (frees graph memory)
+            for (LiveGraphShard shard : snapshotShards) {
+                if (shard.builder != null) {
+                    try {
+                        shard.builder.close();
+                    } catch (IOException e) {
+                        // ignore
+                    }
                 }
             }
 
@@ -1534,28 +1637,26 @@ public class VectorIndexManager extends AbstractIndexManager {
                 }
                 this.nextNodeId.set(Math.max(maxOrd + 1, nextNodeId.get()));
 
-                int totalNodes = (int) onDiskNodeToPkSize() + nodeToPk.size();
+                int totalNodes = (int) onDiskNodeToPkSize() + totalLiveSize();
                 LOGGER.log(Level.INFO,
                         "checkpoint vector index {0} Phase C: {1} nodes across {2} segments (FusedPQ), "
                                 + "{3} new live inserts during checkpoint",
-                        new Object[]{index.name, totalNodes, newSegments.size(), nodeToPk.size()});
+                        new Object[]{index.name, totalNodes, newSegments.size(), totalLiveSize()});
             } else {
                 // FusedPQ fell back to simple path in Phase B
                 // Segments were already cleared in Phase B
-                int totalNodes = nodeToPk.size() + (int) onDiskNodeToPkSize();
+                int totalNodes = totalLiveSize() + (int) onDiskNodeToPkSize();
                 LOGGER.log(Level.INFO,
                         "checkpoint vector index {0} Phase C: {1} nodes (simple fallback)",
                         new Object[]{index.name, totalNodes});
             }
 
             // Clear frozen state
-            this.frozenBuilder = null;
-            this.frozenMravv = null;
-            this.frozenNodeToPk = null;
+            this.frozenShards = null;
             this.pendingCheckpointDeletes = null;
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
 
-            dirty.set(nodeToPk.size() > 0); // dirty if new inserts arrived during Phase B
+            dirty.set(totalLiveSize() > 0); // dirty if new inserts arrived during Phase B
         } finally {
             // Signal waiting DML threads before releasing write lock
             CountDownLatch latch = this.checkpointPhaseComplete;
@@ -1572,63 +1673,50 @@ public class VectorIndexManager extends AbstractIndexManager {
     /**
      * Recovers from a Phase B failure by merging frozen state back into live state.
      */
-    private void recoverFromPhaseBFailure(
-            ConcurrentHashMap<Integer, VectorFloat<?>> snapshotVectors,
-            ConcurrentHashMap<Bytes, Integer> snapshotPkToNode,
-            ConcurrentHashMap<Integer, Bytes> snapshotNodeToPk,
-            GraphIndexBuilder snapshotBuilder,
-            RandomAccessVectorValues snapshotMravv) {
+    private void recoverFromPhaseBFailure(List<LiveGraphShard> snapshotShards) {
         stateLock.writeLock().lock();
         try {
             LOGGER.log(Level.WARNING,
                     "checkpoint vector index {0}: Phase B failed, restoring frozen state", index.name);
 
-            // Merge any new DML that happened during Phase B back into the snapshot maps
-            ConcurrentHashMap<Integer, VectorFloat<?>> currentVectors = this.vectors;
-            ConcurrentHashMap<Bytes, Integer> currentPkToNode = this.pkToNode;
-            ConcurrentHashMap<Integer, Bytes> currentNodeToPk = this.nodeToPk;
+            // Merge any new DML that happened during Phase B back into the last snapshot shard
+            List<LiveGraphShard> currentShards = this.liveShards;
+            LiveGraphShard lastSnapshot = snapshotShards.get(snapshotShards.size() - 1);
 
-            snapshotVectors.putAll(currentVectors);
-            snapshotPkToNode.putAll(currentPkToNode);
-            snapshotNodeToPk.putAll(currentNodeToPk);
-
-            // Close the new empty builder
-            GraphIndexBuilder newBuilder = this.builder;
-            if (newBuilder != null) {
-                try {
-                    newBuilder.close();
-                } catch (IOException e) {
-                    // ignore
-                }
-            }
-
-            // Restore the snapshot as the live state
-            this.vectors = snapshotVectors;
-            this.pkToNode = snapshotPkToNode;
-            this.nodeToPk = snapshotNodeToPk;
-            this.builder = snapshotBuilder;
-            this.mravv = snapshotMravv;
-
-            // Re-add new DML nodes to the restored builder
-            if (snapshotBuilder != null) {
-                for (Map.Entry<Integer, VectorFloat<?>> e : currentVectors.entrySet()) {
-                    if (!snapshotNodeToPk.containsKey(e.getKey())
-                            || snapshotNodeToPk.get(e.getKey()) != currentNodeToPk.get(e.getKey())) {
-                        // This was a new insert during Phase B — skip re-adding to builder
-                        // as we already merged maps, we just need the graph node
-                        try {
-                            snapshotBuilder.addGraphNode(e.getKey(), e.getValue());
-                        } catch (Exception ex) {
-                            LOGGER.log(Level.WARNING, "Failed to re-add node during recovery", ex);
+            for (LiveGraphShard currentShard : currentShards) {
+                for (Map.Entry<Integer, VectorFloat<?>> e : currentShard.vectors.entrySet()) {
+                    int nodeId = e.getKey();
+                    VectorFloat<?> vec = e.getValue();
+                    Bytes pk = currentShard.nodeToPk.get(nodeId);
+                    if (pk != null) {
+                        lastSnapshot.vectors.put(nodeId, vec);
+                        lastSnapshot.pkToNode.put(pk, nodeId);
+                        lastSnapshot.nodeToPk.put(nodeId, pk);
+                        // Re-add new DML nodes to the restored builder
+                        if (lastSnapshot.builder != null) {
+                            try {
+                                lastSnapshot.builder.addGraphNode(nodeId, vec);
+                            } catch (Exception ex) {
+                                LOGGER.log(Level.WARNING, "Failed to re-add node during recovery", ex);
+                            }
                         }
+                    }
+                }
+                // Close current shard builder
+                if (currentShard.builder != null) {
+                    try {
+                        currentShard.builder.close();
+                    } catch (IOException e) {
+                        // ignore
                     }
                 }
             }
 
+            // Restore snapshot shards as live state
+            this.liveShards = new ArrayList<>(snapshotShards);
+
             // Clear frozen state
-            this.frozenBuilder = null;
-            this.frozenMravv = null;
-            this.frozenNodeToPk = null;
+            this.frozenShards = null;
             this.pendingCheckpointDeletes = null;
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
             dirty.set(true);
@@ -1647,9 +1735,7 @@ public class VectorIndexManager extends AbstractIndexManager {
      * Returns the list of SegmentWriteResults to be loaded in Phase C.
      */
     private List<SegmentWriteResult> doCheckpointFusedPQPhaseB(
-            ConcurrentHashMap<Integer, VectorFloat<?>> snapshotVectors,
-            ConcurrentHashMap<Integer, Bytes> snapshotNodeToPk,
-            GraphIndexBuilder snapshotBuilder,
+            List<LiveGraphShard> snapshotShards,
             int snapshotDimension,
             List<VectorSegment> sealedSegments,
             List<VectorSegment> mergeableSegments,
@@ -1657,19 +1743,24 @@ public class VectorIndexManager extends AbstractIndexManager {
             List<PostCheckpointAction> resultActions)
             throws IOException, DataStorageManagerException {
 
-        if (snapshotBuilder != null) {
-            snapshotBuilder.cleanup();
+        // Cleanup all snapshot shard builders
+        for (LiveGraphShard shard : snapshotShards) {
+            if (shard.builder != null) {
+                shard.builder.cleanup();
+            }
         }
 
-        // Collect all vectors from snapshot live state + mergeable segments into sequential lists
+        // Collect all vectors from ALL snapshot shards + mergeable segments into sequential lists
         List<VectorFloat<?>> poolVectorsList = new ArrayList<>();
         List<Bytes> poolPkList = new ArrayList<>();
 
-        for (Map.Entry<Integer, Bytes> e : snapshotNodeToPk.entrySet()) {
-            VectorFloat<?> vec = snapshotVectors.get(e.getKey());
-            if (vec != null) {
-                poolVectorsList.add(vec);
-                poolPkList.add(e.getValue());
+        for (LiveGraphShard shard : snapshotShards) {
+            for (Map.Entry<Integer, Bytes> e : shard.nodeToPk.entrySet()) {
+                VectorFloat<?> vec = shard.vectors.get(e.getKey());
+                if (vec != null) {
+                    poolVectorsList.add(vec);
+                    poolPkList.add(e.getValue());
+                }
             }
         }
 
@@ -1827,6 +1918,30 @@ public class VectorIndexManager extends AbstractIndexManager {
         resultActions.addAll(persistIndexStatusMultiSegment(sealedSegments, newSegmentResults, sequenceNumber, pin));
 
         return newSegmentResults;
+    }
+
+    /**
+     * Encapsulates the state of a single live in-memory graph shard.
+     * The active shard (last in the list) accepts new inserts; sealed shards are read-only.
+     */
+    static class LiveGraphShard {
+        final ConcurrentHashMap<Integer, VectorFloat<?>> vectors;
+        final ConcurrentHashMap<Bytes, Integer> pkToNode;
+        final ConcurrentHashMap<Integer, Bytes> nodeToPk;
+        final RandomAccessVectorValues mravv;
+        final GraphIndexBuilder builder;
+
+        LiveGraphShard(ConcurrentHashMap<Integer, VectorFloat<?>> vectors,
+                       ConcurrentHashMap<Bytes, Integer> pkToNode,
+                       ConcurrentHashMap<Integer, Bytes> nodeToPk,
+                       RandomAccessVectorValues mravv,
+                       GraphIndexBuilder builder) {
+            this.vectors = vectors;
+            this.pkToNode = pkToNode;
+            this.nodeToPk = nodeToPk;
+            this.mravv = mravv;
+            this.builder = builder;
+        }
     }
 
     /** Holds the result of writing a single segment during checkpoint. */
@@ -2301,27 +2416,30 @@ public class VectorIndexManager extends AbstractIndexManager {
 
     @Override
     public void close() {
-        GraphIndexBuilder b = this.builder;
-        if (b != null) {
-            try {
-                b.close();
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING,
-                        "error closing vector index builder for " + index.name, e);
+        for (LiveGraphShard shard : liveShards) {
+            if (shard.builder != null) {
+                try {
+                    shard.builder.close();
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING,
+                            "error closing vector index builder for " + index.name, e);
+                }
             }
         }
-        // Close frozen builder if checkpoint was in progress
-        GraphIndexBuilder fb = this.frozenBuilder;
-        if (fb != null) {
-            try {
-                fb.close();
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING,
-                        "error closing frozen vector index builder for " + index.name, e);
+        // Close frozen shards if checkpoint was in progress
+        List<LiveGraphShard> frozen = this.frozenShards;
+        if (frozen != null) {
+            for (LiveGraphShard shard : frozen) {
+                if (shard.builder != null) {
+                    try {
+                        shard.builder.close();
+                    } catch (IOException e) {
+                        LOGGER.log(Level.WARNING,
+                                "error closing frozen vector index builder for " + index.name, e);
+                    }
+                }
             }
-            this.frozenBuilder = null;
-            this.frozenMravv = null;
-            this.frozenNodeToPk = null;
+            this.frozenShards = null;
         }
         this.pendingCheckpointDeletes = null;
         this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
@@ -2353,7 +2471,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         // Back-pressure: if checkpoint Phase B is active and live cap exceeded,
         // wait for Phase C to complete before proceeding.
         CountDownLatch latch = checkpointPhaseComplete;
-        if (latch != null && nodeToPk.size() >= liveVectorCapDuringCheckpoint) {
+        if (latch != null && totalLiveSize() >= liveVectorCapDuringCheckpoint) {
             try {
                 latch.await();
             } catch (InterruptedException e) {
@@ -2375,10 +2493,19 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
             VectorFloat<?> vec = VTS.createFloatVector(floats);
             int nodeId = nextNodeId.getAndIncrement();
-            vectors.put(nodeId, vec);
-            pkToNode.put(key, nodeId);
-            nodeToPk.put(nodeId, key);
-            builder.addGraphNode(nodeId, vec);
+
+            List<LiveGraphShard> shards = this.liveShards;
+            LiveGraphShard active = shards.get(shards.size() - 1);
+
+            // Check if rotation is needed
+            if (active.nodeToPk.size() >= computeEffectiveMaxLiveGraphSize()) {
+                active = rotateLiveShard();
+            }
+
+            active.vectors.put(nodeId, vec);
+            active.pkToNode.put(key, nodeId);
+            active.nodeToPk.put(nodeId, key);
+            active.builder.addGraphNode(nodeId, vec);
             dirty.set(true);
         } finally {
             stateLock.readLock().unlock();
@@ -2405,18 +2532,19 @@ public class VectorIndexManager extends AbstractIndexManager {
             if (pending != null) {
                 pending.add(key);
             }
-            // Check live nodes
-            Integer nodeId = pkToNode.remove(key);
-            if (nodeId == null) {
-                return;
-            }
-            nodeToPk.remove(nodeId);
-            dirty.set(true);
-            GraphIndexBuilder b = builder;
-            if (b != null) {
-                b.markNodeDeleted(nodeId);
-            } else {
-                vectors.remove(nodeId);
+            // Check all live shards (PK exists in at most one)
+            for (LiveGraphShard shard : liveShards) {
+                Integer nodeId = shard.pkToNode.remove(key);
+                if (nodeId != null) {
+                    shard.nodeToPk.remove(nodeId);
+                    dirty.set(true);
+                    if (shard.builder != null) {
+                        shard.builder.markNodeDeleted(nodeId);
+                    } else {
+                        shard.vectors.remove(nodeId);
+                    }
+                    break;
+                }
             }
         } finally {
             stateLock.readLock().unlock();
@@ -2483,7 +2611,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         int nodeId = nextNodeId.getAndIncrement();
         rebuildVectors.putVector(nodeId, vec);
         rebuildNodeToPk.insert(ordinalToBytes(nodeId), key);
-        builder.addGraphNode(nodeId, vec);
+        activeBuilder().addGraphNode(nodeId, vec);
         if (batchNodeCount != null) {
             batchNodeCount.incrementAndGet();
         }
@@ -2529,42 +2657,43 @@ public class VectorIndexManager extends AbstractIndexManager {
             throw new StatementExecutionException("vector index search failed: " + e.getMessage(), e);
         }
 
-        // Search live in-memory builder
-        GraphIndexBuilder b = builder;
-        if (b != null && !nodeToPk.isEmpty()) {
-            int k = Math.min(topK, nodeToPk.size());
-            ImmutableGraphIndex graph = b.getGraph();
-            SearchResult result = GraphSearcher.search(
-                    qv, k, mravv, similarityFunction, graph, Bits.ALL);
-            for (SearchResult.NodeScore ns : result.getNodes()) {
-                Bytes pk = nodeToPk.get(ns.node);
-                if (pk != null) {
-                    results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+        // Search all live in-memory shards
+        for (LiveGraphShard shard : liveShards) {
+            if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
+                int k = Math.min(topK, shard.nodeToPk.size());
+                ImmutableGraphIndex graph = shard.builder.getGraph();
+                SearchResult result = GraphSearcher.search(
+                        qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
+                for (SearchResult.NodeScore ns : result.getNodes()) {
+                    Bytes pk = shard.nodeToPk.get(ns.node);
+                    if (pk != null) {
+                        results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+                    }
                 }
             }
         }
 
-        // Search frozen builder (during Phase B of checkpoint)
-        GraphIndexBuilder fb = frozenBuilder;
-        ConcurrentHashMap<Integer, Bytes> fNodeToPk = frozenNodeToPk;
-        if (fb != null && fNodeToPk != null && !fNodeToPk.isEmpty()) {
-            RandomAccessVectorValues fMravv = frozenMravv;
-            if (fMravv != null) {
-                int k = Math.min(topK, fNodeToPk.size());
-                try {
-                    ImmutableGraphIndex graph = fb.getGraph();
-                    SearchResult result = GraphSearcher.search(
-                            qv, k, fMravv, similarityFunction, graph, Bits.ALL);
-                    Set<Bytes> pending = pendingCheckpointDeletes;
-                    for (SearchResult.NodeScore ns : result.getNodes()) {
-                        Bytes pk = fNodeToPk.get(ns.node);
-                        if (pk != null && (pending == null || !pending.contains(pk))) {
-                            results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+        // Search frozen shards (during Phase B of checkpoint)
+        List<LiveGraphShard> frozen = frozenShards;
+        if (frozen != null) {
+            Set<Bytes> pending = pendingCheckpointDeletes;
+            for (LiveGraphShard shard : frozen) {
+                if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
+                    int k = Math.min(topK, shard.nodeToPk.size());
+                    try {
+                        ImmutableGraphIndex graph = shard.builder.getGraph();
+                        SearchResult result = GraphSearcher.search(
+                                qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
+                        for (SearchResult.NodeScore ns : result.getNodes()) {
+                            Bytes pk = shard.nodeToPk.get(ns.node);
+                            if (pk != null && (pending == null || !pending.contains(pk))) {
+                                results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+                            }
                         }
+                    } catch (Exception e) {
+                        LOGGER.log(Level.WARNING,
+                                "error searching frozen shard for " + index.name, e);
                     }
-                } catch (Exception e) {
-                    LOGGER.log(Level.WARNING,
-                            "error searching frozen builder for " + index.name, e);
                 }
             }
         }
@@ -2591,55 +2720,59 @@ public class VectorIndexManager extends AbstractIndexManager {
     // -------------------------------------------------------------------------
 
     private synchronized void initBuilderForDimension(int dim) {
-        initBuilderForDimension(dim, vectors);
-    }
-
-    private synchronized void initBuilderForDimension(int dim, Map<Integer, VectorFloat<?>> vectorsMap) {
         if (this.dimension == 0) {
-            this.mravv = new MapRandomAccessVectorValues(vectorsMap, dim);
-            BuildScoreProvider bsp =
-                    BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
-            this.builder = new GraphIndexBuilder(
-                    bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+            LiveGraphShard shard = createEmptyLiveShard(dim, beamWidth, neighborOverflow, alpha);
+            this.liveShards = new ArrayList<>(Collections.singletonList(shard));
             // Set dimension LAST: concurrent readers check dimension != 0 to skip init,
-            // so builder must be visible before dimension becomes non-zero.
+            // so liveShards must be visible before dimension becomes non-zero.
             this.dimension = dim;
         }
     }
 
+    /**
+     * Variant used during rebuild with file-backed vector storage.
+     * Creates a builder with a custom RandomAccessVectorValues (e.g., FileBackedVectorValues).
+     */
     private synchronized void initBuilderForDimension(int dim, RandomAccessVectorValues ravv) {
         if (this.dimension == 0) {
-            this.mravv = ravv;
             BuildScoreProvider bsp =
-                    BuildScoreProvider.randomAccessScoreProvider(mravv, similarityFunction);
-            this.builder = new GraphIndexBuilder(
+                    BuildScoreProvider.randomAccessScoreProvider(ravv, similarityFunction);
+            GraphIndexBuilder b = new GraphIndexBuilder(
                     bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+            // During rebuild, we use the builder directly (not via liveShards), so store
+            // on a temporary shard. The rebuild path uses its own separate maps.
+            LiveGraphShard shard = new LiveGraphShard(
+                    new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), ravv, b);
+            this.liveShards = new ArrayList<>(Collections.singletonList(shard));
             // Set dimension LAST (see above)
             this.dimension = dim;
         }
     }
 
     private void resetState() {
-        GraphIndexBuilder b = this.builder;
-        if (b != null) {
-            try {
-                b.close();
-            } catch (IOException e) {
-                // ignore on reset
+        for (LiveGraphShard shard : liveShards) {
+            if (shard.builder != null) {
+                try {
+                    shard.builder.close();
+                } catch (IOException e) {
+                    // ignore on reset
+                }
             }
         }
         // Clean up frozen state if checkpoint was in progress
-        GraphIndexBuilder fb = this.frozenBuilder;
-        if (fb != null) {
-            try {
-                fb.close();
-            } catch (IOException e) {
-                // ignore on reset
+        List<LiveGraphShard> frozen = this.frozenShards;
+        if (frozen != null) {
+            for (LiveGraphShard shard : frozen) {
+                if (shard.builder != null) {
+                    try {
+                        shard.builder.close();
+                    } catch (IOException e) {
+                        // ignore on reset
+                    }
+                }
             }
         }
-        frozenBuilder = null;
-        frozenMravv = null;
-        frozenNodeToPk = null;
+        frozenShards = null;
         pendingCheckpointDeletes = null;
         liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
         CountDownLatch latch = this.checkpointPhaseComplete;
@@ -2651,14 +2784,10 @@ public class VectorIndexManager extends AbstractIndexManager {
             seg.close();
         }
         segments = new java.util.concurrent.CopyOnWriteArrayList<>();
-        vectors.clear();
-        pkToNode.clear();
-        nodeToPk.clear();
+        liveShards = new ArrayList<>();
         nextNodeId.set(0);
         nextSegmentId.set(0);
         dimension = 0;
-        builder = null;
-        mravv = null;
     }
 
     // -------------------------------------------------------------------------
@@ -2968,9 +3097,14 @@ public class VectorIndexManager extends AbstractIndexManager {
     // -------------------------------------------------------------------------
 
     public int getNodeCount() {
-        ConcurrentHashMap<Integer, Bytes> frozen = frozenNodeToPk;
-        int frozenCount = frozen != null ? frozen.size() : 0;
-        return nodeToPk.size() + frozenCount + (int) onDiskNodeToPkSize();
+        int frozenCount = 0;
+        List<LiveGraphShard> frozen = frozenShards;
+        if (frozen != null) {
+            for (LiveGraphShard shard : frozen) {
+                frozenCount += shard.nodeToPk.size();
+            }
+        }
+        return totalLiveSize() + frozenCount + (int) onDiskNodeToPkSize();
     }
 
     public int getDimension() {
@@ -2982,19 +3116,28 @@ public class VectorIndexManager extends AbstractIndexManager {
     }
 
     public int getVectorsMapSize() {
-        ConcurrentHashMap<Integer, VectorFloat<?>> frozenVecs = null;
-        ConcurrentHashMap<Integer, Bytes> frozen = frozenNodeToPk;
-        if (frozen != null) {
-            // During Phase B, vectors field has been swapped. Approximate frozen vectors size.
-            frozenVecs = null; // We don't keep a frozen vectors ref, but frozenNodeToPk size is equivalent
+        int count = 0;
+        for (LiveGraphShard shard : liveShards) {
+            count += shard.vectors.size();
         }
-        return vectors.size() + (frozen != null ? frozen.size() : 0);
+        List<LiveGraphShard> frozen = frozenShards;
+        if (frozen != null) {
+            for (LiveGraphShard shard : frozen) {
+                count += shard.nodeToPk.size();
+            }
+        }
+        return count;
     }
 
     public int getLiveNodeCount() {
-        ConcurrentHashMap<Integer, Bytes> frozen = frozenNodeToPk;
-        int frozenCount = frozen != null ? frozen.size() : 0;
-        return nodeToPk.size() + frozenCount;
+        int frozenCount = 0;
+        List<LiveGraphShard> frozen = frozenShards;
+        if (frozen != null) {
+            for (LiveGraphShard shard : frozen) {
+                frozenCount += shard.nodeToPk.size();
+            }
+        }
+        return totalLiveSize() + frozenCount;
     }
 
     public int getOnDiskNodeCount() {
@@ -3002,7 +3145,11 @@ public class VectorIndexManager extends AbstractIndexManager {
     }
 
     public int getPkToNodeSize() {
-        return pkToNode.size();
+        int count = 0;
+        for (LiveGraphShard shard : liveShards) {
+            count += shard.pkToNode.size();
+        }
+        return count;
     }
 
     public int getSegmentCount() {
@@ -3046,6 +3193,18 @@ public class VectorIndexManager extends AbstractIndexManager {
     }
 
     public boolean isCheckpointActive() {
-        return frozenBuilder != null;
+        return frozenShards != null;
+    }
+
+    public int getLiveShardCount() {
+        return liveShards.size();
+    }
+
+    public int getMaxLiveGraphSize() {
+        return maxLiveGraphSize;
+    }
+
+    public int getEffectiveMaxLiveGraphSize() {
+        return computeEffectiveMaxLiveGraphSize();
     }
 }

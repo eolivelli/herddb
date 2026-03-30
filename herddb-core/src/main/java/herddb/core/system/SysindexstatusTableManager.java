@@ -102,6 +102,9 @@ public class SysindexstatusTableManager extends AbstractSystemTableManager {
             props.put("estimatedSizeBytes", vim.getEstimatedSizeBytes());
             props.put("dirty", vim.isDirty());
             props.put("checkpointActive", vim.isCheckpointActive());
+            props.put("liveShardCount", vim.getLiveShardCount());
+            props.put("maxLiveGraphSize", vim.getMaxLiveGraphSize());
+            props.put("effectiveMaxLiveGraphSize", vim.getEffectiveMaxLiveGraphSize());
         } else if (indexManager instanceof BRINIndexManager) {
             BRINIndexManager brin = (BRINIndexManager) indexManager;
             props.put("numBlocks", brin.getNumBlocks());

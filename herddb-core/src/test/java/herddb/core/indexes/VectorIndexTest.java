@@ -1329,6 +1329,218 @@ public class VectorIndexTest {
 
     // ---- helpers ----
 
+    // =========================================================================
+    // Live graph shard rotation tests
+    // =========================================================================
+
+    @Test
+    public void testLiveGraphShardRotation() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final int dimension = 16;
+        final int numRows = 350;
+        final int maxLiveGraphSize = 100;
+
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton("localhost"), "localhost", 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec) WITH maxLiveGraphSize=" + maxLiveGraphSize,
+                    Collections.emptyList());
+
+            // Insert enough rows to trigger rotation (seed+1 to avoid zero vector)
+            for (int i = 0; i < numRows; i++) {
+                float[] vec = randomVec(dimension, i + 1);
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, vec));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertNotNull(vim);
+
+            // Verify multiple shards were created
+            assertTrue("Expected multiple live shards, got " + vim.getLiveShardCount(),
+                    vim.getLiveShardCount() >= 3);
+            assertEquals("Total node count", numRows, vim.getNodeCount());
+            assertEquals("maxLiveGraphSize should match", maxLiveGraphSize, vim.getMaxLiveGraphSize());
+
+            // Verify search still works correctly
+            float[] query = randomVec(dimension, 1);
+            List<Map.Entry<herddb.utils.Bytes, Float>> results = vim.search(query, 5);
+            assertEquals("Expected 5 results", 5, results.size());
+        }
+    }
+
+    @Test
+    public void testLiveGraphShardRotationCheckpoint() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final int dimension = 16;
+        final int numRows = 400;
+        final int maxLiveGraphSize = 100;
+
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton("localhost"), "localhost", 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec) WITH maxLiveGraphSize=" + maxLiveGraphSize,
+                    Collections.emptyList());
+
+            for (int i = 0; i < numRows; i++) {
+                float[] vec = randomVec(dimension, i + 1);
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, vec));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertTrue("Expected multiple live shards before checkpoint", vim.getLiveShardCount() >= 3);
+
+            // Checkpoint should persist all shards to on-disk segments
+            manager.checkpoint();
+
+            // After checkpoint, all data should be on-disk and live shards should be 1 (empty active)
+            assertEquals("After checkpoint, live shard count should be 1", 1, vim.getLiveShardCount());
+            assertTrue("After checkpoint, on-disk nodes > 0", vim.getOnDiskNodeCount() > 0);
+            assertEquals("Total node count after checkpoint", numRows, vim.getNodeCount());
+
+            // Search should still work
+            float[] query = randomVec(dimension, 1);
+            List<Map.Entry<herddb.utils.Bytes, Float>> results = vim.search(query, 5);
+            assertEquals("Expected 5 results after checkpoint", 5, results.size());
+        }
+    }
+
+    @Test
+    public void testLiveGraphShardRotationDelete() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final int dimension = 16;
+        final int numRows = 250;
+        final int maxLiveGraphSize = 100;
+
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton("localhost"), "localhost", 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec) WITH maxLiveGraphSize=" + maxLiveGraphSize,
+                    Collections.emptyList());
+
+            for (int i = 0; i < numRows; i++) {
+                float[] vec = randomVec(dimension, i + 1);
+                executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                        Arrays.asList(i, vec));
+            }
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertTrue("Expected multiple shards", vim.getLiveShardCount() >= 2);
+
+            // Delete first 50 rows (likely in first shard)
+            for (int i = 0; i < 50; i++) {
+                executeUpdate(manager, "DELETE FROM tblspace1.t1 WHERE id=?",
+                        Arrays.asList(i));
+            }
+
+            // Verify search returns correct count
+            float[] query = randomVec(dimension, 100);
+            List<Map.Entry<herddb.utils.Bytes, Float>> results = vim.search(query, numRows);
+            assertEquals("Expected remaining rows", numRows - 50, results.size());
+        }
+    }
+
+    @Test
+    public void testLiveGraphShardAutoTune() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton("localhost"), "localhost", 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            // No maxLiveGraphSize specified — should auto-compute
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            VectorIndexManager vim = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            assertEquals("default maxLiveGraphSize should be 0", 0, vim.getMaxLiveGraphSize());
+
+            int effective = vim.getEffectiveMaxLiveGraphSize();
+            // With default m=16, beamWidth=100: should be 50000
+            assertTrue("effectiveMaxLiveGraphSize should be >= 10000, got " + effective, effective >= 10000);
+            assertTrue("effectiveMaxLiveGraphSize should be <= 100000, got " + effective, effective <= 100000);
+
+            // Test with heavier params
+            execute(manager, "CREATE TABLE tblspace1.t2 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx2 ON tblspace1.t2(vec) WITH m=32 beamWidth=200",
+                    Collections.emptyList());
+
+            VectorIndexManager vim2 = (VectorIndexManager)
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t2").get("vidx2");
+            int effective2 = vim2.getEffectiveMaxLiveGraphSize();
+            assertTrue("heavier params should give smaller shards: " + effective2 + " < " + effective,
+                    effective2 < effective);
+        }
+    }
+
     private static void normalize(float[] v) {
         float norm = 0;
         for (float f : v) {
