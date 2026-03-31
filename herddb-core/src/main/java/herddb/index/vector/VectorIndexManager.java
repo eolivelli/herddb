@@ -45,7 +45,6 @@ import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.GraphSearcher;
 import io.github.jbellis.jvector.graph.ImmutableGraphIndex;
-import io.github.jbellis.jvector.graph.MapRandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.OnHeapGraphIndex;
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.SearchResult;
@@ -207,6 +206,9 @@ public class VectorIndexManager extends AbstractIndexManager {
     /** Monotonically increasing node-ID counter. */
     private final AtomicInteger nextNodeId = new AtomicInteger(0);
 
+    /** Global lock-free vector storage shared by all live shards. Indexed directly by nodeId. */
+    private VectorStorage vectorStorage = new VectorStorage(0);
+
     /** Page-ID counter, same pattern as BRINIndexManager. */
     private final AtomicLong newPageId = new AtomicLong(1);
 
@@ -353,7 +355,7 @@ public class VectorIndexManager extends AbstractIndexManager {
             public Long getSample() {
                 long total = 0;
                 for (LiveGraphShard shard : liveShards) {
-                    total += (long) shard.vectors.size() * dimension * Float.BYTES;
+                    total += (long) shard.vectorCount.get() * dimension * Float.BYTES;
                 }
                 return total;
             }
@@ -415,14 +417,13 @@ public class VectorIndexManager extends AbstractIndexManager {
     }
 
     private LiveGraphShard createEmptyLiveShard(int dim, int bw, float no, float a) {
-        ConcurrentHashMap<Integer, VectorFloat<?>> vecs = new ConcurrentHashMap<>();
         ConcurrentHashMap<Bytes, Integer> p2n = new ConcurrentHashMap<>();
         ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>();
-        MapRandomAccessVectorValues ravv = new MapRandomAccessVectorValues(vecs, dim);
+        VectorStorageRandomAccessVectorValues ravv = new VectorStorageRandomAccessVectorValues(vectorStorage, dim);
         BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(ravv, similarityFunction);
         GraphIndexBuilder b = new GraphIndexBuilder(
                 bsp, dim, m, bw, no, a, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
-        return new LiveGraphShard(vecs, p2n, n2p, ravv, b);
+        return new LiveGraphShard(p2n, n2p, ravv, b);
     }
 
     /**
@@ -494,6 +495,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                 new Object[]{index.name, index.uuid});
 
         dataStorageManager.initIndex(tableSpaceUUID, index.uuid);
+        vectorStorage = new VectorStorage(computeEffectiveMaxLiveGraphSize());
 
         if (LogSequenceNumber.START_OF_TIME.equals(sequenceNumber)) {
             LOGGER.log(Level.FINE, "loaded empty vector index {0}", index.name);
@@ -767,9 +769,9 @@ public class VectorIndexManager extends AbstractIndexManager {
                                      int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
             throws IOException {
         // Restore pk/vector maps from temp file into a single live shard
-        ConcurrentHashMap<Integer, VectorFloat<?>> vecs = new ConcurrentHashMap<>();
         ConcurrentHashMap<Bytes, Integer> p2n = new ConcurrentHashMap<>();
         ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>();
+        int loadedCount = 0;
         try (DataInputStream dis = new DataInputStream(
                 new BufferedInputStream(new FileInputStream(mapFile.toFile()), CHUNK_SIZE))) {
             int entryCount = dis.readInt();
@@ -785,14 +787,15 @@ public class VectorIndexManager extends AbstractIndexManager {
                 }
                 Bytes pk = Bytes.from_array(pkData);
                 VectorFloat<?> vec = VTS.createFloatVector(floats);
-                vecs.put(nodeId, vec);
+                vectorStorage.set(nodeId, vec);
                 p2n.put(pk, nodeId);
                 n2p.put(nodeId, pk);
+                loadedCount++;
             }
         }
 
         this.nextNodeId.set(savedNextNodeId);
-        MapRandomAccessVectorValues ravv = new MapRandomAccessVectorValues(vecs, dim);
+        VectorStorageRandomAccessVectorValues ravv = new VectorStorageRandomAccessVectorValues(vectorStorage, dim);
 
         // Load OnHeapGraphIndex from temp file
         GraphIndexBuilder loadedBuilder;
@@ -810,12 +813,13 @@ public class VectorIndexManager extends AbstractIndexManager {
                     PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
         }
 
-        LiveGraphShard shard = new LiveGraphShard(vecs, p2n, n2p, ravv, loadedBuilder);
+        LiveGraphShard shard = new LiveGraphShard(p2n, n2p, ravv, loadedBuilder);
+        shard.vectorCount.set(loadedCount);
         this.liveShards = new ArrayList<>(Collections.singletonList(shard));
 
         LOGGER.log(Level.INFO,
                 "loaded vector index {0} (simple): {1} nodes, dimension {2}",
-                new Object[]{index.name, vecs.size(), dim});
+                new Object[]{index.name, loadedCount, dim});
         return true;
     }
 
@@ -1058,7 +1062,10 @@ public class VectorIndexManager extends AbstractIndexManager {
                         // Small final batch kept as live state: build fresh graph from live vectors.
                         initEmptyLiveShards(dimension, beamWidth, neighborOverflow, alpha);
                         LiveGraphShard liveShard = liveShards.get(0);
-                        liveShard.vectors.putAll(rebuildLiveVectors);
+                        for (Map.Entry<Integer, VectorFloat<?>> entry : rebuildLiveVectors.entrySet()) {
+                            vectorStorage.set(entry.getKey(), entry.getValue());
+                            liveShard.vectorCount.incrementAndGet();
+                        }
                         liveShard.nodeToPk.putAll(rebuildLiveNodeToPk);
                         liveShard.pkToNode.putAll(rebuildLivePkToNode);
                         for (Map.Entry<Integer, VectorFloat<?>> entry : rebuildLiveVectors.entrySet()) {
@@ -1202,9 +1209,12 @@ public class VectorIndexManager extends AbstractIndexManager {
                             }
                         }
                         if (dimension > 0 && rebuildGraph != null) {
-                            ConcurrentHashMap<Integer, VectorFloat<?>> vecs = new ConcurrentHashMap<>(rebuildVectorsMap);
                             ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>(rebuildNodeToPkMap);
-                            MapRandomAccessVectorValues newMravv = new MapRandomAccessVectorValues(vecs, dimension);
+                            VectorStorageRandomAccessVectorValues newMravv =
+                                    new VectorStorageRandomAccessVectorValues(vectorStorage, dimension);
+                            for (Map.Entry<Integer, VectorFloat<?>> e : rebuildVectorsMap.entrySet()) {
+                                vectorStorage.set(e.getKey(), e.getValue());
+                            }
                             BuildScoreProvider bsp =
                                     BuildScoreProvider.randomAccessScoreProvider(newMravv, similarityFunction);
                             GraphIndexBuilder newBuilder = new GraphIndexBuilder(
@@ -1213,12 +1223,16 @@ public class VectorIndexManager extends AbstractIndexManager {
                                     REFINE_FINAL_GRAPH,
                                     PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
                             LiveGraphShard updatedShard = new LiveGraphShard(
-                                    vecs, new ConcurrentHashMap<>(), n2p, newMravv, newBuilder);
+                                    new ConcurrentHashMap<>(), n2p, newMravv, newBuilder);
+                            updatedShard.vectorCount.set(rebuildVectorsMap.size());
                             this.liveShards = new ArrayList<>(Collections.singletonList(updatedShard));
                         } else {
                             initEmptyLiveShards(dimension, beamWidth, neighborOverflow, alpha);
                             LiveGraphShard liveShard = liveShards.get(0);
-                            liveShard.vectors.putAll(rebuildVectorsMap);
+                            for (Map.Entry<Integer, VectorFloat<?>> e : rebuildVectorsMap.entrySet()) {
+                                vectorStorage.set(e.getKey(), e.getValue());
+                                liveShard.vectorCount.incrementAndGet();
+                            }
                             liveShard.nodeToPk.putAll(rebuildNodeToPkMap);
                         }
                         dirty.set(true);
@@ -1305,7 +1319,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         GraphIndexBuilder b = new GraphIndexBuilder(
                 bsp, dimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
         LiveGraphShard shard = new LiveGraphShard(
-                new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), fbv, b);
+                new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), fbv, b);
         this.liveShards = new ArrayList<>(Collections.singletonList(shard));
     }
 
@@ -1419,7 +1433,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         int seqId = 0;
         for (LiveGraphShard shard : liveShards) {
             for (Map.Entry<Integer, Bytes> e : shard.nodeToPk.entrySet()) {
-                VectorFloat<?> vec = shard.vectors.get(e.getKey());
+                VectorFloat<?> vec = vectorStorage.get(e.getKey());
                 if (vec != null) {
                     allVectors.put(seqId, vec);
                     allNodeToPk.put(seqId, e.getValue());
@@ -1459,10 +1473,20 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
         }
 
-        // Rebuild a single shard with all data
+        // Release old nodeId slots before assigning new sequential IDs
+        for (LiveGraphShard shard : liveShards) {
+            for (Integer oldNodeId : shard.nodeToPk.keySet()) {
+                vectorStorage.remove(oldNodeId);
+            }
+        }
+
+        // Rebuild a single shard with all data using remapped sequential IDs
         nextNodeId.set(seqId);
         LiveGraphShard newShard = createEmptyLiveShard(dimension, beamWidth, neighborOverflow, alpha);
-        newShard.vectors.putAll(allVectors);
+        for (Map.Entry<Integer, VectorFloat<?>> e : allVectors.entrySet()) {
+            vectorStorage.set(e.getKey(), e.getValue());
+            newShard.vectorCount.incrementAndGet();
+        }
         for (Map.Entry<Integer, Bytes> e : allNodeToPk.entrySet()) {
             newShard.nodeToPk.put(e.getKey(), e.getValue());
             newShard.pkToNode.put(e.getValue(), e.getKey());
@@ -1472,8 +1496,6 @@ public class VectorIndexManager extends AbstractIndexManager {
         }
         newShard.builder.cleanup();
         this.liveShards = new ArrayList<>(Collections.singletonList(newShard));
-
-        newShard.vectors.keySet().retainAll(newShard.nodeToPk.keySet());
 
         List<Long> graphPageIds;
         Path graphTmpFile = Files.createTempFile("herddb-vector-graph-", ".tmp");
@@ -1487,7 +1509,7 @@ public class VectorIndexManager extends AbstractIndexManager {
             Files.deleteIfExists(graphTmpFile);
         }
         List<Long> mapPageIds;
-        Path mapTmpFile = serializeMapDataToFile(newShard.vectors, newShard.nodeToPk);
+        Path mapTmpFile = serializeMapDataToFile(vectorStorage, newShard.nodeToPk);
         try {
             mapPageIds = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
         } finally {
@@ -1668,6 +1690,15 @@ public class VectorIndexManager extends AbstractIndexManager {
                         new Object[]{index.name, totalNodes});
             }
 
+            // Release vectorStorage slots for all checkpointed (now on-disk) nodeIds
+            if (snapshotShards != null) {
+                for (LiveGraphShard shard : snapshotShards) {
+                    for (Integer nodeId : shard.nodeToPk.keySet()) {
+                        vectorStorage.remove(nodeId);
+                    }
+                }
+            }
+
             // Clear frozen state
             this.frozenShards = null;
             this.pendingCheckpointDeletes = null;
@@ -1701,14 +1732,15 @@ public class VectorIndexManager extends AbstractIndexManager {
             LiveGraphShard lastSnapshot = snapshotShards.get(snapshotShards.size() - 1);
 
             for (LiveGraphShard currentShard : currentShards) {
-                for (Map.Entry<Integer, VectorFloat<?>> e : currentShard.vectors.entrySet()) {
+                for (Map.Entry<Integer, Bytes> e : currentShard.nodeToPk.entrySet()) {
                     int nodeId = e.getKey();
-                    VectorFloat<?> vec = e.getValue();
-                    Bytes pk = currentShard.nodeToPk.get(nodeId);
-                    if (pk != null) {
-                        lastSnapshot.vectors.put(nodeId, vec);
+                    VectorFloat<?> vec = vectorStorage.get(nodeId);
+                    Bytes pk = e.getValue();
+                    if (vec != null) {
+                        // vec is already in vectorStorage; just update the shard's pk mappings
                         lastSnapshot.pkToNode.put(pk, nodeId);
                         lastSnapshot.nodeToPk.put(nodeId, pk);
+                        lastSnapshot.vectorCount.incrementAndGet();
                         // Re-add new DML nodes to the restored builder
                         if (lastSnapshot.builder != null) {
                             try {
@@ -1773,7 +1805,7 @@ public class VectorIndexManager extends AbstractIndexManager {
 
         for (LiveGraphShard shard : snapshotShards) {
             for (Map.Entry<Integer, Bytes> e : shard.nodeToPk.entrySet()) {
-                VectorFloat<?> vec = shard.vectors.get(e.getKey());
+                VectorFloat<?> vec = vectorStorage.get(e.getKey());
                 if (vec != null) {
                     poolVectorsList.add(vec);
                     poolPkList.add(e.getValue());
@@ -1836,11 +1868,14 @@ public class VectorIndexManager extends AbstractIndexManager {
             // Build maps from pool for simple checkpoint
             ConcurrentHashMap<Integer, VectorFloat<?>> poolVecs = new ConcurrentHashMap<>();
             ConcurrentHashMap<Integer, Bytes> poolNodeToPk = new ConcurrentHashMap<>();
+            VectorStorage poolStorage = new VectorStorage(poolVectorsList.size());
             for (int i = 0; i < poolVectorsList.size(); i++) {
                 poolVecs.put(i, poolVectorsList.get(i));
+                poolStorage.set(i, poolVectorsList.get(i));
                 poolNodeToPk.put(i, poolPkList.get(i));
             }
-            MapRandomAccessVectorValues poolMravv = new MapRandomAccessVectorValues(poolVecs, snapshotDimension);
+            VectorStorageRandomAccessVectorValues poolMravv =
+                    new VectorStorageRandomAccessVectorValues(poolStorage, snapshotDimension);
             BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(poolMravv, similarityFunction);
             GraphIndexBuilder poolBuilder = new GraphIndexBuilder(
                     bsp, snapshotDimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
@@ -1922,9 +1957,11 @@ public class VectorIndexManager extends AbstractIndexManager {
 
             ConcurrentHashMap<Integer, VectorFloat<?>> partVectors = new ConcurrentHashMap<>();
             ConcurrentHashMap<Integer, Bytes> partNodeToPk = new ConcurrentHashMap<>();
+            VectorStorage partStorage = new VectorStorage(end - start);
             for (int i = start; i < end; i++) {
                 int seqId = i - start;
                 partVectors.put(seqId, poolVectorsList.get(i));
+                partStorage.set(seqId, poolVectorsList.get(i));
                 partNodeToPk.put(seqId, poolPkList.get(i));
             }
 
@@ -1934,7 +1971,7 @@ public class VectorIndexManager extends AbstractIndexManager {
             segmentIndex++;
             List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, snapshotDimension);
             List<Long> mapPageIds = writeFusedPQMapData(
-                    new MapRandomAccessVectorValues(partVectors, snapshotDimension), partNodeToPk);
+                    new VectorStorageRandomAccessVectorValues(partStorage, snapshotDimension), partNodeToPk);
             long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
             newSegmentResults.add(new SegmentWriteResult(segId, graphPageIds, mapPageIds, estimatedSize,
                     Collections.emptyList()));
@@ -1962,18 +1999,16 @@ public class VectorIndexManager extends AbstractIndexManager {
      * The active shard (last in the list) accepts new inserts; sealed shards are read-only.
      */
     static class LiveGraphShard {
-        final ConcurrentHashMap<Integer, VectorFloat<?>> vectors;
         final ConcurrentHashMap<Bytes, Integer> pkToNode;
         final ConcurrentHashMap<Integer, Bytes> nodeToPk;
         final RandomAccessVectorValues mravv;
         final GraphIndexBuilder builder;
+        final AtomicInteger vectorCount = new AtomicInteger(0);
 
-        LiveGraphShard(ConcurrentHashMap<Integer, VectorFloat<?>> vectors,
-                       ConcurrentHashMap<Bytes, Integer> pkToNode,
+        LiveGraphShard(ConcurrentHashMap<Bytes, Integer> pkToNode,
                        ConcurrentHashMap<Integer, Bytes> nodeToPk,
                        RandomAccessVectorValues mravv,
                        GraphIndexBuilder builder) {
-            this.vectors = vectors;
             this.pkToNode = pkToNode;
             this.nodeToPk = nodeToPk;
             this.mravv = mravv;
@@ -2133,7 +2168,10 @@ public class VectorIndexManager extends AbstractIndexManager {
                 "writeFusedPQGraph {0}: building graph for {1} vectors (dim={2}) using {3} threads",
                 new Object[]{index.name, totalVectors, dim, CHECKPOINT_POOL.getParallelism()});
 
-        MapRandomAccessVectorValues allMravv = new MapRandomAccessVectorValues(allVectors, dim);
+        VectorStorage allStorage = new VectorStorage(allVectors.size());
+        allVectors.forEach(allStorage::set);
+        VectorStorageRandomAccessVectorValues allMravv =
+                new VectorStorageRandomAccessVectorValues(allStorage, dim);
         BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(allMravv, similarityFunction);
         GraphIndexBuilder mergedBuilder = new GraphIndexBuilder(
                 bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH,
@@ -2467,6 +2505,36 @@ public class VectorIndexManager extends AbstractIndexManager {
      *   [ nodeId:int | pkLen:int | pkBytes | floatCount:int | floats ]
      * Returns the path to the temp file (caller must delete after use).
      */
+    private Path serializeMapDataToFile(VectorStorage storage,
+                                        ConcurrentHashMap<Integer, Bytes> nodeToKey) throws IOException {
+        Path tmpFile = Files.createTempFile("herddb-vector-map-", ".tmp");
+        try (BufferedOutputStream bos = new BufferedOutputStream(
+                new FileOutputStream(tmpFile.toFile()), CHUNK_SIZE)) {
+            List<Map.Entry<Integer, Bytes>> entries = new ArrayList<>(nodeToKey.entrySet());
+            int entryCount = entries.size();
+            writeInt(bos, entryCount);
+
+            for (Map.Entry<Integer, Bytes> e : entries) {
+                int nodeId = e.getKey();
+                byte[] pkBytes = e.getValue().to_array();
+                VectorFloat<?> vec = storage.get(nodeId);
+                if (vec == null) {
+                    continue;
+                }
+                int floatCount = vec.length();
+                writeInt(bos, nodeId);
+                writeInt(bos, pkBytes.length);
+                bos.write(pkBytes);
+                writeInt(bos, floatCount);
+                for (int j = 0; j < floatCount; j++) {
+                    int bits = Float.floatToIntBits(vec.get(j));
+                    writeInt(bos, bits);
+                }
+            }
+        }
+        return tmpFile;
+    }
+
     private Path serializeMapDataToFile(ConcurrentHashMap<Integer, VectorFloat<?>> vecs,
                                         ConcurrentHashMap<Integer, Bytes> nodeToKey) throws IOException {
         Path tmpFile = Files.createTempFile("herddb-vector-map-", ".tmp");
@@ -2590,7 +2658,8 @@ public class VectorIndexManager extends AbstractIndexManager {
                 active = rotateLiveShard();
             }
 
-            active.vectors.put(nodeId, vec);
+            vectorStorage.set(nodeId, vec);
+            active.vectorCount.incrementAndGet();
             active.pkToNode.put(key, nodeId);
             active.nodeToPk.put(nodeId, key);
             active.builder.addGraphNode(nodeId, vec);
@@ -2629,7 +2698,8 @@ public class VectorIndexManager extends AbstractIndexManager {
                     if (shard.builder != null) {
                         shard.builder.markNodeDeleted(nodeId);
                     } else {
-                        shard.vectors.remove(nodeId);
+                        vectorStorage.remove(nodeId);
+                        shard.vectorCount.decrementAndGet();
                     }
                     break;
                 }
@@ -2830,7 +2900,7 @@ public class VectorIndexManager extends AbstractIndexManager {
             // During rebuild, we use the builder directly (not via liveShards), so store
             // on a temporary shard. The rebuild path uses its own separate maps.
             LiveGraphShard shard = new LiveGraphShard(
-                    new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), ravv, b);
+                    new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), ravv, b);
             this.liveShards = new ArrayList<>(Collections.singletonList(shard));
             // Set dimension LAST (see above)
             this.dimension = dim;
@@ -2876,6 +2946,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         nextNodeId.set(0);
         nextSegmentId.set(0);
         dimension = 0;
+        vectorStorage = new VectorStorage(computeEffectiveMaxLiveGraphSize());
     }
 
     // -------------------------------------------------------------------------
@@ -3206,7 +3277,7 @@ public class VectorIndexManager extends AbstractIndexManager {
     public int getVectorsMapSize() {
         int count = 0;
         for (LiveGraphShard shard : liveShards) {
-            count += shard.vectors.size();
+            count += shard.vectorCount.get();
         }
         List<LiveGraphShard> frozen = frozenShards;
         if (frozen != null) {
@@ -3260,12 +3331,12 @@ public class VectorIndexManager extends AbstractIndexManager {
     public long estimateLiveMemoryBytes() {
         long rawFloatBytes = 0;
         for (LiveGraphShard shard : liveShards) {
-            rawFloatBytes += (long) shard.vectors.size() * dimension * Float.BYTES;
+            rawFloatBytes += (long) shard.vectorCount.get() * dimension * Float.BYTES;
         }
         List<LiveGraphShard> frozen = frozenShards;
         if (frozen != null) {
             for (LiveGraphShard shard : frozen) {
-                rawFloatBytes += (long) shard.vectors.size() * dimension * Float.BYTES;
+                rawFloatBytes += (long) shard.vectorCount.get() * dimension * Float.BYTES;
             }
         }
         return (long) (rawFloatBytes * memoryMultiplier);
