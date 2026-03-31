@@ -110,6 +110,17 @@ public class IngestionWorker implements Runnable {
                     long elapsed = System.nanoTime() - start;
                     metrics.record(elapsed);
 
+                    // Throttle if max ops/s is configured
+                    if (config.ingestMaxOpsPerSecond > 0) {
+                        long total = metrics.getCount();
+                        double expectedElapsedSecs = (double) total / config.ingestMaxOpsPerSecond;
+                        double actualElapsedSecs = (System.nanoTime() - ingestStartNanos) / 1e9;
+                        double sleepSecs = expectedElapsedSecs - actualElapsedSecs;
+                        if (sleepSecs > 0.001) {
+                            Thread.sleep((long) (sleepSecs * 1000));
+                        }
+                    }
+
                     long total = metrics.getCount();
                     if (total % 10_000 == 0) {
                         MetricsCollector.Stats s = metrics.computeStats();
@@ -120,9 +131,10 @@ public class IngestionWorker implements Runnable {
                         long remaining = config.numRows - total;
                         double etaSecs = rowsPerSec > 0 ? remaining / rowsPerSec : 0;
                         String etaStr = formatEta(etaSecs);
-                        statusLine.set(String.format("Ingested %d/%d rows | mean: %.2f ms | p50: %.2f ms | p99: %.2f ms | commit avg: %.1f ms last: %.1f ms | ETA: %s",
+                        statusLine.set(String.format("Ingested %d/%d rows | %.0f ops/s | mean: %.2f ms | p50: %.2f ms | p99: %.2f ms | commit avg: %.1f ms last: %.1f ms | ETA: %s",
                                 total,
                                 config.numRows,
+                                rowsPerSec,
                                 s.meanNanos() / 1_000_000.0,
                                 s.p50Nanos() / 1_000_000.0,
                                 s.p99Nanos() / 1_000_000.0,

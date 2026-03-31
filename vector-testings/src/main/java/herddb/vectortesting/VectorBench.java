@@ -237,7 +237,8 @@ public class VectorBench {
             System.out.printf("=== INGESTION RESULTS ===%n");
             System.out.printf("Rows: %d | Wall time: %.1fs | Throughput: %.0f ops/s%n",
                     ingestionRows, ingestSecs, ingestionThroughput);
-            System.out.printf("Threads: %d | Batch size: %d%n", config.ingestThreads, config.batchSize);
+            System.out.printf("Threads: %d | Batch size: %d | Max ops/s: %s%n", config.ingestThreads, config.batchSize,
+                    config.ingestMaxOpsPerSecond > 0 ? config.ingestMaxOpsPerSecond : "unlimited");
             ingestionLatency.print("INGESTION LATENCY");
 
             // Verify row count matches ingested records

@@ -16,4 +16,4 @@ set -x
 # specific language governing permissions and limitations
 # under the License.
 #
-./run.sh --password hdb --batch-size 10000 --ingest-threads 12 --dataset sift10m -n 10000000 --checkpoint --drop-table "$@"
+./run.sh --password hdb --batch-size 10000 --ingest-threads 8 --dataset sift10m -n 10000000 --checkpoint --index-before-ingest --drop-table "$@"

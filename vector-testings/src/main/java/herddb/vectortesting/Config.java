@@ -54,6 +54,7 @@ public class Config {
     String similarity = null; // null = use dataset default
     boolean indexBeforeIngest = false;
     int resumeFrom = 0; // skip first N vectors; row IDs start from N
+    int ingestMaxOpsPerSecond = 10_000; // 0 = unlimited
 
     private static Options buildOptions() {
         Options opts = new Options();
@@ -81,6 +82,7 @@ public class Config {
         opts.addOption(null, "client-timeout", true, "Client request timeout in seconds (default: 7200)");
         opts.addOption(null, "index-before-ingest", false, "Create vector index before ingestion instead of after");
         opts.addOption(null, "resume-from", true, "Skip first N vectors and start row IDs from N (default: 0)");
+        opts.addOption(null, "ingest-max-ops", true, "Max ingestion ops/s across all threads, 0=unlimited (default: 10000)");
         opts.addOption(null, "config", true, "Path to properties file");
         opts.addOption("h", "help", false, "Show help");
         return opts;
@@ -181,6 +183,9 @@ public class Config {
         if (cmd.hasOption("resume-from")) {
             cfg.resumeFrom = Integer.parseInt(cmd.getOptionValue("resume-from"));
         }
+        if (cmd.hasOption("ingest-max-ops")) {
+            cfg.ingestMaxOpsPerSecond = Integer.parseInt(cmd.getOptionValue("ingest-max-ops"));
+        }
 
         return cfg;
     }
@@ -258,6 +263,9 @@ public class Config {
         if (props.containsKey("resume-from")) {
             resumeFrom = Integer.parseInt(props.getProperty("resume-from"));
         }
+        if (props.containsKey("ingest-max-ops")) {
+            ingestMaxOpsPerSecond = Integer.parseInt(props.getProperty("ingest-max-ops"));
+        }
     }
 
     /** Returns the similarity function: CLI override if set, otherwise dataset default. */
@@ -303,6 +311,7 @@ public class Config {
                 + ", similarity=" + effectiveSimilarity()
                 + (similarity != null ? " (override)" : " (dataset default)")
                 + (resumeFrom > 0 ? ", resumeFrom=" + resumeFrom : "")
+                + ", ingestMaxOpsPerSecond=" + (ingestMaxOpsPerSecond > 0 ? ingestMaxOpsPerSecond : "unlimited")
                 + ", indexBeforeIngest=" + indexBeforeIngest
                 + ", skipIngest=" + skipIngest
                 + ", skipIndex=" + skipIndex
