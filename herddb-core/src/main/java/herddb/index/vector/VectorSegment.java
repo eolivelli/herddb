@@ -67,6 +67,7 @@ class VectorSegment implements Closeable {
     int[] pkOffsets;   // -1 means deleted/absent
     int[] pkLengths;
     volatile int liveCount;
+    int maxOrdinal = -1;
 
     // ThreadLocal cache of GraphSearcher to avoid per-search allocation
     private ThreadLocal<GraphSearcher> searcherCache = new ThreadLocal<>();

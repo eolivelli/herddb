@@ -38,10 +38,16 @@ class VectorStorageRandomAccessVectorValues implements RandomAccessVectorValues 
 
     private final VectorStorage storage;
     private final int dimension;
+    private final int size;
 
     VectorStorageRandomAccessVectorValues(VectorStorage storage, int dimension) {
+        this(storage, dimension, -1);
+    }
+
+    VectorStorageRandomAccessVectorValues(VectorStorage storage, int dimension, int size) {
         this.storage = storage;
         this.dimension = dimension;
+        this.size = size;
     }
 
     @Override
@@ -66,7 +72,10 @@ class VectorStorageRandomAccessVectorValues implements RandomAccessVectorValues 
 
     @Override
     public int size() {
-        throw new UnsupportedOperationException(
-                "VectorStorageRandomAccessVectorValues.size() is not supported");
+        if (size < 0) {
+            throw new UnsupportedOperationException(
+                    "VectorStorageRandomAccessVectorValues.size() is not supported without an explicit size");
+        }
+        return size;
     }
 }

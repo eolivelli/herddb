@@ -597,11 +597,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                 segments.add(seg);
                 nextSegmentId.set(1);
                 // Compute nextNodeId from max ordinal in the segment
-                int maxOrd = -1;
-                try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
-                    maxOrd = stream.mapToInt(e -> bytesToOrdinal(e.getKey())).max().orElse(-1);
-                }
-                this.nextNodeId.set(maxOrd + 1);
+                this.nextNodeId.set(seg.maxOrdinal + 1);
                 initEmptyLiveShards(dim, savedBeamWidth, savedNeighborOverflow, savedAlpha);
             }
             return ok;
@@ -661,11 +657,8 @@ public class VectorIndexManager extends AbstractIndexManager {
         // Compute nextNodeId from max ordinal across all segments
         int maxOrd = -1;
         for (VectorSegment seg : segments) {
-            try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
-                int segMax = stream.mapToInt(e -> bytesToOrdinal(e.getKey())).max().orElse(-1);
-                if (segMax > maxOrd) {
-                    maxOrd = segMax;
-                }
+            if (seg.maxOrdinal > maxOrd) {
+                maxOrd = seg.maxOrdinal;
             }
         }
         this.nextNodeId.set(maxOrd + 1);
@@ -745,6 +738,7 @@ public class VectorIndexManager extends AbstractIndexManager {
             seg.pkLengths = new int[0];
         }
         seg.liveCount = entryCount;
+        seg.maxOrdinal = maxOrdinal;
 
         Files.deleteIfExists(mapFile);
 
@@ -1076,11 +1070,8 @@ public class VectorIndexManager extends AbstractIndexManager {
                         // Recompute nextNodeId from all segments
                         int maxOrd = -1;
                         for (VectorSegment seg : segments) {
-                            try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
-                                int segMax = stream.mapToInt(e -> bytesToOrdinal(e.getKey())).max().orElse(-1);
-                                if (segMax > maxOrd) {
-                                    maxOrd = segMax;
-                                }
+                            if (seg.maxOrdinal > maxOrd) {
+                                maxOrd = seg.maxOrdinal;
                             }
                         }
                         this.nextNodeId.set(maxOrd + 1);
@@ -1609,7 +1600,35 @@ public class VectorIndexManager extends AbstractIndexManager {
         }
 
         // =====================================================================
-        // Phase C: load segments, swap, cleanup (brief write lock)
+        // Phase C-prep: pre-load new segments from storage (NO lock, I/O heavy)
+        // =====================================================================
+        List<VectorSegment> preloadedSegments = new ArrayList<>();
+        try {
+            if (newSegmentResults != null) {
+                for (SegmentWriteResult swr : newSegmentResults) {
+                    Path reloadMapFile = readChunksToTempFile(
+                            swr.mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
+                    Path reloadGraphFile = readChunksToTempFile(
+                            swr.graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
+                    VectorSegment seg = new VectorSegment(swr.segmentId);
+                    seg.estimatedSizeBytes = swr.estimatedSizeBytes;
+                    seg.graphPageIds = swr.graphPageIds;
+                    seg.mapPageIds = swr.mapPageIds;
+                    loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, snapshotDimension, nextNodeId.get());
+                    preloadedSegments.add(seg);
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            // Close any pre-loaded segments on failure
+            for (VectorSegment seg : preloadedSegments) {
+                seg.close();
+            }
+            recoverFromPhaseBFailure(snapshotShards);
+            throw e;
+        }
+
+        // =====================================================================
+        // Phase C: swap + cleanup (brief write lock)
         // =====================================================================
         stateLock.writeLock().lock();
         try {
@@ -1625,29 +1644,18 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
 
             if (newSegmentResults != null) {
-                // Close mergeable segments (frees off-heap mmap + BLink) BEFORE loading new ones
+                // Close mergeable segments (frees off-heap mmap + BLink)
                 for (VectorSegment seg : mergeableSegments) {
                     seg.close();
                 }
 
-                // Load new segments from storage
+                // Assemble new segment list from sealed + pre-loaded segments
                 List<VectorSegment> newSegments = new java.util.concurrent.CopyOnWriteArrayList<>();
                 for (VectorSegment sealed : sealedSegments) {
                     sealed.dirty = false;
                     newSegments.add(sealed);
                 }
-                for (SegmentWriteResult swr : newSegmentResults) {
-                    Path reloadMapFile = readChunksToTempFile(
-                            swr.mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
-                    Path reloadGraphFile = readChunksToTempFile(
-                            swr.graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
-                    VectorSegment seg = new VectorSegment(swr.segmentId);
-                    seg.estimatedSizeBytes = swr.estimatedSizeBytes;
-                    seg.graphPageIds = swr.graphPageIds;
-                    seg.mapPageIds = swr.mapPageIds;
-                    loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, snapshotDimension, nextNodeId.get());
-                    newSegments.add(seg);
-                }
+                newSegments.addAll(preloadedSegments);
 
                 // Apply pending deletes to newly loaded segments
                 Set<Bytes> pending = this.pendingCheckpointDeletes;
@@ -1664,14 +1672,11 @@ public class VectorIndexManager extends AbstractIndexManager {
                 // Atomic swap
                 this.segments = newSegments;
 
-                // Recompute nextNodeId: max of segment ordinals vs current nextNodeId
+                // Recompute nextNodeId from pre-computed maxOrdinal fields
                 int maxOrd = -1;
                 for (VectorSegment seg : newSegments) {
-                    try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
-                        int segMax = stream.mapToInt(e2 -> bytesToOrdinal(e2.getKey())).max().orElse(-1);
-                        if (segMax > maxOrd) {
-                            maxOrd = segMax;
-                        }
+                    if (seg.maxOrdinal > maxOrd) {
+                        maxOrd = seg.maxOrdinal;
                     }
                 }
                 this.nextNodeId.set(Math.max(maxOrd + 1, nextNodeId.get()));
@@ -2171,7 +2176,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         VectorStorage allStorage = new VectorStorage(allVectors.size());
         allVectors.forEach(allStorage::set);
         VectorStorageRandomAccessVectorValues allMravv =
-                new VectorStorageRandomAccessVectorValues(allStorage, dim);
+                new VectorStorageRandomAccessVectorValues(allStorage, dim, allVectors.size());
         BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(allMravv, similarityFunction);
         GraphIndexBuilder mergedBuilder = new GraphIndexBuilder(
                 bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH,
