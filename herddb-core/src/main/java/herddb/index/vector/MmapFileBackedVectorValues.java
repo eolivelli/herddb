@@ -191,7 +191,7 @@ class MmapFileBackedVectorValues extends FileBackedVectorValues {
 
     @Override
     public boolean isValueShared() {
-        return sharedBuffer != null;
+        return true;
     }
 
     @Override
@@ -202,6 +202,9 @@ class MmapFileBackedVectorValues extends FileBackedVectorValues {
 
     @Override
     public void close() throws IOException {
+        if (sharedBuffer != null) {
+            return; // copy — shared resources owned by the original
+        }
         // Force unmap is not strictly possible via public API, but the GC will handle it.
         // We close the channel and delete the file.
         try {

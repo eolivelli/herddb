@@ -140,6 +140,12 @@ public class VectorIndexManager extends AbstractIndexManager {
     /** Number of threads used for parallel index rebuild. */
     private static final int REBUILD_THREADS = Integer.getInteger("herddb.vectorindex.rebuild.threads", 8);
 
+    /** Maximum memory (in bytes) for live vectors during checkpoint back-pressure.
+     *  Converted to a vector count using the dimension of the vectors.
+     *  The actual cap is {@code max(byteBudget / bytesPerVector, snapshotSize / 2)}. */
+    private static final long MAX_LIVE_BYTES_DURING_CHECKPOINT =
+            Long.getLong("herddb.vectorindex.maxLiveBytesDuringCheckpoint", 4L * 1024 * 1024 * 1024);
+
     private static final ThreadFactory DAEMON_THREAD_FACTORY = r -> {
         Thread t = new Thread(r, "vector-index-rebuild");
         t.setDaemon(true);
@@ -1562,17 +1568,23 @@ public class VectorIndexManager extends AbstractIndexManager {
             for (LiveGraphShard shard : snapshotShards) {
                 totalSnapshotSize += shard.nodeToPk.size();
             }
-            this.liveVectorCapDuringCheckpoint = Math.max(10000, totalSnapshotSize / 2);
+            // Each vector occupies dimension floats (4 bytes each) plus object/reference overhead (~64 bytes)
+            long bytesPerVector = (long) snapshotDimension * Float.BYTES + 64;
+            int vectorCapFromBytes = (int) Math.min(Integer.MAX_VALUE,
+                    MAX_LIVE_BYTES_DURING_CHECKPOINT / bytesPerVector);
+            this.liveVectorCapDuringCheckpoint = Math.max(vectorCapFromBytes, totalSnapshotSize / 2);
 
             // Swap to new empty live state — DML proceeds immediately after write lock release
             initEmptyLiveShards(snapshotDimension, beamWidth, neighborOverflow, alpha);
             dirty.set(false);
 
             LOGGER.log(Level.INFO,
-                    "checkpoint vector index {0} Phase A: snapshotted {1} live shards ({2} vectors) + {3} on-disk vectors, "
-                            + "{4} sealed + {5} mergeable segments",
-                    new Object[]{index.name, snapshotShards.size(), totalSnapshotSize, onDiskNodeToPkSize(),
-                            sealedSegments.size(), mergeableSegments.size()});
+                    "checkpoint vector index {0} Phase A: snapshotted {1} live shards ({2} vectors, dim={3}) + {4} on-disk vectors, "
+                            + "{5} sealed + {6} mergeable segments, liveVectorCapDuringCheckpoint={7} "
+                            + "(byteBudget={8}, bytesPerVector={9})",
+                    new Object[]{index.name, snapshotShards.size(), totalSnapshotSize, snapshotDimension,
+                            onDiskNodeToPkSize(), sealedSegments.size(), mergeableSegments.size(),
+                            liveVectorCapDuringCheckpoint, MAX_LIVE_BYTES_DURING_CHECKPOINT, bytesPerVector});
         } finally {
             stateLock.writeLock().unlock();
         }
@@ -2633,12 +2645,10 @@ public class VectorIndexManager extends AbstractIndexManager {
         // wait for Phase C to complete before proceeding.
         CountDownLatch latch = checkpointPhaseComplete;
         if (latch != null && totalLiveSize() >= liveVectorCapDuringCheckpoint) {
-            try {
-                latch.await();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new DataStorageManagerException("interrupted waiting for checkpoint", e);
-            }
+            LOGGER.log(Level.FINE,
+                    "vector index {0} back-pressure: live size {1} reached cap {2}, waiting for checkpoint to complete",
+                    new Object[]{index.name, totalLiveSize(), liveVectorCapDuringCheckpoint});
+            waitForVectorIndexCheckPointToComplete(latch);
         }
 
         stateLock.readLock().lock();
@@ -2671,6 +2681,15 @@ public class VectorIndexManager extends AbstractIndexManager {
             dirty.set(true);
         } finally {
             stateLock.readLock().unlock();
+        }
+    }
+
+    private static void waitForVectorIndexCheckPointToComplete(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new DataStorageManagerException("interrupted waiting for checkpoint", e);
         }
     }
 
@@ -2770,10 +2789,10 @@ public class VectorIndexManager extends AbstractIndexManager {
                     new Object[]{dimension, floats.length});
             return;
         }
-        VectorFloat<?> vec = VTS.createFloatVector(floats);
         int nodeId = nextNodeId.getAndIncrement();
-        rebuildVectors.putVector(nodeId, vec);
+        rebuildVectors.putVector(nodeId, floats);
         rebuildNodeToPk.insert(ordinalToBytes(nodeId), key);
+        VectorFloat<?> vec = VTS.createFloatVector(floats);
         activeBuilder().addGraphNode(nodeId, vec);
         if (batchNodeCount != null) {
             batchNodeCount.incrementAndGet();

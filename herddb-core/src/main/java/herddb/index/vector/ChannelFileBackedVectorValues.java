@@ -271,7 +271,7 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
 
     @Override
     public boolean isValueShared() {
-        return sharedBuffer != null;
+        return true;
     }
 
     @Override
@@ -282,6 +282,9 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
 
     @Override
     public void close() throws IOException {
+        if (sharedBuffer != null) {
+            return; // copy — shared resources owned by the original
+        }
         try {
             // Close all per-thread read channels
             FileChannel ch;

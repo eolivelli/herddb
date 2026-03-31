@@ -22,6 +22,7 @@ package herddb.index.vector;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
@@ -203,12 +204,53 @@ public class FileBackedVectorValuesTest {
     }
 
     @Test
-    public void testIsNotValueShared() throws Exception {
+    public void testIsValueShared() throws Exception {
         int dimension = 2;
         Path tempDir = tempFolder.getRoot().toPath();
 
         try (FileBackedVectorValues fbv = createFBV(dimension, 5, tempDir)) {
-            assertFalse(fbv.isValueShared());
+            assertTrue(fbv.isValueShared());
+        }
+    }
+
+    @Test
+    public void testCloseOnCopyDoesNotAffectOriginal() throws Exception {
+        int dimension = 3;
+        Path tempDir = tempFolder.getRoot().toPath();
+
+        try (FileBackedVectorValues fbv = createFBV(dimension, 5, tempDir)) {
+            fbv.putVector(0, new float[]{1, 2, 3});
+            fbv.putVector(1, new float[]{4, 5, 6});
+
+            // Create a copy and close it
+            RandomAccessVectorValues copy = fbv.copy();
+            ((java.io.Closeable) copy).close();
+
+            // Original should still work
+            assertArrayEquals(new float[]{1, 2, 3}, toFloatArray(fbv.getVector(0)), 0.0001f);
+            assertArrayEquals(new float[]{4, 5, 6}, toFloatArray(fbv.getVector(1)), 0.0001f);
+        }
+    }
+
+    @Test
+    public void testCopyUsesSharedBuffer() throws Exception {
+        int dimension = 3;
+        Path tempDir = tempFolder.getRoot().toPath();
+
+        try (FileBackedVectorValues fbv = createFBV(dimension, 5, tempDir)) {
+            fbv.putVector(0, new float[]{1, 2, 3});
+            fbv.putVector(1, new float[]{4, 5, 6});
+
+            RandomAccessVectorValues copy = fbv.copy();
+            assertTrue(copy.isValueShared());
+
+            // Two calls to getVector on the copy should return the same VectorFloat reference
+            VectorFloat<?> v1 = copy.getVector(0);
+            VectorFloat<?> v2 = copy.getVector(1);
+            assertSame(v1, v2); // same shared object, overwritten each time
+
+            // The value should reflect the last call
+            assertArrayEquals(new float[]{4, 5, 6}, toFloatArray(v2), 0.0001f);
         }
     }
 
