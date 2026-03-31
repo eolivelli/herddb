@@ -86,7 +86,9 @@ import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -145,6 +147,18 @@ public class VectorIndexManager extends AbstractIndexManager {
         return t;
     };
 
+    /** Dedicated ForkJoinPool for checkpoint graph building, sized to half the available CPUs
+     *  to avoid starving the common pool and other server work. */
+    private static final ForkJoinPool CHECKPOINT_POOL = new ForkJoinPool(
+            Math.max(1, Runtime.getRuntime().availableProcessors() / 2),
+            pool -> {
+                ForkJoinWorkerThread t = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
+                t.setDaemon(true);
+                t.setName("vector-index-checkpoint-" + t.getPoolIndex());
+                return t;
+            },
+            null, false);
+
     /* property keys for CREATE INDEX ... WITH */
     public static final String PROP_M = "m";
     public static final String PROP_BEAM_WIDTH = "beamWidth";
@@ -166,6 +180,7 @@ public class VectorIndexManager extends AbstractIndexManager {
     private final int maxLiveGraphSize;
 
     private final MemoryManager memoryManager;
+    private final double memoryMultiplier;
 
     /** Maximum bytes per persisted page chunk (1 MB). */
     static final int CHUNK_SIZE = 1_048_576;
@@ -249,10 +264,12 @@ public class VectorIndexManager extends AbstractIndexManager {
                                int writeLockTimeout,
                                int readLockTimeout,
                                long serverMaxSegmentSize,
+                               double memoryMultiplier,
                                StatsLogger statsLogger) {
         super(index, tableManager, dataStorageManager, tableSpaceUUID, log,
                 transaction, writeLockTimeout, readLockTimeout);
         this.memoryManager = memoryManager;
+        this.memoryMultiplier = memoryMultiplier;
         Map<String, String> props = index.properties;
         this.m = intProp(props, PROP_M, DEFAULT_M);
         this.beamWidth = intProp(props, PROP_BEAM_WIDTH, DEFAULT_BEAM_WIDTH);
@@ -1888,6 +1905,13 @@ public class VectorIndexManager extends AbstractIndexManager {
 
         List<SegmentWriteResult> newSegmentResults = new ArrayList<>();
         int start = 0;
+        int segmentIndex = 0;
+        int totalSegments = (int) Math.ceil((double) poolVectorsList.size() / maxNodesPerSegment);
+        long phaseBStartMs = System.currentTimeMillis();
+        LOGGER.log(Level.INFO,
+                "checkpoint vector index {0} Phase B: writing {1} vectors across ~{2} segments",
+                new Object[]{index.name, poolVectorsList.size(), totalSegments});
+
         while (start < poolVectorsList.size()) {
             int end = Math.min(start + maxNodesPerSegment, poolVectorsList.size());
 
@@ -1904,7 +1928,10 @@ public class VectorIndexManager extends AbstractIndexManager {
                 partNodeToPk.put(seqId, poolPkList.get(i));
             }
 
+            long segStartMs = System.currentTimeMillis();
             int segId = nextSegmentId.getAndIncrement();
+            int segSize = partNodeToPk.size();
+            segmentIndex++;
             List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, snapshotDimension);
             List<Long> mapPageIds = writeFusedPQMapData(
                     new MapRandomAccessVectorValues(partVectors, snapshotDimension), partNodeToPk);
@@ -1912,8 +1939,18 @@ public class VectorIndexManager extends AbstractIndexManager {
             newSegmentResults.add(new SegmentWriteResult(segId, graphPageIds, mapPageIds, estimatedSize,
                     Collections.emptyList()));
 
+            long segElapsedMs = System.currentTimeMillis() - segStartMs;
+            LOGGER.log(Level.INFO,
+                    "checkpoint vector index {0} Phase B: segment {1}/{2} ({3} nodes) written in {4} ms",
+                    new Object[]{index.name, segmentIndex, totalSegments, segSize, segElapsedMs});
+
             start = end;
         }
+
+        long phaseBElapsedMs = System.currentTimeMillis() - phaseBStartMs;
+        LOGGER.log(Level.INFO,
+                "checkpoint vector index {0} Phase B: completed in {1} ms ({2} segments, {3} total vectors)",
+                new Object[]{index.name, phaseBElapsedMs, newSegmentResults.size(), poolVectorsList.size()});
 
         resultActions.addAll(persistIndexStatusMultiSegment(sealedSegments, newSegmentResults, sequenceNumber, pin));
 
@@ -2088,23 +2125,69 @@ public class VectorIndexManager extends AbstractIndexManager {
             return writeChunks(new byte[0], TYPE_VECTOR_GRAPHCHUNK);
         }
 
-        // Build a fresh OnHeapGraphIndex from all vectors
+        int totalVectors = allNodeToPk.size();
+
+        // Build a fresh OnHeapGraphIndex from all vectors using the dedicated checkpoint pool
+        long graphStartMs = System.currentTimeMillis();
+        LOGGER.log(Level.INFO,
+                "writeFusedPQGraph {0}: building graph for {1} vectors (dim={2}) using {3} threads",
+                new Object[]{index.name, totalVectors, dim, CHECKPOINT_POOL.getParallelism()});
+
         MapRandomAccessVectorValues allMravv = new MapRandomAccessVectorValues(allVectors, dim);
         BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(allMravv, similarityFunction);
         GraphIndexBuilder mergedBuilder = new GraphIndexBuilder(
-                bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
-        allVectors.entrySet().parallelStream()
-                .filter(e -> allNodeToPk.containsKey(e.getKey()))
-                .forEach(e -> mergedBuilder.addGraphNode(e.getKey(), e.getValue()));
+                bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH,
+                PhysicalCoreExecutor.pool(), CHECKPOINT_POOL);
+
+        int progressInterval = Math.max(1000, totalVectors / 10);
+        AtomicInteger nodesAdded = new AtomicInteger(0);
+        try {
+            CHECKPOINT_POOL.submit(() ->
+                allVectors.entrySet().parallelStream()
+                    .filter(e -> allNodeToPk.containsKey(e.getKey()))
+                    .forEach(e -> {
+                        mergedBuilder.addGraphNode(e.getKey(), e.getValue());
+                        int count = nodesAdded.incrementAndGet();
+                        if (count % progressInterval == 0) {
+                            LOGGER.log(Level.INFO,
+                                    "writeFusedPQGraph {0}: added {1}/{2} nodes ({3}%)",
+                                    new Object[]{index.name, count, totalVectors,
+                                            (int) (100.0 * count / totalVectors)});
+                        }
+                    })
+            ).get();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException) {
+                throw (IOException) cause;
+            }
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            throw new IOException("writeFusedPQGraph failed", cause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("writeFusedPQGraph interrupted", e);
+        }
         mergedBuilder.cleanup();
         OnHeapGraphIndex mergedGraph = (OnHeapGraphIndex) mergedBuilder.getGraph();
+        long graphElapsedMs = System.currentTimeMillis() - graphStartMs;
+        LOGGER.log(Level.INFO,
+                "writeFusedPQGraph {0}: graph built in {1} ms ({2} nodes)",
+                new Object[]{index.name, graphElapsedMs, totalVectors});
 
         // Compute PQ: subspaces = dim/4, exactly 256 clusters (FusedPQ requirement)
+        long pqStartMs = System.currentTimeMillis();
         int pqSubspaces = Math.max(1, dim / 4);
         ProductQuantization pq = ProductQuantization.compute(allMravv, pqSubspaces, 256, true);
         PQVectors pqv = pq.encodeAll(allMravv, PhysicalCoreExecutor.pool());
+        long pqElapsedMs = System.currentTimeMillis() - pqStartMs;
+        LOGGER.log(Level.INFO,
+                "writeFusedPQGraph {0}: PQ computed in {1} ms",
+                new Object[]{index.name, pqElapsedMs});
 
         // Write to temp file
+        long writeStartMs = System.currentTimeMillis();
         Path tempFile = Files.createTempFile("herddb-vector-", ".idx");
         try {
             try (OnDiskGraphIndexWriter writer = new OnDiskGraphIndexWriter.Builder(mergedGraph, tempFile)
@@ -2120,7 +2203,12 @@ public class VectorIndexManager extends AbstractIndexManager {
                         ordinal -> new InlineVectors.State(allMravv.getVector(ordinal)));
                 writer.write(suppliers);
             }
-            return writeChunks(tempFile, TYPE_VECTOR_GRAPHCHUNK);
+            List<Long> pages = writeChunks(tempFile, TYPE_VECTOR_GRAPHCHUNK);
+            long writeElapsedMs = System.currentTimeMillis() - writeStartMs;
+            LOGGER.log(Level.INFO,
+                    "writeFusedPQGraph {0}: disk write completed in {1} ms ({2} pages)",
+                    new Object[]{index.name, writeElapsedMs, pages.size()});
+            return pages;
         } finally {
             Files.deleteIfExists(tempFile);
             try {
@@ -3166,6 +3254,21 @@ public class VectorIndexManager extends AbstractIndexManager {
             total += seg.estimatedSizeBytes;
         }
         return total;
+    }
+
+    @Override
+    public long estimateLiveMemoryBytes() {
+        long rawFloatBytes = 0;
+        for (LiveGraphShard shard : liveShards) {
+            rawFloatBytes += (long) shard.vectors.size() * dimension * Float.BYTES;
+        }
+        List<LiveGraphShard> frozen = frozenShards;
+        if (frozen != null) {
+            for (LiveGraphShard shard : frozen) {
+                rawFloatBytes += (long) shard.vectors.size() * dimension * Float.BYTES;
+            }
+        }
+        return (long) (rawFloatBytes * memoryMultiplier);
     }
 
     public int getM() {

@@ -176,6 +176,24 @@ public final class ServerConfiguration {
     public static final String PROPERTY_CHECKPOINT_PERIOD = "server.checkpoint.period";
     public static final long PROPERTY_CHECKPOINT_PERIOD_DEFAULT = 1000L * 60 * 15;
 
+    /**
+     * Maximum estimated memory usage (bytes) per tablespace before an automatic
+     * checkpoint is triggered. When a tablespace's total memory (data buffers +
+     * keys + dirty pages + vector index live graphs) exceeds this limit, a
+     * checkpoint is initiated for that tablespace. Set to 0 to disable
+     * memory-based checkpoint triggering (default).
+     */
+    public static final String PROPERTY_CHECKPOINT_MEMORY_LIMIT = "server.checkpoint.memory.limit";
+    public static final long PROPERTY_CHECKPOINT_MEMORY_LIMIT_DEFAULT = 0L;
+
+    /**
+     * Multiplier applied to raw vector float data size to estimate total
+     * in-memory footprint of live HNSW graph structures (neighbor maps,
+     * completion trackers, ConcurrentHashMap overhead, etc.). Default 5.0.
+     */
+    public static final String PROPERTY_VECTOR_MEMORY_MULTIPLIER = "server.checkpoint.memory.vector.multiplier";
+    public static final double PROPERTY_VECTOR_MEMORY_MULTIPLIER_DEFAULT = 5.0;
+
     public static final String PROPERTY_DEFAULT_REPLICA_COUNT = "tablespace.default.replica.count";
     public static final int PROPERTY_DEFAULT_REPLICA_COUNT_DEFAULT = 1;
 

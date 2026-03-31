@@ -244,6 +244,16 @@ public abstract class AbstractIndexManager implements AutoCloseable {
     }
 
     /**
+     * Estimates the live (in-memory, not yet checkpointed) memory usage of this index in bytes.
+     * Subclasses that maintain significant in-memory state should override this.
+     *
+     * @return estimated live memory bytes, 0 by default
+     */
+    public long estimateLiveMemoryBytes() {
+        return 0L;
+    }
+
+    /**
      * Erase the index. Out-side the scope of a transaction
      */
     public abstract void truncate() throws DataStorageManagerException;

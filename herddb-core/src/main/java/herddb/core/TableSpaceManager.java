@@ -939,6 +939,9 @@ public class TableSpaceManager {
             result += stats.getKeysUsedMemory();
             result += stats.getDirtyUsedMemory();
         }
+        for (AbstractIndexManager indexManager : indexes.values()) {
+            result += indexManager.estimateLiveMemoryBytes();
+        }
         return result;
     }
 
@@ -1981,7 +1984,7 @@ public class TableSpaceManager {
                         .scope("table_" + index.table)
                         .scope("vidx_" + index.name);
                 indexManager = new VectorIndexManager(index, dbmanager.getMemoryManager(), tableManager, log, dataStorageManager, this, tableSpaceUUID, transaction,
-                        writeLockTimeout, readLockTimeout, vectorMaxSegmentSize, vectorMetrics);
+                        writeLockTimeout, readLockTimeout, vectorMaxSegmentSize, dbmanager.getVectorMemoryMultiplier(), vectorMetrics);
                 break;
             default:
                 throw new DataStorageManagerException("invalid NON-UNIQUE index type " + index.type);

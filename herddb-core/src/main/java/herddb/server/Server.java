@@ -237,6 +237,8 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         this.manager.setServerToServerUsername(configuration.getString(ServerConfiguration.PROPERTY_SERVER_TO_SERVER_USERNAME, ClientConfiguration.PROPERTY_CLIENT_USERNAME_DEFAULT));
         this.manager.setServerToServerPassword(configuration.getString(ServerConfiguration.PROPERTY_SERVER_TO_SERVER_PASSWORD, ClientConfiguration.PROPERTY_CLIENT_PASSWORD_DEFAULT));
         this.manager.setCheckpointPeriod(configuration.getLong(ServerConfiguration.PROPERTY_CHECKPOINT_PERIOD, ServerConfiguration.PROPERTY_CHECKPOINT_PERIOD_DEFAULT));
+        this.manager.setCheckpointMemoryLimit(configuration.getLong(ServerConfiguration.PROPERTY_CHECKPOINT_MEMORY_LIMIT, ServerConfiguration.PROPERTY_CHECKPOINT_MEMORY_LIMIT_DEFAULT));
+        this.manager.setVectorMemoryMultiplier(configuration.getDouble(ServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER, ServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER_DEFAULT));
         this.manager.setAbandonedTransactionsTimeout(configuration.getLong(ServerConfiguration.PROPERTY_ABANDONED_TRANSACTIONS_TIMEOUT, ServerConfiguration.PROPERTY_ABANDONED_TRANSACTIONS_TIMEOUT_DEFAULT));
 
         boolean enforeLeadership = configuration.getBoolean(ServerConfiguration.PROPERTY_ENFORCE_LEADERSHIP, ServerConfiguration.PROPERTY_ENFORCE_LEADERSHIP_DEFAULT);

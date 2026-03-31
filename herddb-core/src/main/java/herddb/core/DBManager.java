@@ -150,6 +150,8 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
     private final String mode;
     private ConnectionsInfoProvider connectionsInfoProvider;
     private long checkpointPeriod;
+    private long checkpointMemoryLimit;
+    private double vectorMemoryMultiplier = ServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER_DEFAULT;
     private long abandonedTransactionsTimeout;
     private final StatsLogger mainStatsLogger;
 
@@ -1304,6 +1306,27 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
                     }
                 }
             }
+            if (!checkpointDone && checkpointMemoryLimit > 0) {
+                long now = System.currentTimeMillis();
+                long cooldown = 10_000;
+                if (now - lastCheckPointTs.get() > cooldown) {
+                    for (TableSpaceManager man : tablesSpaces.values()) {
+                        long memUsage = man.handleLocalMemoryUsage();
+                        if (memUsage > checkpointMemoryLimit) {
+                            LOGGER.log(Level.INFO,
+                                    "Memory-triggered checkpoint for tablespace {0}: {1} bytes exceeds limit {2}",
+                                    new Object[]{man.getTableSpaceName(), memUsage, checkpointMemoryLimit});
+                            lastCheckPointTs.set(now);
+                            try {
+                                man.checkpoint(false, false, false);
+                                checkpointDone = true;
+                            } catch (DataStorageManagerException | LogNotAvailableException error) {
+                                LOGGER.log(Level.SEVERE, "memory-triggered checkpoint failed:" + error, error);
+                            }
+                        }
+                    }
+                }
+            }
             if (!checkpointDone && type.enableTableCheckPoints()) {
                 for (TableSpaceManager man : tablesSpaces.values()) {
                     man.runLocalTableCheckPoints();
@@ -1496,6 +1519,22 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
 
     public void setCheckpointPeriod(long checkpointPeriod) {
         this.checkpointPeriod = checkpointPeriod;
+    }
+
+    public long getCheckpointMemoryLimit() {
+        return checkpointMemoryLimit;
+    }
+
+    public void setCheckpointMemoryLimit(long checkpointMemoryLimit) {
+        this.checkpointMemoryLimit = checkpointMemoryLimit;
+    }
+
+    public double getVectorMemoryMultiplier() {
+        return vectorMemoryMultiplier;
+    }
+
+    public void setVectorMemoryMultiplier(double vectorMemoryMultiplier) {
+        this.vectorMemoryMultiplier = vectorMemoryMultiplier;
     }
 
     public long getAbandonedTransactionsTimeout() {
