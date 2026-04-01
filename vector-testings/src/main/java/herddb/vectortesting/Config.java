@@ -82,7 +82,7 @@ public class Config {
         opts.addOption(null, "client-timeout", true, "Client request timeout in seconds (default: 7200)");
         opts.addOption(null, "index-before-ingest", false, "Create vector index before ingestion instead of after");
         opts.addOption(null, "resume-from", true, "Skip first N vectors and start row IDs from N (default: 0)");
-        opts.addOption(null, "ingest-max-ops", true, "Max ingestion ops/s across all threads, 0=unlimited (default: 10000)");
+        opts.addOption(null, "ingest-max-ops", true, "Max ingestion ops/s across all threads, 0=unlimited (default: 100000)");
         opts.addOption(null, "config", true, "Path to properties file");
         opts.addOption("h", "help", false, "Show help");
         return opts;

@@ -278,6 +278,20 @@ public class CommitLogTailer implements Runnable, AutoCloseable {
         return watermark;
     }
 
+    /**
+     * Returns the total number of entries processed since this tailer was created.
+     */
+    public long getEntriesProcessed() {
+        return entriesProcessed;
+    }
+
+    /**
+     * Returns whether the tailer is currently running.
+     */
+    public boolean isRunning() {
+        return running;
+    }
+
     @Override
     public void close() {
         running = false;

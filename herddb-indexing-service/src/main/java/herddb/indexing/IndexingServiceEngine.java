@@ -21,12 +21,16 @@
 package herddb.indexing;
 
 import herddb.codec.DataAccessorForFullRecord;
+import herddb.core.MemoryManager;
+import herddb.index.vector.AbstractVectorStore;
+import herddb.index.vector.PersistentVectorStore;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
 import herddb.log.LogSequenceNumber;
 import herddb.model.Index;
 import herddb.model.Record;
 import herddb.model.Table;
+import herddb.storage.DataStorageManager;
 import herddb.utils.Bytes;
 
 import java.io.IOException;
@@ -35,8 +39,10 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.bookkeeper.stats.Gauge;
@@ -58,7 +64,7 @@ public class IndexingServiceEngine implements AutoCloseable {
 
     private final Path logDirectory;
     private final Path dataDirectory;
-    private final Properties config;
+    private final IndexingServerConfiguration config;
 
     private WatermarkStore watermarkStore;
     private SchemaTracker schemaTracker;
@@ -71,24 +77,127 @@ public class IndexingServiceEngine implements AutoCloseable {
 
     private volatile StatsLogger statsLogger;
 
+    private MemoryManager memoryManager;
+    private DataStorageManager dataStorageManager;
+    private ScheduledExecutorService checkpointScheduler;
+
     /**
      * In-memory vector stores keyed by "table.index".
      * Each store holds all vectors for one vector index.
      */
-    private final ConcurrentHashMap<String, InMemoryVectorStore> vectorStores = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AbstractVectorStore> vectorStores = new ConcurrentHashMap<>();
+
+    private VectorStoreFactory vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir) ->
+            new InMemoryVectorStore(vectorColumnName);
 
     private static String storeKey(String table, String index) {
         return table + "." + index;
     }
 
-    public IndexingServiceEngine(Path logDirectory, Path dataDirectory, Properties config) {
+    public IndexingServiceEngine(Path logDirectory, Path dataDirectory, IndexingServerConfiguration config) {
         this.logDirectory = logDirectory;
         this.dataDirectory = dataDirectory;
         this.config = config;
     }
 
+    public Path getDataDirectory() {
+        return dataDirectory;
+    }
+
+    public void setVectorStoreFactory(VectorStoreFactory factory) {
+        this.vectorStoreFactory = factory;
+    }
+
+    public void setMemoryManager(MemoryManager memoryManager) {
+        this.memoryManager = memoryManager;
+        LOGGER.log(Level.INFO, "MemoryManager set: maxDataUsedMemory={0} MB, maxLogicalPageSize={1}",
+                new Object[]{memoryManager.getMaxDataUsedMemory() / (1024 * 1024),
+                             memoryManager.getMaxLogicalPageSize()});
+    }
+
+    public MemoryManager getMemoryManager() {
+        return memoryManager;
+    }
+
+    public void setDataStorageManager(DataStorageManager dataStorageManager) {
+        this.dataStorageManager = dataStorageManager;
+        LOGGER.log(Level.INFO, "DataStorageManager set: {0}", dataStorageManager.getClass().getName());
+    }
+
+    public DataStorageManager getDataStorageManager() {
+        return dataStorageManager;
+    }
+
     public void start() throws Exception {
         LOGGER.info("IndexingServiceEngine starting, logDir=" + logDirectory + ", dataDir=" + dataDirectory);
+
+        // Start the data storage manager if configured
+        if (dataStorageManager != null) {
+            dataStorageManager.start();
+            LOGGER.info("DataStorageManager started");
+        }
+
+        // Configure VectorStoreFactory based on storage type
+        String storageType = config.getString(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE,
+                IndexingServerConfiguration.PROPERTY_STORAGE_TYPE_DEFAULT);
+        if ("file".equals(storageType) && dataStorageManager != null && memoryManager != null) {
+            LOGGER.info("Configuring PersistentVectorStore factory (storage type: file)");
+            final DataStorageManager dsm = dataStorageManager;
+            final MemoryManager mm = memoryManager;
+            final Path tmpDir = dataDirectory;
+            final int m = config.getInt(IndexingServerConfiguration.PROPERTY_VECTOR_M,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_M_DEFAULT);
+            final int beamWidth = config.getInt(IndexingServerConfiguration.PROPERTY_VECTOR_BEAM_WIDTH,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_BEAM_WIDTH_DEFAULT);
+            final float neighborOverflow = (float) config.getDouble(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_NEIGHBOR_OVERFLOW,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_NEIGHBOR_OVERFLOW_DEFAULT);
+            final float alpha = (float) config.getDouble(IndexingServerConfiguration.PROPERTY_VECTOR_ALPHA,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_ALPHA_DEFAULT);
+            final boolean fusedPQ = config.getBoolean(IndexingServerConfiguration.PROPERTY_VECTOR_FUSED_PQ,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_FUSED_PQ_DEFAULT);
+            final long maxSegmentSize = config.getLong(IndexingServerConfiguration.PROPERTY_VECTOR_MAX_SEGMENT_SIZE,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_MAX_SEGMENT_SIZE_DEFAULT);
+            final int maxLiveGraphSize = config.getInt(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_GRAPH_SIZE,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_GRAPH_SIZE_DEFAULT);
+            final long compactionInterval = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_COMPACTION_INTERVAL,
+                    IndexingServerConfiguration.PROPERTY_COMPACTION_INTERVAL_DEFAULT);
+            final double memoryMultiplier = config.getDouble(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER_DEFAULT);
+
+            vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir) -> {
+                PersistentVectorStore store = new PersistentVectorStore(
+                        indexName, tableName, "default", vectorColumnName,
+                        tmpDir, dsm, mm,
+                        m, beamWidth, neighborOverflow, alpha,
+                        fusedPQ, maxSegmentSize, maxLiveGraphSize,
+                        compactionInterval, memoryMultiplier);
+                try {
+                    store.start();
+                } catch (Exception e) {
+                    throw new RuntimeException("Failed to start PersistentVectorStore " + indexName, e);
+                }
+                return store;
+            };
+
+            // Start periodic checkpoint scheduler
+            long checkpointInterval = compactionInterval;
+            if (checkpointInterval > 0) {
+                checkpointScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "indexing-checkpoint-scheduler");
+                    t.setDaemon(true);
+                    return t;
+                });
+                checkpointScheduler.scheduleWithFixedDelay(this::runCheckpointOnAllStores,
+                        checkpointInterval, checkpointInterval, TimeUnit.MILLISECONDS);
+                LOGGER.log(Level.INFO, "Checkpoint scheduler started, interval={0} ms", checkpointInterval);
+            }
+        } else {
+            LOGGER.info("Using InMemoryVectorStore factory (storage type: " + storageType + ")");
+        }
 
         // Initialize components
         watermarkStore = new WatermarkStore(dataDirectory);
@@ -106,6 +215,19 @@ public class IndexingServiceEngine implements AutoCloseable {
         tailerThread.start();
 
         LOGGER.info("IndexingServiceEngine started, watermark=" + watermark);
+    }
+
+    private void runCheckpointOnAllStores() {
+        for (Map.Entry<String, AbstractVectorStore> entry : vectorStores.entrySet()) {
+            AbstractVectorStore store = entry.getValue();
+            if (store instanceof PersistentVectorStore) {
+                try {
+                    ((PersistentVectorStore) store).checkpoint();
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "Checkpoint failed for store " + entry.getKey(), e);
+                }
+            }
+        }
     }
 
     /**
@@ -218,7 +340,7 @@ public class IndexingServiceEngine implements AutoCloseable {
         String key = storeKey(index.table, index.name);
         // The vector column is the first (and only) column of the vector index
         String vectorColumnName = index.columnNames[0];
-        vectorStores.put(key, new InMemoryVectorStore(vectorColumnName));
+        vectorStores.put(key, vectorStoreFactory.create(index.name, index.table, vectorColumnName, dataDirectory));
         LOGGER.log(Level.INFO, "Created vector store for index {0} on column {1}",
                 new Object[]{index.name, vectorColumnName});
     }
@@ -237,11 +359,11 @@ public class IndexingServiceEngine implements AutoCloseable {
         Record record = new Record(entry.key, entry.value);
         DataAccessorForFullRecord accessor = new DataAccessorForFullRecord(table, record);
         for (Index idx : vectorIndexes) {
-            InMemoryVectorStore store = vectorStores.get(storeKey(tableName, idx.name));
+            AbstractVectorStore store = vectorStores.get(storeKey(tableName, idx.name));
             if (store == null) {
                 continue;
             }
-            float[] vector = extractVector(accessor, store.vectorColumnName);
+            float[] vector = extractVector(accessor, store.getVectorColumnName());
             if (vector != null) {
                 store.addVector(entry.key, vector);
             }
@@ -261,13 +383,13 @@ public class IndexingServiceEngine implements AutoCloseable {
         Record record = new Record(entry.key, entry.value);
         DataAccessorForFullRecord accessor = new DataAccessorForFullRecord(table, record);
         for (Index idx : vectorIndexes) {
-            InMemoryVectorStore store = vectorStores.get(storeKey(tableName, idx.name));
+            AbstractVectorStore store = vectorStores.get(storeKey(tableName, idx.name));
             if (store == null) {
                 continue;
             }
             // Remove old entry, add new one
             store.removeVector(entry.key);
-            float[] vector = extractVector(accessor, store.vectorColumnName);
+            float[] vector = extractVector(accessor, store.getVectorColumnName());
             if (vector != null) {
                 store.addVector(entry.key, vector);
             }
@@ -281,7 +403,7 @@ public class IndexingServiceEngine implements AutoCloseable {
             return;
         }
         for (Index idx : vectorIndexes) {
-            InMemoryVectorStore store = vectorStores.get(storeKey(tableName, idx.name));
+            AbstractVectorStore store = vectorStores.get(storeKey(tableName, idx.name));
             if (store != null) {
                 store.removeVector(entry.key);
             }
@@ -310,7 +432,7 @@ public class IndexingServiceEngine implements AutoCloseable {
                                                   float[] vector, int limit) {
         LOGGER.log(Level.INFO, "engine search: tablespace={0}, table={1}, index={2}, limit={3}, vectorDim={4}, lastLSN={5}",
                 new Object[]{tablespace, table, index, limit, vector.length, lastProcessedLsn});
-        InMemoryVectorStore store = vectorStores.get(storeKey(table, index));
+        AbstractVectorStore store = vectorStores.get(storeKey(table, index));
         if (store == null) {
             LOGGER.log(Level.WARNING, "No vector store found for {0}.{1}", new Object[]{table, index});
             return Collections.emptyList();
@@ -319,9 +441,13 @@ public class IndexingServiceEngine implements AutoCloseable {
     }
 
     public IndexStatusInfo getIndexStatus(String tablespace, String table, String index) {
-        InMemoryVectorStore store = vectorStores.get(storeKey(table, index));
+        AbstractVectorStore store = vectorStores.get(storeKey(table, index));
         long vectorCount = store != null ? store.size() : 0;
-        return new IndexStatusInfo(vectorCount, 1,
+        int segmentCount = 1;
+        if (store instanceof PersistentVectorStore) {
+            segmentCount = ((PersistentVectorStore) store).getSegmentCount();
+        }
+        return new IndexStatusInfo(vectorCount, segmentCount,
                 lastProcessedLsn != null ? lastProcessedLsn.ledgerId : -1,
                 lastProcessedLsn != null ? lastProcessedLsn.offset : -1,
                 "tailing");
@@ -329,6 +455,44 @@ public class IndexingServiceEngine implements AutoCloseable {
 
     public void setStatsLogger(StatsLogger statsLogger) {
         this.statsLogger = statsLogger;
+        registerTailerMetrics();
+    }
+
+    private void registerTailerMetrics() {
+        StatsLogger sl = this.statsLogger;
+        if (sl == null) {
+            return;
+        }
+        StatsLogger tailerStats = sl.scope("tailer");
+
+        tailerStats.registerGauge("watermark_ledger_id", new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return -1L; }
+            @Override public Long getSample() {
+                LogSequenceNumber lsn = lastProcessedLsn;
+                return lsn != null ? lsn.ledgerId : -1L;
+            }
+        });
+        tailerStats.registerGauge("watermark_offset", new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return -1L; }
+            @Override public Long getSample() {
+                LogSequenceNumber lsn = lastProcessedLsn;
+                return lsn != null ? lsn.offset : -1L;
+            }
+        });
+        tailerStats.registerGauge("entries_processed", new Gauge<Long>() {
+            @Override public Long getDefaultValue() { return 0L; }
+            @Override public Long getSample() {
+                CommitLogTailer t = tailer;
+                return t != null ? t.getEntriesProcessed() : 0L;
+            }
+        });
+        tailerStats.registerGauge("running", new Gauge<Integer>() {
+            @Override public Integer getDefaultValue() { return 0; }
+            @Override public Integer getSample() {
+                CommitLogTailer t = tailer;
+                return t != null && t.isRunning() ? 1 : 0;
+            }
+        });
     }
 
     /**
@@ -389,6 +553,16 @@ public class IndexingServiceEngine implements AutoCloseable {
     public void close() throws Exception {
         LOGGER.info("IndexingServiceEngine closing");
 
+        // Stop the checkpoint scheduler
+        if (checkpointScheduler != null) {
+            checkpointScheduler.shutdown();
+            try {
+                checkpointScheduler.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
         // Stop the tailer
         if (tailer != null) {
             tailer.close();
@@ -407,8 +581,25 @@ public class IndexingServiceEngine implements AutoCloseable {
             saveWatermark();
         }
 
-        // Clear all in-memory vector stores
+        // Close and clear all vector stores
+        for (AbstractVectorStore store : vectorStores.values()) {
+            try {
+                store.close();
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Error closing vector store", e);
+            }
+        }
         vectorStores.clear();
+
+        // Close the data storage manager if configured
+        if (dataStorageManager != null) {
+            try {
+                dataStorageManager.close();
+                LOGGER.info("DataStorageManager closed");
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Error closing DataStorageManager", e);
+            }
+        }
 
         LOGGER.info("IndexingServiceEngine closed");
     }

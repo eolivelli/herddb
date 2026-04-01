@@ -22,11 +22,13 @@ package herddb.server;
 
 import herddb.daemons.PidFileLocker;
 import herddb.indexing.IndexingServer;
+import herddb.indexing.IndexingServerConfiguration;
 import herddb.indexing.IndexingServiceEngine;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Properties;
@@ -144,12 +146,19 @@ public class IndexingServiceMain {
         System.out.println("Starting IndexingServer on " + bindHost + ":" + port
                 + ", data dir: " + dataDirPath + ", log dir: " + logDirPath);
 
-        IndexingServiceEngine engine = new IndexingServiceEngine(logDirPath, dataDirPath, configuration);
+        // Ensure directories exist
+        Files.createDirectories(dataDirPath);
+        Files.createDirectories(logDirPath);
+
+        IndexingServerConfiguration indexingConfig = new IndexingServerConfiguration(configuration);
+        IndexingServiceEngine engine = new IndexingServiceEngine(logDirPath, dataDirPath, indexingConfig);
         try {
-            engine.start();
-            runningServer = new IndexingServer(bindHost, port, engine, configuration);
+            // Start server first so it wires MemoryManager and DataStorageManager
+            // onto the engine before the engine starts and configures its VectorStoreFactory
+            runningServer = new IndexingServer(bindHost, port, engine, indexingConfig);
             try {
                 runningServer.start();
+                engine.start();
                 shutdownLatch.await();
             } finally {
                 runningServer.stop();

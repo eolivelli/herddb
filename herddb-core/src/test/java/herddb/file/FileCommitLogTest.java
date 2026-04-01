@@ -556,6 +556,62 @@ public class FileCommitLogTest {
         }
     }
 
+    @Test
+    public void testGetLastWrittenSequenceNumberAfterLedgerRollover() throws Exception {
+        TestStatsProvider testStatsProvider = new TestStatsProvider();
+        TestStatsProvider.TestStatsLogger statsLogger = testStatsProvider.getStatsLogger("test");
+
+        // Use a very small file size to force frequent ledger rollovers
+        try (FileCommitLogManager manager = new FileCommitLogManager(
+                folder.newFolder().toPath(),
+                64, // 64 bytes — forces rollover after ~1 entry
+                ServerConfiguration.PROPERTY_MAX_UNSYNCHED_BATCH_DEFAULT,
+                ServerConfiguration.PROPERTY_MAX_UNSYNCHED_BATCH_BYTES_DEFAULT,
+                ServerConfiguration.PROPERTY_MAX_SYNC_TIME_DEFAULT,
+                false,
+                false, /* O_DIRECT */
+                ServerConfiguration.PROPERTY_DEFERRED_SYNC_PERIOD_DEFAULT,
+                statsLogger)) {
+            manager.start();
+
+            try (FileCommitLog log = manager.createCommitLog("tt", "aa", "nodeid")) {
+                log.startWriting(1);
+
+                LogSequenceNumber lastLsn = null;
+                for (int i = 0; i < 100; i++) {
+                    lastLsn = log.log(LogEntryFactory.beginTransaction(0), true).getLogSequenceNumber();
+                }
+
+                // Wait for queue to drain
+                TestUtils.waitForCondition(() -> log.getQueueSize() == 0, NOOP, 100);
+
+                LogSequenceNumber lastWritten = log.getLastWrittenSequenceNumber();
+                LogSequenceNumber lastSeq = log.getLastSequenceNumber();
+
+                // lastWrittenSequenceNumber must never have offset -1 (the phantom LSN)
+                assertTrue("lastWrittenSequenceNumber offset should be >= 0, got: " + lastWritten,
+                        lastWritten.offset >= 0);
+
+                // lastWrittenSequenceNumber must correspond to an actual entry
+                // It should be >= the last synchronously written entry
+                assertTrue("lastWrittenSequenceNumber should be >= last sync write, lastWritten="
+                        + lastWritten + ", lastLsn=" + lastLsn,
+                        !lastLsn.after(lastWritten));
+
+                // If a ledger rollover happened, getLastSequenceNumber() may return (newLedgerId, -1)
+                // but getLastWrittenSequenceNumber() must not
+                if (lastSeq.offset == -1) {
+                    // This proves the bug scenario: getLastSequenceNumber returns phantom LSN
+                    // but getLastWrittenSequenceNumber does not
+                    assertTrue("lastWrittenSequenceNumber should be in a previous ledger when lastSeq has offset -1",
+                            lastWritten.ledgerId < lastSeq.ledgerId);
+                    assertTrue("lastWrittenSequenceNumber offset must be >= 0",
+                            lastWritten.offset >= 0);
+                }
+            }
+        }
+    }
+
     /**
      * Helper: writes one complete entry (ENTRY_START + seqNumber + serialized LogEntry + ENTRY_END).
      */

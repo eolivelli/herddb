@@ -91,6 +91,7 @@ public class BookkeeperCommitLog extends CommitLog {
     private volatile long currentLedgerId = 0;
     private volatile long lastLedgerId = -1;
     private final AtomicLong lastSequenceNumber = new AtomicLong(-1);
+    private volatile LogSequenceNumber lastWrittenLsn;
     private LedgersInfo actualLedgersList;
     private int expectedReplicaCount;
     private int ensemble = 1;
@@ -436,6 +437,7 @@ public class BookkeeperCommitLog extends CommitLog {
                     lastSequenceNumber.accumulateAndGet(pos.offset,
                             EnsureLongIncrementAccumulator.INSTANCE);
                 }
+                lastWrittenLsn = pos;
                 notifyListeners(pos, edit);
                 return pos;
             }
@@ -696,6 +698,7 @@ public class BookkeeperCommitLog extends CommitLog {
                             }
                             lastLedgerId = ledgerId;
                             lastSequenceNumber.set(end);
+                            lastWrittenLsn = new LogSequenceNumber(ledgerId, end);
                             long _stop = System.currentTimeMillis();
                             LOGGER.log(Level.INFO, "{4} From entry {0}, to entry {1} ({2} %) read time {3}",
                                     new Object[]{start, end, percent, (_stop - _start) + " ms", tableSpaceDescription});
@@ -1065,6 +1068,7 @@ public class BookkeeperCommitLog extends CommitLog {
             lastSequenceNumber.set(number.offset);
         }
         lastLedgerId = number.ledgerId;
+        lastWrittenLsn = number;
         currentLedgerId = number.ledgerId;
         return consumer.accept(number, statusEdit);
 
@@ -1084,6 +1088,12 @@ public class BookkeeperCommitLog extends CommitLog {
     @Override
     public LogSequenceNumber getLastSequenceNumber() {
         return new LogSequenceNumber(lastLedgerId, lastSequenceNumber.get());
+    }
+
+    @Override
+    public LogSequenceNumber getLastWrittenSequenceNumber() {
+        LogSequenceNumber result = lastWrittenLsn;
+        return result != null ? result : getLastSequenceNumber();
     }
 
     public CommitFileWriter getWriter() {

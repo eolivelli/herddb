@@ -20,11 +20,14 @@
 
 package herddb.indexing;
 
+import herddb.core.MemoryManager;
+import herddb.file.FileDataStorageManager;
+import herddb.mem.MemoryDataStorageManager;
+import herddb.storage.DataStorageManager;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -48,14 +51,14 @@ public class IndexingServer implements AutoCloseable {
 
     private final String host;
     private final int port;
-    private final Properties config;
+    private final IndexingServerConfiguration config;
     private final IndexingServiceEngine engine;
 
     private Server server;
     private PrometheusMetricsProvider statsProvider;
     private org.eclipse.jetty.server.Server httpServer;
 
-    public IndexingServer(String host, int port, IndexingServiceEngine engine, Properties config) {
+    public IndexingServer(String host, int port, IndexingServiceEngine engine, IndexingServerConfiguration config) {
         this.host = host;
         this.port = port;
         this.engine = engine;
@@ -63,10 +66,68 @@ public class IndexingServer implements AutoCloseable {
     }
 
     public IndexingServer(int port, IndexingServiceEngine engine) {
-        this("0.0.0.0", port, engine, new Properties());
+        this("0.0.0.0", port, engine, new IndexingServerConfiguration());
+    }
+
+    /**
+     * Builds a MemoryManager based on configuration.
+     * If {@code indexing.memory.vector.limit} is 0 (auto), uses 50% of JVM max heap.
+     */
+    MemoryManager buildMemoryManager() {
+        long maxVectorMemory = config.getLong(IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT,
+                IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT_DEFAULT);
+        long maxLogicalPageSize = config.getLong(IndexingServerConfiguration.PROPERTY_MEMORY_PAGE_SIZE,
+                IndexingServerConfiguration.PROPERTY_MEMORY_PAGE_SIZE_DEFAULT);
+
+        long maxDataUsedMemory;
+        if (maxVectorMemory <= 0) {
+            // Auto: use 50% of JVM max heap
+            maxDataUsedMemory = Runtime.getRuntime().maxMemory() / 2;
+        } else {
+            maxDataUsedMemory = maxVectorMemory;
+        }
+
+        // Ensure maxDataUsedMemory is at least maxLogicalPageSize
+        if (maxDataUsedMemory < maxLogicalPageSize) {
+            maxDataUsedMemory = maxLogicalPageSize;
+        }
+
+        LOGGER.log(Level.INFO, "Building MemoryManager: maxDataUsedMemory={0} MB, maxLogicalPageSize={1}",
+                new Object[]{maxDataUsedMemory / (1024 * 1024), maxLogicalPageSize});
+
+        // maxPKUsedMemory must be >= maxLogicalPageSize, so pass maxLogicalPageSize for it
+        // maxIndexUsedMemory=0 means use data memory for index pages
+        return new MemoryManager(maxDataUsedMemory, 0, maxLogicalPageSize, maxLogicalPageSize);
+    }
+
+    /**
+     * Builds a DataStorageManager based on configuration.
+     * Supported types: "file" (default) and "memory".
+     */
+    DataStorageManager buildDataStorageManager(Path dataDir) {
+        String storageType = config.getString(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE,
+                IndexingServerConfiguration.PROPERTY_STORAGE_TYPE_DEFAULT);
+
+        LOGGER.log(Level.INFO, "Building DataStorageManager: type={0}, dataDir={1}",
+                new Object[]{storageType, dataDir});
+
+        switch (storageType) {
+            case "memory":
+                return new MemoryDataStorageManager();
+            case "file":
+            default:
+                return new FileDataStorageManager(dataDir);
+        }
     }
 
     public void start() throws IOException {
+        // Build and set MemoryManager and DataStorageManager on the engine
+        MemoryManager memoryManager = buildMemoryManager();
+        engine.setMemoryManager(memoryManager);
+
+        DataStorageManager dataStorageManager = buildDataStorageManager(engine.getDataDirectory());
+        engine.setDataStorageManager(dataStorageManager);
+
         // Initialize metrics
         statsProvider = new PrometheusMetricsProvider();
         PropertiesConfiguration statsConfig = new PropertiesConfiguration();
@@ -82,10 +143,13 @@ public class IndexingServer implements AutoCloseable {
                 .start();
 
         // Start HTTP server for metrics
-        boolean httpEnabled = Boolean.parseBoolean(config.getProperty("http.enable", "false"));
+        boolean httpEnabled = config.getBoolean(IndexingServerConfiguration.PROPERTY_HTTP_ENABLE,
+                IndexingServerConfiguration.PROPERTY_HTTP_ENABLE_DEFAULT);
         if (httpEnabled) {
-            int httpPort = Integer.parseInt(config.getProperty("http.port", "9851"));
-            String httpHost = config.getProperty("http.host", "0.0.0.0");
+            int httpPort = config.getInt(IndexingServerConfiguration.PROPERTY_HTTP_PORT,
+                    IndexingServerConfiguration.PROPERTY_HTTP_PORT_DEFAULT);
+            String httpHost = config.getString(IndexingServerConfiguration.PROPERTY_HTTP_HOST,
+                    IndexingServerConfiguration.PROPERTY_HTTP_HOST_DEFAULT);
             try {
                 httpServer = new org.eclipse.jetty.server.Server();
                 ServerConnector connector = new ServerConnector(httpServer);

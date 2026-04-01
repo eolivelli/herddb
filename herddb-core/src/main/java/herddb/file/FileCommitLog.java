@@ -79,6 +79,7 @@ public class FileCommitLog extends CommitLog {
 
     private long maxLogFileSize = 1024 * 1024;
     private long writtenBytes = 0;
+    private volatile LogSequenceNumber lastWrittenLsn;
 
     private volatile CommitFileWriter writer;
     private Thread spool;
@@ -600,6 +601,7 @@ public class FileCommitLog extends CommitLog {
 
             long newSequenceNumber = ++writer.sequenceNumber;
             int written = writer.writeEntry(newSequenceNumber, entry.entry);
+            lastWrittenLsn = new LogSequenceNumber(writer.ledgerId, newSequenceNumber);
 
             if (writtenBytes > maxLogFileSize) {
                 openNewLedger();
@@ -711,6 +713,7 @@ public class FileCommitLog extends CommitLog {
             }
 
             recoveredLogSequence = new LogSequenceNumber(currentLedgerId, offset);
+            lastWrittenLsn = recoveredLogSequence;
 
             LOGGER.log(Level.INFO, "Tablespace {1}, max ledgerId is {0}", new Object[]{currentLedgerId, tableSpaceName});
         } catch (IOException | RuntimeException err) {
@@ -838,6 +841,12 @@ public class FileCommitLog extends CommitLog {
         } else {
             return new LogSequenceNumber(_writer.ledgerId, _writer.sequenceNumber);
         }
+    }
+
+    @Override
+    public LogSequenceNumber getLastWrittenSequenceNumber() {
+        LogSequenceNumber result = lastWrittenLsn;
+        return result != null ? result : getLastSequenceNumber();
     }
 
 }

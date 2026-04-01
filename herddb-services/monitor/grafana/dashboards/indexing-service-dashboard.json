@@ -1,0 +1,1045 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Dashboard for HerdDB Indexing Service - JVM, Search RPC, Vector Indexes, CommitLog Tailer",
+  "editable": true,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "refresh": "30s",
+  "rows": [
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 1,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": true,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 12,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "jvm_memory_bytes_used{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "{{area}} memory",
+              "refId": "A",
+              "step": 5
+            }
+          ],
+          "thresholds": [],
+          "title": "JVM Memory Used",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "bytes", "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "JVM Metrics",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 2,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "jvm_threads_current{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "current",
+              "refId": "A",
+              "step": 10
+            },
+            {
+              "expr": "jvm_threads_daemon{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "daemon",
+              "refId": "B",
+              "step": 10
+            }
+          ],
+          "thresholds": [],
+          "title": "JVM Threads",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "short", "decimals": 0, "show": true },
+            { "format": "short", "show": true }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 3,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(jvm_gc_collection_seconds_sum{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "{{gc}}",
+              "refId": "A",
+              "step": 10
+            }
+          ],
+          "thresholds": [],
+          "title": "GC Time / 1 min rate",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "s", "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": false,
+      "title": "JVM Details",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 10,
+          "legend": {
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "rate(indexing_search_requests{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "search req/s",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Search Requests Rate",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "ops", "show": true },
+            { "format": "short", "show": true }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 11,
+          "legend": {
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "rate(indexing_search_errors{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "search errors/s",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Search Errors Rate",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "ops", "show": true },
+            { "format": "short", "show": true }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 12,
+          "legend": {
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "rate(indexing_search_latency_sum{job=\"indexing-service\",instance=~\"$instance\"}[1m]) / rate(indexing_search_latency_count{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "avg latency",
+              "refId": "A"
+            },
+            {
+              "expr": "indexing_search_latency{job=\"indexing-service\",instance=~\"$instance\",quantile=\"0.99\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "p99 latency",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "Search Latency",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "\u00b5s", "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Search RPC",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 13,
+          "legend": {
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "rate(indexing_status_requests{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "status req/s",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Status Requests Rate",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "ops", "show": true },
+            { "format": "short", "show": true }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 14,
+          "legend": {
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "rate(indexing_status_errors{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "status errors/s",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Status Errors Rate",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "ops", "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": false,
+      "title": "Status RPC",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 300,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 20,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 12,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_.+_node_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Vector Index - Total Node Count",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "short", "decimals": 0, "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Vector Index Status",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 21,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_.+_live_node_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Live Node Count (per index)",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "short", "decimals": 0, "show": true },
+            { "format": "short", "show": true }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 22,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_.+_ondisk_node_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "On-Disk Node Count (per index)",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "short", "decimals": 0, "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": false,
+      "title": "Index Nodes",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 23,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_.+_segment_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Segment Count (per index)",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "short", "decimals": 0, "show": true },
+            { "format": "short", "show": true }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 24,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_.+_live_shard_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Live Shard Count (per index)",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "short", "decimals": 0, "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": false,
+      "title": "Index Segments",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 300,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 25,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_.+_estimated_size_bytes\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Estimated Memory Size (per index)",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "bytes", "show": true },
+            { "format": "short", "show": true }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 26,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_.+_live_vectors_memory_bytes\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Live Vectors Memory (per index)",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "bytes", "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Vector Index Memory",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 27,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 12,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_.+_dirty\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Index Dirty Flag (per index)",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "short", "decimals": 0, "min": 0, "max": 1, "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": false,
+      "title": "Index Dirty",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 30,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "tailer_entries_processed{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "entries processed",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "CommitLog Tailer - Entries Processed",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "short", "decimals": 0, "show": true },
+            { "format": "short", "show": true }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 31,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "tailer_watermark_ledger_id{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "ledger ID",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "CommitLog Tailer - Watermark Ledger ID",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "short", "decimals": 0, "show": true },
+            { "format": "short", "show": true }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 32,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "tailer_watermark_offset{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "offset",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "CommitLog Tailer - Watermark Offset",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "short", "decimals": 0, "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "CommitLog Tailer",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 150,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 33,
+          "span": 4,
+          "targets": [
+            {
+              "expr": "tailer_running{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "running",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Tailer Running",
+          "type": "singlestat",
+          "valueName": "current",
+          "colorBackground": true,
+          "colors": ["#d44a3a", "#299c46", "#299c46"],
+          "thresholds": "0.5",
+          "valueMaps": [
+            { "value": "0", "text": "STOPPED", "op": "=" },
+            { "value": "1", "text": "RUNNING", "op": "=" }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 34,
+          "legend": {
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 8,
+          "targets": [
+            {
+              "expr": "rate(tailer_entries_processed{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "entries/s",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "CommitLog Tailer - Ingestion Rate",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "ops", "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": false,
+      "title": "Tailer Status",
+      "titleSize": "h6"
+    }
+  ],
+  "schemaVersion": 14,
+  "style": "dark",
+  "tags": [
+    "indexing-service",
+    "vector",
+    "herddb"
+  ],
+  "templating": {
+    "list": [
+      {
+        "allValue": "",
+        "current": {},
+        "datasource": "Prometheus",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Instance",
+        "multi": true,
+        "name": "instance",
+        "options": [],
+        "query": "label_values(indexing_search_requests{job=\"indexing-service\"}, instance)",
+        "refresh": 1,
+        "regex": "",
+        "sort": 0,
+        "type": "query",
+        "useTags": false
+      }
+    ]
+  },
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h"],
+    "time_options": ["5m", "15m", "1h", "6h", "12h", "24h", "2d", "7d", "30d"]
+  },
+  "timezone": "",
+  "title": "HerdDB Indexing Service",
+  "version": 1,
+  "uid": "indexing-service"
+}

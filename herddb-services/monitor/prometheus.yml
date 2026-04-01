@@ -12,3 +12,8 @@ scrape_configs:
     static_configs:
       - targets:
           - localhost:9847
+  - job_name: indexing-service
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - localhost:9851

@@ -1,6 +1,78 @@
 # Vector Index in HerdDB
 
-This document describes the vector index feature: how to use it, its design, storage format, and implementation details.
+This document describes the vector index feature: its architecture, how to use it, storage format, and implementation details.
+
+---
+
+## Architecture Overview
+
+HerdDB's vector indexing uses a **two-component architecture** where vector index operations are offloaded from the main database server to a standalone **IndexingService**:
+
+```
+┌─────────────────────────────────────────────────┐
+│  HerdDB Server (DBManager)                      │
+│                                                 │
+│  VectorIndexManager (thin remote client)        │
+│    - DML ops are no-ops (data flows via WAL)    │
+│    - Search delegates to IndexingService gRPC   │
+│    - Checkpoint waits for IndexingService        │
+│      catch-up before WAL truncation             │
+│                                                 │
+│  CommitLog (WAL)  ──writes──►  .txlog files     │
+└─────────────────────────────────────────────────┘
+                                    │
+                               tails WAL
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────┐
+│  IndexingService (standalone gRPC server)       │
+│                                                 │
+│  IndexingServiceEngine                          │
+│    - CommitLogTailer: reads .txlog files        │
+│    - SchemaTracker: tracks DDL from WAL         │
+│    - TransactionBuffer: buffers until COMMIT    │
+│    - VectorStoreFactory: creates vector stores  │
+│                                                 │
+│  Per-index vector stores:                       │
+│    ┌───────────────────────────────────────┐    │
+│    │ InMemoryVectorStore (brute-force)     │    │
+│    │  OR                                   │    │
+│    │ PersistentVectorStore (jvector HNSW)  │    │
+│    │   - Live graph shards (in-memory)     │    │
+│    │   - On-disk segments (FusedPQ)        │    │
+│    │   - BLink for PK-to-ordinal mapping   │    │
+│    │   - DataStorageManager for persistence│    │
+│    │   - MemoryManager for bounded memory  │    │
+│    │   - Background compaction thread      │    │
+│    └───────────────────────────────────────┘    │
+│                                                 │
+│  MemoryManager: bounded memory for BLink pages  │
+│  DataStorageManager: persistence backend        │
+│    - FileDataStorageManager (local disk)        │
+│    - MemoryDataStorageManager (testing)          │
+│    - (future: RemoteFileService for remote I/O) │
+└─────────────────────────────────────────────────┘
+```
+
+### Key design decisions
+
+1. **Decoupled via CommitLog tailing.** The IndexingService replays the database WAL independently. The main server's `VectorIndexManager` is a thin client — inserts/updates/deletes are no-ops because the IndexingService consumes them asynchronously from the WAL.
+
+2. **DataStorageManager for persistence.** Vector graph chunks and PK-mapping data are stored as pages via `DataStorageManager.writeIndexPage/readIndexPage`. This reuses HerdDB's existing storage infrastructure and enables future wiring of `RemoteFileService` for distributed storage without changing the vector store code.
+
+3. **BLink for PK mapping.** On-disk segments use `BLink<Bytes, Long>` for PK-to-ordinal lookups, backed by DataStorageManager pages and evicted via `MemoryManager`'s page replacement policy. This bounds memory usage for large on-disk indexes.
+
+4. **Two store implementations.** `AbstractVectorStore` is the common base class. `InMemoryVectorStore` provides brute-force cosine similarity for small datasets or testing. `PersistentVectorStore` uses jvector for production workloads with on-disk persistence.
+
+---
+
+## Modules
+
+| Module | Contains |
+|--------|----------|
+| `herddb-core` | `AbstractVectorStore`, `PersistentVectorStore`, `VectorIndexManager` (thin remote client), `VectorStorage`, `VectorSegment`, helper classes, SQL planner integration, `DataStorageManager`, `MemoryManager`, `BLink` |
+| `herddb-indexing-service` | `IndexingServer` (gRPC), `IndexingServiceEngine`, `IndexingServerConfiguration`, `InMemoryVectorStore`, `VectorStoreFactory`, `CommitLogTailer`, `SchemaTracker`, `TransactionBuffer`, `WatermarkStore`, Prometheus metrics |
+| `herddb-services` | `IndexingServiceMain` — standalone server entry point |
 
 ---
 
@@ -40,21 +112,13 @@ INSERT INTO tblspace1.documents(id, title, vec) VALUES(1, 'doc one', CAST(? AS F
 ### 4. Query — approximate nearest-neighbour search
 
 ```sql
--- Top-10 most similar documents to a query vector
 SELECT id, title
 FROM tblspace1.documents
-ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC
-LIMIT 10;
-
--- Combined WHERE filter + ANN search
-SELECT id, title
-FROM tblspace1.documents
-WHERE category = ?
 ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC
 LIMIT 10;
 ```
 
-When a vector index exists on `vec`, the `ORDER BY ann_of(…) DESC LIMIT k` pattern is automatically routed through the index. Without a vector index, the query falls back to brute-force cosine similarity over a full table scan.
+When a vector index exists on `vec`, the `ORDER BY ann_of(…) DESC LIMIT k` pattern is automatically routed through the index via `VectorANNScanOp`. Without a vector index, the query falls back to brute-force cosine similarity over a full table scan.
 
 ---
 
@@ -64,65 +128,314 @@ All parameters are optional. Unspecified parameters use the defaults shown below
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `m` | integer | `16` | Maximum number of edges per graph node. Higher = better recall, more memory, slower build. Typical range: 8–32. |
-| `beamWidth` | integer | `100` | Beam width (candidates explored) when inserting a new node during build. Higher = better graph quality, slower inserts. Typical range: 50–400. |
-| `neighborOverflow` | float | `1.2` | Temporary degree overflow factor. Each node may temporarily hold `m × neighborOverflow` neighbours during construction before pruning. Must be ≥ 1.0. |
-| `alpha` | float | `1.4` | Diversity criterion aggressiveness. Values > 1.0 allow longer edges, which improves recall on clustered data. `1.0` = pure short-edge pruning (HNSW-like). |
-| `similarity` | string | `cosine` | Distance metric used for both build and search. Accepted values: `cosine`, `euclidean`, `dot`. Must match the metric used at query time. |
-| `fusedPQ` | boolean | `true` | When `true` and the vector dimension is ≥ 8 and the index has ≥ 256 vectors, checkpoints use jvector's FusedPQ on-disk format (faster approximate scoring at search time). Falls back to the legacy `OnHeapGraphIndex` format otherwise. |
+| `m` | integer | `16` | Maximum edges per graph node. Higher = better recall, more memory. Range: 8–32. |
+| `beamWidth` | integer | `100` | Candidates explored during insertion. Higher = better graph quality, slower inserts. Range: 50–400. |
+| `neighborOverflow` | float | `1.2` | Temporary degree overflow factor during construction. Must be ≥ 1.0. |
+| `alpha` | float | `1.4` | Diversity criterion. Values > 1.0 allow longer edges (better recall on clustered data). |
+| `similarity` | string | `cosine` | Distance metric: `cosine`, `euclidean`, `dot`. |
+| `fusedPQ` | boolean | `true` | Use FusedPQ on-disk format when dim ≥ 8 and vectors ≥ 256. |
+| `maxSegmentSize` | long | `2147483648` | Maximum on-disk segment size in bytes before segment rotation. |
+| `maxLiveGraphSize` | integer | `0` | Maximum vectors per live graph shard before rotation. 0 = unlimited. |
 
-**Syntax:**
+---
 
-```sql
-CREATE VECTOR INDEX <name> ON <tablespace>.<table>(<column>)
-  [WITH <key>=<value> [<key>=<value> …]];
+## IndexingServerConfiguration
+
+The `IndexingServerConfiguration` class provides typed access to all IndexingService settings. It follows the `ServerConfiguration` pattern: `Properties`-backed, typed getters, fluent `set()`, `copy()`.
+
+| Property | Key | Default | Description |
+|----------|-----|---------|-------------|
+| gRPC host | `indexing.grpc.host` | `0.0.0.0` | gRPC server bind address |
+| gRPC port | `indexing.grpc.port` | `9850` | gRPC server port |
+| HTTP enable | `indexing.http.enable` | `false` | Enable Prometheus metrics HTTP endpoint |
+| HTTP host | `indexing.http.host` | `0.0.0.0` | Metrics endpoint bind address |
+| HTTP port | `indexing.http.port` | `9851` | Metrics endpoint port |
+| Log dir | `indexing.log.dir` | `txlog` | WAL directory to tail |
+| Data dir | `indexing.data.dir` | `data` | Data directory for persistence |
+| Max vector memory | `indexing.memory.vector.limit` | `0` | Max memory for vector data. 0 = auto (50% of JVM heap). |
+| Page size | `indexing.memory.page.size` | `1048576` | Logical page size for MemoryManager (1 MB). |
+| Vector M | `indexing.vector.m` | `16` | Default M for new vector stores |
+| Vector beam width | `indexing.vector.beamWidth` | `100` | Default beam width |
+| Vector neighbor overflow | `indexing.vector.neighborOverflow` | `1.2` | Default neighbor overflow |
+| Vector alpha | `indexing.vector.alpha` | `1.4` | Default alpha |
+| Vector fusedPQ | `indexing.vector.fusedPQ` | `true` | Default FusedPQ enable |
+| Max segment size | `indexing.vector.maxSegmentSize` | `2147483648` | Default max segment size |
+| Max live graph size | `indexing.vector.maxLiveGraphSize` | `0` | Default max live graph size |
+| Compaction interval | `indexing.compaction.interval` | `60000` | Checkpoint interval in ms |
+| Compaction threads | `indexing.compaction.threads` | `2` | Background compaction threads |
+| Storage type | `indexing.storage.type` | `file` | `file` (persistent) or `memory` (testing) |
+| Memory multiplier | `indexing.vector.memoryMultiplier` | `5.0` | Multiplier for memory estimation |
+
+---
+
+## PersistentVectorStore — jvector Implementation
+
+`PersistentVectorStore` extends `AbstractVectorStore` and implements the full jvector-backed HNSW vector index with on-disk persistence.
+
+### Key source files
+
+| File | Module | Purpose |
+|------|--------|---------|
+| `AbstractVectorStore.java` | herddb-core | Abstract base: `addVector`, `removeVector`, `search`, `size`, `estimatedMemoryUsageBytes`, `start`, `close` |
+| `PersistentVectorStore.java` | herddb-core | Full jvector HNSW implementation (2277 lines) |
+| `VectorStorage.java` | herddb-core | Lock-free `AtomicReferenceArray<VectorFloat<?>>` for vector data |
+| `VectorStorageRandomAccessVectorValues.java` | herddb-core | jvector `RandomAccessVectorValues` adapter over `VectorStorage` |
+| `VectorSegment.java` | herddb-core | On-disk segment: `OnDiskGraphIndex`, `BLink<Bytes,Long>`, ordinal-to-PK cache |
+| `SegmentedMappedReader.java` | herddb-core | jvector `ReaderSupplier` for memory-mapped graph file reading |
+| `FileBackedVectorValues.java` | herddb-core | Abstract disk-backed vector values |
+| `ChannelFileBackedVectorValues.java` | herddb-core | FileChannel-based implementation |
+| `MmapFileBackedVectorValues.java` | herddb-core | Memory-mapped implementation |
+| `InMemoryVectorStore.java` | herddb-indexing-service | Brute-force cosine similarity (for testing / small datasets) |
+| `VectorStoreFactory.java` | herddb-indexing-service | Factory interface for creating vector stores |
+| `VectorIndexManager.java` | herddb-core | Thin remote client in DBManager (delegates to IndexingService via gRPC) |
+| `RemoteVectorIndexService.java` | herddb-core | Interface for remote vector index operations |
+
+### Live graph shards
+
+In-memory inserts go into **LiveGraphShard** instances:
+
+```
+LiveGraphShard:
+  pkToNode   : ConcurrentHashMap<Bytes, Integer>   // PK → nodeId
+  nodeToPk   : ConcurrentHashMap<Integer, Bytes>   // nodeId → PK
+  mravv      : RandomAccessVectorValues             // vector accessor
+  builder    : GraphIndexBuilder                     // mutable HNSW graph
+  vectorCount: AtomicInteger                         // live count
 ```
 
-Key-value pairs are separated by whitespace or commas. No surrounding parentheses are required.
+Only the **last shard** accepts new inserts. When `maxLiveGraphSize` is exceeded, the shard is sealed and a new empty shard is created (shard rotation). All live shards are searched in parallel.
 
-**Constraints:**
-- The indexed column must be of type `floata` (nullable or `NOT NULL`).
-- Exactly one column may be indexed per vector index.
-- `UNIQUE` is not supported and raises an error at definition time.
-- Parameters are stored in the index definition and survive checkpoint/restart.
+Vectors are stored in a global `VectorStorage` (lock-free `AtomicReferenceArray<VectorFloat<?>>`), indexed directly by nodeId for O(1) access without boxing or hashing.
+
+### On-disk segments
+
+Each on-disk segment (`VectorSegment`) contains:
+
+- `OnDiskGraphIndex` — FusedPQ graph loaded via memory-mapped `ReaderSupplier`
+- `BLink<Bytes, Long>` — PK-to-ordinal mapping, backed by DataStorageManager pages
+- Ordinal-to-PK cache — compact `byte[]` arrays (`pkData`, `pkOffsets`, `pkLengths`)
+- `graphPageIds` / `mapPageIds` — DataStorageManager page IDs for graph and map chunks
+- `estimatedSizeBytes` — memory usage estimate
+
+Segments are sealed when they reach ~80% of `maxSegmentSize`. Sealed segments are not rewritten during compaction.
+
+### Three-phase checkpoint
+
+The checkpoint process ensures DML is never blocked during the expensive Phase B:
+
+**Phase A — Snapshot + Swap** (brief write lock)
+```
+stateLock.writeLock()
+  1. Snapshot current live shards
+  2. Classify segments into sealed vs mergeable
+  3. Set frozenShards = snapshot (searched during Phase B)
+  4. Set pendingCheckpointDeletes = new set
+  5. Calculate DML back-pressure cap
+  6. Create new empty live shards
+  7. dirty = false
+stateLock.writeUnlock()
+```
+
+**Phase B — Build Graphs** (no lock, I/O-heavy)
+```
+  1. Collect vectors from snapshot shards + mergeable segments
+  2. Build fresh OnHeapGraphIndex via CHECKPOINT_POOL (ForkJoinPool)
+  3. Compute ProductQuantization codebook (dim/4 subspaces, 256 clusters)
+  4. Write OnDiskGraphIndex with FusedPQ + InlineVectors features
+  5. Split into 1 MB chunks → write as DataStorageManager pages
+  6. Write PK mapping data as map chunks
+```
+
+**Phase C — Load + Swap** (brief write lock)
+```
+stateLock.writeLock()
+  1. Load new segments from DataStorageManager pages
+  2. Create BLinks for PK-to-ordinal mapping
+  3. Close old frozen shards and merged segments
+  4. Apply pending deletes from Phase B
+  5. Atomic swap: segments = newSegments
+  6. Clear frozen state
+stateLock.writeUnlock()
+```
+
+### Hybrid search
+
+Search queries all three sources and merges results:
+
+```
+search(queryVector, topK):
+  results = []
+
+  1. On-disk segments (FusedPQ two-phase scoring):
+     for each segment:
+       approxSF = view.approximateScoreFunctionFor(qv)  // FusedPQ
+       reranker = view.rerankerFor(qv)                   // InlineVectors
+       sr = GraphSearcher.search(approxSF + reranker, k, acceptBits)
+       map ordinals → PKs via segment.getPkForOrdinal()
+       add to results
+
+  2. Live shards (exact in-memory search):
+     for each shard:
+       sr = GraphSearcher.search(qv, k, mravv, similarityFunction)
+       map nodeIds → PKs via shard.nodeToPk
+       add to results
+
+  3. Frozen shards (during Phase B):
+     same as live shards, with pendingCheckpointDeletes filter
+
+  sort results by score descending
+  return top-K
+```
+
+### FusedPQ compaction
+
+FusedPQ is activated when ALL conditions are met:
+- `fusedPQ = true` in configuration
+- `dimension >= 8` (PQ requires at least 8 subspaces)
+- `vectors >= 256` (jvector requires exactly 256 PQ clusters)
+
+The compaction builds:
+1. `ProductQuantization` codebook: `pqSubspaces = max(1, dim / 4)`, 256 clusters
+2. `PQVectors` from encoded training data
+3. `OnDiskGraphIndex` via `OnDiskGraphIndexWriter` with:
+   - `FusedPQ(maxDegree, pq)` — embeds PQ-encoded neighbor vectors in each node for fast approximate scoring
+   - `InlineVectors(dim)` — stores full-precision vectors for exact reranking
+
+When conditions are not met, a simpler checkpoint path writes the `OnHeapGraphIndex` directly.
+
+### Background compaction thread
+
+`PersistentVectorStore` manages its own background daemon thread that periodically calls `checkpoint()` when the index is dirty. The interval is controlled by `compactionIntervalMs` (default 60 seconds). The `IndexingServiceEngine` also runs a `ScheduledExecutorService` that triggers checkpoints across all persistent stores.
+
+### Memory management
+
+- **MemoryManager** provides `PageReplacementPolicy` (ClockPro by default) for BLink page eviction
+- **VectorStorage** uses lock-free `AtomicReferenceArray` — no boxing, single volatile read per access
+- **Back-pressure during checkpoint**: when Phase B is active, new inserts are limited to `liveVectorCapDuringCheckpoint` vectors. If exceeded, inserts block until Phase C completes.
+- `estimatedMemoryUsageBytes()` = live vectors × dimension × 4 bytes × `memoryMultiplier` (default 5.0)
 
 ---
 
-## Overview
+## Data Flow
 
-HerdDB's vector index is backed by [jvector](https://github.com/jbellis/jvector) (version `4.0.0-rc.9-SNAPSHOT`), a Java library implementing a Vamana-style approximate nearest-neighbour (ANN) graph index (similar in spirit to HNSW but with a more aggressive diversity criterion).
+### Write path
 
-The implementation covers:
+```
+Client INSERT → HerdDB Server → CommitLog (.txlog)
+                                      │
+                     ┌────────────────┘
+                     ▼
+            CommitLogTailer (IndexingServiceEngine)
+                     │
+                     ▼
+            TransactionBuffer (buffer until COMMIT)
+                     │
+                     ▼
+            SchemaTracker (DDL) + VectorStore (DML)
+                     │
+                     ▼
+            PersistentVectorStore.addVector(pk, float[])
+              → VectorStorage.set(nodeId, VectorFloat)
+              → GraphIndexBuilder.addGraphNode(nodeId, vec)
+              → pkToNode.put(pk, nodeId)
+```
 
-- DDL: `CREATE VECTOR INDEX` with optional `WITH` hyperparameter clause
-- DML write path: every `INSERT` / `UPDATE` / `DELETE` updates the index
-- Checkpoint persistence: serialises the graph to HerdDB's page storage
-- Restart recovery: reloads the graph from pages, with two formats (legacy and FusedPQ)
-- Query execution: `ann_of(col, ?)` — CalcitePlanner intercepts `ORDER BY ann_of() DESC LIMIT k` and routes through `VectorANNScanOp` when a vector index exists; falls back to brute-force cosine similarity otherwise
-- Hybrid search: after a FusedPQ checkpoint, newly inserted rows are held in an in-memory graph alongside the on-disk graph; both are searched and results are merged by score
+### Read path
+
+```
+Client SELECT ... ORDER BY ann_of(vec, ?) DESC LIMIT k
+  → CalcitePlanner intercepts ORDER BY ann_of()
+  → VectorANNScanOp.execute()
+  → VectorIndexManager.search(queryVector, topK)
+  → gRPC call to IndexingService
+  → IndexingServiceEngine.search()
+  → PersistentVectorStore.search(queryVector, topK)
+  → hybrid search: on-disk segments + live shards
+  → results returned via gRPC to VectorANNScanOp
+  → PK fetch + WHERE filter + projection
+```
+
+### Checkpoint path
+
+```
+IndexingServiceEngine checkpoint scheduler
+  → PersistentVectorStore.checkpoint()
+  → Phase A: snapshot live state (brief write lock)
+  → Phase B: build FusedPQ graphs, write to DataStorageManager (no lock)
+  → Phase C: load new segments, swap (brief write lock)
+  → IndexStatus written with metadata + active page IDs
+```
 
 ---
 
-## Key Source Files
+## Storage Format
 
-| File | Purpose |
-|------|---------|
-| `herddb-core/src/main/java/herddb/model/Index.java` | Adds `TYPE_VECTOR = "vector"` constant; `Builder.build()` enforces FLOATARRAY / no-UNIQUE constraints; stores `Map<String,String> properties` (serialised as version-2 index format) |
-| `herddb-core/src/main/java/herddb/sql/JSQLParserPlanner.java` | `convertIndexType()` accepts `"vector"`; `extractIndexWithClause()` strips the `WITH` suffix before JSQLParser sees it and stores properties in a ThreadLocal; `buildCreateIndexStatement()` reads the ThreadLocal and applies properties to the builder |
-| `herddb-core/src/main/java/herddb/index/vector/VectorIndexManager.java` | Full index manager; configurable hyper-parameters from `index.properties`; FusedPQ checkpoint/load/hybrid-search logic |
-| `herddb-core/src/main/java/herddb/core/TableSpaceManager.java` | `bootIndex()` switch has a `case Index.TYPE_VECTOR` branch |
-| `herddb-core/src/main/java/herddb/sql/functions/BuiltinFunctions.java` | Declares `ANN_OF = "ann_of"` and `NAME_ANN_OF = "ANN_OF"` constants |
-| `herddb-core/src/main/java/herddb/sql/CalcitePlanner.java` | Registers `ANN_OF` scalar function; `planSort()` intercepts `ORDER BY ann_of()` to create `VectorANNScanOp` |
-| `herddb-core/src/main/java/herddb/sql/expressions/SQLExpressionCompiler.java` | `case BuiltinFunctions.NAME_ANN_OF` dispatches to `CompiledFunction(ANN_OF, …)` |
-| `herddb-core/src/main/java/herddb/sql/expressions/CompiledFunction.java` | `case BuiltinFunctions.ANN_OF` evaluates cosine similarity |
-| `herddb-core/src/main/java/herddb/model/planner/VectorANNScanOp.java` | `PlannerOp` that performs index-backed ANN search with optional brute-force fallback |
-| `herddb-core/src/test/java/herddb/core/indexes/VectorIndexTest.java` | Integration tests (DDL, DML, checkpoint/restart, `search()`, `ann_of`, WITH clause, FusedPQ, hybrid search) |
+All vector index data is stored through `DataStorageManager.writeIndexPage / readIndexPage`. No files outside HerdDB's storage directories are created at rest (temporary files are used during FusedPQ graph building and deleted immediately).
+
+### Page types
+
+```
+TYPE_VECTOR_GRAPHCHUNK = 12
+  VInt(12) | VInt(chunkLen) | byte[chunkLen]
+  // Simple: raw bytes from OnHeapGraphIndex.save()
+  // FusedPQ: raw bytes of OnDiskGraphIndex file
+
+TYPE_VECTOR_MAPCHUNK = 13
+  VInt(13) | VInt(chunkLen) | byte[chunkLen]
+  // Serialized PK/vector mapping data
+```
+
+Each chunk is at most 1 MB (`CHUNK_SIZE = 1_048_576`).
+
+### Metadata (IndexStatus.indexData)
+
+Three versions, all big-endian `ByteBuffer`:
+
+**Version 1 — Simple OnHeapGraphIndex:**
+```
+int version=1, int dimension, int M, int beamWidth,
+float neighborOverflow, float alpha, byte addHierarchy,
+int nextNodeId, int numGraphChunks, long[] graphPageIds,
+int numMapChunks, long[] mapPageIds
+```
+
+**Version 2 — FusedPQ OnDiskGraphIndex:**
+```
+Same as v1, plus: byte fusedPQ (after addHierarchy)
+```
+
+**Version 3 — Multi-segment:**
+```
+int version=3, int dimension, int M, int beamWidth,
+float neighborOverflow, float alpha, byte addHierarchy,
+byte fusedPQ, int nextNodeId, int numSegments,
+for each segment:
+  int segmentId, long estimatedSize,
+  int numGraphChunks, long[] graphPageIds,
+  int numMapChunks, long[] mapPageIds
+```
+
+### Map data format
+
+```
+int entryCount
+for each entry:
+  int ordinal (nodeId or newOrdinal)
+  int pkLen
+  byte[] pkBytes
+  int floatCount (= dimension)
+  float[] floats (big-endian IEEE 754)
+```
+
+### BLink pages
+
+Each on-disk segment creates a `BLink<Bytes, Long>` for PK-to-ordinal mapping. BLink pages are stored as separate DataStorageManager index pages with a per-segment namespace: `{indexUUID}_seg{segmentId}_pktonode`.
 
 ---
 
-## How jvector Is Used
+## jvector Integration
 
-### Library coordinates
+### Library
 
 ```xml
 <dependency>
@@ -132,369 +445,74 @@ The implementation covers:
 </dependency>
 ```
 
-The jar must be present in the local Maven repository (not published to Maven Central at the snapshot stage).
+### Key jvector types used
 
-### Core jvector types used
-
-| jvector class | Role in HerdDB |
-|---------------|----------------|
-| `GraphIndexBuilder` | Mutable builder for incremental inserts and deletes; wraps `OnHeapGraphIndex` |
-| `OnHeapGraphIndex` | In-memory Vamana graph; serialised via `save(DataOutput)` (legacy format) |
-| `OnDiskGraphIndex` | Immutable on-disk graph; loaded via `ReaderSupplier → ByteBufferReader`; supports FusedPQ approximate scoring |
-| `OnDiskGraphIndexWriter` | Writes an `OnHeapGraphIndex` to a file with optional feature suppliers (`FusedPQ`, `InlineVectors`) |
-| `FusedPQ` | On-disk feature that fuses PQ-encoded neighbour vectors into each node's record for fast approximate scoring without random I/O |
-| `InlineVectors` | On-disk feature that stores the full-precision vector alongside each node for exact reranking |
-| `ProductQuantization` | Computes a 256-cluster PQ codebook from training vectors; used to encode neighbours for FusedPQ |
-| `PQVectors` | Holds PQ-encoded vectors; used as a state supplier when writing FusedPQ data |
-| `DefaultSearchScoreProvider` | Combines an `ApproximateScoreFunction` (FusedPQ) with an `ExactScoreFunction` (InlineVectors) for two-phase reranking |
-| `MapRandomAccessVectorValues` | `ConcurrentHashMap<Integer, VectorFloat<?>>` wrapper for vector access by node ID |
-| `BuildScoreProvider` | Provides similarity scoring during graph construction |
-| `VamanaDiversityProvider` | Controls the graph's diversity criterion (alpha parameter); required when loading a legacy graph |
-| `ByteBufferReader` | In-memory `RandomAccessReader`; used to load graphs from a `ByteBuffer` without touching the filesystem |
-| `VectorTypeSupport` / `VectorizationProvider` | Factory for `VectorFloat<?>` objects from `float[]` arrays |
-| `VectorSimilarityFunction` | Enum for `COSINE`, `EUCLIDEAN`, `DOT_PRODUCT`; configurable per index |
+| jvector class | Role |
+|---------------|------|
+| `GraphIndexBuilder` | Mutable builder for incremental inserts/deletes |
+| `OnHeapGraphIndex` | In-memory Vamana graph |
+| `OnDiskGraphIndex` | Immutable on-disk graph with FusedPQ support |
+| `OnDiskGraphIndexWriter` | Writes graph to file with feature suppliers |
+| `FusedPQ` | Embeds PQ-encoded neighbor vectors for fast approximate scoring |
+| `InlineVectors` | Stores full-precision vectors for exact reranking |
+| `ProductQuantization` | Computes PQ codebook from training vectors |
+| `PQVectors` | PQ-encoded vectors for FusedPQ state |
+| `DefaultSearchScoreProvider` | Combines approximate + exact scoring for two-phase reranking |
+| `BuildScoreProvider` | Scoring during graph construction |
+| `VamanaDiversityProvider` | Controls diversity criterion (alpha) |
+| `GraphSearcher` | Executes search on a graph index |
+| `VectorSimilarityFunction` | `COSINE`, `EUCLIDEAN`, `DOT_PRODUCT` |
+| `VectorFloat<?>` / `VectorTypeSupport` | Vector data types with SIMD acceleration |
 
 ---
 
-## Lifecycle
-
-### Fresh start (empty index)
-
-```
-recordInserted(pk, indexKeyBytes)
-  → decode float[] from indexKeyBytes via Bytes.to_float_array()
-  → on first insert: create MapRandomAccessVectorValues + GraphIndexBuilder
-  → assign nodeId = nextNodeId.getAndIncrement()
-  → put vector in: vectors map, pkToNode map, nodeToPk map
-  → builder.addGraphNode(nodeId, vectorFloat)
-```
-
-### Checkpoint — simple path (fusedPQ=false, or dim < 8, or < 256 vectors)
-
-```
-builder.cleanup()
-  → removes marked-deleted nodes; sets allMutationsCompleted=true
-OnHeapGraphIndex.save(DataOutputStream)
-  → raw bytes split into ≤ 1 MB chunks → written as TYPE_VECTOR_GRAPHCHUNK pages
-serializeMapData()
-  → (nodeId, pkBytes, floatValues) for each live node
-  → split into ≤ 1 MB chunks → written as TYPE_VECTOR_MAPCHUNK pages
-write IndexStatus
-  → indexData = binary metadata (version=1, see Storage Format)
-  → activePages = set of all chunk page IDs
-```
-
-### Checkpoint — FusedPQ path (fusedPQ=true, dim ≥ 8, ≥ 256 vectors)
-
-```
-Merge all active vectors (on-disk ordinals + live inserts):
-  → read on-disk vectors via view.getVector(ordinal) [InlineVectors feature]
-  → combine with vectors from live GraphIndexBuilder
-Build fresh merged OnHeapGraphIndex from all active vectors
-Compute PQ codebook:
-  → pqSubspaces = max(1, dim / 4)
-  → ProductQuantization.compute(allVectors, pqSubspaces, 256, true)
-  → pq.encodeAll(...) → PQVectors
-Write to temp file via OnDiskGraphIndexWriter.Builder:
-  → .with(new FusedPQ(maxDegree, pq))
-  → .with(new InlineVectors(dim))
-  → writer.write(suppliers)  // FUSED_PQ + INLINE_VECTORS state per ordinal
-Read temp file bytes → split into ≤ 1 MB chunks → TYPE_VECTOR_GRAPHCHUNK pages
-Compute sequential renumbering (oldNodeId → newOrdinal)
-writeFusedPQMapData():
-  → (newOrdinal, pkBytes, floatValues) per active node
-  → TYPE_VECTOR_MAPCHUNK pages
-write IndexStatus
-  → indexData = binary metadata (version=2, fusedPQ flag=1)
-Delete temp file
-```
-
-### Restart / recovery — legacy format (version=1)
-
-```
-getIndexStatus(sequenceNumber)
-  → read binary metadata (version=1)
-  → reassemble map chunks → deserialise (nodeId, pkBytes, float[]) entries
-    → populate vectors, pkToNode, nodeToPk maps
-  → reassemble graph chunks → ByteBuffer → ByteBufferReader
-    → OnHeapGraphIndex.load(reader, dim, neighborOverflow, diversityProvider)
-    → new GraphIndexBuilder(bsp, dim, loadedGraph, ...)
-```
-
-### Restart / recovery — FusedPQ format (version=2, fusedPQ flag=1)
-
-```
-getIndexStatus(sequenceNumber)
-  → read binary metadata (version=2, fusedPQ=true)
-  → reassemble map chunks → deserialise (newOrdinal, pkBytes, float[]) entries
-    → populate onDiskNodeToPk, onDiskPkToNode maps
-  → reassemble graph chunks → byte[]
-    → ReaderSupplier: () -> new ByteBufferReader(ByteBuffer.wrap(graphBytes))
-    → OnDiskGraphIndex.load(readerSupplier)   → this.onDiskGraph
-    → keep graphBytes reference in this.onDiskGraphBytes
-  → create empty live GraphIndexBuilder for new inserts
-    → nextNodeId set to maxOnDiskOrdinal + 1
-```
-
-### Hybrid search (after FusedPQ load)
-
-```
-search(queryVector, topK):
-  1. If onDiskGraph != null and onDiskNodeToPk is non-empty:
-       activeOrdinals = onDiskNodeToPk.keySet()   // excludes deleted on-disk nodes
-       acceptBits = activeOrdinals::contains
-       approxSF = view.approximateScoreFunctionFor(qv, similarityFunction)  // FusedPQ
-       reranker  = view.rerankerFor(qv, similarityFunction)                 // InlineVectors
-       ssp = new DefaultSearchScoreProvider(approxSF, reranker)
-       sr  = GraphSearcher.search(ssp, k, acceptBits)
-       map ordinals → PKs via onDiskNodeToPk
-  2. If builder != null and nodeToPk is non-empty:
-       GraphSearcher.search(qv, k, mravv, similarityFunction, graph, Bits.ALL)
-       map nodeIds → PKs via nodeToPk
-  3. Merge both result lists, sort by score descending, return top-K
-```
-
-### Delete
-
-```
-recordDeleted(pk, indexKeyBytes)
-  → check onDiskPkToNode: if found, remove from onDiskPkToNode + onDiskNodeToPk
-    // on-disk graph is immutable; deleted ordinals are filtered at search time via acceptBits
-  → check pkToNode: if found, remove from pkToNode + nodeToPk
-    → builder.markNodeDeleted(nodeId)
-    // vector stays in vectors map until next checkpoint cleanup()
-```
-
-### Update
-
-```
-recordUpdated(pk, oldIndexKey, newIndexKey)
-  → recordDeleted(pk, oldIndexKey)
-  → recordInserted(pk, newIndexKey)   // assigns a new nodeId
-```
-
----
-
-## WITH Clause Parsing
-
-JSQLParser 3.2 does not support arbitrary trailing syntax on `CREATE INDEX` statements. The `WITH` clause is therefore handled by pre-processing the SQL string in `JSQLParserPlanner.translate()` before JSQLParser is invoked:
-
-1. `extractIndexWithClause(query)` scans the query string for `WITH` appearing outside of parentheses (i.e., after the column list).
-2. When found, the key=value pairs are parsed (whitespace around `=` is normalised; tokens are split on whitespace/commas).
-3. The parsed properties are stored in a `ThreadLocal<Map<String,String>>` (`PENDING_INDEX_PROPERTIES`).
-4. The query is returned with the `WITH …` suffix stripped.
-5. JSQLParser parses the clean query.
-6. `buildCreateIndexStatement()` reads and clears the ThreadLocal, applying properties to the `Index.Builder`.
-7. A `try/finally` in `translate()` guarantees the ThreadLocal is always cleared even on parse errors.
-
----
-
-## Storage Format
-
-The index is stored entirely through HerdDB's `DataStorageManager` page mechanism (same infrastructure used by BRIN indexes). No files outside HerdDB's tablespace directories are created at rest.
-
-> **Note:** The FusedPQ checkpoint path writes a temporary file (via `Files.createTempFile`) to satisfy `OnDiskGraphIndexWriter.Builder`'s file-path requirement. The file is read immediately after writing and deleted before the checkpoint returns.
-
-### Pages
-
-Two page types, each prefixed with a VInt type tag and a VInt length:
-
-```
-TYPE_VECTOR_GRAPHCHUNK = 12
-  VInt(12) | VInt(chunkLen) | byte[chunkLen]
-  // Legacy: raw bytes from OnHeapGraphIndex.save()
-  // FusedPQ: raw bytes of the OnDiskGraphIndex file
-
-TYPE_VECTOR_MAPCHUNK = 13
-  VInt(13) | VInt(chunkLen) | byte[chunkLen]
-  // Pieces of the serialised pk/vector map (see below)
-```
-
-### Metadata (stored in `IndexStatus.indexData`)
-
-A flat big-endian `ByteBuffer`:
-
-**Version 1 (legacy):**
-```
-int    version           = 1
-int    dimension
-int    M
-int    beamWidth
-float  neighborOverflow
-float  alpha
-byte   addHierarchy      (0 = false, reserved)
-int    nextNodeId
-int    numGraphChunks
-long[] graphChunkPageIds
-int    numMapChunks
-long[] mapChunkPageIds
-```
-
-**Version 2 (FusedPQ):**
-```
-int    version           = 2
-int    dimension
-int    M
-int    beamWidth
-float  neighborOverflow
-float  alpha
-byte   addHierarchy      (0 = false, reserved)
-byte   fusedPQ           (1 = FusedPQ format, 0 = legacy)
-int    nextNodeId
-int    numGraphChunks
-long[] graphChunkPageIds
-int    numMapChunks
-long[] mapChunkPageIds
-```
-
-### Map data — legacy format
-
-```
-int    entryCount
-for each entry:
-  int    nodeId
-  int    pkLen
-  byte[] pkBytes
-  int    floatCount   (= dimension)
-  float[] floats      (big-endian IEEE 754)
-```
-
-### Map data — FusedPQ format
-
-```
-int    entryCount
-for each entry:
-  int    newOrdinal   // sequential ordinal assigned by OnDiskGraphIndexWriter
-  int    pkLen
-  byte[] pkBytes
-  int    floatCount   (= dimension)
-  float[] floats      (big-endian IEEE 754)
-```
-
-The vectors are stored here for reference but are also embedded in the on-disk graph via `InlineVectors`. On load, the map data is used only to reconstruct the `onDiskNodeToPk` / `onDiskPkToNode` mappings.
-
-### Graph data
-
-- **Legacy:** raw bytes from `OnHeapGraphIndex.save(DataOutput)`. Internal jvector format (versioned, magic = `OnHeapGraphIndex.MAGIC`).
-- **FusedPQ:** raw bytes of a complete `OnDiskGraphIndex` file written by `OnDiskGraphIndexWriter`. Loaded via `OnDiskGraphIndex.load(ReaderSupplier)`.
-
----
-
-## Index Properties — Serialisation (Index.java version 2)
-
-`Index.properties` is a `Map<String,String>` stored in the index definition byte array. Version 1 index files (written before this feature) have an empty map on deserialisation.
-
-```
-Version 1 format (old):
-  VLong(1) | VLong(0) | tablespace | name | uuid | table | propertyBits | type | columns...
-
-Version 2 format (current):
-  VLong(2) | VLong(0) | tablespace | name | uuid | table | propertyBits | type | columns...
-  VInt(numProps)
-  for each property: UTF(key) | UTF(value)
-```
-
----
-
-## Node-ID Mapping
-
-jvector uses integer node IDs (0-based). HerdDB primary keys are arbitrary byte sequences (`Bytes`). Two separate mapping domains exist:
-
-**Live nodes** (in-memory, since last checkpoint):
-```
-pkToNode  : ConcurrentHashMap<Bytes, Integer>   // pk → nodeId
-nodeToPk  : ConcurrentHashMap<Integer, Bytes>   // nodeId → pk
-vectors   : ConcurrentHashMap<Integer, VectorFloat<?>>
-```
-
-**On-disk nodes** (loaded from FusedPQ checkpoint):
-```
-onDiskPkToNode  : ConcurrentHashMap<Bytes, Integer>   // pk → sequential ordinal
-onDiskNodeToPk  : ConcurrentHashMap<Integer, Bytes>   // sequential ordinal → pk
-```
-
-Live node IDs are assigned from `AtomicInteger nextNodeId` (starts at `maxOnDiskOrdinal + 1` after a FusedPQ load, to avoid collisions). Node IDs are never reused.
-
-`getNodeCount()` returns `nodeToPk.size() + onDiskNodeToPk.size()`.
-
----
-
-## Query Execution — `ann_of` and the Vector Index Path
+## SQL Integration
 
 ### The `ann_of` function
 
-`ann_of(vectorColumn, queryVector)` is a scalar SQL function that returns the cosine similarity between two float arrays. It is registered as a Calcite `ScalarFunction`. Without a vector index it produces the exact cosine value for every scanned row; with a vector index it triggers the `VectorANNScanOp` path.
+`ann_of(vectorColumn, queryVector)` is a scalar SQL function returning cosine similarity between two float arrays. Registered as a Calcite `ScalarFunction`.
 
-The similarity function used at query time always matches the one stored in the index definition (`vector.similarity` property, default `cosine`).
-
-### Calcite plan tree
+### Planner interception
 
 For `SELECT … ORDER BY ann_of(col, ?) DESC LIMIT k`:
 
-```
-EnumerableLimit
-  EnumerableProject        ← strips the hidden ann_of column if not in SELECT
-    EnumerableSort         ← ORDER BY the ann_of result
-      EnumerableProject    ← adds ann_of(col, ?) as an extra column
-        BindableTableScan  ← full scan (may carry WHERE filters)
-```
+1. `CalcitePlanner.planSort()` detects `ORDER BY ann_of()` pattern
+2. Creates `VectorANNScanOp` with compiled query vector expression
+3. `VectorANNScanOp.execute()` calls `VectorIndexManager.search()` (which delegates via gRPC)
+4. Fetches rows by PK, applies WHERE filter, projects columns
 
-### Planner interception — `planSort()`
+### WITH clause parsing
 
-`CalcitePlanner.planSort()` intercepts the `EnumerableSort` when:
-- There is exactly one sort key
-- The sort key is a `RexCall` with operator name `ANN_OF`
-- The immediate input is a `BindableTableScan`
-
-It then builds a `VectorANNScanOp` with a compiled query-vector expression, an optional compiled WHERE predicate, and a brute-force fallback `SortOp`.
-
-### `VectorANNScanOp` execution
-
-1. Finds the `VectorIndexManager` for the target column (if none exists, delegates to the brute-force fallback).
-2. Evaluates the query vector expression.
-3. Calls `VectorIndexManager.search(queryVector, Integer.MAX_VALUE)` → ordered `List<(Bytes pk, Float score)>`.
-4. For each `(pk, score)`: fetches the row by PK, applies the optional WHERE predicate, projects the row, appends the score.
-5. Returns a `ScanResult` in ANN order — no further sort needed.
-
-### WHERE + ANN
-
-`VectorANNScanOp` applies the WHERE predicate after the PK fetch. The index is queried with `topK = Integer.MAX_VALUE` to ensure enough candidates are returned before filtering. A future optimisation could pass the LIMIT (with oversampling) down to reduce the number of PKs fetched.
+`JSQLParserPlanner.extractIndexWithClause()` pre-processes the SQL to strip `WITH key=value ...` suffix before JSQLParser sees it, storing properties in a `ThreadLocal`. `buildCreateIndexStatement()` reads and applies them to the `Index.Builder`.
 
 ---
 
-## Known Limitations and Future Work
+## IndexingServiceEngine
 
-### LIMIT not pushed into ANN search
+The engine is the core component of the standalone IndexingService. It:
 
-`VectorANNScanOp` always calls `vim.search(queryVector, Integer.MAX_VALUE)`. Passing the LIMIT (with an oversampling factor) would reduce unnecessary PK fetches and row reads.
+1. **Tails the CommitLog** via `CommitLogTailer` — reads `.txlog` files from the database's WAL directory
+2. **Buffers transactions** via `TransactionBuffer` — delays DML application until COMMIT
+3. **Tracks schema** via `SchemaTracker` — processes DDL entries (CREATE/DROP TABLE/INDEX)
+4. **Manages vector stores** — creates `AbstractVectorStore` instances per vector index via `VectorStoreFactory`
+5. **Persists watermark** via `WatermarkStore` — tracks last processed LSN for restart recovery
+6. **Runs periodic checkpoints** via `ScheduledExecutorService` — triggers `PersistentVectorStore.checkpoint()` on all persistent stores
 
-### WHERE filtering is post-fetch
+### Storage type selection
 
-All candidates from the index are fetched by PK before the WHERE predicate is tested. For selective predicates this causes unnecessary row reads.
+On `start()`, the engine reads `indexing.storage.type` from configuration:
+- `"file"` (default): creates `PersistentVectorStore` instances backed by `FileDataStorageManager`
+- `"memory"`: creates `InMemoryVectorStore` instances (brute-force, for testing)
 
-### Only `ORDER BY ann_of(col, ?) [DESC|ASC]` is intercepted
+---
 
-The pattern requires exactly one sort key, `RexCall("ANN_OF")`, and a `BindableTableScan` directly below the inner project. Multi-table joins, sub-queries, and multi-column ORDER BY fall through to brute-force.
+## Known Limitations
 
-### FusedPQ requires ≥ 256 vectors
-
-jvector's `FusedPQ` currently requires exactly 256 PQ clusters. Checkpoints with fewer than 256 active vectors automatically fall back to the legacy `OnHeapGraphIndex` format. The FusedPQ path becomes active for subsequent checkpoints once the threshold is met.
-
-### Deleted-node accumulation between checkpoints
-
-Deleted live nodes are removed from `pkToNode`/`nodeToPk` immediately but their vectors stay in the `vectors` map until `builder.cleanup()` runs at checkpoint time.
-
-### Concurrent access
-
-`MapRandomAccessVectorValues` is thread-safe. `addGraphNode` is safe to call concurrently. `cleanup()` is `synchronized` in `GraphIndexBuilder` and must not be called concurrently with inserts.
-
-### Java version
-
-The project targets Java 8. The HerdDB integration code avoids `var` and other post-Java-8 constructs even though jvector itself uses them internally.
-
-### @Deprecated / @Experimental jvector APIs
-
-`OnHeapGraphIndex.save()` / `load()` and the `GraphIndexBuilder` constructor that accepts an existing `MutableGraphIndex` are marked deprecated/experimental in jvector 4.x. They are stable within the 4.x series but should be reviewed when upgrading jvector.
+- **LIMIT not pushed into ANN search.** `VectorANNScanOp` currently queries with `topK = Integer.MAX_VALUE`.
+- **WHERE filtering is post-fetch.** All ANN candidates are fetched by PK before WHERE is tested.
+- **FusedPQ requires ≥ 256 vectors.** Smaller indexes use the simpler OnHeapGraphIndex format.
+- **Single sort key only.** Multi-column ORDER BY and joins fall through to brute-force.
+- **Deleted vectors accumulate between checkpoints.** Vectors stay in `VectorStorage` until checkpoint cleanup.
 
 ---
 
@@ -502,77 +520,24 @@ The project targets Java 8. The HerdDB integration code avoids `var` and other p
 
 A standalone benchmark tool lives in `vector-testings/`. It measures ingestion throughput, index build time, ANN query latency/throughput, and recall accuracy against ground truth.
 
-### Prerequisites
-
-- JDK 21+
-- A running HerdDB server
-- The HerdDB modules installed locally (`mvn install -DskipTests` from the root)
-
-### Build
-
 ```bash
+# Build
 mvn -f vector-testings/pom.xml package -DskipTests
-```
 
-### Run
-
-```bash
-# Using the convenience script (auto-builds if needed)
-./vector-testings/run.sh [options]
-
-# Or directly
-java -jar vector-testings/target/vector-testings-*.jar [options]
-```
-
-### Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-u` / `--url` | `jdbc:herddb:server:localhost:7000` | JDBC connection URL |
-| `--user` | `sa` | Username |
-| `--password` | (empty) | Password |
-| `--dataset` | `sift1m` | Dataset preset: `sift1m`, `sift10m`, `bigann` |
-| `--dataset-url` | (per preset) | Override dataset download URL |
-| `--dataset-dir` | `./datasets` | Dataset download/cache directory |
-| `-n` / `--rows` | `100000` | Rows to ingest (cycles dataset if larger) |
-| `--ingest-threads` | `4` | Ingestion parallelism |
-| `--batch-size` | `500` | Commit after N inserts |
-| `--query-threads` | `4` | Query parallelism |
-| `--queries` | `1000` | Number of ANN queries |
-| `-k` | `10` | LIMIT K for queries |
-| `--m` | `16` | Vector index M parameter |
-| `--beam-width` | `100` | Vector index beamWidth |
-| `--skip-ingest` | `false` | Skip ingestion phase |
-| `--skip-index` | `false` | Skip index creation |
-| `--drop-table` | `false` | Drop and recreate table |
-
-### Datasets
-
-- **sift1m** — 1M vectors, 128 dims, ~170 MB download (fvecs format)
-- **sift10m** — First 10M vectors from BIGANN, 128 dims, ~98 GB download (bvecs format)
-- **bigann** — 1B vectors, 128 dims, ~98 GB download (bvecs format)
-
-The dataset is downloaded and cached automatically on first run.
-
-### Examples
-
-```bash
-# Quick smoke test with 1K rows
+# Quick smoke test
 ./vector-testings/run.sh --password secret -n 1000 --batch-size 100
 
 # Full SIFT-1M benchmark
 ./vector-testings/run.sh --password secret --dataset sift1m -n 1000000 --ingest-threads 8
 
-# Re-run queries only (data already loaded)
+# Queries only (data already loaded)
 ./vector-testings/run.sh --password secret --skip-ingest --skip-index --queries 5000 -k 20
-
-# Reset and re-run with custom index parameters
-./vector-testings/run.sh --password secret --drop-table -n 500000 --m 32 --beam-width 200
-
-# SIFT-10M benchmark
-./vector-testings/run.sh --password secret --dataset sift10m -n 10000000
 ```
 
-### Output
+### Datasets
 
-The tool prints metrics for each phase: ingestion throughput (ops/s), latency percentiles (p50/p95/p99), index creation time, query throughput (qps), and recall@K against ground truth.
+| Name | Vectors | Dimensions | Size |
+|------|---------|------------|------|
+| `sift1m` | 1M | 128 | ~170 MB |
+| `sift10m` | 10M | 128 | ~98 GB |
+| `bigann` | 1B | 128 | ~98 GB |

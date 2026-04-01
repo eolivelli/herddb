@@ -208,8 +208,8 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                             new Object[]{server, tablespace, target, instanceLsn});
                     return;
                 }
-                LOGGER.log(Level.INFO, "Instance {0} at {1} for tablespace {2}, waiting for {3}",
-                        new Object[]{server, instanceLsn, tablespace, target});
+                LOGGER.log(Level.INFO, "Instance {0} at {1} for tablespace {2}, waiting for {3} (currently {4} vectors in the index, status: {5})",
+                        new Object[]{server, instanceLsn, tablespace, target, resp.getVectorCount(), resp.getStatus()});
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Instance {0} unreachable for tablespace {1}, retrying: {2}",
                         new Object[]{server, tablespace, e.getMessage()});

@@ -22,7 +22,6 @@ package herddb.indexing;
 
 import java.nio.file.Path;
 import java.util.Arrays;
-import java.util.Properties;
 
 /**
  * Test helper that starts an IndexingService in-process (engine + gRPC server)
@@ -44,26 +43,34 @@ public class EmbeddedIndexingService implements AutoCloseable {
 
     private final Path logDirectory;
     private final Path dataDirectory;
-    private final Properties config;
+    private final IndexingServerConfiguration config;
     private IndexingServiceEngine engine;
     private IndexingServer server;
 
     public EmbeddedIndexingService(Path logDirectory, Path dataDirectory) {
-        this(logDirectory, dataDirectory, new Properties());
+        this(logDirectory, dataDirectory, defaultTestConfig());
     }
 
-    public EmbeddedIndexingService(Path logDirectory, Path dataDirectory, Properties config) {
+    public EmbeddedIndexingService(Path logDirectory, Path dataDirectory, IndexingServerConfiguration config) {
         this.logDirectory = logDirectory;
         this.dataDirectory = dataDirectory;
         this.config = config;
     }
 
+    private static IndexingServerConfiguration defaultTestConfig() {
+        java.util.Properties props = new java.util.Properties();
+        props.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "memory");
+        return new IndexingServerConfiguration(props);
+    }
+
     public void start() throws Exception {
         engine = new IndexingServiceEngine(logDirectory, dataDirectory, config);
-        engine.start();
 
+        // Start server first so it wires MemoryManager and DataStorageManager
+        // onto the engine before the engine starts and configures its VectorStoreFactory
         server = new IndexingServer("localhost", 0, engine, config);
         server.start();
+        engine.start();
     }
 
     public int getPort() {

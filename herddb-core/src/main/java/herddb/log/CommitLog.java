@@ -82,6 +82,15 @@ public abstract class CommitLog implements AutoCloseable {
 
     public abstract LogSequenceNumber getLastSequenceNumber();
 
+    /**
+     * Returns the LSN of the last entry actually written to the log.
+     * Unlike {@link #getLastSequenceNumber()}, this never returns a phantom LSN
+     * for a newly opened ledger that has no entries yet.
+     */
+    public LogSequenceNumber getLastWrittenSequenceNumber() {
+        return getLastSequenceNumber();
+    }
+
     public abstract void startWriting(int expectedReplicaCount) throws LogNotAvailableException;
 
     public abstract void clear() throws LogNotAvailableException;

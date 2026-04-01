@@ -20,6 +20,7 @@
 
 package herddb.indexing;
 
+import herddb.index.vector.AbstractVectorStore;
 import herddb.utils.Bytes;
 
 import java.util.AbstractMap;
@@ -34,28 +35,31 @@ import java.util.Map;
  *
  * @author enrico.olivelli
  */
-class InMemoryVectorStore {
+class InMemoryVectorStore extends AbstractVectorStore {
 
-    final String vectorColumnName;
     private final List<VectorEntry> entries = Collections.synchronizedList(new ArrayList<>());
 
     InMemoryVectorStore(String vectorColumnName) {
-        this.vectorColumnName = vectorColumnName;
+        super(vectorColumnName);
     }
 
-    void addVector(Bytes pk, float[] vector) {
+    @Override
+    public void addVector(Bytes pk, float[] vector) {
         entries.add(new VectorEntry(pk, vector));
     }
 
-    void removeVector(Bytes pk) {
+    @Override
+    public void removeVector(Bytes pk) {
         entries.removeIf(e -> e.pk.equals(pk));
     }
 
-    int size() {
+    @Override
+    public int size() {
         return entries.size();
     }
 
-    List<Map.Entry<Bytes, Float>> search(float[] queryVector, int topK) {
+    @Override
+    public List<Map.Entry<Bytes, Float>> search(float[] queryVector, int topK) {
         List<Map.Entry<Bytes, Float>> results = new ArrayList<>();
         // Take a snapshot to avoid ConcurrentModificationException
         List<VectorEntry> snapshot;
@@ -68,6 +72,29 @@ class InMemoryVectorStore {
         }
         results.sort((a, b) -> Float.compare(b.getValue(), a.getValue()));
         return results.size() <= topK ? results : results.subList(0, topK);
+    }
+
+    @Override
+    public long estimatedMemoryUsageBytes() {
+        long total = 0;
+        List<VectorEntry> snapshot;
+        synchronized (entries) {
+            snapshot = new ArrayList<>(entries);
+        }
+        for (VectorEntry entry : snapshot) {
+            total += entry.pk.to_array().length + (long) entry.vector.length * 4;
+        }
+        return total;
+    }
+
+    @Override
+    public void start() throws Exception {
+        // no-op for in-memory store
+    }
+
+    @Override
+    public void close() throws Exception {
+        entries.clear();
     }
 
     private static float cosineSimilarity(float[] a, float[] b) {
