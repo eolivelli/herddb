@@ -77,6 +77,7 @@ import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.IntFunction;
 import java.util.logging.Level;
@@ -225,6 +226,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /** Protects state swaps during checkpoint. */
     private final ReentrantReadWriteLock stateLock = new ReentrantReadWriteLock();
+
+    /** Prevents concurrent three-phase checkpoints from interleaving and losing data. */
+    private final ReentrantLock checkpointLock = new ReentrantLock();
 
     // -------------------------------------------------------------------------
     // Background compaction thread
@@ -744,6 +748,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     private void doCheckpoint() throws IOException, DataStorageManagerException {
+        if (!checkpointLock.tryLock()) {
+            LOGGER.log(Level.INFO, "checkpoint {0}: skipped (another checkpoint in progress)", indexName);
+            return;
+        }
+        try {
+            doCheckpointUnderLock();
+        } finally {
+            checkpointLock.unlock();
+        }
+    }
+
+    private void doCheckpointUnderLock() throws IOException, DataStorageManagerException {
         long checkpointStartMs = System.currentTimeMillis();
         LogSequenceNumber sequenceNumber = LogSequenceNumber.START_OF_TIME;
 

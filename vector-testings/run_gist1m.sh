@@ -16,4 +16,4 @@ set -x
 # specific language governing permissions and limitations
 # under the License.
 #
-./run.sh --password hdb --batch-size 10000 --ingest-threads 12 --dataset gist1m -n 10000001 --checkpoint "$@"
+./run.sh --password hdb --batch-size 10000 --ingest-threads 12 --dataset gist1m -n 1000000 --checkpoint "$@"

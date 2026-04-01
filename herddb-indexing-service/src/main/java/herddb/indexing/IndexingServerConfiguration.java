@@ -91,6 +91,10 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_COMPACTION_THREADS = "indexing.compaction.threads";
     public static final int PROPERTY_COMPACTION_THREADS_DEFAULT = 2;
 
+    // Apply parallelism
+    public static final String PROPERTY_APPLY_PARALLELISM = "indexing.apply.parallelism";
+    public static final int PROPERTY_APPLY_PARALLELISM_DEFAULT = 0; // 0 = auto: max(1, availableProcessors/2)
+
     // Storage
     public static final String PROPERTY_STORAGE_TYPE = "indexing.storage.type";
     public static final String PROPERTY_STORAGE_TYPE_DEFAULT = "file";

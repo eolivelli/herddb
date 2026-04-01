@@ -41,8 +41,9 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -80,7 +81,10 @@ public class IndexingServiceEngine implements AutoCloseable {
 
     private MemoryManager memoryManager;
     private DataStorageManager dataStorageManager;
-    private ScheduledExecutorService checkpointScheduler;
+
+    private ExecutorService[] applyWorkers;
+    private int applyParallelism;
+    private volatile Throwable asyncError;
 
     /**
      * In-memory vector stores keyed by "table.index".
@@ -189,18 +193,6 @@ public class IndexingServiceEngine implements AutoCloseable {
                 return store;
             };
 
-            // Start periodic checkpoint scheduler
-            long checkpointInterval = compactionInterval;
-            if (checkpointInterval > 0) {
-                checkpointScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-                    Thread t = new Thread(r, "indexing-checkpoint-scheduler");
-                    t.setDaemon(true);
-                    return t;
-                });
-                checkpointScheduler.scheduleWithFixedDelay(this::runCheckpointOnAllStores,
-                        checkpointInterval, checkpointInterval, TimeUnit.MILLISECONDS);
-                LOGGER.log(Level.INFO, "Checkpoint scheduler started, interval={0} ms", checkpointInterval);
-            }
         } else {
             LOGGER.info("Using InMemoryVectorStore factory (storage type: " + storageType + ")");
         }
@@ -214,6 +206,24 @@ public class IndexingServiceEngine implements AutoCloseable {
         schemaTracker = new SchemaTracker();
         transactionBuffer = new TransactionBuffer();
 
+        // Initialize striped DML apply workers
+        int configuredParallelism = config.getInt(
+                IndexingServerConfiguration.PROPERTY_APPLY_PARALLELISM,
+                IndexingServerConfiguration.PROPERTY_APPLY_PARALLELISM_DEFAULT);
+        applyParallelism = configuredParallelism > 0
+                ? configuredParallelism
+                : Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
+        applyWorkers = new ExecutorService[applyParallelism];
+        for (int i = 0; i < applyParallelism; i++) {
+            final int idx = i;
+            applyWorkers[i] = Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "indexing-apply-worker-" + idx);
+                t.setDaemon(true);
+                return t;
+            });
+        }
+        LOGGER.log(Level.INFO, "DML apply workers started, parallelism={0}", applyParallelism);
+
         // Create and start the tailer
         tailer = new CommitLogTailer(logDirectory, watermark, this::processEntry);
         tailerThread = new Thread(tailer, "indexing-service-tailer");
@@ -221,19 +231,6 @@ public class IndexingServiceEngine implements AutoCloseable {
         tailerThread.start();
 
         LOGGER.info("IndexingServiceEngine started, watermark=" + watermark);
-    }
-
-    private void runCheckpointOnAllStores() {
-        for (Map.Entry<String, AbstractVectorStore> entry : vectorStores.entrySet()) {
-            AbstractVectorStore store = entry.getValue();
-            if (store instanceof PersistentVectorStore) {
-                try {
-                    ((PersistentVectorStore) store).checkpoint();
-                } catch (Exception e) {
-                    LOGGER.log(Level.WARNING, "Checkpoint failed for store " + entry.getKey(), e);
-                }
-            }
-        }
     }
 
     /**
@@ -253,9 +250,7 @@ public class IndexingServiceEngine implements AutoCloseable {
                 case LogEntryType.COMMITTRANSACTION:
                     // Apply all buffered entries for this transaction
                     List<TransactionBuffer.BufferedLogEntry> buffered = transactionBuffer.commitTransaction(txId);
-                    for (TransactionBuffer.BufferedLogEntry be : buffered) {
-                        applyEntry(be.getLsn(), be.getEntry());
-                    }
+                    applyBufferedEntries(buffered);
                     break;
 
                 case LogEntryType.ROLLBACKTRANSACTION:
@@ -268,7 +263,7 @@ public class IndexingServiceEngine implements AutoCloseable {
                         transactionBuffer.addEntry(txId, lsn, entry);
                     } else {
                         // Non-transactional entry: apply immediately
-                        applyEntry(lsn, entry);
+                        applySingleEntry(lsn, entry);
                     }
                     break;
             }
@@ -278,11 +273,101 @@ public class IndexingServiceEngine implements AutoCloseable {
 
             // Periodically save watermark
             if (entriesSinceLastWatermarkSave >= WATERMARK_SAVE_INTERVAL_ENTRIES) {
+                awaitPendingWork();
                 saveWatermark();
             }
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error processing entry at LSN " + lsn + ": " + entry, e);
         }
+    }
+
+    private void applyBufferedEntries(List<TransactionBuffer.BufferedLogEntry> entries) {
+        for (TransactionBuffer.BufferedLogEntry be : entries) {
+            applySingleEntry(be.getLsn(), be.getEntry());
+        }
+    }
+
+    private void applySingleEntry(LogSequenceNumber lsn, LogEntry entry) {
+        if (isDdlType(entry.type)) {
+            // DDL must be synchronous: drain all pending DML first
+            awaitPendingWork();
+            applyEntry(lsn, entry);
+        } else if (isDmlType(entry.type)) {
+            checkAsyncError();
+            submitDmlAsync(lsn, entry);
+        } else {
+            applyEntry(lsn, entry);
+        }
+    }
+
+    private void submitDmlAsync(LogSequenceNumber lsn, LogEntry entry) {
+        int stripe = Math.floorMod(entry.key.hashCode(), applyParallelism);
+        applyWorkers[stripe].execute(() -> {
+            try {
+                applyEntry(lsn, entry);
+            } catch (Throwable t) {
+                asyncError = t;
+                LOGGER.log(Level.SEVERE, "Async DML apply failed at LSN " + lsn, t);
+            }
+        });
+    }
+
+    private void awaitPendingWork() {
+        if (applyWorkers == null) {
+            return;
+        }
+        CountDownLatch latch = new CountDownLatch(applyParallelism);
+        for (ExecutorService worker : applyWorkers) {
+            worker.execute(latch::countDown);
+        }
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting for pending DML work", e);
+        }
+        checkAsyncError();
+    }
+
+    private void checkAsyncError() {
+        Throwable err = asyncError;
+        if (err != null) {
+            asyncError = null;
+            throw new RuntimeException("Async DML apply failed", err);
+        }
+    }
+
+    private static boolean isDmlType(short type) {
+        return type == LogEntryType.INSERT
+                || type == LogEntryType.UPDATE
+                || type == LogEntryType.DELETE;
+    }
+
+    private static boolean isDdlType(short type) {
+        return type == LogEntryType.CREATE_TABLE
+                || type == LogEntryType.ALTER_TABLE
+                || type == LogEntryType.DROP_TABLE
+                || type == LogEntryType.TRUNCATE_TABLE
+                || type == LogEntryType.CREATE_INDEX
+                || type == LogEntryType.DROP_INDEX;
+    }
+
+    /**
+     * Routes entry through the async pipeline (used by tests).
+     * DDL entries are applied synchronously after draining pending work.
+     * DML entries are submitted to the striped apply workers.
+     */
+    // package-private for testing
+    void applySingleEntryForTest(LogSequenceNumber lsn, LogEntry entry) {
+        applySingleEntry(lsn, entry);
+    }
+
+    /**
+     * Drains all pending async DML work (used by tests).
+     */
+    // package-private for testing
+    void awaitPendingWorkForTest() {
+        awaitPendingWork();
     }
 
     /**
@@ -597,16 +682,6 @@ public class IndexingServiceEngine implements AutoCloseable {
     public void close() throws Exception {
         LOGGER.info("IndexingServiceEngine closing");
 
-        // Stop the checkpoint scheduler
-        if (checkpointScheduler != null) {
-            checkpointScheduler.shutdown();
-            try {
-                checkpointScheduler.awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-
         // Stop the tailer
         if (tailer != null) {
             tailer.close();
@@ -618,6 +693,29 @@ public class IndexingServiceEngine implements AutoCloseable {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+
+        // Drain and shut down apply workers
+        if (applyWorkers != null) {
+            try {
+                awaitPendingWork();
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Error draining apply workers during shutdown", e);
+            }
+            for (ExecutorService worker : applyWorkers) {
+                worker.shutdown();
+            }
+            for (ExecutorService worker : applyWorkers) {
+                try {
+                    if (!worker.awaitTermination(5, TimeUnit.SECONDS)) {
+                        worker.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    worker.shutdownNow();
+                    Thread.currentThread().interrupt();
+                }
+            }
+            LOGGER.info("DML apply workers shut down");
         }
 
         // Save final watermark
