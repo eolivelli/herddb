@@ -234,6 +234,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private volatile boolean running;
 
     // -------------------------------------------------------------------------
+    // Checkpoint statistics (observable by external metrics)
+    // -------------------------------------------------------------------------
+
+    private final AtomicLong lastCheckpointDurationMs = new AtomicLong(0);
+    private final AtomicLong lastCheckpointPhaseBDurationMs = new AtomicLong(0);
+    private final AtomicLong totalCheckpointCount = new AtomicLong(0);
+    private final AtomicLong totalFusedPQCheckpointCount = new AtomicLong(0);
+    private final AtomicLong totalSimpleCheckpointCount = new AtomicLong(0);
+    private final AtomicLong lastCheckpointVectorsProcessed = new AtomicLong(0);
+
+    // -------------------------------------------------------------------------
     // Test hook
     // -------------------------------------------------------------------------
 
@@ -255,6 +266,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
                                  long compactionIntervalMs, double memoryMultiplier) {
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName, tmpDirectory,
+                dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
+                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs, memoryMultiplier,
+                VectorSimilarityFunction.COSINE);
+    }
+
+    public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
+                                 String vectorColumnName, Path tmpDirectory,
+                                 DataStorageManager dataStorageManager,
+                                 MemoryManager memoryManager,
+                                 int m, int beamWidth, float neighborOverflow, float alpha,
+                                 boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
+                                 long compactionIntervalMs, double memoryMultiplier,
+                                 VectorSimilarityFunction similarityFunction) {
         super(vectorColumnName);
         this.indexName = indexName;
         this.tableName = tableName;
@@ -268,7 +293,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.neighborOverflow = neighborOverflow;
         this.alpha = alpha;
         this.fusedPQ = fusedPQ;
-        this.similarityFunction = VectorSimilarityFunction.COSINE;
+        this.similarityFunction = similarityFunction;
         this.maxSegmentSize = maxSegmentSize;
         this.maxLiveGraphSize = maxLiveGraphSize;
         this.compactionIntervalMs = compactionIntervalMs;
@@ -286,6 +311,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
                                  long compactionIntervalMs, double memoryMultiplier) {
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
+                dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
+                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs, memoryMultiplier,
+                VectorSimilarityFunction.COSINE);
+    }
+
+    /**
+     * Constructor that accepts an explicit indexUUID and similarity function.
+     */
+    public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
+                                 String vectorColumnName, String indexUUID, Path tmpDirectory,
+                                 DataStorageManager dataStorageManager,
+                                 MemoryManager memoryManager,
+                                 int m, int beamWidth, float neighborOverflow, float alpha,
+                                 boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
+                                 long compactionIntervalMs, double memoryMultiplier,
+                                 VectorSimilarityFunction similarityFunction) {
         super(vectorColumnName);
         this.indexName = indexName;
         this.tableName = tableName;
@@ -299,11 +341,35 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.neighborOverflow = neighborOverflow;
         this.alpha = alpha;
         this.fusedPQ = fusedPQ;
-        this.similarityFunction = VectorSimilarityFunction.COSINE;
+        this.similarityFunction = similarityFunction;
         this.maxSegmentSize = maxSegmentSize;
         this.maxLiveGraphSize = maxLiveGraphSize;
         this.compactionIntervalMs = compactionIntervalMs;
         this.memoryMultiplier = memoryMultiplier;
+    }
+
+    // -------------------------------------------------------------------------
+    // Similarity function parsing
+    // -------------------------------------------------------------------------
+
+    /**
+     * Parses a similarity string (from index properties) into a {@link VectorSimilarityFunction}.
+     * Accepted values: "cosine", "euclidean", "dot". Case-insensitive.
+     * Returns {@link VectorSimilarityFunction#COSINE} for null or unrecognized values.
+     */
+    public static VectorSimilarityFunction parseSimilarityFunction(String similarity) {
+        if (similarity == null) {
+            return VectorSimilarityFunction.COSINE;
+        }
+        switch (similarity.toLowerCase()) {
+            case "euclidean":
+                return VectorSimilarityFunction.EUCLIDEAN;
+            case "dot":
+                return VectorSimilarityFunction.DOT_PRODUCT;
+            case "cosine":
+            default:
+                return VectorSimilarityFunction.COSINE;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -568,16 +634,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
         List<Map.Entry<Bytes, Float>> results = new ArrayList<>();
         VectorFloat<?> qv = VTS.createFloatVector(queryVector);
 
+        // Overquery each source to improve recall when merging across segments.
+        // Each source returns more candidates; the final merge picks the true topK.
+        int perSourceK = topK * VectorSegment.OVERQUERY_FACTOR;
+
         // Search all on-disk segments
         List<VectorSegment> currentSegments = this.segments;
         for (VectorSegment seg : currentSegments) {
-            seg.search(qv, topK, similarityFunction, results);
+            seg.search(qv, perSourceK, similarityFunction, results);
         }
 
         // Search all live in-memory shards
         for (LiveGraphShard shard : liveShards) {
             if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
-                int k = Math.min(topK, shard.nodeToPk.size());
+                int k = Math.min(perSourceK, shard.nodeToPk.size());
                 ImmutableGraphIndex graph = shard.builder.getGraph();
                 SearchResult result = GraphSearcher.search(
                         qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
@@ -596,7 +666,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             Set<Bytes> pending = pendingCheckpointDeletes;
             for (LiveGraphShard shard : frozen) {
                 if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
-                    int k = Math.min(topK, shard.nodeToPk.size());
+                    int k = Math.min(perSourceK, shard.nodeToPk.size());
                     try {
                         ImmutableGraphIndex graph = shard.builder.getGraph();
                         SearchResult result = GraphSearcher.search(
@@ -674,6 +744,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     private void doCheckpoint() throws IOException, DataStorageManagerException {
+        long checkpointStartMs = System.currentTimeMillis();
         LogSequenceNumber sequenceNumber = LogSequenceNumber.START_OF_TIME;
 
         stateLock.writeLock().lock();
@@ -728,6 +799,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
             if (!useFusedPQ) {
                 doCheckpointSimpleUnderLock(sequenceNumber);
+                totalSimpleCheckpointCount.incrementAndGet();
+                totalCheckpointCount.incrementAndGet();
+                lastCheckpointVectorsProcessed.set(totalActiveVectors);
+                lastCheckpointDurationMs.set(System.currentTimeMillis() - checkpointStartMs);
                 return;
             }
         } finally {
@@ -736,6 +811,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         // FusedPQ path: use three-phase checkpoint
         doCheckpointFusedPQThreePhase(sequenceNumber);
+        totalFusedPQCheckpointCount.incrementAndGet();
+        totalCheckpointCount.incrementAndGet();
+        lastCheckpointDurationMs.set(System.currentTimeMillis() - checkpointStartMs);
     }
 
     /**
@@ -1136,6 +1214,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 // ignore
             }
             persistIndexStatusSimple(graphPageIds, mapPageIds, poolNodeToPk.size(), false, sequenceNumber);
+            lastCheckpointVectorsProcessed.set(poolNodeToPk.size());
             LOGGER.log(Level.INFO,
                     "checkpoint {0}: {1} nodes (simple fallback from FusedPQ)",
                     new Object[]{indexName, poolNodeToPk.size()});
@@ -1210,6 +1289,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         long phaseBElapsedMs = System.currentTimeMillis() - phaseBStartMs;
+        lastCheckpointPhaseBDurationMs.set(phaseBElapsedMs);
+        lastCheckpointVectorsProcessed.set(poolVectorsList.size());
         LOGGER.log(Level.INFO,
                 "checkpoint {0} Phase B: completed in {1} ms ({2} segments, {3} total vectors)",
                 new Object[]{indexName, phaseBElapsedMs, newSegmentResults.size(), poolVectorsList.size()});
@@ -2309,5 +2390,33 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public String getSimilarityFunction() {
         return similarityFunction.name();
+    }
+
+    public long getLastCheckpointDurationMs() {
+        return lastCheckpointDurationMs.get();
+    }
+
+    public long getLastCheckpointPhaseBDurationMs() {
+        return lastCheckpointPhaseBDurationMs.get();
+    }
+
+    public long getTotalCheckpointCount() {
+        return totalCheckpointCount.get();
+    }
+
+    public long getTotalFusedPQCheckpointCount() {
+        return totalFusedPQCheckpointCount.get();
+    }
+
+    public long getTotalSimpleCheckpointCount() {
+        return totalSimpleCheckpointCount.get();
+    }
+
+    public long getLastCheckpointVectorsProcessed() {
+        return lastCheckpointVectorsProcessed.get();
+    }
+
+    public long getLiveVectorsMemoryBytes() {
+        return estimatedMemoryUsageBytes();
     }
 }

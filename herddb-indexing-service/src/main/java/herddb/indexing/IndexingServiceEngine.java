@@ -24,6 +24,7 @@ import herddb.codec.DataAccessorForFullRecord;
 import herddb.core.MemoryManager;
 import herddb.index.vector.AbstractVectorStore;
 import herddb.index.vector.PersistentVectorStore;
+import herddb.index.vector.VectorIndexManager;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
 import herddb.log.LogSequenceNumber;
@@ -87,8 +88,10 @@ public class IndexingServiceEngine implements AutoCloseable {
      */
     private final ConcurrentHashMap<String, AbstractVectorStore> vectorStores = new ConcurrentHashMap<>();
 
-    private VectorStoreFactory vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir) ->
-            new InMemoryVectorStore(vectorColumnName);
+    private VectorStoreFactory vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir, indexProperties) ->
+            new InMemoryVectorStore(vectorColumnName,
+                    InMemoryVectorStore.parseSimilarityType(
+                            indexProperties != null ? indexProperties.get(VectorIndexManager.PROP_SIMILARITY) : null));
 
     private static String storeKey(String table, String index) {
         return table + "." + index;
@@ -168,13 +171,16 @@ public class IndexingServiceEngine implements AutoCloseable {
                     IndexingServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER,
                     IndexingServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER_DEFAULT);
 
-            vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir) -> {
+            vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir, indexProperties) -> {
+                var similarityFunction = PersistentVectorStore.parseSimilarityFunction(
+                        indexProperties != null ? indexProperties.get(VectorIndexManager.PROP_SIMILARITY) : null);
                 PersistentVectorStore store = new PersistentVectorStore(
                         indexName, tableName, "default", vectorColumnName,
                         tmpDir, dsm, mm,
                         m, beamWidth, neighborOverflow, alpha,
                         fusedPQ, maxSegmentSize, maxLiveGraphSize,
-                        compactionInterval, memoryMultiplier);
+                        compactionInterval, memoryMultiplier,
+                        similarityFunction);
                 try {
                     store.start();
                 } catch (Exception e) {
@@ -282,7 +288,8 @@ public class IndexingServiceEngine implements AutoCloseable {
     /**
      * Applies a single (committed or non-transactional) entry.
      */
-    private void applyEntry(LogSequenceNumber lsn, LogEntry entry) {
+    // package-private for testing
+    void applyEntry(LogSequenceNumber lsn, LogEntry entry) {
         switch (entry.type) {
             // DDL operations: update schema tracker
             case LogEntryType.CREATE_TABLE:
@@ -340,9 +347,11 @@ public class IndexingServiceEngine implements AutoCloseable {
         String key = storeKey(index.table, index.name);
         // The vector column is the first (and only) column of the vector index
         String vectorColumnName = index.columnNames[0];
-        vectorStores.put(key, vectorStoreFactory.create(index.name, index.table, vectorColumnName, dataDirectory));
-        LOGGER.log(Level.INFO, "Created vector store for index {0} on column {1}",
-                new Object[]{index.name, vectorColumnName});
+        AbstractVectorStore store = vectorStoreFactory.create(index.name, index.table, vectorColumnName, dataDirectory, index.properties);
+        vectorStores.put(key, store);
+        registerIndexMetrics(index.tablespace, index.table, index.name, store);
+        LOGGER.log(Level.INFO, "Created vector store for index {0} on column {1} with properties {2}",
+                new Object[]{index.name, vectorColumnName, index.properties});
     }
 
     private void applyInsert(LogEntry entry) {
@@ -422,7 +431,7 @@ public class IndexingServiceEngine implements AutoCloseable {
         try {
             watermarkStore.save(lastProcessedLsn);
             entriesSinceLastWatermarkSave = 0;
-            LOGGER.log(Level.INFO, "Saved watermark at {0}", lastProcessedLsn);
+            LOGGER.log(Level.FINE, "Saved watermark at {0}", lastProcessedLsn);
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to save watermark", e);
         }
@@ -497,10 +506,9 @@ public class IndexingServiceEngine implements AutoCloseable {
 
     /**
      * Registers per-index gauges for a vector index managed by this engine.
-     * Called when a VectorIndexManager instance is created for a vector index.
-     * The gauges report real data once the VectorIndexManager is wired in.
+     * Called when a vector store is created for a vector index.
      */
-    void registerIndexMetrics(String tablespace, String table, String indexName) {
+    void registerIndexMetrics(String tablespace, String table, String indexName, AbstractVectorStore store) {
         StatsLogger sl = this.statsLogger;
         if (sl == null) {
             return;
@@ -510,43 +518,79 @@ public class IndexingServiceEngine implements AutoCloseable {
                 .scope("table_" + table)
                 .scope("vidx_" + indexName);
 
-        // TODO: wire these gauges to actual VectorIndexManager instances
         indexStats.registerGauge("node_count", new Gauge<Integer>() {
             @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return 0; }
-        });
-        indexStats.registerGauge("live_node_count", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return 0; }
-        });
-        indexStats.registerGauge("ondisk_node_count", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return 0; }
-        });
-        indexStats.registerGauge("segment_count", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return 0; }
-        });
-        indexStats.registerGauge("dimension", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return 0; }
+            @Override public Integer getSample() {
+                return store.size();
+            }
         });
         indexStats.registerGauge("estimated_size_bytes", new Gauge<Long>() {
             @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return 0L; }
+            @Override public Long getSample() {
+                return store.estimatedMemoryUsageBytes();
+            }
         });
-        indexStats.registerGauge("live_vectors_memory_bytes", new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() { return 0L; }
-        });
-        indexStats.registerGauge("live_shard_count", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return 0; }
-        });
-        indexStats.registerGauge("dirty", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() { return 0; }
-        });
+
+        if (store instanceof PersistentVectorStore) {
+            PersistentVectorStore pvs = (PersistentVectorStore) store;
+
+            indexStats.registerGauge("live_node_count", new Gauge<Integer>() {
+                @Override public Integer getDefaultValue() { return 0; }
+                @Override public Integer getSample() { return pvs.getLiveNodeCount(); }
+            });
+            indexStats.registerGauge("ondisk_node_count", new Gauge<Integer>() {
+                @Override public Integer getDefaultValue() { return 0; }
+                @Override public Integer getSample() { return pvs.getOnDiskNodeCount(); }
+            });
+            indexStats.registerGauge("segment_count", new Gauge<Integer>() {
+                @Override public Integer getDefaultValue() { return 0; }
+                @Override public Integer getSample() { return pvs.getSegmentCount(); }
+            });
+            indexStats.registerGauge("dimension", new Gauge<Integer>() {
+                @Override public Integer getDefaultValue() { return 0; }
+                @Override public Integer getSample() { return pvs.getDimension(); }
+            });
+            indexStats.registerGauge("live_vectors_memory_bytes", new Gauge<Long>() {
+                @Override public Long getDefaultValue() { return 0L; }
+                @Override public Long getSample() { return pvs.getLiveVectorsMemoryBytes(); }
+            });
+            indexStats.registerGauge("live_shard_count", new Gauge<Integer>() {
+                @Override public Integer getDefaultValue() { return 0; }
+                @Override public Integer getSample() { return pvs.getLiveShardCount(); }
+            });
+            indexStats.registerGauge("dirty", new Gauge<Integer>() {
+                @Override public Integer getDefaultValue() { return 0; }
+                @Override public Integer getSample() { return pvs.isDirty() ? 1 : 0; }
+            });
+            indexStats.registerGauge("checkpoint_active", new Gauge<Integer>() {
+                @Override public Integer getDefaultValue() { return 0; }
+                @Override public Integer getSample() { return pvs.isCheckpointActive() ? 1 : 0; }
+            });
+            indexStats.registerGauge("checkpoint_count", new Gauge<Long>() {
+                @Override public Long getDefaultValue() { return 0L; }
+                @Override public Long getSample() { return pvs.getTotalCheckpointCount(); }
+            });
+            indexStats.registerGauge("checkpoint_fusedpq_count", new Gauge<Long>() {
+                @Override public Long getDefaultValue() { return 0L; }
+                @Override public Long getSample() { return pvs.getTotalFusedPQCheckpointCount(); }
+            });
+            indexStats.registerGauge("checkpoint_simple_count", new Gauge<Long>() {
+                @Override public Long getDefaultValue() { return 0L; }
+                @Override public Long getSample() { return pvs.getTotalSimpleCheckpointCount(); }
+            });
+            indexStats.registerGauge("checkpoint_duration_ms", new Gauge<Long>() {
+                @Override public Long getDefaultValue() { return 0L; }
+                @Override public Long getSample() { return pvs.getLastCheckpointDurationMs(); }
+            });
+            indexStats.registerGauge("checkpoint_phase_b_duration_ms", new Gauge<Long>() {
+                @Override public Long getDefaultValue() { return 0L; }
+                @Override public Long getSample() { return pvs.getLastCheckpointPhaseBDurationMs(); }
+            });
+            indexStats.registerGauge("checkpoint_vectors_processed", new Gauge<Long>() {
+                @Override public Long getDefaultValue() { return 0L; }
+                @Override public Long getSample() { return pvs.getLastCheckpointVectorsProcessed(); }
+            });
+        }
     }
 
     @Override

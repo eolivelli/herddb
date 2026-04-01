@@ -177,7 +177,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
         return results;
     }
 
-    private static final long CATCHUP_POLL_INTERVAL_MS = 500;
+    private static final long CATCHUP_POLL_INTERVAL_MS = 5000;
 
     @Override
     public void waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber) throws InterruptedException {
@@ -208,8 +208,8 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                             new Object[]{server, tablespace, target, instanceLsn});
                     return;
                 }
-                LOGGER.log(Level.INFO, "Instance {0} at {1} for tablespace {2}, waiting for {3} (currently {4} vectors in the index, status: {5})",
-                        new Object[]{server, instanceLsn, tablespace, target, resp.getVectorCount(), resp.getStatus()});
+                LOGGER.log(Level.INFO, "Instance {0} at {1} for tablespace {2}, waiting for {3} (status: {4})",
+                        new Object[]{server, instanceLsn, tablespace, target, resp.getStatus()});
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Instance {0} unreachable for tablespace {1}, retrying: {2}",
                         new Object[]{server, tablespace, e.getMessage()});

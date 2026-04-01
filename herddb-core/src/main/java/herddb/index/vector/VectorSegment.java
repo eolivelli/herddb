@@ -52,6 +52,12 @@ class VectorSegment implements Closeable {
 
     private static final Logger LOGGER = Logger.getLogger(VectorSegment.class.getName());
 
+    /**
+     * Overquery factor for approximate search: we ask jvector for more candidates
+     * than topK, then rerank them with exact scores to improve recall.
+     */
+    static final int OVERQUERY_FACTOR = 3;
+
     static Bytes ordinalToBytes(int ordinal) {
         byte[] b = new byte[4];
         b[0] = (byte) (ordinal >>> 24);
@@ -141,7 +147,8 @@ class VectorSegment implements Closeable {
             io.github.jbellis.jvector.graph.similarity.ScoreFunction.ExactScoreFunction reranker =
                     view.rerankerFor(qv, similarityFunction);
             DefaultSearchScoreProvider ssp = new DefaultSearchScoreProvider(approxSF, reranker);
-            SearchResult sr = searcher.search(ssp, k, acceptBits);
+            int rerankK = Math.min(k * OVERQUERY_FACTOR, activeCount);
+            SearchResult sr = searcher.search(ssp, k, rerankK, 0.0f, 0.0f, acceptBits);
             int matched = 0;
             for (SearchResult.NodeScore ns : sr.getNodes()) {
                 Bytes pk = getPkForOrdinal(ns.node);

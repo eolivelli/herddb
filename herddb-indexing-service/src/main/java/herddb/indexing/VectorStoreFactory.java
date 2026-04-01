@@ -22,6 +22,7 @@ package herddb.indexing;
 
 import herddb.index.vector.AbstractVectorStore;
 import java.nio.file.Path;
+import java.util.Map;
 
 /**
  * Factory for creating {@link AbstractVectorStore} instances.
@@ -32,5 +33,6 @@ import java.nio.file.Path;
 public interface VectorStoreFactory {
 
     AbstractVectorStore create(String indexName, String tableName,
-                               String vectorColumnName, Path dataDirectory);
+                               String vectorColumnName, Path dataDirectory,
+                               Map<String, String> indexProperties);
 }

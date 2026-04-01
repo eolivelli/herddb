@@ -31,16 +31,43 @@ import java.util.Map;
 
 /**
  * In-memory brute-force vector store used by the IndexingServiceEngine.
- * Stores vectors keyed by primary key and supports cosine similarity search.
+ * Stores vectors keyed by primary key and supports similarity search.
  *
  * @author enrico.olivelli
  */
 class InMemoryVectorStore extends AbstractVectorStore {
 
+    enum SimilarityType { COSINE, EUCLIDEAN, DOT }
+
     private final List<VectorEntry> entries = Collections.synchronizedList(new ArrayList<>());
+    private final SimilarityType similarityType;
 
     InMemoryVectorStore(String vectorColumnName) {
+        this(vectorColumnName, SimilarityType.COSINE);
+    }
+
+    InMemoryVectorStore(String vectorColumnName, SimilarityType similarityType) {
         super(vectorColumnName);
+        this.similarityType = similarityType;
+    }
+
+    SimilarityType getSimilarityType() {
+        return similarityType;
+    }
+
+    static SimilarityType parseSimilarityType(String similarity) {
+        if (similarity == null) {
+            return SimilarityType.COSINE;
+        }
+        switch (similarity.toLowerCase()) {
+            case "euclidean":
+                return SimilarityType.EUCLIDEAN;
+            case "dot":
+                return SimilarityType.DOT;
+            case "cosine":
+            default:
+                return SimilarityType.COSINE;
+        }
     }
 
     @Override
@@ -67,10 +94,16 @@ class InMemoryVectorStore extends AbstractVectorStore {
             snapshot = new ArrayList<>(entries);
         }
         for (VectorEntry entry : snapshot) {
-            float score = cosineSimilarity(queryVector, entry.vector);
+            float score = computeSimilarity(queryVector, entry.vector);
             results.add(new AbstractMap.SimpleEntry<>(entry.pk, score));
         }
-        results.sort((a, b) -> Float.compare(b.getValue(), a.getValue()));
+        if (similarityType == SimilarityType.EUCLIDEAN) {
+            // Lower distance = more similar
+            results.sort((a, b) -> Float.compare(a.getValue(), b.getValue()));
+        } else {
+            // Higher score = more similar (cosine, dot)
+            results.sort((a, b) -> Float.compare(b.getValue(), a.getValue()));
+        }
         return results.size() <= topK ? results : results.subList(0, topK);
     }
 
@@ -97,6 +130,18 @@ class InMemoryVectorStore extends AbstractVectorStore {
         entries.clear();
     }
 
+    private float computeSimilarity(float[] a, float[] b) {
+        switch (similarityType) {
+            case EUCLIDEAN:
+                return euclideanDistance(a, b);
+            case DOT:
+                return dotProduct(a, b);
+            case COSINE:
+            default:
+                return cosineSimilarity(a, b);
+        }
+    }
+
     private static float cosineSimilarity(float[] a, float[] b) {
         float dot = 0, normA = 0, normB = 0;
         int len = Math.min(a.length, b.length);
@@ -107,6 +152,25 @@ class InMemoryVectorStore extends AbstractVectorStore {
         }
         float denom = (float) (Math.sqrt(normA) * Math.sqrt(normB));
         return denom == 0 ? 0 : dot / denom;
+    }
+
+    private static float euclideanDistance(float[] a, float[] b) {
+        float sum = 0;
+        int len = Math.min(a.length, b.length);
+        for (int i = 0; i < len; i++) {
+            float diff = a[i] - b[i];
+            sum += diff * diff;
+        }
+        return (float) Math.sqrt(sum);
+    }
+
+    private static float dotProduct(float[] a, float[] b) {
+        float dot = 0;
+        int len = Math.min(a.length, b.length);
+        for (int i = 0; i < len; i++) {
+            dot += a[i] * b[i];
+        }
+        return dot;
     }
 
     private static class VectorEntry {
