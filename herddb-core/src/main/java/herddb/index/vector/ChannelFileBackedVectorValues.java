@@ -24,6 +24,7 @@ import herddb.core.PageReplacementPolicy;
 import herddb.index.brin.BlockRangeIndex;
 import herddb.index.brin.BlockRangeIndexMetadata;
 import herddb.storage.DataStorageManagerException;
+import herddb.utils.ObjectSizeUtils;
 import herddb.utils.SizeAwareObject;
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
@@ -397,7 +398,8 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
 
         @Override
         public long getEstimatedSize() {
-            return 20; // object header (~16) + int field (4)
+            // header + int field: 12+4=16 (compressed oops) or 16+4+4(padding)=24 (uncompressed)
+            return ObjectSizeUtils.COMPRESSED_OOPS ? 16L : 24L;
         }
 
         @Override
@@ -420,7 +422,8 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
 
         @Override
         public long getEstimatedSize() {
-            return 24; // object header (~16) + long field (8)
+            // header + long field: 12+4(padding)+8=24 (compressed oops) or 16+8=24 (uncompressed)
+            return 24L;
         }
 
         @Override

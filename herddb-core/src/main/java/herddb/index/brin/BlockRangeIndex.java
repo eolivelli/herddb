@@ -26,6 +26,7 @@ import herddb.core.Page.Metadata;
 import herddb.core.PageReplacementPolicy;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.EnsureLongIncrementAccumulator;
+import herddb.utils.ObjectSizeUtils;
 import herddb.utils.SizeAwareObject;
 import java.io.IOException;
 import java.util.AbstractMap;
@@ -56,8 +57,20 @@ public final class BlockRangeIndex<K extends Comparable<K> & SizeAwareObject, V 
 
     private static final Logger LOG = Logger.getLogger(BlockRangeIndex.class.getName());
 
-    private static final long ENTRY_CONSTANT_BYTE_SIZE = 93;
-    private static final long BLOCK_CONSTANT_BYTE_SIZE = 128;
+    /**
+     * Per-entry overhead in the block's TreeMap&lt;Key, List&lt;Val&gt;&gt;.
+     * Amortized cost includes TreeMap.Entry + ArrayList + backing Object[] array.
+     * <p>
+     * With compressed oops: ~93 bytes. Without: ~141 bytes.
+     */
+    private static final long ENTRY_CONSTANT_BYTE_SIZE = ObjectSizeUtils.COMPRESSED_OOPS ? 93L : 141L;
+
+    /**
+     * Per-block constant overhead: Block instance + ReentrantLock + empty TreeMap + BRINPage.
+     * <p>
+     * With compressed oops: ~128 bytes. Without: ~192 bytes.
+     */
+    private static final long BLOCK_CONSTANT_BYTE_SIZE = ObjectSizeUtils.COMPRESSED_OOPS ? 128L : 192L;
 
     private final long maxPageBlockSize;
     private final long minPageBlockSize;

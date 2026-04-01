@@ -29,7 +29,10 @@ import herddb.utils.Bytes;
 public final class BytesLongSizeEvaluator implements SizeEvaluator<Bytes, Long> {
 
     /**
-     * java.lang.Long object size: 12 (header) + 4 (padding) + 8 (value) = 24 bytes.
+     * java.lang.Long object size.
+     * With compressed oops: 12 (header) + 4 (padding) + 8 (value) = 24 bytes.
+     * Without compressed oops: 16 (header) + 8 (value) = 24 bytes.
+     * Long happens to be 24 bytes in both cases due to alignment.
      */
     private static final long LONG_SIZE = 24L;
 

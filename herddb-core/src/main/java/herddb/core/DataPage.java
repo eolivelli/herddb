@@ -22,6 +22,7 @@ package herddb.core;
 
 import herddb.model.Record;
 import herddb.utils.Bytes;
+import herddb.utils.ObjectSizeUtils;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Set;
@@ -38,14 +39,13 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 public final class DataPage extends Page<TableManager> {
 
     /**
-     * Constant entry size take in account map entry nodes:
-     *
-     * <pre>
-     * COUNT       AVG       SUM   DESCRIPTION
-     *     1        32        32   java.util.HashMap$Node
-     * </pre>
+     * Constant entry size accounting for HashMap$Node overhead.
+     * <p>
+     * HashMap$Node: header + hash(int) + key ref + value ref + next ref.
+     * With compressed oops: 12 + 4 + 4 + 4 + 4 + 4(padding) = 32 bytes.
+     * Without compressed oops: 16 + 4 + 4(padding) + 8 + 8 + 8 = 48 bytes.
      */
-    public static final long CONSTANT_ENTRY_BYTE_SIZE = 32;
+    public static final long CONSTANT_ENTRY_BYTE_SIZE = ObjectSizeUtils.COMPRESSED_OOPS ? 32L : 48L;
 
     public static long estimateEntrySize(Bytes key, byte[] value) {
         return Record.estimateSize(key, value) + DataPage.CONSTANT_ENTRY_BYTE_SIZE;

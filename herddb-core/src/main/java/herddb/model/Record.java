@@ -24,6 +24,7 @@ import herddb.codec.RecordSerializer;
 import herddb.utils.Bytes;
 import herddb.utils.DataAccessor;
 import herddb.utils.MapDataAccessor;
+import herddb.utils.ObjectSizeUtils;
 import herddb.utils.SizeAwareObject;
 import java.lang.ref.WeakReference;
 import java.util.Map;
@@ -37,33 +38,19 @@ import java.util.Objects;
 public final class Record implements SizeAwareObject {
 
     /**
-     * Constant size is internal data plus weak reference size (Bytes size is accounted during live estimation):
-     *
-     * <pre>
-     * herddb.model.Record object internals:
-     *  OFFSET  SIZE                          TYPE DESCRIPTION                               VALUE
-     *       0    12                               (object header)                           N/A
-     *      12     4            herddb.utils.Bytes Record.key                                N/A
-     *      16     4            herddb.utils.Bytes Record.value                              N/A
-     *      20     4   java.lang.ref.WeakReference Record.cache                              N/A
-     * Instance size: 24 bytes
-     * Space losses: 0 bytes internal + 0 bytes external = 0 bytes total
-     * </pre>
-     *
-     * <pre>
-     * java.lang.ref.WeakReference object internals:
-     *  OFFSET  SIZE                           TYPE DESCRIPTION                               VALUE
-     *       0    12                                (object header)                           N/A
-     *      12     4               java.lang.Object Reference.referent                        N/A
-     *      16     4   java.lang.ref.ReferenceQueue Reference.queue                           N/A
-     *      20     4        java.lang.ref.Reference Reference.next                            N/A
-     *      24     4        java.lang.ref.Reference Reference.discovered                      N/A
-     *      28     4                                (loss due to the next object alignment)
-     * Instance size: 32 bytes
-     * Space losses: 0 bytes internal + 4 bytes external = 4 bytes total
-     * </pre>
+     * Constant size is internal data plus weak reference size (Bytes size is accounted during live estimation).
+     * <p>
+     * Record: header + 3 refs (key, value, cache).
+     * With compressed oops: 12 + 3*4 = 24 bytes.
+     * Without compressed oops: 16 + 3*8 = 40 bytes.
+     * <p>
+     * WeakReference (extends Reference): header + 4 refs (referent, queue, next, discovered).
+     * With compressed oops: 12 + 4*4 + 4(padding) = 32 bytes.
+     * Without compressed oops: 16 + 4*8 = 48 bytes.
      */
-    private static final long CONSTANT_BYTE_SIZE = 24 + 32;
+    private static final long CONSTANT_BYTE_SIZE = ObjectSizeUtils.COMPRESSED_OOPS
+            ? (24 + 32)    // 56
+            : (40 + 48);   // 88
 
     public static long estimateSize(Bytes key, byte[] value) {
         return key.getEstimatedSize() + Bytes.estimateSize(value) + CONSTANT_BYTE_SIZE;

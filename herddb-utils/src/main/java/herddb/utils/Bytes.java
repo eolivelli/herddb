@@ -42,18 +42,17 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     private static final boolean BIG_ENDIAN_NATIVE_ORDER = ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN;
 
     /**
-     * <pre>
-     * herddb.utils.Bytes object internals:
-     *  OFFSET  SIZE               TYPE DESCRIPTION                               VALUE
-     *       0    12                    (object header)                           N/A
-     *      12     4                int Bytes.hashCode                            N/A
-     *      16     4             byte[] Bytes.data                                N/A
-     *      20     4   java.lang.Object Bytes.deserialized                        N/A
-     * Instance size: 24 bytes
-     * Space losses: 0 bytes internal + 0 bytes external = 0 bytes total
-     * </pre>
+     * Estimated size of a Bytes instance (excluding the data array contents).
+     * <p>
+     * With compressed oops (heap &lt; 32GB):
+     * header(12) + buffer ref(4) + offset(4) + length(4) + hashCode(4) + deserialized ref(4) = 32 bytes
+     * <p>
+     * Without compressed oops (heap &gt;= 32GB):
+     * header(16) + buffer ref(8) + offset(4) + length(4) + hashCode(4) + deserialized ref(8) + padding(4) = 48 bytes
      */
-    private static final int CONSTANT_BYTE_SIZE = 24;
+    private static final int CONSTANT_BYTE_SIZE = ObjectSizeUtils.COMPRESSED_OOPS
+            ? 32
+            : 48;
 
     public static long estimateSize(byte[] value) {
         return value.length + CONSTANT_BYTE_SIZE;

@@ -26,6 +26,7 @@ import herddb.core.PageReplacementPolicy;
 import herddb.index.blink.BLinkMetadata.BLinkNodeMetadata;
 import herddb.utils.BooleanHolder;
 import herddb.utils.Holder;
+import herddb.utils.ObjectSizeUtils;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.AbstractMap.SimpleImmutableEntry;
@@ -1747,53 +1748,27 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
     private static class Node<X extends Comparable<X>, Y> extends BLinkPage<X, Y> {
 
         /**
-         * <pre>
-         * herddb.index.blink.BLink$Node object internals:
-         *  OFFSET  SIZE                                         TYPE DESCRIPTION                               VALUE
-         *       0    12                                              (object header)                           N/A
-         *      12     4                       herddb.core.Page.Owner Page.owner                                N/A
-         *      16     8                                         long Page.pageId                               N/A
-         *      24     4                    herddb.core.Page.Metadata Page.metadata                             N/A
-         *      28     4                                          int Node.keys                                 N/A
-         *      32     8                                         long Node.storeId                              N/A
-         *      40     8                                         long Node.flushId                              N/A
-         *      48     8                                         long Node.size                                 N/A
-         *      56     1                                      boolean Node.leaf                                 N/A
-         *      57     1                                      boolean Node.empty                                N/A
-         *      58     1                                      boolean Node.loaded                               N/A
-         *      59     1                                      boolean Node.dirty                                N/A
-         *      60     4     java.util.concurrent.locks.ReadWriteLock Node.lock                                 N/A
-         *      64     4     java.util.concurrent.locks.ReadWriteLock Node.loadLock                             N/A
-         *      68     4   java.util.concurrent.ConcurrentSkipListMap Node.map                                  N/A
-         *      72     4                         java.lang.Comparable Node.rightsep                             N/A
-         *      76     4             herddb.index.blink.nn.BLink.Node Node.outlink                              N/A
-         *      80     4             herddb.index.blink.nn.BLink.Node Node.rightlink                            N/A
-         *      84     4                                              (loss due to the next object alignment)
-         * Instance size: 88 bytes
-         * Space losses: 0 bytes internal + 4 bytes external = 4 bytes total
-         * </pre>
+         * Estimated constant memory overhead for a BLink Node object.
          * <p>
-         * And still adding one of each:
-         * <pre>
-         * COUNT       AVG       SUM   DESCRIPTION
-         *   272        32      8704   java.util.concurrent.ConcurrentHashMap$Node
-         *   141        48      6768   java.util.concurrent.ConcurrentSkipListMap
-         *     8        16       128   java.util.concurrent.ConcurrentSkipListMap$EntrySet
-         *   209        32      6688   java.util.concurrent.ConcurrentSkipListMap$HeadIndex
-         *  3464        24     83136   java.util.concurrent.ConcurrentSkipListMap$Index
-         *     2        16        32   java.util.concurrent.locks.ReentrantLock
-         *     2        32        64   java.util.concurrent.locks.ReentrantLock$NonfairSync
-         *   283        24      6792   java.util.concurrent.locks.ReentrantReadWriteLock
-         *   283        48     13584   java.util.concurrent.locks.ReentrantReadWriteLock$NonfairSync
-         *   283        16      4528   java.util.concurrent.locks.ReentrantReadWriteLock$ReadLock
-         *   283        16      4528   java.util.concurrent.locks.ReentrantReadWriteLock$Sync$ThreadLocalHoldCounter
-         *   283        16      4528   java.util.concurrent.locks.ReentrantReadWriteLock$WriteLock
-         *
-         * One of each: 320 bytes
-         * </pre>
+         * Includes the Node instance itself, one TreeMap, and two ReentrantReadWriteLocks.
+         * <p>
+         * With compressed oops:
+         *   Node instance: 88 bytes, TreeMap: 48 bytes, 2x ReadWriteLock: 240 bytes = 376 bytes
+         * <p>
+         * Without compressed oops:
+         *   Node instance: 136 bytes, TreeMap: 64 bytes, 2x ReadWriteLock: 384 bytes = 584 bytes
          */
-        static final long NODE_CONSTANT_SIZE = 408L;
-        static final long ENTRY_CONSTANT_SIZE = /* ConcurrentSkipListMap$Node */ 42L;
+        static final long NODE_CONSTANT_SIZE = ObjectSizeUtils.COMPRESSED_OOPS ? 376L : 584L;
+
+        /**
+         * Estimated size of a single TreeMap.Entry (Red-Black tree node).
+         * <p>
+         * Fields: key ref, value ref, left ref, right ref, parent ref, boolean color.
+         * <p>
+         * With compressed oops: header(12) + 5 refs(20) + boolean(1) + padding(15) = 48 bytes
+         * Without compressed oops: header(16) + 5 refs(40) + boolean(1) + padding(7) = 64 bytes
+         */
+        static final long ENTRY_CONSTANT_SIZE = ObjectSizeUtils.COMPRESSED_OOPS ? 48L : 64L;
 
         long storeId;
 
