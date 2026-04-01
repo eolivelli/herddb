@@ -614,6 +614,121 @@
     },
     {
       "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 60,
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_backpressure_active\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": "0.5",
+          "title": "Back-Pressure Active",
+          "type": "singlestat",
+          "valueName": "current",
+          "colorBackground": true,
+          "colors": ["#299c46", "#d44a3a", "#d44a3a"],
+          "valueMaps": [
+            { "value": "0", "text": "OK", "op": "=" },
+            { "value": "1", "text": "THROTTLED", "op": "=" }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 61,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_backpressure_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Back-Pressure Events (cumulative)",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "short", "decimals": 0, "show": true },
+            { "format": "short", "show": true }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 62,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_backpressure_time_ms\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Cumulative Back-Pressure Time",
+          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "type": "graph",
+          "xaxis": { "mode": "time", "show": true },
+          "yaxes": [
+            { "format": "ms", "show": true },
+            { "format": "short", "show": true }
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Memory Back-Pressure",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
       "height": 300,
       "panels": [
         {

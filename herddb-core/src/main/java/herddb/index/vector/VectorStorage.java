@@ -93,4 +93,19 @@ class VectorStorage {
     int length() {
         return array.length();
     }
+
+    /**
+     * Shrinks the backing array if less than half is in use.
+     * Call after bulk removals (e.g., checkpoint Phase C) to reclaim memory.
+     */
+    synchronized void compact(int highestActiveNodeId) {
+        int newLen = Math.max(256, highestActiveNodeId + 1);
+        if (newLen < array.length() / 2) {
+            AtomicReferenceArray<VectorFloat<?>> na = new AtomicReferenceArray<>(newLen);
+            for (int i = 0; i < newLen && i < array.length(); i++) {
+                na.set(i, array.get(i));
+            }
+            array = na;
+        }
+    }
 }

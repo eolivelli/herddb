@@ -125,6 +125,14 @@ public class IndexingServer implements AutoCloseable {
         MemoryManager memoryManager = buildMemoryManager();
         engine.setMemoryManager(memoryManager);
 
+        // Set the effective vector memory limit for back-pressure enforcement
+        long maxVectorMemory = config.getLong(IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT,
+                IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT_DEFAULT);
+        long effectiveVectorMemoryLimit = maxVectorMemory <= 0
+                ? Runtime.getRuntime().maxMemory() / 2
+                : maxVectorMemory;
+        engine.setMaxVectorMemoryBytes(effectiveVectorMemoryLimit);
+
         DataStorageManager dataStorageManager = buildDataStorageManager(engine.getDataDirectory());
         engine.setDataStorageManager(dataStorageManager);
 

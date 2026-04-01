@@ -81,6 +81,7 @@ public class IndexingServiceEngine implements AutoCloseable {
 
     private MemoryManager memoryManager;
     private DataStorageManager dataStorageManager;
+    private long maxVectorMemoryBytes = Long.MAX_VALUE;
 
     private ExecutorService[] applyWorkers;
     private int applyParallelism;
@@ -120,6 +121,12 @@ public class IndexingServiceEngine implements AutoCloseable {
         LOGGER.log(Level.INFO, "MemoryManager set: maxDataUsedMemory={0} MB, maxLogicalPageSize={1}",
                 new Object[]{memoryManager.getMaxDataUsedMemory() / (1024 * 1024),
                              memoryManager.getMaxLogicalPageSize()});
+    }
+
+    public void setMaxVectorMemoryBytes(long maxVectorMemoryBytes) {
+        this.maxVectorMemoryBytes = maxVectorMemoryBytes;
+        LOGGER.log(Level.INFO, "MaxVectorMemoryBytes set: {0} MB",
+                new Object[]{maxVectorMemoryBytes / (1024 * 1024)});
     }
 
     public MemoryManager getMemoryManager() {
@@ -175,6 +182,7 @@ public class IndexingServiceEngine implements AutoCloseable {
                     IndexingServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER,
                     IndexingServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER_DEFAULT);
 
+            final long vectorMemLimit = maxVectorMemoryBytes;
             vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir, indexProperties) -> {
                 var similarityFunction = PersistentVectorStore.parseSimilarityFunction(
                         indexProperties != null ? indexProperties.get(VectorIndexManager.PROP_SIMILARITY) : null);
@@ -184,7 +192,7 @@ public class IndexingServiceEngine implements AutoCloseable {
                         m, beamWidth, neighborOverflow, alpha,
                         fusedPQ, maxSegmentSize, maxLiveGraphSize,
                         compactionInterval, memoryMultiplier,
-                        similarityFunction);
+                        similarityFunction, vectorMemLimit);
                 try {
                     store.start();
                 } catch (Exception e) {
@@ -674,6 +682,18 @@ public class IndexingServiceEngine implements AutoCloseable {
             indexStats.registerGauge("checkpoint_vectors_processed", new Gauge<Long>() {
                 @Override public Long getDefaultValue() { return 0L; }
                 @Override public Long getSample() { return pvs.getLastCheckpointVectorsProcessed(); }
+            });
+            indexStats.registerGauge("backpressure_active", new Gauge<Integer>() {
+                @Override public Integer getDefaultValue() { return 0; }
+                @Override public Integer getSample() { return pvs.isBackpressureActive() ? 1 : 0; }
+            });
+            indexStats.registerGauge("backpressure_count", new Gauge<Long>() {
+                @Override public Long getDefaultValue() { return 0L; }
+                @Override public Long getSample() { return pvs.getTotalBackpressureCount(); }
+            });
+            indexStats.registerGauge("backpressure_time_ms", new Gauge<Long>() {
+                @Override public Long getDefaultValue() { return 0L; }
+                @Override public Long getSample() { return pvs.getTotalBackpressureTimeMs(); }
             });
         }
     }
