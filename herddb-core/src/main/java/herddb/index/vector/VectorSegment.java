@@ -19,7 +19,6 @@
 
 package herddb.index.vector;
 
-import static herddb.index.vector.VectorIndexManager.ordinalToBytes;
 import herddb.index.blink.BLink;
 import herddb.utils.Bytes;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
@@ -52,6 +51,15 @@ import java.util.stream.StreamSupport;
 class VectorSegment implements Closeable {
 
     private static final Logger LOGGER = Logger.getLogger(VectorSegment.class.getName());
+
+    static Bytes ordinalToBytes(int ordinal) {
+        byte[] b = new byte[4];
+        b[0] = (byte) (ordinal >>> 24);
+        b[1] = (byte) (ordinal >>> 16);
+        b[2] = (byte) (ordinal >>> 8);
+        b[3] = (byte) ordinal;
+        return Bytes.from_array(b);
+    }
 
     final int segmentId;
     OnDiskGraphIndex onDiskGraph;
@@ -103,17 +111,23 @@ class VectorSegment implements Closeable {
                 List<Map.Entry<Bytes, Float>> results) {
         OnDiskGraphIndex odg = this.onDiskGraph;
         if (odg == null) {
+            LOGGER.log(Level.FINE, "segment {0}: skipping search, no on-disk graph", segmentId);
             return;
         }
         int[] offsets = this.pkOffsets;
         if (offsets == null) {
+            LOGGER.log(Level.FINE, "segment {0}: skipping search, no pk offsets", segmentId);
             return;
         }
         int activeCount = this.liveCount;
         int k = Math.min(topK, activeCount);
         if (k == 0) {
+            LOGGER.log(Level.FINE, "segment {0}: skipping search, no active nodes", segmentId);
             return;
         }
+        LOGGER.log(Level.FINE, "segment {0}: searching topK={1}, activeCount={2}, effectiveK={3}",
+                new Object[]{segmentId, topK, activeCount, k});
+        long segStart = System.nanoTime();
         Bits acceptBits = ordinal -> ordinal >= 0 && ordinal < offsets.length && offsets[ordinal] >= 0;
         try {
             GraphSearcher searcher = searcherCache.get();
@@ -128,12 +142,17 @@ class VectorSegment implements Closeable {
                     view.rerankerFor(qv, similarityFunction);
             DefaultSearchScoreProvider ssp = new DefaultSearchScoreProvider(approxSF, reranker);
             SearchResult sr = searcher.search(ssp, k, acceptBits);
+            int matched = 0;
             for (SearchResult.NodeScore ns : sr.getNodes()) {
                 Bytes pk = getPkForOrdinal(ns.node);
                 if (pk != null) {
                     results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+                    matched++;
                 }
             }
+            long segElapsedUs = java.util.concurrent.TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - segStart);
+            LOGGER.log(Level.FINE, "segment {0}: search completed in {1} us, {2} results matched",
+                    new Object[]{segmentId, segElapsedUs, matched});
         } catch (OutOfMemoryError e) {
             LOGGER.log(Level.SEVERE, "OOM searching on-disk graph segment " + segmentId, e);
             throw e;

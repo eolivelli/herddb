@@ -35,7 +35,18 @@ CONFIGFILE=conf/server.properties
 sed -i 's/#http.enable=true/http.enable=true/g' $CONFIGFILE
 sed -i 's/server.halt.on.tablespace.boot.error=false/server.halt.on.tablespace.boot.error=false/g' $CONFIGFILE
 export JAVA_OPTS="-XX:+UseG1GC -Djdk.attach.allowAttachSelf=true -Dherddb.vectorindex.rebuild.threads=8 -Dserver.checkpoint.memory.limit=8589934592 -Dserver.checkpoint.period=900000 -Duser.language=en -Xmx50g -Xms50g -Dio.netty.maxDirectMemory=0 -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$SERVER1DIR/server-heapdump.hprof -Djava.io.tmpdir=$(pwd)/tmp"
+echo "indexing.service.servers=localhost:9850" >> $CONFIGFILE
 bin/service server start
+cd ../..
+
+sleep 1
+
+# Start the indexing service
+cd $SERVER1DIR/herddb*
+INDEXING_CONFIGFILE=conf/indexingservice.properties
+echo "log.dir=dbdata/txlog" >> $INDEXING_CONFIGFILE
+export JAVA_OPTS="-XX:+UseG1GC -Djdk.attach.allowAttachSelf=true -Duser.language=en -Xmx2g -Xms2g -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -Djava.io.tmpdir=$(pwd)/tmp"
+bin/service indexing-service start
 cd ../..
 
 sleep 1

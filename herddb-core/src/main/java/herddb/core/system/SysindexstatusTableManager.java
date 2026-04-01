@@ -24,6 +24,7 @@ import herddb.codec.RecordSerializer;
 import herddb.core.AbstractIndexManager;
 import herddb.core.TableSpaceManager;
 import herddb.index.brin.BRINIndexManager;
+import herddb.index.vector.RemoteVectorIndexService;
 import herddb.index.vector.VectorIndexManager;
 import herddb.model.ColumnTypes;
 import herddb.model.Index;
@@ -87,24 +88,16 @@ public class SysindexstatusTableManager extends AbstractSystemTableManager {
         Map<String, Object> props = new LinkedHashMap<>();
         if (indexManager instanceof VectorIndexManager) {
             VectorIndexManager vim = (VectorIndexManager) indexManager;
-            props.put("nodeCount", vim.getNodeCount());
-            props.put("liveNodeCount", vim.getLiveNodeCount());
-            props.put("ondiskNodeCount", vim.getOnDiskNodeCount());
-            props.put("segmentCount", vim.getSegmentCount());
-            props.put("dimension", vim.getDimension());
-            props.put("m", vim.getM());
-            props.put("beamWidth", vim.getBeamWidth());
-            props.put("neighborOverflow", vim.getNeighborOverflow());
-            props.put("alpha", vim.getAlpha());
-            props.put("similarityFunction", vim.getSimilarityFunction());
-            props.put("fusedPQ", vim.isFusedPQEnabled());
-            props.put("maxSegmentSize", vim.getMaxSegmentSize());
-            props.put("estimatedSizeBytes", vim.getEstimatedSizeBytes());
-            props.put("dirty", vim.isDirty());
-            props.put("checkpointActive", vim.isCheckpointActive());
-            props.put("liveShardCount", vim.getLiveShardCount());
-            props.put("maxLiveGraphSize", vim.getMaxLiveGraphSize());
-            props.put("effectiveMaxLiveGraphSize", vim.getEffectiveMaxLiveGraphSize());
+            try {
+                RemoteVectorIndexService.IndexStatusInfo status = vim.getRemoteIndexStatus();
+                props.put("vectorCount", status.getVectorCount());
+                props.put("segmentCount", status.getSegmentCount());
+                props.put("lastLsnLedger", status.getLastLsnLedger());
+                props.put("lastLsnOffset", status.getLastLsnOffset());
+                props.put("status", status.getStatus());
+            } catch (Exception e) {
+                props.put("error", e.getMessage());
+            }
         } else if (indexManager instanceof BRINIndexManager) {
             BRINIndexManager brin = (BRINIndexManager) indexManager;
             props.put("numBlocks", brin.getNumBlocks());

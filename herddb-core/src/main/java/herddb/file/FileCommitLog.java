@@ -32,6 +32,7 @@ import herddb.utils.ODirectFileOutputStream;
 import herddb.utils.OpenFileUtils;
 import herddb.utils.SimpleBufferedOutputStream;
 import herddb.utils.SystemProperties;
+import herddb.utils.TailableFileInputStream;
 import java.io.BufferedInputStream;
 import java.io.EOFException;
 import java.io.IOException;
@@ -275,6 +276,25 @@ public class FileCommitLog extends CommitLog {
             return new CommitFileReader(in, ledgerId);
         }
 
+        /**
+         * Opens a reader suitable for tailing a file that is being actively appended to.
+         * Unlike {@link #openForDescribeRawfile(Path)}, this reader uses a
+         * {@link TailableFileInputStream} that does not cache EOF, so subsequent
+         * calls to {@link #nextEntry()} will see newly appended data.
+         */
+        public static CommitFileReader openForTailing(Path filename) throws IOException {
+            ExtendedDataInputStream in = new ExtendedDataInputStream(
+                    new TailableFileInputStream(filename));
+            String lastPath = (filename.getFileName() + "").replace(LOGFILEEXTENSION, "");
+            long ledgerId;
+            try {
+                ledgerId = Long.valueOf(lastPath, 16);
+            } catch (NumberFormatException err) {
+                ledgerId = 0;
+            }
+            return new CommitFileReader(in, ledgerId);
+        }
+
         private CommitFileReader(Path logDirectory, long ledgerId) throws IOException {
             this.ledgerId = ledgerId;
             Path filename = logDirectory.resolve(String.format("%016x", ledgerId) + LOGFILEEXTENSION);
@@ -284,6 +304,12 @@ public class FileCommitLog extends CommitLog {
 
         public LogEntryWithSequenceNumber nextEntry() throws IOException {
             byte entryStart;
+            // Mark position before reading so we can rewind if we hit a partial entry.
+            // This is critical for tailable readers: the writer may not have finished
+            // writing the entry yet, and we need to retry from the start on the next poll.
+            if (in.markSupported()) {
+                in.mark(Integer.MAX_VALUE);
+            }
             try {
                 try {
                     entryStart = in.readByte();
@@ -311,7 +337,13 @@ public class FileCommitLog extends CommitLog {
             } catch (EOFException truncatedLog) {
                 // if we hit EOF the entry has not been written, and so not acked, we can ignore it and say that the file is finished
                 // it is important that this is the last file in the set
-                LOGGER.log(Level.SEVERE, "found unfinished entry in file " + this.ledgerId + ". entry was not acked. ignoring " + truncatedLog);
+                if (in.markSupported()) {
+                    // Rewind so the next call retries this partial entry once more data is available
+                    LOGGER.log(Level.FINE, "found partial entry in file " + this.ledgerId + ", rewinding to retry later");
+                    in.reset();
+                } else {
+                    LOGGER.log(Level.SEVERE, "found unfinished entry in file " + this.ledgerId + ". entry was not acked. ignoring " + truncatedLog);
+                }
                 return null;
             }
         }

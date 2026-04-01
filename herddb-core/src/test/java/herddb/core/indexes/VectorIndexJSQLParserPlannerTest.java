@@ -35,6 +35,7 @@ import herddb.model.StatementExecutionException;
 import herddb.model.TransactionContext;
 import herddb.model.commands.CreateTableSpaceStatement;
 import herddb.server.ServerConfiguration;
+import herddb.utils.Bytes;
 import herddb.utils.DataAccessor;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -52,7 +53,8 @@ public class VectorIndexJSQLParserPlannerTest {
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
 
-    private DBManager buildManager(Path dataPath, Path logsPath, Path metadataPath, Path tmoDir, String nodeId) throws Exception {
+    private DBManager buildManager(Path dataPath, Path logsPath, Path metadataPath, Path tmoDir, String nodeId,
+                                    MockRemoteVectorIndexService mockService) throws Exception {
         ServerConfiguration config = new ServerConfiguration();
         config.set(ServerConfiguration.PROPERTY_PLANNER_TYPE, ServerConfiguration.PLANNER_TYPE_JSQLPARSER);
         DBManager manager = new DBManager(nodeId,
@@ -60,6 +62,7 @@ public class VectorIndexJSQLParserPlannerTest {
                 new FileDataStorageManager(dataPath),
                 new FileCommitLogManager(logsPath),
                 tmoDir, null, config, null);
+        manager.setRemoteVectorIndexService(mockService);
         return manager;
     }
 
@@ -83,7 +86,12 @@ public class VectorIndexJSQLParserPlannerTest {
         final float[] query = {0.05f, 0.99f, 0.0f};
         normalize(query);
 
-        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmoDir, nodeId)) {
+        MockRemoteVectorIndexService mockService = new MockRemoteVectorIndexService();
+        mockService.addVector("t1", "vidx", Bytes.from_int(1), vecX);
+        mockService.addVector("t1", "vidx", Bytes.from_int(2), vecY);
+        mockService.addVector("t1", "vidx", Bytes.from_int(3), vecZ);
+
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmoDir, nodeId, mockService)) {
             manager.start();
             CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
                     "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
@@ -134,7 +142,13 @@ public class VectorIndexJSQLParserPlannerTest {
         final float[] query = {0.05f, 0.99f, 0.0f};
         normalize(query);
 
-        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmoDir, nodeId)) {
+        MockRemoteVectorIndexService mockService = new MockRemoteVectorIndexService();
+        mockService.addVector("t1", "vidx", Bytes.from_int(1), vecX);
+        mockService.addVector("t1", "vidx", Bytes.from_int(2), vecY);
+        mockService.addVector("t1", "vidx", Bytes.from_int(3), vecZ);
+        mockService.addVector("t1", "vidx", Bytes.from_int(4), vecW);
+
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmoDir, nodeId, mockService)) {
             manager.start();
             CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
                     "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
@@ -184,7 +198,8 @@ public class VectorIndexJSQLParserPlannerTest {
         final float[] query = {0.05f, 0.99f, 0.0f};
         normalize(query);
 
-        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmoDir, nodeId)) {
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmoDir, nodeId,
+                new MockRemoteVectorIndexService())) {
             manager.start();
             CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
                     "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);

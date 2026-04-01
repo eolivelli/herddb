@@ -1977,14 +1977,10 @@ public class TableSpaceManager {
                         writeLockTimeout, readLockTimeout);
                 break;
             case Index.TYPE_VECTOR:
-                long vectorMaxSegmentSize = dbmanager.getServerConfiguration().getLong(
-                        ServerConfiguration.PROPERTY_VECTOR_MAX_SEGMENT_SIZE,
-                        ServerConfiguration.PROPERTY_VECTOR_MAX_SEGMENT_SIZE_DEFAULT);
-                StatsLogger vectorMetrics = tablespaceStasLogger
-                        .scope("table_" + index.table)
-                        .scope("vidx_" + index.name);
-                indexManager = new VectorIndexManager(index, dbmanager.getMemoryManager(), tableManager, log, dataStorageManager, this, tableSpaceUUID, transaction,
-                        writeLockTimeout, readLockTimeout, vectorMaxSegmentSize, dbmanager.getVectorMemoryMultiplier(), vectorMetrics);
+                indexManager = new VectorIndexManager(index, tableManager, log,
+                        dataStorageManager, tableSpaceUUID, transaction,
+                        writeLockTimeout, readLockTimeout,
+                        dbmanager.getRemoteVectorIndexService());
                 break;
             default:
                 throw new DataStorageManagerException("invalid NON-UNIQUE index type " + index.type);

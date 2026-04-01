@@ -23,18 +23,23 @@ package herddb.server;
 import static java.util.Locale.ROOT;
 import static java.util.stream.Collectors.toMap;
 import herddb.daemons.PidFileLocker;
+import herddb.index.vector.RemoteVectorIndexService;
+import herddb.indexing.IndexingServiceClient;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStreamReader;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
 import java.util.logging.Level;
 import java.util.logging.LogManager;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
 import org.apache.bookkeeper.stats.prometheus.PrometheusMetricsProvider;
 import org.apache.bookkeeper.stats.prometheus.PrometheusServlet;
 import org.apache.commons.configuration.PropertiesConfiguration;
@@ -60,6 +65,7 @@ public class ServerMain implements AutoCloseable {
     private final Properties configuration;
     private final PidFileLocker pidFileLocker;
     private Server server;
+    private RemoteVectorIndexService remoteVectorIndexService;
     private org.eclipse.jetty.server.Server httpserver;
     private boolean started;
     private String uiurl;
@@ -82,6 +88,15 @@ public class ServerMain implements AutoCloseable {
                 Logger.getLogger(ServerMain.class.getName()).log(Level.SEVERE, null, ex);
             } finally {
                 server = null;
+            }
+        }
+        if (remoteVectorIndexService != null) {
+            try {
+                remoteVectorIndexService.close();
+            } catch (Exception ex) {
+                Logger.getLogger(ServerMain.class.getName()).log(Level.SEVERE, null, ex);
+            } finally {
+                remoteVectorIndexService = null;
             }
         }
         if (httpserver != null) {
@@ -216,6 +231,24 @@ public class ServerMain implements AutoCloseable {
         ServerConfiguration config = new ServerConfiguration(this.configuration);
 
         server = new Server(config, statsProvider);
+
+        String indexingServers = config.getString(
+                ServerConfiguration.PROPERTY_INDEXING_SERVICE_SERVERS,
+                ServerConfiguration.PROPERTY_INDEXING_SERVICE_SERVERS_DEFAULT);
+        if (!indexingServers.isEmpty()) {
+            long timeout = config.getLong(
+                    ServerConfiguration.PROPERTY_INDEXING_SERVICE_TIMEOUT,
+                    ServerConfiguration.PROPERTY_INDEXING_SERVICE_TIMEOUT_DEFAULT);
+            List<String> serverList = Arrays.stream(indexingServers.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .collect(Collectors.toList());
+            LOGGER.log(Level.INFO, "Configuring IndexingService client with servers: {0}, timeout: {1}s",
+                    new Object[]{serverList, timeout});
+            remoteVectorIndexService = new IndexingServiceClient(serverList, timeout);
+            server.getManager().setRemoteVectorIndexService(remoteVectorIndexService);
+        }
+
         server.start();
 
         boolean httpEnabled = config.getBoolean("http.enable", true);

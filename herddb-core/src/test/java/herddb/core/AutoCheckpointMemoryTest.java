@@ -25,10 +25,10 @@ import static herddb.core.TestUtils.executeUpdate;
 import static herddb.model.TransactionContext.NO_TRANSACTION;
 import static org.junit.Assert.assertTrue;
 
+import herddb.core.indexes.MockRemoteVectorIndexService;
 import herddb.file.FileCommitLogManager;
 import herddb.file.FileDataStorageManager;
 import herddb.file.FileMetadataStorageManager;
-import herddb.index.vector.VectorIndexManager;
 import herddb.model.StatementEvaluationContext;
 import herddb.model.commands.CreateTableSpaceStatement;
 import java.nio.file.Path;
@@ -39,8 +39,10 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 /**
- * Tests that a checkpoint is automatically triggered when a tablespace's
- * estimated memory usage exceeds the configured limit.
+ * Tests that a checkpoint works correctly with a remote vector index service.
+ * In remote mode, vector index memory estimation returns 0 (no local state),
+ * so memory-triggered checkpoints are not relevant for vector indexes.
+ * This test verifies the basic checkpoint+vector index lifecycle doesn't fail.
  */
 public class AutoCheckpointMemoryTest {
 
@@ -48,7 +50,7 @@ public class AutoCheckpointMemoryTest {
     public TemporaryFolder folder = new TemporaryFolder();
 
     @Test
-    public void testMemoryTriggeredCheckpoint() throws Exception {
+    public void testCheckpointWithRemoteVectorIndex() throws Exception {
         Path dataPath = folder.newFolder("data").toPath();
         Path logsPath = folder.newFolder("logs").toPath();
         Path metadataPath = folder.newFolder("metadata").toPath();
@@ -56,7 +58,7 @@ public class AutoCheckpointMemoryTest {
 
         String nodeId = "localhost";
         final int dimension = 8;
-        final int numRows = 500;
+        final int numRows = 50;
 
         try (DBManager manager = new DBManager(nodeId,
                 new FileMetadataStorageManager(metadataPath),
@@ -64,15 +66,7 @@ public class AutoCheckpointMemoryTest {
                 new FileCommitLogManager(logsPath),
                 tmoDir, null)) {
 
-            // Use a long time-based period so only the memory trigger fires
-            manager.setCheckpointPeriod(600_000);
-            // Set a low memory limit so the memory trigger fires after a few hundred vectors
-            // Each vector: 8 floats * 4 bytes * 5.0 multiplier = 160 bytes estimated
-            // 500 vectors ≈ 80 KB estimated vector memory (plus table data)
-            // Set limit low enough that it will be exceeded
-            manager.setCheckpointMemoryLimit(10_000);
-            manager.setVectorMemoryMultiplier(5.0);
-
+            manager.setRemoteVectorIndexService(new MockRemoteVectorIndexService());
             manager.start();
             CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
                     "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
@@ -84,7 +78,6 @@ public class AutoCheckpointMemoryTest {
             execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
                     Collections.emptyList());
 
-            // Insert enough vector data to exceed the memory limit
             for (int i = 1; i <= numRows; i++) {
                 float[] vec = randomVec(dimension, i);
                 executeUpdate(manager,
@@ -92,26 +85,12 @@ public class AutoCheckpointMemoryTest {
                         Arrays.asList(i, vec));
             }
 
-            VectorIndexManager vim = (VectorIndexManager)
-                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").get("vidx");
+            // Checkpoint should succeed with remote vector index
+            manager.checkpoint();
 
-            long lastCheckpoint = manager.getLastCheckPointTs();
-
-            // Wait for the activator to detect memory pressure and trigger checkpoint
-            // The activator polls every 1 second
-            boolean checkpointTriggered = false;
-            for (int i = 0; i < 30; i++) {
-                Thread.sleep(1000);
-                if (manager.getLastCheckPointTs() != lastCheckpoint) {
-                    checkpointTriggered = true;
-                    break;
-                }
-            }
-
-            assertTrue("A memory-triggered checkpoint should have occurred", checkpointTriggered);
-            // After checkpoint, live vectors should have been flushed to disk
-            assertTrue("Live node count should be less than total after checkpoint",
-                    vim.getLiveNodeCount() < numRows);
+            // Verify the index is still present after checkpoint
+            assertTrue("vidx must be present after checkpoint",
+                    manager.getTableSpaceManager("tblspace1").getIndexesOnTable("t1").containsKey("vidx"));
         }
     }
 

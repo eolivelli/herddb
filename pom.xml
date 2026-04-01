@@ -677,6 +677,7 @@
                 <module>herddb-thirdparty</module>
                 <module>herddb-docker</module>
                 <module>herddb-remote-file-service</module>
+                <module>herddb-indexing-service</module>
                 <module>vector-testings</module>
             </modules>
             <distributionManagement>
@@ -883,6 +884,7 @@
                 <module>herddb-backward-compatibility</module>
                 <module>herddb-docker</module>
                 <module>herddb-remote-file-service</module>
+                <module>herddb-indexing-service</module>
                 <module>vector-testings</module>
             </modules>
             <build>

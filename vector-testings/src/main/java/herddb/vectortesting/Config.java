@@ -52,9 +52,9 @@ public class Config {
     boolean checkpoint = false;
     int clientTimeoutSeconds = 7200 * 4; // 8 hours
     String similarity = null; // null = use dataset default
-    boolean indexBeforeIngest = false;
+    boolean indexBeforeIngest = true;
     int resumeFrom = 0; // skip first N vectors; row IDs start from N
-    int ingestMaxOpsPerSecond = 10_000; // 0 = unlimited
+    int ingestMaxOpsPerSecond = 100_000; // 0 = unlimited
 
     private static Options buildOptions() {
         Options opts = new Options();

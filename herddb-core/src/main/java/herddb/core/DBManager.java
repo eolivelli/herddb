@@ -152,6 +152,7 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
     private long checkpointPeriod;
     private long checkpointMemoryLimit;
     private double vectorMemoryMultiplier = ServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER_DEFAULT;
+    private herddb.index.vector.RemoteVectorIndexService remoteVectorIndexService;
     private long abandonedTransactionsTimeout;
     private final StatsLogger mainStatsLogger;
 
@@ -1535,6 +1536,14 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
 
     public void setVectorMemoryMultiplier(double vectorMemoryMultiplier) {
         this.vectorMemoryMultiplier = vectorMemoryMultiplier;
+    }
+
+    public herddb.index.vector.RemoteVectorIndexService getRemoteVectorIndexService() {
+        return remoteVectorIndexService;
+    }
+
+    public void setRemoteVectorIndexService(herddb.index.vector.RemoteVectorIndexService remoteVectorIndexService) {
+        this.remoteVectorIndexService = remoteVectorIndexService;
     }
 
     public long getAbandonedTransactionsTimeout() {

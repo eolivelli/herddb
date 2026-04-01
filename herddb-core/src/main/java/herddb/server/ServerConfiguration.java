@@ -353,6 +353,11 @@ public final class ServerConfiguration {
     public static final String PROPERTY_VECTOR_MAX_SEGMENT_SIZE = "server.vector.max.segment.size";
     public static final long PROPERTY_VECTOR_MAX_SEGMENT_SIZE_DEFAULT = 2L * 1024 * 1024 * 1024; // 2GB
 
+    public static final String PROPERTY_INDEXING_SERVICE_SERVERS = "indexing.service.servers";
+    public static final String PROPERTY_INDEXING_SERVICE_SERVERS_DEFAULT = "";
+    public static final String PROPERTY_INDEXING_SERVICE_TIMEOUT = "indexing.service.timeout";
+    public static final long PROPERTY_INDEXING_SERVICE_TIMEOUT_DEFAULT = 30; // seconds
+
     public static final String PROPERTY_PLANNER_WAITFORTABLESPACE_TIMEOUT = "server.planner.waitfortablespace.timeout";
     public static final int PROPERTY_PLANNER_WAITFORTABLESPACE_TIMEOUT_DEFAULT = SystemProperties.getIntSystemProperty("herddb.planner.waitfortablespacetimeout", 60000);
 
