@@ -25,6 +25,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
+import javax.management.openmbean.CompositeData;
 
 /**
  * Utility to detect JVM object layout parameters at runtime and provide
@@ -90,8 +91,9 @@ public final class ObjectSizeUtils {
             Object vmOption = server.invoke(mbean, "getVMOption",
                     new Object[]{"UseCompressedOops"},
                     new String[]{"java.lang.String"});
-            // VMOption.getValue() returns "true" or "false"
-            String value = (String) vmOption.getClass().getMethod("getValue").invoke(vmOption);
+            // The MBean returns a CompositeData representation of VMOption
+            CompositeData data = (CompositeData) vmOption;
+            String value = (String) data.get("value");
             return Boolean.parseBoolean(value);
         } catch (Exception e) {
             LOGGER.log(Level.WARNING,
