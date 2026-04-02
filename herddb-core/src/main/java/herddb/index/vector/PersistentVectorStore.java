@@ -553,7 +553,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 if (!running) {
                     return;
                 }
-                // Interrupted by memory back-pressure; proceed to checkpoint check
+                // Interrupted by memory back-pressure; proceed to checkpoint check.
+                // Clear the interrupt flag so that checkpoint() can complete
+                // without ForkJoinTask.get() or other blocking calls failing immediately.
+                Thread.interrupted();
             }
             if (!running) {
                 return;
@@ -1852,8 +1855,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         int progressInterval = Math.max(1000, totalVectors / 10);
         AtomicInteger nodesAdded = new AtomicInteger(0);
-        try {
-            CHECKPOINT_POOL.submit(() ->
+        // Submit graph-building work to the checkpoint pool.
+        // Use an uninterruptible wait: on the compaction thread, interrupts are
+        // memory-pressure wake-up signals (from waitForMemoryPressureRelief),
+        // NOT abort requests.  If we let InterruptedException propagate, the
+        // checkpoint fails and triggers recoverFromPhaseBFailure — but memory
+        // stays above the limit, so the ingestion thread interrupts again,
+        // creating a livelock where checkpoints never complete.
+        java.util.concurrent.ForkJoinTask<?> graphTask = CHECKPOINT_POOL.submit(() ->
                 allVectors.entrySet().parallelStream()
                     .filter(e -> allNodeToPk.containsKey(e.getKey()))
                     .forEach(e -> {
@@ -1866,7 +1875,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                             (int) (100.0 * count / totalVectors)});
                         }
                     })
-            ).get();
+        );
+        boolean interrupted = false;
+        try {
+            while (true) {
+                try {
+                    graphTask.get();
+                    break;
+                } catch (InterruptedException e) {
+                    // Memory-pressure wake-up; the checkpoint is already running,
+                    // so just keep waiting for it to finish.
+                    interrupted = true;
+                }
+            }
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
             if (cause instanceof IOException) {
@@ -1876,9 +1897,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 throw (RuntimeException) cause;
             }
             throw new IOException("writeFusedPQGraph failed", cause);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("writeFusedPQGraph interrupted", e);
+        } finally {
+            if (interrupted) {
+                // Clear the interrupt flag rather than re-setting it.
+                // The interrupt served its purpose (wake-up), and re-setting
+                // would cause the next blocking call to fail immediately.
+                Thread.interrupted();
+            }
         }
         mergedBuilder.cleanup();
         OnHeapGraphIndex mergedGraph = (OnHeapGraphIndex) mergedBuilder.getGraph();
