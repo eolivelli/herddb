@@ -63,6 +63,7 @@ public class VectorIndexManager extends AbstractIndexManager {
     public static final String PROP_SIMILARITY = "similarity";
     public static final String PROP_MAX_SEGMENT_SIZE = "maxSegmentSize";
     public static final String PROP_MAX_LIVE_GRAPH_SIZE = "maxLiveGraphSize";
+    public static final String PROP_NUM_SHARDS = "numShards";
 
     private final RemoteVectorIndexService remoteService;
 

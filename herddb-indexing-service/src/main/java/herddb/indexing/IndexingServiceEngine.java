@@ -20,20 +20,28 @@
 
 package herddb.indexing;
 
+import herddb.cluster.BookKeeperCommitLogTailer;
+import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.codec.DataAccessorForFullRecord;
 import herddb.core.MemoryManager;
+import herddb.file.FileMetadataStorageManager;
 import herddb.index.vector.AbstractVectorStore;
 import herddb.index.vector.PersistentVectorStore;
 import herddb.index.vector.VectorIndexManager;
+import herddb.log.CommitLogTailing;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
 import herddb.log.LogSequenceNumber;
+import herddb.mem.MemoryMetadataStorageManager;
+import herddb.metadata.MetadataStorageManager;
 import herddb.model.Index;
 import herddb.model.Record;
 import herddb.model.Table;
+import herddb.model.TableSpace;
+import herddb.server.ServerConfiguration;
 import herddb.storage.DataStorageManager;
 import herddb.utils.Bytes;
-
+import herddb.utils.XXHash64Utils;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Collection;
@@ -68,16 +76,22 @@ public class IndexingServiceEngine implements AutoCloseable {
     private final Path dataDirectory;
     private final IndexingServerConfiguration config;
 
+    private final int instanceId;
+    private final int numInstances;
+
     private WatermarkStore watermarkStore;
     private SchemaTracker schemaTracker;
     private TransactionBuffer transactionBuffer;
-    private CommitLogTailer tailer;
+    private CommitLogTailing tailer;
     private Thread tailerThread;
 
     private volatile LogSequenceNumber lastProcessedLsn;
     private long entriesSinceLastWatermarkSave;
 
     private volatile StatsLogger statsLogger;
+
+    private MetadataStorageManager metadataStorageManager;
+    private boolean ownsMetadataStorageManager;
 
     private MemoryManager memoryManager;
     private DataStorageManager dataStorageManager;
@@ -106,6 +120,38 @@ public class IndexingServiceEngine implements AutoCloseable {
         this.logDirectory = logDirectory;
         this.dataDirectory = dataDirectory;
         this.config = config;
+        this.instanceId = config.getInt(IndexingServerConfiguration.PROPERTY_INSTANCE_ID,
+                IndexingServerConfiguration.PROPERTY_INSTANCE_ID_DEFAULT);
+        this.numInstances = config.getInt(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES,
+                IndexingServerConfiguration.PROPERTY_NUM_INSTANCES_DEFAULT);
+    }
+
+    private MetadataStorageManager buildMetadataStorageManager() {
+        String mode = config.getString(IndexingServerConfiguration.PROPERTY_MODE,
+                IndexingServerConfiguration.PROPERTY_MODE_DEFAULT);
+        switch (mode) {
+            case ServerConfiguration.PROPERTY_MODE_LOCAL:
+                return new MemoryMetadataStorageManager();
+            case ServerConfiguration.PROPERTY_MODE_STANDALONE:
+            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE: {
+                Path metadataDirectory = dataDirectory.resolve(
+                        config.getString(IndexingServerConfiguration.PROPERTY_METADATA_DIR,
+                                IndexingServerConfiguration.PROPERTY_METADATA_DIR_DEFAULT));
+                return new FileMetadataStorageManager(metadataDirectory);
+            }
+            case ServerConfiguration.PROPERTY_MODE_CLUSTER:
+            case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER: {
+                String zkAddress = config.getString(IndexingServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS,
+                        IndexingServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS_DEFAULT);
+                int zkSessionTimeout = config.getInt(IndexingServerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT,
+                        IndexingServerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT_DEFAULT);
+                String zkPath = config.getString(IndexingServerConfiguration.PROPERTY_ZOOKEEPER_PATH,
+                        IndexingServerConfiguration.PROPERTY_ZOOKEEPER_PATH_DEFAULT);
+                return new ZookeeperMetadataStorageManager(zkAddress, zkSessionTimeout, zkPath);
+            }
+            default:
+                throw new IllegalArgumentException("Unknown server.mode: " + mode);
+        }
     }
 
     public Path getDataDirectory() {
@@ -140,6 +186,14 @@ public class IndexingServiceEngine implements AutoCloseable {
 
     public DataStorageManager getDataStorageManager() {
         return dataStorageManager;
+    }
+
+    public void setMetadataStorageManager(MetadataStorageManager metadataStorageManager) {
+        this.metadataStorageManager = metadataStorageManager;
+    }
+
+    public MetadataStorageManager getMetadataStorageManager() {
+        return metadataStorageManager;
     }
 
     public void start() throws Exception {
@@ -232,8 +286,59 @@ public class IndexingServiceEngine implements AutoCloseable {
         }
         LOGGER.log(Level.INFO, "DML apply workers started, parallelism={0}", applyParallelism);
 
+        // Validate instance identity
+        if (numInstances < 1) {
+            throw new IllegalArgumentException("numInstances must be >= 1, got " + numInstances);
+        }
+        if (instanceId < 0 || instanceId >= numInstances) {
+            throw new IllegalArgumentException(
+                    "instanceId must be in [0, " + (numInstances - 1) + "], got " + instanceId);
+        }
+        LOGGER.log(Level.INFO, "Instance identity: instanceId={0}, numInstances={1}",
+                new Object[]{instanceId, numInstances});
+
+        // Boot MetadataStorageManager if not injected
+        if (metadataStorageManager == null) {
+            metadataStorageManager = buildMetadataStorageManager();
+            ownsMetadataStorageManager = true;
+            metadataStorageManager.start();
+            LOGGER.log(Level.INFO, "MetadataStorageManager started: {0}",
+                    metadataStorageManager.getClass().getName());
+            // Ensure the default tablespace exists (needed for local/memory mode)
+            metadataStorageManager.ensureDefaultTableSpace("local", "local", 0, 1);
+        }
+
+        // Resolve tablespace name to UUID
+        String tablespaceName = config.getString(IndexingServerConfiguration.PROPERTY_TABLESPACE_NAME,
+                IndexingServerConfiguration.PROPERTY_TABLESPACE_NAME_DEFAULT);
+        TableSpace tableSpace = metadataStorageManager.describeTableSpace(tablespaceName);
+        if (tableSpace == null) {
+            throw new IllegalArgumentException(
+                    "tablespace '" + tablespaceName + "' not found in metadata");
+        }
+        String tableSpaceUUID = tableSpace.uuid;
+        LOGGER.log(Level.INFO, "Resolved tablespace name ''{0}'' to UUID ''{1}''",
+                new Object[]{tablespaceName, tableSpaceUUID});
+
         // Create and start the tailer
-        tailer = new CommitLogTailer(logDirectory, watermark, this::processEntry);
+        String logType = config.getString(IndexingServerConfiguration.PROPERTY_LOG_TYPE,
+                IndexingServerConfiguration.PROPERTY_LOG_TYPE_DEFAULT);
+        if ("bookkeeper".equals(logType)) {
+            String zkAddress = config.getString(IndexingServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS,
+                    IndexingServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS_DEFAULT);
+            int zkSessionTimeout = config.getInt(IndexingServerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT,
+                    IndexingServerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT_DEFAULT);
+            String zkPath = config.getString(IndexingServerConfiguration.PROPERTY_ZOOKEEPER_PATH,
+                    IndexingServerConfiguration.PROPERTY_ZOOKEEPER_PATH_DEFAULT);
+            String bkLedgersPath = config.getString(IndexingServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH,
+                    IndexingServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT);
+            LOGGER.log(Level.INFO, "Creating BookKeeperCommitLogTailer, zk={0}, tsUUID={1}",
+                    new Object[]{zkAddress, tableSpaceUUID});
+            tailer = new BookKeeperCommitLogTailer(zkAddress, zkSessionTimeout, zkPath,
+                    bkLedgersPath, tableSpaceUUID, watermark, this::processEntry);
+        } else {
+            tailer = new FileCommitLogTailer(logDirectory, tableSpaceUUID, watermark, this::processEntry);
+        }
         tailerThread = new Thread(tailer, "indexing-service-tailer");
         tailerThread.setDaemon(true);
         tailerThread.start();
@@ -242,7 +347,7 @@ public class IndexingServiceEngine implements AutoCloseable {
     }
 
     /**
-     * Entry consumer callback invoked by the CommitLogTailer.
+     * Entry consumer callback invoked by the commit log tailer.
      */
     private void processEntry(LogSequenceNumber lsn, LogEntry entry) {
         try {
@@ -447,10 +552,45 @@ public class IndexingServiceEngine implements AutoCloseable {
                 new Object[]{index.name, vectorColumnName, index.properties});
     }
 
+    /**
+     * Determines whether an INSERT for the given primary key should be accepted by this instance
+     * based on the shard assignment.
+     */
+    boolean isInsertAcceptedLocally(Bytes key, int numShards) {
+        if (numInstances <= 1) {
+            return true;
+        }
+        if (numShards <= 1) {
+            return true;
+        }
+        long hash = XXHash64Utils.hash(key.getBuffer(), key.getOffset(), key.getLength());
+        int shardId = Math.floorMod((int) hash, numShards);
+        return shardId % numInstances == instanceId;
+    }
+
+    private int getNumShardsForTable(Collection<Index> vectorIndexes) {
+        for (Index idx : vectorIndexes) {
+            String val = idx.properties.get(VectorIndexManager.PROP_NUM_SHARDS);
+            if (val != null) {
+                try {
+                    return Integer.parseInt(val);
+                } catch (NumberFormatException e) {
+                    LOGGER.log(Level.WARNING, "Invalid numShards value: {0}", val);
+                }
+            }
+        }
+        return 1;
+    }
+
     private void applyInsert(LogEntry entry) {
         String tableName = entry.tableName;
         Collection<Index> vectorIndexes = schemaTracker.getVectorIndexesForTable(tableName);
         if (vectorIndexes.isEmpty()) {
+            return;
+        }
+        // Shard filtering: skip INSERT if this instance does not own the shard
+        int numShards = getNumShardsForTable(vectorIndexes);
+        if (!isInsertAcceptedLocally(entry.key, numShards)) {
             return;
         }
         Table table = schemaTracker.getTable(tableName);
@@ -584,14 +724,14 @@ public class IndexingServiceEngine implements AutoCloseable {
         tailerStats.registerGauge("entries_processed", new Gauge<Long>() {
             @Override public Long getDefaultValue() { return 0L; }
             @Override public Long getSample() {
-                CommitLogTailer t = tailer;
+                CommitLogTailing t = tailer;
                 return t != null ? t.getEntriesProcessed() : 0L;
             }
         });
         tailerStats.registerGauge("running", new Gauge<Integer>() {
             @Override public Integer getDefaultValue() { return 0; }
             @Override public Integer getSample() {
-                CommitLogTailer t = tailer;
+                CommitLogTailing t = tailer;
                 return t != null && t.isRunning() ? 1 : 0;
             }
         });
@@ -760,6 +900,16 @@ public class IndexingServiceEngine implements AutoCloseable {
                 LOGGER.info("DataStorageManager closed");
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Error closing DataStorageManager", e);
+            }
+        }
+
+        // Close the metadata storage manager if we own it
+        if (ownsMetadataStorageManager && metadataStorageManager != null) {
+            try {
+                metadataStorageManager.close();
+                LOGGER.info("MetadataStorageManager closed");
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Error closing MetadataStorageManager", e);
             }
         }
 

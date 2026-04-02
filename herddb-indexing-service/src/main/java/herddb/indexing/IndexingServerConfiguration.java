@@ -20,6 +20,7 @@
 
 package herddb.indexing;
 
+import herddb.model.TableSpace;
 import java.util.Properties;
 
 /**
@@ -102,6 +103,45 @@ public final class IndexingServerConfiguration {
     // Memory multiplier
     public static final String PROPERTY_VECTOR_MEMORY_MULTIPLIER = "indexing.vector.memoryMultiplier";
     public static final double PROPERTY_VECTOR_MEMORY_MULTIPLIER_DEFAULT = 5.0;
+
+    // Instance identity and clustering
+    public static final String PROPERTY_INSTANCE_ID = "indexing.instance.id";
+    public static final int PROPERTY_INSTANCE_ID_DEFAULT = 0;
+
+    public static final String PROPERTY_NUM_INSTANCES = "indexing.cluster.numInstances";
+    public static final int PROPERTY_NUM_INSTANCES_DEFAULT = 1;
+
+    public static final String PROPERTY_DEFAULT_NUM_SHARDS = "indexing.vector.default.numShards";
+    public static final int PROPERTY_DEFAULT_NUM_SHARDS_DEFAULT = 1;
+
+    // Log tailing mode
+    public static final String PROPERTY_LOG_TYPE = "indexing.log.type";
+    public static final String PROPERTY_LOG_TYPE_DEFAULT = "file";
+
+    // BookKeeper/ZooKeeper settings (for log.type=bookkeeper)
+    // Use SAME keys as ServerConfiguration so config can be copy/pasted
+    public static final String PROPERTY_ZOOKEEPER_ADDRESS = "server.zookeeper.address";
+    public static final String PROPERTY_ZOOKEEPER_ADDRESS_DEFAULT = "localhost:2181";
+
+    public static final String PROPERTY_ZOOKEEPER_SESSION_TIMEOUT = "server.zookeeper.session.timeout";
+    public static final int PROPERTY_ZOOKEEPER_SESSION_TIMEOUT_DEFAULT = 40000;
+
+    public static final String PROPERTY_ZOOKEEPER_PATH = "server.zookeeper.path";
+    public static final String PROPERTY_ZOOKEEPER_PATH_DEFAULT = "/herd";
+
+    public static final String PROPERTY_BOOKKEEPER_LEDGERS_PATH = "server.bookkeeper.ledgers.path";
+    public static final String PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT = "/ledgers";
+
+    public static final String PROPERTY_TABLESPACE_NAME = "indexing.tablespace.name";
+    public static final String PROPERTY_TABLESPACE_NAME_DEFAULT = TableSpace.DEFAULT;
+
+    // Server mode — same key as ServerConfiguration so config can be copy/pasted
+    public static final String PROPERTY_MODE = "server.mode";
+    public static final String PROPERTY_MODE_DEFAULT = "local";
+
+    // Metadata directory — same key as ServerConfiguration
+    public static final String PROPERTY_METADATA_DIR = "server.metadata.dir";
+    public static final String PROPERTY_METADATA_DIR_DEFAULT = "metadata";
 
     public IndexingServerConfiguration() {
         this.properties = new Properties();

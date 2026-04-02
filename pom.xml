@@ -710,7 +710,7 @@
                         <configuration>
                             <reuseForks>false</reuseForks>
                             <forkedProcessTimeoutInSeconds>1800</forkedProcessTimeoutInSeconds>
-                            <argLine>-Dzookeeper.forceSync=no -Dio.netty.tryReflectionSetAccessible=true -Xmx2G -XX:+UseG1GC -Djava.io.tmpdir=${project.build.directory} --add-opens=java.base/java.nio=ALL-UNNAMED  --add-opens=java.base/java.io=ALL-UNNAMED  --add-opens=java.base/java.lang=ALL-UNNAMED</argLine>
+                            <argLine>-Dzookeeper.forceSync=no -Dio.netty.tryReflectionSetAccessible=true -Xmx2G -XX:+UseG1GC -Djava.io.tmpdir=${project.build.directory} --add-opens=java.base/java.nio=ALL-UNNAMED  --add-opens=java.base/java.io=ALL-UNNAMED  --add-opens=java.base/java.lang=ALL-UNNAMED --add-modules jdk.incubator.vector</argLine>
                             <trimStackTrace>false</trimStackTrace>
                         </configuration>
                     </plugin>
@@ -951,7 +951,7 @@
                         <version>3.0.0-M5</version>
                         <configuration>
                             <reuseForks>false</reuseForks>
-                            <argLine> --add-opens=java.base/java.nio=ALL-UNNAMED  --add-opens=java.base/java.io=ALL-UNNAMED  --add-opens=java.base/java.lang=ALL-UNNAMED -Xmx2G -XX:+UseG1GC  @{argLine}</argLine>
+                            <argLine> --add-opens=java.base/java.nio=ALL-UNNAMED  --add-opens=java.base/java.io=ALL-UNNAMED  --add-opens=java.base/java.lang=ALL-UNNAMED --add-modules jdk.incubator.vector -Xmx2G -XX:+UseG1GC  @{argLine}</argLine>
                             <trimStackTrace>false</trimStackTrace>
                             <forkedProcessTimeoutInSeconds>900</forkedProcessTimeoutInSeconds>
                         </configuration>

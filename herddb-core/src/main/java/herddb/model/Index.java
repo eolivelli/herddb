@@ -279,6 +279,17 @@ public class Index implements ColumnsList {
                 if (colType != ColumnTypes.FLOATARRAY && colType != ColumnTypes.NOTNULL_FLOATARRAY) {
                     throw new IllegalArgumentException("vector index column must be of type floata (FLOATARRAY)");
                 }
+                if (properties.containsKey("numShards")) {
+                    try {
+                        int numShards = Integer.parseInt(properties.get("numShards"));
+                        if (numShards < 1) {
+                            throw new IllegalArgumentException("numShards must be >= 1, got " + numShards);
+                        }
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException(
+                                "numShards must be a valid integer, got '" + properties.get("numShards") + "'");
+                    }
+                }
             }
             if (name == null || name.isEmpty()) {
                 name = table + "_" + columns.stream().map(s -> s.name.toLowerCase()).collect(Collectors.joining("_"));

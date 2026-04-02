@@ -20,6 +20,7 @@
 
 package herddb.indexing;
 
+import herddb.metadata.MetadataStorageManager;
 import java.nio.file.Path;
 import java.util.Arrays;
 
@@ -44,6 +45,7 @@ public class EmbeddedIndexingService implements AutoCloseable {
     private final Path logDirectory;
     private final Path dataDirectory;
     private final IndexingServerConfiguration config;
+    private MetadataStorageManager metadataStorageManager;
     private IndexingServiceEngine engine;
     private IndexingServer server;
 
@@ -57,14 +59,32 @@ public class EmbeddedIndexingService implements AutoCloseable {
         this.config = config;
     }
 
+    public EmbeddedIndexingService(Path logDirectory, Path dataDirectory, int instanceId, int numInstances) {
+        this(logDirectory, dataDirectory, defaultTestConfig(instanceId, numInstances));
+    }
+
     private static IndexingServerConfiguration defaultTestConfig() {
+        return defaultTestConfig(0, 1);
+    }
+
+    private static IndexingServerConfiguration defaultTestConfig(int instanceId, int numInstances) {
         java.util.Properties props = new java.util.Properties();
         props.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "memory");
+        props.setProperty(IndexingServerConfiguration.PROPERTY_INSTANCE_ID, String.valueOf(instanceId));
+        props.setProperty(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES, String.valueOf(numInstances));
         return new IndexingServerConfiguration(props);
+    }
+
+    public void setMetadataStorageManager(MetadataStorageManager metadataStorageManager) {
+        this.metadataStorageManager = metadataStorageManager;
     }
 
     public void start() throws Exception {
         engine = new IndexingServiceEngine(logDirectory, dataDirectory, config);
+
+        if (metadataStorageManager != null) {
+            engine.setMetadataStorageManager(metadataStorageManager);
+        }
 
         // Start server first so it wires MemoryManager and DataStorageManager
         // onto the engine before the engine starts and configures its VectorStoreFactory

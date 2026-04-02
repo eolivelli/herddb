@@ -26,6 +26,8 @@ import herddb.indexing.IndexingServiceEngine.IndexStatusInfo;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
 import herddb.log.LogSequenceNumber;
+import herddb.mem.MemoryMetadataStorageManager;
+import herddb.model.TableSpace;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataOutputStream;
 
@@ -88,8 +90,16 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
         Path logDir = folder.newFolder("log").toPath();
         Path dataDir = folder.newFolder("data").toPath();
 
+        // Register a tablespace with a known UUID
+        String tsUUID = "tablespace1";
+        MemoryMetadataStorageManager metadataManager = new MemoryMetadataStorageManager();
+        metadataManager.start();
+        metadataManager.registerTableSpace(TableSpace.builder()
+                .name(TableSpace.DEFAULT).uuid(tsUUID)
+                .leader("local").replica("local").build());
+
         // Create per-tablespace subdirectory (mimics FileCommitLog directory structure)
-        Path tablespaceDir = logDir.resolve("tablespace1.txlog");
+        Path tablespaceDir = logDir.resolve(tsUUID + ".txlog");
         Files.createDirectory(tablespaceDir);
 
         // Write 5 entries to ledger 1
@@ -100,6 +110,7 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
         Files.createFile(tablespaceDir.resolve("0000000000000002.txlog"));
 
         try (EmbeddedIndexingService eis = new EmbeddedIndexingService(logDir, dataDir)) {
+            eis.setMetadataStorageManager(metadataManager);
             eis.start();
 
             // Wait for tailer to consume all 5 entries from ledger 1

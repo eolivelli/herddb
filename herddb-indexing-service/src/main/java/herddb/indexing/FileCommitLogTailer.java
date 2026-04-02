@@ -20,12 +20,10 @@
 
 package herddb.indexing;
 
-import herddb.file.FileCommitLog;
 import herddb.file.FileCommitLog.CommitFileReader;
 import herddb.file.FileCommitLog.LogEntryWithSequenceNumber;
-import herddb.log.LogEntry;
+import herddb.log.CommitLogTailing;
 import herddb.log.LogSequenceNumber;
-
 import java.io.IOException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -47,13 +45,14 @@ import java.util.logging.Logger;
  *
  * @author enrico.olivelli
  */
-public class CommitLogTailer implements Runnable, AutoCloseable {
+public class FileCommitLogTailer implements CommitLogTailing {
 
-    private static final Logger LOGGER = Logger.getLogger(CommitLogTailer.class.getName());
+    private static final Logger LOGGER = Logger.getLogger(FileCommitLogTailer.class.getName());
     private static final String TXLOG_EXTENSION = ".txlog";
     private static final long POLL_INTERVAL_MS = 500;
 
     private final Path logDirectory;
+    private final String tableSpaceUUID;
     private volatile LogSequenceNumber watermark;
     private final EntryConsumer consumer;
     private volatile boolean running = true;
@@ -63,16 +62,9 @@ public class CommitLogTailer implements Runnable, AutoCloseable {
     private Path activeReaderPath;
     private long entriesProcessed;
 
-    /**
-     * Functional interface for consuming log entries.
-     */
-    @FunctionalInterface
-    public interface EntryConsumer {
-        void accept(LogSequenceNumber lsn, LogEntry entry);
-    }
-
-    public CommitLogTailer(Path logDirectory, LogSequenceNumber startFrom, EntryConsumer consumer) {
+    public FileCommitLogTailer(Path logDirectory, String tableSpaceUUID, LogSequenceNumber startFrom, EntryConsumer consumer) {
         this.logDirectory = logDirectory;
+        this.tableSpaceUUID = tableSpaceUUID;
         this.watermark = startFrom;
         this.consumer = consumer;
     }
@@ -248,21 +240,35 @@ public class CommitLogTailer implements Runnable, AutoCloseable {
         if (!Files.isDirectory(logDirectory)) {
             return files;
         }
-        // The log directory contains per-tablespace subdirectories named <ledgerId>.txlog,
+        // The log directory contains per-tablespace subdirectories named <uuid>.txlog,
         // each containing the actual segment files (e.g. 0000000000000001.txlog).
-        // We need to scan inside each subdirectory for regular .txlog files.
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(logDirectory, "*" + TXLOG_EXTENSION)) {
-            for (Path path : stream) {
-                if (Files.isDirectory(path)) {
-                    try (DirectoryStream<Path> inner = Files.newDirectoryStream(path, "*" + TXLOG_EXTENSION)) {
-                        for (Path segment : inner) {
-                            if (Files.isRegularFile(segment)) {
-                                files.add(segment);
-                            }
+        if (tableSpaceUUID != null) {
+            // Filter to a specific tablespace subdirectory
+            Path tsDir = logDirectory.resolve(tableSpaceUUID + TXLOG_EXTENSION);
+            if (Files.isDirectory(tsDir)) {
+                try (DirectoryStream<Path> inner = Files.newDirectoryStream(tsDir, "*" + TXLOG_EXTENSION)) {
+                    for (Path segment : inner) {
+                        if (Files.isRegularFile(segment)) {
+                            files.add(segment);
                         }
                     }
-                } else if (Files.isRegularFile(path)) {
-                    files.add(path);
+                }
+            }
+        } else {
+            // Scan all subdirectories
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(logDirectory, "*" + TXLOG_EXTENSION)) {
+                for (Path path : stream) {
+                    if (Files.isDirectory(path)) {
+                        try (DirectoryStream<Path> inner = Files.newDirectoryStream(path, "*" + TXLOG_EXTENSION)) {
+                            for (Path segment : inner) {
+                                if (Files.isRegularFile(segment)) {
+                                    files.add(segment);
+                                }
+                            }
+                        }
+                    } else if (Files.isRegularFile(path)) {
+                        files.add(path);
+                    }
                 }
             }
         }
@@ -271,23 +277,17 @@ public class CommitLogTailer implements Runnable, AutoCloseable {
         return files;
     }
 
-    /**
-     * Returns the current watermark (last processed LSN).
-     */
+    @Override
     public LogSequenceNumber getWatermark() {
         return watermark;
     }
 
-    /**
-     * Returns the total number of entries processed since this tailer was created.
-     */
+    @Override
     public long getEntriesProcessed() {
         return entriesProcessed;
     }
 
-    /**
-     * Returns whether the tailer is currently running.
-     */
+    @Override
     public boolean isRunning() {
         return running;
     }

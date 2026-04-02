@@ -41,7 +41,7 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
-public class CommitLogTailerTest {
+public class FileCommitLogTailerTest {
 
     private static final byte ENTRY_START = 13;
     private static final byte ENTRY_END = 25;
@@ -85,7 +85,7 @@ public class CommitLogTailerTest {
         writeTxlogFile(tablespaceDir.resolve("0000000000000002.txlog"), 2, 1, 2);
 
         List<LogSequenceNumber> consumed = new ArrayList<>();
-        try (CommitLogTailer tailer = new CommitLogTailer(logDir, LogSequenceNumber.START_OF_TIME,
+        try (FileCommitLogTailer tailer = new FileCommitLogTailer(logDir, null, LogSequenceNumber.START_OF_TIME,
                 (lsn, entry) -> consumed.add(lsn))) {
             // Run a single scan (not the polling loop)
             Thread t = new Thread(tailer);
@@ -134,7 +134,7 @@ public class CommitLogTailerTest {
         writeTxlogFile(ts2.resolve("0000000000000002.txlog"), 2, 1, 3);
 
         List<LogSequenceNumber> consumed = new ArrayList<>();
-        try (CommitLogTailer tailer = new CommitLogTailer(logDir, LogSequenceNumber.START_OF_TIME,
+        try (FileCommitLogTailer tailer = new FileCommitLogTailer(logDir, null, LogSequenceNumber.START_OF_TIME,
                 (lsn, entry) -> consumed.add(lsn))) {
             Thread t = new Thread(tailer);
             t.start();
@@ -158,7 +158,7 @@ public class CommitLogTailerTest {
         Path logDir = folder.newFolder("txlog-empty").toPath();
 
         List<LogSequenceNumber> consumed = new ArrayList<>();
-        try (CommitLogTailer tailer = new CommitLogTailer(logDir, LogSequenceNumber.START_OF_TIME,
+        try (FileCommitLogTailer tailer = new FileCommitLogTailer(logDir, null, LogSequenceNumber.START_OF_TIME,
                 (lsn, entry) -> consumed.add(lsn))) {
             Thread t = new Thread(tailer);
             t.start();
@@ -187,7 +187,7 @@ public class CommitLogTailerTest {
         // Start from watermark at ledger 1, offset 3 — should skip entries 1,2,3
         LogSequenceNumber watermark = new LogSequenceNumber(1, 3);
         List<LogSequenceNumber> consumed = new ArrayList<>();
-        try (CommitLogTailer tailer = new CommitLogTailer(logDir, watermark,
+        try (FileCommitLogTailer tailer = new FileCommitLogTailer(logDir, null, watermark,
                 (lsn, entry) -> consumed.add(lsn))) {
             Thread t = new Thread(tailer);
             t.start();
@@ -213,7 +213,7 @@ public class CommitLogTailerTest {
         Path logDir = folder.getRoot().toPath().resolve("does-not-exist");
 
         List<LogSequenceNumber> consumed = new ArrayList<>();
-        try (CommitLogTailer tailer = new CommitLogTailer(logDir, LogSequenceNumber.START_OF_TIME,
+        try (FileCommitLogTailer tailer = new FileCommitLogTailer(logDir, null, LogSequenceNumber.START_OF_TIME,
                 (lsn, entry) -> consumed.add(lsn))) {
             Thread t = new Thread(tailer);
             t.start();
@@ -260,7 +260,7 @@ public class CommitLogTailerTest {
         writeTxlogFile(segmentFile, 1, 1, 3);
 
         List<LogSequenceNumber> consumed = Collections.synchronizedList(new ArrayList<>());
-        try (CommitLogTailer tailer = new CommitLogTailer(logDir, LogSequenceNumber.START_OF_TIME,
+        try (FileCommitLogTailer tailer = new FileCommitLogTailer(logDir, null, LogSequenceNumber.START_OF_TIME,
                 (lsn, entry) -> consumed.add(lsn))) {
             Thread t = new Thread(tailer);
             t.start();
@@ -309,7 +309,7 @@ public class CommitLogTailerTest {
         writeTxlogFile(segment1, 1, 1, 3);
 
         List<LogSequenceNumber> consumed = Collections.synchronizedList(new ArrayList<>());
-        try (CommitLogTailer tailer = new CommitLogTailer(logDir, LogSequenceNumber.START_OF_TIME,
+        try (FileCommitLogTailer tailer = new FileCommitLogTailer(logDir, null, LogSequenceNumber.START_OF_TIME,
                 (lsn, entry) -> consumed.add(lsn))) {
             Thread t = new Thread(tailer);
             t.start();
