@@ -6,7 +6,7 @@ metadata:
     {{- include "herddb.labels" . | nindent 4 }}
 data:
   server.properties: |
-    server.mode=remote-file-service
+    server.mode={{ .Values.server.mode }}
     server.host=0.0.0.0
     server.port={{ .Values.server.port }}
     server.base.dir=/opt/herddb/data
@@ -14,7 +14,9 @@ data:
     http.enable=true
     http.host=0.0.0.0
     http.port={{ .Values.server.httpPort }}
+    {{- if eq .Values.server.mode "remote-file-service" }}
     remote.file.servers={{ include "herddb.remoteFileServers" . }}
+    {{- end }}
     {{- range $k, $v := .Values.server.extraConfig }}
     {{ $k }}={{ $v }}
     {{- end }}
