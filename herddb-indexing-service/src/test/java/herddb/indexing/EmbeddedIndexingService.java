@@ -20,6 +20,7 @@
 
 package herddb.indexing;
 
+import herddb.mem.MemoryMetadataStorageManager;
 import herddb.metadata.MetadataStorageManager;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -82,9 +83,14 @@ public class EmbeddedIndexingService implements AutoCloseable {
     public void start() throws Exception {
         engine = new IndexingServiceEngine(logDirectory, dataDirectory, config);
 
-        if (metadataStorageManager != null) {
-            engine.setMetadataStorageManager(metadataStorageManager);
+        if (metadataStorageManager == null) {
+            // Tests use an in-memory metadata manager with a default tablespace
+            MemoryMetadataStorageManager memMeta = new MemoryMetadataStorageManager();
+            memMeta.start();
+            memMeta.ensureDefaultTableSpace("local", "local", 0, 1);
+            metadataStorageManager = memMeta;
         }
+        engine.setMetadataStorageManager(metadataStorageManager);
 
         // Start server first so it wires MemoryManager and DataStorageManager
         // onto the engine before the engine starts and configures its VectorStoreFactory

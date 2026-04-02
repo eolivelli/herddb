@@ -33,7 +33,6 @@ import herddb.log.CommitLogTailing;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
 import herddb.log.LogSequenceNumber;
-import herddb.mem.MemoryMetadataStorageManager;
 import herddb.metadata.MetadataStorageManager;
 import herddb.model.Index;
 import herddb.model.Record;
@@ -133,13 +132,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         String mode = config.getString(IndexingServerConfiguration.PROPERTY_MODE,
                 IndexingServerConfiguration.PROPERTY_MODE_DEFAULT);
         switch (mode) {
-            case ServerConfiguration.PROPERTY_MODE_LOCAL:
-                return new MemoryMetadataStorageManager();
             case ServerConfiguration.PROPERTY_MODE_STANDALONE:
             case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE: {
-                Path metadataDirectory = dataDirectory.resolve(
+                Path metadataDirectory = java.nio.file.Paths.get(
                         config.getString(IndexingServerConfiguration.PROPERTY_METADATA_DIR,
-                                IndexingServerConfiguration.PROPERTY_METADATA_DIR_DEFAULT));
+                                IndexingServerConfiguration.PROPERTY_METADATA_DIR_DEFAULT)).toAbsolutePath();
                 return new FileMetadataStorageManager(metadataDirectory);
             }
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
@@ -333,8 +330,6 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             metadataStorageManager.start();
             LOGGER.log(Level.INFO, "MetadataStorageManager started: {0}",
                     metadataStorageManager.getClass().getName());
-            // Ensure the default tablespace exists (needed for local/memory mode)
-            metadataStorageManager.ensureDefaultTableSpace("local", "local", 0, 1);
         }
 
         // Resolve tablespace name to UUID

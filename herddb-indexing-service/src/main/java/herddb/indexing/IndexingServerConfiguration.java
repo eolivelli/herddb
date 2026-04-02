@@ -21,6 +21,7 @@
 package herddb.indexing;
 
 import herddb.model.TableSpace;
+import herddb.server.ServerConfiguration;
 import java.util.Properties;
 
 /**
@@ -140,7 +141,7 @@ public final class IndexingServerConfiguration {
 
     // Server mode — same key as ServerConfiguration so config can be copy/pasted
     public static final String PROPERTY_MODE = "server.mode";
-    public static final String PROPERTY_MODE_DEFAULT = "local";
+    public static final String PROPERTY_MODE_DEFAULT = ServerConfiguration.PROPERTY_MODE_STANDALONE;
 
     // Metadata directory — same key as ServerConfiguration
     public static final String PROPERTY_METADATA_DIR = "server.metadata.dir";

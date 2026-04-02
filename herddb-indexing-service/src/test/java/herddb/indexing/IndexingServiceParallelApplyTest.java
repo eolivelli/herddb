@@ -22,6 +22,7 @@ package herddb.indexing;
 
 import static org.junit.Assert.*;
 
+import herddb.mem.MemoryMetadataStorageManager;
 import herddb.codec.RecordSerializer;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
@@ -62,6 +63,13 @@ public class IndexingServiceParallelApplyTest {
                 .build();
     }
 
+    private static MemoryMetadataStorageManager createTestMetadata() throws Exception {
+        MemoryMetadataStorageManager m = new MemoryMetadataStorageManager();
+        m.start();
+        m.ensureDefaultTableSpace("local", "local", 0, 1);
+        return m;
+    }
+
     private IndexingServiceEngine createEngine(Path logDir, Path dataDir, int parallelism) throws Exception {
         Properties props = new Properties();
         props.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "memory");
@@ -69,6 +77,7 @@ public class IndexingServiceParallelApplyTest {
         IndexingServerConfiguration config = new IndexingServerConfiguration(props);
 
         IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        engine.setMetadataStorageManager(createTestMetadata());
         engine.start();
         return engine;
     }
@@ -135,6 +144,7 @@ public class IndexingServiceParallelApplyTest {
         IndexingServerConfiguration config = new IndexingServerConfiguration(props);
 
         IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        engine.setMetadataStorageManager(createTestMetadata());
         engine.setVectorStoreFactory((indexName, tableName, vectorColumnName, dataDirectory, indexProperties) -> {
             return new InMemoryVectorStore(vectorColumnName) {
                 @Override
@@ -197,6 +207,7 @@ public class IndexingServiceParallelApplyTest {
         IndexingServerConfiguration config = new IndexingServerConfiguration(props);
 
         IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        engine.setMetadataStorageManager(createTestMetadata());
 
         try {
             engine.start();
@@ -269,6 +280,7 @@ public class IndexingServiceParallelApplyTest {
         IndexingServerConfiguration config = new IndexingServerConfiguration(props);
 
         IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        engine.setMetadataStorageManager(createTestMetadata());
         engine.setVectorStoreFactory((indexName, tableName, vectorColumnName, dataDirectory, indexProperties) -> {
             return new InMemoryVectorStore(vectorColumnName) {
                 @Override
@@ -320,6 +332,7 @@ public class IndexingServiceParallelApplyTest {
         IndexingServerConfiguration config = new IndexingServerConfiguration(props);
 
         IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        engine.setMetadataStorageManager(createTestMetadata());
         try {
             engine.start();
             // Engine should start without errors with auto-detected parallelism

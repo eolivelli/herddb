@@ -22,6 +22,7 @@ package herddb.indexing;
 
 import static org.junit.Assert.*;
 
+import herddb.mem.MemoryMetadataStorageManager;
 import herddb.index.vector.AbstractVectorStore;
 import herddb.index.vector.VectorIndexManager;
 import herddb.log.LogEntry;
@@ -59,6 +60,10 @@ public class IndexingServiceSimilarityTest {
         IndexingServerConfiguration config = new IndexingServerConfiguration(props);
 
         IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        MemoryMetadataStorageManager meta = new MemoryMetadataStorageManager();
+        meta.start();
+        meta.ensureDefaultTableSpace("local", "local", 0, 1);
+        engine.setMetadataStorageManager(meta);
 
         // Capture the properties passed to the factory
         AtomicReference<Map<String, String>> capturedProperties = new AtomicReference<>();
@@ -121,6 +126,10 @@ public class IndexingServiceSimilarityTest {
         IndexingServerConfiguration config = new IndexingServerConfiguration(props);
 
         IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        MemoryMetadataStorageManager meta2 = new MemoryMetadataStorageManager();
+        meta2.start();
+        meta2.ensureDefaultTableSpace("local", "local", 0, 1);
+        engine.setMetadataStorageManager(meta2);
 
         // Use the default factory (no custom factory set)
         AtomicReference<AbstractVectorStore> createdStore = new AtomicReference<>();

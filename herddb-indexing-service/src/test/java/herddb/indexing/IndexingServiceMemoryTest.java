@@ -22,6 +22,7 @@ package herddb.indexing;
 
 import static org.junit.Assert.*;
 
+import herddb.mem.MemoryMetadataStorageManager;
 import java.nio.file.Path;
 import java.util.Properties;
 
@@ -39,6 +40,13 @@ public class IndexingServiceMemoryTest {
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
 
+    private static MemoryMetadataStorageManager createTestMetadata() throws Exception {
+        MemoryMetadataStorageManager m = new MemoryMetadataStorageManager();
+        m.start();
+        m.ensureDefaultTableSpace("local", "local", 0, 1);
+        return m;
+    }
+
     @Test
     public void testEngineStartsWithMemoryStorage() throws Exception {
         Path logDir = folder.newFolder("log").toPath();
@@ -49,6 +57,7 @@ public class IndexingServiceMemoryTest {
         IndexingServerConfiguration config = new IndexingServerConfiguration(props);
 
         IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        engine.setMetadataStorageManager(createTestMetadata());
         IndexingServer server = new IndexingServer("localhost", 0, engine, config);
         try {
             server.start();
@@ -142,6 +151,7 @@ public class IndexingServiceMemoryTest {
         IndexingServerConfiguration config = new IndexingServerConfiguration(props);
 
         IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        engine.setMetadataStorageManager(createTestMetadata());
         IndexingServer server = new IndexingServer("localhost", 0, engine, config);
 
         server.start();
@@ -165,6 +175,7 @@ public class IndexingServiceMemoryTest {
 
         IndexingServerConfiguration config = new IndexingServerConfiguration();
         IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        engine.setMetadataStorageManager(createTestMetadata());
 
         assertNull("MemoryManager should be null before start", engine.getMemoryManager());
         assertNull("DataStorageManager should be null before start", engine.getDataStorageManager());

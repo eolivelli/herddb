@@ -45,6 +45,7 @@ sleep 1
 cd $SERVER1DIR/herddb*
 INDEXING_CONFIGFILE=conf/indexingservice.properties
 echo "log.dir=dbdata/txlog" >> $INDEXING_CONFIGFILE
+echo "server.metadata.dir=dbdata/metadata" >> $INDEXING_CONFIGFILE
 export JAVA_OPTS="-XX:+UseG1GC  -Duser.language=en -Dherddb.vectorindex.rebuild.threads=8 -Djava.net.preferIPv4Stack=true  -Xmx40g -Xms40g -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$SERVER1DIR/indexingservice-heapdump.hprof --add-modules jdk.incubator.vector -Djava.io.tmpdir=$(pwd)/tmp"
 bin/service indexing-service start
 cd ../..

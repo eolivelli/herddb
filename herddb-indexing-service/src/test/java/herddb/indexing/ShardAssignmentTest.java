@@ -22,6 +22,7 @@ package herddb.indexing;
 
 import static org.junit.Assert.*;
 
+import herddb.mem.MemoryMetadataStorageManager;
 import herddb.codec.RecordSerializer;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
@@ -70,6 +71,10 @@ public class ShardAssignmentTest {
         props.setProperty(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES, String.valueOf(numInstances));
         IndexingServerConfiguration config = new IndexingServerConfiguration(props);
         IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        MemoryMetadataStorageManager meta = new MemoryMetadataStorageManager();
+        meta.start();
+        meta.ensureDefaultTableSpace("local", "local", 0, 1);
+        engine.setMetadataStorageManager(meta);
         engine.start();
         return engine;
     }
