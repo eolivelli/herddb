@@ -19,8 +19,9 @@
  */
 package herddb.indexing;
 
-import static org.junit.Assert.*;
-
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 import herddb.cluster.BookKeeperCommitLogTailer;
 import herddb.cluster.BookkeeperCommitLog;
 import herddb.cluster.BookkeeperCommitLogManager;

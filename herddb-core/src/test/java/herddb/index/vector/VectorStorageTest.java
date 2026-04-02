@@ -187,7 +187,11 @@ public class VectorStorageTest {
 
         // Writer: triggers growth repeatedly
         futures.add(exec.submit(() -> {
-            try { latch.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            try {
+                latch.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             for (int i = 0; i < count; i++) {
                 storage.set(i, vec((float) i));
             }
@@ -195,7 +199,11 @@ public class VectorStorageTest {
 
         // Reader: reads concurrently, should never throw
         futures.add(exec.submit(() -> {
-            try { latch.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            try {
+                latch.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
             for (int iter = 0; iter < 10000; iter++) {
                 storage.get(iter % count); // may return null, but must not throw
             }

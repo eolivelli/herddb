@@ -20,7 +20,9 @@
 
 package herddb.indexing;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 import herddb.mem.MemoryMetadataStorageManager;
 import herddb.index.vector.AbstractVectorStore;
@@ -31,12 +33,10 @@ import herddb.log.LogSequenceNumber;
 import herddb.model.ColumnTypes;
 import herddb.model.Index;
 import herddb.model.Table;
-
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicReference;
-
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;

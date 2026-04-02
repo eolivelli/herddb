@@ -503,10 +503,6 @@ public class DatasetLoader {
         }
     }
 
-    private VectorStream streamHdf5Vectors(int maxVectors) {
-        return streamHdf5Vectors(0, maxVectors);
-    }
-
     private VectorStream streamHdf5Vectors(int skipVectors, int maxVectors) {
         // Load all vectors from HDF5 into memory, then stream from the array
         HdfFile hdf = new HdfFile(getHdf5File().toPath());

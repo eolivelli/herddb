@@ -20,12 +20,9 @@
 
 package herddb.indexing;
 
-import static org.junit.Assert.*;
-
+import static org.junit.Assert.assertEquals;
 import herddb.log.LogSequenceNumber;
-
 import java.io.IOException;
-
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;

@@ -21,7 +21,6 @@
 package herddb.indexing;
 
 import static org.junit.Assert.assertTrue;
-
 import herddb.core.MemoryManager;
 import herddb.index.vector.PersistentVectorStore;
 import herddb.mem.MemoryDataStorageManager;

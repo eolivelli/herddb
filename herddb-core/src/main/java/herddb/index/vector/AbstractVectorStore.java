@@ -21,7 +21,6 @@
 package herddb.index.vector;
 
 import herddb.utils.Bytes;
-
 import java.util.List;
 import java.util.Map;
 

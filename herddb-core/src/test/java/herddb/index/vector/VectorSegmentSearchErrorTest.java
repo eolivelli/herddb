@@ -56,7 +56,7 @@ public class VectorSegmentSearchErrorTest {
         seg.pkData = new byte[]{1, 2, 3, 4};
         seg.pkOffsets = new int[]{0};
         seg.pkLengths = new int[]{4};
-        seg.liveCount = 1;
+        seg.liveCount.set(1);
 
         // Create a broken OnDiskGraphIndex by using an invalid file.
         // Instead, we set onDiskGraph to a value that will cause GraphSearcher
@@ -166,7 +166,7 @@ public class VectorSegmentSearchErrorTest {
         // Since onDiskGraph is null, it exits before checking liveCount anyway.
         // This test documents the behavior.
         seg.pkOffsets = new int[]{-1};
-        seg.liveCount = 0;
+        seg.liveCount.set(0);
         List<Map.Entry<Bytes, Float>> results = new ArrayList<>();
         VectorFloat<?> qv = VTS.createFloatVector(new float[]{1.0f});
         seg.search(qv, 10, VectorSimilarityFunction.COSINE, results);

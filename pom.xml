@@ -637,6 +637,7 @@
 
 				<!-- Kubernetes/Helm charts -->
 				<exclude>kubernetes/**/*</exclude>
+				<exclude>**/src/main/helm/**/*</exclude>
 
 				<!-- Monitoring/observability configuration (Docker Compose, Prometheus, Grafana) -->
 				<exclude>**/monitor/**/*</exclude>

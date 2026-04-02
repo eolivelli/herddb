@@ -24,7 +24,6 @@ import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
 import herddb.model.Index;
 import herddb.model.Table;
-
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;

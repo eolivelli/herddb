@@ -24,7 +24,6 @@ import static herddb.core.TestUtils.execute;
 import static herddb.core.TestUtils.executeUpdate;
 import static herddb.model.TransactionContext.NO_TRANSACTION;
 import static org.junit.Assert.assertTrue;
-
 import herddb.core.indexes.MockRemoteVectorIndexService;
 import herddb.file.FileCommitLogManager;
 import herddb.file.FileDataStorageManager;
