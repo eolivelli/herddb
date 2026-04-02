@@ -1,3 +1,4 @@
+{{- if eq .Values.server.mode "remote-file-service" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -40,3 +41,4 @@ data:
     http.enable=true
     http.port={{ .Values.fileServer.httpPort }}
     http.host=0.0.0.0
+{{- end }}

@@ -676,6 +676,7 @@
                 <module>herddb-backward-compatibility</module>
                 <module>herddb-thirdparty</module>
                 <module>herddb-docker</module>
+                <module>herddb-kubernetes</module>
                 <module>herddb-remote-file-service</module>
                 <module>herddb-indexing-service</module>
                 <module>vector-testings</module>
@@ -883,6 +884,7 @@
                 <module>herddb-thirdparty</module>
                 <module>herddb-backward-compatibility</module>
                 <module>herddb-docker</module>
+                <module>herddb-kubernetes</module>
                 <module>herddb-remote-file-service</module>
                 <module>herddb-indexing-service</module>
                 <module>vector-testings</module>
