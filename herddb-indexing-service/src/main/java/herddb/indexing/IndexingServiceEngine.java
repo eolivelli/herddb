@@ -136,6 +136,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 Path metadataDirectory = java.nio.file.Paths.get(
                         config.getString(IndexingServerConfiguration.PROPERTY_METADATA_DIR,
                                 IndexingServerConfiguration.PROPERTY_METADATA_DIR_DEFAULT)).toAbsolutePath();
+                LOGGER.log(Level.INFO, "Indexing service cluster metadata directory: {0}", metadataDirectory);
                 return new FileMetadataStorageManager(metadataDirectory);
             }
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:

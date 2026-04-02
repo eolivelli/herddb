@@ -117,8 +117,11 @@ public class IndexingServiceMain {
         String dataDir = configuration.getProperty("data.dir", "indexingservice_" + port);
         String logDir = configuration.getProperty("log.dir", "indexingservice_" + port + "_log");
 
-        // Per-port PID file so multiple instances can coexist on the same host
-        System.setProperty("pidfile", "indexing-service-" + port + ".java.pid");
+        // Per-port PID file so multiple instances can coexist on the same host.
+        // Only set the default if not already provided via -Dpidfile (e.g. by the service script).
+        if (System.getProperty("pidfile", "").isEmpty()) {
+            System.setProperty("pidfile", "indexing-service-" + port + ".java.pid");
+        }
 
         CountDownLatch shutdownLatch = new CountDownLatch(1);
 
