@@ -139,6 +139,9 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_TABLESPACE_NAME = "indexing.tablespace.name";
     public static final String PROPERTY_TABLESPACE_NAME_DEFAULT = TableSpace.DEFAULT;
 
+    public static final String PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS = "indexing.tablespace.wait.poll.interval.ms";
+    public static final int PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS_DEFAULT = 2_000;
+
     // Server mode — same key as ServerConfiguration so config can be copy/pasted
     public static final String PROPERTY_MODE = "server.mode";
     public static final String PROPERTY_MODE_DEFAULT = ServerConfiguration.PROPERTY_MODE_STANDALONE;

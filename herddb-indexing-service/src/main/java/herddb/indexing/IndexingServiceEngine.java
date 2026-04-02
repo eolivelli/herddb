@@ -331,13 +331,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     metadataStorageManager.getClass().getName());
         }
 
-        // Resolve tablespace name to UUID
+        // Resolve tablespace name to UUID, polling until available or interrupted
         String tablespaceName = config.getString(IndexingServerConfiguration.PROPERTY_TABLESPACE_NAME,
                 IndexingServerConfiguration.PROPERTY_TABLESPACE_NAME_DEFAULT);
-        TableSpace tableSpace = metadataStorageManager.describeTableSpace(tablespaceName);
-        if (tableSpace == null) {
-            throw new IllegalArgumentException(
-                    "tablespace '" + tablespaceName + "' not found in metadata");
+        long pollIntervalMs = config.getLong(IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS,
+                IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS_DEFAULT);
+        TableSpace tableSpace = null;
+        while (true) {
+            tableSpace = metadataStorageManager.describeTableSpace(tablespaceName);
+            if (tableSpace != null) {
+                break;
+            }
+            LOGGER.log(Level.INFO, "Tablespace ''{0}'' not yet available, retrying in {1}ms...",
+                    new Object[]{tablespaceName, pollIntervalMs});
+            Thread.sleep(pollIntervalMs);
         }
         String tableSpaceUUID = tableSpace.uuid;
         LOGGER.log(Level.INFO, "Resolved tablespace name ''{0}'' to UUID ''{1}''",
