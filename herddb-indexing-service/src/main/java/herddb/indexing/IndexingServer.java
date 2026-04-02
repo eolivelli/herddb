@@ -71,7 +71,8 @@ public class IndexingServer implements AutoCloseable {
 
     /**
      * Builds a MemoryManager based on configuration.
-     * If {@code indexing.memory.vector.limit} is 0 (auto), uses 50% of JVM max heap.
+     * If {@code indexing.memory.vector.limit} is 0 (auto), uses 33% of JVM max heap
+     * (consistent with the vector back-pressure budget set in {@link #start()}).
      */
     MemoryManager buildMemoryManager() {
         long maxVectorMemory = config.getLong(IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT,
@@ -81,8 +82,8 @@ public class IndexingServer implements AutoCloseable {
 
         long maxDataUsedMemory;
         if (maxVectorMemory <= 0) {
-            // Auto: use 50% of JVM max heap
-            maxDataUsedMemory = Runtime.getRuntime().maxMemory() / 2;
+            // Auto: use 33% of JVM max heap (same fraction as vector back-pressure budget)
+            maxDataUsedMemory = Runtime.getRuntime().maxMemory() / 3;
         } else {
             maxDataUsedMemory = maxVectorMemory;
         }

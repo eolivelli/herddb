@@ -992,6 +992,37 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     return pvs.getTotalBackpressureTimeMs();
                 }
             });
+            indexStats.registerGauge("max_vector_memory_bytes", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    long v = pvs.getMaxVectorMemoryBytes();
+                    return v == Long.MAX_VALUE ? 0L : v;
+                }
+            });
+            indexStats.registerGauge("frozen_shard_count", new Gauge<Integer>() {
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.getFrozenShardCount();
+                }
+            });
+            indexStats.registerGauge("live_vector_cap_during_checkpoint", new Gauge<Integer>() {
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.getLiveVectorCapDuringCheckpoint();
+                }
+            });
         }
     }
 

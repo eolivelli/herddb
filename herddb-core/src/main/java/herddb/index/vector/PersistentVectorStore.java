@@ -1149,10 +1149,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
             for (LiveGraphShard shard : snapshotShards) {
                 totalSnapshotSize += shard.nodeToPk.size();
             }
-            long bytesPerVector = (long) snapshotDimension * Float.BYTES + 64;
-            int vectorCapFromBytes = (int) Math.min(Integer.MAX_VALUE,
-                    MAX_LIVE_BYTES_DURING_CHECKPOINT / bytesPerVector);
-            this.liveVectorCapDuringCheckpoint = Math.max(vectorCapFromBytes, totalSnapshotSize / 2);
+            long effectiveBudget = maxVectorMemoryBytes != Long.MAX_VALUE ? maxVectorMemoryBytes
+                    : (memoryBudget != null ? memoryBudget.maxMemoryBytes() : Long.MAX_VALUE);
+            this.liveVectorCapDuringCheckpoint = computeLiveVectorCapDuringCheckpoint(
+                    totalSnapshotSize, snapshotDimension,
+                    effectiveBudget, memoryMultiplier, computeEffectiveMaxLiveGraphSize());
 
             initEmptyLiveShards(snapshotDimension, beamWidth, neighborOverflow, alpha);
             dirty.set(false);
@@ -1162,6 +1163,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             + "{5} sealed + {6} mergeable segments",
                     new Object[]{indexName, snapshotShards.size(), totalSnapshotSize, snapshotDimension,
                             onDiskNodeToPkSize(), sealedSegments.size(), mergeableSegments.size()});
+            LOGGER.log(Level.INFO,
+                    "checkpoint {0} Phase A: liveVectorCapDuringCheckpoint={1}"
+                            + " (frozenVectors={2}, dim={3}, budget={4}, multiplier={5})",
+                    new Object[]{indexName, liveVectorCapDuringCheckpoint,
+                            totalSnapshotSize, snapshotDimension, effectiveBudget, memoryMultiplier});
         } finally {
             stateLock.writeLock().unlock();
         }
@@ -2335,6 +2341,42 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return Math.max(10_000, Math.min(100_000, computed));
     }
 
+    /**
+     * Computes the maximum number of live vectors allowed during checkpoint Phase B.
+     *
+     * <p>When a memory budget is configured ({@code effectiveBudget != Long.MAX_VALUE}),
+     * the cap is derived from the remaining headroom after accounting for the frozen shards
+     * that are being written during Phase B.  This prevents workers from accumulating so many
+     * new live shards that combined heap (frozen + live) exceeds the JVM limit before Phase C
+     * can release the frozen data.
+     *
+     * <p>When no budget is configured the method falls back to the static
+     * {@link #MAX_LIVE_BYTES_DURING_CHECKPOINT} system-property limit.
+     *
+     * @param frozenVectorCount total vector count across all frozen shards (Phase A snapshot)
+     * @param dim               vector dimension
+     * @param effectiveBudget   per-store or global budget in bytes; {@code Long.MAX_VALUE} if unconfigured
+     * @param memoryMultiplier  per-vector overhead factor used by {@link #estimatedMemoryUsageBytes()}
+     * @param minShardSize      minimum floor — result of {@link #computeEffectiveMaxLiveGraphSize()}
+     * @return cap to assign to {@link #liveVectorCapDuringCheckpoint}
+     */
+    static int computeLiveVectorCapDuringCheckpoint(
+            int frozenVectorCount, int dim,
+            long effectiveBudget, double memoryMultiplier, int minShardSize) {
+        if (effectiveBudget == Long.MAX_VALUE) {
+            // No budget configured: fall back to static raw-byte limit
+            long rawBytesPerVector = (long) dim * Float.BYTES + 64;
+            return (int) Math.min(Integer.MAX_VALUE,
+                    MAX_LIVE_BYTES_DURING_CHECKPOINT / Math.max(1L, rawBytesPerVector));
+        }
+        long estimatedBytesPerVector = Math.max(1L, (long) (dim * Float.BYTES * memoryMultiplier));
+        long frozenEstimated = (long) frozenVectorCount * estimatedBytesPerVector;
+        long headroom = Math.max(0L, effectiveBudget - frozenEstimated);
+        int cap = (int) Math.min(Integer.MAX_VALUE, headroom / estimatedBytesPerVector);
+        // Minimum: at least one shard's worth so Phase B can always make progress
+        return Math.max(cap, minShardSize);
+    }
+
     private LiveGraphShard createEmptyLiveShard(int dim, int bw, float no, float a) {
         ConcurrentHashMap<Bytes, Integer> p2n = new ConcurrentHashMap<>();
         ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>();
@@ -2644,5 +2686,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public long getMaxVectorMemoryBytes() {
         return maxVectorMemoryBytes;
+    }
+
+    public int getFrozenShardCount() {
+        List<LiveGraphShard> frozen = frozenShards;
+        return frozen != null ? frozen.size() : 0;
+    }
+
+    public int getLiveVectorCapDuringCheckpoint() {
+        return liveVectorCapDuringCheckpoint;
     }
 }

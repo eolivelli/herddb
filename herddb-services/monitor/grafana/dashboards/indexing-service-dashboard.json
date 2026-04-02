@@ -61,10 +61,19 @@
             "value_type": "individual"
           },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "bytes", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "bytes",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -118,12 +127,26 @@
           ],
           "thresholds": [],
           "title": "JVM Threads",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -160,12 +183,25 @@
           ],
           "thresholds": [],
           "title": "GC Time / 1 min rate",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "s", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "s",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -235,12 +271,26 @@
           ],
           "thresholds": [],
           "title": "Vector Index - Total Node Count",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -285,12 +335,26 @@
           ],
           "thresholds": [],
           "title": "Live Node Count (per index)",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -326,12 +390,26 @@
           ],
           "thresholds": [],
           "title": "On-Disk Node Count (per index)",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -376,12 +454,26 @@
           ],
           "thresholds": [],
           "title": "Segment Count (per index)",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -417,12 +509,26 @@
           ],
           "thresholds": [],
           "title": "Live Shard Count (per index)",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -467,12 +573,25 @@
           ],
           "thresholds": [],
           "title": "Estimated Memory Size (per index)",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "bytes", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "bytes",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -508,17 +627,331 @@
           ],
           "thresholds": [],
           "title": "Live Vectors Memory (per index)",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "bytes", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "bytes",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
       "showTitle": true,
       "title": "Vector Index Memory",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 70,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_max_vector_memory_bytes\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "budget (max_vector_memory_bytes)",
+              "refId": "A",
+              "step": 5
+            },
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_estimated_size_bytes\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "estimated usage",
+              "refId": "B",
+              "step": 5
+            },
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_live_vectors_memory_bytes\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "live vectors memory",
+              "refId": "C",
+              "step": 5
+            }
+          ],
+          "thresholds": [],
+          "title": "Vector Memory: Budget vs Estimated Usage",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "bytes",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 71,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "jvm_memory_bytes_max{job=\"indexing-service\",instance=~\"$instance\",area=\"heap\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "heap max",
+              "refId": "A",
+              "step": 5
+            },
+            {
+              "expr": "jvm_memory_bytes_used{job=\"indexing-service\",instance=~\"$instance\",area=\"heap\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "heap used",
+              "refId": "B",
+              "step": 5
+            }
+          ],
+          "thresholds": [],
+          "title": "JVM Heap: Max vs Used",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "bytes",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 72,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_frozen_shard_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "frozen shards",
+              "refId": "A",
+              "step": 5
+            },
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_live_shard_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "live shards",
+              "refId": "B",
+              "step": 5
+            }
+          ],
+          "thresholds": [],
+          "title": "Frozen Shard Count (during checkpoint)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 73,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_live_vector_cap_during_checkpoint\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "live vector cap",
+              "refId": "A",
+              "step": 5
+            },
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_live_node_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 5,
+              "legendFormat": "live node count",
+              "refId": "B",
+              "step": 5
+            }
+          ],
+          "thresholds": [],
+          "title": "Live Vector Cap During Checkpoint",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Vector Memory Sizing",
       "titleSize": "h6"
     },
     {
@@ -558,12 +991,28 @@
           ],
           "thresholds": [],
           "title": "Index Dirty Flag (per index)",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "min": 0, "max": 1, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "min": 0,
+              "max": 1,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -599,12 +1048,28 @@
           ],
           "thresholds": [],
           "title": "Checkpoint Active (per index)",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "min": 0, "max": 1, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "min": 0,
+              "max": 1,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -634,10 +1099,22 @@
           "type": "singlestat",
           "valueName": "current",
           "colorBackground": true,
-          "colors": ["#299c46", "#d44a3a", "#d44a3a"],
+          "colors": [
+            "#299c46",
+            "#d44a3a",
+            "#d44a3a"
+          ],
           "valueMaps": [
-            { "value": "0", "text": "OK", "op": "=" },
-            { "value": "1", "text": "THROTTLED", "op": "=" }
+            {
+              "value": "0",
+              "text": "OK",
+              "op": "="
+            },
+            {
+              "value": "1",
+              "text": "THROTTLED",
+              "op": "="
+            }
           ]
         },
         {
@@ -673,12 +1150,26 @@
           ],
           "thresholds": [],
           "title": "Back-Pressure Events (cumulative)",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -714,12 +1205,25 @@
           ],
           "thresholds": [],
           "title": "Cumulative Back-Pressure Time",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "ms", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "ms",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -764,12 +1268,25 @@
           ],
           "thresholds": [],
           "title": "Last Checkpoint Duration",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "ms", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "ms",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -805,12 +1322,25 @@
           ],
           "thresholds": [],
           "title": "FusedPQ Phase B Duration (Graph Construction)",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "ms", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "ms",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -855,12 +1385,26 @@
           ],
           "thresholds": [],
           "title": "Total Checkpoint Count",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -903,12 +1447,26 @@
           ],
           "thresholds": [],
           "title": "FusedPQ vs Simple Checkpoint Count",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -944,12 +1502,26 @@
           ],
           "thresholds": [],
           "title": "Last Checkpoint Vectors Processed",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -994,12 +1566,26 @@
           ],
           "thresholds": [],
           "title": "CommitLog Tailer - Entries Processed",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -1035,12 +1621,26 @@
           ],
           "thresholds": [],
           "title": "CommitLog Tailer - Watermark Ledger ID",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -1076,12 +1676,26 @@
           ],
           "thresholds": [],
           "title": "CommitLog Tailer - Watermark Offset",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "short", "decimals": 0, "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -1111,10 +1725,22 @@
           "type": "singlestat",
           "valueName": "current",
           "colorBackground": true,
-          "colors": ["#d44a3a", "#299c46", "#299c46"],
+          "colors": [
+            "#d44a3a",
+            "#299c46",
+            "#299c46"
+          ],
           "valueMaps": [
-            { "value": "0", "text": "STOPPED", "op": "=" },
-            { "value": "1", "text": "RUNNING", "op": "=" }
+            {
+              "value": "0",
+              "text": "STOPPED",
+              "op": "="
+            },
+            {
+              "value": "1",
+              "text": "RUNNING",
+              "op": "="
+            }
           ]
         },
         {
@@ -1150,12 +1776,25 @@
           ],
           "thresholds": [],
           "title": "CommitLog Tailer - Ingestion Rate",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "ops", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "ops",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -1200,12 +1839,25 @@
           ],
           "thresholds": [],
           "title": "Search Requests Rate",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "ops", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "ops",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -1241,12 +1893,25 @@
           ],
           "thresholds": [],
           "title": "Search Errors Rate",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "ops", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "ops",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -1289,12 +1954,25 @@
           ],
           "thresholds": [],
           "title": "Search Latency",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "\u00b5s", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "\u00b5s",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -1339,12 +2017,25 @@
           ],
           "thresholds": [],
           "title": "Status Requests Rate",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "ops", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "ops",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         },
         {
@@ -1380,12 +2071,25 @@
           ],
           "thresholds": [],
           "title": "Status Errors Rate",
-          "tooltip": { "shared": true, "sort": 0, "value_type": "individual" },
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
           "type": "graph",
-          "xaxis": { "mode": "time", "show": true },
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
           "yaxes": [
-            { "format": "ops", "show": true },
-            { "format": "short", "show": true }
+            {
+              "format": "ops",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
           ]
         }
       ],
@@ -1478,8 +2182,27 @@
     "to": "now"
   },
   "timepicker": {
-    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h"],
-    "time_options": ["5m", "15m", "1h", "6h", "12h", "24h", "2d", "7d", "30d"]
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h"
+    ],
+    "time_options": [
+      "5m",
+      "15m",
+      "1h",
+      "6h",
+      "12h",
+      "24h",
+      "2d",
+      "7d",
+      "30d"
+    ]
   },
   "timezone": "",
   "title": "HerdDB Indexing Service",
