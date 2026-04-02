@@ -22,7 +22,6 @@ package herddb.core.indexes;
 import herddb.index.vector.RemoteVectorIndexService;
 import herddb.log.LogSequenceNumber;
 import herddb.utils.Bytes;
-import java.nio.ByteBuffer;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;

@@ -20,14 +20,13 @@
 
 package herddb.indexing;
 
-import static org.junit.Assert.*;
-
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
 import herddb.log.LogSequenceNumber;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataOutputStream;
-
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -36,7 +35,6 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;

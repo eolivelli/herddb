@@ -19,11 +19,8 @@
  */
 package herddb.indexing;
 
-import static org.junit.Assert.*;
-
-import herddb.cluster.BookkeeperCommitLog;
-import herddb.cluster.BookkeeperCommitLogManager;
-import herddb.cluster.ZookeeperMetadataStorageManager;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import herddb.codec.RecordSerializer;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
@@ -32,20 +29,14 @@ import herddb.model.ColumnTypes;
 import herddb.model.Index;
 import herddb.model.Record;
 import herddb.model.Table;
-import herddb.server.ServerConfiguration;
 import herddb.utils.Bytes;
 import herddb.utils.ZKTestEnv;
-
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 import java.util.Set;
-
-import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;

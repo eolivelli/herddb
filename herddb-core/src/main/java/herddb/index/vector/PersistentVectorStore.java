@@ -19,8 +19,8 @@
 
 package herddb.index.vector;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import herddb.core.MemoryManager;
-import herddb.core.PostCheckpointAction;
 import herddb.index.blink.BLink;
 import herddb.index.blink.BLinkIndexDataStorage;
 import herddb.index.blink.BytesLongSizeEvaluator;
@@ -541,6 +541,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         LOGGER.log(Level.INFO, "PersistentVectorStore {0} started", indexName);
     }
 
+    @SuppressFBWarnings("NN_NAKED_NOTIFY")
     private void compactionLoop() {
         while (running) {
             try {
@@ -1113,6 +1114,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /**
      * Three-phase FusedPQ checkpoint.
      */
+    @SuppressFBWarnings("NN_NAKED_NOTIFY")
     private void doCheckpointFusedPQThreePhase(LogSequenceNumber sequenceNumber)
             throws IOException, DataStorageManagerException {
 
@@ -1747,7 +1749,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 seg.pkOffsets = new int[0];
                 seg.pkLengths = new int[0];
             }
-            seg.liveCount = entryCount;
+            seg.liveCount.set(entryCount);
             seg.maxOrdinal = maxOrdinal;
         }
 

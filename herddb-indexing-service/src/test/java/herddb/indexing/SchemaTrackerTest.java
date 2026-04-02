@@ -20,16 +20,16 @@
 
 package herddb.indexing;
 
-import static org.junit.Assert.*;
-
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
 import herddb.model.ColumnTypes;
 import herddb.model.Index;
 import herddb.model.Table;
-
 import java.util.Collection;
-
 import org.junit.Before;
 import org.junit.Test;
 

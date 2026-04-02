@@ -52,7 +52,6 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -737,29 +736,45 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         StatsLogger tailerStats = sl.scope("tailer");
 
         tailerStats.registerGauge("watermark_ledger_id", new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return -1L; }
-            @Override public Long getSample() {
+            @Override
+            public Long getDefaultValue() {
+                return -1L;
+            }
+            @Override
+            public Long getSample() {
                 LogSequenceNumber lsn = lastProcessedLsn;
                 return lsn != null ? lsn.ledgerId : -1L;
             }
         });
         tailerStats.registerGauge("watermark_offset", new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return -1L; }
-            @Override public Long getSample() {
+            @Override
+            public Long getDefaultValue() {
+                return -1L;
+            }
+            @Override
+            public Long getSample() {
                 LogSequenceNumber lsn = lastProcessedLsn;
                 return lsn != null ? lsn.offset : -1L;
             }
         });
         tailerStats.registerGauge("entries_processed", new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
                 CommitLogTailing t = tailer;
                 return t != null ? t.getEntriesProcessed() : 0L;
             }
         });
         tailerStats.registerGauge("running", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() {
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
                 CommitLogTailing t = tailer;
                 return t != null && t.isRunning() ? 1 : 0;
             }
@@ -781,14 +796,22 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 .scope("vidx_" + indexName);
 
         indexStats.registerGauge("node_count", new Gauge<Integer>() {
-            @Override public Integer getDefaultValue() { return 0; }
-            @Override public Integer getSample() {
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
                 return store.size();
             }
         });
         indexStats.registerGauge("estimated_size_bytes", new Gauge<Long>() {
-            @Override public Long getDefaultValue() { return 0L; }
-            @Override public Long getSample() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
                 return store.estimatedMemoryUsageBytes();
             }
         });
@@ -797,72 +820,174 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             PersistentVectorStore pvs = (PersistentVectorStore) store;
 
             indexStats.registerGauge("live_node_count", new Gauge<Integer>() {
-                @Override public Integer getDefaultValue() { return 0; }
-                @Override public Integer getSample() { return pvs.getLiveNodeCount(); }
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.getLiveNodeCount();
+                }
             });
             indexStats.registerGauge("ondisk_node_count", new Gauge<Integer>() {
-                @Override public Integer getDefaultValue() { return 0; }
-                @Override public Integer getSample() { return pvs.getOnDiskNodeCount(); }
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.getOnDiskNodeCount();
+                }
             });
             indexStats.registerGauge("segment_count", new Gauge<Integer>() {
-                @Override public Integer getDefaultValue() { return 0; }
-                @Override public Integer getSample() { return pvs.getSegmentCount(); }
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.getSegmentCount();
+                }
             });
             indexStats.registerGauge("dimension", new Gauge<Integer>() {
-                @Override public Integer getDefaultValue() { return 0; }
-                @Override public Integer getSample() { return pvs.getDimension(); }
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.getDimension();
+                }
             });
             indexStats.registerGauge("live_vectors_memory_bytes", new Gauge<Long>() {
-                @Override public Long getDefaultValue() { return 0L; }
-                @Override public Long getSample() { return pvs.getLiveVectorsMemoryBytes(); }
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getLiveVectorsMemoryBytes();
+                }
             });
             indexStats.registerGauge("live_shard_count", new Gauge<Integer>() {
-                @Override public Integer getDefaultValue() { return 0; }
-                @Override public Integer getSample() { return pvs.getLiveShardCount(); }
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.getLiveShardCount();
+                }
             });
             indexStats.registerGauge("dirty", new Gauge<Integer>() {
-                @Override public Integer getDefaultValue() { return 0; }
-                @Override public Integer getSample() { return pvs.isDirty() ? 1 : 0; }
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.isDirty() ? 1 : 0;
+                }
             });
             indexStats.registerGauge("checkpoint_active", new Gauge<Integer>() {
-                @Override public Integer getDefaultValue() { return 0; }
-                @Override public Integer getSample() { return pvs.isCheckpointActive() ? 1 : 0; }
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.isCheckpointActive() ? 1 : 0;
+                }
             });
             indexStats.registerGauge("checkpoint_count", new Gauge<Long>() {
-                @Override public Long getDefaultValue() { return 0L; }
-                @Override public Long getSample() { return pvs.getTotalCheckpointCount(); }
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getTotalCheckpointCount();
+                }
             });
             indexStats.registerGauge("checkpoint_fusedpq_count", new Gauge<Long>() {
-                @Override public Long getDefaultValue() { return 0L; }
-                @Override public Long getSample() { return pvs.getTotalFusedPQCheckpointCount(); }
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getTotalFusedPQCheckpointCount();
+                }
             });
             indexStats.registerGauge("checkpoint_simple_count", new Gauge<Long>() {
-                @Override public Long getDefaultValue() { return 0L; }
-                @Override public Long getSample() { return pvs.getTotalSimpleCheckpointCount(); }
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getTotalSimpleCheckpointCount();
+                }
             });
             indexStats.registerGauge("checkpoint_duration_ms", new Gauge<Long>() {
-                @Override public Long getDefaultValue() { return 0L; }
-                @Override public Long getSample() { return pvs.getLastCheckpointDurationMs(); }
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getLastCheckpointDurationMs();
+                }
             });
             indexStats.registerGauge("checkpoint_phase_b_duration_ms", new Gauge<Long>() {
-                @Override public Long getDefaultValue() { return 0L; }
-                @Override public Long getSample() { return pvs.getLastCheckpointPhaseBDurationMs(); }
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getLastCheckpointPhaseBDurationMs();
+                }
             });
             indexStats.registerGauge("checkpoint_vectors_processed", new Gauge<Long>() {
-                @Override public Long getDefaultValue() { return 0L; }
-                @Override public Long getSample() { return pvs.getLastCheckpointVectorsProcessed(); }
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getLastCheckpointVectorsProcessed();
+                }
             });
             indexStats.registerGauge("backpressure_active", new Gauge<Integer>() {
-                @Override public Integer getDefaultValue() { return 0; }
-                @Override public Integer getSample() { return pvs.isBackpressureActive() ? 1 : 0; }
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.isBackpressureActive() ? 1 : 0;
+                }
             });
             indexStats.registerGauge("backpressure_count", new Gauge<Long>() {
-                @Override public Long getDefaultValue() { return 0L; }
-                @Override public Long getSample() { return pvs.getTotalBackpressureCount(); }
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getTotalBackpressureCount();
+                }
             });
             indexStats.registerGauge("backpressure_time_ms", new Gauge<Long>() {
-                @Override public Long getDefaultValue() { return 0L; }
-                @Override public Long getSample() { return pvs.getTotalBackpressureTimeMs(); }
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getTotalBackpressureTimeMs();
+                }
             });
         }
     }

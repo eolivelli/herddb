@@ -22,7 +22,6 @@ package herddb.indexing;
 
 import herddb.index.vector.AbstractVectorStore;
 import herddb.utils.Bytes;
-
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;

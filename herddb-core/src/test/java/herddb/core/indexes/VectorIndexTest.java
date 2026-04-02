@@ -36,7 +36,6 @@ import herddb.model.ColumnTypes;
 import herddb.model.DataScanner;
 import herddb.model.Index;
 import herddb.model.StatementEvaluationContext;
-import herddb.model.Table;
 import herddb.model.TableSpace;
 import herddb.model.TransactionContext;
 import herddb.model.commands.CreateTableSpaceStatement;

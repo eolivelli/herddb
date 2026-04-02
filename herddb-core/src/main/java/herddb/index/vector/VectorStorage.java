@@ -19,6 +19,7 @@
 
 package herddb.index.vector;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
@@ -46,6 +47,7 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
  * write in {@code set} establishes happens-before with any subsequent volatile read in
  * {@code get}, satisfying JLS 17.4.4.
  */
+@SuppressFBWarnings("UG_SYNC_SET_UNSYNC_GET")
 class VectorStorage {
 
     private volatile AtomicReferenceArray<VectorFloat<?>> array;

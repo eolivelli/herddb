@@ -20,8 +20,8 @@
 
 package herddb.indexing;
 
-import static org.junit.Assert.*;
-
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.fail;
 import herddb.indexing.IndexingServiceEngine.IndexStatusInfo;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
@@ -30,7 +30,6 @@ import herddb.mem.MemoryMetadataStorageManager;
 import herddb.model.TableSpace;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataOutputStream;
-
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -38,7 +37,6 @@ import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -146,8 +144,8 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
                 // This should time out — the bug means it would never complete
                 try {
                     catchUpFuture.get(3, TimeUnit.SECONDS);
-                    fail("waitForCatchUp with phantom LSN (2, -1) should have timed out, " +
-                            "but it completed. This means the tailer unexpectedly advanced past ledger 2.");
+                    fail("waitForCatchUp with phantom LSN (2, -1) should have timed out, "
+                            + "but it completed. This means the tailer unexpectedly advanced past ledger 2.");
                 } catch (TimeoutException expected) {
                     // Expected: waitForCatchUp is stuck because phantom LSN is unreachable
                     catchUpFuture.cancel(true);

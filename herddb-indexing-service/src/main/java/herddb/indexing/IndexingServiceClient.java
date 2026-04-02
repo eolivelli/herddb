@@ -20,15 +20,14 @@
 
 package herddb.indexing;
 
-import com.google.protobuf.ByteString;
 import herddb.index.vector.RemoteVectorIndexService;
 import herddb.indexing.proto.GetIndexStatusRequest;
 import herddb.indexing.proto.GetIndexStatusResponse;
-import herddb.log.LogSequenceNumber;
 import herddb.indexing.proto.IndexingServiceGrpc;
 import herddb.indexing.proto.SearchRequest;
 import herddb.indexing.proto.SearchResponse;
 import herddb.indexing.proto.SearchResult;
+import herddb.log.LogSequenceNumber;
 import herddb.utils.Bytes;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;

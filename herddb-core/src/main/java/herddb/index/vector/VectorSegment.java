@@ -38,6 +38,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Spliterator;
 import java.util.Spliterators;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
@@ -80,7 +81,7 @@ class VectorSegment implements Closeable {
     byte[] pkData;
     int[] pkOffsets;   // -1 means deleted/absent
     int[] pkLengths;
-    volatile int liveCount;
+    final AtomicInteger liveCount = new AtomicInteger();
     int maxOrdinal = -1;
 
     // ThreadLocal cache of GraphSearcher to avoid per-search allocation
@@ -125,7 +126,7 @@ class VectorSegment implements Closeable {
             LOGGER.log(Level.FINE, "segment {0}: skipping search, no pk offsets", segmentId);
             return;
         }
-        int activeCount = this.liveCount;
+        int activeCount = this.liveCount.get();
         int k = Math.min(topK, activeCount);
         if (k == 0) {
             LOGGER.log(Level.FINE, "segment {0}: skipping search, no active nodes", segmentId);
@@ -188,7 +189,7 @@ class VectorSegment implements Closeable {
             int ord = onDiskOrdinal.intValue();
             if (ord >= 0 && ord < offsets.length) {
                 offsets[ord] = -1;
-                liveCount--;
+                liveCount.decrementAndGet();
             }
         }
         dirty = true;
@@ -199,7 +200,7 @@ class VectorSegment implements Closeable {
      * Returns the number of live nodes in this segment.
      */
     long size() {
-        return liveCount;
+        return liveCount.get();
     }
 
     /**
@@ -273,7 +274,7 @@ class VectorSegment implements Closeable {
         this.pkData = null;
         this.pkOffsets = null;
         this.pkLengths = null;
-        this.liveCount = 0;
+        this.liveCount.set(0);
         this.searcherCache = new ThreadLocal<>();
         BLink<Bytes, Long> p2n = this.onDiskPkToNode;
         if (p2n != null) {
