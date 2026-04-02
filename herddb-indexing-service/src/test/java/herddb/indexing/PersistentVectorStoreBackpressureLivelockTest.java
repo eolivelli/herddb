@@ -39,13 +39,10 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 /**
- * Reproduces a livelock where memory-pressure interrupts repeatedly abort
- * the compaction thread's checkpoint, preventing memory from ever being freed
- * and permanently blocking ingestion.
- *
- * <p>The fix makes the ForkJoinTask.get() wait in writeFusedPQGraph
- * uninterruptible, so that a checkpoint in progress always completes
- * even when interrupted by backpressure signals.
+ * Verifies that memory-pressure backpressure does not interfere with
+ * checkpoint completion. The fix replaces Thread.interrupt() wake-up
+ * with monitor-based notification, so the compaction thread is never
+ * interrupted during Phase B file I/O.
  */
 public class PersistentVectorStoreBackpressureLivelockTest {
 
@@ -63,12 +60,12 @@ public class PersistentVectorStoreBackpressureLivelockTest {
     }
 
     /**
-     * Verifies that interrupting the compaction thread during Phase B
-     * (as memory-pressure backpressure does) does NOT abort the checkpoint.
-     * The checkpoint should complete successfully despite the interrupts.
+     * Verifies that checkpoint Phase B completes successfully.
+     * Memory backpressure now uses monitor-based notification instead of
+     * Thread.interrupt(), so Phase B file I/O is never disrupted.
      */
     @Test(timeout = 120_000)
-    public void testInterruptDuringPhaseBDoesNotAbortCheckpoint() throws Exception {
+    public void testCheckpointPhaseBCompletes() throws Exception {
         Path tmpDir = tmpFolder.newFolder("backpressure-livelock").toPath();
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         MemoryManager mm = new MemoryManager(128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
@@ -81,14 +78,9 @@ public class PersistentVectorStoreBackpressureLivelockTest {
                 Long.MAX_VALUE, 5.0,
                 VectorSimilarityFunction.EUCLIDEAN)) {
 
-            AtomicInteger interruptCount = new AtomicInteger();
+            AtomicInteger hookCount = new AtomicInteger();
 
-            // Hook that interrupts the current (compaction) thread during Phase B,
-            // simulating what waitForMemoryPressureRelief does via ct.interrupt().
-            store.setCheckpointPhaseBHook(() -> {
-                interruptCount.incrementAndGet();
-                Thread.currentThread().interrupt();
-            });
+            store.setCheckpointPhaseBHook(hookCount::incrementAndGet);
 
             store.start();
 
@@ -101,14 +93,11 @@ public class PersistentVectorStoreBackpressureLivelockTest {
 
             assertEquals(numVectors, store.size());
 
-            // Manually trigger checkpoint — this should succeed despite the
-            // interrupt set by the hook, because the fix makes the
-            // ForkJoinTask.get() wait uninterruptibly.
             store.checkpoint();
 
             // Verify the hook was actually called
             assertTrue("Phase B hook should have been called",
-                    interruptCount.get() > 0);
+                    hookCount.get() > 0);
 
             // Verify the store is consistent — vectors are still searchable
             assertTrue("Store should still have vectors after checkpoint",

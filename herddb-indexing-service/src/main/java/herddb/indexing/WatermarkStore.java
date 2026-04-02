@@ -84,6 +84,6 @@ public class WatermarkStore {
             dos.writeLong(lsn.offset);
         }
         Files.move(tmpFile, watermarkFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        LOGGER.log(Level.INFO, "Saved watermark: {0}", lsn);
+        LOGGER.log(Level.FINE, "Saved watermark: {0}", lsn);
     }
 }

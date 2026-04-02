@@ -258,6 +258,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final AtomicLong totalBackpressureTimeMs = new AtomicLong(0);
     private volatile int backpressureActive;
     private final Object memoryPressureMonitor = new Object();
+    private final Object compactionWakeUp = new Object();
 
     // -------------------------------------------------------------------------
     // Test hook
@@ -548,14 +549,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 long sleepMs = shouldTriggerMemoryPressureCheckpoint()
                         ? Math.min(compactionIntervalMs, 1000)
                         : compactionIntervalMs;
-                Thread.sleep(sleepMs);
+                synchronized (compactionWakeUp) {
+                    compactionWakeUp.wait(sleepMs);
+                }
             } catch (InterruptedException e) {
                 if (!running) {
                     return;
                 }
-                // Interrupted by memory back-pressure; proceed to checkpoint check.
-                // Clear the interrupt flag so that checkpoint() can complete
-                // without ForkJoinTask.get() or other blocking calls failing immediately.
+                // Interrupted by shutdown; clear the flag and proceed.
                 Thread.interrupted();
             }
             if (!running) {
@@ -616,9 +617,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         // Wake up the compaction thread to trigger an immediate checkpoint
-        Thread ct = compactionThread;
-        if (ct != null) {
-            ct.interrupt();
+        synchronized (compactionWakeUp) {
+            compactionWakeUp.notifyAll();
         }
 
         synchronized (memoryPressureMonitor) {
@@ -1857,12 +1857,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
         int progressInterval = Math.max(1000, totalVectors / 10);
         AtomicInteger nodesAdded = new AtomicInteger(0);
         // Submit graph-building work to the checkpoint pool.
-        // Use an uninterruptible wait: on the compaction thread, interrupts are
-        // memory-pressure wake-up signals (from waitForMemoryPressureRelief),
-        // NOT abort requests.  If we let InterruptedException propagate, the
-        // checkpoint fails and triggers recoverFromPhaseBFailure — but memory
-        // stays above the limit, so the ingestion thread interrupts again,
-        // creating a livelock where checkpoints never complete.
         java.util.concurrent.ForkJoinTask<?> graphTask = CHECKPOINT_POOL.submit(() ->
                 allVectors.entrySet().parallelStream()
                     .filter(e -> allNodeToPk.containsKey(e.getKey()))
@@ -1877,18 +1871,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         }
                     })
         );
-        boolean interrupted = false;
         try {
-            while (true) {
-                try {
-                    graphTask.get();
-                    break;
-                } catch (InterruptedException e) {
-                    // Memory-pressure wake-up; the checkpoint is already running,
-                    // so just keep waiting for it to finish.
-                    interrupted = true;
-                }
-            }
+            graphTask.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("writeFusedPQGraph interrupted", e);
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
             if (cause instanceof IOException) {
@@ -1898,13 +1885,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 throw (RuntimeException) cause;
             }
             throw new IOException("writeFusedPQGraph failed", cause);
-        } finally {
-            if (interrupted) {
-                // Clear the interrupt flag rather than re-setting it.
-                // The interrupt served its purpose (wake-up), and re-setting
-                // would cause the next blocking call to fail immediately.
-                Thread.interrupted();
-            }
         }
         mergedBuilder.cleanup();
         OnHeapGraphIndex mergedGraph = (OnHeapGraphIndex) mergedBuilder.getGraph();
