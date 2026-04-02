@@ -978,7 +978,7 @@ public class FileDataStorageManager extends DataStorageManager {
             }
 
         } catch (IOException err) {
-            LOGGER.log(Level.SEVERE, "Failed to write on path: {0}", pageFile);
+            LOGGER.log(Level.SEVERE, "Failed to write on path: " + pageFile, err);
             Path path = pageFile;
             boolean exists;
             do {

@@ -1177,6 +1177,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             newSegmentResults = doCheckpointFusedPQPhaseB(
                     snapshotShards, snapshotDimension, sealedSegments, mergeableSegments, sequenceNumber);
         } catch (IOException | RuntimeException e) {
+            LOGGER.log(Level.SEVERE, "checkpoint " + indexName + ": Phase B exception", e);
             recoverFromPhaseBFailure(snapshotShards);
             throw e;
         }
