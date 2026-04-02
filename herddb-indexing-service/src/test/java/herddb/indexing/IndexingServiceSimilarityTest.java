@@ -23,13 +23,12 @@ package herddb.indexing;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-
-import herddb.mem.MemoryMetadataStorageManager;
 import herddb.index.vector.AbstractVectorStore;
 import herddb.index.vector.VectorIndexManager;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
 import herddb.log.LogSequenceNumber;
+import herddb.mem.MemoryMetadataStorageManager;
 import herddb.model.ColumnTypes;
 import herddb.model.Index;
 import herddb.model.Table;
