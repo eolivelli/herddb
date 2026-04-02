@@ -177,6 +177,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final double memoryMultiplier;
     private final long compactionIntervalMs;
     private final long maxVectorMemoryBytes;
+    private final VectorMemoryBudget memoryBudget;
 
     // -------------------------------------------------------------------------
     // In-memory state -- LIVE inserts (new since last checkpoint)
@@ -309,6 +310,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  long compactionIntervalMs, double memoryMultiplier,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes) {
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName, tmpDirectory,
+                dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
+                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs, memoryMultiplier,
+                similarityFunction, maxVectorMemoryBytes, null);
+    }
+
+    public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
+                                 String vectorColumnName, Path tmpDirectory,
+                                 DataStorageManager dataStorageManager,
+                                 MemoryManager memoryManager,
+                                 int m, int beamWidth, float neighborOverflow, float alpha,
+                                 boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
+                                 long compactionIntervalMs, double memoryMultiplier,
+                                 VectorSimilarityFunction similarityFunction,
+                                 long maxVectorMemoryBytes,
+                                 VectorMemoryBudget memoryBudget) {
         super(vectorColumnName);
         this.indexName = indexName;
         this.tableName = tableName;
@@ -328,6 +345,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.compactionIntervalMs = compactionIntervalMs;
         this.memoryMultiplier = memoryMultiplier;
         this.maxVectorMemoryBytes = maxVectorMemoryBytes;
+        this.memoryBudget = memoryBudget;
     }
 
     /**
@@ -376,6 +394,26 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  long compactionIntervalMs, double memoryMultiplier,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes) {
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
+                dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
+                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs, memoryMultiplier,
+                similarityFunction, maxVectorMemoryBytes, null);
+    }
+
+    /**
+     * Constructor that accepts an explicit indexUUID, similarity function, memory limit,
+     * and global memory budget.
+     */
+    public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
+                                 String vectorColumnName, String indexUUID, Path tmpDirectory,
+                                 DataStorageManager dataStorageManager,
+                                 MemoryManager memoryManager,
+                                 int m, int beamWidth, float neighborOverflow, float alpha,
+                                 boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
+                                 long compactionIntervalMs, double memoryMultiplier,
+                                 VectorSimilarityFunction similarityFunction,
+                                 long maxVectorMemoryBytes,
+                                 VectorMemoryBudget memoryBudget) {
         super(vectorColumnName);
         this.indexName = indexName;
         this.tableName = tableName;
@@ -395,6 +433,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.compactionIntervalMs = compactionIntervalMs;
         this.memoryMultiplier = memoryMultiplier;
         this.maxVectorMemoryBytes = maxVectorMemoryBytes;
+        this.memoryBudget = memoryBudget;
     }
 
     // -------------------------------------------------------------------------
@@ -533,14 +572,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     private boolean shouldTriggerMemoryPressureCheckpoint() {
+        // Check global budget first (covers all stores sharing the same heap)
+        if (memoryBudget != null) {
+            boolean trigger = memoryBudget.isAboveThreshold(0.7);
+            if (trigger) {
+                LOGGER.log(Level.INFO,
+                        "vector store {0} memory pressure (global): {1} bytes exceeds 70% of global limit {2} bytes, triggering early checkpoint",
+                        new Object[]{indexName, memoryBudget.totalEstimatedMemoryUsageBytes(), memoryBudget.maxMemoryBytes()});
+            }
+            return trigger;
+        }
+        // Fallback to per-store check
         if (maxVectorMemoryBytes == Long.MAX_VALUE) {
             return false;
         }
         long usage = estimatedMemoryUsageBytes();
-        boolean trigger = usage > (long) (maxVectorMemoryBytes * 0.8);
+        boolean trigger = usage > (long) (maxVectorMemoryBytes * 0.7);
         if (trigger) {
             LOGGER.log(Level.INFO,
-                    "vector store {0} memory pressure: {1} bytes exceeds 80% of limit {2} bytes, triggering early checkpoint",
+                    "vector store {0} memory pressure: {1} bytes exceeds 70% of limit {2} bytes, triggering early checkpoint",
                     new Object[]{indexName, usage, maxVectorMemoryBytes});
         }
         return trigger;
@@ -550,10 +600,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
         long startMs = System.currentTimeMillis();
         backpressureActive = 1;
         totalBackpressureCount.incrementAndGet();
-        long usage = estimatedMemoryUsageBytes();
-        LOGGER.log(Level.WARNING,
-                "vector store {0} memory back-pressure: estimated {1} bytes exceeds limit {2} bytes, blocking addVector",
-                new Object[]{indexName, usage, maxVectorMemoryBytes});
+        if (memoryBudget != null) {
+            LOGGER.log(Level.WARNING,
+                    "vector store {0} memory back-pressure (global): estimated {1} bytes exceeds global limit {2} bytes, blocking addVector",
+                    new Object[]{indexName, memoryBudget.totalEstimatedMemoryUsageBytes(), memoryBudget.maxMemoryBytes()});
+        } else {
+            long usage = estimatedMemoryUsageBytes();
+            LOGGER.log(Level.WARNING,
+                    "vector store {0} memory back-pressure: estimated {1} bytes exceeds limit {2} bytes, blocking addVector",
+                    new Object[]{indexName, usage, maxVectorMemoryBytes});
+        }
 
         // Wake up the compaction thread to trigger an immediate checkpoint
         Thread ct = compactionThread;
@@ -562,7 +618,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         synchronized (memoryPressureMonitor) {
-            while (running && estimatedMemoryUsageBytes() > maxVectorMemoryBytes) {
+            while (running && isMemoryOverLimit()) {
                 try {
                     memoryPressureMonitor.wait(100);
                 } catch (InterruptedException e) {
@@ -577,6 +633,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
         LOGGER.log(Level.INFO,
                 "vector store {0} memory back-pressure released after {1} ms (waited for checkpoint)",
                 new Object[]{indexName, elapsedMs});
+    }
+
+    private boolean isMemoryOverLimit() {
+        if (memoryBudget != null) {
+            return memoryBudget.isMemoryPressureActive();
+        }
+        return maxVectorMemoryBytes != Long.MAX_VALUE
+                && estimatedMemoryUsageBytes() > maxVectorMemoryBytes;
     }
 
     @Override
@@ -650,8 +714,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
             waitForCheckpointToComplete(latch);
         }
 
-        // Memory limit back-pressure: block if live vector memory exceeds budget
-        if (maxVectorMemoryBytes != Long.MAX_VALUE
+        // Memory limit back-pressure: block if vector memory exceeds budget
+        if (memoryBudget != null) {
+            if (memoryBudget.isMemoryPressureActive()) {
+                waitForMemoryPressureRelief();
+            }
+        } else if (maxVectorMemoryBytes != Long.MAX_VALUE
                 && estimatedMemoryUsageBytes() > maxVectorMemoryBytes) {
             waitForMemoryPressureRelief();
         }

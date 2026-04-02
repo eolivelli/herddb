@@ -96,6 +96,9 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_APPLY_PARALLELISM = "indexing.apply.parallelism";
     public static final int PROPERTY_APPLY_PARALLELISM_DEFAULT = 0; // 0 = auto: max(1, availableProcessors/2)
 
+    public static final String PROPERTY_APPLY_QUEUE_CAPACITY = "indexing.apply.queue.capacity";
+    public static final int PROPERTY_APPLY_QUEUE_CAPACITY_DEFAULT = 1000;
+
     // Storage
     public static final String PROPERTY_STORAGE_TYPE = "indexing.storage.type";
     public static final String PROPERTY_STORAGE_TYPE_DEFAULT = "file";

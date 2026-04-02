@@ -28,6 +28,7 @@ import herddb.file.FileMetadataStorageManager;
 import herddb.index.vector.AbstractVectorStore;
 import herddb.index.vector.PersistentVectorStore;
 import herddb.index.vector.VectorIndexManager;
+import herddb.index.vector.VectorMemoryBudget;
 import herddb.log.CommitLogTailing;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
@@ -52,6 +53,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -66,7 +69,7 @@ import org.apache.bookkeeper.stats.StatsLogger;
  *
  * @author enrico.olivelli
  */
-public class IndexingServiceEngine implements AutoCloseable {
+public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget {
 
     private static final Logger LOGGER = Logger.getLogger(IndexingServiceEngine.class.getName());
 
@@ -196,6 +199,24 @@ public class IndexingServiceEngine implements AutoCloseable {
         return metadataStorageManager;
     }
 
+    // -------------------------------------------------------------------------
+    // VectorMemoryBudget implementation
+    // -------------------------------------------------------------------------
+
+    @Override
+    public long totalEstimatedMemoryUsageBytes() {
+        long total = 0;
+        for (AbstractVectorStore store : vectorStores.values()) {
+            total += store.estimatedMemoryUsageBytes();
+        }
+        return total;
+    }
+
+    @Override
+    public long maxMemoryBytes() {
+        return maxVectorMemoryBytes;
+    }
+
     public void start() throws Exception {
         LOGGER.info("IndexingServiceEngine starting, logDir=" + logDirectory + ", dataDir=" + dataDirectory);
 
@@ -237,6 +258,7 @@ public class IndexingServiceEngine implements AutoCloseable {
                     IndexingServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER_DEFAULT);
 
             final long vectorMemLimit = maxVectorMemoryBytes;
+            final VectorMemoryBudget budget = this;
             vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir, indexProperties) -> {
                 var similarityFunction = PersistentVectorStore.parseSimilarityFunction(
                         indexProperties != null ? indexProperties.get(VectorIndexManager.PROP_SIMILARITY) : null);
@@ -246,7 +268,7 @@ public class IndexingServiceEngine implements AutoCloseable {
                         m, beamWidth, neighborOverflow, alpha,
                         fusedPQ, maxSegmentSize, maxLiveGraphSize,
                         compactionInterval, memoryMultiplier,
-                        similarityFunction, vectorMemLimit);
+                        similarityFunction, vectorMemLimit, budget);
                 try {
                     store.start();
                 } catch (Exception e) {
@@ -275,16 +297,23 @@ public class IndexingServiceEngine implements AutoCloseable {
         applyParallelism = configuredParallelism > 0
                 ? configuredParallelism
                 : Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
+        int queueCapacity = config.getInt(
+                IndexingServerConfiguration.PROPERTY_APPLY_QUEUE_CAPACITY,
+                IndexingServerConfiguration.PROPERTY_APPLY_QUEUE_CAPACITY_DEFAULT);
         applyWorkers = new ExecutorService[applyParallelism];
         for (int i = 0; i < applyParallelism; i++) {
             final int idx = i;
-            applyWorkers[i] = Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "indexing-apply-worker-" + idx);
-                t.setDaemon(true);
-                return t;
-            });
+            applyWorkers[i] = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+                    new LinkedBlockingQueue<>(queueCapacity),
+                    r -> {
+                        Thread t = new Thread(r, "indexing-apply-worker-" + idx);
+                        t.setDaemon(true);
+                        return t;
+                    },
+                    new ThreadPoolExecutor.CallerRunsPolicy());
         }
-        LOGGER.log(Level.INFO, "DML apply workers started, parallelism={0}", applyParallelism);
+        LOGGER.log(Level.INFO, "DML apply workers started, parallelism={0}, queueCapacity={1}",
+                new Object[]{applyParallelism, queueCapacity});
 
         // Validate instance identity
         if (numInstances < 1) {
@@ -875,6 +904,7 @@ public class IndexingServiceEngine implements AutoCloseable {
                     Thread.currentThread().interrupt();
                 }
             }
+            applyWorkers = null;
             LOGGER.info("DML apply workers shut down");
         }
 
