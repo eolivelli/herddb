@@ -28,6 +28,7 @@ import herddb.indexing.proto.SearchRequest;
 import herddb.indexing.proto.SearchResponse;
 import herddb.indexing.proto.SearchResult;
 import herddb.log.LogSequenceNumber;
+import herddb.server.DynamicServiceClient;
 import herddb.utils.Bytes;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -36,8 +37,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -48,35 +52,101 @@ import java.util.logging.Logger;
  * <p>
  * Search fans out to all instances and merges results by score.
  * If only one instance is configured, results are returned as-is (already sorted by similarity).
+ * <p>
+ * Supports dynamic server list updates via {@link #updateServers(List)}.
+ * A volatile snapshot swap pattern ensures lock-free reads in the hot path.
  *
  * @author enrico.olivelli
  */
-public class IndexingServiceClient implements RemoteVectorIndexService {
+public class IndexingServiceClient implements RemoteVectorIndexService, DynamicServiceClient {
 
     private static final Logger LOGGER = Logger.getLogger(IndexingServiceClient.class.getName());
 
     private static final long DEFAULT_TIMEOUT_SECONDS = 30;
 
-    private final List<String> servers;
-    private final Map<String, ManagedChannel> channels;
+    private volatile ServerSnapshot snapshot;
     private final long timeoutSeconds;
 
-    public IndexingServiceClient(List<String> servers, long timeoutSeconds) {
-        this.servers = Collections.unmodifiableList(new ArrayList<>(servers));
-        this.timeoutSeconds = timeoutSeconds;
-        this.channels = new HashMap<>();
-        for (String server : servers) {
-            ManagedChannel channel = ManagedChannelBuilder.forTarget(server)
-                    .usePlaintext()
-                    .keepAliveTime(300, TimeUnit.SECONDS)
-                    .keepAliveTimeout(20, TimeUnit.SECONDS)
-                    .build();
-            channels.put(server, channel);
+    private static class ServerSnapshot {
+        final List<String> servers;
+        final Map<String, ManagedChannel> channels;
+
+        ServerSnapshot(List<String> servers, Map<String, ManagedChannel> channels) {
+            this.servers = Collections.unmodifiableList(new ArrayList<>(servers));
+            this.channels = Collections.unmodifiableMap(new HashMap<>(channels));
         }
+    }
+
+    public IndexingServiceClient(List<String> servers, long timeoutSeconds) {
+        this.timeoutSeconds = timeoutSeconds;
+        Map<String, ManagedChannel> channels = new HashMap<>();
+        for (String server : servers) {
+            channels.put(server, buildChannel(server));
+        }
+        this.snapshot = new ServerSnapshot(servers, channels);
     }
 
     public IndexingServiceClient(List<String> servers) {
         this(servers, DEFAULT_TIMEOUT_SECONDS);
+    }
+
+    private static ManagedChannel buildChannel(String server) {
+        return ManagedChannelBuilder.forTarget(server)
+                .usePlaintext()
+                .keepAliveTime(300, TimeUnit.SECONDS)
+                .keepAliveTimeout(20, TimeUnit.SECONDS)
+                .build();
+    }
+
+    @Override
+    public synchronized void updateServers(List<String> newServers) {
+        ServerSnapshot current = this.snapshot;
+
+        // Compute diff
+        Set<String> added = new LinkedHashSet<>(newServers);
+        added.removeAll(current.channels.keySet());
+
+        Set<String> removed = new LinkedHashSet<>(current.channels.keySet());
+        removed.removeAll(new HashSet<>(newServers));
+
+        // Build new channels map: reuse existing, add new
+        Map<String, ManagedChannel> newChannels = new HashMap<>();
+        for (String server : newServers) {
+            ManagedChannel existing = current.channels.get(server);
+            if (existing != null) {
+                newChannels.put(server, existing);
+            } else {
+                newChannels.put(server, buildChannel(server));
+            }
+        }
+
+        this.snapshot = new ServerSnapshot(newServers, newChannels);
+
+        LOGGER.log(Level.INFO, "Updated indexing service servers: {0} (added: {1}, removed: {2})",
+                new Object[]{newServers, added, removed});
+
+        // Gracefully shutdown removed channels in background
+        if (!removed.isEmpty()) {
+            List<ManagedChannel> toShutdown = new ArrayList<>();
+            for (String server : removed) {
+                ManagedChannel ch = current.channels.get(server);
+                if (ch != null) {
+                    toShutdown.add(ch);
+                }
+            }
+            Thread shutdownThread = new Thread(() -> {
+                for (ManagedChannel ch : toShutdown) {
+                    try {
+                        ch.shutdown().awaitTermination(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        ch.shutdownNow();
+                    }
+                }
+            }, "indexing-channel-shutdown");
+            shutdownThread.setDaemon(true);
+            shutdownThread.start();
+        }
     }
 
     /**
@@ -85,11 +155,17 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
      */
     public List<Map.Entry<Bytes, Float>> search(String tablespace, String table, String index,
                                                   float[] vector, int limit) {
-        boolean multiInstance = servers.size() > 1;
+        ServerSnapshot s = this.snapshot;
+
+        if (s.servers.isEmpty()) {
+            throw new RuntimeException("No indexing service instances available");
+        }
+
+        boolean multiInstance = s.servers.size() > 1;
         boolean returnScore = multiInstance; // always request scores when merging multiple instances
 
         LOGGER.log(Level.INFO, "client search: tablespace={0}, table={1}, index={2}, limit={3}, vectorDim={4}, instances={5}",
-                new Object[]{tablespace, table, index, limit, vector.length, servers.size()});
+                new Object[]{tablespace, table, index, limit, vector.length, s.servers.size()});
         long start = System.nanoTime();
 
         SearchRequest.Builder requestBuilder = SearchRequest.newBuilder()
@@ -105,7 +181,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
 
         if (!multiInstance) {
             // Single instance: pass through
-            ManagedChannel channel = channels.values().iterator().next();
+            ManagedChannel channel = s.channels.values().iterator().next();
             IndexingServiceGrpc.IndexingServiceBlockingStub stub =
                     IndexingServiceGrpc.newBlockingStub(channel)
                             .withDeadlineAfter(timeoutSeconds, TimeUnit.SECONDS);
@@ -119,7 +195,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
 
         // Multiple instances: fan out, merge by score
         List<Map.Entry<Bytes, Float>> merged = new ArrayList<>();
-        for (Map.Entry<String, ManagedChannel> entry : channels.entrySet()) {
+        for (Map.Entry<String, ManagedChannel> entry : s.channels.entrySet()) {
             try {
                 IndexingServiceGrpc.IndexingServiceBlockingStub stub =
                         IndexingServiceGrpc.newBlockingStub(entry.getValue())
@@ -144,8 +220,14 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
 
     @Override
     public RemoteVectorIndexService.IndexStatusInfo getIndexStatus(String tablespace, String table, String index) {
+        ServerSnapshot s = this.snapshot;
+
+        if (s.servers.isEmpty()) {
+            throw new RuntimeException("No indexing service instances available");
+        }
+
         // Query the first available instance
-        for (Map.Entry<String, ManagedChannel> entry : channels.entrySet()) {
+        for (Map.Entry<String, ManagedChannel> entry : s.channels.entrySet()) {
             try {
                 IndexingServiceGrpc.IndexingServiceBlockingStub stub =
                         IndexingServiceGrpc.newBlockingStub(entry.getValue())
@@ -180,7 +262,8 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
 
     @Override
     public void waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber) throws InterruptedException {
-        for (Map.Entry<String, ManagedChannel> serverEntry : channels.entrySet()) {
+        ServerSnapshot s = this.snapshot;
+        for (Map.Entry<String, ManagedChannel> serverEntry : s.channels.entrySet()) {
             String server = serverEntry.getKey();
             ManagedChannel channel = serverEntry.getValue();
             waitForInstanceCatchUp(server, channel, tablespace, sequenceNumber);
@@ -218,12 +301,13 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
     }
 
     public List<String> getServers() {
-        return servers;
+        return snapshot.servers;
     }
 
     @Override
     public void close() {
-        for (ManagedChannel channel : channels.values()) {
+        ServerSnapshot s = this.snapshot;
+        for (ManagedChannel channel : s.channels.values()) {
             try {
                 channel.shutdown().awaitTermination(10, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
@@ -231,6 +315,5 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                 channel.shutdownNow();
             }
         }
-        channels.clear();
     }
 }
