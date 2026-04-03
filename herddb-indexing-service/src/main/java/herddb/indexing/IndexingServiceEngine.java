@@ -702,8 +702,6 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     public List<Map.Entry<Bytes, Float>> search(String tablespace, String table, String index,
                                                   float[] vector, int limit) {
-        LOGGER.log(Level.INFO, "engine search: tablespace={0}, table={1}, index={2}, limit={3}, vectorDim={4}, lastLSN={5}",
-                new Object[]{tablespace, table, index, limit, vector.length, lastProcessedLsn});
         AbstractVectorStore store = vectorStores.get(storeKey(table, index));
         if (store == null) {
             LOGGER.log(Level.WARNING, "No vector store found for {0}.{1}", new Object[]{table, index});

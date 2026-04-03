@@ -70,9 +70,6 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
     public void search(SearchRequest request, StreamObserver<SearchResponse> responseObserver) {
         searchRequests.inc();
         long start = System.nanoTime();
-        LOGGER.log(Level.INFO, "gRPC search request: tablespace={0}, table={1}, index={2}, limit={3}, vectorDim={4}",
-                new Object[]{request.getTablespace(), request.getTable(), request.getIndex(),
-                        request.getLimit(), request.getVectorCount()});
         try {
             float[] vector = new float[request.getVectorCount()];
             for (int i = 0; i < vector.length; i++) {
@@ -99,8 +96,6 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
 
             long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
             searchLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-            LOGGER.log(Level.INFO, "gRPC search completed: index={0}, {1} results in {2} us",
-                    new Object[]{request.getIndex(), results.size(), elapsedMicros});
             responseObserver.onNext(responseBuilder.build());
             responseObserver.onCompleted();
         } catch (Exception e) {

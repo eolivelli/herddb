@@ -19,13 +19,101 @@
           "dashLength": 10,
           "dashes": false,
           "datasource": "Prometheus",
-          "fill": 1,
-          "id": 1,
+          "fill": 2,
+          "id": 101,
           "legend": {
+            "alignAsTable": true,
             "avg": true,
             "current": true,
             "max": true,
-            "min": true,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [
+            {
+              "alias": "/max/",
+              "fill": 0,
+              "dashes": true
+            }
+          ],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "jvm_memory_bytes_used{area=\"heap\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "heap used [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "jvm_memory_bytes_committed{area=\"heap\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "heap committed [{{instance}}]",
+              "refId": "B"
+            },
+            {
+              "expr": "jvm_memory_bytes_max{area=\"heap\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "heap max [{{instance}}]",
+              "refId": "C"
+            }
+          ],
+          "thresholds": [],
+          "title": "Heap Memory",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "bytes",
+              "logBase": 1,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 2,
+          "id": 102,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": false,
             "show": true,
             "total": false,
             "values": true
@@ -40,21 +128,27 @@
           "renderer": "flot",
           "seriesOverrides": [],
           "spaceLength": 10,
-          "span": 12,
+          "span": 6,
           "stack": false,
           "steppedLine": false,
           "targets": [
             {
-              "expr": "jvm_memory_bytes_used{job=\"indexing-service\",instance=~\"$instance\"}",
+              "expr": "jvm_memory_bytes_used{area=\"nonheap\",job=\"indexing-service\",instance=~\"$instance\"}",
               "format": "time_series",
-              "intervalFactor": 5,
-              "legendFormat": "{{area}} memory",
-              "refId": "A",
-              "step": 5
+              "intervalFactor": 2,
+              "legendFormat": "nonheap used [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "jvm_memory_bytes_committed{area=\"nonheap\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "nonheap committed [{{instance}}]",
+              "refId": "B"
             }
           ],
           "thresholds": [],
-          "title": "JVM Memory Used",
+          "title": "Non-Heap Memory",
           "tooltip": {
             "shared": true,
             "sort": 0,
@@ -68,17 +162,344 @@
           "yaxes": [
             {
               "format": "bytes",
+              "logBase": 1,
               "show": true
             },
             {
               "format": "short",
-              "show": true
+              "logBase": 1,
+              "show": false
             }
           ]
         }
       ],
       "showTitle": true,
-      "title": "JVM Metrics",
+      "title": "JVM",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 2,
+          "id": 103,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": false,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": true,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "jvm_memory_pool_bytes_used{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{pool}} [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Memory Pools Used",
+          "tooltip": {
+            "shared": true,
+            "sort": 2,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "bytes",
+              "logBase": 1,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 2,
+          "id": 104,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [
+            {
+              "alias": "/max/",
+              "fill": 0,
+              "dashes": true
+            }
+          ],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "jvm_memory_direct_bytes_used{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "direct used [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "jvm_memory_direct_bytes_max{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "direct max [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "Direct Memory",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "bytes",
+              "logBase": 1,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        }
+      ],
+      "showTitle": false,
+      "title": "Pools Row",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 2,
+          "id": 105,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [
+            {
+              "alias": "/capacity/",
+              "fill": 0,
+              "dashes": true
+            }
+          ],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "jvm_buffer_direct_used_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "direct used [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "jvm_buffer_direct_capacity_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "direct capacity [{{instance}}]",
+              "refId": "B"
+            },
+            {
+              "expr": "jvm_buffer_mapped_used_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "mapped used [{{instance}}]",
+              "refId": "C"
+            },
+            {
+              "expr": "jvm_buffer_mapped_capacity_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "mapped capacity [{{instance}}]",
+              "refId": "D"
+            }
+          ],
+          "thresholds": [],
+          "title": "Buffer Pool Memory (Direct & Mapped)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "bytes",
+              "logBase": 1,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 2,
+          "id": 106,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "process_resident_memory_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "RSS [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "process_virtual_memory_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "Virtual [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "Process Memory (RSS & Virtual)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "bytes",
+              "logBase": 1,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        }
+      ],
+      "showTitle": false,
+      "title": "Buffer Pools Row",
       "titleSize": "h6"
     },
     {
@@ -92,9 +513,9 @@
           "dashes": false,
           "datasource": "Prometheus",
           "fill": 1,
-          "id": 2,
+          "id": 107,
           "legend": {
-            "avg": false,
+            "avg": true,
             "current": true,
             "max": true,
             "min": false,
@@ -103,30 +524,29 @@
             "values": true
           },
           "lines": true,
-          "linewidth": 1,
+          "linewidth": 2,
           "links": [],
           "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
           "span": 6,
+          "stack": false,
+          "steppedLine": false,
           "targets": [
             {
-              "expr": "jvm_threads_current{job=\"indexing-service\",instance=~\"$instance\"}",
+              "expr": "rate(process_cpu_seconds_total{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
               "format": "time_series",
-              "intervalFactor": 5,
-              "legendFormat": "current",
-              "refId": "A",
-              "step": 10
-            },
-            {
-              "expr": "jvm_threads_daemon{job=\"indexing-service\",instance=~\"$instance\"}",
-              "format": "time_series",
-              "intervalFactor": 5,
-              "legendFormat": "daemon",
-              "refId": "B",
-              "step": 10
+              "intervalFactor": 2,
+              "legendFormat": "CPU usage [{{instance}}]",
+              "refId": "A"
             }
           ],
           "thresholds": [],
-          "title": "JVM Threads",
+          "title": "CPU Usage (1m rate)",
           "tooltip": {
             "shared": true,
             "sort": 0,
@@ -139,13 +559,16 @@
           },
           "yaxes": [
             {
-              "format": "short",
-              "decimals": 0,
+              "format": "percentunit",
+              "label": "cores",
+              "logBase": 1,
+              "min": 0,
               "show": true
             },
             {
               "format": "short",
-              "show": true
+              "logBase": 1,
+              "show": false
             }
           ]
         },
@@ -156,9 +579,98 @@
           "dashes": false,
           "datasource": "Prometheus",
           "fill": 1,
-          "id": 3,
+          "id": 108,
           "legend": {
             "avg": false,
+            "current": true,
+            "max": false,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "jvm_threads_current{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "current [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "jvm_threads_daemon{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "daemon [{{instance}}]",
+              "refId": "B"
+            },
+            {
+              "expr": "jvm_threads_peak{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "peak [{{instance}}]",
+              "refId": "C"
+            }
+          ],
+          "thresholds": [],
+          "title": "Threads",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "decimals": 0,
+              "format": "short",
+              "logBase": 1,
+              "min": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        }
+      ],
+      "showTitle": false,
+      "title": "CPU Threads Row",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 109,
+          "legend": {
+            "avg": true,
             "current": true,
             "max": true,
             "min": false,
@@ -170,19 +682,26 @@
           "linewidth": 1,
           "links": [],
           "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
           "span": 6,
+          "stack": false,
+          "steppedLine": false,
           "targets": [
             {
               "expr": "rate(jvm_gc_collection_seconds_sum{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
               "format": "time_series",
-              "intervalFactor": 5,
-              "legendFormat": "{{gc}}",
-              "refId": "A",
-              "step": 10
+              "intervalFactor": 2,
+              "legendFormat": "{{gc}} [{{instance}}]",
+              "refId": "A"
             }
           ],
           "thresholds": [],
-          "title": "GC Time / 1 min rate",
+          "title": "GC Time / 1m Rate",
           "tooltip": {
             "shared": true,
             "sort": 0,
@@ -196,17 +715,84 @@
           "yaxes": [
             {
               "format": "s",
+              "logBase": 1,
               "show": true
             },
             {
               "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 110,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": false,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "rate(jvm_gc_collection_seconds_count{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{gc}} [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "GC Count / 1m Rate",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "decimals": 0,
+              "format": "ops",
+              "logBase": 1,
               "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
             }
           ]
         }
       ],
       "showTitle": false,
-      "title": "JVM Details",
+      "title": "GC Row",
       "titleSize": "h6"
     },
     {
