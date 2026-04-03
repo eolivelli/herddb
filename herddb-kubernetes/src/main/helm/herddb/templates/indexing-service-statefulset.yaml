@@ -1,0 +1,109 @@
+{{- if .Values.indexingService.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "herddb.fullname" . }}-indexing-service
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: indexing-service
+spec:
+  serviceName: {{ include "herddb.fullname" . }}-indexing-service
+  replicas: {{ .Values.indexingService.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: indexing-service
+  template:
+    metadata:
+      labels:
+        {{- include "herddb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: indexing-service
+    spec:
+      serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      {{- if .Values.zookeeper.enabled }}
+      initContainers:
+        - name: wait-for-zookeeper
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "Waiting for ZooKeeper at {{ include "herddb.zkAddress" . }}..."
+              {{- $zkHost := printf "%s-zookeeper-0.%s-zookeeper.%s.svc.cluster.local"
+                    (include "herddb.fullname" .)
+                    (include "herddb.fullname" .)
+                    .Release.Namespace }}
+              while ! echo ruok > /dev/tcp/{{ $zkHost }}/{{ .Values.zookeeper.clientPort }} 2>/dev/null; do
+                echo "ZooKeeper not ready, retrying in 2s..."
+                sleep 2
+              done
+              echo "ZooKeeper is ready."
+      {{- end }}
+      containers:
+        - name: indexing-service
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              ORDINAL=${HOSTNAME##*-}
+              POD_FQDN="${HOSTNAME}.{{ include "herddb.fullname" . }}-indexing-service.{{ .Release.Namespace }}.svc.cluster.local"
+              exec /opt/herddb/bin/service indexing-service console \
+                /opt/herddb/conf/indexingservice.properties \
+                --data-dir=/opt/herddb/indexdata \
+                --log-dir=/opt/herddb/indexlog \
+                --bind-host=${POD_FQDN} \
+                -Dindexing.instance.id=${ORDINAL} \
+                -Dindexing.cluster.numInstances={{ .Values.indexingService.replicaCount }}
+          {{- if .Values.indexingService.javaOpts }}
+          env:
+            - name: JAVA_OPTS
+              value: {{ .Values.indexingService.javaOpts | quote }}
+          {{- end }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.indexingService.port }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.indexingService.httpPort }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.indexingService.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.indexingService.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /opt/herddb/indexdata
+            - name: log
+              mountPath: /opt/herddb/indexlog
+            - name: config
+              mountPath: /opt/herddb/conf
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "herddb.fullname" . }}-indexing-service-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.indexingService.storage.data.storageClass }}
+        storageClassName: {{ .Values.indexingService.storage.data.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.indexingService.storage.data.size }}
+    - metadata:
+        name: log
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.indexingService.storage.log.storageClass }}
+        storageClassName: {{ .Values.indexingService.storage.log.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.indexingService.storage.log.size }}
+{{- end }}

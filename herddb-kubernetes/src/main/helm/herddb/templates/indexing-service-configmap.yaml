@@ -1,0 +1,25 @@
+{{- if .Values.indexingService.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "herddb.fullname" . }}-indexing-service-config
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: indexing-service
+data:
+  indexingservice.properties: |
+    port={{ .Values.indexingService.port }}
+    bind.host=0.0.0.0
+    indexing.storage.type=file
+    indexing.http.enable=true
+    indexing.http.port={{ .Values.indexingService.httpPort }}
+    indexing.http.host=0.0.0.0
+    {{- if eq .Values.server.mode "cluster" }}
+    server.mode=cluster
+    server.zookeeper.address={{ include "herddb.zkAddress" . }}
+    server.zookeeper.path=/herd
+    server.zookeeper.session.timeout=40000
+    indexing.log.type=bookkeeper
+    server.bookkeeper.ledgers.path=/ledgers
+    {{- end }}
+{{- end }}

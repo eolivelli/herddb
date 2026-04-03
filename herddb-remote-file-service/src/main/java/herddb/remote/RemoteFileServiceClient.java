@@ -108,8 +108,14 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
         }
         this.snapshot = new ServerSnapshot(new ConsistentHashRouter(servers), channels);
 
-        LOGGER.log(Level.INFO, "RemoteFileServiceClient: servers={0}, timeout={1}s, retries={2}",
-                new Object[]{servers, clientTimeoutSeconds, maxRetries});
+        if (servers.isEmpty()) {
+            LOGGER.log(Level.INFO,
+                    "RemoteFileServiceClient: starting with empty server list (awaiting ZK discovery), timeout={0}s, retries={1}",
+                    new Object[]{clientTimeoutSeconds, maxRetries});
+        } else {
+            LOGGER.log(Level.INFO, "RemoteFileServiceClient: servers={0}, timeout={1}s, retries={2}",
+                    new Object[]{servers, clientTimeoutSeconds, maxRetries});
+        }
     }
 
     private static ManagedChannel buildChannel(String server) {

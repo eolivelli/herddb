@@ -16,7 +16,9 @@ data:
     http.port={{ .Values.server.httpPort }}
     {{- if eq .Values.server.storageMode "remote" }}
     server.storage.mode=remote
+    {{- if not .Values.zookeeper.enabled }}
     remote.file.servers={{ include "herddb.remoteFileServers" . }}
+    {{- end }}
     {{- end }}
     {{- if eq .Values.server.mode "cluster" }}
     server.zookeeper.address={{ include "herddb.zkAddress" . }}

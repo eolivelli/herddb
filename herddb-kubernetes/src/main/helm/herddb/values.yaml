@@ -45,6 +45,7 @@ fileServer:
   replicaCount: 2
   port: 9846
   httpPort: 9847
+  javaOpts: ""
   # Storage backend: "local" (default) or "s3"
   storageMode: local
   # S3 / MinIO configuration (used when storageMode=s3)
@@ -131,6 +132,29 @@ bookkeeper:
     limits:
       memory: "512Mi"
       cpu: "0.5"
+
+# Optional IndexingService for vector search (requires zookeeper.enabled=true
+# and bookkeeper.enabled=true in cluster mode).
+indexingService:
+  enabled: false
+  replicaCount: 2
+  port: 9850
+  httpPort: 9851
+  javaOpts: ""
+  storage:
+    data:
+      size: 10Gi
+      storageClass: ""
+    log:
+      size: 5Gi
+      storageClass: ""
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "4"
+    limits:
+      memory: "1Gi"
+      cpu: "4"
 
 # Tools pod — sleep + pre-configured CLI for kubectl exec
 tools:

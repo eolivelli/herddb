@@ -43,8 +43,8 @@ public class ConsistentHashRouter {
     private final List<String> servers;
 
     public ConsistentHashRouter(List<String> servers) {
-        if (servers == null || servers.isEmpty()) {
-            throw new IllegalArgumentException("Server list must not be empty");
+        if (servers == null) {
+            throw new IllegalArgumentException("Server list must not be null");
         }
         this.servers = List.copyOf(servers);
         for (String server : servers) {

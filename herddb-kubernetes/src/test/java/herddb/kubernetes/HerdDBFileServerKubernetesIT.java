@@ -1,0 +1,420 @@
+/*
+ Licensed to Diennea S.r.l. under one
+ or more contributor license agreements. See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership. Diennea S.r.l. licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
+
+ http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied.  See the License for the
+ specific language governing permissions and limitations
+ under the License.
+*/
+package herddb.kubernetes;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assume.assumeTrue;
+import io.fabric8.kubernetes.api.model.HasMetadata;
+import io.fabric8.kubernetes.api.model.IntOrString;
+import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.api.model.ServiceBuilder;
+import io.fabric8.kubernetes.api.model.ServicePortBuilder;
+import io.fabric8.kubernetes.client.Config;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Logger;
+import java.util.stream.Collectors;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
+import org.junit.ClassRule;
+import org.junit.Test;
+import org.testcontainers.k3s.K3sContainer;
+import org.testcontainers.utility.DockerImageName;
+import org.testcontainers.utility.MountableFile;
+
+/**
+ * Kubernetes integration test: cluster mode with 2 RemoteFileServer replicas
+ * discovered via ZooKeeper, backed by MinIO (S3 storage).
+ *
+ * <p>Validates: ZK, BookKeeper, MinIO, 2 file servers (ZK-registered),
+ * HerdDB server with remote storage mode, basic SQL with BRIN index.
+ */
+public class HerdDBFileServerKubernetesIT {
+
+    private static final Logger LOG = Logger.getLogger(HerdDBFileServerKubernetesIT.class.getName());
+
+    private static final String IMAGE_NAME = "herddb/herddb-server";
+    private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
+    private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
+    private static final int NODE_PORT = 30008;
+
+    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+            + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
+
+    @ClassRule
+    public static K3sContainer k3s = new K3sContainer(DockerImageName.parse("rancher/k3s:v1.31.4-k3s1"))
+            .withExposedPorts(6443, NODE_PORT);
+
+    private static KubernetesClient kubernetesClient;
+    private static String helmChartPath;
+
+    @BeforeClass
+    public static void setup() throws Exception {
+        // Check that the docker image exists locally
+        Process checkImage = new ProcessBuilder("docker", "image", "inspect", FULL_IMAGE)
+                .redirectErrorStream(true)
+                .start();
+        int exitCode = checkImage.waitFor();
+        assumeTrue("Docker image " + FULL_IMAGE + " must be built first "
+                + "(run: mvn package jib:dockerBuild@build -pl herddb-docker)", exitCode == 0);
+
+        // Save docker image to a tarball
+        Path imageTar = Files.createTempFile("herddb-image", ".tar");
+        try {
+            LOG.info("Saving docker image to tarball...");
+            Process save = new ProcessBuilder("docker", "save", FULL_IMAGE, "-o", imageTar.toString())
+                    .redirectErrorStream(true)
+                    .start();
+            assertEquals("docker save failed", 0, save.waitFor());
+
+            // Copy tarball into K3S container and import
+            LOG.info("Loading image into K3S...");
+            k3s.copyFileToContainer(MountableFile.forHostPath(imageTar), "/tmp/herddb.tar");
+            k3s.execInContainer("ctr", "--address", "/run/k3s/containerd/containerd.sock",
+                    "--namespace", "k8s.io", "images", "import", "/tmp/herddb.tar");
+        } finally {
+            Files.deleteIfExists(imageTar);
+        }
+
+        // Create Kubernetes client
+        String kubeConfigYaml = k3s.getKubeConfigYaml();
+        Config config = Config.fromKubeconfig(kubeConfigYaml);
+        config.setNamespace("default");
+        kubernetesClient = new KubernetesClientBuilder().withConfig(config).build();
+
+        helmChartPath = findHelmChartPath();
+        LOG.info("Using helm chart at: " + helmChartPath);
+    }
+
+    @AfterClass
+    public static void tearDown() {
+        if (kubernetesClient != null) {
+            kubernetesClient.close();
+        }
+    }
+
+    @Test
+    public void testClusterModeWithFileServersAndMinIO() throws Exception {
+        LOG.info("=== Test: Cluster Mode with File Servers + MinIO ===");
+
+        Map<String, String> values = new LinkedHashMap<>();
+        // Server: cluster mode with remote storage
+        values.put("server.mode", "cluster");
+        values.put("server.storageMode", "remote");
+        values.put("server.replicaCount", "1");
+        values.put("tools.enabled", "false");
+        values.put("image.pullPolicy", "Never");
+        // ZooKeeper
+        values.put("zookeeper.enabled", "true");
+        values.put("zookeeper.javaOpts", JAVA_OPTS);
+        values.put("zookeeper.resources.requests.memory", "256Mi");
+        values.put("zookeeper.resources.requests.cpu", "0.5");
+        values.put("zookeeper.resources.limits.memory", "256Mi");
+        values.put("zookeeper.resources.limits.cpu", "0.5");
+        values.put("zookeeper.storage.size", "1Gi");
+        // BookKeeper
+        values.put("bookkeeper.enabled", "true");
+        values.put("bookkeeper.replicaCount", "1");
+        values.put("bookkeeper.javaOpts", JAVA_OPTS);
+        values.put("bookkeeper.resources.requests.memory", "256Mi");
+        values.put("bookkeeper.resources.requests.cpu", "0.5");
+        values.put("bookkeeper.resources.limits.memory", "256Mi");
+        values.put("bookkeeper.resources.limits.cpu", "0.5");
+        values.put("bookkeeper.storage.journal.size", "1Gi");
+        values.put("bookkeeper.storage.ledger.size", "1Gi");
+        // File Server: 2 replicas with S3 backend
+        values.put("fileServer.replicaCount", "2");
+        values.put("fileServer.storageMode", "s3");
+        values.put("fileServer.javaOpts", JAVA_OPTS);
+        values.put("fileServer.resources.requests.memory", "256Mi");
+        values.put("fileServer.resources.requests.cpu", "0.5");
+        values.put("fileServer.resources.limits.memory", "256Mi");
+        values.put("fileServer.resources.limits.cpu", "0.5");
+        values.put("fileServer.storage.size", "1Gi");
+        // MinIO
+        values.put("minio.enabled", "true");
+        values.put("minio.resources.requests.memory", "256Mi");
+        values.put("minio.resources.requests.cpu", "0.5");
+        values.put("minio.resources.limits.memory", "256Mi");
+        values.put("minio.resources.limits.cpu", "0.5");
+        values.put("minio.storage.size", "1Gi");
+        // Server resources
+        values.put("server.javaOpts", JAVA_OPTS);
+        values.put("server.resources.requests.memory", "256Mi");
+        values.put("server.resources.requests.cpu", "0.5");
+        values.put("server.resources.limits.memory", "256Mi");
+        values.put("server.resources.limits.cpu", "0.5");
+        values.put("server.storage.data.size", "1Gi");
+        values.put("server.storage.commitlog.size", "1Gi");
+
+        // Render and apply Helm chart
+        String renderedYaml = helmTemplate(helmChartPath, values);
+        LOG.info("Rendered YAML length: " + renderedYaml.length());
+
+        List<HasMetadata> resources = kubernetesClient.load(
+                new ByteArrayInputStream(renderedYaml.getBytes(StandardCharsets.UTF_8))).items();
+        LOG.info("Applying " + resources.size() + " Kubernetes resources...");
+        kubernetesClient.resourceList(resources).createOrReplace();
+
+        // Wait for ZooKeeper
+        LOG.info("Waiting for ZooKeeper pod to be ready...");
+        waitForComponent("zookeeper", 5, TimeUnit.MINUTES);
+        LOG.info("ZooKeeper pod is ready.");
+
+        // Wait for MinIO
+        LOG.info("Waiting for MinIO pod to be ready...");
+        waitForComponent("minio", 5, TimeUnit.MINUTES);
+        LOG.info("MinIO pod is ready.");
+
+        // Wait for BookKeeper
+        LOG.info("Waiting for BookKeeper pod to be ready...");
+        waitForComponent("bookkeeper", 5, TimeUnit.MINUTES);
+        LOG.info("BookKeeper pod is ready.");
+
+        // Wait for File Servers (2 replicas)
+        LOG.info("Waiting for File Server pods to be ready...");
+        waitForComponent("file-server", 5, TimeUnit.MINUTES);
+        LOG.info("File Server pods are ready.");
+
+        // Verify 2 file server pods
+        List<Pod> fsPods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "file-server")
+                .list().getItems();
+        assertEquals("Expected 2 file server pods", 2, fsPods.size());
+
+        // Create NodePort service for JDBC access
+        kubernetesClient.services().inNamespace("default").createOrReplace(
+                new ServiceBuilder()
+                        .withNewMetadata()
+                            .withName("herddb-fs-nodeport")
+                            .withNamespace("default")
+                        .endMetadata()
+                        .withNewSpec()
+                            .withType("NodePort")
+                            .withSelector(Collections.singletonMap("app.kubernetes.io/component", "server"))
+                            .withPorts(new ServicePortBuilder()
+                                    .withPort(7000)
+                                    .withTargetPort(new IntOrString(7000))
+                                    .withNodePort(NODE_PORT)
+                                    .build())
+                        .endSpec()
+                        .build());
+        LOG.info("NodePort service created on port " + NODE_PORT);
+
+        // Wait for HerdDB server
+        LOG.info("Waiting for HerdDB server pod to be ready...");
+        waitForComponent("server", 5, TimeUnit.MINUTES);
+        LOG.info("HerdDB server pod is ready.");
+
+        // Connect via JDBC and run SQL operations
+        String host = k3s.getHost();
+        int mappedPort = k3s.getMappedPort(NODE_PORT);
+        LOG.info("Connecting to HerdDB via NodePort at " + host + ":" + mappedPort);
+
+        String jdbcUrl = "jdbc:herddb:server:" + host + ":" + mappedPort;
+        try (Connection connection = DriverManager.getConnection(jdbcUrl);
+             Statement statement = connection.createStatement()) {
+
+            // CREATE TABLE
+            statement.execute("CREATE TABLE fs_test (id int primary key, name string, score int)");
+            LOG.info("Table created.");
+
+            // CREATE BRIN INDEX
+            statement.execute("CREATE BRIN INDEX brin_idx ON fs_test(score)");
+            LOG.info("BRIN index created.");
+
+            // INSERT rows
+            assertEquals(1, statement.executeUpdate(
+                    "INSERT INTO fs_test (id, name, score) VALUES (1, 'hello', 42)"));
+            assertEquals(1, statement.executeUpdate(
+                    "INSERT INTO fs_test (id, name, score) VALUES (2, 'world', 99)"));
+            assertEquals(1, statement.executeUpdate(
+                    "INSERT INTO fs_test (id, name, score) VALUES (3, 'foo', 42)"));
+            LOG.info("Rows inserted.");
+
+            // SELECT all rows
+            try (ResultSet rs = statement.executeQuery("SELECT id, name, score FROM fs_test ORDER BY id")) {
+                assertTrue("Expected row 1", rs.next());
+                assertEquals(1, rs.getInt("id"));
+                assertEquals("hello", rs.getString("name"));
+                assertEquals(42, rs.getInt("score"));
+
+                assertTrue("Expected row 2", rs.next());
+                assertEquals(2, rs.getInt("id"));
+                assertEquals("world", rs.getString("name"));
+                assertEquals(99, rs.getInt("score"));
+
+                assertTrue("Expected row 3", rs.next());
+                assertEquals(3, rs.getInt("id"));
+                assertEquals("foo", rs.getString("name"));
+                assertEquals(42, rs.getInt("score"));
+            }
+            LOG.info("All rows verified.");
+
+            // Query using BRIN index: WHERE score = 42
+            Set<Integer> matchingIds = new HashSet<>();
+            try (ResultSet rs = statement.executeQuery("SELECT id, name FROM fs_test WHERE score = 42")) {
+                while (rs.next()) {
+                    matchingIds.add(rs.getInt("id"));
+                }
+            }
+            assertEquals("BRIN index query should return ids 1 and 3",
+                    new HashSet<>(java.util.Arrays.asList(1, 3)), matchingIds);
+            LOG.info("BRIN index query verified: ids=" + matchingIds);
+        }
+        LOG.info("Test passed: Cluster mode with file servers + MinIO works.");
+    }
+
+    private void waitForComponent(String component, long timeout, TimeUnit unit) throws Exception {
+        long deadline = System.currentTimeMillis() + unit.toMillis(timeout);
+        while (System.currentTimeMillis() < deadline) {
+            List<Pod> pods = kubernetesClient.pods()
+                    .inNamespace("default")
+                    .withLabel("app.kubernetes.io/component", component)
+                    .list().getItems();
+            if (!pods.isEmpty()) {
+                logPodStatus(component);
+                // Try to get logs
+                for (Pod pod : pods) {
+                    try {
+                        String logs = kubernetesClient.pods()
+                                .inNamespace("default")
+                                .withName(pod.getMetadata().getName())
+                                .getLog();
+                        if (logs != null && !logs.isEmpty()) {
+                            String[] lines = logs.split("\n");
+                            int start = Math.max(0, lines.length - 20);
+                            LOG.info("Last " + Math.min(20, lines.length) + " log lines for "
+                                    + pod.getMetadata().getName() + ":");
+                            for (int i = start; i < lines.length; i++) {
+                                LOG.info("  " + lines[i]);
+                            }
+                        }
+                    } catch (Exception e) {
+                        LOG.info("Could not get logs for " + pod.getMetadata().getName()
+                                + ": " + e.getMessage());
+                    }
+                }
+                // Check if all pods are ready
+                boolean ready = pods.stream().allMatch(p ->
+                        p.getStatus() != null
+                        && p.getStatus().getConditions() != null
+                        && p.getStatus().getConditions().stream()
+                                .anyMatch(c -> "Ready".equals(c.getType()) && "True".equals(c.getStatus())));
+                if (ready) {
+                    return;
+                }
+            } else {
+                LOG.info("No pods found yet for component " + component);
+            }
+            Thread.sleep(10000);
+        }
+        logPodStatus(component);
+        throw new RuntimeException("Timed out waiting for " + component + " pod(s) to be ready");
+    }
+
+    private void logPodStatus(String component) {
+        List<Pod> pods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", component)
+                .list().getItems();
+        for (Pod pod : pods) {
+            LOG.info("Pod " + pod.getMetadata().getName()
+                    + " phase=" + pod.getStatus().getPhase()
+                    + " conditions=" + pod.getStatus().getConditions());
+            if (pod.getStatus().getContainerStatuses() != null) {
+                pod.getStatus().getContainerStatuses().forEach(cs ->
+                        LOG.info("  container " + cs.getName()
+                                + " ready=" + cs.getReady()
+                                + " restartCount=" + cs.getRestartCount()
+                                + " state=" + cs.getState()));
+            }
+            if (pod.getStatus().getInitContainerStatuses() != null) {
+                pod.getStatus().getInitContainerStatuses().forEach(cs ->
+                        LOG.info("  initContainer " + cs.getName()
+                                + " ready=" + cs.getReady()
+                                + " restartCount=" + cs.getRestartCount()
+                                + " state=" + cs.getState()));
+            }
+        }
+    }
+
+    private static String findHelmChartPath() {
+        String[] candidates = {
+                "src/main/helm/herddb",
+                "herddb-kubernetes/src/main/helm/herddb"
+        };
+        for (String candidate : candidates) {
+            File chartDir = new File(candidate);
+            if (new File(chartDir, "Chart.yaml").exists()) {
+                return chartDir.getAbsolutePath();
+            }
+        }
+        throw new IllegalStateException("Cannot find helm chart directory. "
+                + "Looked in: " + String.join(", ", candidates));
+    }
+
+    private static String helmTemplate(String chartPath, Map<String, String> values) throws Exception {
+        List<String> command = new ArrayList<>();
+        command.add("helm");
+        command.add("template");
+        command.add("test-fs");
+        command.add(chartPath);
+        for (Map.Entry<String, String> entry : values.entrySet()) {
+            command.add("--set");
+            command.add(entry.getKey() + "=" + entry.getValue());
+        }
+
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+        String output;
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            output = reader.lines().collect(Collectors.joining("\n"));
+        }
+        int exitCode = process.waitFor();
+        if (exitCode != 0) {
+            throw new RuntimeException("helm template failed (exit=" + exitCode + "): " + output);
+        }
+        return output;
+    }
+}

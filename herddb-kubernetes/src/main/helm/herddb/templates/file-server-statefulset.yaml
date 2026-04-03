@@ -24,6 +24,17 @@ spec:
         - name: file-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.zookeeper.enabled }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              POD_FQDN="${HOSTNAME}.{{ include "herddb.fullname" . }}-file-server.{{ .Release.Namespace }}.svc.cluster.local"
+              exec /opt/herddb/bin/service file-server console \
+                /opt/herddb/conf/fileserver.properties \
+                --port={{ .Values.fileServer.port }} \
+                --data-dir=/opt/herddb/filedata \
+                --bind-host=${POD_FQDN}
+          {{- else }}
           command: ["/opt/herddb/bin/service"]
           args:
             - file-server
@@ -31,6 +42,12 @@ spec:
             - "/opt/herddb/conf/fileserver.properties"
             - "--port={{ .Values.fileServer.port }}"
             - "--data-dir=/opt/herddb/filedata"
+          {{- end }}
+          {{- if .Values.fileServer.javaOpts }}
+          env:
+            - name: JAVA_OPTS
+              value: {{ .Values.fileServer.javaOpts | quote }}
+          {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.fileServer.port }}
@@ -38,6 +55,11 @@ spec:
             - name: http
               containerPort: {{ .Values.fileServer.httpPort }}
               protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.fileServer.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
           resources:
             {{- toYaml .Values.fileServer.resources | nindent 12 }}
           volumeMounts:

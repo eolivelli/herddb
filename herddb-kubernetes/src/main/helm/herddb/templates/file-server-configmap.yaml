@@ -41,4 +41,9 @@ data:
     http.enable=true
     http.port={{ .Values.fileServer.httpPort }}
     http.host=0.0.0.0
+    {{- if .Values.zookeeper.enabled }}
+    server.zookeeper.address={{ include "herddb.zkAddress" . }}
+    server.zookeeper.path=/herd
+    server.zookeeper.session.timeout=40000
+    {{- end }}
 {{- end }}

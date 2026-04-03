@@ -154,13 +154,31 @@ public class IndexingServiceMain {
         Files.createDirectories(logDirPath);
 
         IndexingServerConfiguration indexingConfig = new IndexingServerConfiguration(configuration);
+
+        // Build and start the MetadataStorageManager early so the IndexingServer
+        // can register itself in ZooKeeper before the engine starts tailing the WAL.
+        herddb.metadata.MetadataStorageManager metadataManager = null;
+        String zkAddress = configuration.getProperty("server.zookeeper.address", "");
+        if (!zkAddress.isEmpty()) {
+            int zkSessionTimeout = Integer.parseInt(
+                    configuration.getProperty("server.zookeeper.session.timeout", "40000"));
+            String zkPath = configuration.getProperty("server.zookeeper.path", "/herd");
+            metadataManager = new herddb.cluster.ZookeeperMetadataStorageManager(
+                    zkAddress, zkSessionTimeout, zkPath);
+            metadataManager.start();
+        }
+
         IndexingServiceEngine engine = new IndexingServiceEngine(logDirPath, dataDirPath, indexingConfig);
+        if (metadataManager != null) {
+            engine.setMetadataStorageManager(metadataManager);
+        }
         try {
             // Start server first so it wires MemoryManager and DataStorageManager
             // onto the engine before the engine starts and configures its VectorStoreFactory
             runningServer = new IndexingServer(bindHost, port, engine, indexingConfig);
             try {
-                runningServer.setMetadataStorageManager(engine.getMetadataStorageManager());
+                runningServer.setMetadataStorageManager(
+                        metadataManager != null ? metadataManager : engine.getMetadataStorageManager());
                 runningServer.start();
                 engine.start();
                 shutdownLatch.await();
