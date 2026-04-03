@@ -33,14 +33,18 @@ import herddb.remote.proto.ReadFileResponse;
 import herddb.remote.proto.RemoteFileServiceGrpc;
 import herddb.remote.proto.WriteFileRequest;
 import herddb.remote.proto.WriteFileResponse;
+import herddb.server.DynamicServiceClient;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -54,10 +58,11 @@ import java.util.logging.Logger;
  * ConsistentHashRouter for path distribution.
  * <p>
  * Provides both synchronous and asynchronous (CompletableFuture) APIs.
+ * Supports dynamic server list updates via {@link #updateServers(List)}.
  *
  * @author enrico.olivelli
  */
-public class RemoteFileServiceClient implements AutoCloseable {
+public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceClient {
 
     private static final Logger LOGGER = Logger.getLogger(RemoteFileServiceClient.class.getName());
 
@@ -69,8 +74,17 @@ public class RemoteFileServiceClient implements AutoCloseable {
     private static final long DEFAULT_CLIENT_TIMEOUT_SECONDS = 1800; // 30 minutes
     private static final int DEFAULT_CLIENT_RETRIES = 10;
 
-    private final ConsistentHashRouter router;
-    private final Map<String, ManagedChannel> channels;
+    private static class ServerSnapshot {
+        final ConsistentHashRouter router;
+        final Map<String, ManagedChannel> channels;
+
+        ServerSnapshot(ConsistentHashRouter router, Map<String, ManagedChannel> channels) {
+            this.router = router;
+            this.channels = Collections.unmodifiableMap(new HashMap<>(channels));
+        }
+    }
+
+    private volatile ServerSnapshot snapshot;
     private final int maxRetries;
     private final long clientTimeoutSeconds;
     private final ScheduledExecutorService retryScheduler;
@@ -82,45 +96,105 @@ public class RemoteFileServiceClient implements AutoCloseable {
     public RemoteFileServiceClient(List<String> servers, Map<String, Object> configuration) {
         this.clientTimeoutSeconds = longConfig(configuration, CONFIG_CLIENT_TIMEOUT, DEFAULT_CLIENT_TIMEOUT_SECONDS);
         this.maxRetries = intConfig(configuration, CONFIG_CLIENT_RETRIES, DEFAULT_CLIENT_RETRIES);
-        this.router = new ConsistentHashRouter(servers);
-        this.channels = new HashMap<>();
         this.retryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "remote-file-retry");
             t.setDaemon(true);
             return t;
         });
 
+        Map<String, ManagedChannel> channels = new HashMap<>();
         for (String server : servers) {
-            String[] parts = server.split(":");
-            String host = parts[0];
-            int port = Integer.parseInt(parts[1]);
-            ManagedChannel channel = ManagedChannelBuilder.forAddress(host, port)
-                    .usePlaintext()
-                    .keepAliveTime(300, TimeUnit.SECONDS)
-                    .keepAliveTimeout(20, TimeUnit.SECONDS)
-                    .keepAliveWithoutCalls(false)
-                    .build();
-            channels.put(server, channel);
+            channels.put(server, buildChannel(server));
         }
+        this.snapshot = new ServerSnapshot(new ConsistentHashRouter(servers), channels);
 
         LOGGER.log(Level.INFO, "RemoteFileServiceClient: servers={0}, timeout={1}s, retries={2}",
                 new Object[]{servers, clientTimeoutSeconds, maxRetries});
     }
 
+    private static ManagedChannel buildChannel(String server) {
+        String[] parts = server.split(":");
+        String host = parts[0];
+        int port = Integer.parseInt(parts[1]);
+        return ManagedChannelBuilder.forAddress(host, port)
+                .usePlaintext()
+                .keepAliveTime(300, TimeUnit.SECONDS)
+                .keepAliveTimeout(20, TimeUnit.SECONDS)
+                .keepAliveWithoutCalls(false)
+                .build();
+    }
+
+    @Override
+    public synchronized void updateServers(List<String> newServers) {
+        if (newServers.isEmpty()) {
+            LOGGER.log(Level.WARNING, "updateServers called with empty list, keeping current servers");
+            return;
+        }
+
+        ServerSnapshot current = this.snapshot;
+
+        Set<String> added = new LinkedHashSet<>(newServers);
+        added.removeAll(current.channels.keySet());
+
+        Set<String> removed = new LinkedHashSet<>(current.channels.keySet());
+        removed.removeAll(new HashSet<>(newServers));
+
+        Map<String, ManagedChannel> newChannels = new HashMap<>();
+        for (String server : newServers) {
+            ManagedChannel existing = current.channels.get(server);
+            if (existing != null) {
+                newChannels.put(server, existing);
+            } else {
+                newChannels.put(server, buildChannel(server));
+            }
+        }
+
+        this.snapshot = new ServerSnapshot(new ConsistentHashRouter(newServers), newChannels);
+
+        LOGGER.log(Level.INFO, "Updated remote file servers: {0} (added: {1}, removed: {2})",
+                new Object[]{newServers, added, removed});
+
+        // Gracefully shutdown removed channels in background
+        if (!removed.isEmpty()) {
+            List<ManagedChannel> toShutdown = new ArrayList<>();
+            for (String server : removed) {
+                ManagedChannel ch = current.channels.get(server);
+                if (ch != null) {
+                    toShutdown.add(ch);
+                }
+            }
+            Thread shutdownThread = new Thread(() -> {
+                for (ManagedChannel ch : toShutdown) {
+                    try {
+                        ch.shutdown().awaitTermination(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        ch.shutdownNow();
+                    }
+                }
+            }, "remote-file-channel-shutdown");
+            shutdownThread.setDaemon(true);
+            shutdownThread.start();
+        }
+    }
+
     private RemoteFileServiceGrpc.RemoteFileServiceBlockingStub blockingStubForPath(String path) {
-        String server = router.getServer(path);
-        return RemoteFileServiceGrpc.newBlockingStub(channels.get(server))
+        ServerSnapshot s = this.snapshot;
+        String server = s.router.getServer(path);
+        return RemoteFileServiceGrpc.newBlockingStub(s.channels.get(server))
                 .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
     }
 
     private RemoteFileServiceGrpc.RemoteFileServiceStub asyncStubForPath(String path) {
-        String server = router.getServer(path);
-        return RemoteFileServiceGrpc.newStub(channels.get(server))
+        ServerSnapshot s = this.snapshot;
+        String server = s.router.getServer(path);
+        return RemoteFileServiceGrpc.newStub(s.channels.get(server))
                 .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
     }
 
     private RemoteFileServiceGrpc.RemoteFileServiceStub asyncStubForServer(String server) {
-        return RemoteFileServiceGrpc.newStub(channels.get(server))
+        ServerSnapshot s = this.snapshot;
+        return RemoteFileServiceGrpc.newStub(s.channels.get(server))
                 .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
     }
 
@@ -228,8 +302,9 @@ public class RemoteFileServiceClient implements AutoCloseable {
     }
 
     private CompletableFuture<List<String>> doListFilesAsync(String prefix) {
+        ServerSnapshot s = this.snapshot;
         List<CompletableFuture<List<String>>> futures = new ArrayList<>();
-        for (String server : channels.keySet()) {
+        for (String server : s.channels.keySet()) {
             RemoteFileServiceGrpc.RemoteFileServiceStub stub = asyncStubForServer(server);
             CompletableFuture<List<String>> serverFuture = new CompletableFuture<>();
             List<String> paths = Collections.synchronizedList(new ArrayList<>());
@@ -268,8 +343,9 @@ public class RemoteFileServiceClient implements AutoCloseable {
     }
 
     private CompletableFuture<Integer> doDeleteByPrefixAsync(String prefix) {
+        ServerSnapshot s = this.snapshot;
         List<CompletableFuture<Integer>> futures = new ArrayList<>();
-        for (String server : channels.keySet()) {
+        for (String server : s.channels.keySet()) {
             RemoteFileServiceGrpc.RemoteFileServiceStub stub = asyncStubForServer(server);
             CompletableFuture<Integer> serverFuture = new CompletableFuture<>();
             stub.deleteByPrefix(
@@ -334,13 +410,14 @@ public class RemoteFileServiceClient implements AutoCloseable {
      * Returns the server address that would store the given path.
      */
     public String getServerForPath(String path) {
-        return router.getServer(path);
+        return snapshot.router.getServer(path);
     }
 
     @Override
     public void close() {
         retryScheduler.shutdownNow();
-        for (Map.Entry<String, ManagedChannel> entry : channels.entrySet()) {
+        ServerSnapshot s = this.snapshot;
+        for (Map.Entry<String, ManagedChannel> entry : s.channels.entrySet()) {
             try {
                 entry.getValue().shutdown().awaitTermination(5, TimeUnit.SECONDS);
             } catch (InterruptedException e) {

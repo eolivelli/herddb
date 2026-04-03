@@ -24,6 +24,8 @@ import java.util.List;
 
 /**
  * Interface for clients that support dynamic server list updates.
+ *
+ * @author enrico.olivelli
  */
 public interface DynamicServiceClient {
     void updateServers(List<String> servers);
