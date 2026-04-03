@@ -20,6 +20,7 @@
 
 package herddb.remote;
 
+import herddb.metadata.MetadataStorageManager;
 import herddb.remote.storage.CachingObjectStorage;
 import herddb.remote.storage.LocalObjectStorage;
 import herddb.remote.storage.ObjectStorage;
@@ -76,6 +77,8 @@ public class RemoteFileServer implements AutoCloseable {
     private ObjectStorage objectStorage;
     private PrometheusMetricsProvider statsProvider;
     private org.eclipse.jetty.server.Server httpServer;
+    private MetadataStorageManager metadataStorageManager;
+    private String registeredServiceId;
 
     public RemoteFileServer(String host, int port, Path dataDirectory, int ioThreads, Properties config) {
         this.host = host;
@@ -149,6 +152,16 @@ public class RemoteFileServer implements AutoCloseable {
             }
         }
 
+        if (metadataStorageManager != null) {
+            registeredServiceId = host + ":" + server.getPort();
+            try {
+                metadataStorageManager.registerFileServer(registeredServiceId, registeredServiceId);
+                LOGGER.log(Level.INFO, "Registered file server in metadata store: {0}", registeredServiceId);
+            } catch (Exception e) {
+                LOGGER.log(Level.SEVERE, "Failed to register file server", e);
+            }
+        }
+
         LOGGER.log(Level.INFO, "RemoteFileServer started on port {0}, storage: {1}, io threads: {2}",
                 new Object[]{port, storageMode, ioThreads});
     }
@@ -216,7 +229,21 @@ public class RemoteFileServer implements AutoCloseable {
         return host + ":" + getPort();
     }
 
+    public void setMetadataStorageManager(MetadataStorageManager metadataStorageManager) {
+        this.metadataStorageManager = metadataStorageManager;
+    }
+
     public void stop() throws InterruptedException {
+        if (metadataStorageManager != null && registeredServiceId != null) {
+            String id = registeredServiceId;
+            registeredServiceId = null;
+            try {
+                metadataStorageManager.unregisterFileServer(id);
+                LOGGER.log(Level.INFO, "Unregistered file server: {0}", id);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Failed to unregister file server", e);
+            }
+        }
         if (httpServer != null) {
             try {
                 httpServer.stop();

@@ -20,7 +20,9 @@
 
 package herddb.server;
 
+import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.daemons.PidFileLocker;
+import herddb.metadata.MetadataStorageManager;
 import herddb.remote.RemoteFileServer;
 import java.io.File;
 import java.io.FileInputStream;
@@ -139,11 +141,26 @@ public class RemoteFileServerMain {
         java.nio.file.Path dataDirPath = Paths.get(dataDir).toAbsolutePath();
         System.out.println("Starting RemoteFileServer on " + bindHost + ":" + port + ", data dir: " + dataDirPath);
 
+        MetadataStorageManager metadataManager = null;
+        String zkAddress = configuration.getProperty("server.zookeeper.address", "");
+        if (!zkAddress.isEmpty()) {
+            int zkSessionTimeout = Integer.parseInt(configuration.getProperty("server.zookeeper.session.timeout", "40000"));
+            String zkPath = configuration.getProperty("server.zookeeper.path", "/herd");
+            metadataManager = new ZookeeperMetadataStorageManager(zkAddress, zkSessionTimeout, zkPath);
+            metadataManager.start();
+        }
+
         runningServer = new RemoteFileServer(bindHost, port, dataDirPath, ioThreads, configuration);
+        if (metadataManager != null) {
+            runningServer.setMetadataStorageManager(metadataManager);
+        }
         try {
             runningServer.start();
             shutdownLatch.await();
         } finally {
+            if (metadataManager != null) {
+                metadataManager.close();
+            }
             pidFileLocker.close();
         }
     }

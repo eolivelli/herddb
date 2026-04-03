@@ -160,6 +160,7 @@ public class IndexingServiceMain {
             // onto the engine before the engine starts and configures its VectorStoreFactory
             runningServer = new IndexingServer(bindHost, port, engine, indexingConfig);
             try {
+                runningServer.setMetadataStorageManager(engine.getMetadataStorageManager());
                 runningServer.start();
                 engine.start();
                 shutdownLatch.await();

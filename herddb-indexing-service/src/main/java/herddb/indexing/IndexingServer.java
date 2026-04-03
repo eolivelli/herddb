@@ -23,6 +23,7 @@ package herddb.indexing;
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
 import herddb.mem.MemoryDataStorageManager;
+import herddb.metadata.MetadataStorageManager;
 import herddb.storage.DataStorageManager;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
@@ -57,6 +58,8 @@ public class IndexingServer implements AutoCloseable {
     private Server server;
     private PrometheusMetricsProvider statsProvider;
     private org.eclipse.jetty.server.Server httpServer;
+    private MetadataStorageManager metadataStorageManager;
+    private String registeredServiceId;
 
     public IndexingServer(String host, int port, IndexingServiceEngine engine, IndexingServerConfiguration config) {
         this.host = host;
@@ -177,6 +180,16 @@ public class IndexingServer implements AutoCloseable {
             }
         }
 
+        if (metadataStorageManager != null) {
+            registeredServiceId = host + ":" + server.getPort();
+            try {
+                metadataStorageManager.registerIndexingService(registeredServiceId, registeredServiceId);
+                LOGGER.log(Level.INFO, "Registered indexing service in metadata store: {0}", registeredServiceId);
+            } catch (Exception e) {
+                LOGGER.log(Level.SEVERE, "Failed to register indexing service", e);
+            }
+        }
+
         LOGGER.log(Level.INFO, "IndexingServer started on port {0}", getPort());
     }
 
@@ -199,7 +212,21 @@ public class IndexingServer implements AutoCloseable {
         return -1;
     }
 
+    public void setMetadataStorageManager(MetadataStorageManager metadataStorageManager) {
+        this.metadataStorageManager = metadataStorageManager;
+    }
+
     public void stop() throws InterruptedException {
+        if (metadataStorageManager != null && registeredServiceId != null) {
+            String id = registeredServiceId;
+            registeredServiceId = null;
+            try {
+                metadataStorageManager.unregisterIndexingService(id);
+                LOGGER.log(Level.INFO, "Unregistered indexing service: {0}", id);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Failed to unregister indexing service", e);
+            }
+        }
         if (httpServer != null) {
             try {
                 httpServer.stop();
