@@ -98,6 +98,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private MemoryManager memoryManager;
     private DataStorageManager dataStorageManager;
     private long maxVectorMemoryBytes = Long.MAX_VALUE;
+    private volatile String tableSpaceUUID;
 
     private ExecutorService[] applyWorkers;
     private int applyParallelism;
@@ -261,7 +262,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 var similarityFunction = PersistentVectorStore.parseSimilarityFunction(
                         indexProperties != null ? indexProperties.get(VectorIndexManager.PROP_SIMILARITY) : null);
                 PersistentVectorStore store = new PersistentVectorStore(
-                        indexName, tableName, "default", vectorColumnName,
+                        indexName, tableName, tableSpaceUUID, vectorColumnName,
                         tmpDir, dsm, mm,
                         m, beamWidth, neighborOverflow, alpha,
                         fusedPQ, maxSegmentSize, maxLiveGraphSize,
@@ -348,7 +349,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     new Object[]{tablespaceName, pollIntervalMs});
             Thread.sleep(pollIntervalMs);
         }
-        String tableSpaceUUID = tableSpace.uuid;
+        this.tableSpaceUUID = tableSpace.uuid;
         LOGGER.log(Level.INFO, "Resolved tablespace name ''{0}'' to UUID ''{1}''",
                 new Object[]{tablespaceName, tableSpaceUUID});
 
