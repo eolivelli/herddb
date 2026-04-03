@@ -232,6 +232,9 @@ public class ServerMain implements AutoCloseable {
 
         server = new Server(config, statsProvider);
 
+        server.start();
+
+        // Indexing service discovery — static config takes precedence, then ZK discovery
         String indexingServers = config.getString(
                 ServerConfiguration.PROPERTY_INDEXING_SERVICE_SERVERS,
                 ServerConfiguration.PROPERTY_INDEXING_SERVICE_SERVERS_DEFAULT);
@@ -243,13 +246,44 @@ public class ServerMain implements AutoCloseable {
                     .map(String::trim)
                     .filter(s -> !s.isEmpty())
                     .collect(Collectors.toList());
-            LOGGER.log(Level.INFO, "Configuring IndexingService client with servers: {0}, timeout: {1}s",
+            LOGGER.log(Level.INFO, "Configuring IndexingService client with static servers: {0}, timeout: {1}s",
                     new Object[]{serverList, timeout});
             remoteVectorIndexService = new IndexingServiceClient(serverList, timeout);
             server.getManager().setRemoteVectorIndexService(remoteVectorIndexService);
-        }
+        } else {
+            // Try ZK-based discovery
+            try {
+                List<String> discovered = server.getMetadataStorageManager().listIndexingServices();
+                if (!discovered.isEmpty()
+                        || server.getMetadataStorageManager() instanceof herddb.cluster.ZookeeperMetadataStorageManager) {
+                    long timeout = config.getLong(
+                            ServerConfiguration.PROPERTY_INDEXING_SERVICE_TIMEOUT,
+                            ServerConfiguration.PROPERTY_INDEXING_SERVICE_TIMEOUT_DEFAULT);
+                    LOGGER.log(Level.INFO, "Configuring IndexingService client with ZK discovery, initial servers: {0}",
+                            discovered);
+                    IndexingServiceClient client = new IndexingServiceClient(discovered, timeout);
+                    remoteVectorIndexService = client;
+                    server.getManager().setRemoteVectorIndexService(remoteVectorIndexService);
 
-        server.start();
+                    server.getMetadataStorageManager().addServiceDiscoveryListener(
+                            new herddb.metadata.ServiceDiscoveryListener() {
+                                @Override
+                                public void onIndexingServicesChanged(List<String> currentAddresses) {
+                                    LOGGER.log(Level.INFO, "IndexingService servers changed via ZK: {0}",
+                                            currentAddresses);
+                                    client.updateServers(currentAddresses);
+                                }
+
+                                @Override
+                                public void onFileServersChanged(List<String> currentAddresses) {
+                                    // handled by Server.java for RemoteFileServiceClient
+                                }
+                            });
+                }
+            } catch (Exception e) {
+                LOGGER.log(Level.FINE, "ZK-based indexing service discovery not available: {0}", e.getMessage());
+            }
+        }
 
         boolean httpEnabled = config.getBoolean("http.enable", true);
         if (httpEnabled) {

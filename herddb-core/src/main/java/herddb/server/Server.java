@@ -56,6 +56,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -357,9 +358,23 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
             }
             case ServerConfiguration.PROPERTY_STORAGE_MODE_REMOTE: {
                 int diskswapThreshold = configuration.getInt(ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS, ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS_DEFAULT);
-                String remoteServers = configuration.getString(ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS, ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
-                List<String> servers = Arrays.asList(remoteServers.split(","));
-                LOGGER.log(Level.INFO, "Remote file services are {0}", servers);
+                String remoteServersConfig = configuration.getString(ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS, ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
+                List<String> servers;
+                boolean useZKDiscovery = false;
+                if (!remoteServersConfig.isEmpty()) {
+                    servers = Arrays.asList(remoteServersConfig.split(","));
+                    LOGGER.log(Level.INFO, "Remote file services (static): {0}", servers);
+                } else {
+                    // Try ZK-based discovery
+                    try {
+                        servers = metadataStorageManager.listFileServers();
+                        useZKDiscovery = true;
+                        LOGGER.log(Level.INFO, "Remote file services (ZK discovery): {0}", servers);
+                    } catch (Exception e) {
+                        servers = Collections.emptyList();
+                        LOGGER.log(Level.WARNING, "Failed to discover remote file servers via ZK", e);
+                    }
+                }
                 Map<String, Object> clientConfig = new HashMap<>();
                 clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT,
                         configuration.getLong(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT,
@@ -370,6 +385,24 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 try {
                     Class<?> clientClass = Class.forName("herddb.remote.RemoteFileServiceClient");
                     Object client = clientClass.getConstructor(List.class, Map.class).newInstance(servers, clientConfig);
+                    // Set up ZK-based discovery listener if applicable
+                    if (useZKDiscovery && client instanceof DynamicServiceClient) {
+                        DynamicServiceClient dynamicClient = (DynamicServiceClient) client;
+                        metadataStorageManager.addServiceDiscoveryListener(
+                                new herddb.metadata.ServiceDiscoveryListener() {
+                                    @Override
+                                    public void onIndexingServicesChanged(List<String> currentAddresses) {
+                                        // handled by ServerMain for IndexingServiceClient
+                                    }
+
+                                    @Override
+                                    public void onFileServersChanged(List<String> currentAddresses) {
+                                        LOGGER.log(Level.INFO, "Remote file servers changed via ZK: {0}",
+                                                currentAddresses);
+                                        dynamicClient.updateServers(currentAddresses);
+                                    }
+                                });
+                    }
                     Class<?> storageClass = Class.forName("herddb.remote.RemoteFileDataStorageManager");
                     Constructor<?> ctor = storageClass.getConstructor(Path.class, Path.class, int.class, clientClass);
                     return (DataStorageManager) ctor.newInstance(dataDirectory, tmpDirectory, diskswapThreshold, client);

@@ -62,7 +62,7 @@ public final class ServerConfiguration {
     public static final String PROPERTY_STORAGE_MODE_BOOKKEEPER = "bookkeeper";
 
     public static final String PROPERTY_REMOTE_FILE_SERVERS = "remote.file.servers";
-    public static final String PROPERTY_REMOTE_FILE_SERVERS_DEFAULT = "localhost:9846";
+    public static final String PROPERTY_REMOTE_FILE_SERVERS_DEFAULT = "";
 
     public static final String PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT = "remote.file.client.timeout";
     public static final long PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT_DEFAULT = 1800; // 30 minutes, in seconds
