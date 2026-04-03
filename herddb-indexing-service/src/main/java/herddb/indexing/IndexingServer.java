@@ -24,11 +24,19 @@ import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.metadata.MetadataStorageManager;
+import herddb.metadata.ServiceDiscoveryListener;
+import herddb.server.DynamicServiceClient;
 import herddb.storage.DataStorageManager;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -118,6 +126,68 @@ public class IndexingServer implements AutoCloseable {
         switch (storageType) {
             case "memory":
                 return new MemoryDataStorageManager();
+            case "remote": {
+                String remoteServersConfig = config.getString(
+                        IndexingServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS,
+                        IndexingServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
+                List<String> servers;
+                boolean useZKDiscovery = false;
+                if (!remoteServersConfig.isEmpty()) {
+                    servers = Arrays.asList(remoteServersConfig.split(","));
+                    LOGGER.log(Level.INFO, "Remote file services for indexing (static): {0}", servers);
+                } else if (metadataStorageManager != null) {
+                    try {
+                        servers = metadataStorageManager.listFileServers();
+                        useZKDiscovery = true;
+                        LOGGER.log(Level.INFO, "Remote file services for indexing (ZK discovery): {0}", servers);
+                    } catch (Exception e) {
+                        servers = Collections.emptyList();
+                        LOGGER.log(Level.WARNING, "Failed to discover remote file servers via ZK", e);
+                    }
+                } else {
+                    servers = Collections.emptyList();
+                    LOGGER.log(Level.WARNING, "Remote storage configured but no file servers "
+                            + "and no metadata storage manager for ZK discovery");
+                }
+                Map<String, Object> clientConfig = new HashMap<>();
+                clientConfig.put(IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT,
+                        config.getLong(IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT,
+                                IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT_DEFAULT));
+                clientConfig.put(IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
+                        config.getInt(IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
+                                IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT));
+                try {
+                    Class<?> clientClass = Class.forName("herddb.remote.RemoteFileServiceClient");
+                    Object client = clientClass.getConstructor(List.class, Map.class)
+                            .newInstance(servers, clientConfig);
+                    if (useZKDiscovery && client instanceof DynamicServiceClient) {
+                        DynamicServiceClient dynamicClient = (DynamicServiceClient) client;
+                        metadataStorageManager.addServiceDiscoveryListener(
+                                new ServiceDiscoveryListener() {
+                                    @Override
+                                    public void onIndexingServicesChanged(List<String> currentAddresses) {
+                                        // not relevant here
+                                    }
+
+                                    @Override
+                                    public void onFileServersChanged(List<String> currentAddresses) {
+                                        LOGGER.log(Level.INFO,
+                                                "Remote file servers for indexing changed via ZK: {0}",
+                                                currentAddresses);
+                                        dynamicClient.updateServers(currentAddresses);
+                                    }
+                                });
+                    }
+                    Class<?> storageClass = Class.forName("herddb.remote.RemoteFileDataStorageManager");
+                    Constructor<?> ctor = storageClass.getConstructor(
+                            Path.class, Path.class, int.class, clientClass);
+                    return (DataStorageManager) ctor.newInstance(
+                            dataDir, dataDir, Integer.MAX_VALUE, client);
+                } catch (ReflectiveOperationException e) {
+                    throw new RuntimeException("Cannot create RemoteFileDataStorageManager. "
+                            + "Ensure herddb-remote-file-service is on the classpath.", e);
+                }
+            }
             case "file":
             default:
                 return new FileDataStorageManager(dataDir);
