@@ -1007,6 +1007,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             if (totalActiveVectors == 0 && !segments.isEmpty()) {
                 for (VectorSegment seg : segments) {
                     seg.close();
+                    dropSegmentBLinkStorage(seg);
                 }
                 segments = new java.util.concurrent.CopyOnWriteArrayList<>();
                 nextSegmentId.set(0);
@@ -1077,6 +1078,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     }
                 }
                 seg.close();
+                dropSegmentBLinkStorage(seg);
             }
             segments = new java.util.concurrent.CopyOnWriteArrayList<>();
             nextSegmentId.set(0);
@@ -1240,6 +1242,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         } catch (IOException | RuntimeException e) {
             for (VectorSegment seg : preloadedSegments) {
                 seg.close();
+                dropSegmentBLinkStorage(seg);
             }
             recoverFromPhaseBFailure(snapshotShards);
             throw e;
@@ -1261,6 +1264,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             if (newSegmentResults != null) {
                 for (VectorSegment seg : mergeableSegments) {
                     seg.close();
+                    dropSegmentBLinkStorage(seg);
                 }
 
                 List<VectorSegment> newSegments = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -1401,9 +1405,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         if (poolVectorsList.size() < MIN_VECTORS_FOR_FUSED_PQ && !poolVectorsList.isEmpty()) {
             for (VectorSegment seg : mergeableSegments) {
                 seg.close();
+                dropSegmentBLinkStorage(seg);
             }
             for (VectorSegment seg : sealedSegments) {
                 seg.close();
+                dropSegmentBLinkStorage(seg);
             }
             stateLock.writeLock().lock();
             try {
@@ -2132,6 +2138,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
     static int bytesToOrdinal(Bytes b) {
         byte[] d = b.to_array();
         return ((d[0] & 0xFF) << 24) | ((d[1] & 0xFF) << 16) | ((d[2] & 0xFF) << 8) | (d[3] & 0xFF);
+    }
+
+    private void dropSegmentBLinkStorage(VectorSegment seg) {
+        String pkToNodeName = indexUUID + "_seg" + seg.segmentId + "_pktonode";
+        try {
+            dataStorageManager.dropIndex(tableSpaceUUID, pkToNodeName);
+        } catch (DataStorageManagerException e) {
+            LOGGER.log(Level.WARNING, "Failed to drop BLink storage for segment " + seg.segmentId
+                    + " of vector store " + indexName, e);
+        }
     }
 
     private void createSegmentBLinks(VectorSegment seg) {
