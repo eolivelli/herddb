@@ -4,7 +4,7 @@
   },
   "description": "Dashboard for HerdDB Indexing Service - JVM, Search RPC, Vector Indexes, CommitLog Tailer, FusedPQ Checkpoints",
   "editable": true,
-  "graphTooltip": 0,
+  "graphTooltip": 1,
   "id": null,
   "links": [],
   "refresh": "30s",
@@ -1789,6 +1789,68 @@
           "yaxes": [
             {
               "format": "ops",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 35,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "apply_queue_size{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "queue size",
+              "refId": "A"
+            },
+            {
+              "expr": "apply_queue_capacity{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "queue capacity",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "Apply Workers - Queue Size",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "decimals": 0,
               "show": true
             },
             {

@@ -16,4 +16,4 @@ set -x
 # specific language governing permissions and limitations
 # under the License.
 #
-./run.sh --password hdb --batch-size 20000 --ingest-threads 8 --dataset bigann -n 100000000 --index-before-ingest --checkpoint  "$@"
+./run.sh --password hdb --batch-size 20000 --ingest-threads 12 --dataset bigann -n 100000000 --index-before-ingest --checkpoint  "$@"

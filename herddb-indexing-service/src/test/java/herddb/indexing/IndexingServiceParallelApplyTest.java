@@ -32,6 +32,7 @@ import herddb.model.Index;
 import herddb.model.Record;
 import herddb.model.Table;
 import herddb.utils.Bytes;
+import java.io.StringWriter;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -39,6 +40,9 @@ import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import org.apache.bookkeeper.stats.StatsLogger;
+import org.apache.bookkeeper.stats.prometheus.PrometheusMetricsProvider;
+import org.apache.commons.configuration.PropertiesConfiguration;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -334,6 +338,50 @@ public class IndexingServiceParallelApplyTest {
         try {
             engine.start();
             // Engine should start without errors with auto-detected parallelism
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    public void testApplyQueueSizeGaugeIsExposed() throws Exception {
+        Path logDir = folder.newFolder("log").toPath();
+        Path dataDir = folder.newFolder("data").toPath();
+
+        int parallelism = 2;
+        int queueCapacity = 500;
+        Properties props = new Properties();
+        props.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "memory");
+        props.setProperty(IndexingServerConfiguration.PROPERTY_APPLY_PARALLELISM, String.valueOf(parallelism));
+        props.setProperty(IndexingServerConfiguration.PROPERTY_APPLY_QUEUE_CAPACITY, String.valueOf(queueCapacity));
+        IndexingServerConfiguration config = new IndexingServerConfiguration(props);
+
+        PrometheusMetricsProvider statsProvider = new PrometheusMetricsProvider();
+        PropertiesConfiguration statsConfig = new PropertiesConfiguration();
+        statsConfig.setProperty(PrometheusMetricsProvider.PROMETHEUS_STATS_HTTP_ENABLE, false);
+        statsProvider.start(statsConfig);
+        StatsLogger statsLogger = statsProvider.getStatsLogger("");
+
+        IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        engine.setMetadataStorageManager(createTestMetadata());
+        engine.setStatsLogger(statsLogger);
+        try {
+            engine.start();
+
+            StringWriter sw = new StringWriter();
+            statsProvider.writeAllMetrics(sw);
+            String metrics = sw.toString();
+
+            assertTrue("apply_queue_size gauge must be present in metrics output: " + metrics,
+                    metrics.contains("apply_queue_size"));
+            assertTrue("apply_queue_capacity gauge must be present in metrics output: " + metrics,
+                    metrics.contains("apply_queue_capacity"));
+            // when idle, queue size must be 0 (Prometheus text format uses integers or floats)
+            assertTrue("apply_queue_size must be 0 when idle, metrics=" + metrics,
+                    metrics.matches("(?s).*apply_queue_size\\S*\\s+0(\\.0)?.*"));
+            // queue capacity = configured capacity
+            assertTrue("apply_queue_capacity must equal configured capacity when idle, metrics=" + metrics,
+                    metrics.matches("(?s).*apply_queue_capacity\\S*\\s+" + queueCapacity + "(\\.0)?.*"));
         } finally {
             engine.close();
         }

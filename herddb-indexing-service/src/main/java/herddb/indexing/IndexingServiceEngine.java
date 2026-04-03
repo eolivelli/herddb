@@ -51,6 +51,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -780,6 +781,36 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             public Integer getSample() {
                 CommitLogTailing t = tailer;
                 return t != null && t.isRunning() ? 1 : 0;
+            }
+        });
+
+        StatsLogger applyStats = sl.scope("apply");
+        applyStats.registerGauge("queue_size", new Gauge<Integer>() {
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                int total = 0;
+                for (ExecutorService w : applyWorkers) {
+                    total += ((ThreadPoolExecutor) w).getQueue().size();
+                }
+                return total;
+            }
+        });
+        applyStats.registerGauge("queue_capacity", new Gauge<Integer>() {
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                if (applyWorkers.length == 0) {
+                    return 0;
+                }
+                BlockingQueue<?> q = ((ThreadPoolExecutor) applyWorkers[0]).getQueue();
+                return q.size() + q.remainingCapacity();
             }
         });
     }
