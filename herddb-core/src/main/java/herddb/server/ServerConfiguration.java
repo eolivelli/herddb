@@ -55,7 +55,11 @@ public final class ServerConfiguration {
     public static final String PROPERTY_MODE_STANDALONE = "standalone";
     public static final String PROPERTY_MODE_CLUSTER = "cluster";
     public static final String PROPERTY_MODE_DISKLESSCLUSTER = "diskless-cluster";
-    public static final String PROPERTY_MODE_REMOTE_FILE_SERVICE = "remote-file-service";
+
+    public static final String PROPERTY_STORAGE_MODE = "server.storage.mode";
+    public static final String PROPERTY_STORAGE_MODE_LOCAL = "local";
+    public static final String PROPERTY_STORAGE_MODE_REMOTE = "remote";
+    public static final String PROPERTY_STORAGE_MODE_BOOKKEEPER = "bookkeeper";
 
     public static final String PROPERTY_REMOTE_FILE_SERVERS = "remote.file.servers";
     public static final String PROPERTY_REMOTE_FILE_SERVERS_DEFAULT = "localhost:9846";

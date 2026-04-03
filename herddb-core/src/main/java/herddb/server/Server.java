@@ -252,7 +252,6 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 LOGGER.info("JDBC URL is not available. This server will not be accessible outside the JVM");
                 break;
             case ServerConfiguration.PROPERTY_MODE_STANDALONE:
-            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE:
                 jdbcUrl = "jdbc:herddb:server:" + serverHostData.getHost() + ":" + serverHostData.getPort();
                 LOGGER.log(Level.INFO, "Use this JDBC URL to connect to this server: {0}", new Object[]{jdbcUrl});
                 break;
@@ -312,7 +311,6 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
             case ServerConfiguration.PROPERTY_MODE_LOCAL:
                 return new MemoryMetadataStorageManager();
             case ServerConfiguration.PROPERTY_MODE_STANDALONE:
-            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE:
                 Path metadataDirectory = this.baseDirectory.resolve(configuration.getString(ServerConfiguration.PROPERTY_METADATADIR, ServerConfiguration.PROPERTY_METADATADIR_DEFAULT));
                 return new FileMetadataStorageManager(metadataDirectory);
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
@@ -321,17 +319,23 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                         configuration.getInt(ServerConfiguration.PROPERTY_ZOOKEEPER_SESSIONTIMEOUT, ServerConfiguration.PROPERTY_ZOOKEEPER_SESSIONTIMEOUT_DEFAULT),
                         configuration.getString(ServerConfiguration.PROPERTY_ZOOKEEPER_PATH, ServerConfiguration.PROPERTY_ZOOKEEPER_PATH_DEFAULT));
             default:
-                throw new RuntimeException();
+                throw new RuntimeException("invalid " + ServerConfiguration.PROPERTY_MODE + "=" + mode);
         }
     }
 
     private DataStorageManager buildDataStorageManager(String nodeId) {
-        LOGGER.log(Level.INFO, "Local storage manager mode is {0}, for nodeId {1}", new Object[] {mode, nodeId});
-        switch (mode) {
-            case ServerConfiguration.PROPERTY_MODE_LOCAL:
-                return new MemoryDataStorageManager();
-            case ServerConfiguration.PROPERTY_MODE_STANDALONE:
-            case ServerConfiguration.PROPERTY_MODE_CLUSTER: {
+        String defaultStorageMode = mode.equals(ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER)
+                ? ServerConfiguration.PROPERTY_STORAGE_MODE_BOOKKEEPER
+                : ServerConfiguration.PROPERTY_STORAGE_MODE_LOCAL;
+        String storageMode = configuration.getString(
+                ServerConfiguration.PROPERTY_STORAGE_MODE, defaultStorageMode);
+        LOGGER.log(Level.INFO, "Storage mode is {0}, server mode is {1}, for nodeId {2}",
+                new Object[]{storageMode, mode, nodeId});
+        switch (storageMode) {
+            case ServerConfiguration.PROPERTY_STORAGE_MODE_LOCAL: {
+                if (mode.equals(ServerConfiguration.PROPERTY_MODE_LOCAL)) {
+                    return new MemoryDataStorageManager();
+                }
                 int diskswapThreshold = configuration.getInt(ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS, ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS_DEFAULT);
                 boolean requirefsync = configuration.getBoolean(ServerConfiguration.PROPERTY_REQUIRE_FSYNC, ServerConfiguration.PROPERTY_REQUIRE_FSYNC_DEFAULT);
                 boolean pageodirect = configuration.getBoolean(ServerConfiguration.PROPERTY_PAGE_USE_ODIRECT, ServerConfiguration.PROPERTY_PAGE_USE_ODIRECT_DEFAULT);
@@ -340,12 +344,18 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 boolean hashWritesEnabled = configuration.getBoolean(ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED, ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT);
                 return new FileDataStorageManager(dataDirectory, tmpDirectory, diskswapThreshold, requirefsync, pageodirect, indexodirect, hashChecksEnabled, hashWritesEnabled, statsLogger);
             }
-            case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER: {
+            case ServerConfiguration.PROPERTY_STORAGE_MODE_BOOKKEEPER: {
+                if (!mode.equals(ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER)) {
+                    throw new RuntimeException(ServerConfiguration.PROPERTY_STORAGE_MODE + "="
+                            + ServerConfiguration.PROPERTY_STORAGE_MODE_BOOKKEEPER
+                            + " is only supported with " + ServerConfiguration.PROPERTY_MODE + "="
+                            + ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER);
+                }
                 int diskswapThreshold = configuration.getInt(ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS, ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS_DEFAULT);
                 return new BookKeeperDataStorageManager(nodeId, tmpDirectory, diskswapThreshold, (ZookeeperMetadataStorageManager) metadataStorageManager,
                         (BookkeeperCommitLogManager) this.commitLogManager, this.statsLogger);
             }
-            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE: {
+            case ServerConfiguration.PROPERTY_STORAGE_MODE_REMOTE: {
                 int diskswapThreshold = configuration.getInt(ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS, ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS_DEFAULT);
                 String remoteServers = configuration.getString(ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS, ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
                 List<String> servers = Arrays.asList(remoteServers.split(","));
@@ -369,7 +379,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 }
             }
             default:
-                throw new RuntimeException();
+                throw new RuntimeException("invalid " + ServerConfiguration.PROPERTY_STORAGE_MODE + "=" + storageMode);
         }
     }
 
@@ -378,7 +388,6 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         switch (mode) {
             case ServerConfiguration.PROPERTY_MODE_LOCAL:
                 return new MemoryCommitLogManager(false);
-            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE:
             case ServerConfiguration.PROPERTY_MODE_STANDALONE:
                 Path logDirectory = this.baseDirectory.resolve(configuration.getString(ServerConfiguration.PROPERTY_LOGDIR, ServerConfiguration.PROPERTY_LOGDIR_DEFAULT));
                 return new FileCommitLogManager(logDirectory,
@@ -426,7 +435,6 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
             case ServerConfiguration.PROPERTY_MODE_STANDALONE:
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
             case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER:
-            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE:
                 return new LocalNodeIdManager(dataDirectory);
             default:
                 throw new RuntimeException();

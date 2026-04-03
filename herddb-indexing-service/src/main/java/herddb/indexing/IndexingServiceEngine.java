@@ -133,8 +133,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         String mode = config.getString(IndexingServerConfiguration.PROPERTY_MODE,
                 IndexingServerConfiguration.PROPERTY_MODE_DEFAULT);
         switch (mode) {
-            case ServerConfiguration.PROPERTY_MODE_STANDALONE:
-            case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE: {
+            case ServerConfiguration.PROPERTY_MODE_STANDALONE: {
                 Path metadataDirectory = java.nio.file.Paths.get(
                         config.getString(IndexingServerConfiguration.PROPERTY_METADATA_DIR,
                                 IndexingServerConfiguration.PROPERTY_METADATA_DIR_DEFAULT)).toAbsolutePath();
