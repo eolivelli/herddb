@@ -128,13 +128,18 @@ Long  XXHash64 of everything above
 
 ## Configuration
 
-To run HerdDB with remote page storage, set `server.mode=remote-file-service` in the server configuration:
+To run HerdDB with remote page storage, set `server.storage.mode=remote` in the server configuration:
 
 ```properties
-server.mode=remote-file-service
+# Server mode can be standalone or cluster
+server.mode=standalone
+
+# Use remote file storage for data pages
+server.storage.mode=remote
 
 # Comma-separated list of RemoteFileServer addresses (host:port)
-# Default: localhost:9846
+# When running in cluster mode with ZooKeeper, this can be left empty
+# for automatic ZK-based discovery of file servers.
 remote.file.servers=host1:9846,host2:9846
 
 # Local directory for metadata (checkpoint files, schemas, transactions)
@@ -168,10 +173,10 @@ java -cp herddb-remote-file-service.jar herddb.remote.RemoteFileServer --port 98
 `Server.java` resolves `RemoteFileDataStorageManager` via **reflection** to avoid a circular Maven dependency between `herddb-core` and `herddb-remote-file-service`. The `herddb-remote-file-service` JAR must be on the classpath at runtime.
 
 ```java
-case ServerConfiguration.PROPERTY_MODE_REMOTE_FILE_SERVICE: {
+case ServerConfiguration.PROPERTY_STORAGE_MODE_REMOTE: {
     List<String> servers = Arrays.asList(remoteServers.split(","));
     Class<?> clientClass = Class.forName("herddb.remote.RemoteFileServiceClient");
-    Object client = clientClass.getConstructor(List.class).newInstance(servers);
+    Object client = clientClass.getConstructor(List.class, Map.class).newInstance(servers, clientConfig);
     Class<?> storageClass = Class.forName("herddb.remote.RemoteFileDataStorageManager");
     return (DataStorageManager) storageClass
             .getConstructor(Path.class, Path.class, int.class, clientClass)

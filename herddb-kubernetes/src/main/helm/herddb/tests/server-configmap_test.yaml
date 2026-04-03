@@ -2,11 +2,11 @@ suite: server ConfigMap
 templates:
   - templates/server-configmap.yaml
 tests:
-  - it: should set server mode to remote-file-service
+  - it: should set storage mode to remote
     asserts:
       - matchRegex:
           path: data["server.properties"]
-          pattern: "server\\.mode=remote-file-service"
+          pattern: "server\\.storage\\.mode=remote"
 
   - it: should bind to all interfaces
     asserts:

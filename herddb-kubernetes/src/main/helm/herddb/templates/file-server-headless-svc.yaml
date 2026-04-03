@@ -1,4 +1,4 @@
-{{- if eq .Values.server.mode "remote-file-service" }}
+{{- if eq .Values.server.storageMode "remote" }}
 apiVersion: v1
 kind: Service
 metadata:

@@ -41,11 +41,12 @@ cd ../..
 
 sleep 1
 
-# Start HerdDB server in remote-file-service mode (6GB heap)
+# Start HerdDB server with remote file storage (6GB heap)
 cd $SERVER1DIR/herddb*
 mkdir -p tmp
 CONFIGFILE=conf/server.properties
-sed -i 's/server.mode=standalone/server.mode=remote-file-service/g' $CONFIGFILE
+echo "server.storage.mode=remote" >> $CONFIGFILE
+echo "remote.file.servers=localhost:9846" >> $CONFIGFILE
 sed -i 's/#http.enable=true/http.enable=true/g' $CONFIGFILE
 sed -i 's/server.halt.on.tablespace.boot.error=false/server.halt.on.tablespace.boot.error=false/g' $CONFIGFILE
 export JAVA_OPTS="-XX:+UseG1GC -Djdk.attach.allowAttachSelf=true -Dherddb.vectorindex.rebuild.threads=24 -Duser.language=en -Xmx30g -Xms30g -Dio.netty.maxDirectMemory=0 -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$SERVER1DIR/server-heapdump.hprof -Djava.io.tmpdir=$(pwd)/tmp"

@@ -14,8 +14,10 @@ serviceAccount:
 
 # HerdDB server (JDBC endpoint + metadata)
 server:
-  # Server mode: "standalone", "remote-file-service", or "cluster"
-  mode: remote-file-service
+  # Server mode: "standalone" or "cluster"
+  mode: standalone
+  # Storage mode: "local", "remote", or "bookkeeper"
+  storageMode: remote
   replicaCount: 1
   port: 7000
   httpPort: 9845

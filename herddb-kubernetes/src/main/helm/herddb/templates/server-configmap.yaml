@@ -14,7 +14,8 @@ data:
     http.enable=true
     http.host=0.0.0.0
     http.port={{ .Values.server.httpPort }}
-    {{- if eq .Values.server.mode "remote-file-service" }}
+    {{- if eq .Values.server.storageMode "remote" }}
+    server.storage.mode=remote
     remote.file.servers={{ include "herddb.remoteFileServers" . }}
     {{- end }}
     {{- if eq .Values.server.mode "cluster" }}
