@@ -1,0 +1,19 @@
+{{- if .Values.bookkeeper.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "herddb.fullname" . }}-bookkeeper
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bookkeeper
+spec:
+  clusterIP: None
+  selector:
+    {{- include "herddb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: bookkeeper
+  ports:
+    - name: bookie
+      port: {{ .Values.bookkeeper.bookiePort }}
+      targetPort: {{ .Values.bookkeeper.bookiePort }}
+      protocol: TCP
+{{- end }}

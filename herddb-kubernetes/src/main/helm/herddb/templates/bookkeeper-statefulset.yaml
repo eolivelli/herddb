@@ -1,0 +1,96 @@
+{{- if .Values.bookkeeper.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "herddb.fullname" . }}-bookkeeper
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bookkeeper
+spec:
+  serviceName: {{ include "herddb.fullname" . }}-bookkeeper
+  replicas: {{ .Values.bookkeeper.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: bookkeeper
+  template:
+    metadata:
+      labels:
+        {{- include "herddb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: bookkeeper
+    spec:
+      serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      initContainers:
+        - name: wait-for-zookeeper
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["bash", "-c"]
+          args:
+            - |
+              ZK_HOST="{{ include "herddb.fullname" . }}-zookeeper-0.{{ include "herddb.fullname" . }}-zookeeper.{{ .Release.Namespace }}.svc.cluster.local"
+              ZK_PORT={{ .Values.zookeeper.clientPort }}
+              echo "Waiting for ZooKeeper at ${ZK_HOST}:${ZK_PORT}..."
+              while ! (echo ruok 2>/dev/null > /dev/tcp/${ZK_HOST}/${ZK_PORT}); do
+                echo "ZooKeeper not ready, retrying in 2s..."
+                sleep 2
+              done
+              echo "ZooKeeper is ready."
+      containers:
+        - name: bookkeeper
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/opt/herddb/bin/service"]
+          args:
+            - bookkeeper
+            - console
+            - /opt/herddb/conf/bookie.properties
+          {{- if .Values.bookkeeper.javaOpts }}
+          env:
+            - name: JAVA_OPTS
+              value: {{ .Values.bookkeeper.javaOpts | quote }}
+          {{- end }}
+          ports:
+            - name: bookie
+              containerPort: {{ .Values.bookkeeper.bookiePort }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.bookkeeper.bookiePort }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.bookkeeper.resources | nindent 12 }}
+          volumeMounts:
+            - name: bookkeeper-config
+              mountPath: /opt/herddb/conf/bookie.properties
+              subPath: bookie.properties
+            - name: journal
+              mountPath: /opt/herddb/bookie-data/journal
+            - name: ledger
+              mountPath: /opt/herddb/bookie-data/ledgers
+      volumes:
+        - name: bookkeeper-config
+          configMap:
+            name: {{ include "herddb.fullname" . }}-bookkeeper-config
+  volumeClaimTemplates:
+    - metadata:
+        name: journal
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.bookkeeper.storage.journal.storageClass }}
+        storageClassName: {{ .Values.bookkeeper.storage.journal.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.bookkeeper.storage.journal.size }}
+    - metadata:
+        name: ledger
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.bookkeeper.storage.ledger.storageClass }}
+        storageClassName: {{ .Values.bookkeeper.storage.ledger.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.bookkeeper.storage.ledger.size }}
+{{- end }}

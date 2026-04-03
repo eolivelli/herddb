@@ -17,6 +17,14 @@ data:
     {{- if eq .Values.server.mode "remote-file-service" }}
     remote.file.servers={{ include "herddb.remoteFileServers" . }}
     {{- end }}
+    {{- if eq .Values.server.mode "cluster" }}
+    server.zookeeper.address={{ include "herddb.zkAddress" . }}
+    server.zookeeper.path=/herd
+    server.bookkeeper.start=false
+    server.bookkeeper.ensemble.size=1
+    server.bookkeeper.write.quorum.size=1
+    server.bookkeeper.ack.quorum.size=1
+    {{- end }}
     {{- range $k, $v := .Values.server.extraConfig }}
     {{ $k }}={{ $v }}
     {{- end }}

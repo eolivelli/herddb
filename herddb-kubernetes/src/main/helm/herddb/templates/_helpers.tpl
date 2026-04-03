@@ -78,6 +78,17 @@ Produces: <fullname>-file-server-0.<fullname>-file-server.<namespace>.svc.cluste
 {{- end }}
 
 {{/*
+ZooKeeper connection address (first ZK pod via headless service).
+*/}}
+{{- define "herddb.zkAddress" -}}
+{{- printf "%s-zookeeper-0.%s-zookeeper.%s.svc.cluster.local:%d"
+    (include "herddb.fullname" .)
+    (include "herddb.fullname" .)
+    .Release.Namespace
+    (int .Values.zookeeper.clientPort) -}}
+{{- end }}
+
+{{/*
 JDBC URL for the first server pod (used by the tools pod).
 */}}
 {{- define "herddb.jdbcUrl" -}}

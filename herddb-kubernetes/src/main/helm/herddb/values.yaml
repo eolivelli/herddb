@@ -14,7 +14,7 @@ serviceAccount:
 
 # HerdDB server (JDBC endpoint + metadata)
 server:
-  # Server mode: "standalone" (single node, local storage) or "remote-file-service"
+  # Server mode: "standalone", "remote-file-service", or "cluster"
   mode: remote-file-service
   replicaCount: 1
   port: 7000
@@ -84,6 +84,44 @@ minio:
   storage:
     size: 10Gi
     storageClass: ""
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "0.5"
+    limits:
+      memory: "512Mi"
+      cpu: "0.5"
+
+# Optional in-cluster ZooKeeper instance for cluster mode.
+zookeeper:
+  enabled: false
+  replicaCount: 1
+  clientPort: 2181
+  javaOpts: ""
+  storage:
+    size: 2Gi
+    storageClass: ""
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "0.5"
+    limits:
+      memory: "256Mi"
+      cpu: "0.5"
+
+# Optional BookKeeper bookie for cluster mode (requires zookeeper.enabled=true).
+bookkeeper:
+  enabled: false
+  replicaCount: 1
+  bookiePort: 3181
+  javaOpts: ""
+  storage:
+    journal:
+      size: 2Gi
+      storageClass: ""
+    ledger:
+      size: 5Gi
+      storageClass: ""
   resources:
     requests:
       memory: "512Mi"

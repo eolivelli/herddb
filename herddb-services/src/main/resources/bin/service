@@ -53,6 +53,9 @@ case "$SERVICE" in
   zookeeper)
     MAINCLASS=herddb.server.ZooKeeperMainWrapper
     ;;
+  bookkeeper)
+    MAINCLASS=herddb.server.BookKeeperMainWrapper
+    ;;
   file-server)
     MAINCLASS=herddb.server.RemoteFileServerMain
     ;;
@@ -61,7 +64,7 @@ case "$SERVICE" in
     ;;
 
   *)
-    echo $"Usage: $0 server|zookeeper|file-server|indexing-service {start|stop|restart|console|kill|stacktrace|status}"
+    echo $"Usage: $0 server|zookeeper|bookkeeper|file-server|indexing-service {start|stop|restart|console|kill|stacktrace|status}"
     RETVAL=1
     exit $RETVAL
 esac

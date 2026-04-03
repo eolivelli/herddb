@@ -1,0 +1,69 @@
+{{- if .Values.zookeeper.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "herddb.fullname" . }}-zookeeper
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: zookeeper
+spec:
+  serviceName: {{ include "herddb.fullname" . }}-zookeeper
+  replicas: {{ .Values.zookeeper.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: zookeeper
+  template:
+    metadata:
+      labels:
+        {{- include "herddb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: zookeeper
+    spec:
+      serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      containers:
+        - name: zookeeper
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/opt/herddb/bin/service"]
+          args:
+            - zookeeper
+            - console
+            - /opt/herddb/conf/zoo.cfg
+          {{- if .Values.zookeeper.javaOpts }}
+          env:
+            - name: JAVA_OPTS
+              value: {{ .Values.zookeeper.javaOpts | quote }}
+          {{- end }}
+          ports:
+            - name: client
+              containerPort: {{ .Values.zookeeper.clientPort }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.zookeeper.clientPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.zookeeper.resources | nindent 12 }}
+          volumeMounts:
+            - name: zookeeper-config
+              mountPath: /opt/herddb/conf/zoo.cfg
+              subPath: zoo.cfg
+            - name: data
+              mountPath: /opt/herddb/zk-data
+      volumes:
+        - name: zookeeper-config
+          configMap:
+            name: {{ include "herddb.fullname" . }}-zookeeper-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.zookeeper.storage.storageClass }}
+        storageClassName: {{ .Values.zookeeper.storage.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.zookeeper.storage.size }}
+{{- end }}

@@ -1,0 +1,17 @@
+{{- if .Values.bookkeeper.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "herddb.fullname" . }}-bookkeeper-config
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bookkeeper
+data:
+  bookie.properties: |
+    zkServers={{ include "herddb.zkAddress" . }}
+    zkLedgersRootPath=/ledgers
+    bookiePort={{ .Values.bookkeeper.bookiePort }}
+    ledgerDirNames=/opt/herddb/bookie-data/ledgers
+    journalDirName=/opt/herddb/bookie-data/journal
+    httpServerEnabled=false
+{{- end }}

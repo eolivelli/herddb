@@ -1,0 +1,14 @@
+{{- if .Values.zookeeper.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "herddb.fullname" . }}-zookeeper-config
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: zookeeper
+data:
+  zoo.cfg: |
+    tickTime=2000
+    dataDir=/opt/herddb/zk-data
+    clientPort={{ .Values.zookeeper.clientPort }}
+{{- end }}
