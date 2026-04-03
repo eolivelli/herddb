@@ -749,16 +749,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 return;
             }
             VectorFloat<?> vec = VTS.createFloatVector(vector);
-            int nodeId = nextNodeId.getAndIncrement();
 
             List<LiveGraphShard> shards = this.liveShards;
             LiveGraphShard active = shards.get(shards.size() - 1);
 
-            // Check if rotation is needed
+            // Check if rotation is needed BEFORE allocating the nodeId so that
+            // the new shard's startNodeId (= nextNodeId.get() at creation time)
+            // matches the first nodeId assigned to it, keeping localId >= 0.
             if (active.nodeToPk.size() >= computeEffectiveMaxLiveGraphSize()) {
                 active = rotateLiveShard();
             }
 
+            int nodeId = nextNodeId.getAndIncrement();
             vectorStorage.set(nodeId, vec);
             active.vectorCount.incrementAndGet();
             active.pkToNode.put(pk, nodeId);

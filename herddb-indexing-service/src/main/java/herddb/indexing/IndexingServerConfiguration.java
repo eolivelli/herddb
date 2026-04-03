@@ -88,7 +88,7 @@ public final class IndexingServerConfiguration {
 
     // Compaction
     public static final String PROPERTY_COMPACTION_INTERVAL = "indexing.compaction.interval";
-    public static final long PROPERTY_COMPACTION_INTERVAL_DEFAULT = 300000L;
+    public static final long PROPERTY_COMPACTION_INTERVAL_DEFAULT = 60000L;
 
     public static final String PROPERTY_COMPACTION_THREADS = "indexing.compaction.threads";
     public static final int PROPERTY_COMPACTION_THREADS_DEFAULT = 2;
