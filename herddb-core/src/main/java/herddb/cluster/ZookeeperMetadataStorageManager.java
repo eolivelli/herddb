@@ -30,6 +30,7 @@ import herddb.model.TableSpaceAlreadyExistsException;
 import herddb.model.TableSpaceDoesNotExistException;
 import herddb.model.TableSpaceReplicaState;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -63,7 +64,15 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
     private final String tableSpacesPath;
     private final String tableSpacesReplicasPath;
     private final String nodesPath;
+    private final String indexingServicesPath;
+    private final String fileServersPath;
     private volatile boolean started;
+
+    // For re-registration after session expiry
+    private volatile String registeredIndexingServiceId;
+    private volatile String registeredIndexingServiceAddress;
+    private volatile String registeredFileServerId;
+    private volatile String registeredFileServerAddress;
 
     private final Watcher mainWatcher = (WatchedEvent event) -> {
         switch (event.getState()) {
@@ -75,6 +84,28 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
                 // ignore
                 break;
 
+        }
+    };
+
+    private final Watcher indexingServicesWatcher = (WatchedEvent event) -> {
+        if (event.getType() == Watcher.Event.EventType.NodeChildrenChanged) {
+            try {
+                List<String> addresses = listIndexingServices();
+                notifyIndexingServicesChanged(addresses);
+            } catch (MetadataStorageManagerException e) {
+                LOGGER.log(Level.WARNING, "Error refreshing indexing services list", e);
+            }
+        }
+    };
+
+    private final Watcher fileServersWatcher = (WatchedEvent event) -> {
+        if (event.getType() == Watcher.Event.EventType.NodeChildrenChanged) {
+            try {
+                List<String> addresses = listFileServers();
+                notifyFileServersChanged(addresses);
+            } catch (MetadataStorageManagerException e) {
+                LOGGER.log(Level.WARNING, "Error refreshing file servers list", e);
+            }
         }
     };
 
@@ -118,6 +149,22 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
         }
         this.zooKeeper = zk;
         LOGGER.info("Connected to ZK " + zk);
+
+        // Re-register services after session expiry
+        if (registeredIndexingServiceId != null) {
+            try {
+                registerIndexingService(registeredIndexingServiceId, registeredIndexingServiceAddress);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Failed to re-register indexing service after session expiry", e);
+            }
+        }
+        if (registeredFileServerId != null) {
+            try {
+                registerFileServer(registeredFileServerId, registeredFileServerAddress);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Failed to re-register file server after session expiry", e);
+            }
+        }
     }
 
     private void handleSessionExpiredError(Throwable error) {
@@ -139,6 +186,8 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
         this.tableSpacesPath = basePath + "/tableSpaces";  // tableSpaces/TABLESPACENAME
         this.tableSpacesReplicasPath = basePath + "/replicas";  // replicas/TABLESPACEUUID
         this.nodesPath = basePath + "/nodes";
+        this.indexingServicesPath = basePath + "/indexingServices";
+        this.fileServersPath = basePath + "/fileServers";
     }
 
     @Override
@@ -182,6 +231,14 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
         }
         try {
             zooKeeper.create(nodesPath, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        } catch (KeeperException.NodeExistsException ok) {
+        }
+        try {
+            zooKeeper.create(indexingServicesPath, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        } catch (KeeperException.NodeExistsException ok) {
+        }
+        try {
+            zooKeeper.create(fileServersPath, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
         } catch (KeeperException.NodeExistsException ok) {
         }
 
@@ -475,6 +532,18 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
             for (String child : children) {
                 ensureZooKeeper().delete(ledgersPath + "/" + child, -1);
             }
+            {
+                List<String> indexingChildren = ensureZooKeeper().getChildren(indexingServicesPath, false);
+                for (String child : indexingChildren) {
+                    ensureZooKeeper().delete(indexingServicesPath + "/" + child, -1);
+                }
+            }
+            {
+                List<String> fileServerChildren = ensureZooKeeper().getChildren(fileServersPath, false);
+                for (String child : fileServerChildren) {
+                    ensureZooKeeper().delete(fileServersPath + "/" + child, -1);
+                }
+            }
         } catch (InterruptedException | KeeperException | IOException error) {
             LOGGER.log(Level.SEVERE, "Cannot clear metadata", error);
             throw new MetadataStorageManagerException(error);
@@ -507,6 +576,106 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
             throw new MetadataStorageManagerException(err);
         }
 
+    }
+
+    @Override
+    public void registerIndexingService(String serviceId, String address) throws MetadataStorageManagerException {
+        try {
+            String path = indexingServicesPath + "/" + serviceId;
+            byte[] data = address.getBytes(StandardCharsets.UTF_8);
+            try {
+                ensureZooKeeper().create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+            } catch (KeeperException.NodeExistsException ok) {
+                ensureZooKeeper().setData(path, data, -1);
+            }
+            this.registeredIndexingServiceId = serviceId;
+            this.registeredIndexingServiceAddress = address;
+            LOGGER.log(Level.INFO, "Registered indexing service: {0} -> {1}", new Object[]{serviceId, address});
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public void unregisterIndexingService(String serviceId) throws MetadataStorageManagerException {
+        try {
+            ensureZooKeeper().delete(indexingServicesPath + "/" + serviceId, -1);
+            this.registeredIndexingServiceId = null;
+            this.registeredIndexingServiceAddress = null;
+            LOGGER.log(Level.INFO, "Unregistered indexing service: {0}", serviceId);
+        } catch (KeeperException.NoNodeException ok) {
+            // already gone
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public List<String> listIndexingServices() throws MetadataStorageManagerException {
+        try {
+            List<String> children = ensureZooKeeper().getChildren(indexingServicesPath, indexingServicesWatcher);
+            List<String> addresses = new ArrayList<>();
+            for (String child : children) {
+                byte[] data = ensureZooKeeper().getData(indexingServicesPath + "/" + child, false, null);
+                addresses.add(new String(data, StandardCharsets.UTF_8));
+            }
+            return addresses;
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public void registerFileServer(String serviceId, String address) throws MetadataStorageManagerException {
+        try {
+            String path = fileServersPath + "/" + serviceId;
+            byte[] data = address.getBytes(StandardCharsets.UTF_8);
+            try {
+                ensureZooKeeper().create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+            } catch (KeeperException.NodeExistsException ok) {
+                ensureZooKeeper().setData(path, data, -1);
+            }
+            this.registeredFileServerId = serviceId;
+            this.registeredFileServerAddress = address;
+            LOGGER.log(Level.INFO, "Registered file server: {0} -> {1}", new Object[]{serviceId, address});
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public void unregisterFileServer(String serviceId) throws MetadataStorageManagerException {
+        try {
+            ensureZooKeeper().delete(fileServersPath + "/" + serviceId, -1);
+            this.registeredFileServerId = null;
+            this.registeredFileServerAddress = null;
+            LOGGER.log(Level.INFO, "Unregistered file server: {0}", serviceId);
+        } catch (KeeperException.NoNodeException ok) {
+            // already gone
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public List<String> listFileServers() throws MetadataStorageManagerException {
+        try {
+            List<String> children = ensureZooKeeper().getChildren(fileServersPath, fileServersWatcher);
+            List<String> addresses = new ArrayList<>();
+            for (String child : children) {
+                byte[] data = ensureZooKeeper().getData(fileServersPath + "/" + child, false, null);
+                addresses.add(new String(data, StandardCharsets.UTF_8));
+            }
+            return addresses;
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
     }
 
     @Override

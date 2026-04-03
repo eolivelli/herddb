@@ -29,6 +29,7 @@ import herddb.server.ServerConfiguration;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Store of all metadata of the system: definition of tables, tablesets, available nodes
@@ -38,6 +39,7 @@ import java.util.List;
 public abstract class MetadataStorageManager implements AutoCloseable {
 
     private MetadataChangeListener listener;
+    private final CopyOnWriteArrayList<ServiceDiscoveryListener> serviceDiscoveryListeners = new CopyOnWriteArrayList<>();
 
     public abstract void start() throws MetadataStorageManagerException;
 
@@ -132,6 +134,54 @@ public abstract class MetadataStorageManager implements AutoCloseable {
     protected final void notifyMetadataChanged(String description) {
         if (listener != null) {
             listener.metadataChanged(description);
+        }
+    }
+
+    public void registerIndexingService(String serviceId, String address) throws MetadataStorageManagerException {
+    }
+
+    public void unregisterIndexingService(String serviceId) throws MetadataStorageManagerException {
+    }
+
+    public List<String> listIndexingServices() throws MetadataStorageManagerException {
+        return Collections.emptyList();
+    }
+
+    public void registerFileServer(String serviceId, String address) throws MetadataStorageManagerException {
+    }
+
+    public void unregisterFileServer(String serviceId) throws MetadataStorageManagerException {
+    }
+
+    public List<String> listFileServers() throws MetadataStorageManagerException {
+        return Collections.emptyList();
+    }
+
+    public final void addServiceDiscoveryListener(ServiceDiscoveryListener listener) {
+        serviceDiscoveryListeners.add(listener);
+    }
+
+    public final void removeServiceDiscoveryListener(ServiceDiscoveryListener listener) {
+        serviceDiscoveryListeners.remove(listener);
+    }
+
+    protected final void notifyIndexingServicesChanged(List<String> addresses) {
+        for (ServiceDiscoveryListener l : serviceDiscoveryListeners) {
+            try {
+                l.onIndexingServicesChanged(addresses);
+            } catch (Exception e) {
+                // log but don't propagate
+            }
+        }
+    }
+
+    protected final void notifyFileServersChanged(List<String> addresses) {
+        for (ServiceDiscoveryListener l : serviceDiscoveryListeners) {
+            try {
+                l.onFileServersChanged(addresses);
+            } catch (Exception e) {
+                // log but don't propagate
+            }
         }
     }
 
