@@ -65,7 +65,7 @@ public class PersistentVectorStoreRecallTest {
         return new PersistentVectorStore("testidx", "testtable", "tstblspace",
                 "vector_col", tmpDir, dsm, mm,
                 16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
-                Long.MAX_VALUE, 5.0,
+                Long.MAX_VALUE,
                 VectorSimilarityFunction.EUCLIDEAN);
     }
 

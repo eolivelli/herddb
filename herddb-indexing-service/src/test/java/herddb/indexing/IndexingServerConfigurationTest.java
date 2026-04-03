@@ -94,9 +94,6 @@ public class IndexingServerConfigurationTest {
         assertEquals("file", config.getString(
                 IndexingServerConfiguration.PROPERTY_STORAGE_TYPE,
                 IndexingServerConfiguration.PROPERTY_STORAGE_TYPE_DEFAULT));
-        assertEquals(5.0, config.getDouble(
-                IndexingServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER,
-                IndexingServerConfiguration.PROPERTY_VECTOR_MEMORY_MULTIPLIER_DEFAULT), 0.001);
     }
 
     @Test

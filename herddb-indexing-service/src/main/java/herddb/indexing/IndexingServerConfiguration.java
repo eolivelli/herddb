@@ -104,10 +104,6 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_STORAGE_TYPE = "indexing.storage.type";
     public static final String PROPERTY_STORAGE_TYPE_DEFAULT = "file";
 
-    // Memory multiplier
-    public static final String PROPERTY_VECTOR_MEMORY_MULTIPLIER = "indexing.vector.memoryMultiplier";
-    public static final double PROPERTY_VECTOR_MEMORY_MULTIPLIER_DEFAULT = 5.0;
-
     // Instance identity and clustering
     public static final String PROPERTY_INSTANCE_ID = "indexing.instance.id";
     public static final int PROPERTY_INSTANCE_ID_DEFAULT = 0;

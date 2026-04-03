@@ -41,7 +41,6 @@ import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexWriter;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.FusedPQ;
 import io.github.jbellis.jvector.graph.disk.feature.InlineVectors;
-import io.github.jbellis.jvector.graph.diversity.VamanaDiversityProvider;
 import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
 import io.github.jbellis.jvector.quantization.PQVectors;
 import io.github.jbellis.jvector.quantization.ProductQuantization;
@@ -174,7 +173,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final VectorSimilarityFunction similarityFunction;
     private final long maxSegmentSize;
     private final int maxLiveGraphSize;
-    private final double memoryMultiplier;
     private final long compactionIntervalMs;
     private final long maxVectorMemoryBytes;
     private final VectorMemoryBudget memoryBudget;
@@ -259,6 +257,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private volatile int backpressureActive;
     private final Object memoryPressureMonitor = new Object();
     private final Object compactionWakeUp = new Object();
+    private boolean compactionWakeUpPending = false;
 
     // -------------------------------------------------------------------------
     // Test hook
@@ -281,10 +280,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  MemoryManager memoryManager,
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
-                                 long compactionIntervalMs, double memoryMultiplier) {
+                                 long compactionIntervalMs) {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
-                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs, memoryMultiplier,
+                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
                 VectorSimilarityFunction.COSINE, Long.MAX_VALUE);
     }
 
@@ -294,11 +293,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  MemoryManager memoryManager,
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
-                                 long compactionIntervalMs, double memoryMultiplier,
+                                 long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction) {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
-                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs, memoryMultiplier,
+                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
                 similarityFunction, Long.MAX_VALUE);
     }
 
@@ -308,12 +307,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  MemoryManager memoryManager,
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
-                                 long compactionIntervalMs, double memoryMultiplier,
+                                 long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes) {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
-                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs, memoryMultiplier,
+                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
                 similarityFunction, maxVectorMemoryBytes, null);
     }
 
@@ -323,7 +322,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  MemoryManager memoryManager,
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
-                                 long compactionIntervalMs, double memoryMultiplier,
+                                 long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes,
                                  VectorMemoryBudget memoryBudget) {
@@ -344,7 +343,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.maxSegmentSize = maxSegmentSize;
         this.maxLiveGraphSize = maxLiveGraphSize;
         this.compactionIntervalMs = compactionIntervalMs;
-        this.memoryMultiplier = memoryMultiplier;
         this.maxVectorMemoryBytes = maxVectorMemoryBytes;
         this.memoryBudget = memoryBudget;
     }
@@ -359,10 +357,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  MemoryManager memoryManager,
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
-                                 long compactionIntervalMs, double memoryMultiplier) {
+                                 long compactionIntervalMs) {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
-                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs, memoryMultiplier,
+                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
                 VectorSimilarityFunction.COSINE, Long.MAX_VALUE);
     }
 
@@ -375,11 +373,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  MemoryManager memoryManager,
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
-                                 long compactionIntervalMs, double memoryMultiplier,
+                                 long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction) {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
-                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs, memoryMultiplier,
+                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
                 similarityFunction, Long.MAX_VALUE);
     }
 
@@ -392,12 +390,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  MemoryManager memoryManager,
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
-                                 long compactionIntervalMs, double memoryMultiplier,
+                                 long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes) {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
-                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs, memoryMultiplier,
+                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
                 similarityFunction, maxVectorMemoryBytes, null);
     }
 
@@ -411,7 +409,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  MemoryManager memoryManager,
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
-                                 long compactionIntervalMs, double memoryMultiplier,
+                                 long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes,
                                  VectorMemoryBudget memoryBudget) {
@@ -432,7 +430,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.maxSegmentSize = maxSegmentSize;
         this.maxLiveGraphSize = maxLiveGraphSize;
         this.compactionIntervalMs = compactionIntervalMs;
-        this.memoryMultiplier = memoryMultiplier;
         this.maxVectorMemoryBytes = maxVectorMemoryBytes;
         this.memoryBudget = memoryBudget;
     }
@@ -475,15 +472,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
         final RandomAccessVectorValues mravv;
         final GraphIndexBuilder builder;
         final AtomicInteger vectorCount = new AtomicInteger(0);
+        /**
+         * Global nodeId of the first node added to this shard's builder.
+         * The builder uses local nodeIds {@code [0, vectorCount)}.
+         * To convert: {@code localNodeId = globalNodeId - startNodeId}.
+         */
+        final int startNodeId;
 
         LiveGraphShard(ConcurrentHashMap<Bytes, Integer> pkToNode,
                        ConcurrentHashMap<Integer, Bytes> nodeToPk,
                        RandomAccessVectorValues mravv,
-                       GraphIndexBuilder builder) {
+                       GraphIndexBuilder builder,
+                       int startNodeId) {
             this.pkToNode = pkToNode;
             this.nodeToPk = nodeToPk;
             this.mravv = mravv;
             this.builder = builder;
+            this.startNodeId = startNodeId;
         }
     }
 
@@ -550,7 +555,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         ? Math.min(compactionIntervalMs, 1000)
                         : compactionIntervalMs;
                 synchronized (compactionWakeUp) {
-                    compactionWakeUp.wait(sleepMs);
+                    if (!compactionWakeUpPending) {
+                        compactionWakeUp.wait(sleepMs);
+                    }
+                    compactionWakeUpPending = false;
                 }
             } catch (InterruptedException e) {
                 if (!running) {
@@ -618,6 +626,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         // Wake up the compaction thread to trigger an immediate checkpoint
         synchronized (compactionWakeUp) {
+            compactionWakeUpPending = true;
             compactionWakeUp.notifyAll();
         }
 
@@ -754,7 +763,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             active.vectorCount.incrementAndGet();
             active.pkToNode.put(pk, nodeId);
             active.nodeToPk.put(nodeId, pk);
-            active.builder.addGraphNode(nodeId, vec);
+            active.builder.addGraphNode(nodeId - active.startNodeId, vec);
             dirty.set(true);
         } finally {
             stateLock.readLock().unlock();
@@ -787,7 +796,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     shard.nodeToPk.remove(nodeId);
                     dirty.set(true);
                     if (shard.builder != null) {
-                        shard.builder.markNodeDeleted(nodeId);
+                        shard.builder.markNodeDeleted(nodeId - shard.startNodeId);
                     } else {
                         vectorStorage.remove(nodeId);
                         shard.vectorCount.decrementAndGet();
@@ -834,7 +843,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 SearchResult result = GraphSearcher.search(
                         qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
                 for (SearchResult.NodeScore ns : result.getNodes()) {
-                    Bytes pk = shard.nodeToPk.get(ns.node);
+                    Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
                     if (pk != null) {
                         results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
                     }
@@ -854,7 +863,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         SearchResult result = GraphSearcher.search(
                                 qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
                         for (SearchResult.NodeScore ns : result.getNodes()) {
-                            Bytes pk = shard.nodeToPk.get(ns.node);
+                            Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
                             if (pk != null && (pending == null || !pending.contains(pk))) {
                                 results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
                             }
@@ -893,20 +902,40 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Returns estimated memory usage in bytes.
+     *
+     * <p>Accounts for:
+     * <ul>
+     *   <li>Raw float vectors in VectorStorage</li>
+     *   <li>HNSW graph structure (Neighbors, int[] node arrays, float[] score arrays,
+     *       CompletionTracker) — via JVector's own {@code ramBytesUsed()}</li>
+     *   <li>pkToNode + nodeToPk ConcurrentHashMap entries (~100 bytes per entry × 2)</li>
+     *   <li>Bytes PK objects (~50 bytes average)</li>
+     * </ul>
      */
     @Override
     public long estimatedMemoryUsageBytes() {
-        long rawFloatBytes = 0;
+        long total = 0;
         for (LiveGraphShard shard : liveShards) {
-            rawFloatBytes += (long) shard.vectorCount.get() * dimension * Float.BYTES;
+            total += shardMemoryBytes(shard);
         }
         List<LiveGraphShard> frozen = frozenShards;
         if (frozen != null) {
             for (LiveGraphShard shard : frozen) {
-                rawFloatBytes += (long) shard.vectorCount.get() * dimension * Float.BYTES;
+                total += shardMemoryBytes(shard);
             }
         }
-        return (long) (rawFloatBytes * memoryMultiplier);
+        return total;
+    }
+
+    private long shardMemoryBytes(LiveGraphShard shard) {
+        long count = shard.vectorCount.get();
+        long bytes = count * (long) dimension * Float.BYTES;
+        bytes += count * 200L; // pkToNode + nodeToPk ConcurrentHashMap entries (~100B × 2)
+        bytes += count * 50L;  // Bytes PK objects (average)
+        if (shard.builder != null) {
+            bytes += ((OnHeapGraphIndex) shard.builder.getGraph()).ramBytesUsed();
+        }
+        return bytes;
     }
 
     // -------------------------------------------------------------------------
@@ -1069,9 +1098,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         }
 
-        // Rebuild a single shard with all data using remapped sequential IDs
+        // Rebuild a single shard with all data using remapped sequential IDs (0..seqId-1).
+        // Use startNodeId=0 so local IDs in the builder match the remapped global IDs.
         nextNodeId.set(seqId);
-        LiveGraphShard newShard = createEmptyLiveShard(dimension, beamWidth, neighborOverflow, alpha);
+        LiveGraphShard newShard = createEmptyLiveShard(dimension, beamWidth, neighborOverflow, alpha, 0);
         for (Map.Entry<Integer, VectorFloat<?>> e : allVectors.entrySet()) {
             vectorStorage.set(e.getKey(), e.getValue());
             newShard.vectorCount.incrementAndGet();
@@ -1152,8 +1182,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
             long effectiveBudget = maxVectorMemoryBytes != Long.MAX_VALUE ? maxVectorMemoryBytes
                     : (memoryBudget != null ? memoryBudget.maxMemoryBytes() : Long.MAX_VALUE);
             this.liveVectorCapDuringCheckpoint = computeLiveVectorCapDuringCheckpoint(
-                    totalSnapshotSize, snapshotDimension,
-                    effectiveBudget, memoryMultiplier, computeEffectiveMaxLiveGraphSize());
+                    totalSnapshotSize, snapshotDimension, m, neighborOverflow,
+                    effectiveBudget, computeEffectiveMaxLiveGraphSize());
 
             initEmptyLiveShards(snapshotDimension, beamWidth, neighborOverflow, alpha);
             dirty.set(false);
@@ -1165,9 +1195,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             onDiskNodeToPkSize(), sealedSegments.size(), mergeableSegments.size()});
             LOGGER.log(Level.INFO,
                     "checkpoint {0} Phase A: liveVectorCapDuringCheckpoint={1}"
-                            + " (frozenVectors={2}, dim={3}, budget={4}, multiplier={5})",
+                            + " (frozenVectors={2}, dim={3}, budget={4})",
                     new Object[]{indexName, liveVectorCapDuringCheckpoint,
-                            totalSnapshotSize, snapshotDimension, effectiveBudget, memoryMultiplier});
+                            totalSnapshotSize, snapshotDimension, effectiveBudget});
         } finally {
             stateLock.writeLock().unlock();
         }
@@ -1537,7 +1567,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         lastSnapshot.vectorCount.incrementAndGet();
                         if (lastSnapshot.builder != null) {
                             try {
-                                lastSnapshot.builder.addGraphNode(nodeId, vec);
+                                lastSnapshot.builder.addGraphNode(nodeId - lastSnapshot.startNodeId, vec);
                             } catch (Exception ex) {
                                 LOGGER.log(Level.WARNING, "Failed to re-add node during recovery", ex);
                             }
@@ -1576,11 +1606,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         ByteBuffer metaBuf = ByteBuffer.wrap(status.indexData);
 
         int version = metaBuf.getInt();
-        if (version != METADATA_VERSION_SIMPLE && version != METADATA_VERSION_FUSEDPQ
-                && version != METADATA_VERSION_MULTI_SEGMENT) {
+        if (version != METADATA_VERSION_MULTI_SEGMENT) {
             LOGGER.log(Level.SEVERE,
-                    "unsupported vector index metadata version {0} for {1}, starting empty",
-                    new Object[]{version, indexName});
+                    "unsupported vector index metadata version {0} for {1} (only v{2} is supported),"
+                            + " starting empty — old experimental formats have been removed",
+                    new Object[]{version, indexName, METADATA_VERSION_MULTI_SEGMENT});
             return;
         }
 
@@ -1590,62 +1620,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
         float savedNeighborOverflow = metaBuf.getFloat();
         float savedAlpha = metaBuf.getFloat();
         /* boolean savedAddHierarchy = */ metaBuf.get();
-
-        boolean savedFusedPQ = false;
-        if (version >= METADATA_VERSION_FUSEDPQ) {
-            savedFusedPQ = metaBuf.get() != 0;
-        }
+        /* boolean savedFusedPQ = */ metaBuf.get();
 
         int savedNextNodeId = metaBuf.getInt();
 
         this.dimension = dim;
         newPageId.set(status.newPageId);
 
-        if (version == METADATA_VERSION_MULTI_SEGMENT) {
-            loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
-            return;
-        }
-
-        // Legacy single-segment format (v1 or v2)
-        int numGraphChunks = metaBuf.getInt();
-        long[] graphChunkPageIds = new long[numGraphChunks];
-        for (int i = 0; i < numGraphChunks; i++) {
-            graphChunkPageIds[i] = metaBuf.getLong();
-        }
-
-        int numMapChunks = metaBuf.getInt();
-        long[] mapChunkPageIds = new long[numMapChunks];
-        for (int i = 0; i < numMapChunks; i++) {
-            mapChunkPageIds[i] = metaBuf.getLong();
-        }
-
-        if (dim == 0 || numGraphChunks == 0) {
-            LOGGER.log(Level.INFO, "vector store {0} is empty, no load needed", indexName);
-            return;
-        }
-
-        Path mapFile = readChunksToTempFile(mapChunkPageIds, TYPE_VECTOR_MAPCHUNK);
-        Path graphFile = readChunksToTempFile(graphChunkPageIds, TYPE_VECTOR_GRAPHCHUNK);
-
-        if (savedFusedPQ) {
-            VectorSegment seg = new VectorSegment(0);
-            seg.estimatedSizeBytes = (long) numGraphChunks * CHUNK_SIZE;
-            seg.graphPageIds = toLongList(graphChunkPageIds);
-            seg.mapPageIds = toLongList(mapChunkPageIds);
-            loadFusedPQSegment(seg, mapFile, graphFile, dim, savedNextNodeId);
-            segments.add(seg);
-            nextSegmentId.set(1);
-            this.nextNodeId.set(seg.maxOrdinal + 1);
-            initEmptyLiveShards(dim, savedBeamWidth, savedNeighborOverflow, savedAlpha);
-        } else {
-            try {
-                loadSimpleFormat(mapFile, graphFile,
-                        dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
-            } finally {
-                Files.deleteIfExists(mapFile);
-                Files.deleteIfExists(graphFile);
-            }
-        }
+        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
     }
 
     private void loadMultiSegmentFormat(ByteBuffer metaBuf, int dim, int savedNextNodeId,
@@ -1773,61 +1755,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
         LOGGER.log(Level.INFO,
                 "loaded vector segment {0} for store {1}: {2} nodes",
                 new Object[]{seg.segmentId, indexName, seg.size()});
-    }
-
-    private void loadSimpleFormat(Path mapFile, Path graphFile,
-                                   int dim, int savedNextNodeId,
-                                   int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
-            throws IOException {
-        ConcurrentHashMap<Bytes, Integer> p2n = new ConcurrentHashMap<>();
-        ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>();
-        int loadedCount = 0;
-        try (DataInputStream dis = new DataInputStream(
-                new BufferedInputStream(new FileInputStream(mapFile.toFile()), CHUNK_SIZE))) {
-            int entryCount = dis.readInt();
-            for (int i = 0; i < entryCount; i++) {
-                int nodeId = dis.readInt();
-                int pkLen = dis.readInt();
-                byte[] pkData = new byte[pkLen];
-                dis.readFully(pkData);
-                int floatCount = dis.readInt();
-                float[] floats = new float[floatCount];
-                for (int j = 0; j < floatCount; j++) {
-                    floats[j] = dis.readFloat();
-                }
-                Bytes pk = Bytes.from_array(pkData);
-                VectorFloat<?> vec = VTS.createFloatVector(floats);
-                vectorStorage.set(nodeId, vec);
-                p2n.put(pk, nodeId);
-                n2p.put(nodeId, pk);
-                loadedCount++;
-            }
-        }
-
-        this.nextNodeId.set(savedNextNodeId);
-        VectorStorageRandomAccessVectorValues ravv = new VectorStorageRandomAccessVectorValues(vectorStorage, dim);
-
-        GraphIndexBuilder loadedBuilder;
-        try (SegmentedMappedReader reader = new SegmentedMappedReader(graphFile)) {
-            BuildScoreProvider bsp =
-                    BuildScoreProvider.randomAccessScoreProvider(ravv, similarityFunction);
-            VamanaDiversityProvider diversityProvider = new VamanaDiversityProvider(bsp, savedAlpha);
-            OnHeapGraphIndex loadedGraph =
-                    OnHeapGraphIndex.load(reader, dim, savedNeighborOverflow, diversityProvider);
-            loadedBuilder = new GraphIndexBuilder(
-                    bsp, dim, loadedGraph,
-                    savedBeamWidth, savedNeighborOverflow, savedAlpha,
-                    REFINE_FINAL_GRAPH,
-                    PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool());
-        }
-
-        LiveGraphShard shard = new LiveGraphShard(p2n, n2p, ravv, loadedBuilder);
-        shard.vectorCount.set(loadedCount);
-        this.liveShards = new ArrayList<>(Collections.singletonList(shard));
-
-        LOGGER.log(Level.INFO,
-                "loaded vector store {0} (simple): {1} nodes, dimension {2}",
-                new Object[]{indexName, loadedCount, dim});
     }
 
     // -------------------------------------------------------------------------
@@ -2355,36 +2282,60 @@ public class PersistentVectorStore extends AbstractVectorStore {
      *
      * @param frozenVectorCount total vector count across all frozen shards (Phase A snapshot)
      * @param dim               vector dimension
+     * @param m                 HNSW M parameter (max connections per node)
+     * @param neighborOverflow  HNSW neighbor overflow factor
      * @param effectiveBudget   per-store or global budget in bytes; {@code Long.MAX_VALUE} if unconfigured
-     * @param memoryMultiplier  per-vector overhead factor used by {@link #estimatedMemoryUsageBytes()}
      * @param minShardSize      minimum floor — result of {@link #computeEffectiveMaxLiveGraphSize()}
      * @return cap to assign to {@link #liveVectorCapDuringCheckpoint}
      */
     static int computeLiveVectorCapDuringCheckpoint(
-            int frozenVectorCount, int dim,
-            long effectiveBudget, double memoryMultiplier, int minShardSize) {
+            int frozenVectorCount, int dim, int m, float neighborOverflow,
+            long effectiveBudget, int minShardSize) {
+        long estimatedBytesPerVector = estimatedBytesPerVector(dim, m, neighborOverflow);
         if (effectiveBudget == Long.MAX_VALUE) {
-            // No budget configured: fall back to static raw-byte limit
-            long rawBytesPerVector = (long) dim * Float.BYTES + 64;
             return (int) Math.min(Integer.MAX_VALUE,
-                    MAX_LIVE_BYTES_DURING_CHECKPOINT / Math.max(1L, rawBytesPerVector));
+                    MAX_LIVE_BYTES_DURING_CHECKPOINT / Math.max(1L, estimatedBytesPerVector));
         }
-        long estimatedBytesPerVector = Math.max(1L, (long) (dim * Float.BYTES * memoryMultiplier));
         long frozenEstimated = (long) frozenVectorCount * estimatedBytesPerVector;
         long headroom = Math.max(0L, effectiveBudget - frozenEstimated);
         int cap = (int) Math.min(Integer.MAX_VALUE, headroom / estimatedBytesPerVector);
-        // Minimum: at least one shard's worth so Phase B can always make progress
         return Math.max(cap, minShardSize);
     }
 
+    /**
+     * Estimated heap bytes consumed per live vector, using the same accounting as
+     * {@link #shardMemoryBytes(LiveGraphShard)}.
+     */
+    static long estimatedBytesPerVector(int dim, int m, float neighborOverflow) {
+        // int nodeArrayLength = maxOverflowDegree + 1 = (int)(m * neighborOverflow) + 1
+        int nodeArrayLen = (int) (m * neighborOverflow) + 1;
+        // NodeArray.ramBytesUsed(nodeArrayLen):
+        //   OH(16) + size_field(4) + ref+ah nodes(24) + ref+ah scores(24) + nodeArrayLen*(4+4)
+        // Neighbors adds: nodeId(4) + diverseBefore(4)
+        // Plus REF_BYTES(8) for the DenseIntMap slot
+        long graphBytesPerNode = 8L + 16L + 4L + 24L + 24L + (long) nodeArrayLen * 8L + 8L;
+        return (long) dim * Float.BYTES   // raw vector
+                + 250L                   // pkToNode + nodeToPk + Bytes PK
+                + graphBytesPerNode;     // HNSW graph overhead per node (layer 0)
+    }
+
     private LiveGraphShard createEmptyLiveShard(int dim, int bw, float no, float a) {
+        return createEmptyLiveShard(dim, bw, no, a, nextNodeId.get());
+    }
+
+    /**
+     * Creates an empty live shard with an explicit {@code startNodeId}.
+     * Use this when the global nodeId space has already been remapped (e.g., simple checkpoint rebuild).
+     */
+    private LiveGraphShard createEmptyLiveShard(int dim, int bw, float no, float a, int startNodeId) {
         ConcurrentHashMap<Bytes, Integer> p2n = new ConcurrentHashMap<>();
         ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>();
-        VectorStorageRandomAccessVectorValues ravv = new VectorStorageRandomAccessVectorValues(vectorStorage, dim);
+        VectorStorageRandomAccessVectorValues ravv =
+                new VectorStorageRandomAccessVectorValues(vectorStorage, dim, -1, startNodeId);
         BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(ravv, similarityFunction);
         GraphIndexBuilder b = new GraphIndexBuilder(
                 bsp, dim, m, bw, no, a, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
-        return new LiveGraphShard(p2n, n2p, ravv, b);
+        return new LiveGraphShard(p2n, n2p, ravv, b, startNodeId);
     }
 
     /**

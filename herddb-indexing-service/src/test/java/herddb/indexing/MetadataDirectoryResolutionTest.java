@@ -22,7 +22,6 @@ package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
-
 import herddb.file.FileMetadataStorageManager;
 import herddb.metadata.MetadataStorageManager;
 import java.lang.reflect.Field;

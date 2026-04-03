@@ -75,7 +75,7 @@ public class PersistentVectorStoreBackpressureLivelockTest {
                 "vidx", "testtable", "tstblspace", "vector_col",
                 tmpDir, dsm, mm,
                 16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
-                Long.MAX_VALUE, 5.0,
+                Long.MAX_VALUE,
                 VectorSimilarityFunction.EUCLIDEAN)) {
 
             AtomicInteger hookCount = new AtomicInteger();
@@ -117,7 +117,6 @@ public class PersistentVectorStoreBackpressureLivelockTest {
         MemoryManager mm = new MemoryManager(128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
 
         // Small memory limit to trigger backpressure during ingestion.
-        // Each vector: DIM * 4 bytes * memoryMultiplier(5.0) = 640 bytes.
         // 256KB allows ~400 vectors before backpressure kicks in.
         long smallMemoryLimit = 256 * 1024;
         long compactionIntervalMs = 100;
@@ -126,7 +125,7 @@ public class PersistentVectorStoreBackpressureLivelockTest {
                 "vidx", "testtable", "tstblspace", "vector_col",
                 tmpDir, dsm, mm,
                 16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
-                compactionIntervalMs, 5.0,
+                compactionIntervalMs,
                 VectorSimilarityFunction.EUCLIDEAN,
                 smallMemoryLimit)) {
 

@@ -62,7 +62,7 @@ public class PersistentVectorStoreConfigTest {
                 "testidx", "testtable", "tstblspace", "vector_col",
                 tmpDir, dsm, mm,
                 16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
-                Long.MAX_VALUE, 5.0)) {
+                Long.MAX_VALUE)) {
             store.start();
 
             assertEquals("M should be 16", 16, store.getM());
@@ -84,7 +84,7 @@ public class PersistentVectorStoreConfigTest {
                 "testidx", "testtable", "tstblspace", "vector_col",
                 tmpDir, dsm, mm,
                 16, 100, 1.2f, 1.4f, false, 2_000_000_000L, 0,
-                Long.MAX_VALUE, 5.0)) {
+                Long.MAX_VALUE)) {
             store.start();
 
             int dim = 32;
@@ -116,7 +116,7 @@ public class PersistentVectorStoreConfigTest {
                 "testidx", "testtable", "tstblspace", "vector_col",
                 tmpDir, dsm, mm,
                 16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 50,
-                Long.MAX_VALUE, 5.0)) {
+                Long.MAX_VALUE)) {
             store.start();
 
             int dim = 32;

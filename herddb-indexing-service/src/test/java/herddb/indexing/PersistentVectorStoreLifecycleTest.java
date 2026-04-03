@@ -53,8 +53,7 @@ public class PersistentVectorStoreLifecycleTest {
         return new PersistentVectorStore("testidx", "testtable", "tstblspace",
                 "vector_col", tmpDir, dsm, mm,
                 16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
-                Long.MAX_VALUE,
-                5.0);
+                Long.MAX_VALUE);
     }
 
     private PersistentVectorStore createStoreWithFixedUUID(Path tmpDir, MemoryDataStorageManager dsm) {
@@ -62,8 +61,7 @@ public class PersistentVectorStoreLifecycleTest {
         return new PersistentVectorStore("testidx", "testtable", "tstblspace",
                 "vector_col", FIXED_UUID, tmpDir, dsm, mm,
                 16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
-                Long.MAX_VALUE,
-                5.0);
+                Long.MAX_VALUE);
     }
 
     private float[] randomVector(Random rng, int dim) {

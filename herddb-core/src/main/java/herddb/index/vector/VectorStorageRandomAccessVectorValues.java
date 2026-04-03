@@ -39,20 +39,32 @@ class VectorStorageRandomAccessVectorValues implements RandomAccessVectorValues 
     private final VectorStorage storage;
     private final int dimension;
     private final int size;
+    /**
+     * Offset added to the localNodeId before looking up in storage.
+     * For shard-local graphs this equals {@code LiveGraphShard.startNodeId},
+     * so that {@code getVector(localId)} returns the vector at global nodeId
+     * {@code localId + offset}.  Zero for any non-shard use (pool building, etc.).
+     */
+    private final int offset;
 
     VectorStorageRandomAccessVectorValues(VectorStorage storage, int dimension) {
-        this(storage, dimension, -1);
+        this(storage, dimension, -1, 0);
     }
 
     VectorStorageRandomAccessVectorValues(VectorStorage storage, int dimension, int size) {
+        this(storage, dimension, size, 0);
+    }
+
+    VectorStorageRandomAccessVectorValues(VectorStorage storage, int dimension, int size, int offset) {
         this.storage = storage;
         this.dimension = dimension;
         this.size = size;
+        this.offset = offset;
     }
 
     @Override
-    public VectorFloat<?> getVector(int nodeId) {
-        return storage.get(nodeId);
+    public VectorFloat<?> getVector(int localNodeId) {
+        return storage.get(localNodeId + offset);
     }
 
     @Override
