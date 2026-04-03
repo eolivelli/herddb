@@ -28,6 +28,11 @@ spec:
             - server
             - console
             - /opt/herddb/conf/server.properties
+          {{- if .Values.server.javaOpts }}
+          env:
+            - name: JAVA_OPTS
+              value: {{ .Values.server.javaOpts | quote }}
+          {{- end }}
           ports:
             - name: jdbc
               containerPort: {{ .Values.server.port }}
@@ -35,6 +40,11 @@ spec:
             - name: http
               containerPort: {{ .Values.server.httpPort }}
               protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.server.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
           volumeMounts:

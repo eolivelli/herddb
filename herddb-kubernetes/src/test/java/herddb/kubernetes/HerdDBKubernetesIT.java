@@ -22,11 +22,13 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 import io.fabric8.kubernetes.api.model.HasMetadata;
+import io.fabric8.kubernetes.api.model.IntOrString;
 import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.api.model.ServiceBuilder;
+import io.fabric8.kubernetes.api.model.ServicePortBuilder;
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
-import io.fabric8.kubernetes.client.LocalPortForward;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -38,6 +40,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -57,9 +60,11 @@ public class HerdDBKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
+    private static final int NODE_PORT = 30007;
 
     @ClassRule
-    public static K3sContainer k3s = new K3sContainer(DockerImageName.parse("rancher/k3s:v1.31.4-k3s1"));
+    public static K3sContainer k3s = new K3sContainer(DockerImageName.parse("rancher/k3s:v1.31.4-k3s1"))
+            .withExposedPorts(6443, NODE_PORT);
 
     private static KubernetesClient kubernetesClient;
 
@@ -85,7 +90,8 @@ public class HerdDBKubernetesIT {
             // Copy tarball into K3S container and import
             LOG.info("Loading image into K3S...");
             k3s.copyFileToContainer(MountableFile.forHostPath(imageTar), "/tmp/herddb.tar");
-            k3s.execInContainer("k3s", "ctr", "images", "import", "/tmp/herddb.tar");
+            k3s.execInContainer("ctr", "--address", "/run/k3s/containerd/containerd.sock",
+                    "--namespace", "k8s.io", "images", "import", "/tmp/herddb.tar");
         } finally {
             Files.deleteIfExists(imageTar);
         }
@@ -93,6 +99,7 @@ public class HerdDBKubernetesIT {
         // Create Kubernetes client
         String kubeConfigYaml = k3s.getKubeConfigYaml();
         Config config = Config.fromKubeconfig(kubeConfigYaml);
+        config.setNamespace("default");
         kubernetesClient = new KubernetesClientBuilder().withConfig(config).build();
 
         // Render helm chart with standalone mode
@@ -108,9 +115,29 @@ public class HerdDBKubernetesIT {
         LOG.info("Applying " + resources.size() + " Kubernetes resources...");
         kubernetesClient.resourceList(resources).createOrReplace();
 
-        // Wait for the server pod to be ready
+        // Create a NodePort service to access HerdDB from outside the cluster
+        kubernetesClient.services().inNamespace("default").createOrReplace(
+                new ServiceBuilder()
+                        .withNewMetadata()
+                            .withName("herddb-nodeport")
+                            .withNamespace("default")
+                        .endMetadata()
+                        .withNewSpec()
+                            .withType("NodePort")
+                            .withSelector(Collections.singletonMap("app.kubernetes.io/component", "server"))
+                            .withPorts(new ServicePortBuilder()
+                                    .withPort(7000)
+                                    .withTargetPort(new IntOrString(7000))
+                                    .withNodePort(NODE_PORT)
+                                    .build())
+                        .endSpec()
+                        .build());
+        LOG.info("NodePort service created on port " + NODE_PORT);
+
+        // Wait for the server pod to be ready (readiness probe checks TCP port 7000)
         LOG.info("Waiting for HerdDB server pod to be ready...");
         kubernetesClient.pods()
+                .inNamespace("default")
                 .withLabel("app.kubernetes.io/component", "server")
                 .waitUntilReady(5, TimeUnit.MINUTES);
         LOG.info("HerdDB server pod is ready.");
@@ -125,42 +152,31 @@ public class HerdDBKubernetesIT {
 
     @Test
     public void testBasicOperations() throws Exception {
-        // Find the server pod
-        List<Pod> serverPods = kubernetesClient.pods()
-                .withLabel("app.kubernetes.io/component", "server")
-                .list()
-                .getItems();
-        assertEquals("Expected exactly 1 server pod", 1, serverPods.size());
-        String podName = serverPods.get(0).getMetadata().getName();
-        LOG.info("Port-forwarding to pod: " + podName);
+        // Connect via NodePort exposed through the K3s container
+        String host = k3s.getHost();
+        int mappedPort = k3s.getMappedPort(NODE_PORT);
+        LOG.info("Connecting to HerdDB via NodePort at " + host + ":" + mappedPort);
 
-        try (LocalPortForward portForward = kubernetesClient.pods()
-                .withName(podName)
-                .portForward(7000)) {
-            int localPort = portForward.getLocalPort();
-            LOG.info("Port-forwarded to localhost:" + localPort);
+        String jdbcUrl = "jdbc:herddb:server:" + host + ":" + mappedPort;
+        try (Connection connection = DriverManager.getConnection(jdbcUrl);
+             Statement statement = connection.createStatement()) {
 
-            String jdbcUrl = "jdbc:herddb:server://localhost:" + localPort;
-            try (Connection connection = DriverManager.getConnection(jdbcUrl);
-                 Statement statement = connection.createStatement()) {
+            // CREATE TABLE
+            statement.execute("CREATE TABLE test_table (id int primary key, name string)");
+            LOG.info("Table created.");
 
-                // CREATE TABLE
-                statement.execute("CREATE TABLE test_table (id int primary key, name string)");
-                LOG.info("Table created.");
+            // INSERT
+            int inserted = statement.executeUpdate(
+                    "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
+            assertEquals(1, inserted);
+            LOG.info("Row inserted.");
 
-                // INSERT
-                int inserted = statement.executeUpdate(
-                        "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
-                assertEquals(1, inserted);
-                LOG.info("Row inserted.");
-
-                // SELECT
-                try (ResultSet rs = statement.executeQuery("SELECT id, name FROM test_table")) {
-                    assertTrue("Expected at least one row", rs.next());
-                    assertEquals(1, rs.getInt("id"));
-                    assertEquals("hello", rs.getString("name"));
-                    LOG.info("Row verified: id=1, name=hello");
-                }
+            // SELECT
+            try (ResultSet rs = statement.executeQuery("SELECT id, name FROM test_table")) {
+                assertTrue("Expected at least one row", rs.next());
+                assertEquals(1, rs.getInt("id"));
+                assertEquals("hello", rs.getString("name"));
+                LOG.info("Row verified: id=1, name=hello");
             }
         }
     }
@@ -187,6 +203,7 @@ public class HerdDBKubernetesIT {
                 "--set", "server.mode=standalone",
                 "--set", "server.replicaCount=1",
                 "--set", "tools.enabled=false",
+                "--set", "server.javaOpts=-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m -Djava.awt.headless=true --add-modules jdk.incubator.vector",
                 "--set", "server.resources.requests.memory=256Mi",
                 "--set", "server.resources.requests.cpu=0.5",
                 "--set", "server.resources.limits.memory=256Mi",

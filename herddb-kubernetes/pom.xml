@@ -51,6 +51,18 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <groupId>org.herddb</groupId>
+            <artifactId>herddb-core</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.bouncycastle</groupId>
+                    <artifactId>bc-fips</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>k3s</artifactId>
             <scope>test</scope>
@@ -64,6 +76,11 @@
             <groupId>io.fabric8</groupId>
             <artifactId>kubernetes-client</artifactId>
             <version>${libs.fabric8}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcpkix-jdk15on</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>

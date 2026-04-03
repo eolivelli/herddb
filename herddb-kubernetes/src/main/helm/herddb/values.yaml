@@ -19,6 +19,8 @@ server:
   replicaCount: 1
   port: 7000
   httpPort: 9845
+  # JVM options (overrides default JAVA_OPTS from setenv.sh)
+  javaOpts: ""
   # Extra key=value entries appended to server.properties
   extraConfig: {}
   storage:
