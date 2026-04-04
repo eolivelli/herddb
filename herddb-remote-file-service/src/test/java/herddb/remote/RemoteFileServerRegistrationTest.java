@@ -22,7 +22,6 @@ package herddb.remote;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
-
 import herddb.metadata.MetadataStorageManager;
 import herddb.model.TableSpace;
 import herddb.model.TableSpaceReplicaState;

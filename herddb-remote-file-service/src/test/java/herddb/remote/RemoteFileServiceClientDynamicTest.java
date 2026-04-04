@@ -22,7 +22,6 @@ package herddb.remote;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
-
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
@@ -59,8 +58,12 @@ public class RemoteFileServiceClientDynamicTest {
 
     @After
     public void tearDown() throws Exception {
-        if (server1 != null) server1.stop();
-        if (server2 != null) server2.stop();
+        if (server1 != null) {
+            server1.stop();
+        }
+        if (server2 != null) {
+            server2.stop();
+        }
     }
 
     @Test

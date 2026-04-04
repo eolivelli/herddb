@@ -22,10 +22,8 @@ package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
-
 import herddb.mem.MemoryMetadataStorageManager;
 import herddb.metadata.MetadataStorageManager;
-import herddb.metadata.MetadataStorageManagerException;
 import herddb.model.TableSpace;
 import herddb.model.TableSpaceReplicaState;
 import java.util.ArrayList;
