@@ -726,6 +726,12 @@ public class RoutedClientSideConnection implements ChannelEventListener, ClientS
     @Override
     public ScanResultSet executeScan(String tableSpace, String query, boolean usePreparedStatement, List<Object> params, long tx, int maxRows, int fetchSize,
                               boolean keepReadLocks) throws HDBException, ClientSideMetadataProviderException {
+        return executeScan(tableSpace, query, usePreparedStatement, params, tx, maxRows, fetchSize, keepReadLocks, false);
+    }
+
+    @Override
+    public ScanResultSet executeScan(String tableSpace, String query, boolean usePreparedStatement, List<Object> params, long tx, int maxRows, int fetchSize,
+                              boolean keepReadLocks, boolean allowFollowerReads) throws HDBException, ClientSideMetadataProviderException {
         Channel channel = ensureOpen();
         Pdu reply = null;
         try {
@@ -734,7 +740,7 @@ public class RoutedClientSideConnection implements ChannelEventListener, ClientS
             long statementId = usePreparedStatement ? prepareQuery(tableSpace, query) : 0;
             query = statementId > 0 ? "" : query;
             ByteBuf message = PduCodec.OpenScanner.write(requestId, tableSpace, query, scannerId, tx, params, statementId,
-                    fetchSize, maxRows, keepReadLocks);
+                    fetchSize, maxRows, keepReadLocks, allowFollowerReads);
             LOGGER.log(Level.FINEST, "open scanner {0} for query {1}, params {2}", new Object[]{scannerId, query, params});
             reply = channel.sendMessageWithPduReply(requestId, message, timeout);
 

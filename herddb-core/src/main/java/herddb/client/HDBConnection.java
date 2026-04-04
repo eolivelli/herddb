@@ -27,11 +27,13 @@ import herddb.client.impl.UnreachableServerException;
 import herddb.model.TransactionContext;
 import herddb.network.ServerHostData;
 import herddb.utils.Futures;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -340,11 +342,17 @@ public class HDBConnection implements AutoCloseable {
         if (discoverTablespaceFromSql) {
             tableSpace = discoverTablespace(tableSpace, query);
         }
+        boolean useFollowerReads = client.isAllowReadsFromFollowers() && tx == 0;
         int trialCount = 0;
         while (!closed) {
             try {
-                ClientSideConnectionPeer route = getRouteToTableSpace(tableSpace);
-                return route.executeScan(tableSpace, query, usePreparedStatement, params, tx, maxRows, fetchSize, keepReadLocks);
+                ClientSideConnectionPeer route;
+                if (useFollowerReads) {
+                    route = getRouteToTableSpaceReplica(tableSpace);
+                } else {
+                    route = getRouteToTableSpace(tableSpace);
+                }
+                return route.executeScan(tableSpace, query, usePreparedStatement, params, tx, maxRows, fetchSize, keepReadLocks, useFollowerReads);
             } catch (RetryRequestException retry) {
                 LOGGER.log(Level.INFO, "temporary error", retry);
                 handleRetryError(retry, trialCount++);
@@ -438,6 +446,24 @@ public class HDBConnection implements AutoCloseable {
             throw new HDBException("no leader found on metadata for tablespace " + tableSpace);
         }
         return getRouteToServer(leaderId);
+    }
+
+    protected ClientSideConnectionPeer getRouteToTableSpaceReplica(String tableSpace) throws ClientSideMetadataProviderException, HDBException {
+        if (closed) {
+            throw new HDBException("connection is closed");
+        }
+        if (tableSpace == null) {
+            throw new HDBException("null tablespace");
+        }
+        Set<String> replicas = client.getClientSideMetadataProvider().getTableSpaceReplicas(tableSpace);
+        if (replicas == null || replicas.isEmpty()) {
+            // fallback to leader
+            return getRouteToTableSpace(tableSpace);
+        }
+        // pick a random replica (this distributes load across all nodes including the leader)
+        List<String> replicaList = new ArrayList<>(replicas);
+        String nodeId = replicaList.get(random.nextInt(replicaList.size()));
+        return getRouteToServer(nodeId);
     }
 
     public boolean isClosed() {

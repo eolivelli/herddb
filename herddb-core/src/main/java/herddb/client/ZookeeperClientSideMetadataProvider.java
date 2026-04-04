@@ -25,9 +25,11 @@ import herddb.model.NodeMetadata;
 import herddb.model.TableSpace;
 import herddb.network.ServerHostData;
 import java.io.IOException;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -155,6 +157,7 @@ public final class ZookeeperClientSideMetadataProvider implements ClientSideMeta
     }
 
     private final Map<String, String> tableSpaceLeaders = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> tableSpaceReplicas = new ConcurrentHashMap<>();
     private final Map<String, ServerHostData> servers = new ConcurrentHashMap<>();
 
     @Override
@@ -170,8 +173,10 @@ public final class ZookeeperClientSideMetadataProvider implements ClientSideMeta
                             .map(entry -> entry.getKey())
                             .collect(Collectors.toList());
             tablespaces.forEach(tableSpaceLeaders::remove);
+            tablespaces.forEach(tableSpaceReplicas::remove);
         } else {
             tableSpaceLeaders.clear();
+            tableSpaceReplicas.clear();
             servers.clear();
         }
     }
@@ -217,8 +222,10 @@ public final class ZookeeperClientSideMetadataProvider implements ClientSideMeta
         tableSpace = tableSpace.toLowerCase();
         Stat stat = new Stat();
         byte[] result = zooKeeper.getData(basePath + "/tableSpaces/" + tableSpace, false, stat);
-        String leader = TableSpace.deserialize(result, stat.getVersion(), stat.getCtime()).leaderId;
+        TableSpace ts = TableSpace.deserialize(result, stat.getVersion(), stat.getCtime());
+        String leader = ts.leaderId;
         tableSpaceLeaders.put(tableSpace, leader);
+        tableSpaceReplicas.put(tableSpace, ts.replicas);
         return leader;
     }
 
@@ -263,6 +270,19 @@ public final class ZookeeperClientSideMetadataProvider implements ClientSideMeta
 
         }
         throw new ClientSideMetadataProviderException("Could not find a server info for node " + nodeId + " in time");
+    }
+
+    @Override
+    public Set<String> getTableSpaceReplicas(String tableSpace) throws ClientSideMetadataProviderException {
+        tableSpace = tableSpace.toLowerCase();
+        Set<String> cached = tableSpaceReplicas.get(tableSpace);
+        if (cached != null) {
+            return cached;
+        }
+        // Force a metadata read which will populate the cache
+        getTableSpaceLeader(tableSpace);
+        cached = tableSpaceReplicas.get(tableSpace);
+        return cached != null ? cached : Collections.emptySet();
     }
 
     // visible for testing

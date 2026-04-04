@@ -63,6 +63,7 @@ public class Pdu implements AutoCloseable {
     public static final byte FLAGS_ISREQUEST = 1;
     public static final byte FLAGS_ISRESPONSE = 2;
     public static final byte FLAGS_OPENSCANNER_DONTKEEP_READ_LOCKS = 4;
+    public static final byte FLAGS_OPENSCANNER_ALLOW_FOLLOWER_READS = 8;
 
 
     private static final Recycler<Pdu> RECYCLER = new Recycler<Pdu>() {

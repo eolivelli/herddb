@@ -19,6 +19,7 @@
  */
 package herddb.proto;
 
+import static herddb.proto.PduCodec.ObjectListReader.isAllowFollowerReads;
 import static herddb.proto.PduCodec.ObjectListReader.isDontKeepReadLocks;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -90,6 +91,68 @@ public class PduCodecTest {
             assertFalse(isDontKeepReadLocks(trailer));
         }
 
+    }
+
+    @Test
+    public void readObjectsTrailerWithFollowerReads() throws Exception {
+        long msgId = 1234;
+        String ts = "dsfs";
+        String query = "q";
+        long scannerId = 2332;
+        long tx = 353;
+        List<Object> params = Arrays.asList("1", 12L, 3d);
+        long statementId = 2342;
+        int fetchSize = 12313;
+        int maxRows = 1239;
+
+        // allowFollowerReads=true, keepReadLocks=false -> trailer should have both bits
+        ByteBuf write = PduCodec.OpenScanner.write(msgId, ts, query, scannerId, tx, params, statementId, fetchSize, maxRows, false, true);
+        try (Pdu pdu = PduCodec.decodePdu(write)) {
+            PduCodec.ObjectListReader paramsReader = PduCodec.OpenScanner.startReadParameters(pdu);
+            for (int i = 0; i < paramsReader.getNumParams(); i++) {
+                paramsReader.nextObject();
+            }
+            byte trailer = paramsReader.readTrailer();
+            assertTrue(isDontKeepReadLocks(trailer));
+            assertTrue(isAllowFollowerReads(trailer));
+        }
+
+        // allowFollowerReads=true, keepReadLocks=true -> trailer should have only follower reads bit
+        write = PduCodec.OpenScanner.write(msgId, ts, query, scannerId, tx, params, statementId, fetchSize, maxRows, true, true);
+        try (Pdu pdu = PduCodec.decodePdu(write)) {
+            PduCodec.ObjectListReader paramsReader = PduCodec.OpenScanner.startReadParameters(pdu);
+            for (int i = 0; i < paramsReader.getNumParams(); i++) {
+                paramsReader.nextObject();
+            }
+            byte trailer = paramsReader.readTrailer();
+            assertFalse(isDontKeepReadLocks(trailer));
+            assertTrue(isAllowFollowerReads(trailer));
+        }
+
+        // allowFollowerReads=false, keepReadLocks=false -> trailer should have only dontKeepReadLocks bit (backward compat)
+        write = PduCodec.OpenScanner.write(msgId, ts, query, scannerId, tx, params, statementId, fetchSize, maxRows, false, false);
+        try (Pdu pdu = PduCodec.decodePdu(write)) {
+            PduCodec.ObjectListReader paramsReader = PduCodec.OpenScanner.startReadParameters(pdu);
+            for (int i = 0; i < paramsReader.getNumParams(); i++) {
+                paramsReader.nextObject();
+            }
+            byte trailer = paramsReader.readTrailer();
+            assertTrue(isDontKeepReadLocks(trailer));
+            assertFalse(isAllowFollowerReads(trailer));
+        }
+
+        // allowFollowerReads=false, keepReadLocks=true -> no trailer
+        write = PduCodec.OpenScanner.write(msgId, ts, query, scannerId, tx, params, statementId, fetchSize, maxRows, true, false);
+        try (Pdu pdu = PduCodec.decodePdu(write)) {
+            PduCodec.ObjectListReader paramsReader = PduCodec.OpenScanner.startReadParameters(pdu);
+            for (int i = 0; i < paramsReader.getNumParams(); i++) {
+                paramsReader.nextObject();
+            }
+            byte trailer = paramsReader.readTrailer();
+            assertEquals(0, trailer);
+            assertFalse(isDontKeepReadLocks(trailer));
+            assertFalse(isAllowFollowerReads(trailer));
+        }
     }
 
     @Test

@@ -606,6 +606,14 @@ public abstract class PduCodec {
                 long scannerId, long tx, List<Object> params, long statementId, int fetchSize, int maxRows,
                 boolean keepReadLocks
         ) {
+            return write(messageId, tableSpace, query, scannerId, tx, params, statementId, fetchSize, maxRows, keepReadLocks, false);
+        }
+
+        public static ByteBuf write(
+                long messageId, String tableSpace, String query,
+                long scannerId, long tx, List<Object> params, long statementId, int fetchSize, int maxRows,
+                boolean keepReadLocks, boolean allowFollowerReads
+        ) {
 
             ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
                     .directBuffer(
@@ -639,8 +647,15 @@ public abstract class PduCodec {
                 writeObject(byteBuf, p);
             }
             // trailer
+            byte trailer = 0;
             if (!keepReadLocks) {
-                byteBuf.writeByte(Pdu.FLAGS_OPENSCANNER_DONTKEEP_READ_LOCKS);
+                trailer |= Pdu.FLAGS_OPENSCANNER_DONTKEEP_READ_LOCKS;
+            }
+            if (allowFollowerReads) {
+                trailer |= Pdu.FLAGS_OPENSCANNER_ALLOW_FOLLOWER_READS;
+            }
+            if (trailer != 0) {
+                byteBuf.writeByte(trailer);
             }
             return byteBuf;
 
@@ -1841,6 +1856,10 @@ public abstract class PduCodec {
 
         public static boolean isDontKeepReadLocks(byte trailer) {
             return ((trailer & Pdu.FLAGS_OPENSCANNER_DONTKEEP_READ_LOCKS) == Pdu.FLAGS_OPENSCANNER_DONTKEEP_READ_LOCKS);
+        }
+
+        public static boolean isAllowFollowerReads(byte trailer) {
+            return ((trailer & Pdu.FLAGS_OPENSCANNER_ALLOW_FOLLOWER_READS) == Pdu.FLAGS_OPENSCANNER_ALLOW_FOLLOWER_READS);
         }
 
     }
