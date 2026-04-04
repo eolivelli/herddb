@@ -19,7 +19,8 @@
  */
 package herddb.cluster;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import herddb.metadata.ServiceDiscoveryListener;
 import herddb.utils.ZKTestEnv;
 import java.util.List;

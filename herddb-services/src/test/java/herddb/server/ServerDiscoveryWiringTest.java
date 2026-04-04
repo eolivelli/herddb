@@ -20,8 +20,8 @@
 
 package herddb.server;
 
-import static org.junit.Assert.*;
-
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.metadata.ServiceDiscoveryListener;
 import herddb.utils.ZKTestEnv;

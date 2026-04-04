@@ -23,9 +23,7 @@ import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-
 import herddb.model.TableSpace;
-import herddb.model.TransactionContext;
 import herddb.network.ServerHostData;
 import herddb.server.Server;
 import herddb.server.ServerConfiguration;
@@ -35,7 +33,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Rule;
 import org.junit.Test;

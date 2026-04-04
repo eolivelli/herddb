@@ -23,7 +23,6 @@ package herddb.server;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
-
 import herddb.client.ClientConfiguration;
 import herddb.client.HDBClient;
 import herddb.client.HDBConnection;
@@ -33,7 +32,6 @@ import herddb.indexing.IndexingServer;
 import herddb.indexing.IndexingServerConfiguration;
 import herddb.indexing.IndexingServiceClient;
 import herddb.indexing.IndexingServiceEngine;
-import herddb.metadata.ServiceDiscoveryListener;
 import herddb.model.TableSpace;
 import java.io.InputStream;
 import java.nio.file.Path;
@@ -173,9 +171,9 @@ public class FollowerReadsVectorIndexTest {
 
                                     // Add server2 as follower
                                     con.executeUpdate(TableSpace.DEFAULT,
-                                            "ALTER TABLESPACE 'herd','expectedreplicacount:1','leader:" +
-                                                    server1.getNodeId() + "','replica:" + server1.getNodeId() +
-                                                    "," + server2.getNodeId() + "'",
+                                            "ALTER TABLESPACE 'herd','expectedreplicacount:1','leader:"
+                                                    + server1.getNodeId() + "','replica:" + server1.getNodeId()
+                                                    + "," + server2.getNodeId() + "'",
                                             0, false, true, Collections.emptyList());
 
                                     // Insert orthogonal vectors
