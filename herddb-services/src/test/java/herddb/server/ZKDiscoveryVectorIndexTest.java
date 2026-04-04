@@ -32,6 +32,7 @@ import herddb.indexing.IndexingServer;
 import herddb.indexing.IndexingServerConfiguration;
 import herddb.indexing.IndexingServiceClient;
 import herddb.indexing.IndexingServiceEngine;
+import herddb.metadata.ServiceDiscoveryListener;
 import herddb.model.TableSpace;
 import java.io.InputStream;
 import java.nio.file.Path;
