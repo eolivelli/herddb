@@ -56,6 +56,6 @@ jobs:
       - name: 'Install Helm'
         uses: azure/setup-helm@v4
       - name: 'Run Kubernetes tests'
-        run: mvn -B verify -pl herddb-kubernetes --file pom.xml -Pjenkins
+        run: mvn -B verify -pl herddb-kubernetes --file pom.xml -Pkubernetes
       - name: 'Remove Snapshots Before Caching'
         run: find ~/.m2 -name '*SNAPSHOT' | xargs rm -Rf
