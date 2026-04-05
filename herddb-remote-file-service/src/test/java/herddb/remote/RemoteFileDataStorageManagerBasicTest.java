@@ -134,6 +134,60 @@ public class RemoteFileDataStorageManagerBasicTest {
     }
 
     @Test
+    public void testDeleteIndexPageRemovesFromRemoteStorage() throws Exception {
+        // PersistentVectorStore's Phase B rollback calls deleteIndexPage to
+        // reclaim provisionally written pages after a failure. For remote
+        // storage this must translate to a real client.deleteFile(...) — the
+        // no-op base-class default would leak S3 objects indefinitely.
+        storage.initTablespace("ts1");
+        storage.initIndex("ts1", "idx1");
+
+        byte[] indexData = {1, 2, 3, 4, 5};
+        storage.writeIndexPage("ts1", "idx1", 1L, out -> out.write(indexData));
+
+        // Sanity: round-trip works before delete.
+        byte[] read = storage.readIndexPage("ts1", "idx1", 1L, in -> {
+            byte[] buf = new byte[5];
+            in.readArray(5, buf);
+            return buf;
+        });
+        assertTrue(Arrays.equals(indexData, read));
+
+        // Act.
+        storage.deleteIndexPage("ts1", "idx1", 1L);
+
+        // After delete, reading the same page must fail.
+        try {
+            storage.readIndexPage("ts1", "idx1", 1L, in -> {
+                byte[] buf = new byte[5];
+                in.readArray(5, buf);
+                return buf;
+            });
+            org.junit.Assert.fail("readIndexPage must fail after deleteIndexPage");
+        } catch (herddb.storage.DataStorageManagerException expected) {
+            // ok
+        }
+    }
+
+    @Test
+    public void testDeleteIndexPageIsIdempotent() throws Exception {
+        // The DataStorageManager.deleteIndexPage contract is idempotent —
+        // deleting a pageId that was never written (or already deleted)
+        // must not throw. This is important because the Phase B rollback
+        // path iterates through possibly-missing pageIds.
+        storage.initTablespace("ts1");
+        storage.initIndex("ts1", "idx1");
+
+        // Never-written pageId: must not throw.
+        storage.deleteIndexPage("ts1", "idx1", 999L);
+
+        // Write then delete twice: second delete must not throw.
+        storage.writeIndexPage("ts1", "idx1", 42L, out -> out.write(new byte[]{7}));
+        storage.deleteIndexPage("ts1", "idx1", 42L);
+        storage.deleteIndexPage("ts1", "idx1", 42L);
+    }
+
+    @Test
     public void testTableCheckpoint() throws Exception {
         storage.initTablespace("ts1");
         storage.initTable("ts1", "uuid1");

@@ -36,6 +36,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
@@ -64,7 +65,14 @@ public class VectorIndexManager extends AbstractIndexManager {
     public static final String PROP_MAX_LIVE_GRAPH_SIZE = "maxLiveGraphSize";
     public static final String PROP_NUM_SHARDS = "numShards";
 
-    private final RemoteVectorIndexService remoteService;
+    /**
+     * Resolved lazily at every call so that the owning DBManager can
+     * swap the underlying {@link RemoteVectorIndexService} instance
+     * (e.g. when the indexing-service client is restarted) without
+     * having to tear down the table space and rebuild every
+     * {@code VectorIndexManager}.
+     */
+    private final Supplier<RemoteVectorIndexService> remoteServiceSupplier;
 
     public VectorIndexManager(Index index,
                                AbstractTableManager tableManager,
@@ -74,14 +82,22 @@ public class VectorIndexManager extends AbstractIndexManager {
                                long transaction,
                                int writeLockTimeout,
                                int readLockTimeout,
-                               RemoteVectorIndexService remoteService) {
+                               Supplier<RemoteVectorIndexService> remoteServiceSupplier) {
         super(index, tableManager, dataStorageManager, tableSpaceUUID, log,
                 transaction, writeLockTimeout, readLockTimeout);
-        if (remoteService == null) {
-            throw new IllegalArgumentException(
+        if (remoteServiceSupplier == null) {
+            throw new IllegalArgumentException("remoteServiceSupplier is required");
+        }
+        this.remoteServiceSupplier = remoteServiceSupplier;
+    }
+
+    private RemoteVectorIndexService remoteService() {
+        RemoteVectorIndexService svc = remoteServiceSupplier.get();
+        if (svc == null) {
+            throw new IllegalStateException(
                     "RemoteVectorIndexService is required; embedded vector indexing mode is no longer supported");
         }
-        this.remoteService = remoteService;
+        return svc;
     }
 
     @Override
@@ -103,7 +119,7 @@ public class VectorIndexManager extends AbstractIndexManager {
                 new Object[]{index.name, index.table, tableSpaceUUID, sequenceNumber, pin});
         long start = System.nanoTime();
         try {
-            remoteService.waitForCatchUp(tableSpaceUUID, sequenceNumber);
+            remoteService().waitForCatchUp(tableSpaceUUID, sequenceNumber);
             long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
             LOGGER.log(Level.INFO, "checkpoint index {0} on table {1} waitForCatchUp completed in {2} ms",
                     new Object[]{index.name, index.table, elapsedMs});
@@ -162,7 +178,7 @@ public class VectorIndexManager extends AbstractIndexManager {
         long start = System.nanoTime();
         try {
             List<Map.Entry<Bytes, Float>> results =
-                    remoteService.search(tableSpaceUUID, index.table, index.name, queryVector, topK);
+                    remoteService().search(tableSpaceUUID, index.table, index.name, queryVector, topK);
             long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
             LOGGER.log(Level.INFO, "search index {0} on table {1} completed in {2} ms, {3} results",
                     new Object[]{index.name, index.table, elapsedMs, results.size()});
@@ -179,7 +195,7 @@ public class VectorIndexManager extends AbstractIndexManager {
      * Returns status information from the remote IndexingService.
      */
     public RemoteVectorIndexService.IndexStatusInfo getRemoteIndexStatus() {
-        return remoteService.getIndexStatus(tableSpaceUUID, index.table, index.name);
+        return remoteService().getIndexStatus(tableSpaceUUID, index.table, index.name);
     }
 
     @Override

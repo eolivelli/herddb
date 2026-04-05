@@ -419,6 +419,28 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
         }
     }
 
+    @Override
+    public void deleteIndexPage(String tableSpace, String uuid, long pageId)
+            throws DataStorageManagerException {
+        // Used by PersistentVectorStore's Phase-B rollback path to reclaim
+        // pages that were written but never made it into a durable
+        // IndexStatus checkpoint. Without this override we fall through to
+        // the no-op base implementation and leak S3 objects until the next
+        // successful indexCheckpoint sweep — which may never come if the
+        // failure cause (e.g. remote storage unreachable) keeps recurring.
+        String path = remoteIndexPagePath(tableSpace, uuid, pageId);
+        try {
+            client.deleteFile(path);
+        } catch (RuntimeException ignored) {
+            // Idempotent: deleting a page that was never written must not
+            // throw. Log-worthy but not fatal; the caller already has the
+            // original failure in hand.
+            LOGGER.log(Level.FINE,
+                    "deleteIndexPage: non-fatal error deleting {0}: {1}",
+                    new Object[]{path, ignored.getMessage()});
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Full table scan
     // -------------------------------------------------------------------------
