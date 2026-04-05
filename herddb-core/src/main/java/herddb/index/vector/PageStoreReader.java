@@ -27,6 +27,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * A {@link RandomAccessReader} that reads a logical byte stream assembled from
@@ -203,9 +204,9 @@ final class PageStoreReader implements RandomAccessReader {
         private final int maxCachedPages;
         private final LinkedHashMap<Integer, byte[]> cache;
         /** Observability: number of page loads that hit the cache. */
-        volatile long cacheHits;
+        final AtomicLong cacheHits = new AtomicLong(0);
         /** Observability: number of page loads that missed and read from the page store. */
-        volatile long cacheMisses;
+        final AtomicLong cacheMisses = new AtomicLong(0);
 
         /**
          * Builds the PageSource by reading each page once to learn its length.
@@ -276,7 +277,7 @@ final class PageStoreReader implements RandomAccessReader {
             synchronized (cache) {
                 page = cache.get(pageIndex);
                 if (page != null) {
-                    cacheHits++;
+                    cacheHits.incrementAndGet();
                     return page;
                 }
             }
@@ -288,7 +289,7 @@ final class PageStoreReader implements RandomAccessReader {
             }
             synchronized (cache) {
                 cache.put(pageIndex, page);
-                cacheMisses++;
+                cacheMisses.incrementAndGet();
             }
             return page;
         }
@@ -349,12 +350,12 @@ final class PageStoreReader implements RandomAccessReader {
 
         /** Visible for tests. */
         long getCacheHits() {
-            return source.cacheHits;
+            return source.cacheHits.get();
         }
 
         /** Visible for tests. */
         long getCacheMisses() {
-            return source.cacheMisses;
+            return source.cacheMisses.get();
         }
 
         /** Visible for tests. */
