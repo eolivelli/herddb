@@ -46,6 +46,7 @@ import herddb.network.ServerSideConnection;
 import herddb.network.ServerSideConnectionAcceptor;
 import herddb.network.netty.NettyChannelAcceptor;
 import herddb.network.netty.NetworkUtils;
+import herddb.auth.oidc.sasl.TokenAuthenticator;
 import herddb.security.SimpleSingleUserManager;
 import herddb.security.UserManager;
 import herddb.storage.DataStorageManager;
@@ -92,9 +93,22 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
     private String jdbcUrl;
     private UserManager userManager;
     private EmbeddedBookie embeddedBookie;
+    private volatile TokenAuthenticator tokenAuthenticator;
 
     public UserManager getUserManager() {
         return userManager;
+    }
+
+    /**
+     * Returns the token authenticator used by the OAUTHBEARER SASL mechanism,
+     * or {@code null} if OIDC authentication is not configured.
+     */
+    public TokenAuthenticator getTokenAuthenticator() {
+        return tokenAuthenticator;
+    }
+
+    public void setTokenAuthenticator(TokenAuthenticator tokenAuthenticator) {
+        this.tokenAuthenticator = tokenAuthenticator;
     }
 
     public void setUserManager(UserManager userManager) {

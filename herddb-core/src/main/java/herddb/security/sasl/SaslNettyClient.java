@@ -20,7 +20,9 @@
 
 package herddb.security.sasl;
 
+import herddb.auth.oidc.sasl.OAuthBearerSaslClient;
 import java.io.IOException;
+import java.util.function.Supplier;
 import java.security.Principal;
 import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
@@ -64,9 +66,26 @@ public class SaslNettyClient {
      * Create a SaslNettyClient for authentication with servers.
      */
     public SaslNettyClient(String username, String password, String serverHostname, String mech) throws Exception {
+        this(username, password, serverHostname, mech, null);
+    }
+
+    /**
+     * Create a SaslNettyClient. When {@code mech} is {@code OAUTHBEARER}, the
+     * {@code tokenSupplier} must produce a valid bearer token.
+     */
+    public SaslNettyClient(String username, String password, String serverHostname, String mech,
+                           Supplier<String> tokenSupplier) throws Exception {
         String serverPrincipal = "herddb/" + serverHostname;
         clientSubject = loginClient();
 
+        if (SaslUtils.AUTH_OAUTHBEARER.equals(mech)) {
+            if (tokenSupplier == null) {
+                throw new IOException("OAUTHBEARER mechanism requires a token supplier");
+            }
+            LOG.log(Level.FINEST, "Using SASL/OAUTHBEARER auth to connect to " + serverHostname);
+            saslClient = new OAuthBearerSaslClient(tokenSupplier, username);
+            return;
+        }
         if (clientSubject == null) {
             if (mech == null || mech.equals(SaslUtils.AUTH_DIGEST_MD5)) {
                 LOG.log(Level.FINEST, "Using plain SASL/DIGEST-MD5 auth to connect to " + serverHostname);

@@ -36,6 +36,8 @@ public class SaslUtils {
 
     public static final String AUTH_PLAIN = "PLAIN";
 
+    public static final String AUTH_OAUTHBEARER = "OAUTHBEARER";
+
 
     public static final String DEFAULT_REALM = "default";
 
