@@ -51,6 +51,11 @@ public interface ClientSideConnectionPeer {
     ScanResultSet executeScan(String tableSpace, String query, boolean usePreparedStatement, List<Object> params, long tx, int maxRows, int fetchSize,
                               boolean keepReadLocks) throws HDBException, ClientSideMetadataProviderException;
 
+    default ScanResultSet executeScan(String tableSpace, String query, boolean usePreparedStatement, List<Object> params, long tx, int maxRows, int fetchSize,
+                              boolean keepReadLocks, boolean allowFollowerReads) throws HDBException, ClientSideMetadataProviderException {
+        return executeScan(tableSpace, query, usePreparedStatement, params, tx, maxRows, fetchSize, keepReadLocks);
+    }
+
     CompletableFuture<DMLResult> executeUpdateAsync(String tableSpace, String query, long tx, boolean returnValues, boolean usePreparedStatement, List<Object> params);
 
     CompletableFuture<List<DMLResult>> executeUpdatesAsync(

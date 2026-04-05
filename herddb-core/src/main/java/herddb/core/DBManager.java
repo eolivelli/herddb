@@ -779,7 +779,7 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
             return Futures.exception(new NotLeaderException("No such tableSpace " + tableSpace + " here (at " + nodeId + "). "
                     + "Maybe the server is starting "));
         }
-        if (errorIfNotLeader && !manager.isLeader()) {
+        if (errorIfNotLeader && !manager.isLeader() && !statement.getAllowExecutionFromFollower()) {
             return Futures.exception(new NotLeaderException("node " + nodeId + " is not leader for tableSpace " + tableSpace));
         }
         CompletableFuture<StatementExecutionResult> res = manager.executeStatementAsync(statement, context, transactionContext);

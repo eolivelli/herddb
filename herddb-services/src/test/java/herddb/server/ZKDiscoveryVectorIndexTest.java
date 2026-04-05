@@ -23,7 +23,6 @@ package herddb.server;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
-
 import herddb.client.ClientConfiguration;
 import herddb.client.HDBClient;
 import herddb.client.HDBConnection;
@@ -35,8 +34,6 @@ import herddb.indexing.IndexingServiceClient;
 import herddb.indexing.IndexingServiceEngine;
 import herddb.metadata.ServiceDiscoveryListener;
 import herddb.model.TableSpace;
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.nio.file.Path;
 import java.util.Arrays;

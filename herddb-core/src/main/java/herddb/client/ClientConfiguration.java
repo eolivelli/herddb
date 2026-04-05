@@ -109,6 +109,9 @@ public class ClientConfiguration {
     public static final String PROPERTY_CLIENT_INITIALIZED = "client.initialized";
     public static final boolean PROPERTY_CLIENT_INITIALIZED_DEFAULT = false;
 
+    public static final String PROPERTY_ALLOW_READS_FROM_FOLLOWERS = "client.allowReadsFromFollowers";
+    public static final boolean PROPERTY_ALLOW_READS_FROM_FOLLOWERS_DEFAULT = false;
+
 
     public ClientConfiguration(Properties properties) {
         this.properties = new Properties();

@@ -32,6 +32,7 @@ import herddb.utils.Wrapper;
 public abstract class Statement implements Wrapper {
 
     private final String tableSpace;
+    private boolean allowExecutionFromFollower;
 
     public Statement(String tableSpace) {
         this.tableSpace = tableSpace;
@@ -39,6 +40,14 @@ public abstract class Statement implements Wrapper {
 
     public String getTableSpace() {
         return tableSpace;
+    }
+
+    public boolean getAllowExecutionFromFollower() {
+        return allowExecutionFromFollower;
+    }
+
+    public void setAllowExecutionFromFollower(boolean allowExecutionFromFollower) {
+        this.allowExecutionFromFollower = allowExecutionFromFollower;
     }
 
     public boolean supportsTransactionAutoCreate() {

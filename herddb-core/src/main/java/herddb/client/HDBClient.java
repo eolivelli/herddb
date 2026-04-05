@@ -62,6 +62,7 @@ public class HDBClient implements AutoCloseable {
     private final int maxOperationRetryCount;
     private final int operationRetryDelay;
     private final boolean localMode;
+    private final boolean allowReadsFromFollowers;
 
     public HDBClient(ClientConfiguration configuration) {
         this(configuration, NullStatsLogger.INSTANCE);
@@ -83,6 +84,7 @@ public class HDBClient implements AutoCloseable {
         boolean connectRemoteServers = configuration.getBoolean(ClientConfiguration.PROPERTY_CLIENT_CONNECT_REMOTE_SERVER, ClientConfiguration.PROPERTY_CLIENT_CONNECT_REMOTE_SERVER_DEFAULT);
         this.maxOperationRetryCount = configuration.getInt(ClientConfiguration.PROPERTY_MAX_OPERATION_RETRY_COUNT, ClientConfiguration.PROPERTY_MAX_OPERATION_RETRY_COUNT_DEFAULT);
         this.operationRetryDelay = configuration.getInt(ClientConfiguration.PROPERTY_OPERATION_RETRY_DELAY, ClientConfiguration.PROPERTY_OPERATION_RETRY_DELAY_DEFAULT);
+        this.allowReadsFromFollowers = configuration.getBoolean(ClientConfiguration.PROPERTY_ALLOW_READS_FROM_FOLLOWERS, ClientConfiguration.PROPERTY_ALLOW_READS_FROM_FOLLOWERS_DEFAULT);
         if (corePoolSize <= 0) {
             // this is particularly useful for "local" mode
             this.thredpool = MoreExecutors.newDirectExecutorService();
@@ -203,5 +205,9 @@ public class HDBClient implements AutoCloseable {
 
     boolean isLocalMode() {
         return localMode;
+    }
+
+    public boolean isAllowReadsFromFollowers() {
+        return allowReadsFromFollowers;
     }
 }

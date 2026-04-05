@@ -129,9 +129,14 @@ public class NonMarshallingClientSideConnectionPeer implements ClientSideConnect
 
     @Override
     public ScanResultSet executeScan(String tableSpace, String query, boolean usePreparedStatement, List<Object> params, long tx, int maxRows, int fetchSize, boolean keepReadLocks) throws HDBException, ClientSideMetadataProviderException {
+        return executeScan(tableSpace, query, usePreparedStatement, params, tx, maxRows, fetchSize, keepReadLocks, false);
+    }
+
+    @Override
+    public ScanResultSet executeScan(String tableSpace, String query, boolean usePreparedStatement, List<Object> params, long tx, int maxRows, int fetchSize, boolean keepReadLocks, boolean allowFollowerReads) throws HDBException, ClientSideMetadataProviderException {
         LocalVMChannel channel = (LocalVMChannel) realConnection.ensureOpen();
         ServerSideConnectionPeer serverSidePeer = (ServerSideConnectionPeer) channel.getServerSideChannel().getMessagesReceiver();
-        return serverSidePeer.executeScan(tableSpace, query, usePreparedStatement, params, tx, maxRows, fetchSize, keepReadLocks);
+        return serverSidePeer.executeScan(tableSpace, query, usePreparedStatement, params, tx, maxRows, fetchSize, keepReadLocks, allowFollowerReads);
     }
 
     @Override

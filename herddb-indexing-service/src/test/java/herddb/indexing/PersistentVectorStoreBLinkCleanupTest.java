@@ -22,7 +22,6 @@ package herddb.indexing;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
-
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
 import herddb.index.vector.PersistentVectorStore;

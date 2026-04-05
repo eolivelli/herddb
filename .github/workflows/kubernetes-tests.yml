@@ -19,6 +19,7 @@ on:
   push:
     branches:
       - master
+      - vector-index-async
 env:
   MAVEN_OPTS: -Dmaven.artifact.threads=4 -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn  -Dmaven.wagon.httpconnectionManager.ttlSeconds=25 -Dmaven.wagon.http.retryHandler.count=3
 jobs:
@@ -55,6 +56,6 @@ jobs:
       - name: 'Install Helm'
         uses: azure/setup-helm@v4
       - name: 'Run Kubernetes tests'
-        run: mvn -B verify -pl herddb-kubernetes --file pom.xml -Pjenkins
+        run: mvn -B verify -pl herddb-kubernetes --file pom.xml -Pkubernetes
       - name: 'Remove Snapshots Before Caching'
         run: find ~/.m2 -name '*SNAPSHOT' | xargs rm -Rf

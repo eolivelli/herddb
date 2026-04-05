@@ -20,6 +20,7 @@
 
 package herddb.server;
 
+import static herddb.proto.PduCodec.ObjectListReader.isAllowFollowerReads;
 import static herddb.proto.PduCodec.ObjectListReader.isDontKeepReadLocks;
 import static herddb.proto.PduCodec.TxCommand.TX_COMMAND_BEGIN_TRANSACTION;
 import static herddb.proto.PduCodec.TxCommand.TX_COMMAND_COMMIT_TRANSACTION;
@@ -453,8 +454,9 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
         // with clients older than 0.20.0 keepReadLocks will be always true
         byte trailer = parametersReader.readTrailer();
         boolean keepReadLocks = !isDontKeepReadLocks(trailer);
+        boolean allowFollowerReads = isAllowFollowerReads(trailer);
         if (LOGGER.isLoggable(Level.FINER)) {
-            LOGGER.log(Level.FINER, "openScanner txId+" + txId + ", fetchSize " + fetchSize + ", maxRows " + maxRows + ", keepReadLocks " + keepReadLocks + ", " + query + " with " + parameters);
+            LOGGER.log(Level.FINER, "openScanner txId+" + txId + ", fetchSize " + fetchSize + ", maxRows " + maxRows + ", keepReadLocks " + keepReadLocks + ", allowFollowerReads " + allowFollowerReads + ", " + query + " with " + parameters);
         }
         RunningStatementsStats runningStatements = server.getManager().getRunningStatements();
         RunningStatementInfo statementInfo = new RunningStatementInfo(query,
@@ -465,6 +467,9 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                     .getPlanner().translate(tableSpace,
                             query, parameters, true, true, false, maxRows);
             translatedQuery.context.setForceRetainReadLock(keepReadLocks);
+            if (allowFollowerReads && txId == 0) {
+                translatedQuery.plan.mainStatement.setAllowExecutionFromFollower(true);
+            }
 
             if (LOGGER.isLoggable(Level.FINEST)) {
                 LOGGER.log(Level.FINEST, "{0} -> {1}", new Object[]{query, translatedQuery.plan.mainStatement});
@@ -1150,6 +1155,10 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
     }
 
     public ScanResultSet executeScan(String tableSpace, String query, boolean usePreparedStatement, List<Object> parameters, long txId, int maxRows, int fetchSize, boolean keepReadLocks) throws HDBException {
+        return executeScan(tableSpace, query, usePreparedStatement, parameters, txId, maxRows, fetchSize, keepReadLocks, false);
+    }
+
+    public ScanResultSet executeScan(String tableSpace, String query, boolean usePreparedStatement, List<Object> parameters, long txId, int maxRows, int fetchSize, boolean keepReadLocks, boolean allowFollowerReads) throws HDBException {
 
         if (query == null) {
             throw new HDBException("bad query null");
@@ -1163,6 +1172,9 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                     .getPlanner().translate(tableSpace,
                             query, parameters, true, true, false, maxRows);
             translatedQuery.context.setForceRetainReadLock(keepReadLocks);
+            if (allowFollowerReads && txId == 0) {
+                translatedQuery.plan.mainStatement.setAllowExecutionFromFollower(true);
+            }
 
             if (LOGGER.isLoggable(Level.FINEST)) {
                 LOGGER.log(Level.FINEST, "{0} -> {1}", new Object[]{query, translatedQuery.plan.mainStatement});

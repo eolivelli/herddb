@@ -21,7 +21,6 @@
 package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
-
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;

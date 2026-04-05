@@ -21,6 +21,8 @@
 package herddb.client;
 
 import herddb.network.ServerHostData;
+import java.util.Collections;
+import java.util.Set;
 
 /**
  * Provide Metadata to the client
@@ -46,6 +48,18 @@ public interface ClientSideMetadataProvider extends AutoCloseable {
      * @throws ClientSideMetadataProviderException
      */
     ServerHostData getServerHostData(String nodeId) throws ClientSideMetadataProviderException;
+
+    /**
+     * Returns the set of node IDs that hold replicas for the given tableSpace.
+     * This includes the leader. Returns empty set if replica info is not available.
+     *
+     * @param tableSpace
+     * @return
+     * @throws ClientSideMetadataProviderException
+     */
+    default Set<String> getTableSpaceReplicas(String tableSpace) throws ClientSideMetadataProviderException {
+        return Collections.emptySet();
+    }
 
     @Override
     default void close() {
