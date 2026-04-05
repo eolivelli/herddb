@@ -74,6 +74,13 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
     private final int swapThreshold;
 
     /**
+     * When set, checkpoint metadata (TableStatus, IndexStatus, table/index definitions,
+     * checkpoint LSN) is also published to remote storage so that shared-storage read
+     * replicas can consume it.
+     */
+    private volatile SharedCheckpointMetadataManager sharedCheckpointMetadataManager;
+
+    /**
      * Tracks the set of active data page IDs as of the last successful tableCheckpoint per
      * "{tableSpace}/{uuid}" key. Used to compute the stale-page diff without a full remote listFiles.
      * Populated on the first checkpoint after boot (via listFiles fallback); subsequent checkpoints
@@ -96,6 +103,13 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
                 localMetadataDir, tmpDir, swapThreshold,
                 false, false, false, false, false,
                 new NullStatsLogger());
+    }
+
+    /**
+     * Enables publication of checkpoint metadata to remote storage for shared-storage read replicas.
+     */
+    public void setSharedCheckpointMetadataManager(SharedCheckpointMetadataManager manager) {
+        this.sharedCheckpointMetadataManager = manager;
     }
 
     // -------------------------------------------------------------------------
@@ -351,6 +365,13 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
             }
         }
         lastCheckpointedDataPages.put(key, new HashSet<>(currentActivePages));
+
+        // Publish to shared storage for read replicas
+        SharedCheckpointMetadataManager shared = this.sharedCheckpointMetadataManager;
+        if (shared != null) {
+            shared.writeTableStatus(tableSpace, uuid, tableStatus);
+        }
+
         return result;
     }
 
@@ -395,6 +416,13 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
             }
         }
         lastCheckpointedIndexPages.put(key, new HashSet<>(currentActivePages));
+
+        // Publish to shared storage for read replicas
+        SharedCheckpointMetadataManager shared = this.sharedCheckpointMetadataManager;
+        if (shared != null) {
+            shared.writeIndexStatus(tableSpace, uuid, indexStatus);
+        }
+
         return result;
     }
 
@@ -529,20 +557,49 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
     public Collection<PostCheckpointAction> writeTables(String tableSpace,
             LogSequenceNumber sequenceNumber, List<Table> tables, List<Index> indexlist,
             boolean prepareActions) throws DataStorageManagerException {
-        return localMetadataManager.writeTables(tableSpace, sequenceNumber, tables, indexlist, prepareActions);
+        Collection<PostCheckpointAction> result =
+                localMetadataManager.writeTables(tableSpace, sequenceNumber, tables, indexlist, prepareActions);
+
+        // Publish to shared storage for read replicas
+        SharedCheckpointMetadataManager shared = this.sharedCheckpointMetadataManager;
+        if (shared != null) {
+            shared.writeTableDefinitions(tableSpace, sequenceNumber, tables);
+            shared.writeIndexDefinitions(tableSpace, sequenceNumber, indexlist);
+        }
+
+        return result;
     }
 
     @Override
     public Collection<PostCheckpointAction> writeCheckpointSequenceNumber(String tableSpace,
             LogSequenceNumber sequenceNumber) throws DataStorageManagerException {
-        return localMetadataManager.writeCheckpointSequenceNumber(tableSpace, sequenceNumber);
+        Collection<PostCheckpointAction> result =
+                localMetadataManager.writeCheckpointSequenceNumber(tableSpace, sequenceNumber);
+
+        // Publish to shared storage for read replicas — this is written LAST,
+        // acting as the atomic commit marker for the checkpoint metadata
+        SharedCheckpointMetadataManager shared = this.sharedCheckpointMetadataManager;
+        if (shared != null) {
+            shared.writeCheckpointLsn(tableSpace, sequenceNumber);
+        }
+
+        return result;
     }
 
     @Override
     public Collection<PostCheckpointAction> writeTransactionsAtCheckpoint(String tableSpace,
             LogSequenceNumber sequenceNumber, Collection<Transaction> transactions)
             throws DataStorageManagerException {
-        return localMetadataManager.writeTransactionsAtCheckpoint(tableSpace, sequenceNumber, transactions);
+        Collection<PostCheckpointAction> result =
+                localMetadataManager.writeTransactionsAtCheckpoint(tableSpace, sequenceNumber, transactions);
+
+        // Publish to shared storage for read replicas
+        SharedCheckpointMetadataManager shared = this.sharedCheckpointMetadataManager;
+        if (shared != null) {
+            shared.writeTransactions(tableSpace, sequenceNumber, transactions);
+        }
+
+        return result;
     }
 
     @Override

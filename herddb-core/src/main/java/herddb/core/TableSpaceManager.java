@@ -189,6 +189,7 @@ public class TableSpaceManager {
     private final AtomicLong newTransactionId = new AtomicLong();
     private final DBManager dbmanager;
     private volatile FollowerThread followerThread;
+    private volatile CheckpointFollowerThread checkpointFollowerThread;
     private final ExecutorService callbacksExecutor;
     private final boolean virtual;
 
@@ -433,7 +434,12 @@ public class TableSpaceManager {
             }
         });
 
-        if (LogSequenceNumber.START_OF_TIME.equals(logSequenceNumber)
+        if (dbmanager.getMode().equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)) {
+            // In shared-storage mode, replicas get their state from S3 checkpoints.
+            // No WAL replay needed — the CheckpointFollowerThread will handle updates.
+            LOGGER.log(Level.INFO, "{0} shared-storage mode: skipping WAL recovery for {1}, state loaded from checkpoint at {2}",
+                    new Object[]{nodeId, tableSpaceName, logSequenceNumber});
+        } else if (LogSequenceNumber.START_OF_TIME.equals(logSequenceNumber)
                 && dbmanager.getServerConfiguration().getBoolean(ServerConfiguration.PROPERTY_BOOT_FORCE_DOWNLOAD_SNAPSHOT, ServerConfiguration.PROPERTY_BOOT_FORCE_DOWNLOAD_SNAPSHOT_DEFAULT)) {
             LOGGER.log(Level.SEVERE, nodeId + " full recovery of data is forced (" + ServerConfiguration.PROPERTY_BOOT_FORCE_DOWNLOAD_SNAPSHOT + "=true) for tableSpace " + tableSpaceName);
             downloadTableSpaceData();
@@ -448,7 +454,8 @@ public class TableSpaceManager {
             }
         }
         recoveryInProgress = false;
-        if (!LogSequenceNumber.START_OF_TIME.equals(actualLogSequenceNumber)) {
+        if (!dbmanager.getMode().equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)
+                && !LogSequenceNumber.START_OF_TIME.equals(actualLogSequenceNumber)) {
             LOGGER.log(Level.INFO, "Recovery finished for {0} seqNum {1}", new Object[]{tableSpaceName, actualLogSequenceNumber});
             checkpoint(false, false, false);
         }
@@ -1346,10 +1353,222 @@ public class TableSpaceManager {
     private void startAsFollower() throws DataStorageManagerException, LogNotAvailableException {
         if (dbmanager.getMode().equals(ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER)) {
             // in diskless cluster mode there is no need to really 'follow' the leader
+        } else if (dbmanager.getMode().equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)) {
+            // shared-storage mode: follow checkpoints from S3 via ZK watches
+            checkpointFollowerThread = new CheckpointFollowerThread();
+            dbmanager.submit(checkpointFollowerThread);
         } else {
             followerThread = new FollowerThread();
             dbmanager.submit(followerThread);
         }
+    }
+
+    /**
+     * Follower thread for shared-storage mode. Instead of replaying WAL entries,
+     * it watches ZooKeeper for checkpoint LSN updates and loads the new checkpoint
+     * state from S3.
+     */
+    private class CheckpointFollowerThread implements Runnable {
+
+        private volatile CountDownLatch running = new CountDownLatch(1);
+        private final Object notifyLock = new Object();
+        private volatile boolean notified = false;
+
+        @Override
+        public String toString() {
+            return "CheckpointFollowerThread{" + tableSpaceName + '}';
+        }
+
+        void notifyCheckpointAvailable() {
+            synchronized (notifyLock) {
+                notified = true;
+                notifyLock.notifyAll();
+            }
+        }
+
+        @Override
+        public void run() {
+            try {
+                long pollInterval = dbmanager.getServerConfiguration().getLong(
+                        ServerConfiguration.PROPERTY_REPLICA_CHECKPOINT_POLL_INTERVAL,
+                        ServerConfiguration.PROPERTY_REPLICA_CHECKPOINT_POLL_INTERVAL_DEFAULT);
+
+                // Set up ZK watch for checkpoint notifications
+                try {
+                    metadataStorageManager.watchCheckpointLsn(tableSpaceUUID, (lsn) -> {
+                        LOGGER.log(Level.INFO, "Checkpoint notification for {0}: {1}", new Object[]{tableSpaceName, lsn});
+                        notifyCheckpointAvailable();
+                    });
+                } catch (MetadataStorageManagerException err) {
+                    LOGGER.log(Level.WARNING, "Failed to set up checkpoint watch for " + tableSpaceName
+                            + ", will rely on polling", err);
+                }
+
+                while (!isLeader() && !closed) {
+                    // Wait for notification or poll interval
+                    synchronized (notifyLock) {
+                        if (!notified) {
+                            try {
+                                notifyLock.wait(pollInterval);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                break;
+                            }
+                        }
+                        notified = false;
+                    }
+
+                    if (isLeader() || closed) {
+                        break;
+                    }
+
+                    // Check for a new checkpoint
+                    try {
+                        LogSequenceNumber newLsn = metadataStorageManager.getCheckpointLsn(tableSpaceUUID);
+                        if (newLsn != null && !newLsn.isStartOfTime()
+                                && (actualLogSequenceNumber == null
+                                    || actualLogSequenceNumber.isStartOfTime()
+                                    || newLsn.after(actualLogSequenceNumber))) {
+                            LOGGER.log(Level.INFO, "Refreshing {0} from checkpoint {1} (current: {2})",
+                                    new Object[]{tableSpaceName, newLsn, actualLogSequenceNumber});
+                            refreshFromCheckpoint(newLsn);
+                        }
+                    } catch (Exception err) {
+                        LOGGER.log(Level.WARNING, "Error refreshing from checkpoint for " + tableSpaceName, err);
+                    }
+                }
+            } catch (Throwable t) {
+                LOGGER.log(Level.SEVERE, "checkpoint follower error " + tableSpaceName, t);
+                setFailed();
+            } finally {
+                running.countDown();
+            }
+        }
+
+        void waitForStop() throws InterruptedException {
+            LOGGER.log(Level.INFO, "Waiting for CheckpointFollowerThread of {0} to stop", tableSpaceName);
+            running.await();
+            LOGGER.log(Level.INFO, "CheckpointFollowerThread of {0} stopped", tableSpaceName);
+        }
+    }
+
+    /**
+     * Atomically switches the replica's in-memory state to a new checkpoint from S3.
+     * <p>
+     * This method:
+     * 1. Reads new metadata from S3 (outside the lock)
+     * 2. Acquires the write lock to block queries
+     * 3. Disposes old tables/indexes, boots new ones from checkpoint
+     * 4. Updates actualLogSequenceNumber
+     * 5. Releases the write lock
+     */
+    void refreshFromCheckpoint(LogSequenceNumber newLsn)
+            throws DataStorageManagerException, MetadataStorageManagerException {
+        long _start = System.currentTimeMillis();
+
+        // Phase 1: Read new metadata from S3 (outside lock)
+        List<Table> newTables = dataStorageManager.loadTables(newLsn, tableSpaceUUID);
+        List<Index> newIndexes = dataStorageManager.loadIndexes(newLsn, tableSpaceUUID);
+
+        // Phase 2: Acquire write lock and swap state
+        long switchTimeout = dbmanager.getServerConfiguration().getLong(
+                ServerConfiguration.PROPERTY_REPLICA_CHECKPOINT_SWITCH_TIMEOUT,
+                ServerConfiguration.PROPERTY_REPLICA_CHECKPOINT_SWITCH_TIMEOUT_DEFAULT);
+
+        long lockStamp = acquireWriteLock("refreshFromCheckpoint");
+        try {
+            // Build sets of current and new table names
+            Set<String> currentTableNames = new HashSet<>();
+            for (AbstractTableManager tm : tables.values()) {
+                if (!tm.isSystemTable()) {
+                    currentTableNames.add(tm.getTable().name);
+                }
+            }
+            Set<String> newTableNames = new HashSet<>();
+            for (Table t : newTables) {
+                newTableNames.add(t.name);
+            }
+
+            // Dispose tables that no longer exist
+            for (String tableName : currentTableNames) {
+                if (!newTableNames.contains(tableName)) {
+                    AbstractTableManager tm = tables.get(tableName);
+                    if (tm != null) {
+                        LOGGER.log(Level.INFO, "refreshFromCheckpoint: dropping table {0}.{1}",
+                                new Object[]{tableSpaceName, tableName});
+                        // Close the table manager (but don't drop remote data — we don't own it)
+                        tm.close();
+                        tables.remove(tableName);
+                        // Remove associated indexes
+                        Map<String, AbstractIndexManager> tableIndexes = indexesByTable.remove(tableName);
+                        if (tableIndexes != null) {
+                            for (AbstractIndexManager idx : tableIndexes.values()) {
+                                idx.close();
+                                indexes.remove(idx.getIndex().name);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Close all existing non-system table managers (they'll be re-booted fresh)
+            for (String tableName : new ArrayList<>(currentTableNames)) {
+                if (newTableNames.contains(tableName)) {
+                    AbstractTableManager tm = tables.get(tableName);
+                    if (tm != null) {
+                        tm.close();
+                        tables.remove(tableName);
+                    }
+                }
+            }
+
+            // Close all existing non-system index managers
+            for (AbstractIndexManager idx : new ArrayList<>(indexes.values())) {
+                idx.close();
+                indexes.remove(idx.getIndex().name);
+            }
+            indexesByTable.clear();
+
+            // Boot all tables fresh from the new checkpoint
+            for (Table table : newTables) {
+                try {
+                    TableManager tableManager = new TableManager(
+                            table, log, dbmanager.getMemoryManager(), dataStorageManager, this, tableSpaceUUID, 0);
+                    tables.put(table.name, tableManager);
+                    tableManager.start(false);
+                    LOGGER.log(Level.FINE, "refreshFromCheckpoint: booted table {0}.{1}",
+                            new Object[]{tableSpaceName, table.name});
+                } catch (Exception err) {
+                    LOGGER.log(Level.SEVERE, "refreshFromCheckpoint: failed to boot table " + table.name, err);
+                }
+            }
+
+            // Boot all indexes fresh from the new checkpoint
+            for (Index index : newIndexes) {
+                AbstractTableManager tableManager = tables.get(index.table);
+                if (tableManager != null) {
+                    try {
+                        bootIndex(index, tableManager, false, 0, false, false);
+                        LOGGER.log(Level.FINE, "refreshFromCheckpoint: booted index {0}.{1}.{2}",
+                                new Object[]{tableSpaceName, index.table, index.name});
+                    } catch (Exception err) {
+                        LOGGER.log(Level.SEVERE, "refreshFromCheckpoint: failed to boot index " + index.name, err);
+                    }
+                }
+            }
+
+            // Update the tablespace LSN
+            actualLogSequenceNumber = newLsn;
+
+            dbmanager.getPlanner().clearCache();
+
+        } finally {
+            releaseWriteLock(lockStamp, "refreshFromCheckpoint");
+        }
+
+        long _stop = System.currentTimeMillis();
+        LOGGER.log(Level.INFO, "refreshFromCheckpoint for {0} completed at {1}, took {2} ms",
+                new Object[]{tableSpaceName, newLsn, (_stop - _start)});
     }
 
     private void startAsLeader(int expectedReplicaCount) throws DataStorageManagerException, DDLException, LogNotAvailableException {
@@ -2061,6 +2280,15 @@ public class TableSpaceManager {
                 LOGGER.log(Level.SEVERE, "Cannot wait for FollowerThread to stop", err);
             }
         }
+        if (checkpointFollowerThread != null) {
+            checkpointFollowerThread.notifyCheckpointAvailable(); // wake it up so it sees closed=true
+            try {
+                checkpointFollowerThread.waitForStop();
+            } catch (InterruptedException err) {
+                Thread.currentThread().interrupt();
+                LOGGER.log(Level.SEVERE, "Cannot wait for CheckpointFollowerThread to stop", err);
+            }
+        }
         if (!virtual) {
             long lockStamp = acquireWriteLock("closeTablespace");
             try {
@@ -2204,6 +2432,8 @@ public class TableSpaceManager {
                     actions.addAll(dataStorageManager.writeCheckpointSequenceNumber(tableSpaceUUID, logSequenceNumber));
                     if (leader) {
                         log.dropOldLedgers(logSequenceNumber);
+                        // Notify shared-storage read replicas of the new checkpoint
+                        publishCheckpointLsnToMetadata(logSequenceNumber);
                     }
                     _logSequenceNumber = log.getLastSequenceNumber();
                 } catch (DataStorageManagerException | LogNotAvailableException ex) {
@@ -2293,6 +2523,8 @@ public class TableSpaceManager {
                     /* Indexes checkpoint is handled by TableManagers */
                     if (leader) {
                         log.dropOldLedgers(logSequenceNumber);
+                        // Notify shared-storage read replicas of the new checkpoint
+                        publishCheckpointLsnToMetadata(logSequenceNumber);
                     }
 
                     _logSequenceNumber = log.getLastSequenceNumber();
@@ -2314,6 +2546,14 @@ public class TableSpaceManager {
             LOGGER.log(Level.INFO, "{0} checkpoint finish {1} started ad {2}, finished at {3}, total time {4} ms",
                     new Object[]{nodeId, tableSpaceName, logSequenceNumber, _logSequenceNumber, Long.toString(_stop - _start)});
             checkpointTimeStats.registerSuccessfulEvent(_stop, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void publishCheckpointLsnToMetadata(LogSequenceNumber logSequenceNumber) {
+        try {
+            metadataStorageManager.publishCheckpointLsn(tableSpaceUUID, logSequenceNumber);
+        } catch (Exception err) {
+            LOGGER.log(Level.WARNING, "Failed to publish checkpoint LSN to metadata for " + tableSpaceName, err);
         }
     }
 

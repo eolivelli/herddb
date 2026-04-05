@@ -242,7 +242,13 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         this.manager.setAbandonedTransactionsTimeout(configuration.getLong(ServerConfiguration.PROPERTY_ABANDONED_TRANSACTIONS_TIMEOUT, ServerConfiguration.PROPERTY_ABANDONED_TRANSACTIONS_TIMEOUT_DEFAULT));
 
         boolean enforeLeadership = configuration.getBoolean(ServerConfiguration.PROPERTY_ENFORCE_LEADERSHIP, ServerConfiguration.PROPERTY_ENFORCE_LEADERSHIP_DEFAULT);
-        this.manager.setErrorIfNotLeader(enforeLeadership);
+        if (mode.equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)) {
+            // shared-storage replicas allow reads from followers but reject writes
+            this.manager.setErrorIfNotLeader(false);
+            this.manager.setReadOnlyReplica(true);
+        } else {
+            this.manager.setErrorIfNotLeader(enforeLeadership);
+        }
 
         this.networkServer = buildChannelAcceptor();
         this.networkServer.setAcceptor(this);
@@ -316,6 +322,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 return new FileMetadataStorageManager(metadataDirectory);
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
             case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER:
+            case ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE:
                 return new ZookeeperMetadataStorageManager(configuration.getString(ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS_DEFAULT),
                         configuration.getInt(ServerConfiguration.PROPERTY_ZOOKEEPER_SESSIONTIMEOUT, ServerConfiguration.PROPERTY_ZOOKEEPER_SESSIONTIMEOUT_DEFAULT),
                         configuration.getString(ServerConfiguration.PROPERTY_ZOOKEEPER_PATH, ServerConfiguration.PROPERTY_ZOOKEEPER_PATH_DEFAULT));
@@ -325,6 +332,10 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
     }
 
     private DataStorageManager buildDataStorageManager(String nodeId) {
+        // shared-storage mode forces remote storage
+        if (mode.equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)) {
+            return buildSharedStorageDataManager(nodeId);
+        }
         String defaultStorageMode = mode.equals(ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER)
                 ? ServerConfiguration.PROPERTY_STORAGE_MODE_BOOKKEEPER
                 : ServerConfiguration.PROPERTY_STORAGE_MODE_LOCAL;
@@ -405,7 +416,21 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                     }
                     Class<?> storageClass = Class.forName("herddb.remote.RemoteFileDataStorageManager");
                     Constructor<?> ctor = storageClass.getConstructor(Path.class, Path.class, int.class, clientClass);
-                    return (DataStorageManager) ctor.newInstance(dataDirectory, tmpDirectory, diskswapThreshold, client);
+                    Object dsm = ctor.newInstance(dataDirectory, tmpDirectory, diskswapThreshold, client);
+
+                    // Optionally enable checkpoint metadata publication to S3 for read replicas
+                    boolean publishToRemote = configuration.getBoolean(
+                            ServerConfiguration.PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE,
+                            ServerConfiguration.PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE_DEFAULT);
+                    if (publishToRemote) {
+                        LOGGER.log(Level.INFO, "Checkpoint metadata publication to remote storage enabled");
+                        Class<?> metaMgrClass = Class.forName("herddb.remote.SharedCheckpointMetadataManager");
+                        Object metaMgr = metaMgrClass.getConstructor(clientClass).newInstance(client);
+                        storageClass.getMethod("setSharedCheckpointMetadataManager", metaMgrClass)
+                                .invoke(dsm, metaMgr);
+                    }
+
+                    return (DataStorageManager) dsm;
                 } catch (ReflectiveOperationException e) {
                     throw new RuntimeException("Cannot create RemoteFileDataStorageManager. "
                             + "Ensure herddb-remote-file-service is on the classpath.", e);
@@ -413,6 +438,69 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
             }
             default:
                 throw new RuntimeException("invalid " + ServerConfiguration.PROPERTY_STORAGE_MODE + "=" + storageMode);
+        }
+    }
+
+    private DataStorageManager buildSharedStorageDataManager(String nodeId) {
+        int diskswapThreshold = configuration.getInt(ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS, ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS_DEFAULT);
+        String remoteServersConfig = configuration.getString(ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS, ServerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
+        List<String> servers;
+        boolean useZKDiscovery = false;
+        if (!remoteServersConfig.isEmpty()) {
+            servers = Arrays.asList(remoteServersConfig.split(","));
+            LOGGER.log(Level.INFO, "Shared-storage remote file services (static): {0}", servers);
+        } else {
+            try {
+                servers = metadataStorageManager.listFileServers();
+                useZKDiscovery = true;
+                LOGGER.log(Level.INFO, "Shared-storage remote file services (ZK discovery): {0}", servers);
+            } catch (Exception e) {
+                servers = Collections.emptyList();
+                LOGGER.log(Level.WARNING, "Failed to discover remote file servers via ZK for shared-storage", e);
+            }
+        }
+        Map<String, Object> clientConfig = new HashMap<>();
+        clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT,
+                configuration.getLong(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT,
+                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_TIMEOUT_DEFAULT));
+        clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
+                configuration.getInt(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
+                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT));
+        try {
+            Class<?> clientClass = Class.forName("herddb.remote.RemoteFileServiceClient");
+            Object client = clientClass.getConstructor(List.class, Map.class).newInstance(servers, clientConfig);
+            // Set up ZK-based discovery listener if applicable
+            if (useZKDiscovery && client instanceof DynamicServiceClient) {
+                DynamicServiceClient dynamicClient = (DynamicServiceClient) client;
+                metadataStorageManager.addServiceDiscoveryListener(
+                        new herddb.metadata.ServiceDiscoveryListener() {
+                            @Override
+                            public void onIndexingServicesChanged(List<String> currentAddresses) {
+                            }
+                            @Override
+                            public void onFileServersChanged(List<String> currentAddresses) {
+                                LOGGER.log(Level.INFO, "Remote file servers changed via ZK (shared-storage): {0}",
+                                        currentAddresses);
+                                dynamicClient.updateServers(currentAddresses);
+                            }
+                        });
+            }
+            // Create SharedCheckpointMetadataManager + ReadReplicaDataStorageManager
+            // wrapped in PromotableRemoteFileDataStorageManager for failover support
+            Class<?> metaMgrClass = Class.forName("herddb.remote.SharedCheckpointMetadataManager");
+            Object metaMgr = metaMgrClass.getConstructor(clientClass).newInstance(client);
+            Class<?> readReplicaClass = Class.forName("herddb.remote.ReadReplicaDataStorageManager");
+            Constructor<?> readReplicaCtor = readReplicaClass.getConstructor(clientClass, metaMgrClass, Path.class, int.class);
+            Object readReplica = readReplicaCtor.newInstance(client, metaMgr, tmpDirectory, diskswapThreshold);
+
+            Class<?> promotableClass = Class.forName("herddb.remote.PromotableRemoteFileDataStorageManager");
+            Constructor<?> promotableCtor = promotableClass.getConstructor(
+                    readReplicaClass, clientClass, metaMgrClass, Path.class, Path.class, int.class);
+            return (DataStorageManager) promotableCtor.newInstance(
+                    readReplica, client, metaMgr, dataDirectory, tmpDirectory, diskswapThreshold);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException("Cannot create PromotableRemoteFileDataStorageManager. "
+                    + "Ensure herddb-remote-file-service is on the classpath.", e);
         }
     }
 
@@ -435,6 +523,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 );
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
             case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER:
+            case ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE:
                 BookkeeperCommitLogManager bkmanager = new BookkeeperCommitLogManager((ZookeeperMetadataStorageManager) this.metadataStorageManager, configuration, statsLogger);
                 bkmanager.setAckQuorumSize(configuration.getInt(ServerConfiguration.PROPERTY_BOOKKEEPER_ACKQUORUMSIZE, ServerConfiguration.PROPERTY_BOOKKEEPER_ACKQUORUMSIZE_DEFAULT));
                 bkmanager.setEnsemble(configuration.getInt(ServerConfiguration.PROPERTY_BOOKKEEPER_ENSEMBLE, ServerConfiguration.PROPERTY_BOOKKEEPER_ENSEMBLE_DEFAULT));
@@ -468,6 +557,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
             case ServerConfiguration.PROPERTY_MODE_STANDALONE:
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
             case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER:
+            case ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE:
                 return new LocalNodeIdManager(dataDirectory);
             default:
                 throw new RuntimeException();

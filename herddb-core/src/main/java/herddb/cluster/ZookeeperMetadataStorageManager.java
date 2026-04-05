@@ -21,6 +21,7 @@ package herddb.cluster;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import herddb.log.LogNotAvailableException;
+import herddb.log.LogSequenceNumber;
 import herddb.metadata.MetadataStorageManager;
 import herddb.metadata.MetadataStorageManagerException;
 import herddb.model.DDLException;
@@ -35,8 +36,10 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.zookeeper.CreateMode;
@@ -66,7 +69,11 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
     private final String nodesPath;
     private final String indexingServicesPath;
     private final String fileServersPath;
+    private final String checkpointsPath;
     private volatile boolean started;
+
+    // Checkpoint LSN watchers for shared-storage read replicas
+    private final ConcurrentHashMap<String, Consumer<LogSequenceNumber>> checkpointWatchers = new ConcurrentHashMap<>();
 
     // For re-registration after session expiry
     private volatile String registeredIndexingServiceId;
@@ -188,6 +195,7 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
         this.nodesPath = basePath + "/nodes";
         this.indexingServicesPath = basePath + "/indexingServices";
         this.fileServersPath = basePath + "/fileServers";
+        this.checkpointsPath = basePath + "/checkpoints"; // checkpoints/TABLESPACEUUID
     }
 
     @Override
@@ -723,6 +731,129 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
             handleSessionExpiredError(err);
             throw new MetadataStorageManagerException(err);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Checkpoint LSN notification for shared-storage read replicas
+    // -------------------------------------------------------------------------
+
+    private static byte[] serializeLsn(LogSequenceNumber lsn) {
+        // Simple format: "ledgerId:offset" as UTF-8
+        return (lsn.ledgerId + ":" + lsn.offset).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static LogSequenceNumber deserializeLsn(byte[] data) {
+        if (data == null || data.length == 0) {
+            return LogSequenceNumber.START_OF_TIME;
+        }
+        String s = new String(data, StandardCharsets.UTF_8);
+        String[] parts = s.split(":");
+        if (parts.length != 2) {
+            return LogSequenceNumber.START_OF_TIME;
+        }
+        try {
+            return new LogSequenceNumber(Long.parseLong(parts[0]), Long.parseLong(parts[1]));
+        } catch (NumberFormatException e) {
+            return LogSequenceNumber.START_OF_TIME;
+        }
+    }
+
+    @Override
+    public void publishCheckpointLsn(String tableSpaceUUID, LogSequenceNumber lsn) throws MetadataStorageManagerException {
+        try {
+            String path = checkpointsPath + "/" + tableSpaceUUID;
+            byte[] data = serializeLsn(lsn);
+            try {
+                ensureZooKeeper().setData(path, data, -1);
+            } catch (KeeperException.NoNodeException notExists) {
+                try {
+                    ensureZooKeeper().create(checkpointsPath, new byte[0],
+                            ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                } catch (KeeperException.NodeExistsException existsRoot) {
+                    // ignore
+                }
+                try {
+                    ensureZooKeeper().create(path, data,
+                            ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                } catch (KeeperException.NodeExistsException exists) {
+                    // race: another node created it, just set
+                    ensureZooKeeper().setData(path, data, -1);
+                }
+            }
+            LOGGER.log(Level.FINE, "Published checkpoint LSN {0} for tablespace {1}",
+                    new Object[]{lsn, tableSpaceUUID});
+        } catch (InterruptedException | KeeperException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public LogSequenceNumber getCheckpointLsn(String tableSpaceUUID) throws MetadataStorageManagerException {
+        try {
+            String path = checkpointsPath + "/" + tableSpaceUUID;
+            Stat stat = new Stat();
+            byte[] data = ensureZooKeeper().getData(path, false, stat);
+            return deserializeLsn(data);
+        } catch (KeeperException.NoNodeException notExists) {
+            return LogSequenceNumber.START_OF_TIME;
+        } catch (InterruptedException | KeeperException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public void watchCheckpointLsn(String tableSpaceUUID, Consumer<LogSequenceNumber> callback) throws MetadataStorageManagerException {
+        checkpointWatchers.put(tableSpaceUUID, callback);
+        try {
+            String path = checkpointsPath + "/" + tableSpaceUUID;
+            // Ensure parent and node exist
+            try {
+                ensureZooKeeper().create(checkpointsPath, new byte[0],
+                        ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            } catch (KeeperException.NodeExistsException e) {
+                // ignore
+            }
+            try {
+                ensureZooKeeper().create(path, new byte[0],
+                        ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            } catch (KeeperException.NodeExistsException e) {
+                // ignore
+            }
+            // Set the watch
+            installCheckpointWatch(tableSpaceUUID, path);
+        } catch (InterruptedException | KeeperException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    private void installCheckpointWatch(String tableSpaceUUID, String path) throws KeeperException, InterruptedException, IOException {
+        Watcher watcher = (WatchedEvent event) -> {
+            if (event.getType() == Watcher.Event.EventType.NodeDataChanged) {
+                Consumer<LogSequenceNumber> cb = checkpointWatchers.get(tableSpaceUUID);
+                if (cb != null) {
+                    try {
+                        Stat stat = new Stat();
+                        byte[] data = ensureZooKeeper().getData(path, false, stat);
+                        LogSequenceNumber lsn = deserializeLsn(data);
+                        // Re-install the watch before calling the callback
+                        installCheckpointWatch(tableSpaceUUID, path);
+                        cb.accept(lsn);
+                    } catch (Exception e) {
+                        LOGGER.log(Level.WARNING, "Error processing checkpoint watch for " + tableSpaceUUID, e);
+                        // Try to re-install the watch
+                        try {
+                            installCheckpointWatch(tableSpaceUUID, path);
+                        } catch (Exception reInstallError) {
+                            LOGGER.log(Level.SEVERE, "Failed to re-install checkpoint watch for " + tableSpaceUUID, reInstallError);
+                        }
+                    }
+                }
+            }
+        };
+        ensureZooKeeper().getData(path, watcher, null);
     }
 
 }
