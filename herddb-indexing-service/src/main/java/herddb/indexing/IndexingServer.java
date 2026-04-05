@@ -181,11 +181,30 @@ public class IndexingServer implements AutoCloseable {
                     Class<?> storageClass = Class.forName("herddb.remote.RemoteFileDataStorageManager");
                     Constructor<?> ctor = storageClass.getConstructor(
                             Path.class, Path.class, int.class, clientClass);
+                    // Give the RemoteFileDataStorageManager its own subdir
+                    // under the indexing data dir. The wrapped
+                    // FileDataStorageManager wipes its tmp dir on close(),
+                    // so it must NOT overlap with sibling state that we
+                    // want to survive restarts (e.g. WatermarkStore's
+                    // watermark.dat, which sits directly in {dataDir}).
+                    // The wrapped FileDataStorageManager wipes its tmpDir on
+                    // both start() and close(). Keeping the metadata dir
+                    // separate from the tmp dir means IndexStatus checkpoint
+                    // markers written to disk survive restarts. Both live
+                    // under {dataDir}/... so they stay inside the
+                    // indexing-service data directory (never on S3).
+                    Path remoteMetaDir = dataDir.resolve("remote-metadata");
+                    Path remoteTmpDir = dataDir.resolve("remote-tmp");
+                    java.nio.file.Files.createDirectories(remoteMetaDir);
+                    java.nio.file.Files.createDirectories(remoteTmpDir);
                     return (DataStorageManager) ctor.newInstance(
-                            dataDir, dataDir, Integer.MAX_VALUE, client);
+                            remoteMetaDir, remoteTmpDir, Integer.MAX_VALUE, client);
                 } catch (ReflectiveOperationException e) {
                     throw new RuntimeException("Cannot create RemoteFileDataStorageManager. "
                             + "Ensure herddb-remote-file-service is on the classpath.", e);
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException(
+                            "Cannot create RemoteFileDataStorageManager metadata directory", e);
                 }
             }
             case "file":

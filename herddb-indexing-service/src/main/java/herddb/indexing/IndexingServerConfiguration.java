@@ -54,6 +54,32 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_LOG_DIR = "indexing.log.dir";
     public static final String PROPERTY_LOG_DIR_DEFAULT = "txlog";
 
+    /**
+     * Directory used by the indexing service for <b>local-only</b> state:
+     * {@code watermark.dat} (the commit-log cursor), the
+     * {@code RemoteFileDataStorageManager}'s local metadata cache
+     * ({@code {dataDir}/remote-metadata}) and its transient scratch space
+     * ({@code {dataDir}/remote-tmp}), plus per-segment <em>transient</em>
+     * checkpoint work files created by {@code PersistentVectorStore}.
+     *
+     * <p>None of the files in this directory are ever uploaded to the remote
+     * file service — vector graph and map pages flow through
+     * {@code DataStorageManager.writeIndexPage} directly to S3. Operators
+     * should size this directory for:
+     * <ul>
+     *   <li>~60–200 MB peak per segment during FusedPQ Phase B,
+     *       multiplied by {@code herddb.vectorindex.phaseBSegmentParallelism}
+     *       (default 2);</li>
+     *   <li>one transient map tmp file per segment reload on restart
+     *       (deleted immediately afterwards, ~20–100 MB depending on the
+     *       PK width);</li>
+     *   <li>the {@code RemoteFileDataStorageManager} local metadata
+     *       (checkpoint markers), which grows linearly with the number of
+     *       tablespaces/indexes but is typically &lt; 10 MB.</li>
+     * </ul>
+     *
+     * <p><b>Recommended free space</b>: 500 MB.
+     */
     public static final String PROPERTY_DATA_DIR = "indexing.data.dir";
     public static final String PROPERTY_DATA_DIR_DEFAULT = "data";
 

@@ -2220,10 +2220,14 @@ public class TableSpaceManager {
                         writeLockTimeout, readLockTimeout);
                 break;
             case Index.TYPE_VECTOR:
+                // Use a supplier so that the RemoteVectorIndexService can be
+                // swapped at runtime (e.g. when the indexing-service client
+                // reconnects after a restart) without rebuilding this
+                // VectorIndexManager.
                 indexManager = new VectorIndexManager(index, tableManager, log,
                         dataStorageManager, tableSpaceUUID, transaction,
                         writeLockTimeout, readLockTimeout,
-                        dbmanager.getRemoteVectorIndexService());
+                        dbmanager::getRemoteVectorIndexService);
                 break;
             default:
                 throw new DataStorageManagerException("invalid NON-UNIQUE index type " + index.type);
