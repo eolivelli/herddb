@@ -30,6 +30,7 @@ import herddb.indexing.proto.SearchResult;
 import herddb.log.LogSequenceNumber;
 import herddb.server.DynamicServiceClient;
 import herddb.utils.Bytes;
+import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import java.util.AbstractMap;
@@ -66,6 +67,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
 
     private volatile ServerSnapshot snapshot;
     private final long timeoutSeconds;
+    private final ClientInterceptor clientInterceptor;
 
     private static class ServerSnapshot {
         final List<String> servers;
@@ -78,7 +80,12 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     }
 
     public IndexingServiceClient(List<String> servers, long timeoutSeconds) {
+        this(servers, timeoutSeconds, null);
+    }
+
+    public IndexingServiceClient(List<String> servers, long timeoutSeconds, ClientInterceptor clientInterceptor) {
         this.timeoutSeconds = timeoutSeconds;
+        this.clientInterceptor = clientInterceptor;
         Map<String, ManagedChannel> channels = new HashMap<>();
         for (String server : servers) {
             channels.put(server, buildChannel(server));
@@ -90,12 +97,15 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         this(servers, DEFAULT_TIMEOUT_SECONDS);
     }
 
-    private static ManagedChannel buildChannel(String server) {
-        return ManagedChannelBuilder.forTarget(server)
+    private ManagedChannel buildChannel(String server) {
+        ManagedChannelBuilder<?> b = ManagedChannelBuilder.forTarget(server)
                 .usePlaintext()
                 .keepAliveTime(300, TimeUnit.SECONDS)
-                .keepAliveTimeout(20, TimeUnit.SECONDS)
-                .build();
+                .keepAliveTimeout(20, TimeUnit.SECONDS);
+        if (clientInterceptor != null) {
+            b.intercept(clientInterceptor);
+        }
+        return b.build();
     }
 
     @Override

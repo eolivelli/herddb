@@ -238,6 +238,13 @@ public final class IndexingServerConfiguration {
         return this.properties.getProperty(key, defaultValue);
     }
 
+    /** Returns a copy of the underlying {@link Properties}. */
+    public Properties asProperties() {
+        Properties copy = new Properties();
+        copy.putAll(this.properties);
+        return copy;
+    }
+
     public IndexingServerConfiguration set(String key, Object value) {
         if (value == null) {
             this.properties.remove(key);
