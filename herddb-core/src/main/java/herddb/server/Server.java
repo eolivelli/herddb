@@ -20,6 +20,10 @@
 
 package herddb.server;
 
+import herddb.auth.oidc.OidcConfiguration;
+import herddb.auth.oidc.OidcTokenValidator;
+import herddb.auth.oidc.PrincipalExtractor;
+import herddb.auth.oidc.sasl.TokenAuthenticator;
 import herddb.client.ClientConfiguration;
 import herddb.cluster.BookKeeperDataStorageManager;
 import herddb.cluster.BookkeeperCommitLogManager;
@@ -46,10 +50,6 @@ import herddb.network.ServerSideConnection;
 import herddb.network.ServerSideConnectionAcceptor;
 import herddb.network.netty.NettyChannelAcceptor;
 import herddb.network.netty.NetworkUtils;
-import herddb.auth.oidc.OidcConfiguration;
-import herddb.auth.oidc.OidcTokenValidator;
-import herddb.auth.oidc.PrincipalExtractor;
-import herddb.auth.oidc.sasl.TokenAuthenticator;
 import herddb.security.SimpleSingleUserManager;
 import herddb.security.UserManager;
 import herddb.storage.DataStorageManager;

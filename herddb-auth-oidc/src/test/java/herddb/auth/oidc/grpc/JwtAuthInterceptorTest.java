@@ -82,7 +82,9 @@ public class JwtAuthInterceptorTest {
                 };
             }
             @Override
-            public String authority() { return "test"; }
+            public String authority() {
+                return "test";
+            }
         };
         JwtAuthClientInterceptor interceptor = new JwtAuthClientInterceptor(() -> "mytoken");
         ClientCall<String, String> call = interceptor.interceptCall(METHOD, CallOptions.DEFAULT, channel);
@@ -109,7 +111,9 @@ public class JwtAuthInterceptorTest {
                 };
             }
             @Override
-            public String authority() { return "test"; }
+            public String authority() {
+                return "test";
+            }
         };
         ClientCall<String, String> call = new JwtAuthClientInterceptor(() -> "")
                 .interceptCall(METHOD, CallOptions.DEFAULT, channel);
@@ -142,7 +146,9 @@ public class JwtAuthInterceptorTest {
         Metadata md = new Metadata();
         md.put(JwtAuthServerInterceptor.AUTHORIZATION_HEADER, "Bearer bad-token");
         RecordingServerCall call = new RecordingServerCall();
-        TokenAuthenticator auth = token -> { throw new IOException("invalid"); };
+        TokenAuthenticator auth = token -> {
+            throw new IOException("invalid");
+        };
         JwtAuthServerInterceptor interceptor = new JwtAuthServerInterceptor(auth);
         interceptor.interceptCall(call, md, failingHandler());
         assertEquals(Status.Code.UNAUTHENTICATED, call.closedStatus.getCode());
@@ -177,9 +183,17 @@ public class JwtAuthInterceptorTest {
         @Override public void request(int numMessages) { }
         @Override public void sendHeaders(Metadata headers) { }
         @Override public void sendMessage(String message) { }
-        @Override public boolean isReady() { return false; }
-        @Override public boolean isCancelled() { return false; }
-        @Override public MethodDescriptor<String, String> getMethodDescriptor() { return METHOD; }
-        @Override public void close(Status status, Metadata trailers) { this.closedStatus = status; }
+        @Override public boolean isReady() {
+            return false;
+        }
+        @Override public boolean isCancelled() {
+            return false;
+        }
+        @Override public MethodDescriptor<String, String> getMethodDescriptor() {
+            return METHOD;
+        }
+        @Override public void close(Status status, Metadata trailers) {
+            this.closedStatus = status;
+        }
     }
 }

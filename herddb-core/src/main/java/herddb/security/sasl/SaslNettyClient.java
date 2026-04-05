@@ -22,10 +22,10 @@ package herddb.security.sasl;
 
 import herddb.auth.oidc.sasl.OAuthBearerSaslClient;
 import java.io.IOException;
-import java.util.function.Supplier;
 import java.security.Principal;
 import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.security.auth.Subject;
