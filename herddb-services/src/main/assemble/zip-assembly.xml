@@ -65,19 +65,30 @@
             <useStrictFiltering>true</useStrictFiltering>
             <unpack>false</unpack>                       
             <excludes>
-                <exclude>org.herddb:herddb-jdbc:jar:uber</exclude>                                
+                <exclude>org.herddb:herddb-jdbc:jar:uber</exclude>
+                <exclude>org.herddb:vector-testings:*</exclude>
             </excludes>
             <outputDirectory>lib</outputDirectory>
-        </dependencySet>         
+        </dependencySet>
         <dependencySet>
             <useProjectArtifact>true</useProjectArtifact>
             <useStrictFiltering>true</useStrictFiltering>
-            <unpack>false</unpack>           
-            <includes>                
+            <unpack>false</unpack>
+            <includes>
                 <include>org.herddb:herddb-jdbc:*</include>
-            </includes>            
+            </includes>
             <outputDirectory>.</outputDirectory>
             <outputFileNameMapping>herddb-jdbc-${project.version}.jar</outputFileNameMapping>
+        </dependencySet>
+        <dependencySet>
+            <useProjectArtifact>true</useProjectArtifact>
+            <useStrictFiltering>true</useStrictFiltering>
+            <unpack>false</unpack>
+            <includes>
+                <include>org.herddb:vector-testings:*</include>
+            </includes>
+            <outputDirectory>vector-testings</outputDirectory>
+            <outputFileNameMapping>vector-testings-${project.version}.jar</outputFileNameMapping>
         </dependencySet>
         <dependencySet>
             <useProjectArtifact>true</useProjectArtifact>
