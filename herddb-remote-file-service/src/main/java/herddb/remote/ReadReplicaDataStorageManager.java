@@ -39,19 +39,13 @@ import herddb.storage.IndexStatus;
 import herddb.storage.TableStatus;
 import herddb.utils.ByteArrayCursor;
 import herddb.utils.Bytes;
-import herddb.utils.ExtendedDataOutputStream;
-import herddb.utils.VisibleByteArrayOutputStream;
-import herddb.utils.XXHash64Utils;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import java.util.function.Consumer;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
