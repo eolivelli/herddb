@@ -62,7 +62,7 @@ public class Config {
         opts.addOption(null, "user", true, "Username (default: sa)");
         opts.addOption(null, "password", true, "Password (default: hdb)");
         opts.addOption(null, "table", true, "Table name (default: vector_bench)");
-        opts.addOption(null, "dataset-dir", true, "Dataset download/cache directory (default: ./datasets)");
+        opts.addOption(null, "dataset-dir", true, "Dataset download/cache directory (default: $VECTORBENCH_DATASET_DIR or ./datasets)");
         opts.addOption(null, "dataset", true, "Dataset preset: sift10k, sift1m, gist1m, sift10m, bigann, glove100, deep-image-96 (default: sift1m)");
         opts.addOption(null, "dataset-url", true, "Override dataset download URL");
         opts.addOption("n", "rows", true, "Number of rows to ingest (default: 100000, cycles dataset if larger)");
@@ -185,6 +185,16 @@ public class Config {
         }
         if (cmd.hasOption("ingest-max-ops")) {
             cfg.ingestMaxOpsPerSecond = Integer.parseInt(cmd.getOptionValue("ingest-max-ops"));
+        }
+
+        // Fall back to VECTORBENCH_DATASET_DIR env var when no explicit CLI/config-file value was given.
+        // This lets the Kubernetes StatefulSet set the dataset path once via env, without every kubectl
+        // exec invocation having to pass --dataset-dir.
+        if (!cmd.hasOption("dataset-dir") && cfg.datasetDir.equals("./datasets")) {
+            String envDir = System.getenv("VECTORBENCH_DATASET_DIR");
+            if (envDir != null && !envDir.isEmpty()) {
+                cfg.datasetDir = envDir;
+            }
         }
 
         return cfg;

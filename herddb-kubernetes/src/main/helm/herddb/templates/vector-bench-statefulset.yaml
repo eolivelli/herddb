@@ -1,0 +1,57 @@
+{{- if .Values.vectorBench.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "herddb.fullname" . }}-vector-bench
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vector-bench
+spec:
+  serviceName: {{ include "herddb.fullname" . }}-vector-bench
+  replicas: 1
+  # Retain the datasets PVC across StatefulSet deletion / scale-down so
+  # downloaded datasets survive helm uninstall + reinstall cycles.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: vector-bench
+  template:
+    metadata:
+      labels:
+        {{- include "herddb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: vector-bench
+    spec:
+      serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      containers:
+        - name: vector-bench
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sleep"]
+          args: ["infinity"]
+          env:
+            - name: HERDDB_JDBC_URL
+              value: {{ include "herddb.jdbcUrl" . | quote }}
+            - name: VECTORBENCH_HEAP
+              value: {{ .Values.vectorBench.javaOpts | quote }}
+            - name: VECTORBENCH_DATASET_DIR
+              value: /opt/herddb/vector-datasets
+          resources:
+            {{- toYaml .Values.vectorBench.resources | nindent 12 }}
+          volumeMounts:
+            - name: datasets
+              mountPath: /opt/herddb/vector-datasets
+  volumeClaimTemplates:
+    - metadata:
+        name: datasets
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.vectorBench.storage.datasets.storageClass }}
+        storageClassName: {{ .Values.vectorBench.storage.datasets.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.vectorBench.storage.datasets.size }}
+{{- end }}
