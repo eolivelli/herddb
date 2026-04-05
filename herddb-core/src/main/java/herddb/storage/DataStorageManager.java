@@ -125,6 +125,27 @@ public abstract class DataStorageManager implements AutoCloseable {
     public abstract void writeIndexPage(String tableSpace, String uuid, long pageId, DataWriter writer);
 
     /**
+     * Deletes a single index page that was previously written with {@link #writeIndexPage}.
+     * <p>Used to roll back pages that were provisionally allocated during a multi-step
+     * operation (e.g. a vector-store FusedPQ checkpoint) that aborted before the new
+     * state was recorded in a checkpoint marker. Without this call, the unreferenced
+     * pages would only be collected by the next successful {@link #indexCheckpoint}.
+     *
+     * <p>Default implementation is a no-op: storage managers that cannot individually
+     * reclaim a page rely on the regular {@code indexCheckpoint} cleanup sweep.
+     * Implementations MUST be idempotent — deleting a page that never existed must
+     * not throw.
+     *
+     * @param tableSpace the tablespace UUID
+     * @param uuid       the index UUID
+     * @param pageId     the page identifier to delete
+     */
+    public void deleteIndexPage(String tableSpace, String uuid, long pageId)
+            throws DataStorageManagerException {
+        // default: no-op; next indexCheckpoint sweep will reclaim unreferenced pages
+    }
+
+    /**
      * Write current table status. This operations mark the actual set of pages at a given log sequence number and
      * "closes" a snapshot
      *

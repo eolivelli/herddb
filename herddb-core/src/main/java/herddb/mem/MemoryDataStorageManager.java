@@ -305,6 +305,11 @@ public class MemoryDataStorageManager extends DataStorageManager {
     }
 
     @Override
+    public void deleteIndexPage(String tableSpace, String indexName, long pageId) {
+        indexpages.remove(tableSpace + "." + indexName + "_" + pageId);
+    }
+
+    @Override
     public List<PostCheckpointAction> tableCheckpoint(String tableSpace, String tableName, TableStatus tableStatus, boolean pin) throws DataStorageManagerException {
 
         /* Checkpoint pinning */
