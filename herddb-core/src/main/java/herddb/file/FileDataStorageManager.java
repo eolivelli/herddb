@@ -1008,6 +1008,18 @@ public class FileDataStorageManager extends DataStorageManager {
         indexPageWrites.registerSuccessfulEvent(delta, TimeUnit.MILLISECONDS);
     }
 
+    @Override
+    public void deleteIndexPage(String tableSpace, String indexName, long pageId)
+            throws DataStorageManagerException {
+        Path tableDir = getIndexDirectory(tableSpace, indexName);
+        Path pageFile = getPageFile(tableDir, pageId);
+        try {
+            Files.deleteIfExists(pageFile);
+        } catch (IOException err) {
+            throw new DataStorageManagerException(err);
+        }
+    }
+
     private static LogSequenceNumber readLogSequenceNumberFromTablesMetadataFile(String tableSpace, Path file) throws DataStorageManagerException {
         try (InputStream input = new BufferedInputStream(Files.newInputStream(file, StandardOpenOption.READ), 4 * 1024 * 1024);
              ExtendedDataInputStream din = new ExtendedDataInputStream(input)) {

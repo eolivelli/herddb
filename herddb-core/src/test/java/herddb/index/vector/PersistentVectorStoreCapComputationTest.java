@@ -210,4 +210,45 @@ public class PersistentVectorStoreCapComputationTest {
         // Should not throw
         assertTrue("cap must be >= minShard", result >= 1_000);
     }
+
+    // -------------------------------------------------------------------------
+    // Absolute max-live-vectors override (P2.6)
+    // -------------------------------------------------------------------------
+
+    @Test
+    public void absoluteCapTightens() {
+        // Memory-derived cap would be large; the absolute cap must clamp it.
+        int result = PersistentVectorStore.computeLiveVectorCapDuringCheckpoint(
+                0, 128, 16, 1.2f, Long.MAX_VALUE, 100, 1000);
+        assertEquals("absolute cap must win when < memory cap", 1000, result);
+    }
+
+    @Test
+    public void absoluteCapZeroIsIgnored() {
+        // When absolute cap is 0, only the memory-derived cap applies.
+        int withNoAbsolute = PersistentVectorStore.computeLiveVectorCapDuringCheckpoint(
+                0, 128, 16, 1.2f, Long.MAX_VALUE, 100, 0);
+        int memoryOnly = PersistentVectorStore.computeLiveVectorCapDuringCheckpoint(
+                0, 128, 16, 1.2f, Long.MAX_VALUE, 100);
+        assertEquals(memoryOnly, withNoAbsolute);
+    }
+
+    @Test
+    public void absoluteCapDoesNotExceedMemoryCap() {
+        // If absolute cap is higher than memory cap, memory cap wins.
+        int withHigh = PersistentVectorStore.computeLiveVectorCapDuringCheckpoint(
+                0, 128, 16, 1.2f, Long.MAX_VALUE, 100, Integer.MAX_VALUE);
+        int memoryOnly = PersistentVectorStore.computeLiveVectorCapDuringCheckpoint(
+                0, 128, 16, 1.2f, Long.MAX_VALUE, 100);
+        assertEquals("larger absolute cap must not raise the effective cap",
+                memoryOnly, withHigh);
+    }
+
+    @Test
+    public void absoluteCapIsFlooredByMinShardSize() {
+        // Absolute cap smaller than minShardSize → result floored at minShardSize.
+        int result = PersistentVectorStore.computeLiveVectorCapDuringCheckpoint(
+                0, 128, 16, 1.2f, Long.MAX_VALUE, 500, 10);
+        assertTrue("result must be at least minShardSize", result >= 500);
+    }
 }

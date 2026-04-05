@@ -1049,6 +1049,99 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     return pvs.getLiveVectorCapDuringCheckpoint();
                 }
             });
+            // P3.7 metrics — checkpoint throughput, segment count, disk usage,
+            // rollback counters.
+            indexStats.registerGauge("sealed_segment_count", new Gauge<Integer>() {
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.getSealedSegmentCount();
+                }
+            });
+            indexStats.registerGauge("phase_b_bytes_written", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getLastPhaseBBytesWritten();
+                }
+            });
+            indexStats.registerGauge("phase_b_vectors_per_second", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return (long) pvs.getLastPhaseBVectorsPerSecond();
+                }
+            });
+            indexStats.registerGauge("checkpoint_consecutive_failures", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getConsecutiveCheckpointFailures();
+                }
+            });
+            indexStats.registerGauge("checkpoint_total_failures", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getTotalCheckpointFailures();
+                }
+            });
+            indexStats.registerGauge("rolled_back_pages_total", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getTotalRolledBackPages();
+                }
+            });
+            indexStats.registerGauge("rolled_back_pages_last", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getLastRolledBackPages();
+                }
+            });
+            indexStats.registerGauge("tmp_dir_bytes", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getTmpDirBytes();
+                }
+            });
+            indexStats.registerGauge("free_disk_bytes", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    long v = pvs.getFreeDiskBytes();
+                    return v < 0 ? 0L : v;
+                }
+            });
         }
     }
 

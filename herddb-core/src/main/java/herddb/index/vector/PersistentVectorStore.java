@@ -126,6 +126,48 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private static final long MAX_LIVE_BYTES_DURING_CHECKPOINT =
             Long.getLong("herddb.vectorindex.maxLiveBytesDuringCheckpoint", 4L * 1024 * 1024 * 1024);
 
+    /**
+     * Hard cap on how many live vectors may accumulate during a single
+     * checkpoint's Phase B. This bounds the worst-case Phase B duration by
+     * limiting the size of the pool that Phase B has to graph-build. When
+     * unset (or set to 0), the cap is governed solely by the memory-budget
+     * derivation (see {@link #computeLiveVectorCapDuringCheckpoint}).
+     *
+     * <p>Set via system property
+     * {@code herddb.vectorindex.maxLiveVectorsPerCheckpoint}.
+     */
+    public static final int MAX_LIVE_VECTORS_PER_CHECKPOINT =
+            Math.max(0, Integer.getInteger(
+                    "herddb.vectorindex.maxLiveVectorsPerCheckpoint", 0));
+
+    /**
+     * How many Phase B segment builds may run concurrently. Each parallel
+     * segment build allocates ~{@code segSize × dim × 4} bytes for the live
+     * vector copy plus PQ codebooks, so the default is deliberately low;
+     * override via system property for installations with plenty of heap.
+     */
+    public static final int PHASE_B_SEGMENT_PARALLELISM =
+            Math.max(1, Integer.getInteger(
+                    "herddb.vectorindex.phaseBSegmentParallelism", 2));
+
+    /**
+     * When the number of sealed segments exceeds this threshold, each Phase A
+     * demotes the smallest sealed segments back to the mergeable pool so the
+     * next Phase B can compact them into a smaller number of larger segments.
+     * Set to {@link Integer#MAX_VALUE} to disable merging.
+     */
+    public static final int SEGMENT_MERGE_THRESHOLD =
+            Math.max(2, Integer.getInteger(
+                    "herddb.vectorindex.segmentMergeThreshold", 32));
+
+    /**
+     * How many of the smallest sealed segments to demote on each trigger.
+     * Must be at least 2 for the merge to produce a net reduction.
+     */
+    public static final int SEGMENT_MERGE_BATCH =
+            Math.max(2, Integer.getInteger(
+                    "herddb.vectorindex.segmentMergeBatch", 4));
+
     /** Dedicated ForkJoinPool for checkpoint graph building. */
     private static final ForkJoinPool CHECKPOINT_POOL = new ForkJoinPool(
             Math.max(1, Runtime.getRuntime().availableProcessors() / 2),
@@ -247,6 +289,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final AtomicLong totalFusedPQCheckpointCount = new AtomicLong(0);
     private final AtomicLong totalSimpleCheckpointCount = new AtomicLong(0);
     private final AtomicLong lastCheckpointVectorsProcessed = new AtomicLong(0);
+    /** Approximate bytes written by the last completed Phase B. */
+    private final AtomicLong lastPhaseBBytesWritten = new AtomicLong(0);
+    /** Pages reclaimed by the most recent failure recovery. */
+    private final AtomicLong lastRolledBackPages = new AtomicLong(0);
 
     // -------------------------------------------------------------------------
     // Memory back-pressure statistics
@@ -258,6 +304,42 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final Object memoryPressureMonitor = new Object();
     private final Object compactionWakeUp = new Object();
     private boolean compactionWakeUpPending = false;
+
+    // -------------------------------------------------------------------------
+    // Provisional page tracking
+    // -------------------------------------------------------------------------
+
+    /**
+     * Collects pageIds allocated by the current Phase B attempt. When Phase B
+     * aborts before {@code persistIndexStatusMultiSegment} records a new
+     * checkpoint marker, these pages are unreferenced on disk and would only be
+     * reclaimed by the next successful {@code indexCheckpoint} sweep — which
+     * may never come if the disk is full. The recovery path drains this list
+     * and calls {@link DataStorageManager#deleteIndexPage} for each entry.
+     *
+     * <p>Field (rather than a local) so tests and background threads can
+     * observe the leakage window.
+     */
+    private volatile List<Long> provisionalPageIds;
+
+    /** Metric: provisional pages rolled back by the last failure recovery. */
+    private final AtomicLong totalRolledBackPages = new AtomicLong(0);
+    /** Metric: how many Phase B attempts have failed since the last success. */
+    private final AtomicLong consecutiveCheckpointFailures = new AtomicLong(0);
+    /** Metric: total checkpoint failures over the lifetime of the store. */
+    private final AtomicLong totalCheckpointFailures = new AtomicLong(0);
+
+    public long getTotalRolledBackPages() {
+        return totalRolledBackPages.get();
+    }
+
+    public long getConsecutiveCheckpointFailures() {
+        return consecutiveCheckpointFailures.get();
+    }
+
+    public long getTotalCheckpointFailures() {
+        return totalCheckpointFailures.get();
+    }
 
     // -------------------------------------------------------------------------
     // Test hook
@@ -547,13 +629,48 @@ public class PersistentVectorStore extends AbstractVectorStore {
         LOGGER.log(Level.INFO, "PersistentVectorStore {0} started", indexName);
     }
 
+    /** Upper bound on the back-off applied after repeated checkpoint failures (30 min). */
+    static final long MAX_BACKOFF_MS =
+            Long.getLong("herddb.vectorindex.maxCheckpointBackoffMs", 30L * 60 * 1000);
+
+    /**
+     * Computes the extra wait between checkpoint attempts after {@code failures}
+     * consecutive failures. Exponential: compactionIntervalMs * 2^(failures - 1),
+     * capped at {@link #MAX_BACKOFF_MS}. Returns 0 on the first attempt.
+     *
+     * <p>Package-private in spirit, but exposed as public so that tests in
+     * the {@code herddb-indexing-service} module can verify the policy.
+     */
+    public static long computeBackoffMs(long baseIntervalMs, long failures, long maxBackoffMs) {
+        if (failures <= 0) {
+            return 0L;
+        }
+        // Use a 60 s floor for the base so that configurations with
+        // compactionIntervalMs == 0 still back off sensibly.
+        long effectiveBase = Math.max(baseIntervalMs, 60_000L);
+        long shift = Math.min(failures - 1, 20); // prevent overflow
+        long backoff = effectiveBase << shift;
+        if (backoff < 0 || backoff > maxBackoffMs) {
+            return maxBackoffMs;
+        }
+        return backoff;
+    }
+
     @SuppressFBWarnings("NN_NAKED_NOTIFY")
     private void compactionLoop() {
         while (running) {
             try {
-                long sleepMs = shouldTriggerMemoryPressureCheckpoint()
+                long baseSleepMs = shouldTriggerMemoryPressureCheckpoint()
                         ? Math.min(compactionIntervalMs, 1000)
                         : compactionIntervalMs;
+                long backoff = computeBackoffMs(compactionIntervalMs,
+                        consecutiveCheckpointFailures.get(), MAX_BACKOFF_MS);
+                long sleepMs = saturatedAdd(baseSleepMs, backoff);
+                if (backoff > 0) {
+                    LOGGER.log(Level.WARNING,
+                            "vector store {0}: backing off checkpoint by {1} ms after {2} consecutive failures",
+                            new Object[]{indexName, backoff, consecutiveCheckpointFailures.get()});
+                }
                 synchronized (compactionWakeUp) {
                     if (!compactionWakeUpPending) {
                         compactionWakeUp.wait(sleepMs);
@@ -582,6 +699,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
             }
         }
+    }
+
+    private static long saturatedAdd(long a, long b) {
+        long r = a + b;
+        if (((a ^ r) & (b ^ r)) < 0) {
+            return Long.MAX_VALUE;
+        }
+        return r;
     }
 
     private boolean shouldTriggerMemoryPressureCheckpoint() {
@@ -1176,6 +1301,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
             }
 
+            // Segment-merge trigger: when sealed count is above the threshold,
+            // demote the smallest sealed segments back to the mergeable pool so
+            // the upcoming Phase B compacts them into larger segments.
+            demoteSmallestSealedSegments(sealedSegments, mergeableSegments);
+
             this.frozenShards = snapshotShards;
             this.pendingCheckpointDeletes = ConcurrentHashMap.newKeySet();
             this.checkpointPhaseComplete = new CountDownLatch(1);
@@ -1207,6 +1337,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         // Phase B: build graphs, write to disk (NO lock)
+        // Install a provisional-page tracker BEFORE any writes so the failure path
+        // can reclaim partially-written pages instead of leaking them until the
+        // next (possibly never-arriving) successful checkpoint.
+        this.provisionalPageIds = Collections.synchronizedList(new ArrayList<>());
         List<SegmentWriteResult> newSegmentResults;
         try {
             Runnable hook = checkpointPhaseBHook;
@@ -1218,6 +1352,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     snapshotShards, snapshotDimension, sealedSegments, mergeableSegments, sequenceNumber);
         } catch (IOException | RuntimeException e) {
             LOGGER.log(Level.SEVERE, "checkpoint " + indexName + ": Phase B exception", e);
+            rollbackProvisionalPages();
+            consecutiveCheckpointFailures.incrementAndGet();
+            totalCheckpointFailures.incrementAndGet();
             recoverFromPhaseBFailure(snapshotShards);
             throw e;
         }
@@ -1229,13 +1366,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 for (SegmentWriteResult swr : newSegmentResults) {
                     Path reloadMapFile = readChunksToTempFile(
                             swr.mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
-                    Path reloadGraphFile = readChunksToTempFile(
-                            swr.graphPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_GRAPHCHUNK);
+                    // No graph temp file: the PageStoreReader reads graph bytes
+                    // directly from the page store, bounded by a small LRU cache.
                     VectorSegment seg = new VectorSegment(swr.segmentId);
                     seg.estimatedSizeBytes = swr.estimatedSizeBytes;
                     seg.graphPageIds = swr.graphPageIds;
                     seg.mapPageIds = swr.mapPageIds;
-                    loadFusedPQSegment(seg, reloadMapFile, reloadGraphFile, snapshotDimension, nextNodeId.get());
+                    loadFusedPQSegment(seg, reloadMapFile, snapshotDimension, nextNodeId.get());
                     preloadedSegments.add(seg);
                 }
             }
@@ -1244,9 +1381,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 seg.close();
                 dropSegmentBLinkStorage(seg);
             }
+            // Phase B had already persisted an IndexStatus containing these new
+            // segments, so the pages are now referenced on disk. We still call
+            // rollbackProvisionalPages as a best-effort to delete them directly;
+            // any that fail to delete will be reconciled by the next successful
+            // indexCheckpoint sweep.
+            rollbackProvisionalPages();
+            consecutiveCheckpointFailures.incrementAndGet();
+            totalCheckpointFailures.incrementAndGet();
             recoverFromPhaseBFailure(snapshotShards);
             throw e;
         }
+
+        // Phase B + prep succeeded: the pages belong to the new persisted state.
+        // Clear the tracker without deleting anything, and reset the failure count.
+        this.provisionalPageIds = null;
+        consecutiveCheckpointFailures.set(0);
 
         // Phase C: swap + cleanup (brief write lock)
         stateLock.writeLock().lock();
@@ -1489,67 +1639,280 @@ public class PersistentVectorStore extends AbstractVectorStore {
         int maxNodesPerSegment = (int) Math.max(MIN_VECTORS_FOR_FUSED_PQ,
                 maxSegmentSize / Math.max(1, avgBytesPerVector));
 
-        List<SegmentWriteResult> newSegmentResults = new ArrayList<>();
-        int start = 0;
-        int segmentIndex = 0;
         int totalSegments = (int) Math.ceil((double) poolVectorsList.size() / maxNodesPerSegment);
         long phaseBStartMs = System.currentTimeMillis();
         LOGGER.log(Level.INFO,
-                "checkpoint {0} Phase B: writing {1} vectors across ~{2} segments",
-                new Object[]{indexName, poolVectorsList.size(), totalSegments});
+                "checkpoint {0} Phase B: writing {1} vectors across ~{2} segments (parallelism={3})",
+                new Object[]{indexName, poolVectorsList.size(), totalSegments,
+                        PHASE_B_SEGMENT_PARALLELISM});
 
-        while (start < poolVectorsList.size()) {
-            int end = Math.min(start + maxNodesPerSegment, poolVectorsList.size());
-
-            if (end < poolVectorsList.size()
-                    && (poolVectorsList.size() - end) < MIN_VECTORS_FOR_FUSED_PQ) {
-                end = poolVectorsList.size();
+        // Slice the pool into segment-sized chunks up-front, so each task is
+        // self-contained and we can parallelise independent segment builds.
+        // Each slice carries its assigned segmentId so the allocation order is
+        // deterministic and observable.
+        List<SegmentSlice> slices = new ArrayList<>();
+        int start = 0;
+        int segmentIndex = 0;
+        int totalPoolSize = poolVectorsList.size();
+        while (start < totalPoolSize) {
+            int end = Math.min(start + maxNodesPerSegment, totalPoolSize);
+            if (end < totalPoolSize
+                    && (totalPoolSize - end) < MIN_VECTORS_FOR_FUSED_PQ) {
+                end = totalPoolSize;
             }
-
-            ConcurrentHashMap<Integer, VectorFloat<?>> partVectors = new ConcurrentHashMap<>();
-            ConcurrentHashMap<Integer, Bytes> partNodeToPk = new ConcurrentHashMap<>();
-            VectorStorage partStorage = new VectorStorage(end - start);
-            for (int i = start; i < end; i++) {
-                int seqId = i - start;
-                partVectors.put(seqId, poolVectorsList.get(i));
-                partStorage.set(seqId, poolVectorsList.get(i));
-                partNodeToPk.put(seqId, poolPkList.get(i));
-            }
-
-            long segStartMs = System.currentTimeMillis();
-            int segId = nextSegmentId.getAndIncrement();
-            int segSize = partNodeToPk.size();
             segmentIndex++;
-            List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, snapshotDimension);
-            List<Long> mapPageIds = writeFusedPQMapData(
-                    new VectorStorageRandomAccessVectorValues(partStorage, snapshotDimension), partNodeToPk);
-            long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
-            newSegmentResults.add(new SegmentWriteResult(segId, graphPageIds, mapPageIds, estimatedSize));
-
-            long segElapsedMs = System.currentTimeMillis() - segStartMs;
-            LOGGER.log(Level.INFO,
-                    "checkpoint {0} Phase B: segment {1}/{2} ({3} nodes) written in {4} ms",
-                    new Object[]{indexName, segmentIndex, totalSegments, segSize, segElapsedMs});
-
-            // Release vector references after segment is written to disk
-            for (int i = start; i < end; i++) {
-                poolVectorsList.set(i, null);
-                poolPkList.set(i, null);
-            }
-
+            int segId = nextSegmentId.getAndIncrement();
+            slices.add(new SegmentSlice(segId, segmentIndex, start, end));
             start = end;
         }
 
+        List<SegmentWriteResult> newSegmentResults =
+                buildSegmentsInParallel(slices, poolVectorsList, poolPkList,
+                        snapshotDimension, totalSegments);
+
         long phaseBElapsedMs = System.currentTimeMillis() - phaseBStartMs;
         lastCheckpointPhaseBDurationMs.set(phaseBElapsedMs);
-        lastCheckpointVectorsProcessed.set(poolVectorsList.size());
+        lastCheckpointVectorsProcessed.set(totalPoolSize);
+        long bytesWritten = 0L;
+        for (SegmentWriteResult r : newSegmentResults) {
+            bytesWritten += (long) r.graphPageIds.size() * CHUNK_SIZE;
+            bytesWritten += (long) r.mapPageIds.size() * CHUNK_SIZE;
+        }
+        lastPhaseBBytesWritten.set(bytesWritten);
         LOGGER.log(Level.INFO,
-                "checkpoint {0} Phase B: completed in {1} ms ({2} segments, {3} total vectors)",
-                new Object[]{indexName, phaseBElapsedMs, newSegmentResults.size(), poolVectorsList.size()});
+                "checkpoint {0} Phase B: completed in {1} ms ({2} segments, {3} total vectors, {4} bytes)",
+                new Object[]{indexName, phaseBElapsedMs, newSegmentResults.size(),
+                        totalPoolSize, bytesWritten});
 
+        // Order the results by segmentId so that the persisted IndexStatus and
+        // the in-memory segment list are both deterministic.
+        newSegmentResults.sort(java.util.Comparator.comparingInt(r -> r.segmentId));
         persistIndexStatusMultiSegment(sealedSegments, newSegmentResults, sequenceNumber);
 
         return newSegmentResults;
+    }
+
+    /**
+     * Moves the smallest sealed segments into the mergeable list when the
+     * number of sealed segments exceeds {@link #SEGMENT_MERGE_THRESHOLD}. This
+     * is the knob that keeps on-disk segment count bounded: without it,
+     * checkpoint only grows the sealed set monotonically (as observed in the
+     * 1B-vector run that motivated this fix).
+     *
+     * <p>Package-private for testing.
+     */
+    static void chooseSegmentsToDemote(
+            List<VectorSegment> sealedSegments,
+            List<VectorSegment> demotions,
+            int threshold, int batch) {
+        demotions.clear();
+        if (sealedSegments.size() <= threshold) {
+            return;
+        }
+        // Pick the `batch` smallest sealed segments.
+        List<VectorSegment> sorted = new ArrayList<>(sealedSegments);
+        sorted.sort(java.util.Comparator.comparingLong(s -> s.estimatedSizeBytes));
+        int pick = Math.min(batch, sorted.size());
+        for (int i = 0; i < pick; i++) {
+            demotions.add(sorted.get(i));
+        }
+    }
+
+    private void demoteSmallestSealedSegments(
+            List<VectorSegment> sealedSegments, List<VectorSegment> mergeableSegments) {
+        if (sealedSegments.size() <= SEGMENT_MERGE_THRESHOLD) {
+            return;
+        }
+        List<VectorSegment> demotions = new ArrayList<>();
+        chooseSegmentsToDemote(sealedSegments, demotions,
+                SEGMENT_MERGE_THRESHOLD, SEGMENT_MERGE_BATCH);
+        if (demotions.isEmpty()) {
+            return;
+        }
+        sealedSegments.removeAll(demotions);
+        mergeableSegments.addAll(demotions);
+        LOGGER.log(Level.INFO,
+                "checkpoint {0} Phase A: demoted {1} sealed segments (smallest first) for merging "
+                        + "(sealed={2}, threshold={3})",
+                new Object[]{indexName, demotions.size(), sealedSegments.size(),
+                        SEGMENT_MERGE_THRESHOLD});
+    }
+
+    /** Slice descriptor: one FusedPQ segment to build in Phase B. */
+    private static final class SegmentSlice {
+        final int segmentId;
+        final int oneBasedIndex;
+        final int fromInclusive;
+        final int toExclusive;
+
+        SegmentSlice(int segmentId, int oneBasedIndex, int fromInclusive, int toExclusive) {
+            this.segmentId = segmentId;
+            this.oneBasedIndex = oneBasedIndex;
+            this.fromInclusive = fromInclusive;
+            this.toExclusive = toExclusive;
+        }
+
+        int size() {
+            return toExclusive - fromInclusive;
+        }
+    }
+
+    /**
+     * Builds all slices in parallel, bounded by {@link #PHASE_B_SEGMENT_PARALLELISM}.
+     * If any build fails, all remaining tasks are cancelled and the first failure
+     * is rethrown. Successful segment-local allocations are still tracked in
+     * {@link #provisionalPageIds} so the outer rollback path can reclaim them.
+     */
+    private List<SegmentWriteResult> buildSegmentsInParallel(
+            List<SegmentSlice> slices,
+            List<VectorFloat<?>> poolVectorsList,
+            List<Bytes> poolPkList,
+            int snapshotDimension,
+            int totalSegments) throws IOException, DataStorageManagerException {
+
+        int parallelism = Math.min(PHASE_B_SEGMENT_PARALLELISM, Math.max(1, slices.size()));
+        if (parallelism == 1) {
+            // Fast path, no extra threads.
+            List<SegmentWriteResult> results = new ArrayList<>(slices.size());
+            for (SegmentSlice s : slices) {
+                results.add(buildOneSegment(s, poolVectorsList, poolPkList,
+                        snapshotDimension, totalSegments));
+                // Release references immediately in the serial path.
+                releaseSliceReferences(s, poolVectorsList, poolPkList);
+            }
+            return results;
+        }
+
+        java.util.concurrent.ExecutorService executor =
+                java.util.concurrent.Executors.newFixedThreadPool(parallelism, r -> {
+                    Thread t = new Thread(r, "persistent-vector-store-phaseB-" + indexName);
+                    t.setDaemon(true);
+                    return t;
+                });
+        try {
+            List<java.util.concurrent.Future<SegmentWriteResult>> futures = new ArrayList<>(slices.size());
+            for (SegmentSlice s : slices) {
+                futures.add(executor.submit(() -> buildOneSegment(s,
+                        poolVectorsList, poolPkList, snapshotDimension, totalSegments)));
+            }
+            List<SegmentWriteResult> results = new ArrayList<>(slices.size());
+            Throwable firstFailure = null;
+            for (int i = 0; i < futures.size(); i++) {
+                java.util.concurrent.Future<SegmentWriteResult> f = futures.get(i);
+                try {
+                    SegmentWriteResult r = f.get();
+                    results.add(r);
+                    // Release slice references once the segment is durable.
+                    releaseSliceReferences(slices.get(i), poolVectorsList, poolPkList);
+                } catch (java.util.concurrent.ExecutionException ee) {
+                    if (firstFailure == null) {
+                        firstFailure = ee.getCause() != null ? ee.getCause() : ee;
+                    }
+                    for (int j = i + 1; j < futures.size(); j++) {
+                        futures.get(j).cancel(true);
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    if (firstFailure == null) {
+                        firstFailure = ie;
+                    }
+                }
+            }
+            if (firstFailure != null) {
+                if (firstFailure instanceof IOException) {
+                    throw (IOException) firstFailure;
+                }
+                if (firstFailure instanceof DataStorageManagerException) {
+                    throw (DataStorageManagerException) firstFailure;
+                }
+                if (firstFailure instanceof RuntimeException) {
+                    throw (RuntimeException) firstFailure;
+                }
+                throw new IOException("Phase B parallel build failed", firstFailure);
+            }
+            return results;
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private SegmentWriteResult buildOneSegment(
+            SegmentSlice s,
+            List<VectorFloat<?>> poolVectorsList,
+            List<Bytes> poolPkList,
+            int snapshotDimension,
+            int totalSegments) throws IOException, DataStorageManagerException {
+
+        ConcurrentHashMap<Integer, VectorFloat<?>> partVectors = new ConcurrentHashMap<>();
+        ConcurrentHashMap<Integer, Bytes> partNodeToPk = new ConcurrentHashMap<>();
+        VectorStorage partStorage = new VectorStorage(s.size());
+        for (int i = s.fromInclusive; i < s.toExclusive; i++) {
+            int seqId = i - s.fromInclusive;
+            partVectors.put(seqId, poolVectorsList.get(i));
+            partStorage.set(seqId, poolVectorsList.get(i));
+            partNodeToPk.put(seqId, poolPkList.get(i));
+        }
+
+        long segStartMs = System.currentTimeMillis();
+        List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, snapshotDimension);
+        List<Long> mapPageIds = writeFusedPQMapData(
+                new VectorStorageRandomAccessVectorValues(partStorage, snapshotDimension), partNodeToPk);
+        long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
+
+        long segElapsedMs = System.currentTimeMillis() - segStartMs;
+        LOGGER.log(Level.INFO,
+                "checkpoint {0} Phase B: segment {1}/{2} ({3} nodes) written in {4} ms",
+                new Object[]{indexName, s.oneBasedIndex, totalSegments, s.size(), segElapsedMs});
+
+        return new SegmentWriteResult(s.segmentId, graphPageIds, mapPageIds, estimatedSize);
+    }
+
+    private static void releaseSliceReferences(
+            SegmentSlice s, List<VectorFloat<?>> poolVectorsList, List<Bytes> poolPkList) {
+        for (int i = s.fromInclusive; i < s.toExclusive; i++) {
+            poolVectorsList.set(i, null);
+            poolPkList.set(i, null);
+        }
+    }
+
+    /**
+     * Deletes any pageIds tracked in {@link #provisionalPageIds}. Called when
+     * Phase B or Phase C-prep aborts before the new state becomes durable so
+     * that the partially-written pages do not linger on disk until the next
+     * successful {@code indexCheckpoint} sweep (which may never arrive if the
+     * disk is full).
+     *
+     * <p>The method always clears the tracker, whether or not any deletes
+     * succeeded. Delete failures are logged but not rethrown — the failure has
+     * already been signalled via the original Phase B exception.
+     */
+    private void rollbackProvisionalPages() {
+        List<Long> toRollback = this.provisionalPageIds;
+        this.provisionalPageIds = null;
+        if (toRollback == null || toRollback.isEmpty()) {
+            return;
+        }
+        List<Long> snapshot;
+        synchronized (toRollback) {
+            snapshot = new ArrayList<>(toRollback);
+        }
+        int rolled = 0;
+        int failed = 0;
+        for (long pageId : snapshot) {
+            try {
+                dataStorageManager.deleteIndexPage(tableSpaceUUID, indexUUID, pageId);
+                rolled++;
+            } catch (DataStorageManagerException e) {
+                failed++;
+                LOGGER.log(Level.WARNING,
+                        "checkpoint " + indexName + ": failed to delete provisional pageId " + pageId, e);
+            }
+        }
+        totalRolledBackPages.addAndGet(rolled);
+        lastRolledBackPages.set(rolled);
+        LOGGER.log(Level.WARNING,
+                "checkpoint {0}: rolled back {1} provisional pages ({2} delete failures)",
+                new Object[]{indexName, rolled, failed});
     }
 
     /**
@@ -1664,13 +2027,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
 
             Path mapFile = readChunksToTempFile(mapChunkPageIds, TYPE_VECTOR_MAPCHUNK);
-            Path graphFile = readChunksToTempFile(graphChunkPageIds, TYPE_VECTOR_GRAPHCHUNK);
+            // No graph temp file: bounded LRU reader over the page store.
 
             VectorSegment seg = new VectorSegment(segId);
             seg.estimatedSizeBytes = estimatedSize;
             seg.graphPageIds = toLongList(graphChunkPageIds);
             seg.mapPageIds = toLongList(mapChunkPageIds);
-            loadFusedPQSegment(seg, mapFile, graphFile, dim, savedNextNodeId);
+            loadFusedPQSegment(seg, mapFile, dim, savedNextNodeId);
             segments.add(seg);
             if (segId > maxSegId) {
                 maxSegId = segId;
@@ -1694,10 +2057,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
-     * Loads a single FusedPQ segment from map and graph temp files.
+     * Loads a single FusedPQ segment. The map data is read from a one-shot
+     * temp file (linear scan, then deleted). The graph is <em>not</em>
+     * materialised on disk: instead {@link seg#graphPageIds} is plumbed
+     * through a {@link PageStoreReader.Supplier} that reads graph bytes on
+     * demand from the page store, with a small bounded LRU cache.
+     *
+     * <p>The {@code graphPageIds} list <em>must</em> already be populated on
+     * {@code seg} before this method is called.
      */
-    private void loadFusedPQSegment(VectorSegment seg, Path mapFile, Path graphFile,
-                                     int dim, int savedNextNodeId) throws IOException {
+    private void loadFusedPQSegment(VectorSegment seg, Path mapFile, int dim, int savedNextNodeId)
+            throws IOException, DataStorageManagerException {
+        if (seg.graphPageIds == null || seg.graphPageIds.isEmpty()) {
+            throw new IllegalStateException(
+                    "loadFusedPQSegment requires seg.graphPageIds to be populated");
+        }
         createSegmentBLinks(seg);
 
         int entryCount;
@@ -1755,10 +2129,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         Files.deleteIfExists(mapFile);
 
-        ReaderSupplier readerSupplier = new SegmentedMappedReader.Supplier(graphFile);
+        long[] graphPageIds = new long[seg.graphPageIds.size()];
+        for (int i = 0; i < graphPageIds.length; i++) {
+            graphPageIds[i] = seg.graphPageIds.get(i);
+        }
+        ReaderSupplier readerSupplier = new PageStoreReader.Supplier(
+                dataStorageManager, tableSpaceUUID, indexUUID,
+                graphPageIds, TYPE_VECTOR_GRAPHCHUNK,
+                PageStoreReader.DEFAULT_LRU_PAGES);
         seg.onDiskGraph = OnDiskGraphIndex.load(readerSupplier);
         seg.onDiskReaderSupplier = readerSupplier;
-        seg.onDiskGraphFile = graphFile;
+        // onDiskGraphFile intentionally left null: no resident copy on disk.
 
         LOGGER.log(Level.INFO,
                 "loaded vector segment {0} for store {1}: {2} nodes",
@@ -1955,12 +2336,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Streams a file into CHUNK_SIZE pieces and writes each as an index page.
+     * <p>Every allocated pageId is recorded in {@link #provisionalPageIds} (if non-null)
+     * <em>before</em> the corresponding {@code writeIndexPage} call, so that a failure
+     * mid-write still leaves a rollback record for the caller to reclaim the page.
      */
     private List<Long> writeChunks(Path file, int chunkType) throws DataStorageManagerException, IOException {
         List<Long> pageIds = new ArrayList<>();
         long fileSize = Files.size(file);
         if (fileSize == 0) {
             long pageId = newPageId.getAndIncrement();
+            trackProvisionalPageId(pageId);
             dataStorageManager.writeIndexPage(tableSpaceUUID, indexUUID, pageId, out -> {
                 out.writeVInt(chunkType);
                 out.writeVInt(0);
@@ -1974,6 +2359,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             while ((bytesRead = bis.read(buf, 0, CHUNK_SIZE)) > 0) {
                 final int len = bytesRead;
                 long pageId = newPageId.getAndIncrement();
+                trackProvisionalPageId(pageId);
                 dataStorageManager.writeIndexPage(tableSpaceUUID, indexUUID, pageId, out -> {
                     out.writeVInt(chunkType);
                     out.writeVInt(len);
@@ -1986,12 +2372,27 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Records a pageId in the in-flight provisional list (if one is installed).
+     * Called by all page-writing helpers in Phase B so that a mid-write abort can
+     * reclaim the partially-written pages.
+     */
+    private void trackProvisionalPageId(long pageId) {
+        List<Long> tracker = this.provisionalPageIds;
+        if (tracker != null) {
+            synchronized (tracker) {
+                tracker.add(pageId);
+            }
+        }
+    }
+
+    /**
      * Splits data into CHUNK_SIZE pieces and writes each as an index page.
      */
     private List<Long> writeChunks(byte[] data, int chunkType) throws DataStorageManagerException {
         List<Long> pageIds = new ArrayList<>();
         if (data.length == 0) {
             long pageId = newPageId.getAndIncrement();
+            trackProvisionalPageId(pageId);
             dataStorageManager.writeIndexPage(tableSpaceUUID, indexUUID, pageId, out -> {
                 out.writeVInt(chunkType);
                 out.writeVInt(0);
@@ -2003,6 +2404,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             final int off = offset;
             final int len = Math.min(CHUNK_SIZE, data.length - offset);
             long pageId = newPageId.getAndIncrement();
+            trackProvisionalPageId(pageId);
             dataStorageManager.writeIndexPage(tableSpaceUUID, indexUUID, pageId, out -> {
                 out.writeVInt(chunkType);
                 out.writeVInt(len);
@@ -2309,15 +2711,37 @@ public class PersistentVectorStore extends AbstractVectorStore {
     static int computeLiveVectorCapDuringCheckpoint(
             int frozenVectorCount, int dim, int m, float neighborOverflow,
             long effectiveBudget, int minShardSize) {
+        return computeLiveVectorCapDuringCheckpoint(
+                frozenVectorCount, dim, m, neighborOverflow,
+                effectiveBudget, minShardSize, MAX_LIVE_VECTORS_PER_CHECKPOINT);
+    }
+
+    /**
+     * Variant with an explicit absolute cap {@code maxLiveVectorsPerCheckpoint}.
+     * When non-zero, the returned cap is the minimum of the memory-derived
+     * cap and this absolute cap. Floored at {@code minShardSize} so that a
+     * checkpoint can always make at least one shard worth of progress.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static int computeLiveVectorCapDuringCheckpoint(
+            int frozenVectorCount, int dim, int m, float neighborOverflow,
+            long effectiveBudget, int minShardSize, int maxLiveVectorsPerCheckpoint) {
         long estimatedBytesPerVector = estimatedBytesPerVector(dim, m, neighborOverflow);
+        int baseCap;
         if (effectiveBudget == Long.MAX_VALUE) {
-            return (int) Math.min(Integer.MAX_VALUE,
+            baseCap = (int) Math.min(Integer.MAX_VALUE,
                     MAX_LIVE_BYTES_DURING_CHECKPOINT / Math.max(1L, estimatedBytesPerVector));
+        } else {
+            long frozenEstimated = (long) frozenVectorCount * estimatedBytesPerVector;
+            long headroom = Math.max(0L, effectiveBudget - frozenEstimated);
+            baseCap = (int) Math.min(Integer.MAX_VALUE, headroom / estimatedBytesPerVector);
+            baseCap = Math.max(baseCap, minShardSize);
         }
-        long frozenEstimated = (long) frozenVectorCount * estimatedBytesPerVector;
-        long headroom = Math.max(0L, effectiveBudget - frozenEstimated);
-        int cap = (int) Math.min(Integer.MAX_VALUE, headroom / estimatedBytesPerVector);
-        return Math.max(cap, minShardSize);
+        if (maxLiveVectorsPerCheckpoint > 0 && maxLiveVectorsPerCheckpoint < baseCap) {
+            return Math.max(maxLiveVectorsPerCheckpoint, minShardSize);
+        }
+        return baseCap;
     }
 
     /**
@@ -2664,5 +3088,85 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public int getLiveVectorCapDuringCheckpoint() {
         return liveVectorCapDuringCheckpoint;
+    }
+
+    // -------------------------------------------------------------------------
+    // P3.7 metrics — segments, Phase B throughput, disk usage
+    // -------------------------------------------------------------------------
+
+    /** Current count of sealed + mergeable segments. */
+    public int getSealedSegmentCount() {
+        return segments.size();
+    }
+
+    /**
+     * Vectors-per-second throughput achieved by the last completed Phase B
+     * segment-build pass. 0 if Phase B has not run yet.
+     */
+    public double getLastPhaseBVectorsPerSecond() {
+        long durMs = lastCheckpointPhaseBDurationMs.get();
+        long vectors = lastCheckpointVectorsProcessed.get();
+        if (durMs <= 0 || vectors <= 0) {
+            return 0d;
+        }
+        return vectors * 1000.0 / durMs;
+    }
+
+    /**
+     * Approximate bytes written by the last Phase B (graph + map segments).
+     * 0 if no Phase B has completed yet.
+     */
+    public long getLastPhaseBBytesWritten() {
+        return lastPhaseBBytesWritten.get();
+    }
+
+    /** Number of pages discarded by the most recent failure recovery. */
+    public long getLastRolledBackPages() {
+        return lastRolledBackPages.get();
+    }
+
+    /**
+     * Free bytes reported by the tmp directory's filesystem. Returns
+     * {@code -1} if the path is not available.
+     */
+    public long getFreeDiskBytes() {
+        try {
+            if (tmpDirectory == null) {
+                return -1L;
+            }
+            java.io.File f = tmpDirectory.toFile();
+            return f.getUsableSpace();
+        } catch (SecurityException ignored) {
+            return -1L;
+        }
+    }
+
+    /**
+     * Total bytes occupied by files whose name starts with
+     * {@code herddb-vector-} in {@link #tmpDirectory}. Intended as an
+     * observability metric for the P1.4 goal: the number should stay near
+     * zero at rest (only transient map tmp files during checkpoint).
+     */
+    public long getTmpDirBytes() {
+        try {
+            if (tmpDirectory == null || !java.nio.file.Files.isDirectory(tmpDirectory)) {
+                return 0L;
+            }
+            long[] acc = {0L};
+            try (java.util.stream.Stream<java.nio.file.Path> s =
+                    java.nio.file.Files.list(tmpDirectory)) {
+                s.filter(p -> p.getFileName().toString().startsWith("herddb-vector-"))
+                        .forEach(p -> {
+                            try {
+                                acc[0] += java.nio.file.Files.size(p);
+                            } catch (java.io.IOException ignored) {
+                                // skip
+                            }
+                        });
+            }
+            return acc[0];
+        } catch (java.io.IOException ignored) {
+            return 0L;
+        }
     }
 }
