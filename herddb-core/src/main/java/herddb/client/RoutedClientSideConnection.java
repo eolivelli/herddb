@@ -112,10 +112,32 @@ public class RoutedClientSideConnection implements ChannelEventListener, ClientS
         }
         String mech = connection.getClient().getConfiguration().getString(ClientConfiguration.PROPERTY_AUTH_MECH, SaslUtils.AUTH_DIGEST_MD5);
 
+        java.util.function.Supplier<String> tokenSupplier = null;
+        if (SaslUtils.AUTH_OAUTHBEARER.equals(mech)) {
+            final String preAcquired = connection.getClient().getConfiguration().getString(ClientConfiguration.PROPERTY_OIDC_TOKEN, "");
+            if (!preAcquired.isEmpty()) {
+                tokenSupplier = () -> preAcquired;
+            } else {
+                final herddb.auth.oidc.OidcTokenProvider provider =
+                        connection.getClient().getOrCreateOidcTokenProvider();
+                if (provider == null) {
+                    throw new Exception("OAUTHBEARER mechanism selected but no " + ClientConfiguration.PROPERTY_OIDC_ISSUER_URL
+                            + " or " + ClientConfiguration.PROPERTY_OIDC_TOKEN + " configured");
+                }
+                tokenSupplier = () -> {
+                    try {
+                        return provider.getToken();
+                    } catch (herddb.auth.oidc.OidcAuthException e) {
+                        throw new RuntimeException(e);
+                    }
+                };
+            }
+        }
+
         SaslNettyClient saslNettyClient = new SaslNettyClient(
                 connection.getClient().getConfiguration().getString(ClientConfiguration.PROPERTY_CLIENT_USERNAME, ClientConfiguration.PROPERTY_CLIENT_USERNAME_DEFAULT),
                 connection.getClient().getConfiguration().getString(ClientConfiguration.PROPERTY_CLIENT_PASSWORD, ClientConfiguration.PROPERTY_CLIENT_PASSWORD_DEFAULT),
-                serverHostname, mech
+                serverHostname, mech, tokenSupplier
         );
 
         byte[] firstToken = new byte[0];

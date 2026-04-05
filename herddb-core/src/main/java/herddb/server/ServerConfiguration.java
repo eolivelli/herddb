@@ -46,6 +46,30 @@ public final class ServerConfiguration {
     public static final String PROPERTY_MODE = "server.mode";
 
     /**
+     * Enable OIDC/JWT authentication (OAUTHBEARER SASL mechanism).
+     * When true, {@link #PROPERTY_OIDC_ISSUER_URL} must be configured and the server will
+     * validate JWT tokens against the provider's JWKS.
+     */
+    public static final String PROPERTY_OIDC_ENABLED = "oidc.enabled";
+    public static final boolean PROPERTY_OIDC_ENABLED_DEFAULT = false;
+    /** OIDC issuer URL for token validation (server side). */
+    public static final String PROPERTY_OIDC_ISSUER_URL = "oidc.issuer.url";
+    /** Expected audience claim for incoming tokens (optional). */
+    public static final String PROPERTY_OIDC_AUDIENCE = "oidc.audience";
+    /** JWT claim to use as the HerdDB principal (default: preferred_username, fallback: sub). */
+    public static final String PROPERTY_OIDC_USERNAME_CLAIM = "oidc.username.claim";
+    /** Explicit JWKS URI (overrides discovery). */
+    public static final String PROPERTY_OIDC_JWKS_URI = "oidc.jwks.uri";
+
+    /**
+     * OIDC client_id used for server-to-server authentication. When {@link #PROPERTY_OIDC_ENABLED}
+     * is true, leader/follower connections obtain bearer tokens via client_credentials using
+     * these credentials instead of {@link #PROPERTY_SERVER_TO_SERVER_USERNAME}/_PASSWORD.
+     */
+    public static final String PROPERTY_SERVER_OIDC_CLIENT_ID = "server.oidc.client.id";
+    public static final String PROPERTY_SERVER_OIDC_CLIENT_SECRET = "server.oidc.client.secret";
+
+    /**
      * Accept requests only for TableSpaces for which the local server is leader
      */
     public static final String PROPERTY_ENFORCE_LEADERSHIP = "server.enforce.leadership";

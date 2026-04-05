@@ -46,6 +46,9 @@ import herddb.network.ServerSideConnection;
 import herddb.network.ServerSideConnectionAcceptor;
 import herddb.network.netty.NettyChannelAcceptor;
 import herddb.network.netty.NetworkUtils;
+import herddb.auth.oidc.OidcConfiguration;
+import herddb.auth.oidc.OidcTokenValidator;
+import herddb.auth.oidc.PrincipalExtractor;
 import herddb.auth.oidc.sasl.TokenAuthenticator;
 import herddb.security.SimpleSingleUserManager;
 import herddb.security.UserManager;
@@ -111,6 +114,29 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         this.tokenAuthenticator = tokenAuthenticator;
     }
 
+    private static TokenAuthenticator buildOidcTokenAuthenticator(ServerConfiguration configuration) throws IOException {
+        String issuer = configuration.getString(ServerConfiguration.PROPERTY_OIDC_ISSUER_URL, "");
+        if (issuer.isEmpty()) {
+            throw new IOException(ServerConfiguration.PROPERTY_OIDC_ENABLED
+                    + " is true but " + ServerConfiguration.PROPERTY_OIDC_ISSUER_URL + " is not set");
+        }
+        String audience = configuration.getString(ServerConfiguration.PROPERTY_OIDC_AUDIENCE, "");
+        String usernameClaim = configuration.getString(ServerConfiguration.PROPERTY_OIDC_USERNAME_CLAIM, "");
+        String jwksUri = configuration.getString(ServerConfiguration.PROPERTY_OIDC_JWKS_URI, "");
+        OidcConfiguration oidcCfg = new OidcConfiguration(issuer);
+        if (!jwksUri.isEmpty()) {
+            oidcCfg.setJwksUri(jwksUri);
+        } else {
+            oidcCfg.discover();
+        }
+        final OidcTokenValidator validator = new OidcTokenValidator(
+                oidcCfg, audience.isEmpty() ? null : audience,
+                new PrincipalExtractor(usernameClaim));
+        LOGGER.log(Level.INFO, "OIDC authentication enabled (issuer={0}, audience={1}, usernameClaim={2})",
+                new Object[]{issuer, audience, usernameClaim});
+        return validator::validate;
+    }
+
     public void setUserManager(UserManager userManager) {
         this.userManager = userManager;
     }
@@ -159,6 +185,14 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 this.userManager = new FileBasedUserManager(userDirectoryFile);
             } catch (IOException error) {
                 throw new RuntimeException(error);
+            }
+        }
+        if (configuration.getBoolean(ServerConfiguration.PROPERTY_OIDC_ENABLED,
+                ServerConfiguration.PROPERTY_OIDC_ENABLED_DEFAULT)) {
+            try {
+                this.tokenAuthenticator = buildOidcTokenAuthenticator(configuration);
+            } catch (IOException err) {
+                throw new RuntimeException("Failed to initialize OIDC token validator: " + err.getMessage(), err);
             }
         }
         this.metadataStorageManager = buildMetadataStorageManager();
