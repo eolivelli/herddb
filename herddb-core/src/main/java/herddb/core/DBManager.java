@@ -146,6 +146,7 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
     private String serverToServerUsername = ClientConfiguration.PROPERTY_CLIENT_USERNAME_DEFAULT;
     private String serverToServerPassword = ClientConfiguration.PROPERTY_CLIENT_PASSWORD_DEFAULT;
     private boolean errorIfNotLeader = true;
+    private boolean readOnlyReplica = false;
     private final ServerConfiguration serverConfiguration;
     private final String mode;
     private ConnectionsInfoProvider connectionsInfoProvider;
@@ -334,6 +335,14 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
 
     public void setErrorIfNotLeader(boolean errorIfNotLeader) {
         this.errorIfNotLeader = errorIfNotLeader;
+    }
+
+    public boolean isReadOnlyReplica() {
+        return readOnlyReplica;
+    }
+
+    public void setReadOnlyReplica(boolean readOnlyReplica) {
+        this.readOnlyReplica = readOnlyReplica;
     }
 
     public MetadataStorageManager getMetadataStorageManager() {
@@ -781,6 +790,14 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
         }
         if (errorIfNotLeader && !manager.isLeader() && !statement.getAllowExecutionFromFollower()) {
             return Futures.exception(new NotLeaderException("node " + nodeId + " is not leader for tableSpace " + tableSpace));
+        }
+        // In shared-storage read-replica mode, reject non-read statements on non-leader nodes
+        if (readOnlyReplica && !manager.isLeader()) {
+            if (!(statement instanceof GetStatement) && !(statement instanceof ScanStatement)) {
+                return Futures.exception(new NotLeaderException(
+                        "This is a read-only replica. Write operations must go to the leader. "
+                        + "node " + nodeId + " is not leader for tableSpace " + tableSpace));
+            }
         }
         CompletableFuture<StatementExecutionResult> res = manager.executeStatementAsync(statement, context, transactionContext);
         if (statement instanceof DDLStatement) {

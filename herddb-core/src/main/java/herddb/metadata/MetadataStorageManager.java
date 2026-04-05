@@ -20,6 +20,7 @@
 
 package herddb.metadata;
 
+import herddb.log.LogSequenceNumber;
 import herddb.model.DDLException;
 import herddb.model.InvalidTableException;
 import herddb.model.NodeMetadata;
@@ -30,6 +31,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
 
 /**
  * Store of all metadata of the system: definition of tables, tablesets, available nodes
@@ -187,6 +189,64 @@ public abstract class MetadataStorageManager implements AutoCloseable {
 
     public void clear() throws MetadataStorageManagerException {
 
+    }
+
+    // -------------------------------------------------------------------------
+    // Checkpoint LSN notification for shared-storage read replicas
+    // -------------------------------------------------------------------------
+
+    /**
+     * Publishes the latest checkpoint LSN for a tablespace so that read replicas
+     * can be notified of new checkpoints. Default implementation is a no-op.
+     */
+    public void publishCheckpointLsn(String tableSpaceUUID, LogSequenceNumber lsn) throws MetadataStorageManagerException {
+        // no-op for non-ZK implementations
+    }
+
+    /**
+     * Reads the latest published checkpoint LSN for a tablespace.
+     *
+     * @return the latest LSN, or {@link LogSequenceNumber#START_OF_TIME} if none published
+     */
+    public LogSequenceNumber getCheckpointLsn(String tableSpaceUUID) throws MetadataStorageManagerException {
+        return LogSequenceNumber.START_OF_TIME;
+    }
+
+    /**
+     * Sets a watch on checkpoint LSN changes for the given tablespace.
+     * The callback is invoked each time the leader publishes a new checkpoint LSN.
+     * The watch is persistent and re-registers automatically.
+     */
+    public void watchCheckpointLsn(String tableSpaceUUID, Consumer<LogSequenceNumber> callback) throws MetadataStorageManagerException {
+        // no-op for non-ZK implementations
+    }
+
+    /**
+     * A replica publishes its current applied checkpoint LSN. The leader reads this to
+     * determine when it is safe to delete stale pages from remote storage.
+     * <p>
+     * Implementations should use an ephemeral mechanism (e.g., ephemeral znode in ZK) so
+     * that the entry is automatically removed when the replica disconnects/crashes.
+     */
+    public void publishReplicaCheckpointLsn(String tableSpaceUUID, String nodeId, LogSequenceNumber lsn) throws MetadataStorageManagerException {
+        // no-op for non-ZK implementations
+    }
+
+    /**
+     * Removes the replica's published checkpoint LSN (called on clean shutdown).
+     */
+    public void unregisterReplicaCheckpointLsn(String tableSpaceUUID, String nodeId) throws MetadataStorageManagerException {
+        // no-op for non-ZK implementations
+    }
+
+    /**
+     * Returns the minimum checkpoint LSN across all currently-registered replicas for
+     * the given tablespace. Returns {@code null} if no replicas are registered.
+     * <p>
+     * The leader uses this to decide whether it is safe to delete stale remote pages.
+     */
+    public LogSequenceNumber getMinReplicaCheckpointLsn(String tableSpaceUUID) throws MetadataStorageManagerException {
+        return null;
     }
 
     public String generateNewNodeId(ServerConfiguration config) throws MetadataStorageManagerException {

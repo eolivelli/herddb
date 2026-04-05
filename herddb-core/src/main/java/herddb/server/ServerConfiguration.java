@@ -55,6 +55,7 @@ public final class ServerConfiguration {
     public static final String PROPERTY_MODE_STANDALONE = "standalone";
     public static final String PROPERTY_MODE_CLUSTER = "cluster";
     public static final String PROPERTY_MODE_DISKLESSCLUSTER = "diskless-cluster";
+    public static final String PROPERTY_MODE_SHARED_STORAGE = "shared-storage";
 
     public static final String PROPERTY_STORAGE_MODE = "server.storage.mode";
     public static final String PROPERTY_STORAGE_MODE_LOCAL = "local";
@@ -69,6 +70,45 @@ public final class ServerConfiguration {
 
     public static final String PROPERTY_REMOTE_FILE_CLIENT_RETRIES = "remote.file.client.retries";
     public static final int PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT = 10;
+
+    /**
+     * When true, the leader publishes checkpoint metadata to remote storage (S3)
+     * so that shared-storage read replicas can consume it.
+     */
+    public static final String PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE = "server.checkpoint.publish.to.remote";
+    public static final boolean PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE_DEFAULT = false;
+
+    /**
+     * Safety-net poll interval (ms) for shared-storage replicas to check for new checkpoints,
+     * in case ZooKeeper watch notifications are missed.
+     */
+    public static final String PROPERTY_REPLICA_CHECKPOINT_POLL_INTERVAL = "replica.checkpoint.poll.interval.ms";
+    public static final long PROPERTY_REPLICA_CHECKPOINT_POLL_INTERVAL_DEFAULT = 30000; // 30 seconds
+
+    /**
+     * Timeout (seconds) for acquiring the write lock during checkpoint view switch on replicas.
+     */
+    public static final String PROPERTY_REPLICA_CHECKPOINT_SWITCH_TIMEOUT = "replica.checkpoint.switch.timeout.seconds";
+    public static final long PROPERTY_REPLICA_CHECKPOINT_SWITCH_TIMEOUT_DEFAULT = 60;
+
+    /**
+     * Minimum time (milliseconds) that pages stale-at-checkpoint-K must be retained on
+     * remote storage before they can be deleted, even if no replicas are tracked or all
+     * replicas have advanced past K. Acts as a safety grace period so that in-flight
+     * replica queries always see complete pages. Also used as the upper bound when a
+     * replica is stuck or dead.
+     */
+    public static final String PROPERTY_CHECKPOINT_REPLICA_RETENTION_MIN_MILLIS = "server.checkpoint.replica.retention.min.millis";
+    public static final long PROPERTY_CHECKPOINT_REPLICA_RETENTION_MIN_MILLIS_DEFAULT = 5L * 60L * 1000L; // 5 minutes
+
+    /**
+     * Maximum time (milliseconds) to retain stale pages on remote storage. If this is
+     * exceeded, pages are deleted even if some replica is still behind — at which point
+     * that replica will hit DataPageDoesNotExistException and must re-bootstrap from the
+     * latest checkpoint. Set to 0 to retain forever (dangerous).
+     */
+    public static final String PROPERTY_CHECKPOINT_REPLICA_RETENTION_MAX_MILLIS = "server.checkpoint.replica.retention.max.millis";
+    public static final long PROPERTY_CHECKPOINT_REPLICA_RETENTION_MAX_MILLIS_DEFAULT = 2L * 60L * 60L * 1000L; // 2 hours
 
     public static final String PROPERTY_BASEDIR = "server.base.dir";
     public static final String PROPERTY_BASEDIR_DEFAULT = "dbdata";
