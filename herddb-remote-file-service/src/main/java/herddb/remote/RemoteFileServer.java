@@ -20,6 +20,9 @@
 
 package herddb.remote;
 
+import herddb.auth.oidc.OidcBootstrap;
+import herddb.auth.oidc.OidcTokenValidator;
+import herddb.auth.oidc.grpc.JwtAuthServerInterceptor;
 import herddb.metadata.MetadataStorageManager;
 import herddb.remote.storage.CachingObjectStorage;
 import herddb.remote.storage.LocalObjectStorage;
@@ -124,10 +127,18 @@ public class RemoteFileServer implements AutoCloseable {
         StatsLogger statsLogger = statsProvider.getStatsLogger("");
 
         RemoteFileServiceImpl serviceImpl = new RemoteFileServiceImpl(objectStorage, statsLogger);
-        server = ServerBuilder.forPort(port)
-                .addService(serviceImpl)
-                .build()
-                .start();
+        ServerBuilder<?> grpcBuilder = ServerBuilder.forPort(port).addService(serviceImpl);
+        if (OidcBootstrap.isEnabled(config)) {
+            try {
+                OidcTokenValidator validator = OidcBootstrap.buildValidator(config);
+                grpcBuilder.intercept(new JwtAuthServerInterceptor(validator::validate));
+                LOGGER.log(Level.INFO, "OIDC authentication enabled for RemoteFileServer (issuer={0})",
+                        config.getProperty(OidcBootstrap.PROP_ISSUER_URL));
+            } catch (IOException e) {
+                throw new IOException("Failed to initialize OIDC for RemoteFileServer: " + e.getMessage(), e);
+            }
+        }
+        server = grpcBuilder.build().start();
 
         // Start HTTP server for metrics
         boolean httpEnabled = Boolean.parseBoolean(config.getProperty("http.enable", "false"));
