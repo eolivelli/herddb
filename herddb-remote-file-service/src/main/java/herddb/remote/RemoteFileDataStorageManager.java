@@ -47,13 +47,16 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.bookkeeper.stats.NullStatsLogger;
@@ -93,6 +96,28 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
      */
     private final ConcurrentHashMap<String, Set<Long>> lastCheckpointedIndexPages = new ConcurrentHashMap<>();
 
+    /**
+     * Deferred page deletions keyed by "{tableSpace}/{uuid}". Each entry records pages
+     * that became stale at a specific checkpoint LSN and are waiting until it is safe to
+     * actually delete them from remote storage. Populated only when retention is enabled.
+     */
+    private final ConcurrentHashMap<String, List<PendingDeletion>> pendingDataDeletions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, List<PendingDeletion>> pendingIndexDeletions = new ConcurrentHashMap<>();
+
+    /**
+     * When retention is enabled, page deletions are deferred according to the following rules:
+     * <ul>
+     *   <li>wait at least {@link #minRetentionMillis} after a page became stale (safety grace)</li>
+     *   <li>delete when the min replica LSN (from {@link #minReplicaLsnSupplier}) has advanced
+     *       past the page's stale-LSN</li>
+     *   <li>force-delete after {@link #maxRetentionMillis} even if replicas are behind (safety cap)</li>
+     * </ul>
+     */
+    private volatile boolean retentionEnabled = false;
+    private volatile Function<String, LogSequenceNumber> minReplicaLsnSupplier = ts -> null;
+    private volatile long minRetentionMillis = 0L;
+    private volatile long maxRetentionMillis = Long.MAX_VALUE;
+
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
             RemoteFileServiceClient client) {
@@ -110,6 +135,112 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
      */
     public void setSharedCheckpointMetadataManager(SharedCheckpointMetadataManager manager) {
         this.sharedCheckpointMetadataManager = manager;
+    }
+
+    /**
+     * Enables deferred page deletion so that shared-storage read replicas can safely consume
+     * pages from old checkpoints. See the class-level documentation for the retention model.
+     *
+     * @param minReplicaLsnSupplier given a tableSpace UUID, returns the minimum checkpoint LSN
+     *        across all currently-registered replicas, or {@code null} if no replicas are tracked
+     * @param minRetentionMillis minimum grace period before a page can be deleted, even if all
+     *        replicas have advanced past its stale-LSN
+     * @param maxRetentionMillis maximum time a page can be retained; after this, it is force-deleted
+     *        even if some replicas are still behind (they will need to re-bootstrap)
+     */
+    public void setRetentionPolicy(
+            Function<String, LogSequenceNumber> minReplicaLsnSupplier,
+            long minRetentionMillis,
+            long maxRetentionMillis) {
+        this.minReplicaLsnSupplier = minReplicaLsnSupplier != null ? minReplicaLsnSupplier : ts -> null;
+        this.minRetentionMillis = Math.max(0, minRetentionMillis);
+        this.maxRetentionMillis = maxRetentionMillis <= 0 ? Long.MAX_VALUE : maxRetentionMillis;
+        this.retentionEnabled = true;
+        LOGGER.log(Level.INFO,
+                "Deferred page deletion enabled: minRetention={0}ms, maxRetention={1}ms",
+                new Object[]{this.minRetentionMillis, this.maxRetentionMillis});
+    }
+
+    // visible for testing
+    long currentTimeMillis() {
+        return System.currentTimeMillis();
+    }
+
+    // visible for testing
+    int pendingDataDeletionCount(String tableSpace, String uuid) {
+        List<PendingDeletion> pending = pendingDataDeletions.get(tableSpace + "/" + uuid);
+        return pending == null ? 0 : pending.size();
+    }
+
+    // visible for testing
+    int pendingIndexDeletionCount(String tableSpace, String uuid) {
+        List<PendingDeletion> pending = pendingIndexDeletions.get(tableSpace + "/" + uuid);
+        return pending == null ? 0 : pending.size();
+    }
+
+    private static final class PendingDeletion {
+        final LogSequenceNumber staleAt;
+        final long scheduledAtMillis;
+        final String remotePath;
+        final String description;
+        final String tableSpace;
+        final String uuid;
+
+        PendingDeletion(LogSequenceNumber staleAt, long scheduledAtMillis, String remotePath,
+                        String description, String tableSpace, String uuid) {
+            this.staleAt = staleAt;
+            this.scheduledAtMillis = scheduledAtMillis;
+            this.remotePath = remotePath;
+            this.description = description;
+            this.tableSpace = tableSpace;
+            this.uuid = uuid;
+        }
+    }
+
+    /**
+     * Evaluates pending deletions for a table/index and returns the subset that is safe to
+     * execute now. Safe deletions are removed from the pending list.
+     */
+    private List<PostCheckpointAction> promotePendingDeletions(
+            ConcurrentHashMap<String, List<PendingDeletion>> store, String key, String tableSpace) {
+        List<PendingDeletion> pending = store.get(key);
+        if (pending == null || pending.isEmpty()) {
+            return Collections.emptyList();
+        }
+        LogSequenceNumber minReplicaLsn = null;
+        try {
+            minReplicaLsn = minReplicaLsnSupplier.apply(tableSpace);
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Failed to query min replica LSN for " + tableSpace
+                    + "; retaining pages conservatively", e);
+        }
+        long now = currentTimeMillis();
+        List<PostCheckpointAction> toRun = new ArrayList<>();
+        synchronized (pending) {
+            Iterator<PendingDeletion> it = pending.iterator();
+            while (it.hasNext()) {
+                PendingDeletion pd = it.next();
+                long ageMs = now - pd.scheduledAtMillis;
+                boolean minGracePassed = ageMs >= minRetentionMillis;
+                // A replica at LSN L does not reference pages that became stale at LSN pd.staleAt
+                // when L >= pd.staleAt. after() is strictly-after, so we check !pd.staleAt.after(L).
+                boolean replicasAdvanced = minReplicaLsn != null
+                        && !pd.staleAt.after(minReplicaLsn);
+                boolean forceByMaxAge = ageMs >= maxRetentionMillis;
+                boolean safe = (minGracePassed && replicasAdvanced) || forceByMaxAge;
+                if (safe) {
+                    toRun.add(new RemoteDeletePageAction(pd.tableSpace, pd.uuid, pd.description,
+                            pd.remotePath, client));
+                    it.remove();
+                    if (forceByMaxAge && !replicasAdvanced) {
+                        LOGGER.log(Level.WARNING,
+                                "Force-deleting page {0} after {1}ms (min replica LSN: {2}, stale at: {3})",
+                                new Object[]{pd.remotePath, ageMs, minReplicaLsn, pd.staleAt});
+                    }
+                }
+            }
+        }
+        return toRun;
     }
 
     // -------------------------------------------------------------------------
@@ -337,15 +468,16 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
         String key = tableSpace + "/" + uuid;
 
         Set<Long> previousActivePages = lastCheckpointedDataPages.get(key);
+        List<long[]> newlyStale = new ArrayList<>(); // [pageId] or [-1] when only path is known
+        List<String> newlyStalePaths = new ArrayList<>();
         if (previousActivePages != null) {
             // Fast path: diff against the previous checkpoint — no remote listing needed
             for (Long pageId : previousActivePages) {
                 if (!pins.containsKey(pageId)
                         && !currentActivePages.contains(pageId)
                         && pageId < maxPageId) {
-                    result.add(new RemoteDeletePageAction(tableSpace, uuid,
-                            "delete remote page " + pageId,
-                            remoteDataPagePath(tableSpace, uuid, pageId), client));
+                    newlyStale.add(new long[]{pageId});
+                    newlyStalePaths.add(remoteDataPagePath(tableSpace, uuid, pageId));
                 }
             }
         } else {
@@ -359,12 +491,31 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
                         && !pins.containsKey(pageId)
                         && !currentActivePages.contains(pageId)
                         && pageId < maxPageId) {
-                    result.add(new RemoteDeletePageAction(tableSpace, uuid,
-                            "delete remote page " + pageId, remotePath, client));
+                    newlyStale.add(new long[]{pageId});
+                    newlyStalePaths.add(remotePath);
                 }
             }
         }
         lastCheckpointedDataPages.put(key, new HashSet<>(currentActivePages));
+
+        // Emit data-page deletion actions: either deferred (with retention) or immediate
+        if (retentionEnabled) {
+            long now = currentTimeMillis();
+            List<PendingDeletion> bucket = pendingDataDeletions.computeIfAbsent(key,
+                    k -> Collections.synchronizedList(new ArrayList<>()));
+            for (int i = 0; i < newlyStale.size(); i++) {
+                long pageId = newlyStale.get(i)[0];
+                bucket.add(new PendingDeletion(tableStatus.sequenceNumber, now, newlyStalePaths.get(i),
+                        "delete remote page " + pageId, tableSpace, uuid));
+            }
+            result.addAll(promotePendingDeletions(pendingDataDeletions, key, tableSpace));
+        } else {
+            for (int i = 0; i < newlyStale.size(); i++) {
+                long pageId = newlyStale.get(i)[0];
+                result.add(new RemoteDeletePageAction(tableSpace, uuid,
+                        "delete remote page " + pageId, newlyStalePaths.get(i), client));
+            }
+        }
 
         // Publish to shared storage for read replicas
         SharedCheckpointMetadataManager shared = this.sharedCheckpointMetadataManager;
@@ -388,15 +539,16 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
         String key = tableSpace + "/" + uuid;
 
         Set<Long> previousActivePages = lastCheckpointedIndexPages.get(key);
+        List<long[]> newlyStale = new ArrayList<>();
+        List<String> newlyStalePaths = new ArrayList<>();
         if (previousActivePages != null) {
             // Fast path: diff against the previous checkpoint — no remote listing needed
             for (Long pageId : previousActivePages) {
                 if (!pins.containsKey(pageId)
                         && !currentActivePages.contains(pageId)
                         && pageId < maxPageId) {
-                    result.add(new RemoteDeletePageAction(tableSpace, uuid,
-                            "delete remote index page " + pageId,
-                            remoteIndexPagePath(tableSpace, uuid, pageId), client));
+                    newlyStale.add(new long[]{pageId});
+                    newlyStalePaths.add(remoteIndexPagePath(tableSpace, uuid, pageId));
                 }
             }
         } else {
@@ -410,12 +562,31 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
                         && !pins.containsKey(pageId)
                         && !currentActivePages.contains(pageId)
                         && pageId < maxPageId) {
-                    result.add(new RemoteDeletePageAction(tableSpace, uuid,
-                            "delete remote index page " + pageId, remotePath, client));
+                    newlyStale.add(new long[]{pageId});
+                    newlyStalePaths.add(remotePath);
                 }
             }
         }
         lastCheckpointedIndexPages.put(key, new HashSet<>(currentActivePages));
+
+        // Emit index-page deletion actions: either deferred (with retention) or immediate
+        if (retentionEnabled) {
+            long now = currentTimeMillis();
+            List<PendingDeletion> bucket = pendingIndexDeletions.computeIfAbsent(key,
+                    k -> Collections.synchronizedList(new ArrayList<>()));
+            for (int i = 0; i < newlyStale.size(); i++) {
+                long pageId = newlyStale.get(i)[0];
+                bucket.add(new PendingDeletion(indexStatus.sequenceNumber, now, newlyStalePaths.get(i),
+                        "delete remote index page " + pageId, tableSpace, uuid));
+            }
+            result.addAll(promotePendingDeletions(pendingIndexDeletions, key, tableSpace));
+        } else {
+            for (int i = 0; i < newlyStale.size(); i++) {
+                long pageId = newlyStale.get(i)[0];
+                result.add(new RemoteDeletePageAction(tableSpace, uuid,
+                        "delete remote index page " + pageId, newlyStalePaths.get(i), client));
+            }
+        }
 
         // Publish to shared storage for read replicas
         SharedCheckpointMetadataManager shared = this.sharedCheckpointMetadataManager;
@@ -467,21 +638,27 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
     public void dropTable(String tableSpace, String uuid) throws DataStorageManagerException {
         localMetadataManager.dropTable(tableSpace, uuid);
         client.deleteByPrefix(remoteDataPrefix(tableSpace, uuid));
-        lastCheckpointedDataPages.remove(tableSpace + "/" + uuid);
+        String key = tableSpace + "/" + uuid;
+        lastCheckpointedDataPages.remove(key);
+        pendingDataDeletions.remove(key);
     }
 
     @Override
     public void dropIndex(String tableSpace, String uuid) throws DataStorageManagerException {
         localMetadataManager.dropIndex(tableSpace, uuid);
         client.deleteByPrefix(remoteIndexPrefix(tableSpace, uuid));
-        lastCheckpointedIndexPages.remove(tableSpace + "/" + uuid);
+        String key = tableSpace + "/" + uuid;
+        lastCheckpointedIndexPages.remove(key);
+        pendingIndexDeletions.remove(key);
     }
 
     @Override
     public void truncateIndex(String tableSpace, String uuid) throws DataStorageManagerException {
         localMetadataManager.truncateIndex(tableSpace, uuid);
         client.deleteByPrefix(remoteIndexPrefix(tableSpace, uuid));
-        lastCheckpointedIndexPages.remove(tableSpace + "/" + uuid);
+        String key = tableSpace + "/" + uuid;
+        lastCheckpointedIndexPages.remove(key);
+        pendingIndexDeletions.remove(key);
     }
 
     @Override
@@ -491,6 +668,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
         String prefix = tableSpace + "/";
         lastCheckpointedDataPages.keySet().removeIf(k -> k.startsWith(prefix));
         lastCheckpointedIndexPages.keySet().removeIf(k -> k.startsWith(prefix));
+        pendingDataDeletions.keySet().removeIf(k -> k.startsWith(prefix));
+        pendingIndexDeletions.keySet().removeIf(k -> k.startsWith(prefix));
     }
 
     @Override

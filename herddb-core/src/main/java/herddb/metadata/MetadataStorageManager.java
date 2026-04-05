@@ -221,6 +221,34 @@ public abstract class MetadataStorageManager implements AutoCloseable {
         // no-op for non-ZK implementations
     }
 
+    /**
+     * A replica publishes its current applied checkpoint LSN. The leader reads this to
+     * determine when it is safe to delete stale pages from remote storage.
+     * <p>
+     * Implementations should use an ephemeral mechanism (e.g., ephemeral znode in ZK) so
+     * that the entry is automatically removed when the replica disconnects/crashes.
+     */
+    public void publishReplicaCheckpointLsn(String tableSpaceUUID, String nodeId, LogSequenceNumber lsn) throws MetadataStorageManagerException {
+        // no-op for non-ZK implementations
+    }
+
+    /**
+     * Removes the replica's published checkpoint LSN (called on clean shutdown).
+     */
+    public void unregisterReplicaCheckpointLsn(String tableSpaceUUID, String nodeId) throws MetadataStorageManagerException {
+        // no-op for non-ZK implementations
+    }
+
+    /**
+     * Returns the minimum checkpoint LSN across all currently-registered replicas for
+     * the given tablespace. Returns {@code null} if no replicas are registered.
+     * <p>
+     * The leader uses this to decide whether it is safe to delete stale remote pages.
+     */
+    public LogSequenceNumber getMinReplicaCheckpointLsn(String tableSpaceUUID) throws MetadataStorageManagerException {
+        return null;
+    }
+
     public String generateNewNodeId(ServerConfiguration config) throws MetadataStorageManagerException {
         List<NodeMetadata> actualNodes = listNodes();
         NodeIdGenerator generator = new NodeIdGenerator();

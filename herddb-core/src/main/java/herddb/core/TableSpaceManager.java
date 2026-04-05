@@ -1393,6 +1393,10 @@ public class TableSpaceManager {
                         ServerConfiguration.PROPERTY_REPLICA_CHECKPOINT_POLL_INTERVAL,
                         ServerConfiguration.PROPERTY_REPLICA_CHECKPOINT_POLL_INTERVAL_DEFAULT);
 
+                // Publish initial replica LSN (may be START_OF_TIME if no checkpoint seen yet)
+                // so the leader knows this replica exists and won't prematurely delete pages.
+                publishReplicaCheckpointLsn(actualLogSequenceNumber);
+
                 // Set up ZK watch for checkpoint notifications
                 try {
                     metadataStorageManager.watchCheckpointLsn(tableSpaceUUID, (lsn) -> {
@@ -1432,6 +1436,9 @@ public class TableSpaceManager {
                             LOGGER.log(Level.INFO, "Refreshing {0} from checkpoint {1} (current: {2})",
                                     new Object[]{tableSpaceName, newLsn, actualLogSequenceNumber});
                             refreshFromCheckpoint(newLsn);
+                            // Advertise the replica's new position so the leader can
+                            // release pages that became stale at or before newLsn.
+                            publishReplicaCheckpointLsn(newLsn);
                         }
                     } catch (Exception err) {
                         LOGGER.log(Level.WARNING, "Error refreshing from checkpoint for " + tableSpaceName, err);
@@ -1441,7 +1448,24 @@ public class TableSpaceManager {
                 LOGGER.log(Level.SEVERE, "checkpoint follower error " + tableSpaceName, t);
                 setFailed();
             } finally {
+                try {
+                    metadataStorageManager.unregisterReplicaCheckpointLsn(tableSpaceUUID, nodeId);
+                } catch (Exception ignore) {
+                    // best-effort cleanup; ZK ephemeral znode will be removed on session close anyway
+                }
                 running.countDown();
+            }
+        }
+
+        private void publishReplicaCheckpointLsn(LogSequenceNumber lsn) {
+            if (lsn == null) {
+                lsn = LogSequenceNumber.START_OF_TIME;
+            }
+            try {
+                metadataStorageManager.publishReplicaCheckpointLsn(tableSpaceUUID, nodeId, lsn);
+            } catch (Exception err) {
+                LOGGER.log(Level.WARNING, "Failed to publish replica checkpoint LSN " + lsn
+                        + " for " + tableSpaceName, err);
             }
         }
 

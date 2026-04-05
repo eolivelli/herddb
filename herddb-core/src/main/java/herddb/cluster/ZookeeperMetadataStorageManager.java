@@ -829,6 +829,92 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
         }
     }
 
+    @Override
+    public void publishReplicaCheckpointLsn(String tableSpaceUUID, String nodeId, LogSequenceNumber lsn) throws MetadataStorageManagerException {
+        try {
+            // Ensure parent persistent znode exists (the leader's checkpoint znode)
+            String parentPath = checkpointsPath + "/" + tableSpaceUUID;
+            try {
+                ensureZooKeeper().create(checkpointsPath, new byte[0],
+                        ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            } catch (KeeperException.NodeExistsException e) {
+                // ignore
+            }
+            try {
+                ensureZooKeeper().create(parentPath, new byte[0],
+                        ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            } catch (KeeperException.NodeExistsException e) {
+                // ignore
+            }
+            // Now create/update the ephemeral replica node
+            String replicaPath = parentPath + "/" + nodeId;
+            byte[] data = serializeLsn(lsn);
+            try {
+                ensureZooKeeper().setData(replicaPath, data, -1);
+            } catch (KeeperException.NoNodeException notExists) {
+                try {
+                    ensureZooKeeper().create(replicaPath, data,
+                            ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+                } catch (KeeperException.NodeExistsException exists) {
+                    // race: session came back and reclaimed, just set
+                    ensureZooKeeper().setData(replicaPath, data, -1);
+                }
+            }
+            LOGGER.log(Level.FINE, "Published replica checkpoint LSN {0} for {1}/{2}",
+                    new Object[]{lsn, tableSpaceUUID, nodeId});
+        } catch (InterruptedException | KeeperException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public void unregisterReplicaCheckpointLsn(String tableSpaceUUID, String nodeId) throws MetadataStorageManagerException {
+        try {
+            String replicaPath = checkpointsPath + "/" + tableSpaceUUID + "/" + nodeId;
+            try {
+                ensureZooKeeper().delete(replicaPath, -1);
+            } catch (KeeperException.NoNodeException notExists) {
+                // already gone
+            }
+        } catch (InterruptedException | KeeperException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public LogSequenceNumber getMinReplicaCheckpointLsn(String tableSpaceUUID) throws MetadataStorageManagerException {
+        try {
+            String parentPath = checkpointsPath + "/" + tableSpaceUUID;
+            List<String> children;
+            try {
+                children = ensureZooKeeper().getChildren(parentPath, false);
+            } catch (KeeperException.NoNodeException notExists) {
+                return null;
+            }
+            if (children.isEmpty()) {
+                return null;
+            }
+            LogSequenceNumber min = null;
+            for (String child : children) {
+                try {
+                    byte[] data = ensureZooKeeper().getData(parentPath + "/" + child, false, new Stat());
+                    LogSequenceNumber lsn = deserializeLsn(data);
+                    if (min == null || min.after(lsn)) {
+                        min = lsn;
+                    }
+                } catch (KeeperException.NoNodeException disappeared) {
+                    // replica disconnected mid-query, skip
+                }
+            }
+            return min;
+        } catch (InterruptedException | KeeperException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
     private void installCheckpointWatch(String tableSpaceUUID, String path) throws KeeperException, InterruptedException, IOException {
         Watcher watcher = (WatchedEvent event) -> {
             if (event.getType() == Watcher.Event.EventType.NodeDataChanged) {

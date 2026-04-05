@@ -428,6 +428,30 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                         Object metaMgr = metaMgrClass.getConstructor(clientClass).newInstance(client);
                         storageClass.getMethod("setSharedCheckpointMetadataManager", metaMgrClass)
                                 .invoke(dsm, metaMgr);
+
+                        // Enable deferred page deletion so replicas can safely consume old pages.
+                        long minRetentionMillis = configuration.getLong(
+                                ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MIN_MILLIS,
+                                ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MIN_MILLIS_DEFAULT);
+                        long maxRetentionMillis = configuration.getLong(
+                                ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MAX_MILLIS,
+                                ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MAX_MILLIS_DEFAULT);
+                        final MetadataStorageManager msm = metadataStorageManager;
+                        java.util.function.Function<String, herddb.log.LogSequenceNumber> supplier = tableSpaceUuid -> {
+                            try {
+                                return msm.getMinReplicaCheckpointLsn(tableSpaceUuid);
+                            } catch (Exception e) {
+                                LOGGER.log(Level.WARNING,
+                                        "Failed to read min replica LSN from metadata for " + tableSpaceUuid, e);
+                                return null;
+                            }
+                        };
+                        storageClass.getMethod("setRetentionPolicy",
+                                java.util.function.Function.class, long.class, long.class)
+                                .invoke(dsm, supplier, minRetentionMillis, maxRetentionMillis);
+                        LOGGER.log(Level.INFO,
+                                "Replica-aware page retention enabled: min={0}ms, max={1}ms",
+                                new Object[]{minRetentionMillis, maxRetentionMillis});
                     }
 
                     return (DataStorageManager) dsm;
