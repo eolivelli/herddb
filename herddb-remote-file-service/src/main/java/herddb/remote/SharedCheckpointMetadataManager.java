@@ -36,6 +36,9 @@ import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -450,6 +453,168 @@ public class SharedCheckpointMetadataManager {
         } catch (IOException err) {
             throw new DataStorageManagerException("Failed to read transactions from " + path, err);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Hydrate local metadata dir from remote (bootstrap for ephemeral pods)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Downloads all index-status and table-status files for {@code tableSpace} from
+     * remote storage into {@code localMetadataDir}, writing them at the exact
+     * on-disk paths that {@link herddb.file.FileDataStorageManager} expects.
+     * <p>
+     * This is used by the indexing service (and any other {@code RemoteFileDataStorageManager}
+     * consumer that runs on an ephemeral local volume) to bootstrap its local metadata
+     * cache on restart, so that {@code getIndexStatus}/{@code getLatestIndexStatus} lookups
+     * find the checkpoints that were published to S3 before the disk was wiped.
+     * <p>
+     * The byte-for-byte format of {@code *.indexstatus} and {@code *.tablestatus} objects
+     * on S3 is identical to what {@code FileDataStorageManager} writes locally (both
+     * emit {@code writeVLong(1) + writeVLong(0) + status.serialize() + XXHash64 footer}),
+     * so we can copy the payload verbatim without deserializing.
+     * <p>
+     * Implementation: downloads to a staging directory first, then atomically renames
+     * it over the target path. On failure, the staging dir is removed and the target
+     * is left untouched — callers see either the full snapshot or nothing.
+     *
+     * @return the number of files hydrated (0 if nothing was found on remote)
+     */
+    public int hydrateLocalMetadataDir(Path localMetadataDir, String tableSpace) throws IOException {
+        String prefix = metadataPrefix(tableSpace);
+        List<String> remoteFiles;
+        try {
+            remoteFiles = client.listFiles(prefix);
+        } catch (RuntimeException e) {
+            throw new IOException("Failed to list remote metadata files under " + prefix, e);
+        }
+        LOGGER.log(Level.INFO,
+                "hydrateLocalMetadataDir: listed {0} file(s) under {1}",
+                new Object[]{remoteFiles == null ? 0 : remoteFiles.size(), prefix});
+        if (remoteFiles == null || remoteFiles.isEmpty()) {
+            LOGGER.log(Level.INFO,
+                    "hydrateLocalMetadataDir: no remote metadata found under {0}, skipping",
+                    prefix);
+            return 0;
+        }
+
+        Path stagingDir = localMetadataDir.resolve(".hydrate-staging-" + System.nanoTime());
+        Path tableSpaceStaging = stagingDir.resolve(tableSpace + ".tablespace");
+        int filesWritten = 0;
+        try {
+            Files.createDirectories(tableSpaceStaging);
+            for (String remotePath : remoteFiles) {
+                // Ignore the atomic-commit marker (not a checkpoint artefact needing
+                // a corresponding on-disk file) and anything that is not status.
+                if (remotePath.equals(latestCheckpointPath(tableSpace))) {
+                    continue;
+                }
+                String fileName = remotePath;
+                int slash = fileName.lastIndexOf('/');
+                if (slash >= 0) {
+                    fileName = fileName.substring(slash + 1);
+                }
+
+                // Expected naming: {uuid}.{ledger}.{offset}.{ext}
+                //   ext in { indexstatus, tablestatus }
+                String[] parts = fileName.split("\\.");
+                if (parts.length < 4) {
+                    continue;
+                }
+                String ext = parts[parts.length - 1];
+                boolean isIndexStatus = "indexstatus".equals(ext);
+                boolean isTableStatus = "tablestatus".equals(ext);
+                if (!isIndexStatus && !isTableStatus) {
+                    continue;
+                }
+                // Reconstruct uuid (may contain '.') — it's everything before the last 3 dots.
+                StringBuilder uuidSb = new StringBuilder();
+                for (int i = 0; i < parts.length - 3; i++) {
+                    if (i > 0) {
+                        uuidSb.append('.');
+                    }
+                    uuidSb.append(parts[i]);
+                }
+                String uuid = uuidSb.toString();
+                String ledger = parts[parts.length - 3];
+                String offset = parts[parts.length - 2];
+
+                // FileDataStorageManager path layout (see FileDataStorageManager.java):
+                //   {root}/{tableSpace}/{uuid}.{index|table}/{ledger}.{offset}.tableorindexcheckpoint
+                String subDirName = uuid + (isIndexStatus ? ".index" : ".table");
+                Path targetSubDir = tableSpaceStaging.resolve(subDirName);
+                Files.createDirectories(targetSubDir);
+                Path targetFile = targetSubDir.resolve(
+                        ledger + "." + offset + ".checkpoint");
+
+                byte[] data;
+                try {
+                    data = client.readFile(remotePath);
+                } catch (RuntimeException e) {
+                    throw new IOException("Failed to read remote metadata file " + remotePath, e);
+                }
+                if (data == null) {
+                    // concurrent deletion — skip silently
+                    continue;
+                }
+                Files.write(targetFile, data);
+                filesWritten++;
+            }
+
+            if (filesWritten == 0) {
+                // Nothing hydrated: drop the empty staging dir.
+                deleteRecursively(stagingDir);
+                LOGGER.log(Level.INFO,
+                        "hydrateLocalMetadataDir: nothing to hydrate for {0}", tableSpace);
+                return 0;
+            }
+
+            // Atomic rename of the tablespace directory into place. If a previous
+            // (possibly partial) dir exists, remove it first — we trust S3 as the
+            // source of truth on a fresh boot.
+            Path targetTableSpaceDir = localMetadataDir.resolve(tableSpace + ".tablespace");
+            if (Files.exists(targetTableSpaceDir)) {
+                deleteRecursively(targetTableSpaceDir);
+            }
+            Files.createDirectories(targetTableSpaceDir.getParent());
+            try {
+                Files.move(tableSpaceStaging, targetTableSpaceDir,
+                        StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException atomicErr) {
+                // Some filesystems (e.g. tmpfs across mounts) don't support ATOMIC_MOVE
+                // on directories — fall back to non-atomic move.
+                Files.move(tableSpaceStaging, targetTableSpaceDir);
+            }
+            // Clean up outer staging wrapper (now empty apart from what was moved).
+            deleteRecursively(stagingDir);
+            LOGGER.log(Level.INFO,
+                    "hydrateLocalMetadataDir: wrote {0} file(s) for tableSpace {1}",
+                    new Object[]{filesWritten, tableSpace});
+            return filesWritten;
+        } catch (IOException err) {
+            // Roll back — leave target untouched.
+            try {
+                deleteRecursively(stagingDir);
+            } catch (IOException ignored) {
+                // best-effort cleanup
+            }
+            throw err;
+        }
+    }
+
+    private static void deleteRecursively(Path path) throws IOException {
+        if (!Files.exists(path)) {
+            return;
+        }
+        Files.walk(path)
+                .sorted(java.util.Comparator.reverseOrder())
+                .forEach(p -> {
+                    try {
+                        Files.deleteIfExists(p);
+                    } catch (IOException ignored) {
+                        // best-effort
+                    }
+                });
     }
 
     // -------------------------------------------------------------------------

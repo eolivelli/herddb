@@ -72,7 +72,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     private static final Logger LOGGER = Logger.getLogger(IndexingServiceEngine.class.getName());
 
-    private static final long WATERMARK_SAVE_INTERVAL_ENTRIES = 1000;
+    /**
+     * Minimum number of entries to process between forced checkpoint+watermark
+     * saves. Each trigger calls {@code checkpoint()} on every persistent vector
+     * store and then (on success) writes the watermark. Tuned to keep the cost
+     * of the synchronous S3 write ~ once every few thousand entries (vs every
+     * 1000 previously), since the new policy requires a full checkpoint on
+     * each save.
+     */
+    private static final long WATERMARK_CHECKPOINT_INTERVAL_ENTRIES = 5000;
 
     private final Path logDirectory;
     private final Path dataDirectory;
@@ -88,7 +96,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private Thread tailerThread;
 
     private volatile LogSequenceNumber lastProcessedLsn;
-    private long entriesSinceLastWatermarkSave;
+    private long entriesSinceLastCheckpoint;
 
     private volatile StatsLogger statsLogger;
 
@@ -103,6 +111,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private ExecutorService[] applyWorkers;
     private int applyParallelism;
     private volatile Throwable asyncError;
+
+    /**
+     * Hook invoked after the tablespace UUID has been resolved but before the
+     * watermark is loaded and the tailer is started. Used by
+     * {@link IndexingServer} to hydrate the local metadata cache from S3 and
+     * install an {@code S3WatermarkStore} that addresses its S3 object by
+     * tablespace UUID.
+     */
+    private java.util.function.Consumer<String> afterTableSpaceResolved;
 
     /**
      * In-memory vector stores keyed by "table.index".
@@ -157,6 +174,32 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     public Path getDataDirectory() {
         return dataDirectory;
+    }
+
+    /**
+     * Injects the {@link WatermarkStore}. Must be called before {@link #start()}.
+     * If not set, a {@link LocalWatermarkStore} backed by {@code dataDirectory}
+     * is used.
+     */
+    public void setWatermarkStore(WatermarkStore watermarkStore) {
+        this.watermarkStore = watermarkStore;
+    }
+
+    /**
+     * Registers a hook that runs after the tablespace UUID is resolved but
+     * before the commit-log tailer is started. The tablespace UUID is passed
+     * as an argument.
+     */
+    public void setAfterTableSpaceResolved(java.util.function.Consumer<String> hook) {
+        this.afterTableSpaceResolved = hook;
+    }
+
+    /**
+     * Exposes the checkpoint+watermark save path for tests and the cluster
+     * E2E test that needs to force a checkpoint at a specific point in time.
+     */
+    public void forceCheckpointAndSaveWatermark() {
+        checkpointAndSaveWatermark();
     }
 
     public void setVectorStoreFactory(VectorStoreFactory factory) {
@@ -227,8 +270,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // Configure VectorStoreFactory based on storage type
         String storageType = config.getString(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE,
                 IndexingServerConfiguration.PROPERTY_STORAGE_TYPE_DEFAULT);
-        if ("file".equals(storageType) && dataStorageManager != null && memoryManager != null) {
-            LOGGER.info("Configuring PersistentVectorStore factory (storage type: file)");
+        if (("file".equals(storageType) || "remote".equals(storageType))
+                && dataStorageManager != null && memoryManager != null) {
+            LOGGER.log(Level.INFO,
+                    "Configuring PersistentVectorStore factory (storage type: {0})",
+                    storageType);
             final DataStorageManager dsm = dataStorageManager;
             final MemoryManager mm = memoryManager;
             final Path tmpDir = dataDirectory;
@@ -276,11 +322,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             LOGGER.info("Using InMemoryVectorStore factory (storage type: " + storageType + ")");
         }
 
-        // Initialize components
-        watermarkStore = new WatermarkStore(dataDirectory);
-        LogSequenceNumber watermark = watermarkStore.load();
-        lastProcessedLsn = watermark;
-        entriesSinceLastWatermarkSave = 0;
+        // Initialize components (watermark store is loaded later, after the
+        // tablespace UUID is resolved, because a remote-backed watermark store
+        // addresses its S3 object by tablespace UUID).
+        entriesSinceLastCheckpoint = 0;
 
         schemaTracker = new SchemaTracker();
         transactionBuffer = new TransactionBuffer();
@@ -349,6 +394,46 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         LOGGER.log(Level.INFO, "Resolved tablespace name ''{0}'' to UUID ''{1}''",
                 new Object[]{tablespaceName, tableSpaceUUID});
 
+        // Allow external components (IndexingServer) to bootstrap state from
+        // remote storage now that we know the tablespace UUID — this is where
+        // the SharedCheckpointMetadataManager hydrates {remoteMetaDir} from S3
+        // and where an S3WatermarkStore gets installed.
+        if (afterTableSpaceResolved != null) {
+            try {
+                afterTableSpaceResolved.accept(tableSpaceUUID);
+            } catch (Exception e) {
+                throw new IOException("tablespace-resolved hook failed", e);
+            }
+        }
+
+        // Load the watermark now that the watermark store has been configured
+        // for this tablespace UUID.
+        if (watermarkStore == null) {
+            watermarkStore = new LocalWatermarkStore(dataDirectory);
+        }
+        LogSequenceNumber watermark = watermarkStore.load();
+        lastProcessedLsn = watermark;
+        LOGGER.log(Level.INFO, "Loaded watermark: {0}", watermark);
+
+        // Start the commit-log tailer from START_OF_TIME — not from the
+        // watermark. Rationale: the indexing service needs to reprocess DDL
+        // entries (CREATE_TABLE, CREATE_INDEX, ALTER_*) on every restart to
+        // rebuild its in-memory {@link SchemaTracker}. Skipping them by
+        // tailing from a non-trivial watermark would leave the service
+        // without knowledge of the vector indexes that exist, so it could
+        // not create their {@link AbstractVectorStore}s.
+        //
+        // DML entries are replayed too; this is safe because vector-store
+        // apply operations are idempotent (addVector by PK replaces). With
+        // a hydrated {@code remote-metadata/} the PersistentVectorStores
+        // load their sealed segments from S3 on start, so the replay only
+        // has to re-add vectors that were never checkpointed.
+        //
+        // A future optimization can either (a) persist a schema snapshot
+        // next to the watermark, or (b) skip DML entries with LSN less than
+        // or equal to the watermark while always applying DDL.
+        LogSequenceNumber tailerStart = LogSequenceNumber.START_OF_TIME;
+
         // Create and start the tailer
         String logType = config.getString(IndexingServerConfiguration.PROPERTY_LOG_TYPE,
                 IndexingServerConfiguration.PROPERTY_LOG_TYPE_DEFAULT);
@@ -364,15 +449,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             LOGGER.log(Level.INFO, "Creating BookKeeperCommitLogTailer, zk={0}, tsUUID={1}",
                     new Object[]{zkAddress, tableSpaceUUID});
             tailer = new BookKeeperCommitLogTailer(zkAddress, zkSessionTimeout, zkPath,
-                    bkLedgersPath, tableSpaceUUID, watermark, this::processEntry);
+                    bkLedgersPath, tableSpaceUUID, tailerStart, this::processEntry);
         } else {
-            tailer = new FileCommitLogTailer(logDirectory, tableSpaceUUID, watermark, this::processEntry);
+            tailer = new FileCommitLogTailer(logDirectory, tableSpaceUUID, tailerStart, this::processEntry);
         }
         tailerThread = new Thread(tailer, "indexing-service-tailer");
         tailerThread.setDaemon(true);
         tailerThread.start();
 
-        LOGGER.info("IndexingServiceEngine started, watermark=" + watermark);
+        LOGGER.log(Level.INFO,
+                "IndexingServiceEngine started, watermark={0}, tailerStart={1}",
+                new Object[]{watermark, tailerStart});
     }
 
     /**
@@ -411,12 +498,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             }
 
             lastProcessedLsn = lsn;
-            entriesSinceLastWatermarkSave++;
+            entriesSinceLastCheckpoint++;
 
-            // Periodically save watermark
-            if (entriesSinceLastWatermarkSave >= WATERMARK_SAVE_INTERVAL_ENTRIES) {
-                awaitPendingWork();
-                saveWatermark();
+            // Periodically force a checkpoint and then persist the watermark.
+            // The watermark is saved ONLY after all stores successfully
+            // checkpoint — never at any other time. See
+            // {@link WatermarkStore} for the save contract.
+            if (entriesSinceLastCheckpoint >= WATERMARK_CHECKPOINT_INTERVAL_ENTRIES) {
+                checkpointAndSaveWatermark();
             }
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error processing entry at LSN " + lsn + ": " + entry, e);
@@ -689,13 +778,51 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         return null;
     }
 
-    private void saveWatermark() {
+    /**
+     * Drains pending DML work, calls {@code checkpoint()} on every persistent
+     * vector store, then — if ALL checkpoints completed successfully — writes
+     * the watermark. This is the only path that persists the watermark.
+     *
+     * <p>Ordering matters: the watermark LSN must correspond to state that
+     * has been fully durably persisted (vector pages + IndexStatus on S3).
+     * If any checkpoint fails we do not advance the watermark, so restart
+     * will replay from the previous watermark — correct because the apply
+     * path is idempotent.
+     */
+    private void checkpointAndSaveWatermark() {
         try {
-            watermarkStore.save(lastProcessedLsn);
-            entriesSinceLastWatermarkSave = 0;
-            LOGGER.log(Level.FINE, "Saved watermark at {0}", lastProcessedLsn);
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to save watermark", e);
+            // Drain async DML so that lastProcessedLsn is actually applied
+            // into the in-memory store state before checkpoint captures it.
+            awaitPendingWork();
+            LogSequenceNumber checkpointLsn = lastProcessedLsn;
+            entriesSinceLastCheckpoint = 0;
+
+            boolean allCheckpointsSucceeded = true;
+            for (AbstractVectorStore store : vectorStores.values()) {
+                if (store instanceof PersistentVectorStore) {
+                    try {
+                        ((PersistentVectorStore) store).checkpoint();
+                    } catch (Exception e) {
+                        LOGGER.log(Level.WARNING,
+                                "checkpoint failed, watermark will NOT be advanced: " + e.getMessage(), e);
+                        allCheckpointsSucceeded = false;
+                        break;
+                    }
+                }
+            }
+            if (!allCheckpointsSucceeded) {
+                return;
+            }
+            // Only now — all stores have durably persisted state covering
+            // checkpointLsn — is it safe to publish the watermark.
+            try {
+                watermarkStore.save(checkpointLsn);
+                LOGGER.log(Level.FINE, "Saved watermark at {0}", checkpointLsn);
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to save watermark", e);
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "checkpointAndSaveWatermark failed", e);
         }
     }
 
@@ -1186,10 +1313,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             LOGGER.info("DML apply workers shut down");
         }
 
-        // Save final watermark
-        if (lastProcessedLsn != null && watermarkStore != null) {
-            saveWatermark();
-        }
+        // Shutdown: do NOT save the watermark as a side effect. The watermark
+        // is only persisted after a successful checkpoint via
+        // checkpointAndSaveWatermark(). Saving at shutdown would publish an
+        // LSN that is not guaranteed to be covered by checkpointed state on
+        // S3 — on a wiped-disk restart the service would claim progress it
+        // cannot actually replay. Replay from the last checkpoint watermark
+        // on next boot is safe (apply is idempotent).
 
         // Close and clear all vector stores
         for (AbstractVectorStore store : vectorStores.values()) {

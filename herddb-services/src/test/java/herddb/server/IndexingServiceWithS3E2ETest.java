@@ -388,13 +388,10 @@ public class IndexingServiceWithS3E2ETest {
 
     @Test
     public void restartIndexingServiceBeforeCheckpoint() throws Exception {
-        // Simulates a crash of the indexing service before its vector store
-        // has been checkpointed to S3: the watermark in {dataDir}/watermark.dat
-        // is removed before restart to force a full commit-log replay, which
-        // is the only way the (in-memory live-shard-only) vectors can be
-        // recovered. Without checkpointing, the vector-store state lives
-        // exclusively in the tailer's in-memory graph built from the
-        // (local) commit log.
+        // Simulates a crash of the indexing service before any checkpoint has
+        // completed. The S3 watermark object does not yet exist, so on restart
+        // (even with a wiped local disk) the service loads START_OF_TIME and
+        // replays the full commit log — which is the only correct behaviour.
         try (Topology t = new Topology();
              HDBClient hdbClient = newHDBClient(t.server);
              HDBConnection con = hdbClient.openConnection()) {
@@ -403,7 +400,8 @@ public class IndexingServiceWithS3E2ETest {
             waitForIndexing(t.server, con, 5000);
 
             t.stopIndexing();
-            Files.deleteIfExists(t.indexingData.resolve("watermark.dat"));
+            // Ephemeral-pod simulation: wipe ALL local indexing state.
+            wipeIndexingLocalState(t);
             t.startIndexing(t.server);
             waitForIndexing(t.server, con, 10000);
 
@@ -417,11 +415,13 @@ public class IndexingServiceWithS3E2ETest {
 
     @Test
     public void restartIndexingServiceAfterCheckpoint() throws Exception {
-        // A vector-store checkpoint runs before the restart (thanks to the
-        // short compactionIntervalMs), so at least one segment is persisted
-        // to S3. We ALSO clear the watermark to force a commit-log replay
-        // — that way we verify BOTH paths (S3 segment reload + replay)
-        // converge on a usable index.
+        // After inserts, force a checkpoint+watermark publish. Then stop the
+        // indexing service, WIPE its local disk (simulating an ephemeral
+        // Kubernetes pod restart), and restart. The service must:
+        //   - hydrate its remote-metadata cache from S3 (IndexStatus markers)
+        //   - load the watermark from S3
+        //   - skip replay of entries already covered by the published checkpoint
+        //   - and still return ANN results for every id.
         try (Topology t = new Topology(500L);
              HDBClient hdbClient = newHDBClient(t.server);
              HDBConnection con = hdbClient.openConnection()) {
@@ -435,8 +435,12 @@ public class IndexingServiceWithS3E2ETest {
             // the live shards into at least one sealed on-disk segment.
             waitUntilSegmentsExistInS3(t, 15000);
 
+            // Publish IndexStatus + watermark to S3 atomically before restart.
+            t.engine.forceCheckpointAndSaveWatermark();
+
             t.stopIndexing();
-            Files.deleteIfExists(t.indexingData.resolve("watermark.dat"));
+            // Ephemeral-pod simulation: wipe every byte of local indexing state.
+            wipeIndexingLocalState(t);
             t.startIndexing(t.server);
             waitForIdInTopK(con, queryForId(0, 4), 0, 5, 15000);
 
@@ -453,6 +457,28 @@ public class IndexingServiceWithS3E2ETest {
                     0, false, true, Arrays.asList(9999, vecDiag));
             waitForIdInTopK(con, vecDiag, 9999, 5, 10000);
         }
+    }
+
+    /**
+     * Simulates an ephemeral-pod restart by wiping the indexing service's
+     * local data directory. After this, ALL persistent state (watermark +
+     * IndexStatus checkpoint markers) must be read back from S3 on restart.
+     */
+    private static void wipeIndexingLocalState(Topology t) throws Exception {
+        if (!Files.exists(t.indexingData)) {
+            return;
+        }
+        try (java.util.stream.Stream<Path> walk = Files.walk(t.indexingData)) {
+            walk.sorted(java.util.Comparator.reverseOrder())
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (java.io.IOException ignored) {
+                            // best-effort
+                        }
+                    });
+        }
+        Files.createDirectories(t.indexingData);
     }
 
     /**
@@ -539,10 +565,9 @@ public class IndexingServiceWithS3E2ETest {
 
     @Test
     public void tmpDirStaysLocalNotUploadedToS3() throws Exception {
-        // Guard that `indexing.data.dir` only holds watermark + transient
-        // work files, never uploaded to S3. Also asserts that after a
-        // checkpoint the tmp directory is clean (no resident graph
-        // tmp files — see P1.4 PageStoreReader change).
+        // Guard that `indexing.data.dir` only holds transient work files
+        // (no resident graph/map tmp files after a checkpoint). The watermark
+        // now lives on S3, so watermark.dat does NOT exist locally.
         try (Topology t = new Topology();
              HDBClient hdbClient = newHDBClient(t.server);
              HDBConnection con = hdbClient.openConnection()) {
@@ -565,12 +590,25 @@ public class IndexingServiceWithS3E2ETest {
             assertEquals("no resident graph/map tmp files should remain",
                     0L, lingering);
 
-            // Stopping the indexing service flushes the watermark to the
-            // local data dir. It must NOT be uploaded to S3 (it is an
-            // indexing-service-local cursor into the main commit log).
+            // With S3WatermarkStore installed, the watermark is on S3, NOT
+            // on the local disk. Publish one and verify it landed on S3.
+            t.engine.forceCheckpointAndSaveWatermark();
             t.stopIndexing();
-            assertTrue("watermark.dat must live in the local indexing data dir",
+            assertFalse("watermark.dat must NOT live locally with remote storage",
                     Files.exists(t.indexingData.resolve("watermark.dat")));
+
+            // Verify the watermark was published to S3.
+            try (S3AsyncClient s3 = buildS3Client()) {
+                software.amazon.awssdk.services.s3.model.ListObjectsV2Response resp =
+                        s3.listObjectsV2(
+                                software.amazon.awssdk.services.s3.model.ListObjectsV2Request.builder()
+                                        .bucket(BUCKET).prefix(testPrefix).build()).get();
+                long watermarkObjects = resp.contents().stream()
+                        .filter(o -> o.key().endsWith("/watermark.lsn"))
+                        .count();
+                assertTrue("watermark.lsn must exist on S3 under the _indexing/ prefix",
+                        watermarkObjects > 0);
+            }
         }
     }
 }

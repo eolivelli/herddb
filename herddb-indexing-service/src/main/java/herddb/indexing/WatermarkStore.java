@@ -21,69 +21,33 @@
 package herddb.indexing;
 
 import herddb.log.LogSequenceNumber;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 /**
- * Persists the last processed {@link LogSequenceNumber} to disk.
- * Uses atomic write (tmp file + rename) for crash safety.
+ * Persists the last processed {@link LogSequenceNumber} — the "watermark" — so that
+ * the indexing service can resume commit-log tailing from the correct position after a
+ * restart.
+ *
+ * <p><b>Save contract</b>: implementations must be called ONLY after a successful
+ * {@code indexCheckpoint} (i.e. after all index pages and IndexStatus markers have
+ * been durably persisted for the LSN being saved). Saving an LSN that is not yet
+ * covered by a completed checkpoint would mean, on restart with a wiped disk, that
+ * the service would skip replaying entries it never actually persisted.
  *
  * @author enrico.olivelli
  */
-public class WatermarkStore {
-
-    private static final Logger LOGGER = Logger.getLogger(WatermarkStore.class.getName());
-    private static final String WATERMARK_FILE = "watermark.dat";
-    private static final String WATERMARK_TMP_FILE = "watermark.dat.tmp";
-
-    private final Path dataDirectory;
-
-    public WatermarkStore(Path dataDirectory) {
-        this.dataDirectory = dataDirectory;
-    }
+public interface WatermarkStore {
 
     /**
-     * Loads the last saved watermark from disk.
+     * Loads the last saved watermark.
      *
-     * @return the saved LSN, or {@link LogSequenceNumber#START_OF_TIME} if no watermark file exists
+     * @return the saved LSN, or {@link LogSequenceNumber#START_OF_TIME} if no watermark exists
      */
-    public LogSequenceNumber load() throws IOException {
-        Path watermarkFile = dataDirectory.resolve(WATERMARK_FILE);
-        if (!Files.exists(watermarkFile)) {
-            LOGGER.info("No watermark file found at " + watermarkFile + ", starting from beginning");
-            return LogSequenceNumber.START_OF_TIME;
-        }
-        try (InputStream fis = Files.newInputStream(watermarkFile);
-             DataInputStream dis = new DataInputStream(fis)) {
-            long ledgerId = dis.readLong();
-            long offset = dis.readLong();
-            LogSequenceNumber lsn = new LogSequenceNumber(ledgerId, offset);
-            LOGGER.info("Loaded watermark: " + lsn);
-            return lsn;
-        }
-    }
+    LogSequenceNumber load() throws IOException;
 
     /**
-     * Saves the watermark atomically (write to tmp, then rename).
+     * Saves the watermark atomically. Must be called only after the matching checkpoint
+     * has been fully published.
      */
-    public void save(LogSequenceNumber lsn) throws IOException {
-        Files.createDirectories(dataDirectory);
-        Path tmpFile = dataDirectory.resolve(WATERMARK_TMP_FILE);
-        Path watermarkFile = dataDirectory.resolve(WATERMARK_FILE);
-        try (OutputStream fos = Files.newOutputStream(tmpFile);
-             DataOutputStream dos = new DataOutputStream(fos)) {
-            dos.writeLong(lsn.ledgerId);
-            dos.writeLong(lsn.offset);
-        }
-        Files.move(tmpFile, watermarkFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        LOGGER.log(Level.FINE, "Saved watermark: {0}", lsn);
-    }
+    void save(LogSequenceNumber lsn) throws IOException;
 }
