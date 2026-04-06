@@ -2400,6 +2400,11 @@ public class TableSpaceManager {
 
     // visible for testing
     public TableSpaceCheckpoint checkpoint(boolean full, boolean pin, boolean alreadLocked) throws DataStorageManagerException, LogNotAvailableException {
+        return checkpoint(full, pin, alreadLocked, Long.MAX_VALUE);
+    }
+
+    // visible for testing
+    public TableSpaceCheckpoint checkpoint(boolean full, boolean pin, boolean alreadLocked, long catchUpTimeoutMs) throws DataStorageManagerException, LogNotAvailableException {
         if (virtual) {
             return null;
         }
@@ -2445,7 +2450,7 @@ public class TableSpaceManager {
 
                     for (AbstractTableManager tableManager : tables.values()) {
                         if (!tableManager.isSystemTable()) {
-                            TableCheckpoint checkpoint = full ? tableManager.fullCheckpoint(pin) : tableManager.checkpoint(pin);
+                            TableCheckpoint checkpoint = full ? tableManager.fullCheckpoint(pin) : tableManager.checkpoint(pin, catchUpTimeoutMs);
                             if (checkpoint != null) {
                                 LOGGER.log(Level.INFO, "checkpoint done for table {0}.{1} (pin: {2})", new Object[]{tableSpaceName, tableManager.getTable().name, pin});
                                 actions.addAll(checkpoint.actions);
@@ -2527,7 +2532,7 @@ public class TableSpaceManager {
                         // recovery will replay only actions with log position after the actual table-local checkpoint
                         if (!tableManager.isSystemTable()) {
                             try {
-                                TableCheckpoint checkpoint = full ? tableManager.fullCheckpoint(pin) : tableManager.checkpoint(pin);
+                                TableCheckpoint checkpoint = full ? tableManager.fullCheckpoint(pin) : tableManager.checkpoint(pin, catchUpTimeoutMs);
                                 if (checkpoint != null) {
                                     LOGGER.log(Level.INFO, "checkpoint done for table {0}.{1} (pin: {2})", new Object[]{tableSpaceName, tableManager.getTable().name, pin});
                                     actions.addAll(checkpoint.actions);
@@ -2537,6 +2542,11 @@ public class TableSpaceManager {
                                     }
                                 }
                             } catch (DataStorageManagerException | LogNotAvailableException ex) {
+                                if (closed) {
+                                    LOGGER.log(Level.INFO, "Checkpoint of table {0}.{1} aborted, tablespace is closing: {2}",
+                                            new Object[]{tableSpaceName, tableManager.getTable().name, ex.getMessage()});
+                                    return null;
+                                }
                                 // Table may have been dropped by a concurrent DDL between Phase A snapshot and here.
                                 LOGGER.log(Level.WARNING, "Checkpoint of table {0}.{1} failed (table may have been dropped concurrently): {2}",
                                         new Object[]{tableSpaceName, tableManager.getTable().name, ex});

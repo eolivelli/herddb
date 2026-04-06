@@ -770,8 +770,9 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
             return CompletableFuture.completedFuture(dropTableSpace((DropTableSpaceStatement) statement));
         }
         if (statement instanceof CheckpointStatement) {
+            CheckpointStatement checkpointStatement = (CheckpointStatement) statement;
             try {
-                checkpoint();
+                checkpoint(checkpointStatement.getCatchUpTimeoutMs());
             } catch (Exception e) {
                 return Futures.exception(new StatementExecutionException("CHECKPOINT failed: " + e.getMessage(), e));
             }
@@ -1003,8 +1004,12 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
     }
 
     public void checkpoint() throws DataStorageManagerException, LogNotAvailableException {
+        checkpoint(Long.MAX_VALUE);
+    }
+
+    public void checkpoint(long catchUpTimeoutMs) throws DataStorageManagerException, LogNotAvailableException {
         for (TableSpaceManager man : tablesSpaces.values()) {
-            man.checkpoint(false, false, false);
+            man.checkpoint(false, false, false, catchUpTimeoutMs);
         }
     }
 

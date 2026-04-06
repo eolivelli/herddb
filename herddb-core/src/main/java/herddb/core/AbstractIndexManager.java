@@ -148,6 +148,22 @@ public abstract class AbstractIndexManager implements AutoCloseable {
     public abstract List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin) throws DataStorageManagerException;
 
     /**
+     * Ensures that all data is persisted from disk, with a timeout for remote catch-up.
+     * The default implementation delegates to {@link #checkpoint(LogSequenceNumber, boolean)},
+     * ignoring the timeout. Subclasses that need remote synchronization (e.g. vector indexes)
+     * should override this method.
+     *
+     * @param sequenceNumber the checkpoint LSN
+     * @param pin whether to pin the checkpoint
+     * @param catchUpTimeoutMs maximum time to wait for remote catch-up in milliseconds
+     * @return list of post-checkpoint actions
+     * @throws DataStorageManagerException on storage errors or catch-up timeout
+     */
+    public List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin, long catchUpTimeoutMs) throws DataStorageManagerException {
+        return checkpoint(sequenceNumber, pin);
+    }
+
+    /**
      * Unpin a previously pinned checkpont (see {@link #checkpoint(LogSequenceNumber, boolean)})
      *
      * @throws DataStorageManagerException
