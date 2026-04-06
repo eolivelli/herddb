@@ -108,8 +108,12 @@ public class LocalObjectStorageTest {
     public void testWriteBlockReadRange() throws Exception {
         byte[] block0 = new byte[100];
         byte[] block1 = new byte[80];
-        for (int i = 0; i < 100; i++) block0[i] = (byte) i;
-        for (int i = 0; i < 80; i++) block1[i] = (byte) (i + 100);
+        for (int i = 0; i < 100; i++) {
+            block0[i] = (byte) i;
+        }
+        for (int i = 0; i < 80; i++) {
+            block1[i] = (byte) (i + 100);
+        }
 
         storage.writeBlock("ts1/uuid1/graph", 0, block0).get();
         storage.writeBlock("ts1/uuid1/graph", 1, block1).get();

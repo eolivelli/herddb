@@ -20,7 +20,6 @@
 
 package herddb.remote;
 
-import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -42,9 +41,9 @@ import herddb.remote.proto.WriteFileBlockRequest;
 import herddb.remote.proto.WriteFileBlockResponse;
 import herddb.remote.proto.WriteFileRequest;
 import herddb.remote.proto.WriteFileResponse;
-import java.io.ByteArrayInputStream;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -239,8 +238,12 @@ public class RemoteFileServiceTest {
         // Write two blocks via gRPC stub
         byte[] block0 = new byte[100];
         byte[] block1 = new byte[60];
-        for (int i = 0; i < 100; i++) block0[i] = (byte) i;
-        for (int i = 0; i < 60; i++) block1[i] = (byte) (i + 100);
+        for (int i = 0; i < 100; i++) {
+            block0[i] = (byte) i;
+        }
+        for (int i = 0; i < 60; i++) {
+            block1[i] = (byte) (i + 100);
+        }
 
         WriteFileBlockResponse r0 = stub.writeFileBlock(WriteFileBlockRequest.newBuilder()
                 .setPath("ts1/uuid1/multipart/graph")
@@ -301,7 +304,9 @@ public class RemoteFileServiceTest {
         try (RemoteFileServiceClient client = new RemoteFileServiceClient(servers)) {
             // Build test data spanning 3 blocks
             byte[] data = new byte[blockSize * 2 + 30];
-            for (int i = 0; i < data.length; i++) data[i] = (byte) (i & 0xFF);
+            for (int i = 0; i < data.length; i++) {
+                data[i] = (byte) (i & 0xFF);
+            }
 
             long written = client.writeMultipartFile("ts1/uuid1/largefile", new ByteArrayInputStream(data), blockSize);
             assertEquals(data.length, written);
@@ -310,17 +315,23 @@ public class RemoteFileServiceTest {
             byte[] b0 = client.readFileRange("ts1/uuid1/largefile", 0, blockSize, blockSize);
             assertNotNull(b0);
             assertEquals(blockSize, b0.length);
-            for (int i = 0; i < blockSize; i++) assertEquals((byte) (i & 0xFF), b0[i]);
+            for (int i = 0; i < blockSize; i++) {
+                assertEquals((byte) (i & 0xFF), b0[i]);
+            }
 
             byte[] b1 = client.readFileRange("ts1/uuid1/largefile", blockSize, blockSize, blockSize);
             assertNotNull(b1);
             assertEquals(blockSize, b1.length);
-            for (int i = 0; i < blockSize; i++) assertEquals((byte) ((blockSize + i) & 0xFF), b1[i]);
+            for (int i = 0; i < blockSize; i++) {
+                assertEquals((byte) ((blockSize + i) & 0xFF), b1[i]);
+            }
 
             byte[] b2 = client.readFileRange("ts1/uuid1/largefile", blockSize * 2, 30, blockSize);
             assertNotNull(b2);
             assertEquals(30, b2.length);
-            for (int i = 0; i < 30; i++) assertEquals((byte) ((blockSize * 2 + i) & 0xFF), b2[i]);
+            for (int i = 0; i < 30; i++) {
+                assertEquals((byte) ((blockSize * 2 + i) & 0xFF), b2[i]);
+            }
         }
     }
 

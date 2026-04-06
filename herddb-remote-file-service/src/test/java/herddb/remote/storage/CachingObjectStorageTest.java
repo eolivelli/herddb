@@ -117,7 +117,9 @@ public class CachingObjectStorageTest {
             long blockIndex = offset / blockSize;
             int offsetInBlock = (int) (offset % blockSize);
             byte[] block = data.get(path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex);
-            if (block == null) return CompletableFuture.completedFuture(ReadResult.notFound());
+            if (block == null) {
+                return CompletableFuture.completedFuture(ReadResult.notFound());
+            }
             int end = Math.min(offsetInBlock + length, block.length);
             byte[] result = Arrays.copyOfRange(block, offsetInBlock, end);
             return CompletableFuture.completedFuture(ReadResult.found(result));
@@ -129,7 +131,9 @@ public class CachingObjectStorageTest {
             boolean removed = data.remove(path) != null;
             List<String> blocks = new ArrayList<>();
             for (String key : data.keySet()) {
-                if (key.startsWith(multipartPrefix)) blocks.add(key);
+                if (key.startsWith(multipartPrefix)) {
+                    blocks.add(key);
+                }
             }
             blocks.forEach(data::remove);
             return CompletableFuture.completedFuture(removed || !blocks.isEmpty());
@@ -139,7 +143,9 @@ public class CachingObjectStorageTest {
         public CompletableFuture<List<String>> listLogical(String prefix) {
             java.util.LinkedHashSet<String> logical = new java.util.LinkedHashSet<>();
             for (String key : data.keySet()) {
-                if (!key.startsWith(prefix)) continue;
+                if (!key.startsWith(prefix)) {
+                    continue;
+                }
                 int mp = key.indexOf(ObjectStorage.MULTIPART_SUFFIX + "/");
                 logical.add(mp >= 0 ? key.substring(0, mp) : key);
             }
