@@ -104,6 +104,7 @@ public class VectorIndexManager extends AbstractIndexManager {
     protected boolean doStart(LogSequenceNumber sequenceNumber) throws DataStorageManagerException {
         LOGGER.log(Level.INFO, "start VECTOR index {0} in remote mode (IndexingService)",
                 index.name);
+        remoteService(); // fail fast if RemoteVectorIndexService is not configured
         return true;
     }
 
