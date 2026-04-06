@@ -69,6 +69,21 @@ public class ClientConfiguration {
 
     public static final String PROPERTY_AUTH_MECH = "client.auth.mech";
 
+    /**
+     * OIDC issuer URL (e.g. {@code https://keycloak.example/realms/herddb}).
+     * When set with {@link #PROPERTY_AUTH_MECH} = {@code OAUTHBEARER}, the client performs
+     * OIDC discovery and acquires access tokens via the OAuth2 client_credentials grant.
+     */
+    public static final String PROPERTY_OIDC_ISSUER_URL = "oidc.issuer.url";
+    /** OIDC client_id (used for client_credentials token acquisition). */
+    public static final String PROPERTY_OIDC_CLIENT_ID = "oidc.client.id";
+    /** OIDC client_secret. */
+    public static final String PROPERTY_OIDC_CLIENT_SECRET = "oidc.client.secret";
+    /** Optional scope sent with the token request. */
+    public static final String PROPERTY_OIDC_SCOPE = "oidc.scope";
+    /** Optional pre-acquired token. If set, the client skips the token endpoint call. */
+    public static final String PROPERTY_OIDC_TOKEN = "oidc.token";
+
     public static final String PROPERTY_MODE_LOCAL = "local";
     public static final String PROPERTY_MODE_STANDALONE = "standalone";
     public static final String PROPERTY_MODE_CLUSTER = "cluster";

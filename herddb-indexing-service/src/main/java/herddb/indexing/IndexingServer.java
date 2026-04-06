@@ -20,6 +20,9 @@
 
 package herddb.indexing;
 
+import herddb.auth.oidc.OidcBootstrap;
+import herddb.auth.oidc.OidcTokenValidator;
+import herddb.auth.oidc.grpc.JwtAuthServerInterceptor;
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
 import herddb.mem.MemoryDataStorageManager;
@@ -238,10 +241,19 @@ public class IndexingServer implements AutoCloseable {
 
         engine.setStatsLogger(statsLogger);
         IndexingServiceImpl serviceImpl = new IndexingServiceImpl(engine, statsLogger);
-        server = ServerBuilder.forPort(port)
-                .addService(serviceImpl)
-                .build()
-                .start();
+        ServerBuilder<?> grpcBuilder = ServerBuilder.forPort(port).addService(serviceImpl);
+        java.util.Properties oidcProps = config.asProperties();
+        if (OidcBootstrap.isEnabled(oidcProps)) {
+            try {
+                OidcTokenValidator validator = OidcBootstrap.buildValidator(oidcProps);
+                grpcBuilder.intercept(new JwtAuthServerInterceptor(validator::validate));
+                LOGGER.log(Level.INFO, "OIDC authentication enabled for IndexingServer (issuer={0})",
+                        oidcProps.getProperty(OidcBootstrap.PROP_ISSUER_URL));
+            } catch (IOException e) {
+                throw new IOException("Failed to initialize OIDC for IndexingServer: " + e.getMessage(), e);
+            }
+        }
+        server = grpcBuilder.build().start();
 
         // Start HTTP server for metrics
         boolean httpEnabled = config.getBoolean(IndexingServerConfiguration.PROPERTY_HTTP_ENABLE,

@@ -34,6 +34,7 @@ import herddb.remote.proto.RemoteFileServiceGrpc;
 import herddb.remote.proto.WriteFileRequest;
 import herddb.remote.proto.WriteFileResponse;
 import herddb.server.DynamicServiceClient;
+import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
@@ -88,12 +89,19 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
     private final int maxRetries;
     private final long clientTimeoutSeconds;
     private final ScheduledExecutorService retryScheduler;
+    private final ClientInterceptor clientInterceptor;
 
     public RemoteFileServiceClient(List<String> servers) {
-        this(servers, Collections.emptyMap());
+        this(servers, Collections.emptyMap(), null);
     }
 
     public RemoteFileServiceClient(List<String> servers, Map<String, Object> configuration) {
+        this(servers, configuration, null);
+    }
+
+    public RemoteFileServiceClient(List<String> servers, Map<String, Object> configuration,
+                                   ClientInterceptor clientInterceptor) {
+        this.clientInterceptor = clientInterceptor;
         this.clientTimeoutSeconds = longConfig(configuration, CONFIG_CLIENT_TIMEOUT, DEFAULT_CLIENT_TIMEOUT_SECONDS);
         this.maxRetries = intConfig(configuration, CONFIG_CLIENT_RETRIES, DEFAULT_CLIENT_RETRIES);
         this.retryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -118,16 +126,19 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
         }
     }
 
-    private static ManagedChannel buildChannel(String server) {
+    private ManagedChannel buildChannel(String server) {
         String[] parts = server.split(":");
         String host = parts[0];
         int port = Integer.parseInt(parts[1]);
-        return ManagedChannelBuilder.forAddress(host, port)
+        ManagedChannelBuilder<?> b = ManagedChannelBuilder.forAddress(host, port)
                 .usePlaintext()
                 .keepAliveTime(300, TimeUnit.SECONDS)
                 .keepAliveTimeout(20, TimeUnit.SECONDS)
-                .keepAliveWithoutCalls(false)
-                .build();
+                .keepAliveWithoutCalls(false);
+        if (clientInterceptor != null) {
+            b.intercept(clientInterceptor);
+        }
+        return b.build();
     }
 
     @Override

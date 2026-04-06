@@ -20,6 +20,10 @@
 
 package herddb.security.sasl;
 
+import herddb.auth.oidc.sasl.OAuthBearerCallback;
+import herddb.auth.oidc.sasl.OAuthBearerSaslServer;
+import herddb.auth.oidc.sasl.OAuthBearerSaslServerProvider;
+import herddb.auth.oidc.sasl.TokenAuthenticator;
 import herddb.server.Server;
 import java.io.IOException;
 import java.security.Principal;
@@ -84,6 +88,8 @@ public class SaslNettyServer {
                 return new SaslDigestCallbackHandler();
             case SaslUtils.AUTH_PLAIN:
                 return new SaslPlainCallbackHandler();
+            case SaslUtils.AUTH_OAUTHBEARER:
+                return new OAuthBearerCallbackHandler();
             default:
                 throw new IOException("Unsupported mechanism " + mech);
         }
@@ -91,6 +97,13 @@ public class SaslNettyServer {
     }
 
     private SaslServer createSaslServer(final String mech, final Subject subject) throws IOException {
+        if (SaslUtils.AUTH_OAUTHBEARER.equals(mech)) {
+            if (server == null || server.getTokenAuthenticator() == null) {
+                throw new IOException("OAUTHBEARER SASL mechanism requested but no token authenticator is configured on the server");
+            }
+            OAuthBearerSaslServerProvider.install();
+            return new OAuthBearerSaslServer(new OAuthBearerCallbackHandler());
+        }
         if (subject == null) {
             CallbackHandler ch = buildCallbackHandler(mech);
             boolean allowPlain = SaslUtils.AUTH_PLAIN.equals(mech);
@@ -255,6 +268,38 @@ public class SaslNettyServer {
                 LOG.log(Level.INFO, "Authenticated user {0} using PLAIN", nc.getName());
             } catch (Exception err) {
                 throw new IOException("Failed authentication for username " + nc.getName());
+            }
+        }
+    }
+
+    /**
+     * CallbackHandler for the OAUTHBEARER SASL mechanism.
+     * Delegates to the server's configured {@link TokenAuthenticator} to validate the token.
+     */
+    private class OAuthBearerCallbackHandler implements CallbackHandler {
+
+        @Override
+        public void handle(Callback[] callbacks) throws IOException, UnsupportedCallbackException {
+            for (Callback cb : callbacks) {
+                if (cb instanceof OAuthBearerCallback) {
+                    OAuthBearerCallback oauth = (OAuthBearerCallback) cb;
+                    TokenAuthenticator authenticator = server.getTokenAuthenticator();
+                    if (authenticator == null) {
+                        oauth.setValidationError("token authenticator not configured");
+                        continue;
+                    }
+                    try {
+                        String principal = authenticator.authenticate(oauth.getToken());
+                        oauth.setAuthenticatedPrincipal(principal);
+                        LOG.log(Level.INFO, "Authenticated user {0} using OAUTHBEARER", principal);
+                    } catch (IOException e) {
+                        LOG.log(Level.WARNING, "OAUTHBEARER token validation failed: " + e.getMessage());
+                        oauth.setValidationError(e.getMessage());
+                    }
+                } else {
+                    throw new UnsupportedCallbackException(cb,
+                            "handle: Unrecognized SASL OAUTHBEARER Callback");
+                }
             }
         }
     }

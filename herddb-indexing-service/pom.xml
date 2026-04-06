@@ -66,6 +66,18 @@
             <version>${project.version}</version>
         </dependency>
         <dependency>
+            <groupId>org.herddb</groupId>
+            <artifactId>herddb-auth-oidc</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.herddb</groupId>
+            <artifactId>herddb-auth-oidc</artifactId>
+            <version>${project.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.apache.bookkeeper.stats</groupId>
             <artifactId>bookkeeper-stats-api</artifactId>
         </dependency>

@@ -21,6 +21,9 @@
 package herddb.client;
 
 import com.google.common.util.concurrent.MoreExecutors;
+import herddb.auth.oidc.OidcAuthException;
+import herddb.auth.oidc.OidcConfiguration;
+import herddb.auth.oidc.OidcTokenProvider;
 import herddb.network.Channel;
 import herddb.network.ChannelEventListener;
 import herddb.network.ServerHostData;
@@ -63,6 +66,8 @@ public class HDBClient implements AutoCloseable {
     private final int operationRetryDelay;
     private final boolean localMode;
     private final boolean allowReadsFromFollowers;
+    private volatile OidcTokenProvider oidcTokenProvider;
+    private final Object oidcTokenProviderLock = new Object();
 
     public HDBClient(ClientConfiguration configuration) {
         this(configuration, NullStatsLogger.INSTANCE);
@@ -209,5 +214,42 @@ public class HDBClient implements AutoCloseable {
 
     public boolean isAllowReadsFromFollowers() {
         return allowReadsFromFollowers;
+    }
+
+    /**
+     * Returns a shared OIDC token provider for this client, lazily initialized from the
+     * client configuration. Returns {@code null} if OIDC is not configured (no issuer URL)
+     * or if a pre-acquired token is configured.
+     */
+    OidcTokenProvider getOrCreateOidcTokenProvider() throws IOException {
+        OidcTokenProvider p = oidcTokenProvider;
+        if (p != null) {
+            return p;
+        }
+        String issuer = configuration.getString(ClientConfiguration.PROPERTY_OIDC_ISSUER_URL, "");
+        if (issuer.isEmpty()) {
+            return null;
+        }
+        String clientId = configuration.getString(ClientConfiguration.PROPERTY_OIDC_CLIENT_ID, "");
+        String clientSecret = configuration.getString(ClientConfiguration.PROPERTY_OIDC_CLIENT_SECRET, "");
+        if (clientId.isEmpty() || clientSecret.isEmpty()) {
+            throw new IOException("OIDC issuer URL configured but "
+                    + ClientConfiguration.PROPERTY_OIDC_CLIENT_ID + " or "
+                    + ClientConfiguration.PROPERTY_OIDC_CLIENT_SECRET + " is missing");
+        }
+        String scope = configuration.getString(ClientConfiguration.PROPERTY_OIDC_SCOPE, "");
+        synchronized (oidcTokenProviderLock) {
+            if (oidcTokenProvider != null) {
+                return oidcTokenProvider;
+            }
+            try {
+                OidcConfiguration cfg = new OidcConfiguration(issuer).discover();
+                oidcTokenProvider = new OidcTokenProvider(cfg, clientId, clientSecret,
+                        scope.isEmpty() ? null : scope);
+                return oidcTokenProvider;
+            } catch (OidcAuthException e) {
+                throw new IOException(e);
+            }
+        }
     }
 }

@@ -664,6 +664,7 @@
             <modules>
                 <module>herddb-utils</module>
                 <module>herddb-mock</module>
+                <module>herddb-auth-oidc</module>
                 <module>herddb-net</module>
                 <module>herddb-core</module>
                 <module>herddb-jdbc</module>
@@ -873,6 +874,7 @@
             <modules>
                 <module>herddb-utils</module>
                 <module>herddb-mock</module>
+                <module>herddb-auth-oidc</module>
                 <module>herddb-net</module>
                 <module>herddb-core</module>
                 <module>herddb-jdbc</module>
