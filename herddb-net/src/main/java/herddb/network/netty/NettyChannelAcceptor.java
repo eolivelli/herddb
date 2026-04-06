@@ -310,14 +310,29 @@ public class NettyChannelAcceptor implements AutoCloseable {
         }
         localVMChannelAcceptor.close();
 
+        if (callbackExecutor != null) {
+            callbackExecutor.shutdownNow();
+        }
+        io.netty.util.concurrent.Future<?> workerGroupFuture = null;
+        io.netty.util.concurrent.Future<?> bossGroupFuture = null;
         if (workerGroup != null) {
-            workerGroup.shutdownGracefully();
+            workerGroupFuture = workerGroup.shutdownGracefully(0, 5, java.util.concurrent.TimeUnit.SECONDS);
         }
         if (bossGroup != null) {
-            bossGroup.shutdownGracefully();
+            bossGroupFuture = bossGroup.shutdownGracefully(0, 5, java.util.concurrent.TimeUnit.SECONDS);
         }
-        if (callbackExecutor != null) {
-            callbackExecutor.shutdown();
+        try {
+            if (callbackExecutor != null) {
+                callbackExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
+            }
+            if (workerGroupFuture != null) {
+                workerGroupFuture.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            }
+            if (bossGroupFuture != null) {
+                bossGroupFuture.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
         }
     }
 

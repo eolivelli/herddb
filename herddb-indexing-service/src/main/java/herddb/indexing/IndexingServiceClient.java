@@ -269,6 +269,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     }
 
     private static final long CATCHUP_POLL_INTERVAL_MS = 5000;
+    private static final long CATCHUP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
     @Override
     public void waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber) throws InterruptedException {
@@ -283,7 +284,8 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     private void waitForInstanceCatchUp(String server, ManagedChannel channel,
                                          String tablespace,
                                          LogSequenceNumber target) throws InterruptedException {
-        while (true) {
+        long deadline = System.currentTimeMillis() + CATCHUP_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
             try {
                 IndexingServiceGrpc.IndexingServiceBlockingStub stub =
                         IndexingServiceGrpc.newBlockingStub(channel)
@@ -308,6 +310,8 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
             }
             Thread.sleep(CATCHUP_POLL_INTERVAL_MS);
         }
+        LOGGER.log(Level.WARNING, "Instance {0} did not catch up for tablespace {1} to {2} within timeout",
+                new Object[]{server, tablespace, target});
     }
 
     public List<String> getServers() {

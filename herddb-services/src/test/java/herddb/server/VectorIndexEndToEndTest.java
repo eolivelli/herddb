@@ -69,20 +69,20 @@ public class VectorIndexEndToEndTest {
         config.set(ServerConfiguration.PROPERTY_PORT, 0);
         config.set("http.enable", false);
 
-        Path logDir = baseDir.resolve(
-                config.getString(ServerConfiguration.PROPERTY_LOGDIR, ServerConfiguration.PROPERTY_LOGDIR_DEFAULT));
+        // Start Server first so the txlog directory and tablespace exist
+        try (Server server = new Server(config)) {
+            server.start();
+            server.waitForStandaloneBoot();
 
-        try (EmbeddedIndexingService indexingService = new EmbeddedIndexingService(logDir, indexingDataDir)) {
-            indexingService.start();
+            Path logDir = baseDir.resolve(
+                    config.getString(ServerConfiguration.PROPERTY_LOGDIR, ServerConfiguration.PROPERTY_LOGDIR_DEFAULT));
 
-            config.set(ServerConfiguration.PROPERTY_INDEXING_SERVICE_SERVERS,
-                    indexingService.getAddress());
+            try (EmbeddedIndexingService indexingService = new EmbeddedIndexingService(logDir, indexingDataDir)) {
+                indexingService.setMetadataStorageManager(server.getMetadataStorageManager());
+                indexingService.start();
 
-            try (Server server = new Server(config)) {
                 IndexingServiceClient client = indexingService.createClient();
                 server.getManager().setRemoteVectorIndexService(client);
-                server.start();
-                server.waitForStandaloneBoot();
 
                 try (HDBClient hdbClient = new HDBClient(new ClientConfiguration(folder.newFolder().toPath()))) {
                     hdbClient.setClientSideMetadataProvider(new StaticClientSideMetadataProvider(server));
@@ -133,17 +133,20 @@ public class VectorIndexEndToEndTest {
         config.set(ServerConfiguration.PROPERTY_PORT, 0);
         config.set("http.enable", false);
 
-        Path logDir = baseDir.resolve(
-                config.getString(ServerConfiguration.PROPERTY_LOGDIR, ServerConfiguration.PROPERTY_LOGDIR_DEFAULT));
+        // Start Server first so the txlog directory and tablespace exist
+        try (Server server = new Server(config)) {
+            server.start();
+            server.waitForStandaloneBoot();
 
-        try (EmbeddedIndexingService indexingService = new EmbeddedIndexingService(logDir, indexingDataDir)) {
-            indexingService.start();
+            Path logDir = baseDir.resolve(
+                    config.getString(ServerConfiguration.PROPERTY_LOGDIR, ServerConfiguration.PROPERTY_LOGDIR_DEFAULT));
 
-            try (Server server = new Server(config)) {
+            try (EmbeddedIndexingService indexingService = new EmbeddedIndexingService(logDir, indexingDataDir)) {
+                indexingService.setMetadataStorageManager(server.getMetadataStorageManager());
+                indexingService.start();
+
                 IndexingServiceClient client = indexingService.createClient();
                 server.getManager().setRemoteVectorIndexService(client);
-                server.start();
-                server.waitForStandaloneBoot();
 
                 try (HDBClient hdbClient = new HDBClient(new ClientConfiguration(folder.newFolder().toPath()))) {
                     hdbClient.setClientSideMetadataProvider(new StaticClientSideMetadataProvider(server));
@@ -210,20 +213,20 @@ public class VectorIndexEndToEndTest {
         config.set(ServerConfiguration.PROPERTY_PORT, 0);
         config.set("http.enable", false);
 
-        Path logDir = baseDir.resolve(
-                config.getString(ServerConfiguration.PROPERTY_LOGDIR, ServerConfiguration.PROPERTY_LOGDIR_DEFAULT));
+        // Start Server first so the txlog directory and tablespace exist
+        try (Server server = new Server(config)) {
+            server.start();
+            server.waitForStandaloneBoot();
 
-        try (EmbeddedIndexingService indexingService = new EmbeddedIndexingService(logDir, indexingDataDir)) {
-            indexingService.start();
+            Path logDir = baseDir.resolve(
+                    config.getString(ServerConfiguration.PROPERTY_LOGDIR, ServerConfiguration.PROPERTY_LOGDIR_DEFAULT));
 
-            config.set(ServerConfiguration.PROPERTY_INDEXING_SERVICE_SERVERS,
-                    indexingService.getAddress());
+            try (EmbeddedIndexingService indexingService = new EmbeddedIndexingService(logDir, indexingDataDir)) {
+                indexingService.setMetadataStorageManager(server.getMetadataStorageManager());
+                indexingService.start();
 
-            try (Server server = new Server(config)) {
                 IndexingServiceClient client = indexingService.createClient();
                 server.getManager().setRemoteVectorIndexService(client);
-                server.start();
-                server.waitForStandaloneBoot();
 
                 try (HDBClient hdbClient = new HDBClient(new ClientConfiguration(folder.newFolder().toPath()))) {
                     hdbClient.setClientSideMetadataProvider(new StaticClientSideMetadataProvider(server));
