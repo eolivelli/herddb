@@ -87,10 +87,19 @@ class VectorSegment implements Closeable {
     // ThreadLocal cache of GraphSearcher to avoid per-search allocation
     private ThreadLocal<GraphSearcher> searcherCache = new ThreadLocal<>();
 
-    /** Page IDs for the graph chunks (needed to re-persist sealed segments). */
+    /** Page IDs for the graph chunks (needed to re-persist sealed segments, page-based mode). */
     List<Long> graphPageIds = java.util.Collections.emptyList();
-    /** Page IDs for the map chunks (needed to re-persist sealed segments). */
+    /** Page IDs for the map chunks (needed to re-persist sealed segments, page-based mode). */
     List<Long> mapPageIds = java.util.Collections.emptyList();
+
+    /** Logical path of the graph multipart file (non-null only in multipart mode). */
+    String graphFilePath;
+    /** Total size in bytes of the graph multipart file (valid only when graphFilePath != null). */
+    long graphFileSize;
+    /** Logical path of the map multipart file (non-null only in multipart mode). */
+    String mapFilePath;
+    /** Total size in bytes of the map multipart file (valid only when mapFilePath != null). */
+    long mapFileSize;
 
     VectorSegment(int segmentId) {
         this.segmentId = segmentId;

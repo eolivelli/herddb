@@ -27,9 +27,13 @@ import herddb.remote.proto.DeleteFileRequest;
 import herddb.remote.proto.DeleteFileResponse;
 import herddb.remote.proto.ListFilesEntry;
 import herddb.remote.proto.ListFilesRequest;
+import herddb.remote.proto.ReadFileRangeRequest;
+import herddb.remote.proto.ReadFileRangeResponse;
 import herddb.remote.proto.ReadFileRequest;
 import herddb.remote.proto.ReadFileResponse;
 import herddb.remote.proto.RemoteFileServiceGrpc;
+import herddb.remote.proto.WriteFileBlockRequest;
+import herddb.remote.proto.WriteFileBlockResponse;
 import herddb.remote.proto.WriteFileRequest;
 import herddb.remote.proto.WriteFileResponse;
 import herddb.remote.storage.ObjectStorage;
@@ -78,6 +82,17 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
     private final Counter deleteByPrefixErrors;
     private final OpStatsLogger deleteByPrefixLatency;
 
+    private final Counter writeBlockRequests;
+    private final Counter writeBlockErrors;
+    private final Counter writtenBlockBytes;
+    private final OpStatsLogger writeBlockLatency;
+
+    private final Counter readRangeRequests;
+    private final Counter readRangeErrors;
+    private final Counter readRangeNotFound;
+    private final Counter readRangeBytes;
+    private final OpStatsLogger readRangeLatency;
+
     public RemoteFileServiceImpl(ObjectStorage storage) {
         this(storage, NullStatsLogger.INSTANCE);
     }
@@ -109,6 +124,17 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
         this.deleteByPrefixRequests = scope.getCounter("deletebyprefix_requests");
         this.deleteByPrefixErrors = scope.getCounter("deletebyprefix_errors");
         this.deleteByPrefixLatency = scope.getOpStatsLogger("deletebyprefix_latency");
+
+        this.writeBlockRequests = scope.getCounter("writeblock_requests");
+        this.writeBlockErrors = scope.getCounter("writeblock_errors");
+        this.writtenBlockBytes = scope.getCounter("writeblock_bytes");
+        this.writeBlockLatency = scope.getOpStatsLogger("writeblock_latency");
+
+        this.readRangeRequests = scope.getCounter("readrange_requests");
+        this.readRangeErrors = scope.getCounter("readrange_errors");
+        this.readRangeNotFound = scope.getCounter("readrange_not_found");
+        this.readRangeBytes = scope.getCounter("readrange_bytes");
+        this.readRangeLatency = scope.getOpStatsLogger("readrange_latency");
     }
 
     @Override
@@ -174,10 +200,75 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
     }
 
     @Override
+    public void writeFileBlock(WriteFileBlockRequest request,
+                               StreamObserver<WriteFileBlockResponse> responseObserver) {
+        long start = System.nanoTime();
+        writeBlockRequests.inc();
+        byte[] content = request.getContent().toByteArray();
+        storage.writeBlock(request.getPath(), request.getBlockIndex(), content)
+                .whenComplete((v, t) -> {
+                    long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
+                    if (t != null) {
+                        writeBlockErrors.inc();
+                        writeBlockLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                        LOGGER.log(Level.SEVERE, "writeFileBlock failed for path " + request.getPath()
+                                + " block " + request.getBlockIndex(), t);
+                        responseObserver.onError(
+                                Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+                    } else {
+                        writtenBlockBytes.addCount(content.length);
+                        writeBlockLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                        LOGGER.log(Level.FINE, "writeFileBlock path={0} block={1} size={2} time={3}ms",
+                                new Object[]{request.getPath(), request.getBlockIndex(),
+                                        content.length, elapsedMs(start)});
+                        responseObserver.onNext(WriteFileBlockResponse.newBuilder()
+                                .setWrittenSize(content.length)
+                                .build());
+                        responseObserver.onCompleted();
+                    }
+                });
+    }
+
+    @Override
+    public void readFileRange(ReadFileRangeRequest request,
+                              StreamObserver<ReadFileRangeResponse> responseObserver) {
+        long start = System.nanoTime();
+        readRangeRequests.inc();
+        storage.readRange(request.getPath(), request.getOffset(), request.getLength(), request.getBlockSize())
+                .whenComplete((result, t) -> {
+                    long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
+                    if (t != null) {
+                        readRangeErrors.inc();
+                        readRangeLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                        LOGGER.log(Level.SEVERE, "readFileRange failed for path " + request.getPath(), t);
+                        responseObserver.onError(
+                                Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+                    } else if (result.status() == ReadResult.Status.NOT_FOUND) {
+                        readRangeNotFound.inc();
+                        readRangeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                        responseObserver.onNext(ReadFileRangeResponse.newBuilder().setFound(false).build());
+                        responseObserver.onCompleted();
+                    } else {
+                        byte[] content = result.content();
+                        readRangeBytes.addCount(content.length);
+                        readRangeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                        LOGGER.log(Level.FINE, "readFileRange path={0} offset={1} size={2} time={3}ms",
+                                new Object[]{request.getPath(), request.getOffset(),
+                                        content.length, elapsedMs(start)});
+                        responseObserver.onNext(ReadFileRangeResponse.newBuilder()
+                                .setFound(true)
+                                .setContent(UnsafeByteOperations.unsafeWrap(content))
+                                .build());
+                        responseObserver.onCompleted();
+                    }
+                });
+    }
+
+    @Override
     public void deleteFile(DeleteFileRequest request, StreamObserver<DeleteFileResponse> responseObserver) {
         long start = System.nanoTime();
         deleteRequests.inc();
-        storage.delete(request.getPath())
+        storage.deleteLogical(request.getPath())
                 .whenComplete((deleted, t) -> {
                     long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
                     if (t != null) {
@@ -200,7 +291,7 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
     public void listFiles(ListFilesRequest request, StreamObserver<ListFilesEntry> responseObserver) {
         long start = System.nanoTime();
         listRequests.inc();
-        storage.list(request.getPrefix())
+        storage.listLogical(request.getPrefix())
                 .whenComplete((paths, t) -> {
                     long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
                     if (t != null) {

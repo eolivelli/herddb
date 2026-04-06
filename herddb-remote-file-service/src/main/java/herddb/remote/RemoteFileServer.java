@@ -29,7 +29,9 @@ import herddb.remote.storage.LocalObjectStorage;
 import herddb.remote.storage.ObjectStorage;
 import herddb.remote.storage.S3ObjectStorage;
 import io.grpc.Server;
-import io.grpc.ServerBuilder;
+import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
+import io.grpc.netty.shaded.io.netty.channel.nio.NioEventLoopGroup;
+import io.grpc.netty.shaded.io.netty.channel.socket.nio.NioServerSocketChannel;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Path;
@@ -69,6 +71,9 @@ public class RemoteFileServer implements AutoCloseable {
 
     private static final Logger LOGGER = Logger.getLogger(RemoteFileServer.class.getName());
     private static final long DEFAULT_CACHE_MAX_BYTES = 1024L * 1024 * 1024; // 1 GB
+    static final int DEFAULT_IO_RATIO = 70;
+    /** Default block size for multipart files: 4 MB. */
+    public static final int DEFAULT_BLOCK_SIZE = 4 * 1024 * 1024;
 
     private final String host;
     private final int port;
@@ -76,7 +81,10 @@ public class RemoteFileServer implements AutoCloseable {
     private final int ioThreads;
     private final Properties config;
     private Server server;
+    private NioEventLoopGroup bossGroup;
+    private NioEventLoopGroup workerGroup;
     private ExecutorService metadataExecutor;
+    private int blockSize;
     private ObjectStorage objectStorage;
     private PrometheusMetricsProvider statsProvider;
     private org.eclipse.jetty.server.Server httpServer;
@@ -126,8 +134,20 @@ public class RemoteFileServer implements AutoCloseable {
         statsProvider.start(statsConfig);
         StatsLogger statsLogger = statsProvider.getStatsLogger("");
 
+        int ioRatio = Integer.getInteger("herddb.fileserver.netty.ioRatio", DEFAULT_IO_RATIO);
+        this.blockSize = Integer.parseInt(config.getProperty("block.size",
+                String.valueOf(DEFAULT_BLOCK_SIZE)));
+        bossGroup = new NioEventLoopGroup(1);
+        workerGroup = new NioEventLoopGroup(ioThreads);
+        workerGroup.setIoRatio(ioRatio);
+
         RemoteFileServiceImpl serviceImpl = new RemoteFileServiceImpl(objectStorage, statsLogger);
-        ServerBuilder<?> grpcBuilder = ServerBuilder.forPort(port).addService(serviceImpl);
+        NettyServerBuilder grpcBuilder = NettyServerBuilder.forPort(port)
+                .bossEventLoopGroup(bossGroup)
+                .workerEventLoopGroup(workerGroup)
+                .channelType(NioServerSocketChannel.class)
+                .addService(serviceImpl)
+                .maxInboundMessageSize(blockSize + 1024 * 1024);
         if (OidcBootstrap.isEnabled(config)) {
             try {
                 OidcTokenValidator validator = OidcBootstrap.buildValidator(config);
@@ -173,8 +193,9 @@ public class RemoteFileServer implements AutoCloseable {
             }
         }
 
-        LOGGER.log(Level.INFO, "RemoteFileServer started on port {0}, storage: {1}, io threads: {2}",
-                new Object[]{port, storageMode, ioThreads});
+        LOGGER.log(Level.INFO,
+                "RemoteFileServer started on port {0}, storage: {1}, io threads: {2}, ioRatio: {3}, blockSize: {4}",
+                new Object[]{port, storageMode, ioThreads, ioRatio, this.blockSize});
     }
 
     private ObjectStorage buildS3ObjectStorage() throws IOException {
@@ -232,6 +253,10 @@ public class RemoteFileServer implements AutoCloseable {
         return server != null ? server.getPort() : port;
     }
 
+    public int getBlockSize() {
+        return blockSize;
+    }
+
     public String getHost() {
         return host;
     }
@@ -268,6 +293,12 @@ public class RemoteFileServer implements AutoCloseable {
         if (server != null) {
             server.shutdown().awaitTermination(30, TimeUnit.SECONDS);
             LOGGER.log(Level.INFO, "RemoteFileServer stopped");
+        }
+        if (workerGroup != null) {
+            workerGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS).awaitUninterruptibly();
+        }
+        if (bossGroup != null) {
+            bossGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS).awaitUninterruptibly();
         }
         if (metadataExecutor != null) {
             metadataExecutor.shutdown();

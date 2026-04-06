@@ -107,6 +107,46 @@ public class CachingObjectStorageTest {
         }
 
         @Override
+        public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
+            data.put(path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex, content);
+            return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
+        public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
+            long blockIndex = offset / blockSize;
+            int offsetInBlock = (int) (offset % blockSize);
+            byte[] block = data.get(path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex);
+            if (block == null) return CompletableFuture.completedFuture(ReadResult.notFound());
+            int end = Math.min(offsetInBlock + length, block.length);
+            byte[] result = Arrays.copyOfRange(block, offsetInBlock, end);
+            return CompletableFuture.completedFuture(ReadResult.found(result));
+        }
+
+        @Override
+        public CompletableFuture<Boolean> deleteLogical(String path) {
+            String multipartPrefix = path + ObjectStorage.MULTIPART_SUFFIX + "/";
+            boolean removed = data.remove(path) != null;
+            List<String> blocks = new ArrayList<>();
+            for (String key : data.keySet()) {
+                if (key.startsWith(multipartPrefix)) blocks.add(key);
+            }
+            blocks.forEach(data::remove);
+            return CompletableFuture.completedFuture(removed || !blocks.isEmpty());
+        }
+
+        @Override
+        public CompletableFuture<List<String>> listLogical(String prefix) {
+            java.util.LinkedHashSet<String> logical = new java.util.LinkedHashSet<>();
+            for (String key : data.keySet()) {
+                if (!key.startsWith(prefix)) continue;
+                int mp = key.indexOf(ObjectStorage.MULTIPART_SUFFIX + "/");
+                logical.add(mp >= 0 ? key.substring(0, mp) : key);
+            }
+            return CompletableFuture.completedFuture(new ArrayList<>(logical));
+        }
+
+        @Override
         public void close() {
         }
     }

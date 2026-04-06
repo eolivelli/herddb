@@ -25,7 +25,9 @@ package remotefile;
 
 service RemoteFileService {
     rpc WriteFile (WriteFileRequest) returns (WriteFileResponse);
+    rpc WriteFileBlock (WriteFileBlockRequest) returns (WriteFileBlockResponse);
     rpc ReadFile (ReadFileRequest) returns (ReadFileResponse);
+    rpc ReadFileRange (ReadFileRangeRequest) returns (ReadFileRangeResponse);
     rpc DeleteFile (DeleteFileRequest) returns (DeleteFileResponse);
     rpc ListFiles (ListFilesRequest) returns (stream ListFilesEntry);
     rpc DeleteByPrefix (DeleteByPrefixRequest) returns (DeleteByPrefixResponse);
@@ -40,11 +42,33 @@ message WriteFileResponse {
     int64 written_size = 1;
 }
 
+message WriteFileBlockRequest {
+    string path = 1;        // logical file path
+    int64 block_index = 2;  // 0-based block index
+    bytes content = 3;      // block data (<= blockSize bytes)
+}
+
+message WriteFileBlockResponse {
+    int64 written_size = 1;
+}
+
 message ReadFileRequest {
     string path = 1;
 }
 
 message ReadFileResponse {
+    bytes content = 1;
+    bool found = 2;
+}
+
+message ReadFileRangeRequest {
+    string path = 1;
+    int64 offset = 2;
+    int32 length = 3;
+    int32 block_size = 4;  // used by server to compute which block to load
+}
+
+message ReadFileRangeResponse {
     bytes content = 1;
     bool found = 2;
 }

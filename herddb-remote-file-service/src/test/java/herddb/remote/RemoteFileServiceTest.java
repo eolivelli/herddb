@@ -20,6 +20,7 @@
 
 package herddb.remote;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -32,11 +33,16 @@ import herddb.remote.proto.DeleteFileRequest;
 import herddb.remote.proto.DeleteFileResponse;
 import herddb.remote.proto.ListFilesEntry;
 import herddb.remote.proto.ListFilesRequest;
+import herddb.remote.proto.ReadFileRangeRequest;
+import herddb.remote.proto.ReadFileRangeResponse;
 import herddb.remote.proto.ReadFileRequest;
 import herddb.remote.proto.ReadFileResponse;
 import herddb.remote.proto.RemoteFileServiceGrpc;
+import herddb.remote.proto.WriteFileBlockRequest;
+import herddb.remote.proto.WriteFileBlockResponse;
 import herddb.remote.proto.WriteFileRequest;
 import herddb.remote.proto.WriteFileResponse;
+import java.io.ByteArrayInputStream;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import java.nio.charset.StandardCharsets;
@@ -225,6 +231,119 @@ public class RemoteFileServiceTest {
             client.writeFileAsync("pfx/b.page", "b".getBytes()).get(5, TimeUnit.SECONDS);
             CompletableFuture<Integer> delPfxFuture = client.deleteByPrefixAsync("pfx/");
             assertEquals(2, (int) delPfxFuture.get(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    public void testWriteFileBlockAndReadFileRange() {
+        // Write two blocks via gRPC stub
+        byte[] block0 = new byte[100];
+        byte[] block1 = new byte[60];
+        for (int i = 0; i < 100; i++) block0[i] = (byte) i;
+        for (int i = 0; i < 60; i++) block1[i] = (byte) (i + 100);
+
+        WriteFileBlockResponse r0 = stub.writeFileBlock(WriteFileBlockRequest.newBuilder()
+                .setPath("ts1/uuid1/multipart/graph")
+                .setBlockIndex(0)
+                .setContent(ByteString.copyFrom(block0))
+                .build());
+        assertEquals(100, r0.getWrittenSize());
+
+        WriteFileBlockResponse r1 = stub.writeFileBlock(WriteFileBlockRequest.newBuilder()
+                .setPath("ts1/uuid1/multipart/graph")
+                .setBlockIndex(1)
+                .setContent(ByteString.copyFrom(block1))
+                .build());
+        assertEquals(60, r1.getWrittenSize());
+
+        // Read a range within block 0 (offset=10, length=20, blockSize=100)
+        ReadFileRangeResponse range0 = stub.readFileRange(ReadFileRangeRequest.newBuilder()
+                .setPath("ts1/uuid1/multipart/graph")
+                .setOffset(10)
+                .setLength(20)
+                .setBlockSize(100)
+                .build());
+        assertTrue(range0.getFound());
+        byte[] got0 = range0.getContent().toByteArray();
+        assertEquals(20, got0.length);
+        for (int i = 0; i < 20; i++) {
+            assertEquals((byte) (10 + i), got0[i]);
+        }
+
+        // Read start of block 1 (offset=100, length=5, blockSize=100)
+        ReadFileRangeResponse range1 = stub.readFileRange(ReadFileRangeRequest.newBuilder()
+                .setPath("ts1/uuid1/multipart/graph")
+                .setOffset(100)
+                .setLength(5)
+                .setBlockSize(100)
+                .build());
+        assertTrue(range1.getFound());
+        byte[] got1 = range1.getContent().toByteArray();
+        assertEquals(5, got1.length);
+        for (int i = 0; i < 5; i++) {
+            assertEquals((byte) (100 + i), got1[i]);
+        }
+
+        // Missing block
+        ReadFileRangeResponse missing = stub.readFileRange(ReadFileRangeRequest.newBuilder()
+                .setPath("ts1/uuid1/multipart/graph")
+                .setOffset(500)
+                .setLength(10)
+                .setBlockSize(100)
+                .build());
+        assertFalse(missing.getFound());
+    }
+
+    @Test
+    public void testWriteMultipartFileAndRoundTrip() throws Exception {
+        List<String> servers = List.of("localhost:" + server.getPort());
+        int blockSize = 64;
+        try (RemoteFileServiceClient client = new RemoteFileServiceClient(servers)) {
+            // Build test data spanning 3 blocks
+            byte[] data = new byte[blockSize * 2 + 30];
+            for (int i = 0; i < data.length; i++) data[i] = (byte) (i & 0xFF);
+
+            long written = client.writeMultipartFile("ts1/uuid1/largefile", new ByteArrayInputStream(data), blockSize);
+            assertEquals(data.length, written);
+
+            // Read each block back individually
+            byte[] b0 = client.readFileRange("ts1/uuid1/largefile", 0, blockSize, blockSize);
+            assertNotNull(b0);
+            assertEquals(blockSize, b0.length);
+            for (int i = 0; i < blockSize; i++) assertEquals((byte) (i & 0xFF), b0[i]);
+
+            byte[] b1 = client.readFileRange("ts1/uuid1/largefile", blockSize, blockSize, blockSize);
+            assertNotNull(b1);
+            assertEquals(blockSize, b1.length);
+            for (int i = 0; i < blockSize; i++) assertEquals((byte) ((blockSize + i) & 0xFF), b1[i]);
+
+            byte[] b2 = client.readFileRange("ts1/uuid1/largefile", blockSize * 2, 30, blockSize);
+            assertNotNull(b2);
+            assertEquals(30, b2.length);
+            for (int i = 0; i < 30; i++) assertEquals((byte) ((blockSize * 2 + i) & 0xFF), b2[i]);
+        }
+    }
+
+    @Test
+    public void testMultipartListAndDelete() throws Exception {
+        List<String> servers = List.of("localhost:" + server.getPort());
+        int blockSize = 32;
+        try (RemoteFileServiceClient client = new RemoteFileServiceClient(servers)) {
+            byte[] data = new byte[blockSize * 3];
+            client.writeMultipartFile("ts1/uuid2/graphfile", new ByteArrayInputStream(data), blockSize);
+            client.writeFileAsync("ts1/uuid2/plain.page", "x".getBytes()).get(5, TimeUnit.SECONDS);
+
+            // listFiles should return logical paths (deduped)
+            List<String> listed = client.listFilesAsync("ts1/uuid2/").get(5, TimeUnit.SECONDS);
+            assertEquals(2, listed.size());
+            assertTrue(listed.contains("ts1/uuid2/graphfile"));
+            assertTrue(listed.contains("ts1/uuid2/plain.page"));
+
+            // deleteFile on logical multipart path removes all blocks
+            client.deleteFileAsync("ts1/uuid2/graphfile").get(5, TimeUnit.SECONDS);
+            List<String> afterDelete = client.listFilesAsync("ts1/uuid2/").get(5, TimeUnit.SECONDS);
+            assertEquals(1, afterDelete.size());
+            assertEquals("ts1/uuid2/plain.page", afterDelete.get(0));
         }
     }
 }

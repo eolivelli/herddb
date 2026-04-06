@@ -269,6 +269,15 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
         return tableSpace + "/" + uuid + "/index/" + pageId + ".page";
     }
 
+    /** System property to override the multipart block size (bytes). Default: 4 MB. */
+    public static final String MULTIPART_BLOCK_SIZE_PROPERTY = "herddb.remote.multipart.blockSize";
+    private static final int MULTIPART_BLOCK_SIZE =
+            Integer.getInteger(MULTIPART_BLOCK_SIZE_PROPERTY, 4 * 1024 * 1024);
+
+    private static String remoteMultipartPath(String tableSpace, String uuid, String fileType) {
+        return tableSpace + "/" + uuid + "/multipart/" + fileType;
+    }
+
     private static String remoteDataPrefix(String tableSpace, String uuid) {
         return tableSpace + "/" + uuid + "/data/";
     }
@@ -438,6 +447,48 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
             LOGGER.log(Level.FINE,
                     "deleteIndexPage: non-fatal error deleting {0}: {1}",
                     new Object[]{path, ignored.getMessage()});
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Multipart large-file support (FusedPQ graphs, map data, etc.)
+    // -------------------------------------------------------------------------
+
+    @Override
+    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                          Path tempFile)
+            throws IOException, DataStorageManagerException {
+        String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        int blockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
+        long totalBytes;
+        try (java.io.InputStream in = java.nio.file.Files.newInputStream(tempFile)) {
+            totalBytes = client.writeMultipartFile(logicalPath, in, blockSize);
+        }
+        LOGGER.log(Level.INFO,
+                "writeMultipartIndexFile: {0} written {1} bytes in blocks of {2}",
+                new Object[]{logicalPath, totalBytes, blockSize});
+        return logicalPath;
+    }
+
+    @Override
+    public io.github.jbellis.jvector.disk.ReaderSupplier multipartIndexReaderSupplier(
+            String tableSpace, String uuid, String fileType, long fileSize)
+            throws DataStorageManagerException {
+        String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        int blockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
+        return new RemoteRandomAccessReader.Supplier(client, logicalPath, fileSize, blockSize);
+    }
+
+    @Override
+    public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
+            throws DataStorageManagerException {
+        String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        try {
+            client.deleteFile(logicalPath);
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.WARNING,
+                    "deleteMultipartIndexFile: non-fatal error deleting {0}: {1}",
+                    new Object[]{logicalPath, e.getMessage()});
         }
     }
 

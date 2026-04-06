@@ -29,6 +29,7 @@ import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
 import herddb.utils.Bytes;
+import herddb.utils.VisibleByteArrayOutputStream;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.GraphSearcher;
@@ -580,13 +581,40 @@ public class PersistentVectorStore extends AbstractVectorStore {
         final List<Long> graphPageIds;
         final List<Long> mapPageIds;
         final long estimatedSizeBytes;
+        // Multipart mode (non-null when the storage manager supports multipart writes)
+        final String graphFilePath;
+        final long graphFileSize;
+        final String mapFilePath;
+        final long mapFileSize;
 
+        /** Page-based constructor. */
         SegmentWriteResult(int segmentId, List<Long> graphPageIds, List<Long> mapPageIds,
                            long estimatedSizeBytes) {
             this.segmentId = segmentId;
             this.graphPageIds = graphPageIds;
             this.mapPageIds = mapPageIds;
             this.estimatedSizeBytes = estimatedSizeBytes;
+            this.graphFilePath = null;
+            this.graphFileSize = 0;
+            this.mapFilePath = null;
+            this.mapFileSize = 0;
+        }
+
+        /** Multipart constructor. */
+        SegmentWriteResult(int segmentId, String graphFilePath, long graphFileSize,
+                           String mapFilePath, long mapFileSize, long estimatedSizeBytes) {
+            this.segmentId = segmentId;
+            this.graphPageIds = Collections.emptyList();
+            this.mapPageIds = Collections.emptyList();
+            this.estimatedSizeBytes = estimatedSizeBytes;
+            this.graphFilePath = graphFilePath;
+            this.graphFileSize = graphFileSize;
+            this.mapFilePath = mapFilePath;
+            this.mapFileSize = mapFileSize;
+        }
+
+        boolean isMultipart() {
+            return graphFilePath != null;
         }
     }
 
@@ -1364,14 +1392,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
         try {
             if (newSegmentResults != null) {
                 for (SegmentWriteResult swr : newSegmentResults) {
-                    Path reloadMapFile = readChunksToTempFile(
-                            swr.mapPageIds.stream().mapToLong(Long::longValue).toArray(), TYPE_VECTOR_MAPCHUNK);
-                    // No graph temp file: the PageStoreReader reads graph bytes
-                    // directly from the page store, bounded by a small LRU cache.
                     VectorSegment seg = new VectorSegment(swr.segmentId);
                     seg.estimatedSizeBytes = swr.estimatedSizeBytes;
                     seg.graphPageIds = swr.graphPageIds;
                     seg.mapPageIds = swr.mapPageIds;
+                    seg.graphFilePath = swr.graphFilePath;
+                    seg.graphFileSize = swr.graphFileSize;
+                    seg.mapFilePath = swr.mapFilePath;
+                    seg.mapFileSize = swr.mapFileSize;
+                    Path reloadMapFile;
+                    if (swr.isMultipart()) {
+                        reloadMapFile = readMultipartMapDataToTempFile(seg);
+                    } else {
+                        reloadMapFile = readChunksToTempFile(
+                                swr.mapPageIds.stream().mapToLong(Long::longValue).toArray(),
+                                TYPE_VECTOR_MAPCHUNK);
+                    }
                     loadFusedPQSegment(seg, reloadMapFile, snapshotDimension, nextNodeId.get());
                     preloadedSegments.add(seg);
                 }
@@ -1675,8 +1711,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         lastCheckpointVectorsProcessed.set(totalPoolSize);
         long bytesWritten = 0L;
         for (SegmentWriteResult r : newSegmentResults) {
-            bytesWritten += (long) r.graphPageIds.size() * CHUNK_SIZE;
-            bytesWritten += (long) r.mapPageIds.size() * CHUNK_SIZE;
+            if (r.isMultipart()) {
+                bytesWritten += r.graphFileSize + r.mapFileSize;
+            } else {
+                bytesWritten += (long) r.graphPageIds.size() * CHUNK_SIZE;
+                bytesWritten += (long) r.mapPageIds.size() * CHUNK_SIZE;
+            }
         }
         lastPhaseBBytesWritten.set(bytesWritten);
         LOGGER.log(Level.INFO,
@@ -1854,17 +1894,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         long segStartMs = System.currentTimeMillis();
-        List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, snapshotDimension);
-        List<Long> mapPageIds = writeFusedPQMapData(
-                new VectorStorageRandomAccessVectorValues(partStorage, snapshotDimension), partNodeToPk);
-        long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
+        SegmentWriteResult result = writeOneSegmentData(
+                s, partVectors, partNodeToPk, partStorage, snapshotDimension);
 
         long segElapsedMs = System.currentTimeMillis() - segStartMs;
         LOGGER.log(Level.INFO,
-                "checkpoint {0} Phase B: segment {1}/{2} ({3} nodes) written in {4} ms",
-                new Object[]{indexName, s.oneBasedIndex, totalSegments, s.size(), segElapsedMs});
+                "checkpoint {0} Phase B: segment {1}/{2} ({3} nodes) written in {4} ms ({5})",
+                new Object[]{indexName, s.oneBasedIndex, totalSegments, s.size(), segElapsedMs,
+                        result.isMultipart() ? "multipart" : "page-based"});
 
-        return new SegmentWriteResult(s.segmentId, graphPageIds, mapPageIds, estimatedSize);
+        return result;
     }
 
     private static void releaseSliceReferences(
@@ -2004,7 +2043,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private void loadMultiSegmentFormat(ByteBuffer metaBuf, int dim, int savedNextNodeId,
                                          int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
             throws IOException, DataStorageManagerException {
-        int numSegments = metaBuf.getInt();
+        java.io.DataInputStream dis = new java.io.DataInputStream(
+                new java.io.ByteArrayInputStream(metaBuf.array(), metaBuf.position(),
+                        metaBuf.remaining()));
+        int numSegments;
+        try {
+            numSegments = dis.readInt();
+        } catch (IOException e) {
+            throw new DataStorageManagerException("Failed to read segment count", e);
+        }
 
         if (dim == 0 || numSegments == 0) {
             LOGGER.log(Level.INFO, "vector store {0} is empty (multi-segment), no load needed", indexName);
@@ -2013,27 +2060,56 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         int maxSegId = -1;
         for (int s = 0; s < numSegments; s++) {
-            int segId = metaBuf.getInt();
-            long estimatedSize = metaBuf.getLong();
-            int numGraphChunks = metaBuf.getInt();
-            long[] graphChunkPageIds = new long[numGraphChunks];
-            for (int i = 0; i < numGraphChunks; i++) {
-                graphChunkPageIds[i] = metaBuf.getLong();
+            int segId;
+            long estimatedSize;
+            boolean multipart;
+            try {
+                segId = dis.readInt();
+                estimatedSize = dis.readLong();
+                multipart = dis.readByte() == 1;
+            } catch (IOException e) {
+                throw new DataStorageManagerException("Failed to read segment header", e);
             }
-            int numMapChunks = metaBuf.getInt();
-            long[] mapChunkPageIds = new long[numMapChunks];
-            for (int i = 0; i < numMapChunks; i++) {
-                mapChunkPageIds[i] = metaBuf.getLong();
-            }
-
-            Path mapFile = readChunksToTempFile(mapChunkPageIds, TYPE_VECTOR_MAPCHUNK);
-            // No graph temp file: bounded LRU reader over the page store.
 
             VectorSegment seg = new VectorSegment(segId);
             seg.estimatedSizeBytes = estimatedSize;
-            seg.graphPageIds = toLongList(graphChunkPageIds);
-            seg.mapPageIds = toLongList(mapChunkPageIds);
-            loadFusedPQSegment(seg, mapFile, dim, savedNextNodeId);
+
+            if (multipart) {
+                try {
+                    String graphFilePath = dis.readUTF();
+                    long graphFileSize = dis.readLong();
+                    String mapFilePath = dis.readUTF();
+                    long mapFileSize = dis.readLong();
+                    seg.graphFilePath = graphFilePath;
+                    seg.graphFileSize = graphFileSize;
+                    seg.mapFilePath = mapFilePath.isEmpty() ? null : mapFilePath;
+                    seg.mapFileSize = mapFileSize;
+                } catch (IOException e) {
+                    throw new DataStorageManagerException("Failed to read multipart segment metadata", e);
+                }
+                // For multipart, we need to read map data via the multipart reader
+                Path mapFile = readMultipartMapDataToTempFile(seg);
+                loadFusedPQSegment(seg, mapFile, dim, savedNextNodeId);
+            } else {
+                try {
+                    int numGraphChunks = dis.readInt();
+                    long[] graphChunkPageIds = new long[numGraphChunks];
+                    for (int i = 0; i < numGraphChunks; i++) {
+                        graphChunkPageIds[i] = dis.readLong();
+                    }
+                    int numMapChunks = dis.readInt();
+                    long[] mapChunkPageIds = new long[numMapChunks];
+                    for (int i = 0; i < numMapChunks; i++) {
+                        mapChunkPageIds[i] = dis.readLong();
+                    }
+                    seg.graphPageIds = toLongList(graphChunkPageIds);
+                    seg.mapPageIds = toLongList(mapChunkPageIds);
+                    Path mapFile = readChunksToTempFile(mapChunkPageIds, TYPE_VECTOR_MAPCHUNK);
+                    loadFusedPQSegment(seg, mapFile, dim, savedNextNodeId);
+                } catch (IOException e) {
+                    throw new DataStorageManagerException("Failed to read page-based segment metadata", e);
+                }
+            }
             segments.add(seg);
             if (segId > maxSegId) {
                 maxSegId = segId;
@@ -2129,14 +2205,28 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         Files.deleteIfExists(mapFile);
 
-        long[] graphPageIds = new long[seg.graphPageIds.size()];
-        for (int i = 0; i < graphPageIds.length; i++) {
-            graphPageIds[i] = seg.graphPageIds.get(i);
+        ReaderSupplier readerSupplier;
+        if (seg.graphFilePath != null) {
+            // Multipart mode: use remote reader via storage manager
+            readerSupplier = dataStorageManager.multipartIndexReaderSupplier(
+                    tableSpaceUUID,
+                    indexUUID + "_seg" + seg.segmentId,
+                    "graph",
+                    seg.graphFileSize);
+            if (readerSupplier == null) {
+                throw new DataStorageManagerException(
+                        "Storage manager does not support multipart reads for segment " + seg.segmentId);
+            }
+        } else {
+            long[] graphPageIds = new long[seg.graphPageIds.size()];
+            for (int i = 0; i < graphPageIds.length; i++) {
+                graphPageIds[i] = seg.graphPageIds.get(i);
+            }
+            readerSupplier = new PageStoreReader.Supplier(
+                    dataStorageManager, tableSpaceUUID, indexUUID,
+                    graphPageIds, TYPE_VECTOR_GRAPHCHUNK,
+                    PageStoreReader.DEFAULT_LRU_PAGES);
         }
-        ReaderSupplier readerSupplier = new PageStoreReader.Supplier(
-                dataStorageManager, tableSpaceUUID, indexUUID,
-                graphPageIds, TYPE_VECTOR_GRAPHCHUNK,
-                PageStoreReader.DEFAULT_LRU_PAGES);
         seg.onDiskGraph = OnDiskGraphIndex.load(readerSupplier);
         seg.onDiskReaderSupplier = readerSupplier;
         // onDiskGraphFile intentionally left null: no resident copy on disk.
@@ -2149,6 +2239,61 @@ public class PersistentVectorStore extends AbstractVectorStore {
     // -------------------------------------------------------------------------
     // FusedPQ graph building
     // -------------------------------------------------------------------------
+
+    /**
+     * Writes the graph and map data for one segment. Uses multipart writes when the storage
+     * manager supports them (e.g. RemoteFileDataStorageManager in S3 mode), otherwise falls
+     * back to the existing page-based approach.
+     */
+    private SegmentWriteResult writeOneSegmentData(
+            SegmentSlice s,
+            ConcurrentHashMap<Integer, VectorFloat<?>> partVectors,
+            ConcurrentHashMap<Integer, Bytes> partNodeToPk,
+            VectorStorage partStorage,
+            int snapshotDimension)
+            throws IOException, DataStorageManagerException {
+
+        // Try multipart write via storage manager
+        Path graphTempFile = writeFusedPQGraphToTempFile(partVectors, partNodeToPk, snapshotDimension);
+        try {
+            String graphFilePath = dataStorageManager.writeMultipartIndexFile(
+                    tableSpaceUUID,
+                    indexUUID + "_seg" + s.segmentId,
+                    "graph",
+                    graphTempFile);
+            if (graphFilePath != null) {
+                long graphFileSize = Files.size(graphTempFile);
+                // Map data
+                Path mapTempFile = writeFusedPQMapDataToTempFile(
+                        new VectorStorageRandomAccessVectorValues(partStorage, snapshotDimension),
+                        partNodeToPk);
+                try {
+                    String mapFilePath = dataStorageManager.writeMultipartIndexFile(
+                            tableSpaceUUID,
+                            indexUUID + "_seg" + s.segmentId,
+                            "map",
+                            mapTempFile);
+                    long mapFileSize = Files.size(mapTempFile);
+                    long estimatedSize = graphFileSize + mapFileSize;
+                    return new SegmentWriteResult(s.segmentId,
+                            graphFilePath, graphFileSize,
+                            mapFilePath, mapFileSize,
+                            estimatedSize);
+                } finally {
+                    Files.deleteIfExists(mapTempFile);
+                }
+            }
+        } finally {
+            Files.deleteIfExists(graphTempFile);
+        }
+
+        // Fallback: page-based writes
+        List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, snapshotDimension);
+        List<Long> mapPageIds = writeFusedPQMapData(
+                new VectorStorageRandomAccessVectorValues(partStorage, snapshotDimension), partNodeToPk);
+        long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
+        return new SegmentWriteResult(s.segmentId, graphPageIds, mapPageIds, estimatedSize);
+    }
 
     /**
      * Writes the merged graph as FusedPQ on-disk format.
@@ -2301,6 +2446,137 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
     }
 
+    /**
+     * Builds the FusedPQ graph and writes it to a new temp file.
+     * The caller is responsible for deleting the returned file.
+     */
+    private Path writeFusedPQGraphToTempFile(
+            ConcurrentHashMap<Integer, VectorFloat<?>> allVectors,
+            ConcurrentHashMap<Integer, Bytes> allNodeToPk,
+            int dim) throws IOException, DataStorageManagerException {
+        if (allNodeToPk.isEmpty()) {
+            Path empty = Files.createTempFile(tmpDirectory, "herddb-vector-empty-", ".idx");
+            return empty;
+        }
+        int totalVectors = allNodeToPk.size();
+        VectorStorage allStorage = new VectorStorage(allVectors.size());
+        allVectors.forEach(allStorage::set);
+        VectorStorageRandomAccessVectorValues allMravv =
+                new VectorStorageRandomAccessVectorValues(allStorage, dim, allVectors.size());
+        BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(allMravv, similarityFunction);
+        GraphIndexBuilder mergedBuilder = new GraphIndexBuilder(
+                bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH,
+                PhysicalCoreExecutor.pool(), CHECKPOINT_POOL);
+
+        int progressInterval = Math.max(1000, totalVectors / 10);
+        AtomicInteger nodesAdded = new AtomicInteger(0);
+        java.util.concurrent.ForkJoinTask<?> graphTask = CHECKPOINT_POOL.submit(() ->
+                allVectors.entrySet().parallelStream()
+                    .filter(e -> allNodeToPk.containsKey(e.getKey()))
+                    .forEach(e -> {
+                        mergedBuilder.addGraphNode(e.getKey(), e.getValue());
+                        int count = nodesAdded.incrementAndGet();
+                        if (count % progressInterval == 0) {
+                            LOGGER.log(Level.INFO,
+                                    "writeFusedPQGraphToTempFile {0}: added {1}/{2} nodes ({3}%)",
+                                    new Object[]{indexName, count, totalVectors,
+                                            (int) (100.0 * count / totalVectors)});
+                        }
+                    })
+        );
+        try {
+            graphTask.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("writeFusedPQGraphToTempFile interrupted", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException) {
+                throw (IOException) cause;
+            }
+            throw new IOException("writeFusedPQGraphToTempFile failed", cause);
+        }
+        mergedBuilder.cleanup();
+        OnHeapGraphIndex mergedGraph = (OnHeapGraphIndex) mergedBuilder.getGraph();
+
+        int pqSubspaces = Math.max(1, dim / 4);
+        ProductQuantization pq = ProductQuantization.compute(allMravv, pqSubspaces, 256, true);
+        PQVectors pqv = pq.encodeAll(allMravv, PhysicalCoreExecutor.pool());
+
+        Path tempFile = Files.createTempFile(tmpDirectory, "herddb-vector-", ".idx");
+        boolean success = false;
+        try {
+            try (OnDiskGraphIndexWriter writer = new OnDiskGraphIndexWriter.Builder(mergedGraph, tempFile)
+                    .with(new FusedPQ(mergedGraph.maxDegree(), pq))
+                    .with(new InlineVectors(dim))
+                    .build()) {
+                ImmutableGraphIndex.View view = mergedGraph.getView();
+                EnumMap<FeatureId, IntFunction<io.github.jbellis.jvector.graph.disk.feature.Feature.State>> suppliers =
+                        new EnumMap<>(FeatureId.class);
+                suppliers.put(FeatureId.FUSED_PQ, ordinal -> new FusedPQ.State(view, pqv, ordinal));
+                suppliers.put(FeatureId.INLINE_VECTORS,
+                        ordinal -> new InlineVectors.State(allMravv.getVector(ordinal)));
+                writer.write(suppliers);
+            }
+            success = true;
+            return tempFile;
+        } finally {
+            if (!success) {
+                Files.deleteIfExists(tempFile);
+            }
+            try {
+                mergedBuilder.close();
+            } catch (IOException e) {
+                // ignore
+            }
+        }
+    }
+
+    /**
+     * Builds the map data and writes it to a new temp file.
+     * The caller is responsible for deleting the returned file.
+     */
+    private Path writeFusedPQMapDataToTempFile(
+            RandomAccessVectorValues allVectors,
+            ConcurrentHashMap<Integer, Bytes> allNodeToPk) throws IOException {
+        List<Integer> sortedNodeIds = new ArrayList<>(allNodeToPk.keySet());
+        java.util.Collections.sort(sortedNodeIds);
+        Map<Integer, Integer> oldToNew = new java.util.HashMap<>();
+        for (int i = 0; i < sortedNodeIds.size(); i++) {
+            oldToNew.put(sortedNodeIds.get(i), i);
+        }
+        Path mapTmpFile = Files.createTempFile(tmpDirectory, "herddb-vector-map-", ".tmp");
+        boolean success = false;
+        try {
+            try (BufferedOutputStream bos = new BufferedOutputStream(
+                    new FileOutputStream(mapTmpFile.toFile()), CHUNK_SIZE)) {
+                int entryCount = sortedNodeIds.size();
+                writeInt(bos, entryCount);
+                for (int oldId : sortedNodeIds) {
+                    int newOrdinal = oldToNew.get(oldId);
+                    Bytes pk = allNodeToPk.get(oldId);
+                    byte[] pkBytes = pk.to_array();
+                    VectorFloat<?> vec = allVectors.getVector(oldId);
+                    writeInt(bos, newOrdinal);
+                    writeInt(bos, pkBytes.length);
+                    bos.write(pkBytes);
+                    int floatCount = vec.length();
+                    writeInt(bos, floatCount);
+                    for (int j = 0; j < floatCount; j++) {
+                        int bits = Float.floatToIntBits(vec.get(j));
+                        writeInt(bos, bits);
+                    }
+                }
+            }
+            success = true;
+            return mapTmpFile;
+        } finally {
+            if (!success) {
+                Files.deleteIfExists(mapTmpFile);
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Chunk I/O methods
     // -------------------------------------------------------------------------
@@ -2332,6 +2608,52 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         }
         return tempFile;
+    }
+
+    /**
+     * Downloads the map data for a multipart segment into a local temp file.
+     * Uses the storage manager's multipart reader supplier to read the map file.
+     * The caller is responsible for deleting the returned file.
+     */
+    private Path readMultipartMapDataToTempFile(VectorSegment seg)
+            throws IOException, DataStorageManagerException {
+        if (seg.mapFilePath == null || seg.mapFileSize == 0) {
+            // Empty or missing map — return an empty temp file
+            return Files.createTempFile(tmpDirectory, "herddb-vector-map-empty-", ".tmp");
+        }
+        io.github.jbellis.jvector.disk.ReaderSupplier supplier =
+                dataStorageManager.multipartIndexReaderSupplier(
+                        tableSpaceUUID,
+                        indexUUID + "_seg" + seg.segmentId,
+                        "map",
+                        seg.mapFileSize);
+        if (supplier == null) {
+            throw new DataStorageManagerException(
+                    "Storage manager does not support multipart reads for map of segment " + seg.segmentId);
+        }
+        Path tempFile = Files.createTempFile(tmpDirectory, "herddb-vector-map-", ".tmp");
+        boolean success = false;
+        try (io.github.jbellis.jvector.disk.RandomAccessReader reader = supplier.get();
+             FileOutputStream fos = new FileOutputStream(tempFile.toFile());
+             BufferedOutputStream bos = new BufferedOutputStream(fos, CHUNK_SIZE)) {
+            reader.seek(0);
+            // Read in chunks to avoid large allocations
+            byte[] buf = new byte[CHUNK_SIZE];
+            long remaining = seg.mapFileSize;
+            while (remaining > 0) {
+                int toRead = (int) Math.min(buf.length, remaining);
+                byte[] readBuf = toRead == buf.length ? buf : new byte[toRead];
+                reader.readFully(readBuf);
+                bos.write(readBuf, 0, toRead);
+                remaining -= toRead;
+            }
+            success = true;
+            return tempFile;
+        } finally {
+            if (!success) {
+                Files.deleteIfExists(tempFile);
+            }
+        }
     }
 
     /**
@@ -2464,64 +2786,73 @@ public class PersistentVectorStore extends AbstractVectorStore {
             LogSequenceNumber sequenceNumber) throws DataStorageManagerException {
 
         int totalSegments = sealedSegments.size() + newSegmentResults.size();
-
-        int metaSize = 34;
-        for (VectorSegment seg : sealedSegments) {
-            metaSize += 4 + 8 + 4 + seg.graphPageIds.size() * 8 + 4 + seg.mapPageIds.size() * 8;
-        }
-        for (SegmentWriteResult swr : newSegmentResults) {
-            metaSize += 4 + 8 + 4 + swr.graphPageIds.size() * 8 + 4 + swr.mapPageIds.size() * 8;
-        }
-
-        ByteBuffer metaBuf = ByteBuffer.allocate(metaSize);
-        metaBuf.putInt(METADATA_VERSION_MULTI_SEGMENT);
-        metaBuf.putInt(dimension);
-        metaBuf.putInt(m);
-        metaBuf.putInt(beamWidth);
-        metaBuf.putFloat(neighborOverflow);
-        metaBuf.putFloat(alpha);
-        metaBuf.put((byte) (ADD_HIERARCHY ? 1 : 0));
-        metaBuf.put((byte) 1); // fusedPQ
-        metaBuf.putInt(nextNodeId.get());
-        metaBuf.putInt(totalSegments);
-
         Set<Long> activePages = new HashSet<>();
 
-        for (VectorSegment seg : sealedSegments) {
-            metaBuf.putInt(seg.segmentId);
-            metaBuf.putLong(seg.estimatedSizeBytes);
-            metaBuf.putInt(seg.graphPageIds.size());
-            for (long id : seg.graphPageIds) {
-                metaBuf.putLong(id);
-                activePages.add(id);
-            }
-            metaBuf.putInt(seg.mapPageIds.size());
-            for (long id : seg.mapPageIds) {
-                metaBuf.putLong(id);
-                activePages.add(id);
-            }
-        }
+        VisibleByteArrayOutputStream baos = new VisibleByteArrayOutputStream(256);
+        try (java.io.DataOutputStream dos = new java.io.DataOutputStream(baos)) {
+            dos.writeInt(METADATA_VERSION_MULTI_SEGMENT);
+            dos.writeInt(dimension);
+            dos.writeInt(m);
+            dos.writeInt(beamWidth);
+            dos.writeFloat(neighborOverflow);
+            dos.writeFloat(alpha);
+            dos.writeByte(ADD_HIERARCHY ? 1 : 0);
+            dos.writeByte(1); // fusedPQ
+            dos.writeInt(nextNodeId.get());
+            dos.writeInt(totalSegments);
 
-        for (SegmentWriteResult swr : newSegmentResults) {
-            metaBuf.putInt(swr.segmentId);
-            metaBuf.putLong(swr.estimatedSizeBytes);
-            metaBuf.putInt(swr.graphPageIds.size());
-            for (long id : swr.graphPageIds) {
-                metaBuf.putLong(id);
-                activePages.add(id);
+            for (VectorSegment seg : sealedSegments) {
+                writeSegmentMeta(dos, activePages,
+                        seg.segmentId, seg.estimatedSizeBytes,
+                        seg.graphPageIds, seg.mapPageIds,
+                        seg.graphFilePath, seg.graphFileSize,
+                        seg.mapFilePath, seg.mapFileSize);
             }
-            metaBuf.putInt(swr.mapPageIds.size());
-            for (long id : swr.mapPageIds) {
-                metaBuf.putLong(id);
-                activePages.add(id);
+            for (SegmentWriteResult swr : newSegmentResults) {
+                writeSegmentMeta(dos, activePages,
+                        swr.segmentId, swr.estimatedSizeBytes,
+                        swr.graphPageIds, swr.mapPageIds,
+                        swr.graphFilePath, swr.graphFileSize,
+                        swr.mapFilePath, swr.mapFileSize);
             }
+        } catch (IOException e) {
+            throw new DataStorageManagerException("Failed to serialize index metadata", e);
         }
 
         IndexStatus indexStatus = new IndexStatus(
                 indexName, sequenceNumber,
-                newPageId.get(), activePages, metaBuf.array());
+                newPageId.get(), activePages, baos.toByteArray());
 
         dataStorageManager.indexCheckpoint(tableSpaceUUID, indexUUID, indexStatus, false);
+    }
+
+    private static void writeSegmentMeta(
+            java.io.DataOutputStream dos, Set<Long> activePages,
+            int segmentId, long estimatedSizeBytes,
+            List<Long> graphPageIds, List<Long> mapPageIds,
+            String graphFilePath, long graphFileSize,
+            String mapFilePath, long mapFileSize) throws IOException {
+        dos.writeInt(segmentId);
+        dos.writeLong(estimatedSizeBytes);
+        boolean multipart = graphFilePath != null;
+        dos.writeByte(multipart ? 1 : 0);
+        if (multipart) {
+            dos.writeUTF(graphFilePath);
+            dos.writeLong(graphFileSize);
+            dos.writeUTF(mapFilePath != null ? mapFilePath : "");
+            dos.writeLong(mapFileSize);
+        } else {
+            dos.writeInt(graphPageIds.size());
+            for (long id : graphPageIds) {
+                dos.writeLong(id);
+                activePages.add(id);
+            }
+            dos.writeInt(mapPageIds.size());
+            for (long id : mapPageIds) {
+                dos.writeLong(id);
+                activePages.add(id);
+            }
+        }
     }
 
     // -------------------------------------------------------------------------

@@ -28,11 +28,17 @@ import herddb.remote.proto.DeleteFileRequest;
 import herddb.remote.proto.DeleteFileResponse;
 import herddb.remote.proto.ListFilesEntry;
 import herddb.remote.proto.ListFilesRequest;
+import herddb.remote.proto.ReadFileRangeRequest;
+import herddb.remote.proto.ReadFileRangeResponse;
 import herddb.remote.proto.ReadFileRequest;
 import herddb.remote.proto.ReadFileResponse;
 import herddb.remote.proto.RemoteFileServiceGrpc;
+import herddb.remote.proto.WriteFileBlockRequest;
+import herddb.remote.proto.WriteFileBlockResponse;
 import herddb.remote.proto.WriteFileRequest;
 import herddb.remote.proto.WriteFileResponse;
+import java.io.IOException;
+import java.io.InputStream;
 import herddb.server.DynamicServiceClient;
 import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
@@ -71,9 +77,13 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
     public static final String CONFIG_CLIENT_TIMEOUT = "remote.file.client.timeout";
     /** Configuration key for max retries on idempotent operations. */
     public static final String CONFIG_CLIENT_RETRIES = "remote.file.client.retries";
+    /** Configuration key for the default block size used in multipart writes. */
+    public static final String CONFIG_CLIENT_BLOCK_SIZE = "remote.file.client.block.size";
 
     private static final long DEFAULT_CLIENT_TIMEOUT_SECONDS = 1800; // 30 minutes
     private static final int DEFAULT_CLIENT_RETRIES = 10;
+    /** Default multipart block size: 4 MB. */
+    public static final int DEFAULT_BLOCK_SIZE = 4 * 1024 * 1024;
 
     private static class ServerSnapshot {
         final ConsistentHashRouter router;
@@ -88,6 +98,7 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
     private volatile ServerSnapshot snapshot;
     private final int maxRetries;
     private final long clientTimeoutSeconds;
+    private final int blockSize;
     private final ScheduledExecutorService retryScheduler;
     private final ClientInterceptor clientInterceptor;
 
@@ -104,6 +115,7 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
         this.clientInterceptor = clientInterceptor;
         this.clientTimeoutSeconds = longConfig(configuration, CONFIG_CLIENT_TIMEOUT, DEFAULT_CLIENT_TIMEOUT_SECONDS);
         this.maxRetries = intConfig(configuration, CONFIG_CLIENT_RETRIES, DEFAULT_CLIENT_RETRIES);
+        this.blockSize = intConfig(configuration, CONFIG_CLIENT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE);
         this.retryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "remote-file-retry");
             t.setDaemon(true);
@@ -126,6 +138,8 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
         }
     }
 
+    private static final int CHANNEL_MAX_MESSAGE_SIZE = DEFAULT_BLOCK_SIZE + 1024 * 1024; // 5 MB
+
     private ManagedChannel buildChannel(String server) {
         String[] parts = server.split(":");
         String host = parts[0];
@@ -134,11 +148,25 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
                 .usePlaintext()
                 .keepAliveTime(300, TimeUnit.SECONDS)
                 .keepAliveTimeout(20, TimeUnit.SECONDS)
-                .keepAliveWithoutCalls(false);
+                .keepAliveWithoutCalls(false)
+                .maxInboundMessageSize(CHANNEL_MAX_MESSAGE_SIZE);
         if (clientInterceptor != null) {
             b.intercept(clientInterceptor);
         }
         return b.build();
+    }
+
+    /** Routing key for a specific block of a multipart file. */
+    private static String blockRoutingKey(String path, long blockIndex) {
+        return path + "#block" + blockIndex;
+    }
+
+    private RemoteFileServiceGrpc.RemoteFileServiceStub asyncStubForBlock(String path, long blockIndex) {
+        String key = blockRoutingKey(path, blockIndex);
+        ServerSnapshot s = this.snapshot;
+        String server = s.router.getServer(key);
+        return RemoteFileServiceGrpc.newStub(s.channels.get(server))
+                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
     }
 
     @Override
@@ -347,12 +375,144 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
         }
         return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                 .thenApply(v -> {
-                    List<String> result = new ArrayList<>();
+                    // Deduplicate: multiple servers may return the same logical path
+                    // for different blocks of the same multipart file
+                    LinkedHashSet<String> seen = new LinkedHashSet<>();
                     for (CompletableFuture<List<String>> f : futures) {
-                        result.addAll(f.join());
+                        seen.addAll(f.join());
                     }
-                    return result;
+                    return new ArrayList<>(seen);
                 });
+    }
+
+    /**
+     * Writes one block of a multipart file. Not retried (not idempotent).
+     * Routes via consistent hash of {@code path#block{blockIndex}}.
+     */
+    public CompletableFuture<Void> writeFileBlockAsync(String path, long blockIndex, byte[] content) {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        asyncStubForBlock(path, blockIndex).writeFileBlock(
+                WriteFileBlockRequest.newBuilder()
+                        .setPath(path)
+                        .setBlockIndex(blockIndex)
+                        .setContent(UnsafeByteOperations.unsafeWrap(content))
+                        .build(),
+                new StreamObserver<WriteFileBlockResponse>() {
+                    @Override
+                    public void onNext(WriteFileBlockResponse response) {
+                    }
+
+                    @Override
+                    public void onError(Throwable t) {
+                        future.completeExceptionally(t);
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        future.complete(null);
+                    }
+                });
+        return future;
+    }
+
+    /**
+     * Reads a range of bytes from a (possibly multipart) file.
+     * Routes to the server responsible for the block containing {@code offset}.
+     * If the range spans two blocks, two sequential requests are made.
+     *
+     * @return the requested bytes, or null if the file is not found
+     */
+    public CompletableFuture<byte[]> readFileRangeAsync(String path, long offset, int length, int blockSize) {
+        long startBlock = offset / blockSize;
+        long endBlock = (offset + length - 1) / blockSize;
+        if (startBlock == endBlock) {
+            return doReadFileRangeAsync(path, offset, length, blockSize);
+        }
+        // Range spans two blocks — read sequentially and concatenate
+        int firstBlockEnd = (int) ((startBlock + 1) * (long) blockSize - offset);
+        int secondLength = length - firstBlockEnd;
+        return doReadFileRangeAsync(path, offset, firstBlockEnd, blockSize)
+                .thenCompose(first -> {
+                    if (first == null) {
+                        return CompletableFuture.completedFuture((byte[]) null);
+                    }
+                    long secondOffset = (startBlock + 1) * (long) blockSize;
+                    return doReadFileRangeAsync(path, secondOffset, secondLength, blockSize)
+                            .thenApply(second -> {
+                                if (second == null) {
+                                    return first;
+                                }
+                                byte[] combined = new byte[first.length + second.length];
+                                System.arraycopy(first, 0, combined, 0, first.length);
+                                System.arraycopy(second, 0, combined, first.length, second.length);
+                                return combined;
+                            });
+                });
+    }
+
+    private CompletableFuture<byte[]> doReadFileRangeAsync(String path, long offset, int length, int blockSize) {
+        return retryAsync(() -> {
+            long blockIndex = offset / blockSize;
+            CompletableFuture<byte[]> future = new CompletableFuture<>();
+            asyncStubForBlock(path, blockIndex).readFileRange(
+                    ReadFileRangeRequest.newBuilder()
+                            .setPath(path)
+                            .setOffset(offset)
+                            .setLength(length)
+                            .setBlockSize(blockSize)
+                            .build(),
+                    new StreamObserver<ReadFileRangeResponse>() {
+                        private byte[] result;
+
+                        @Override
+                        public void onNext(ReadFileRangeResponse response) {
+                            if (response.getFound()) {
+                                result = response.getContent().toByteArray();
+                            }
+                        }
+
+                        @Override
+                        public void onError(Throwable t) {
+                            future.completeExceptionally(t);
+                        }
+
+                        @Override
+                        public void onCompleted() {
+                            future.complete(result);
+                        }
+                    });
+            return future;
+        }, "readFileRange", path, 0);
+    }
+
+    /**
+     * Writes an {@link InputStream} as a multipart file, splitting into blocks of {@code blockSize}.
+     * Blocks are written sequentially. Returns the total number of bytes written.
+     */
+    public long writeMultipartFile(String path, InputStream in, int blockSize) throws IOException {
+        byte[] buf = new byte[blockSize];
+        long blockIndex = 0;
+        long totalBytes = 0;
+        int read;
+        while ((read = readFully(in, buf)) > 0) {
+            byte[] block = read == blockSize ? buf : java.util.Arrays.copyOf(buf, read);
+            getUnchecked(writeFileBlockAsync(path, blockIndex, block));
+            blockIndex++;
+            totalBytes += read;
+        }
+        return totalBytes;
+    }
+
+    private static int readFully(InputStream in, byte[] buf) throws IOException {
+        int total = 0;
+        while (total < buf.length) {
+            int read = in.read(buf, total, buf.length - total);
+            if (read == -1) {
+                break;
+            }
+            total += read;
+        }
+        return total;
     }
 
     public CompletableFuture<Integer> deleteByPrefixAsync(String prefix) {
@@ -423,11 +583,27 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
         return getUnchecked(deleteByPrefixAsync(prefix));
     }
 
+    public void writeFileBlock(String path, long blockIndex, byte[] content) {
+        getUnchecked(writeFileBlockAsync(path, blockIndex, content));
+    }
+
+    public byte[] readFileRange(String path, long offset, int length, int blockSize) {
+        return getUnchecked(readFileRangeAsync(path, offset, length, blockSize));
+    }
+
+    public int getBlockSize() {
+        return blockSize;
+    }
+
     /**
      * Returns the server address that would store the given path.
      */
     public String getServerForPath(String path) {
         return snapshot.router.getServer(path);
+    }
+
+    public String getServerForBlock(String path, long blockIndex) {
+        return snapshot.router.getServer(blockRoutingKey(path, blockIndex));
     }
 
     @Override

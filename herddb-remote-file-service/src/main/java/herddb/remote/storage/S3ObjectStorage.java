@@ -38,6 +38,7 @@ import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Object;
+import java.util.LinkedHashSet;
 
 /**
  * S3-backed implementation of {@link ObjectStorage} using the AWS SDK v2 async client.
@@ -96,6 +97,68 @@ public class S3ObjectStorage implements ObjectStorage {
                     }
                     throw new RuntimeException(cause);
                 });
+    }
+
+    @Override
+    public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
+        String blockKey = toKey(path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex);
+        PutObjectRequest request = PutObjectRequest.builder()
+                .bucket(bucket)
+                .key(blockKey)
+                .build();
+        return client.putObject(request, AsyncRequestBody.fromBytes(content))
+                .thenApply(resp -> (Void) null);
+    }
+
+    @Override
+    public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
+        long blockIndex = offset / blockSize;
+        int offsetInBlock = (int) (offset % blockSize);
+        // Each block is a separate S3 object starting at byte 0.
+        // Download the whole block object and return the requested slice.
+        return read(path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex)
+                .thenApply(result -> {
+                    if (result.status() == ReadResult.Status.NOT_FOUND) {
+                        return ReadResult.notFound();
+                    }
+                    byte[] blockBytes = result.content();
+                    int from = offsetInBlock;
+                    int to = Math.min(from + length, blockBytes.length);
+                    if (from >= blockBytes.length) {
+                        return ReadResult.notFound();
+                    }
+                    byte[] slice = new byte[to - from];
+                    System.arraycopy(blockBytes, from, slice, 0, slice.length);
+                    return ReadResult.found(slice);
+                });
+    }
+
+    @Override
+    public CompletableFuture<Boolean> deleteLogical(String path) {
+        // Delete multipart blocks and the single-part file in parallel
+        String multipartPrefix = path + ObjectStorage.MULTIPART_SUFFIX + "/";
+        CompletableFuture<Integer> deletedBlocks = deleteByPrefix(multipartPrefix);
+        CompletableFuture<Boolean> deletedSingle = delete(path);
+        return deletedBlocks.thenCombine(deletedSingle, (blocks, single) -> blocks > 0 || single);
+    }
+
+    @Override
+    public CompletableFuture<List<String>> listLogical(String prefix) {
+        return list(prefix).thenApply(paths -> {
+            LinkedHashSet<String> logical = new LinkedHashSet<>();
+            for (String p : paths) {
+                int mpIdx = p.indexOf(ObjectStorage.MULTIPART_SUFFIX + "/");
+                if (mpIdx >= 0) {
+                    String logicalPath = p.substring(0, mpIdx);
+                    if (logicalPath.startsWith(prefix)) {
+                        logical.add(logicalPath);
+                    }
+                } else {
+                    logical.add(p);
+                }
+            }
+            return new ArrayList<>(logical);
+        });
     }
 
     @Override

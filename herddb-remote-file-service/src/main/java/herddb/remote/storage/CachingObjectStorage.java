@@ -138,6 +138,55 @@ public class CachingObjectStorage implements ObjectStorage {
     }
 
     @Override
+    public CompletableFuture<Void> writeBlock(String path, long blockIndex, byte[] content) {
+        String blockPath = path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex;
+        return inner.writeBlock(path, blockIndex, content).thenRun(() -> {
+            writeCacheFile(blockPath, content);
+            cache.put(blockPath, CompletableFuture.completedFuture(content));
+        });
+    }
+
+    @Override
+    public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
+        long blockIndex = offset / blockSize;
+        int offsetInBlock = (int) (offset % blockSize);
+        String blockPath = path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex;
+        // Load the whole block from cache (or from inner storage), then slice
+        return cache.get(blockPath).thenApply(blockBytes -> {
+            if (blockBytes == null) {
+                return ReadResult.notFound();
+            }
+            int from = offsetInBlock;
+            int to = Math.min(from + length, blockBytes.length);
+            if (from >= blockBytes.length) {
+                return ReadResult.notFound();
+            }
+            byte[] slice = new byte[to - from];
+            System.arraycopy(blockBytes, from, slice, 0, slice.length);
+            return ReadResult.found(slice);
+        });
+    }
+
+    @Override
+    public CompletableFuture<Boolean> deleteLogical(String path) {
+        // Invalidate all cached entries for this logical file
+        String multipartPrefix = path + ObjectStorage.MULTIPART_SUFFIX + "/";
+        List<String> toInvalidate = new ArrayList<>(cache.synchronous().asMap().keySet());
+        toInvalidate.stream()
+                .filter(k -> k.equals(path) || k.startsWith(multipartPrefix))
+                .forEach(k -> {
+                    cache.synchronous().invalidate(k);
+                    deleteCacheFile(k);
+                });
+        return inner.deleteLogical(path);
+    }
+
+    @Override
+    public CompletableFuture<List<String>> listLogical(String prefix) {
+        return inner.listLogical(prefix);
+    }
+
+    @Override
     public CompletableFuture<Boolean> delete(String path) {
         cache.synchronous().invalidate(path);
         deleteCacheFile(path);

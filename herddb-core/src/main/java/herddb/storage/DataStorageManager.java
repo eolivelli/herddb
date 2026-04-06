@@ -32,6 +32,7 @@ import herddb.model.Transaction;
 import herddb.utils.ByteArrayCursor;
 import herddb.utils.ExtendedDataOutputStream;
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -143,6 +144,41 @@ public abstract class DataStorageManager implements AutoCloseable {
     public void deleteIndexPage(String tableSpace, String uuid, long pageId)
             throws DataStorageManagerException {
         // default: no-op; next indexCheckpoint sweep will reclaim unreferenced pages
+    }
+
+    /**
+     * Writes a large file as a multipart file distributed across remote storage.
+     * Splits the content of {@code tempFile} into fixed-size blocks and stores them
+     * at {@code {tableSpace}/{uuid}/multipart/{fileType}.multipart/{blockIndex}}.
+     *
+     * @return the logical path of the written multipart file, or {@code null} if multipart
+     *         writes are not supported by this storage manager (falls back to page-based writes)
+     */
+    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                          Path tempFile)
+            throws IOException, DataStorageManagerException {
+        return null; // default: not supported; caller falls back to page-based writes
+    }
+
+    /**
+     * Returns a {@link io.github.jbellis.jvector.disk.ReaderSupplier} for a multipart index file
+     * previously written with {@link #writeMultipartIndexFile}.
+     *
+     * @return a ReaderSupplier, or {@code null} if multipart reads are not supported
+     */
+    public io.github.jbellis.jvector.disk.ReaderSupplier multipartIndexReaderSupplier(
+            String tableSpace, String uuid, String fileType, long fileSize)
+            throws DataStorageManagerException {
+        return null; // default: not supported
+    }
+
+    /**
+     * Deletes a multipart index file and all its blocks.
+     * Default implementation is a no-op.
+     */
+    public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
+            throws DataStorageManagerException {
+        // default: no-op
     }
 
     /**

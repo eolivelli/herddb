@@ -103,4 +103,62 @@ public class LocalObjectStorageTest {
         assertEquals(1, remaining.size());
         assertTrue(remaining.get(0).startsWith("ts2/"));
     }
+
+    @Test
+    public void testWriteBlockReadRange() throws Exception {
+        byte[] block0 = new byte[100];
+        byte[] block1 = new byte[80];
+        for (int i = 0; i < 100; i++) block0[i] = (byte) i;
+        for (int i = 0; i < 80; i++) block1[i] = (byte) (i + 100);
+
+        storage.writeBlock("ts1/uuid1/graph", 0, block0).get();
+        storage.writeBlock("ts1/uuid1/graph", 1, block1).get();
+
+        // Read a range within block 0
+        ReadResult r0 = storage.readRange("ts1/uuid1/graph", 10, 20, 100).get();
+        assertEquals(ReadResult.Status.FOUND, r0.status());
+        assertEquals(20, r0.content().length);
+        for (int i = 0; i < 20; i++) {
+            assertEquals((byte) (10 + i), r0.content()[i]);
+        }
+
+        // Read first 5 bytes of block 1
+        ReadResult r1 = storage.readRange("ts1/uuid1/graph", 100, 5, 100).get();
+        assertEquals(ReadResult.Status.FOUND, r1.status());
+        assertEquals(5, r1.content().length);
+        for (int i = 0; i < 5; i++) {
+            assertEquals((byte) (100 + i), r1.content()[i]);
+        }
+
+        // Read missing block
+        ReadResult missing = storage.readRange("ts1/uuid1/graph", 200, 10, 100).get();
+        assertEquals(ReadResult.Status.NOT_FOUND, missing.status());
+    }
+
+    @Test
+    public void testDeleteLogical() throws Exception {
+        storage.write("ts1/uuid1/plain.page", "plain".getBytes()).get();
+        storage.writeBlock("ts1/uuid1/multi", 0, "block0".getBytes()).get();
+        storage.writeBlock("ts1/uuid1/multi", 1, "block1".getBytes()).get();
+
+        assertTrue(storage.deleteLogical("ts1/uuid1/multi").get());
+        assertFalse(storage.deleteLogical("ts1/uuid1/multi").get()); // already gone
+
+        // plain file unaffected
+        ReadResult r = storage.read("ts1/uuid1/plain.page").get();
+        assertEquals(ReadResult.Status.FOUND, r.status());
+    }
+
+    @Test
+    public void testListLogical() throws Exception {
+        storage.write("ts1/uuid1/a.page", "a".getBytes()).get();
+        storage.writeBlock("ts1/uuid1/bigfile", 0, "b0".getBytes()).get();
+        storage.writeBlock("ts1/uuid1/bigfile", 1, "b1".getBytes()).get();
+        storage.writeBlock("ts1/uuid1/bigfile", 2, "b2".getBytes()).get();
+
+        List<String> logical = storage.listLogical("ts1/").get();
+        assertEquals(2, logical.size());
+        assertTrue(logical.contains("ts1/uuid1/a.page"));
+        assertTrue(logical.contains("ts1/uuid1/bigfile"));
+    }
 }
