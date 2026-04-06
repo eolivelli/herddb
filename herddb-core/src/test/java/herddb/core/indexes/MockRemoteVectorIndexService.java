@@ -78,8 +78,8 @@ public class MockRemoteVectorIndexService implements RemoteVectorIndexService {
     }
 
     @Override
-    public void waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber) {
-        // no-op
+    public boolean waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber, long timeoutMs) {
+        return true; // mock always succeeds immediately
     }
 
     @Override
