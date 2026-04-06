@@ -46,6 +46,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -90,6 +91,26 @@ public class ReadReplicaDataStorageManager extends DataStorageManager {
 
     private static String remoteIndexPagePath(String tableSpace, String uuid, long pageId) {
         return tableSpace + "/" + uuid + "/index/" + pageId + ".page";
+    }
+
+    private static String remoteMultipartPath(String tableSpace, String uuid, String fileType) {
+        return tableSpace + "/" + uuid + "/multipart/" + fileType;
+    }
+
+    // -------------------------------------------------------------------------
+    // Multipart index file reads (used by vector indexes on read replicas)
+    // -------------------------------------------------------------------------
+
+    @Override
+    public io.github.jbellis.jvector.disk.ReaderSupplier multipartIndexReaderSupplier(
+            String tableSpace, String uuid, String fileType, long fileSize)
+            throws DataStorageManagerException {
+        String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        int blockSize = client.getBlockSize();
+        LOGGER.log(Level.FINE,
+                "multipartIndexReaderSupplier: {0} fileSize={1} blockSize={2}",
+                new Object[]{logicalPath, fileSize, blockSize});
+        return new RemoteRandomAccessReader.Supplier(client, logicalPath, fileSize, blockSize);
     }
 
     // -------------------------------------------------------------------------

@@ -22,12 +22,15 @@ package herddb.remote;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import herddb.storage.DataStorageManagerException;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import java.io.ByteArrayInputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.List;
+import java.util.Map;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -161,5 +164,57 @@ public class RemoteRandomAccessReaderTest {
 
         RemoteRandomAccessReader reader = new RemoteRandomAccessReader(client, "ts/idx/len", data.length, BLOCK_SIZE);
         assertEquals(150, reader.length());
+    }
+
+    /**
+     * Verifies that ReadReplicaDataStorageManager.multipartIndexReaderSupplier returns a working
+     * ReaderSupplier that can read multipart files written by RemoteFileServiceClient.writeMultipartFile.
+     * Uses a small block size (64 bytes) by configuring the client so both write and read use the same
+     * block size, enabling cross-block read verification.
+     */
+    @Test
+    public void testReadReplicaMultipartIndexReaderSupplier() throws Exception {
+        // Use a client configured with the same small block size (64 bytes = BLOCK_SIZE)
+        // so that multipartIndexReaderSupplier uses the same block size as writeMultipartFile
+        Map<String, Object> config = new java.util.HashMap<>();
+        config.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, BLOCK_SIZE);
+        try (RemoteFileServiceClient smallBlockClient =
+                new RemoteFileServiceClient(List.of("localhost:" + server.getPort()), config)) {
+
+            byte[] data = seqBytes(BLOCK_SIZE * 3 + 7); // 199 bytes across 4 blocks
+            // Write multipart file using the same block size
+            smallBlockClient.writeMultipartFile("ts1/uuid1/multipart/graph",
+                    new ByteArrayInputStream(data), BLOCK_SIZE);
+
+            // ReadReplicaDataStorageManager: only the client is needed for multipart reads
+            ReadReplicaDataStorageManager replica = new ReadReplicaDataStorageManager(
+                    smallBlockClient, null, folder.newFolder("tmp").toPath(), 0);
+
+            ReaderSupplier supplier = replica.multipartIndexReaderSupplier("ts1", "uuid1", "graph", data.length);
+            assertNotNull(supplier);
+
+            // Read the whole file and verify contents match what was written
+            try (RandomAccessReader reader = supplier.get()) {
+                assertEquals(data.length, reader.length());
+                reader.seek(0);
+                byte[] buf = new byte[data.length];
+                reader.readFully(buf);
+                assertArrayEquals(data, buf);
+            }
+
+            // Verify two independent readers have independent positions (cross-block seek)
+            try (RandomAccessReader r1 = supplier.get();
+                 RandomAccessReader r2 = supplier.get()) {
+                r1.seek(0);
+                r2.seek(BLOCK_SIZE + 5);
+                byte[] b1 = new byte[4];
+                byte[] b2 = new byte[4];
+                r1.readFully(b1);
+                r2.readFully(b2);
+                assertArrayEquals(new byte[]{0, 1, 2, 3}, b1);
+                assertArrayEquals(new byte[]{(byte) (BLOCK_SIZE + 5), (byte) (BLOCK_SIZE + 6),
+                        (byte) (BLOCK_SIZE + 7), (byte) (BLOCK_SIZE + 8)}, b2);
+            }
+        }
     }
 }
