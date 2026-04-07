@@ -918,7 +918,7 @@ public class BookkeeperCommitLog extends CommitLog {
             long nextLedger = -1;
             for (long lId : actualList) {
                 if (lId > ledgerToTail) {
-                    ledgerToTail = lId;
+                    nextLedger = lId;
                     break;
                 }
             }
