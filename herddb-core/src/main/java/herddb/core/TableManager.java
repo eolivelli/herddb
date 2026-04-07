@@ -4164,7 +4164,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     }
 
     private Record fetchRecord(Bytes key, Long pageId, LocalScanPageCache localScanPageCache) throws StatementExecutionException, DataStorageManagerException {
-        int maxTrials = 3;
+        int maxTrials = 10;
         long[] trialPages = null;
         while (true) {
             DataPage dataPage = fetchDataPage(pageId, localScanPageCache);
@@ -4212,6 +4212,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
             trialPages[trialPages.length - maxTrials] = pageId;
             pageId = relocatedPageId;
+            Thread.yield(); // Let concurrent checkpoint/DML threads make progress
             if (--maxTrials == 0) {
                 if (dataPage != null) {
                     Collection<Bytes> keysForDebug = dataPage.getKeysForDebug(); // this may in an inconsistent state

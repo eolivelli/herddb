@@ -150,8 +150,15 @@ public final class DataPage extends Page<TableManager> {
         final long old = usedMemory.getAndAccumulate(diff, (curr, change) -> curr > target ? curr : curr + diff);
 
         if (old > target) {
-            /* Remove the added key */
-            data.remove(record.key);
+            /* Restore the previous record if there was one, otherwise remove.
+             * Simply removing would lose the old record, creating a window where
+             * keyToPage points to this page but the record is absent — which causes
+             * "Inconsistency! no record in memory" errors during concurrent reads. */
+            if (prev != null) {
+                data.put(record.key, prev);
+            } else {
+                data.remove(record.key);
+            }
 
             return false;
         }
