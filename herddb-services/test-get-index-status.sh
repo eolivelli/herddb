@@ -18,10 +18,11 @@
 
 set -x
 
-SERVER1DIR=$(realpath target/server1)
+BASEDIR=${HERDDB_TESTS_HOME:-target}
+SERVER1DIR=$(realpath $BASEDIR/server1)
 ZIP=$(ls target/herddb-service*zip)
 
 
 
-cd $SERVER1DIR/herddb*
-$SERVER1DIR/herddb*/bin/herddb-cli.sh -x jdbc:herddb:server:localhost -q 'select * from sysindexstatus'
+cd $SERVER1DIR
+$SERVER1DIR/bin/herddb-cli.sh -x jdbc:herddb:server:localhost -q 'select * from sysindexstatus'

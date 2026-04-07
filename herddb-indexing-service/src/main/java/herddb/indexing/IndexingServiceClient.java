@@ -174,7 +174,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         boolean multiInstance = s.servers.size() > 1;
         boolean returnScore = multiInstance; // always request scores when merging multiple instances
 
-        LOGGER.log(Level.INFO, "client search: tablespace={0}, table={1}, index={2}, limit={3}, vectorDim={4}, instances={5}",
+        LOGGER.log(Level.FINE, "client search: tablespace={0}, table={1}, index={2}, limit={3}, vectorDim={4}, instances={5}",
                 new Object[]{tablespace, table, index, limit, vector.length, s.servers.size()});
         long start = System.nanoTime();
 
@@ -198,7 +198,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
             SearchResponse response = stub.search(request);
             List<Map.Entry<Bytes, Float>> results = toEntryList(response);
             long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-            LOGGER.log(Level.INFO, "client search completed (single instance): index={0}, {1} results in {2} ms",
+            LOGGER.log(Level.FINE, "client search completed (single instance): index={0}, {1} results in {2} ms",
                     new Object[]{index, results.size(), elapsedMs});
             return results;
         }
@@ -223,7 +223,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
             merged = merged.subList(0, limit);
         }
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-        LOGGER.log(Level.INFO, "client search completed (multi-instance fan-out): index={0}, {1} results in {2} ms",
+        LOGGER.log(Level.FINE, "client search completed (multi-instance fan-out): index={0}, {1} results in {2} ms",
                 new Object[]{index, merged.size(), elapsedMs});
         return merged;
     }

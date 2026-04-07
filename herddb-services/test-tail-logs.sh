@@ -16,4 +16,5 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-tail -f $(find ./ -name *.log)
+BASEDIR=${HERDDB_TESTS_HOME:-target}
+tail -f $(find "$BASEDIR" -name '*.log')

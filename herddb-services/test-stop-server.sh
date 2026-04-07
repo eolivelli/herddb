@@ -18,13 +18,14 @@
 
 set -x xtrace
 
-SERVER1DIR=$(realpath target/server1)
+BASEDIR=${HERDDB_TESTS_HOME:-target}
+SERVER1DIR=$(realpath $BASEDIR/server1)
 
 # Stop the indexing service
-cd $SERVER1DIR/herddb* 2>/dev/null && bin/service indexing-service stop; cd ../..
+cd $SERVER1DIR 2>/dev/null && bin/service indexing-service stop
 
 # Stop the HerdDB server
-cd $SERVER1DIR/herddb* 2>/dev/null && bin/service server stop; cd ../..
+cd $SERVER1DIR 2>/dev/null && bin/service server stop
 
 # Remove directories
 rm -Rf $SERVER1DIR

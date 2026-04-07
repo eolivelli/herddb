@@ -18,18 +18,21 @@
 
 set -x
 
-SERVER1DIR=$(realpath target/server1)
+BASEDIR=${HERDDB_TESTS_HOME:-target}
+SERVER1DIR=$(realpath $BASEDIR/server1)
 ZIP=$(ls target/herddb-service*zip)
 
 echo "Installing $ZIP"
 rm -Rf $SERVER1DIR
-mkdir $SERVER1DIR
 
 echo "Unzipping Server in $SERVER1DIR"
-unzip -q $ZIP -d $SERVER1DIR
+TMPUNZIP=$(mktemp -d)
+unzip -q $ZIP -d $TMPUNZIP
+mv $TMPUNZIP/herddb* $SERVER1DIR
+rmdir $TMPUNZIP
 
 # Start HerdDB server in standalone mode (6GB heap)
-cd $SERVER1DIR/herddb*
+cd $SERVER1DIR
 mkdir -p tmp
 CONFIGFILE=conf/server.properties
 sed -i 's/#http.enable=true/http.enable=true/g' $CONFIGFILE
@@ -37,21 +40,19 @@ sed -i 's/server.halt.on.tablespace.boot.error=false/server.halt.on.tablespace.b
 export JAVA_OPTS="-XX:+UseG1GC -Duser.language=en -Xmx15g -Xms15g -Dio.netty.maxDirectMemory=0 -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$SERVER1DIR/server-heapdump.hprof -Djava.io.tmpdir=$(pwd)/tmp"
 echo "indexing.service.servers=localhost:9850" >> $CONFIGFILE
 bin/service server start
-cd ../..
 
 sleep 1
 
 # Start the indexing service
-cd $SERVER1DIR/herddb*
+cd $SERVER1DIR
 INDEXING_CONFIGFILE=conf/indexingservice.properties
 echo "log.dir=dbdata/txlog" >> $INDEXING_CONFIGFILE
 echo "server.metadata.dir=dbdata/metadata" >> $INDEXING_CONFIGFILE
 export JAVA_OPTS="-XX:+UseG1GC  -Duser.language=en -Dherddb.vectorindex.rebuild.threads=8 -Djava.net.preferIPv4Stack=true  -Xmx40g -Xms40g -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$SERVER1DIR/indexingservice-heapdump.hprof --add-modules jdk.incubator.vector -Djava.io.tmpdir=$(pwd)/tmp"
 bin/service indexing-service start
-cd ../..
 
 sleep 1
 
 # test query
-$SERVER1DIR/herddb*/bin/herddb-cli.sh -x jdbc:herddb:server:localhost -q 'select * from sysnodes'
-$SERVER1DIR/herddb*/bin/herddb-cli.sh -x jdbc:herddb:server:localhost -q 'select * from systablespaces'
+$SERVER1DIR/bin/herddb-cli.sh -x jdbc:herddb:server:localhost -q 'select * from sysnodes'
+$SERVER1DIR/bin/herddb-cli.sh -x jdbc:herddb:server:localhost -q 'select * from systablespaces'
