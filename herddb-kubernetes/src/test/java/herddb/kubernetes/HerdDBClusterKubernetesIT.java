@@ -63,8 +63,11 @@ public class HerdDBClusterKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
+    private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
+    private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -132,14 +135,14 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.enabled", "false");
         values.put("image.pullPolicy", "Never");
         // ZooKeeper resources
-        values.put("zookeeper.javaOpts", JAVA_OPTS);
+        values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("zookeeper.resources.requests.memory", "256Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
         values.put("zookeeper.resources.limits.memory", "256Mi");
         values.put("zookeeper.resources.limits.cpu", "0.5");
         values.put("zookeeper.storage.size", "1Gi");
         // Server resources (standalone alongside ZK)
-        values.put("server.javaOpts", JAVA_OPTS);
+        values.put("server.javaOpts", SERVER_JAVA_OPTS);
         values.put("server.resources.requests.memory", "512Mi");
         values.put("server.resources.requests.cpu", "0.5");
         values.put("server.resources.limits.memory", "512Mi");
@@ -182,14 +185,14 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.replicaCount", "1");
         values.put("image.pullPolicy", "Never");
         // ZooKeeper resources
-        values.put("zookeeper.javaOpts", JAVA_OPTS);
+        values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("zookeeper.resources.requests.memory", "256Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
         values.put("zookeeper.resources.limits.memory", "256Mi");
         values.put("zookeeper.resources.limits.cpu", "0.5");
         values.put("zookeeper.storage.size", "1Gi");
         // BookKeeper resources
-        values.put("bookkeeper.javaOpts", JAVA_OPTS);
+        values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("bookkeeper.resources.requests.memory", "256Mi");
         values.put("bookkeeper.resources.requests.cpu", "0.5");
         values.put("bookkeeper.resources.limits.memory", "256Mi");
@@ -197,7 +200,7 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.storage.journal.size", "1Gi");
         values.put("bookkeeper.storage.ledger.size", "1Gi");
         // Server resources (standalone alongside ZK+BK)
-        values.put("server.javaOpts", JAVA_OPTS);
+        values.put("server.javaOpts", SERVER_JAVA_OPTS);
         values.put("server.resources.requests.memory", "512Mi");
         values.put("server.resources.requests.cpu", "0.5");
         values.put("server.resources.limits.memory", "512Mi");
@@ -252,14 +255,14 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.replicaCount", "1");
         values.put("image.pullPolicy", "Never");
         // ZooKeeper resources
-        values.put("zookeeper.javaOpts", JAVA_OPTS);
+        values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("zookeeper.resources.requests.memory", "256Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
         values.put("zookeeper.resources.limits.memory", "256Mi");
         values.put("zookeeper.resources.limits.cpu", "0.5");
         values.put("zookeeper.storage.size", "1Gi");
         // BookKeeper resources
-        values.put("bookkeeper.javaOpts", JAVA_OPTS);
+        values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("bookkeeper.resources.requests.memory", "256Mi");
         values.put("bookkeeper.resources.requests.cpu", "0.5");
         values.put("bookkeeper.resources.limits.memory", "256Mi");
@@ -267,7 +270,7 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.storage.journal.size", "1Gi");
         values.put("bookkeeper.storage.ledger.size", "1Gi");
         // Server resources (cluster mode)
-        values.put("server.javaOpts", JAVA_OPTS);
+        values.put("server.javaOpts", SERVER_JAVA_OPTS);
         values.put("server.resources.requests.memory", "512Mi");
         values.put("server.resources.requests.cpu", "0.5");
         values.put("server.resources.limits.memory", "512Mi");

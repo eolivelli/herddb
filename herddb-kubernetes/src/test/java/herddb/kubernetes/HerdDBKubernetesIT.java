@@ -187,14 +187,13 @@ public class HerdDBKubernetesIT {
         long deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(5);
         while (System.currentTimeMillis() < deadline) {
             try (Connection conn = DriverManager.getConnection(jdbcUrl);
-                 Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery("SELECT 1")) {
-                if (rs.next()) {
-                    LOG.info("Tablespace is ready.");
-                    return;
-                }
+                 Statement stmt = conn.createStatement()) {
+                // Use a DDL-like operation that requires the tablespace to be fully booted
+                stmt.executeQuery("SELECT * FROM systables LIMIT 1").close();
+                LOG.info("Tablespace is ready.");
+                return;
             } catch (Exception e) {
-                LOG.log(Level.FINE, "Tablespace not ready yet: " + e.getMessage());
+                LOG.info("Tablespace not ready yet: " + e.getMessage());
             }
             Thread.sleep(3000);
         }

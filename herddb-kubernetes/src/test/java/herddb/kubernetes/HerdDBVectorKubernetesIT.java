@@ -69,8 +69,8 @@ public class HerdDBVectorKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+    private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -138,7 +138,7 @@ public class HerdDBVectorKubernetesIT {
         values.put("image.pullPolicy", "Never");
         // ZooKeeper
         values.put("zookeeper.enabled", "true");
-        values.put("zookeeper.javaOpts", JAVA_OPTS);
+        values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("zookeeper.resources.requests.memory", "256Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
         values.put("zookeeper.resources.limits.memory", "256Mi");
@@ -147,7 +147,7 @@ public class HerdDBVectorKubernetesIT {
         // BookKeeper
         values.put("bookkeeper.enabled", "true");
         values.put("bookkeeper.replicaCount", "1");
-        values.put("bookkeeper.javaOpts", JAVA_OPTS);
+        values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("bookkeeper.resources.requests.memory", "256Mi");
         values.put("bookkeeper.resources.requests.cpu", "0.5");
         values.put("bookkeeper.resources.limits.memory", "256Mi");
@@ -157,7 +157,7 @@ public class HerdDBVectorKubernetesIT {
         // Indexing Service: 2 replicas
         values.put("indexingService.enabled", "true");
         values.put("indexingService.replicaCount", "2");
-        values.put("indexingService.javaOpts", JAVA_OPTS);
+        values.put("indexingService.javaOpts", INFRA_JAVA_OPTS);
         values.put("indexingService.resources.requests.memory", "256Mi");
         values.put("indexingService.resources.requests.cpu", "0.5");
         values.put("indexingService.resources.limits.memory", "256Mi");
