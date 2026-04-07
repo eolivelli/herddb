@@ -72,6 +72,13 @@ public class IndexingServer implements AutoCloseable {
     private MetadataStorageManager metadataStorageManager;
     private String registeredServiceId;
 
+    // When storage.type=remote, these are set by buildDataStorageManager
+    // and consumed by the tablespace-resolved hook.
+    private Object remoteFileServiceClient;
+    private Object sharedCheckpointMetadataManager;
+    private Object remoteDataStorageManager;
+    private Path remoteMetaDir;
+
     public IndexingServer(String host, int port, IndexingServiceEngine engine, IndexingServerConfiguration config) {
         this.host = host;
         this.port = port;
@@ -196,12 +203,31 @@ public class IndexingServer implements AutoCloseable {
                     // markers written to disk survive restarts. Both live
                     // under {dataDir}/... so they stay inside the
                     // indexing-service data directory (never on S3).
-                    Path remoteMetaDir = dataDir.resolve("remote-metadata");
+                    Path metaDir = dataDir.resolve("remote-metadata");
                     Path remoteTmpDir = dataDir.resolve("remote-tmp");
-                    java.nio.file.Files.createDirectories(remoteMetaDir);
+                    java.nio.file.Files.createDirectories(metaDir);
                     java.nio.file.Files.createDirectories(remoteTmpDir);
-                    return (DataStorageManager) ctor.newInstance(
-                            remoteMetaDir, remoteTmpDir, Integer.MAX_VALUE, client);
+                    Object dsm = ctor.newInstance(
+                            metaDir, remoteTmpDir, Integer.MAX_VALUE, client);
+
+                    // Create a SharedCheckpointMetadataManager and wire it into
+                    // the RemoteFileDataStorageManager so that every
+                    // indexCheckpoint publishes its IndexStatus to S3, and a
+                    // restart on a wiped disk can hydrate {metaDir} from S3.
+                    Class<?> sharedClass = Class.forName(
+                            "herddb.remote.SharedCheckpointMetadataManager");
+                    Object shared = sharedClass.getConstructor(clientClass)
+                            .newInstance(client);
+                    storageClass.getMethod("setSharedCheckpointMetadataManager", sharedClass)
+                            .invoke(dsm, shared);
+
+                    // Store for later use by the tablespace-resolved hook.
+                    this.remoteFileServiceClient = client;
+                    this.sharedCheckpointMetadataManager = shared;
+                    this.remoteDataStorageManager = dsm;
+                    this.remoteMetaDir = metaDir;
+
+                    return (DataStorageManager) dsm;
                 } catch (ReflectiveOperationException e) {
                     throw new RuntimeException("Cannot create RemoteFileDataStorageManager. "
                             + "Ensure herddb-remote-file-service is on the classpath.", e);
@@ -231,6 +257,13 @@ public class IndexingServer implements AutoCloseable {
 
         DataStorageManager dataStorageManager = buildDataStorageManager(engine.getDataDirectory());
         engine.setDataStorageManager(dataStorageManager);
+
+        // Remote-storage bootstrap: once the tablespace UUID is known, hydrate
+        // the local metadata cache from S3 and install an S3WatermarkStore so
+        // the indexing service can restart on a wiped disk.
+        if (sharedCheckpointMetadataManager != null) {
+            engine.setAfterTableSpaceResolved(this::bootstrapRemoteStateForTablespace);
+        }
 
         // Initialize metrics
         statsProvider = new PrometheusMetricsProvider();
@@ -315,6 +348,90 @@ public class IndexingServer implements AutoCloseable {
 
     public void setMetadataStorageManager(MetadataStorageManager metadataStorageManager) {
         this.metadataStorageManager = metadataStorageManager;
+    }
+
+    /**
+     * Called from {@link IndexingServiceEngine} once the tablespace UUID has been
+     * resolved. Hydrates the local {@code remote-metadata} directory from S3 and
+     * installs an {@link S3WatermarkStore} on the engine so that a subsequent
+     * restart with a wiped local disk can resume from the correct watermark.
+     */
+    private void bootstrapRemoteStateForTablespace(String tableSpaceUUID) {
+        try {
+            // Hydrate local metadata dir from S3 if it is empty.
+            boolean localEmpty = isMetadataDirEmpty(remoteMetaDir, tableSpaceUUID);
+            if (localEmpty) {
+                int count = (Integer) sharedCheckpointMetadataManager.getClass()
+                        .getMethod("hydrateLocalMetadataDir", Path.class, String.class)
+                        .invoke(sharedCheckpointMetadataManager, remoteMetaDir, tableSpaceUUID);
+                LOGGER.log(Level.INFO,
+                        "hydrated {0} checkpoint file(s) for tableSpace {1} from S3",
+                        new Object[]{count, tableSpaceUUID});
+            } else {
+                LOGGER.log(Level.INFO,
+                        "local metadata already present for tableSpace {0}, skipping S3 hydrate",
+                        tableSpaceUUID);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Failed to hydrate local metadata from S3 for " + tableSpaceUUID, e);
+        }
+
+        // Install S3WatermarkStore for this tablespace UUID + instanceId.
+        int instanceId = config.getInt(IndexingServerConfiguration.PROPERTY_INSTANCE_ID,
+                IndexingServerConfiguration.PROPERTY_INSTANCE_ID_DEFAULT);
+        final Object clientRef = remoteFileServiceClient;
+        S3WatermarkStore.RemoteFileIO io = new S3WatermarkStore.RemoteFileIO() {
+            @Override
+            public void writeFile(String path, byte[] content) {
+                try {
+                    clientRef.getClass().getMethod("writeFile", String.class, byte[].class)
+                            .invoke(clientRef, path, content);
+                } catch (java.lang.reflect.InvocationTargetException ite) {
+                    throw new RuntimeException(ite.getCause());
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }
+
+            @Override
+            public byte[] readFile(String path) {
+                try {
+                    return (byte[]) clientRef.getClass().getMethod("readFile", String.class)
+                            .invoke(clientRef, path);
+                } catch (java.lang.reflect.InvocationTargetException ite) {
+                    throw new RuntimeException(ite.getCause());
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        };
+        S3WatermarkStore s3WatermarkStore = new S3WatermarkStore(io, tableSpaceUUID, instanceId);
+        engine.setWatermarkStore(s3WatermarkStore);
+        LOGGER.log(Level.INFO,
+                "Installed S3WatermarkStore at path {0}", s3WatermarkStore.getPath());
+    }
+
+    /**
+     * Returns {@code true} if the per-tablespace metadata subtree is absent or
+     * empty (no checkpoint markers) — in which case this is a fresh/ephemeral
+     * boot and we should hydrate from S3.
+     */
+    private static boolean isMetadataDirEmpty(Path remoteMetaDir, String tableSpaceUUID) {
+        try {
+            Path tsDir = remoteMetaDir.resolve(tableSpaceUUID + ".tablespace");
+            if (!java.nio.file.Files.exists(tsDir)) {
+                return true;
+            }
+            try (java.util.stream.Stream<Path> walk = java.nio.file.Files.walk(tsDir)) {
+                return walk.filter(java.nio.file.Files::isRegularFile)
+                        .filter(p -> p.getFileName().toString().endsWith(".checkpoint"))
+                        .findAny()
+                        .isEmpty();
+            }
+        } catch (java.io.IOException e) {
+            return true;
+        }
     }
 
     public void stop() throws InterruptedException {

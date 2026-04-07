@@ -34,7 +34,7 @@ public class WatermarkStoreTest {
 
     @Test
     public void testLoadReturnsStartOfTimeWhenNoFile() throws IOException {
-        WatermarkStore store = new WatermarkStore(folder.newFolder("empty").toPath());
+        LocalWatermarkStore store = new LocalWatermarkStore(folder.newFolder("empty").toPath());
         LogSequenceNumber lsn = store.load();
         assertEquals(LogSequenceNumber.START_OF_TIME, lsn);
     }
@@ -42,7 +42,7 @@ public class WatermarkStoreTest {
     @Test
     public void testSaveAndLoad() throws IOException {
         java.nio.file.Path dir = folder.newFolder("data").toPath();
-        WatermarkStore store = new WatermarkStore(dir);
+        LocalWatermarkStore store = new LocalWatermarkStore(dir);
 
         LogSequenceNumber saved = new LogSequenceNumber(5, 42);
         store.save(saved);
@@ -55,7 +55,7 @@ public class WatermarkStoreTest {
     @Test
     public void testOverwrite() throws IOException {
         java.nio.file.Path dir = folder.newFolder("overwrite").toPath();
-        WatermarkStore store = new WatermarkStore(dir);
+        LocalWatermarkStore store = new LocalWatermarkStore(dir);
 
         store.save(new LogSequenceNumber(1, 10));
         store.save(new LogSequenceNumber(2, 20));
