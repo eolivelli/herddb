@@ -22,12 +22,11 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 import io.fabric8.kubernetes.api.model.HasMetadata;
-import io.fabric8.kubernetes.api.model.IntOrString;
-import io.fabric8.kubernetes.api.model.ServiceBuilder;
-import io.fabric8.kubernetes.api.model.ServicePortBuilder;
+import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import io.fabric8.kubernetes.client.LocalPortForward;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -39,9 +38,9 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.Statement;
-import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
@@ -59,11 +58,9 @@ public class HerdDBKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final int NODE_PORT = 30007;
-
     @ClassRule
     public static K3sContainer k3s = new K3sContainer(DockerImageName.parse("rancher/k3s:v1.31.4-k3s1"))
-            .withExposedPorts(6443, NODE_PORT);
+            .withExposedPorts(6443);
 
     private static KubernetesClient kubernetesClient;
 
@@ -114,25 +111,6 @@ public class HerdDBKubernetesIT {
         LOG.info("Applying " + resources.size() + " Kubernetes resources...");
         kubernetesClient.resourceList(resources).createOrReplace();
 
-        // Create a NodePort service to access HerdDB from outside the cluster
-        kubernetesClient.services().inNamespace("default").createOrReplace(
-                new ServiceBuilder()
-                        .withNewMetadata()
-                            .withName("herddb-nodeport")
-                            .withNamespace("default")
-                        .endMetadata()
-                        .withNewSpec()
-                            .withType("NodePort")
-                            .withSelector(Collections.singletonMap("app.kubernetes.io/component", "server"))
-                            .withPorts(new ServicePortBuilder()
-                                    .withPort(7000)
-                                    .withTargetPort(new IntOrString(7000))
-                                    .withNodePort(NODE_PORT)
-                                    .build())
-                        .endSpec()
-                        .build());
-        LOG.info("NodePort service created on port " + NODE_PORT);
-
         // Wait for the server pod to be ready (readiness probe checks TCP port 7000)
         LOG.info("Waiting for HerdDB server pod to be ready...");
         kubernetesClient.pods()
@@ -151,31 +129,64 @@ public class HerdDBKubernetesIT {
 
     @Test
     public void testBasicOperations() throws Exception {
-        // Connect via NodePort exposed through the K3s container
-        String host = k3s.getHost();
-        int mappedPort = k3s.getMappedPort(NODE_PORT);
-        LOG.info("Connecting to HerdDB via NodePort at " + host + ":" + mappedPort);
+        // Find the server pod and set up port-forwarding
+        List<Pod> serverPods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "server")
+                .list().getItems();
+        assertEquals("Expected 1 server pod", 1, serverPods.size());
+        String podName = serverPods.get(0).getMetadata().getName();
 
-        String jdbcUrl = "jdbc:herddb:server:" + host + ":" + mappedPort;
-        try (Connection connection = DriverManager.getConnection(jdbcUrl);
-             Statement statement = connection.createStatement()) {
+        try (LocalPortForward portForward = kubernetesClient.pods()
+                .inNamespace("default")
+                .withName(podName)
+                .portForward(7000)) {
+            int localPort = portForward.getLocalPort();
+            LOG.info("Port-forward established to pod " + podName + " on local port " + localPort);
 
-            // CREATE TABLE
-            statement.execute("CREATE TABLE test_table (id int primary key, name string)");
-            LOG.info("Table created.");
+            String jdbcUrl = "jdbc:herddb:server:localhost:" + localPort;
+            executeJdbcWithRetry(jdbcUrl, statement -> {
+                // CREATE TABLE
+                statement.execute("CREATE TABLE test_table (id int primary key, name string)");
+                LOG.info("Table created.");
 
-            // INSERT
-            int inserted = statement.executeUpdate(
-                    "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
-            assertEquals(1, inserted);
-            LOG.info("Row inserted.");
+                // INSERT
+                int inserted = statement.executeUpdate(
+                        "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
+                assertEquals(1, inserted);
+                LOG.info("Row inserted.");
 
-            // SELECT
-            try (ResultSet rs = statement.executeQuery("SELECT id, name FROM test_table")) {
-                assertTrue("Expected at least one row", rs.next());
-                assertEquals(1, rs.getInt("id"));
-                assertEquals("hello", rs.getString("name"));
-                LOG.info("Row verified: id=1, name=hello");
+                // SELECT
+                try (ResultSet rs = statement.executeQuery("SELECT id, name FROM test_table")) {
+                    assertTrue("Expected at least one row", rs.next());
+                    assertEquals(1, rs.getInt("id"));
+                    assertEquals("hello", rs.getString("name"));
+                    LOG.info("Row verified: id=1, name=hello");
+                }
+            });
+        }
+    }
+
+    @FunctionalInterface
+    interface JdbcTask {
+        void execute(Statement statement) throws Exception;
+    }
+
+    private static void executeJdbcWithRetry(String jdbcUrl, JdbcTask task) throws Exception {
+        int maxRetries = 5;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                try (Connection connection = DriverManager.getConnection(jdbcUrl);
+                     Statement statement = connection.createStatement()) {
+                    task.execute(statement);
+                    return;
+                }
+            } catch (Exception e) {
+                LOG.log(Level.WARNING, "JDBC attempt " + attempt + "/" + maxRetries + " failed: " + e.getMessage());
+                if (attempt == maxRetries) {
+                    throw e;
+                }
+                Thread.sleep(5000);
             }
         }
     }

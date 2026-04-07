@@ -22,13 +22,11 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 import io.fabric8.kubernetes.api.model.HasMetadata;
-import io.fabric8.kubernetes.api.model.IntOrString;
 import io.fabric8.kubernetes.api.model.Pod;
-import io.fabric8.kubernetes.api.model.ServiceBuilder;
-import io.fabric8.kubernetes.api.model.ServicePortBuilder;
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import io.fabric8.kubernetes.client.LocalPortForward;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -41,13 +39,13 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
@@ -72,15 +70,13 @@ public class HerdDBFileServerKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final int NODE_PORT = 30008;
-
     private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
     public static K3sContainer k3s = new K3sContainer(DockerImageName.parse("rancher/k3s:v1.31.4-k3s1"))
-            .withExposedPorts(6443, NODE_PORT);
+            .withExposedPorts(6443);
 
     private static KubernetesClient kubernetesClient;
     private static String helmChartPath;
@@ -220,87 +216,101 @@ public class HerdDBFileServerKubernetesIT {
                 .list().getItems();
         assertEquals("Expected 2 file server pods", 2, fsPods.size());
 
-        // Create NodePort service for JDBC access
-        kubernetesClient.services().inNamespace("default").createOrReplace(
-                new ServiceBuilder()
-                        .withNewMetadata()
-                            .withName("herddb-fs-nodeport")
-                            .withNamespace("default")
-                        .endMetadata()
-                        .withNewSpec()
-                            .withType("NodePort")
-                            .withSelector(Collections.singletonMap("app.kubernetes.io/component", "server"))
-                            .withPorts(new ServicePortBuilder()
-                                    .withPort(7000)
-                                    .withTargetPort(new IntOrString(7000))
-                                    .withNodePort(NODE_PORT)
-                                    .build())
-                        .endSpec()
-                        .build());
-        LOG.info("NodePort service created on port " + NODE_PORT);
-
         // Wait for HerdDB server
         LOG.info("Waiting for HerdDB server pod to be ready...");
         waitForComponent("server", 5, TimeUnit.MINUTES);
         LOG.info("HerdDB server pod is ready.");
 
-        // Connect via JDBC and run SQL operations
-        String host = k3s.getHost();
-        int mappedPort = k3s.getMappedPort(NODE_PORT);
-        LOG.info("Connecting to HerdDB via NodePort at " + host + ":" + mappedPort);
+        // Connect via port-forwarding and run SQL operations
+        List<Pod> serverPods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "server")
+                .list().getItems();
+        assertEquals("Expected 1 server pod", 1, serverPods.size());
+        String podName = serverPods.get(0).getMetadata().getName();
 
-        String jdbcUrl = "jdbc:herddb:server:" + host + ":" + mappedPort;
-        try (Connection connection = DriverManager.getConnection(jdbcUrl);
-             Statement statement = connection.createStatement()) {
+        try (LocalPortForward portForward = kubernetesClient.pods()
+                .inNamespace("default")
+                .withName(podName)
+                .portForward(7000)) {
+            int localPort = portForward.getLocalPort();
+            LOG.info("Port-forward established to pod " + podName + " on local port " + localPort);
 
-            // CREATE TABLE
-            statement.execute("CREATE TABLE fs_test (id int primary key, name string, score int)");
-            LOG.info("Table created.");
+            String jdbcUrl = "jdbc:herddb:server:localhost:" + localPort;
+            executeJdbcWithRetry(jdbcUrl, statement -> {
+                // CREATE TABLE
+                statement.execute("CREATE TABLE fs_test (id int primary key, name string, score int)");
+                LOG.info("Table created.");
 
-            // CREATE BRIN INDEX
-            statement.execute("CREATE BRIN INDEX brin_idx ON fs_test(score)");
-            LOG.info("BRIN index created.");
+                // CREATE BRIN INDEX
+                statement.execute("CREATE BRIN INDEX brin_idx ON fs_test(score)");
+                LOG.info("BRIN index created.");
 
-            // INSERT rows
-            assertEquals(1, statement.executeUpdate(
-                    "INSERT INTO fs_test (id, name, score) VALUES (1, 'hello', 42)"));
-            assertEquals(1, statement.executeUpdate(
-                    "INSERT INTO fs_test (id, name, score) VALUES (2, 'world', 99)"));
-            assertEquals(1, statement.executeUpdate(
-                    "INSERT INTO fs_test (id, name, score) VALUES (3, 'foo', 42)"));
-            LOG.info("Rows inserted.");
+                // INSERT rows
+                assertEquals(1, statement.executeUpdate(
+                        "INSERT INTO fs_test (id, name, score) VALUES (1, 'hello', 42)"));
+                assertEquals(1, statement.executeUpdate(
+                        "INSERT INTO fs_test (id, name, score) VALUES (2, 'world', 99)"));
+                assertEquals(1, statement.executeUpdate(
+                        "INSERT INTO fs_test (id, name, score) VALUES (3, 'foo', 42)"));
+                LOG.info("Rows inserted.");
 
-            // SELECT all rows
-            try (ResultSet rs = statement.executeQuery("SELECT id, name, score FROM fs_test ORDER BY id")) {
-                assertTrue("Expected row 1", rs.next());
-                assertEquals(1, rs.getInt("id"));
-                assertEquals("hello", rs.getString("name"));
-                assertEquals(42, rs.getInt("score"));
+                // SELECT all rows
+                try (ResultSet rs = statement.executeQuery("SELECT id, name, score FROM fs_test ORDER BY id")) {
+                    assertTrue("Expected row 1", rs.next());
+                    assertEquals(1, rs.getInt("id"));
+                    assertEquals("hello", rs.getString("name"));
+                    assertEquals(42, rs.getInt("score"));
 
-                assertTrue("Expected row 2", rs.next());
-                assertEquals(2, rs.getInt("id"));
-                assertEquals("world", rs.getString("name"));
-                assertEquals(99, rs.getInt("score"));
+                    assertTrue("Expected row 2", rs.next());
+                    assertEquals(2, rs.getInt("id"));
+                    assertEquals("world", rs.getString("name"));
+                    assertEquals(99, rs.getInt("score"));
 
-                assertTrue("Expected row 3", rs.next());
-                assertEquals(3, rs.getInt("id"));
-                assertEquals("foo", rs.getString("name"));
-                assertEquals(42, rs.getInt("score"));
-            }
-            LOG.info("All rows verified.");
-
-            // Query using BRIN index: WHERE score = 42
-            Set<Integer> matchingIds = new HashSet<>();
-            try (ResultSet rs = statement.executeQuery("SELECT id, name FROM fs_test WHERE score = 42")) {
-                while (rs.next()) {
-                    matchingIds.add(rs.getInt("id"));
+                    assertTrue("Expected row 3", rs.next());
+                    assertEquals(3, rs.getInt("id"));
+                    assertEquals("foo", rs.getString("name"));
+                    assertEquals(42, rs.getInt("score"));
                 }
-            }
-            assertEquals("BRIN index query should return ids 1 and 3",
-                    new HashSet<>(java.util.Arrays.asList(1, 3)), matchingIds);
-            LOG.info("BRIN index query verified: ids=" + matchingIds);
+                LOG.info("All rows verified.");
+
+                // Query using BRIN index: WHERE score = 42
+                Set<Integer> matchingIds = new HashSet<>();
+                try (ResultSet rs = statement.executeQuery("SELECT id, name FROM fs_test WHERE score = 42")) {
+                    while (rs.next()) {
+                        matchingIds.add(rs.getInt("id"));
+                    }
+                }
+                assertEquals("BRIN index query should return ids 1 and 3",
+                        new HashSet<>(java.util.Arrays.asList(1, 3)), matchingIds);
+                LOG.info("BRIN index query verified: ids=" + matchingIds);
+            });
         }
         LOG.info("Test passed: Cluster mode with file servers + MinIO works.");
+    }
+
+    @FunctionalInterface
+    interface JdbcTask {
+        void execute(Statement statement) throws Exception;
+    }
+
+    private static void executeJdbcWithRetry(String jdbcUrl, JdbcTask task) throws Exception {
+        int maxRetries = 5;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                try (Connection connection = DriverManager.getConnection(jdbcUrl);
+                     Statement statement = connection.createStatement()) {
+                    task.execute(statement);
+                    return;
+                }
+            } catch (Exception e) {
+                LOG.log(Level.WARNING, "JDBC attempt " + attempt + "/" + maxRetries + " failed: " + e.getMessage());
+                if (attempt == maxRetries) {
+                    throw e;
+                }
+                Thread.sleep(5000);
+            }
+        }
     }
 
     private void waitForComponent(String component, long timeout, TimeUnit unit) throws Exception {

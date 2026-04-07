@@ -22,13 +22,11 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 import io.fabric8.kubernetes.api.model.HasMetadata;
-import io.fabric8.kubernetes.api.model.IntOrString;
 import io.fabric8.kubernetes.api.model.Pod;
-import io.fabric8.kubernetes.api.model.ServiceBuilder;
-import io.fabric8.kubernetes.api.model.ServicePortBuilder;
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import io.fabric8.kubernetes.client.LocalPortForward;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -42,11 +40,11 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
@@ -72,15 +70,13 @@ public class HerdDBVectorKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final int NODE_PORT = 30009;
-
     private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
     public static K3sContainer k3s = new K3sContainer(DockerImageName.parse("rancher/k3s:v1.31.4-k3s1"))
-            .withExposedPorts(6443, NODE_PORT);
+            .withExposedPorts(6443);
 
     private static KubernetesClient kubernetesClient;
     private static String helmChartPath;
@@ -212,95 +208,112 @@ public class HerdDBVectorKubernetesIT {
                 .list().getItems();
         assertEquals("Expected 2 indexing service pods", 2, isPods.size());
 
-        // Create NodePort service for JDBC access
-        kubernetesClient.services().inNamespace("default").createOrReplace(
-                new ServiceBuilder()
-                        .withNewMetadata()
-                            .withName("herddb-vec-nodeport")
-                            .withNamespace("default")
-                        .endMetadata()
-                        .withNewSpec()
-                            .withType("NodePort")
-                            .withSelector(Collections.singletonMap("app.kubernetes.io/component", "server"))
-                            .withPorts(new ServicePortBuilder()
-                                    .withPort(7000)
-                                    .withTargetPort(new IntOrString(7000))
-                                    .withNodePort(NODE_PORT)
-                                    .build())
-                        .endSpec()
-                        .build());
-        LOG.info("NodePort service created on port " + NODE_PORT);
-
         // Wait for HerdDB server
         LOG.info("Waiting for HerdDB server pod to be ready...");
         waitForComponent("server", 5, TimeUnit.MINUTES);
         LOG.info("HerdDB server pod is ready.");
 
-        // Connect via JDBC and run vector operations
-        String host = k3s.getHost();
-        int mappedPort = k3s.getMappedPort(NODE_PORT);
-        LOG.info("Connecting to HerdDB via NodePort at " + host + ":" + mappedPort);
+        // Connect via port-forwarding and run vector operations
+        List<Pod> serverPods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "server")
+                .list().getItems();
+        assertEquals("Expected 1 server pod", 1, serverPods.size());
+        String podName = serverPods.get(0).getMetadata().getName();
 
-        String jdbcUrl = "jdbc:herddb:server:" + host + ":" + mappedPort;
-        try (Connection connection = DriverManager.getConnection(jdbcUrl);
-             Statement statement = connection.createStatement()) {
+        try (LocalPortForward portForward = kubernetesClient.pods()
+                .inNamespace("default")
+                .withName(podName)
+                .portForward(7000)) {
+            int localPort = portForward.getLocalPort();
+            LOG.info("Port-forward established to pod " + podName + " on local port " + localPort);
 
-            // CREATE TABLE with vector column
-            statement.execute("CREATE TABLE vec_test (id int primary key, vec floata not null)");
-            LOG.info("Table with vector column created.");
+            String jdbcUrl = "jdbc:herddb:server:localhost:" + localPort;
+            executeJdbcWithRetry(jdbcUrl, connection -> {
+                try (Statement statement = connection.createStatement()) {
+                    // CREATE TABLE with vector column
+                    statement.execute("CREATE TABLE vec_test (id int primary key, vec floata not null)");
+                    LOG.info("Table with vector column created.");
 
-            // CREATE VECTOR INDEX
-            statement.execute("CREATE VECTOR INDEX vidx ON vec_test(vec)");
-            LOG.info("Vector index created.");
-
-            // INSERT 4 orthogonal vectors using PreparedStatement
-            float[] vecX = {1.0f, 0.0f, 0.0f, 0.0f};
-            float[] vecY = {0.0f, 1.0f, 0.0f, 0.0f};
-            float[] vecZ = {0.0f, 0.0f, 1.0f, 0.0f};
-            float[] vecW = {0.0f, 0.0f, 0.0f, 1.0f};
-
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "INSERT INTO vec_test(id, vec) VALUES(?, ?)")) {
-                ps.setInt(1, 1);
-                ps.setObject(2, vecX);
-                assertEquals(1, ps.executeUpdate());
-
-                ps.setInt(1, 2);
-                ps.setObject(2, vecY);
-                assertEquals(1, ps.executeUpdate());
-
-                ps.setInt(1, 3);
-                ps.setObject(2, vecZ);
-                assertEquals(1, ps.executeUpdate());
-
-                ps.setInt(1, 4);
-                ps.setObject(2, vecW);
-                assertEquals(1, ps.executeUpdate());
-            }
-            LOG.info("4 orthogonal vectors inserted.");
-
-            // Force checkpoint so the indexing services catch up via WAL tailing
-            statement.execute("EXECUTE CHECKPOINT 'herd'");
-            LOG.info("Checkpoint executed.");
-
-            // Wait for indexing services to process the WAL
-            Thread.sleep(10000);
-            LOG.info("Waited for indexing service catch-up.");
-
-            // ANN search for vector closest to X axis
-            float[] queryVec = {1.0f, 0.0f, 0.0f, 0.0f};
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "SELECT id FROM vec_test ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT 2")) {
-                ps.setObject(1, queryVec);
-                try (ResultSet rs = ps.executeQuery()) {
-                    assertTrue("ANN search must return at least one result", rs.next());
-                    int firstId = rs.getInt("id");
-                    assertEquals("Closest vector to [1,0,0,0] should be id=1", 1, firstId);
-                    LOG.info("ANN search result: first id=" + firstId + " (correct).");
+                    // CREATE VECTOR INDEX
+                    statement.execute("CREATE VECTOR INDEX vidx ON vec_test(vec)");
+                    LOG.info("Vector index created.");
                 }
-            }
+
+                // INSERT 4 orthogonal vectors using PreparedStatement
+                float[] vecX = {1.0f, 0.0f, 0.0f, 0.0f};
+                float[] vecY = {0.0f, 1.0f, 0.0f, 0.0f};
+                float[] vecZ = {0.0f, 0.0f, 1.0f, 0.0f};
+                float[] vecW = {0.0f, 0.0f, 0.0f, 1.0f};
+
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "INSERT INTO vec_test(id, vec) VALUES(?, ?)")) {
+                    ps.setInt(1, 1);
+                    ps.setObject(2, vecX);
+                    assertEquals(1, ps.executeUpdate());
+
+                    ps.setInt(1, 2);
+                    ps.setObject(2, vecY);
+                    assertEquals(1, ps.executeUpdate());
+
+                    ps.setInt(1, 3);
+                    ps.setObject(2, vecZ);
+                    assertEquals(1, ps.executeUpdate());
+
+                    ps.setInt(1, 4);
+                    ps.setObject(2, vecW);
+                    assertEquals(1, ps.executeUpdate());
+                }
+                LOG.info("4 orthogonal vectors inserted.");
+
+                // Force checkpoint so the indexing services catch up via WAL tailing
+                try (Statement statement = connection.createStatement()) {
+                    statement.execute("EXECUTE CHECKPOINT 'herd'");
+                }
+                LOG.info("Checkpoint executed.");
+
+                // Wait for indexing services to process the WAL
+                Thread.sleep(10000);
+                LOG.info("Waited for indexing service catch-up.");
+
+                // ANN search for vector closest to X axis
+                float[] queryVec = {1.0f, 0.0f, 0.0f, 0.0f};
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "SELECT id FROM vec_test ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT 2")) {
+                    ps.setObject(1, queryVec);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        assertTrue("ANN search must return at least one result", rs.next());
+                        int firstId = rs.getInt("id");
+                        assertEquals("Closest vector to [1,0,0,0] should be id=1", 1, firstId);
+                        LOG.info("ANN search result: first id=" + firstId + " (correct).");
+                    }
+                }
+            });
         }
         LOG.info("Test passed: Cluster mode with vector indexing services works.");
+    }
+
+    @FunctionalInterface
+    interface JdbcTask {
+        void execute(Connection connection) throws Exception;
+    }
+
+    private static void executeJdbcWithRetry(String jdbcUrl, JdbcTask task) throws Exception {
+        int maxRetries = 5;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                try (Connection connection = DriverManager.getConnection(jdbcUrl)) {
+                    task.execute(connection);
+                    return;
+                }
+            } catch (Exception e) {
+                LOG.log(Level.WARNING, "JDBC attempt " + attempt + "/" + maxRetries + " failed: " + e.getMessage());
+                if (attempt == maxRetries) {
+                    throw e;
+                }
+                Thread.sleep(5000);
+            }
+        }
     }
 
     private void waitForComponent(String component, long timeout, TimeUnit unit) throws Exception {
