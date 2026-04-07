@@ -86,11 +86,14 @@ public class MultiNodeConsistencyCheckTest extends ReplicatedLogtestcase {
 
                 //The follower is always back 1, I make an entry to make him apply consistency log
                 execute(manager1, "INSERT INTO t2.table1 (id,name) values (?,?)", Arrays.asList("3", false));
+                // Force another sync write to advance BookKeeper LAC so the
+                // follower can read the consistency check entry.
+                execute(manager1, "INSERT INTO t2.table1 (id,name) values (?,?)", Arrays.asList("4", false));
 
                 // Wait for the follower to process the consistency check entry
                 TestUtils.waitForCondition(() -> callCount.get() >= 2,
                         TestUtils.NOOP, 100,
-                        "follower to execute consistency check (callCount=" + callCount.get() + ")");
+                        "follower to execute consistency check");
             }
         }
         //Expected 2 call for createChecksum (node1 and node2)

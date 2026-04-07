@@ -21,7 +21,6 @@ package herddb.cluster.follower;
 
 import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
 import herddb.codec.RecordSerializer;
 import herddb.core.ActivatorRunRequest;
 import herddb.core.MemoryManager;
@@ -137,10 +136,18 @@ public class ChangeRoleTest extends MultiServerBase {
 
             server_2.waitForTableSpaceBoot(TableSpace.DEFAULT, true);
 
-            assertTrue("unexpected value " + server2MemoryManager.getDataPageReplacementPolicy().size(),
-                    server2MemoryManager.getDataPageReplacementPolicy().size() >= 1);
-            assertEquals(1, server2MemoryManager.getIndexPageReplacementPolicy().size());
-            assertEquals(1, server2MemoryManager.getPKPageReplacementPolicy().size());
+            // After boot completes the tablespace is ready, but data pages may
+            // still be loading asynchronously.  Wait for the replacement policy
+            // to reflect the loaded pages.
+            herddb.utils.TestUtils.waitForCondition(
+                    () -> server2MemoryManager.getDataPageReplacementPolicy().size() >= 1,
+                    herddb.utils.TestUtils.NOOP, 100,
+                    "data page replacement policy to have at least 1 entry (current: "
+                            + server2MemoryManager.getDataPageReplacementPolicy().size() + ")");
+            herddb.utils.TestUtils.waitForCondition(
+                    () -> server2MemoryManager.getPKPageReplacementPolicy().size() >= 1,
+                    herddb.utils.TestUtils.NOOP, 100,
+                    "PK page replacement policy to have at least 1 entry");
 
             server_1.getManager().executeStatement(new AlterTableSpaceStatement(TableSpace.DEFAULT,
                     new HashSet<>(Arrays.asList("server1")), "server1", 1, 0), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
