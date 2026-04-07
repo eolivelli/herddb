@@ -45,7 +45,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
@@ -70,8 +69,8 @@ public class HerdDBFileServerKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -173,9 +172,9 @@ public class HerdDBFileServerKubernetesIT {
         values.put("minio.storage.size", "1Gi");
         // Server resources
         values.put("server.javaOpts", JAVA_OPTS);
-        values.put("server.resources.requests.memory", "256Mi");
+        values.put("server.resources.requests.memory", "512Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "256Mi");
+        values.put("server.resources.limits.memory", "512Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
@@ -237,7 +236,13 @@ public class HerdDBFileServerKubernetesIT {
             LOG.info("Port-forward established to pod " + podName + " on local port " + localPort);
 
             String jdbcUrl = "jdbc:herddb:server:localhost:" + localPort;
-            executeJdbcWithRetry(jdbcUrl, statement -> {
+
+            // Wait for tablespace to be ready (TCP probe passes before tablespace boots)
+            HerdDBKubernetesIT.waitForTablespace(jdbcUrl);
+
+            try (Connection connection = DriverManager.getConnection(jdbcUrl);
+                 Statement statement = connection.createStatement()) {
+
                 // CREATE TABLE
                 statement.execute("CREATE TABLE fs_test (id int primary key, name string, score int)");
                 LOG.info("Table created.");
@@ -284,33 +289,9 @@ public class HerdDBFileServerKubernetesIT {
                 assertEquals("BRIN index query should return ids 1 and 3",
                         new HashSet<>(java.util.Arrays.asList(1, 3)), matchingIds);
                 LOG.info("BRIN index query verified: ids=" + matchingIds);
-            });
-        }
-        LOG.info("Test passed: Cluster mode with file servers + MinIO works.");
-    }
-
-    @FunctionalInterface
-    interface JdbcTask {
-        void execute(Statement statement) throws Exception;
-    }
-
-    private static void executeJdbcWithRetry(String jdbcUrl, JdbcTask task) throws Exception {
-        int maxRetries = 5;
-        for (int attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                try (Connection connection = DriverManager.getConnection(jdbcUrl);
-                     Statement statement = connection.createStatement()) {
-                    task.execute(statement);
-                    return;
-                }
-            } catch (Exception e) {
-                LOG.log(Level.WARNING, "JDBC attempt " + attempt + "/" + maxRetries + " failed: " + e.getMessage());
-                if (attempt == maxRetries) {
-                    throw e;
-                }
-                Thread.sleep(5000);
             }
         }
+        LOG.info("Test passed: Cluster mode with file servers + MinIO works.");
     }
 
     private void waitForComponent(String component, long timeout, TimeUnit unit) throws Exception {

@@ -58,6 +58,11 @@ public class HerdDBKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
+
+    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
+
     @ClassRule
     public static K3sContainer k3s = new K3sContainer(DockerImageName.parse("rancher/k3s:v1.31.4-k3s1"))
             .withExposedPorts(6443);
@@ -145,7 +150,13 @@ public class HerdDBKubernetesIT {
             LOG.info("Port-forward established to pod " + podName + " on local port " + localPort);
 
             String jdbcUrl = "jdbc:herddb:server:localhost:" + localPort;
-            executeJdbcWithRetry(jdbcUrl, statement -> {
+
+            // Wait for tablespace to be ready (TCP probe passes before tablespace boots)
+            waitForTablespace(jdbcUrl);
+
+            try (Connection connection = DriverManager.getConnection(jdbcUrl);
+                 Statement statement = connection.createStatement()) {
+
                 // CREATE TABLE
                 statement.execute("CREATE TABLE test_table (id int primary key, name string)");
                 LOG.info("Table created.");
@@ -163,32 +174,31 @@ public class HerdDBKubernetesIT {
                     assertEquals("hello", rs.getString("name"));
                     LOG.info("Row verified: id=1, name=hello");
                 }
-            });
+            }
         }
     }
 
-    @FunctionalInterface
-    interface JdbcTask {
-        void execute(Statement statement) throws Exception;
-    }
-
-    private static void executeJdbcWithRetry(String jdbcUrl, JdbcTask task) throws Exception {
-        int maxRetries = 5;
-        for (int attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                try (Connection connection = DriverManager.getConnection(jdbcUrl);
-                     Statement statement = connection.createStatement()) {
-                    task.execute(statement);
+    /**
+     * Wait for the HerdDB tablespace to be fully booted.
+     * The TCP readiness probe passes when Netty starts listening, but the
+     * tablespace may not be ready yet (NotLeaderException).
+     */
+    static void waitForTablespace(String jdbcUrl) throws Exception {
+        long deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(5);
+        while (System.currentTimeMillis() < deadline) {
+            try (Connection conn = DriverManager.getConnection(jdbcUrl);
+                 Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT 1")) {
+                if (rs.next()) {
+                    LOG.info("Tablespace is ready.");
                     return;
                 }
             } catch (Exception e) {
-                LOG.log(Level.WARNING, "JDBC attempt " + attempt + "/" + maxRetries + " failed: " + e.getMessage());
-                if (attempt == maxRetries) {
-                    throw e;
-                }
-                Thread.sleep(5000);
+                LOG.log(Level.FINE, "Tablespace not ready yet: " + e.getMessage());
             }
+            Thread.sleep(3000);
         }
+        throw new RuntimeException("Timed out waiting for tablespace to be ready");
     }
 
     private static String findHelmChartPath() {
@@ -213,10 +223,10 @@ public class HerdDBKubernetesIT {
                 "--set", "server.mode=standalone",
                 "--set", "server.replicaCount=1",
                 "--set", "tools.enabled=false",
-                "--set", "server.javaOpts=-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m -Djava.awt.headless=true --add-modules jdk.incubator.vector",
-                "--set", "server.resources.requests.memory=256Mi",
+                "--set", "server.javaOpts=" + JAVA_OPTS,
+                "--set", "server.resources.requests.memory=512Mi",
                 "--set", "server.resources.requests.cpu=0.5",
-                "--set", "server.resources.limits.memory=256Mi",
+                "--set", "server.resources.limits.memory=512Mi",
                 "--set", "server.resources.limits.cpu=0.5",
                 "--set", "server.storage.data.size=1Gi",
                 "--set", "server.storage.commitlog.size=1Gi",

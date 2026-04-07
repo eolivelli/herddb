@@ -43,7 +43,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
@@ -64,8 +63,8 @@ public class HerdDBClusterKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -141,9 +140,9 @@ public class HerdDBClusterKubernetesIT {
         values.put("zookeeper.storage.size", "1Gi");
         // Server resources (standalone alongside ZK)
         values.put("server.javaOpts", JAVA_OPTS);
-        values.put("server.resources.requests.memory", "256Mi");
+        values.put("server.resources.requests.memory", "512Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "256Mi");
+        values.put("server.resources.limits.memory", "512Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
@@ -199,9 +198,9 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.storage.ledger.size", "1Gi");
         // Server resources (standalone alongside ZK+BK)
         values.put("server.javaOpts", JAVA_OPTS);
-        values.put("server.resources.requests.memory", "256Mi");
+        values.put("server.resources.requests.memory", "512Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "256Mi");
+        values.put("server.resources.limits.memory", "512Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
@@ -269,9 +268,9 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.storage.ledger.size", "1Gi");
         // Server resources (cluster mode)
         values.put("server.javaOpts", JAVA_OPTS);
-        values.put("server.resources.requests.memory", "256Mi");
+        values.put("server.resources.requests.memory", "512Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "256Mi");
+        values.put("server.resources.limits.memory", "512Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
@@ -315,7 +314,13 @@ public class HerdDBClusterKubernetesIT {
             LOG.info("Port-forward established to pod " + podName + " on local port " + localPort);
 
             String jdbcUrl = "jdbc:herddb:server:localhost:" + localPort;
-            executeJdbcWithRetry(jdbcUrl, statement -> {
+
+            // Wait for tablespace to be ready (TCP probe passes before tablespace boots)
+            HerdDBKubernetesIT.waitForTablespace(jdbcUrl);
+
+            try (Connection connection = DriverManager.getConnection(jdbcUrl);
+                 Statement statement = connection.createStatement()) {
+
                 // CREATE TABLE
                 statement.execute("CREATE TABLE cluster_test (id int primary key, name string)");
                 LOG.info("Table created in cluster mode.");
@@ -333,33 +338,9 @@ public class HerdDBClusterKubernetesIT {
                     assertEquals("cluster-hello", rs.getString("name"));
                     LOG.info("Row verified: id=1, name=cluster-hello");
                 }
-            });
-        }
-        LOG.info("Test 3 passed: Cluster mode with JDBC operations works.");
-    }
-
-    @FunctionalInterface
-    interface JdbcTask {
-        void execute(Statement statement) throws Exception;
-    }
-
-    private static void executeJdbcWithRetry(String jdbcUrl, JdbcTask task) throws Exception {
-        int maxRetries = 5;
-        for (int attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                try (Connection connection = DriverManager.getConnection(jdbcUrl);
-                     Statement statement = connection.createStatement()) {
-                    task.execute(statement);
-                    return;
-                }
-            } catch (Exception e) {
-                LOG.log(Level.WARNING, "JDBC attempt " + attempt + "/" + maxRetries + " failed: " + e.getMessage());
-                if (attempt == maxRetries) {
-                    throw e;
-                }
-                Thread.sleep(5000);
             }
         }
+        LOG.info("Test 3 passed: Cluster mode with JDBC operations works.");
     }
 
     private void applyHelmChart(Map<String, String> values) throws Exception {

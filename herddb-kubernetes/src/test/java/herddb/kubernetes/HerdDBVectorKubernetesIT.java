@@ -44,7 +44,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
@@ -70,8 +69,8 @@ public class HerdDBVectorKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -229,7 +228,11 @@ public class HerdDBVectorKubernetesIT {
             LOG.info("Port-forward established to pod " + podName + " on local port " + localPort);
 
             String jdbcUrl = "jdbc:herddb:server:localhost:" + localPort;
-            executeJdbcWithRetry(jdbcUrl, connection -> {
+
+            // Wait for tablespace to be ready (TCP probe passes before tablespace boots)
+            HerdDBKubernetesIT.waitForTablespace(jdbcUrl);
+
+            try (Connection connection = DriverManager.getConnection(jdbcUrl)) {
                 try (Statement statement = connection.createStatement()) {
                     // CREATE TABLE with vector column
                     statement.execute("CREATE TABLE vec_test (id int primary key, vec floata not null)");
@@ -288,32 +291,9 @@ public class HerdDBVectorKubernetesIT {
                         LOG.info("ANN search result: first id=" + firstId + " (correct).");
                     }
                 }
-            });
-        }
-        LOG.info("Test passed: Cluster mode with vector indexing services works.");
-    }
-
-    @FunctionalInterface
-    interface JdbcTask {
-        void execute(Connection connection) throws Exception;
-    }
-
-    private static void executeJdbcWithRetry(String jdbcUrl, JdbcTask task) throws Exception {
-        int maxRetries = 5;
-        for (int attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                try (Connection connection = DriverManager.getConnection(jdbcUrl)) {
-                    task.execute(connection);
-                    return;
-                }
-            } catch (Exception e) {
-                LOG.log(Level.WARNING, "JDBC attempt " + attempt + "/" + maxRetries + " failed: " + e.getMessage());
-                if (attempt == maxRetries) {
-                    throw e;
-                }
-                Thread.sleep(5000);
             }
         }
+        LOG.info("Test passed: Cluster mode with vector indexing services works.");
     }
 
     private void waitForComponent(String component, long timeout, TimeUnit unit) throws Exception {
