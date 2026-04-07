@@ -469,10 +469,21 @@ public class SimpleFollowerTest extends MultiServerBase {
                 long tx = executeUpdateRes.transactionId;
                 assertTrue(tx > 0);
 
+                // Force a no-op sync write so that all previous deferred entries
+                // (BEGIN + INSERT) are guaranteed to be visible in BookKeeper
+                // before we start waiting for the follower to see them.
+                server_1.getManager().executeUpdate(
+                        new InsertStatement(TableSpace.DEFAULT, "t1",
+                                RecordSerializer.makeRecord(table, "c", 6)),
+                        StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                        TransactionContext.NO_TRANSACTION);
+
                 // wait for transaction to arrive on server_2
                 TestUtils.waitForCondition(() -> {
-                    return server_2.getManager().getTableSpaceManager(TableSpace.DEFAULT).getTransaction(tx) != null;
-                }, TestUtils.NOOP, 100);
+                    TableSpaceManager tsm = server_2.getManager().getTableSpaceManager(TableSpace.DEFAULT);
+                    assertFalse("follower tablespace has failed", tsm.isFailed());
+                    return tsm.getTransaction(tx) != null;
+                }, TestUtils.NOOP, 100, "transaction " + tx + " visible on follower");
 
                 // make the transaction appear "abandoned" to server_2
                 Thread.sleep(1000 + (int) server_2.getManager().getAbandonedTransactionsTimeout());
