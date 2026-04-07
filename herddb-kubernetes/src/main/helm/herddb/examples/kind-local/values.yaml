@@ -1,0 +1,112 @@
+# Full-stack HerdDB on a local Kind cluster.
+#
+# Deploys: HerdDB server (cluster mode) + file server (S3 on MinIO) +
+#           indexing service + ZooKeeper + BookKeeper + MinIO + tools pod.
+#
+# Install:
+#   helm install herddb . -f examples/kind-local/values.yaml
+
+server:
+  mode: cluster
+  storageMode: remote
+  replicaCount: 1
+  javaOpts: "-Xms512m -Xmx512m"
+  storage:
+    data:
+      size: 2Gi
+    commitlog:
+      size: 1Gi
+  resources:
+    requests:
+      memory: "768Mi"
+      cpu: "0.5"
+    limits:
+      memory: "768Mi"
+      cpu: "1"
+
+fileServer:
+  replicaCount: 1
+  storageMode: s3
+  javaOpts: "-Xms256m -Xmx384m -Djava.net.preferIPv4Stack=true"
+  # S3 endpoint, bucket, and credentials are auto-configured from the
+  # minio section below — no need to set them explicitly.
+  storage:
+    size: 2Gi
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "0.5"
+    limits:
+      memory: "512Mi"
+      cpu: "1"
+
+minio:
+  enabled: true
+  storage:
+    size: 5Gi
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "0.25"
+    limits:
+      memory: "256Mi"
+      cpu: "0.5"
+
+zookeeper:
+  enabled: true
+  javaOpts: "-Xms128m -Xmx256m"
+  storage:
+    size: 1Gi
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "0.25"
+    limits:
+      memory: "512Mi"
+      cpu: "0.5"
+
+bookkeeper:
+  enabled: true
+  javaOpts: "-Xms256m -Xmx384m"
+  storage:
+    journal:
+      size: 1Gi
+    ledger:
+      size: 2Gi
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "0.25"
+    limits:
+      memory: "512Mi"
+      cpu: "0.5"
+
+indexingService:
+  enabled: true
+  replicaCount: 1
+  javaOpts: "-Xms384m -Xmx512m -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
+  storage:
+    data:
+      size: 2Gi
+    log:
+      size: 1Gi
+  resources:
+    requests:
+      memory: "768Mi"
+      cpu: "0.5"
+    limits:
+      memory: "768Mi"
+      cpu: "1"
+
+tools:
+  enabled: true
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "0.25"
+    limits:
+      memory: "512Mi"
+      cpu: "0.5"
+
+vectorBench:
+  enabled: false

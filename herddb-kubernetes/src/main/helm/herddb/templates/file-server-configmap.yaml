@@ -23,6 +23,7 @@ data:
     s3.bucket={{ .Values.minio.bucket }}
     {{- end }}
     s3.region={{ .Values.fileServer.s3.region }}
+    {{- if not .Values.fileServer.s3.credentialsSecret }}
     {{- if .Values.fileServer.s3.accessKey }}
     s3.access.key={{ .Values.fileServer.s3.accessKey }}
     {{- else if .Values.minio.enabled }}
@@ -32,6 +33,7 @@ data:
     s3.secret.key={{ .Values.fileServer.s3.secretKey }}
     {{- else if .Values.minio.enabled }}
     s3.secret.key={{ .Values.minio.adminPassword }}
+    {{- end }}
     {{- end }}
     {{- if .Values.fileServer.s3.prefix }}
     s3.prefix={{ .Values.fileServer.s3.prefix }}

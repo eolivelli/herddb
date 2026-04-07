@@ -115,6 +115,56 @@ tests:
           path: spec.template.spec.containers[0].resources.requests.cpu
           value: "4"
 
+  - it: should mount configmap to conf-ro and emptyDir to conf when credentialsSecret is set
+    set:
+      fileServer.s3.credentialsSecret: "my-secret"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: config
+            mountPath: /opt/herddb/conf-ro
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: config-writable
+            mountPath: /opt/herddb/conf
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: config-writable
+            emptyDir: {}
+
+  - it: should have S3 env vars from secret when credentialsSecret is set
+    set:
+      fileServer.s3.credentialsSecret: "my-secret"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: S3_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: my-secret
+                key: S3_ACCESS_KEY
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: S3_SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: my-secret
+                key: S3_SECRET_KEY
+
+  - it: should use bash command when credentialsSecret is set without zookeeper
+    set:
+      fileServer.s3.credentialsSecret: "my-secret"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value: ["/bin/bash", "-c"]
+
   - it: should use the configured service account
     asserts:
       - equal:
