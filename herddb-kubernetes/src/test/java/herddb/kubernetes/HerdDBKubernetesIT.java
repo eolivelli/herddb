@@ -198,16 +198,32 @@ public class HerdDBKubernetesIT {
      * onClose callback doesn't fire consistently on CI.
      */
     static String execSqlViaKubectl(K3sContainer k3sContainer, String toolsPodName, String sql) throws Exception {
+        // Use bash -c with 2>&1 to capture CLI errors in stdout
+        // (kubectl stderr only shows generic "command terminated with exit code N")
+        String shellCmd = "herddb-cli --query '" + sql.replace("'", "'\\''") + "' 2>&1; echo \"__EXIT:$?\"";
         org.testcontainers.containers.Container.ExecResult result = k3sContainer.execInContainer(
                 "kubectl", "exec", toolsPodName, "--",
-                "herddb-cli", "--query", sql);
-        String out = result.getStdout();
-        String err = result.getStderr();
-        if (result.getExitCode() != 0) {
-            throw new RuntimeException("SQL failed (exit=" + result.getExitCode() + "): " + err
-                    + "\nstdout: " + out);
+                "bash", "-c", shellCmd);
+        String combined = result.getStdout();
+
+        // Parse exit code from marker
+        int exitCode = 0;
+        String output = combined;
+        int markerIdx = combined.lastIndexOf("__EXIT:");
+        if (markerIdx >= 0) {
+            String codeStr = combined.substring(markerIdx + "__EXIT:".length()).trim();
+            try {
+                exitCode = Integer.parseInt(codeStr);
+            } catch (NumberFormatException e) {
+                // ignore
+            }
+            output = combined.substring(0, markerIdx).trim();
         }
-        return out;
+
+        if (exitCode != 0) {
+            throw new RuntimeException("SQL failed (exit=" + exitCode + "): " + output);
+        }
+        return output;
     }
 
     private static String findHelmChartPath() {
