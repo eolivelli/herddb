@@ -217,29 +217,29 @@ public class HerdDBVectorKubernetesIT {
         String toolsPod = getToolsPodName();
 
         // Wait for tablespace to be ready via CLI
-        HerdDBKubernetesIT.waitForTablespace(toolsPod);
+        HerdDBKubernetesIT.waitForTablespace(kubernetesClient, toolsPod);
 
         // CREATE TABLE with vector column
-        HerdDBKubernetesIT.execSql(toolsPod, "CREATE TABLE vec_test (id int primary key, vec floata not null)");
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod, "CREATE TABLE vec_test (id int primary key, vec floata not null)");
         LOG.info("Table with vector column created.");
 
         // CREATE VECTOR INDEX
-        HerdDBKubernetesIT.execSql(toolsPod, "CREATE VECTOR INDEX vidx ON vec_test(vec)");
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod, "CREATE VECTOR INDEX vidx ON vec_test(vec)");
         LOG.info("Vector index created.");
 
         // INSERT 4 orthogonal vectors using string-formatted SQL
-        HerdDBKubernetesIT.execSql(toolsPod,
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
                 "INSERT INTO vec_test(id, vec) VALUES(1, '{1.0,0.0,0.0,0.0}')");
-        HerdDBKubernetesIT.execSql(toolsPod,
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
                 "INSERT INTO vec_test(id, vec) VALUES(2, '{0.0,1.0,0.0,0.0}')");
-        HerdDBKubernetesIT.execSql(toolsPod,
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
                 "INSERT INTO vec_test(id, vec) VALUES(3, '{0.0,0.0,1.0,0.0}')");
-        HerdDBKubernetesIT.execSql(toolsPod,
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
                 "INSERT INTO vec_test(id, vec) VALUES(4, '{0.0,0.0,0.0,1.0}')");
         LOG.info("4 orthogonal vectors inserted.");
 
         // Force checkpoint so the indexing services catch up via WAL tailing
-        HerdDBKubernetesIT.execSql(toolsPod, "EXECUTE CHECKPOINT 'herd'");
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod, "EXECUTE CHECKPOINT 'herd'");
         LOG.info("Checkpoint executed.");
 
         // Wait for indexing services to process the WAL
@@ -247,7 +247,7 @@ public class HerdDBVectorKubernetesIT {
         LOG.info("Waited for indexing service catch-up.");
 
         // ANN search for vector closest to X axis
-        String output = HerdDBKubernetesIT.execSql(toolsPod,
+        String output = HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
                 "SELECT id FROM vec_test ORDER BY ann_of(vec, CAST('{1.0,0.0,0.0,0.0}' AS FLOAT ARRAY)) DESC LIMIT 2");
         LOG.info("ANN search output: " + output);
         assertTrue("ANN search must contain id=1 in output", output.contains("1"));

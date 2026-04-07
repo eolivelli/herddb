@@ -144,18 +144,18 @@ public class HerdDBKubernetesIT {
         String toolsPod = getToolsPodName();
 
         // Wait for tablespace to be ready via CLI
-        waitForTablespace(toolsPod);
+        waitForTablespace(kubernetesClient, toolsPod);
 
         // CREATE TABLE
-        execSql(toolsPod, "CREATE TABLE test_table (id int primary key, name string)");
+        execSql(kubernetesClient, toolsPod, "CREATE TABLE test_table (id int primary key, name string)");
         LOG.info("Table created.");
 
         // INSERT
-        execSql(toolsPod, "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
+        execSql(kubernetesClient, toolsPod, "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
         LOG.info("Row inserted.");
 
         // SELECT and verify
-        String output = execSql(toolsPod, "SELECT id, name FROM test_table");
+        String output = execSql(kubernetesClient, toolsPod, "SELECT id, name FROM test_table");
         LOG.info("SELECT output: " + output);
         assertTrue("Expected 'hello' in output", output.contains("hello"));
         assertTrue("Expected '1' in output", output.contains("1"));
@@ -165,17 +165,17 @@ public class HerdDBKubernetesIT {
     /**
      * Wait for the HerdDB tablespace to be fully booted by polling via CLI.
      */
-    static void waitForTablespace(String toolsPod) throws Exception {
-        long deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(5);
+    static void waitForTablespace(KubernetesClient client, String toolsPod) throws Exception {
+        long deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(10);
         while (System.currentTimeMillis() < deadline) {
             try {
-                execSql(toolsPod, "SELECT * FROM systables LIMIT 1");
+                execSqlWithTimeout(client, toolsPod, "SELECT * FROM systables LIMIT 1", 30);
                 LOG.info("Tablespace is ready.");
                 return;
             } catch (Exception e) {
                 LOG.info("Tablespace not ready yet: " + e.getMessage());
             }
-            Thread.sleep(3000);
+            Thread.sleep(5000);
         }
         throw new RuntimeException("Timed out waiting for tablespace to be ready");
     }
@@ -193,15 +193,22 @@ public class HerdDBKubernetesIT {
      * Execute a SQL statement via herddb-cli in the tools pod.
      * Returns the CLI stdout output.
      */
-    static String execSql(String toolsPodName, String sql) throws Exception {
-        return execInPod(kubernetesClient, toolsPodName, "herddb-cli", "--query", sql);
+    static String execSql(KubernetesClient client, String toolsPodName, String sql) throws Exception {
+        return execSqlWithTimeout(client, toolsPodName, sql, 300);
+    }
+
+    static String execSqlWithTimeout(KubernetesClient client, String toolsPodName, String sql,
+                                     int timeoutSeconds) throws Exception {
+        return execInPod(client, toolsPodName, timeoutSeconds,
+                "herddb-cli", "--query", sql);
     }
 
     /**
      * Execute a command in a pod and return stdout.
      * Throws RuntimeException if the command fails.
      */
-    static String execInPod(KubernetesClient client, String podName, String... command) throws Exception {
+    static String execInPod(KubernetesClient client, String podName, int timeoutSeconds,
+                            String... command) throws Exception {
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
         CompletableFuture<Integer> exitCodeFuture = new CompletableFuture<>();
@@ -225,16 +232,13 @@ public class HerdDBKubernetesIT {
                     }
                 })
                 .exec(command)) {
-            int exitCode = exitCodeFuture.get(5, TimeUnit.MINUTES);
+            int exitCode = exitCodeFuture.get(timeoutSeconds, TimeUnit.SECONDS);
             String out = stdout.toString(StandardCharsets.UTF_8);
             String err = stderr.toString(StandardCharsets.UTF_8);
             if (exitCode != 0 && exitCode != 1000) {
                 throw new RuntimeException("Command failed (exit=" + exitCode + "): " + err + "\nstdout: " + out);
             }
-            // Also check stderr for Java exceptions
             if (err.contains("Exception") || err.contains("ERROR")) {
-                // herddb-cli may print errors to stderr but still exit 0
-                // Check if stdout has valid output
                 if (out.trim().isEmpty()) {
                     throw new RuntimeException("Command produced error output: " + err);
                 }

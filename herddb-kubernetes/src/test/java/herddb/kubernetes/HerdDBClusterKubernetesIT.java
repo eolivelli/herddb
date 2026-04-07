@@ -281,18 +281,18 @@ public class HerdDBClusterKubernetesIT {
                 .waitUntilReady(5, TimeUnit.MINUTES);
 
         String toolsPod = getToolsPodName();
-        HerdDBKubernetesIT.waitForTablespace(toolsPod);
+        HerdDBKubernetesIT.waitForTablespace(kubernetesClient, toolsPod);
 
         // CREATE TABLE
-        HerdDBKubernetesIT.execSql(toolsPod, "CREATE TABLE cluster_test (id int primary key, name string)");
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod, "CREATE TABLE cluster_test (id int primary key, name string)");
         LOG.info("Table created in cluster mode.");
 
         // INSERT
-        HerdDBKubernetesIT.execSql(toolsPod, "INSERT INTO cluster_test (id, name) VALUES (1, 'cluster-hello')");
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod, "INSERT INTO cluster_test (id, name) VALUES (1, 'cluster-hello')");
         LOG.info("Row inserted.");
 
         // SELECT
-        String output = HerdDBKubernetesIT.execSql(toolsPod, "SELECT id, name FROM cluster_test");
+        String output = HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod, "SELECT id, name FROM cluster_test");
         assertTrue("Expected 'cluster-hello' in output", output.contains("cluster-hello"));
         LOG.info("Row verified: " + output.trim());
         LOG.info("Test 3 passed: Cluster mode with JDBC operations works.");

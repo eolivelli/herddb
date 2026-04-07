@@ -227,27 +227,27 @@ public class HerdDBFileServerKubernetesIT {
         String toolsPod = getToolsPodName();
 
         // Wait for tablespace to be ready via CLI
-        HerdDBKubernetesIT.waitForTablespace(toolsPod);
+        HerdDBKubernetesIT.waitForTablespace(kubernetesClient, toolsPod);
 
         // CREATE TABLE
-        HerdDBKubernetesIT.execSql(toolsPod, "CREATE TABLE fs_test (id int primary key, name string, score int)");
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod, "CREATE TABLE fs_test (id int primary key, name string, score int)");
         LOG.info("Table created.");
 
         // CREATE BRIN INDEX
-        HerdDBKubernetesIT.execSql(toolsPod, "CREATE BRIN INDEX brin_idx ON fs_test(score)");
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod, "CREATE BRIN INDEX brin_idx ON fs_test(score)");
         LOG.info("BRIN index created.");
 
         // INSERT rows
-        HerdDBKubernetesIT.execSql(toolsPod,
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
                 "INSERT INTO fs_test (id, name, score) VALUES (1, 'hello', 42)");
-        HerdDBKubernetesIT.execSql(toolsPod,
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
                 "INSERT INTO fs_test (id, name, score) VALUES (2, 'world', 99)");
-        HerdDBKubernetesIT.execSql(toolsPod,
+        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
                 "INSERT INTO fs_test (id, name, score) VALUES (3, 'foo', 42)");
         LOG.info("Rows inserted.");
 
         // SELECT all rows and verify
-        String output = HerdDBKubernetesIT.execSql(toolsPod,
+        String output = HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
                 "SELECT id, name, score FROM fs_test ORDER BY id");
         LOG.info("SELECT output: " + output);
         assertTrue("Expected 'hello' in output", output.contains("hello"));
@@ -256,7 +256,7 @@ public class HerdDBFileServerKubernetesIT {
         LOG.info("All rows verified.");
 
         // Query using BRIN index: WHERE score = 42
-        String brinOutput = HerdDBKubernetesIT.execSql(toolsPod,
+        String brinOutput = HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
                 "SELECT id, name FROM fs_test WHERE score = 42");
         LOG.info("BRIN index query output: " + brinOutput);
         assertTrue("Expected id 1 in BRIN query output", brinOutput.contains("1"));
