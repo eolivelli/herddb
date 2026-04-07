@@ -2291,7 +2291,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, snapshotDimension);
         List<Long> mapPageIds = writeFusedPQMapData(
                 new VectorStorageRandomAccessVectorValues(partStorage, snapshotDimension), partNodeToPk);
-        long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
+        long estimatedSize = (long) (graphPageIds.size() + mapPageIds.size()) * CHUNK_SIZE;
         return new SegmentWriteResult(s.segmentId, graphPageIds, mapPageIds, estimatedSize);
     }
 
@@ -3326,6 +3326,35 @@ public class PersistentVectorStore extends AbstractVectorStore {
             total += seg.estimatedSizeBytes;
         }
         return total;
+    }
+
+    public long getMinSegmentSizeBytes() {
+        long min = Long.MAX_VALUE;
+        for (VectorSegment seg : segments) {
+            if (seg.estimatedSizeBytes < min) {
+                min = seg.estimatedSizeBytes;
+            }
+        }
+        return min == Long.MAX_VALUE ? 0 : min;
+    }
+
+    public long getMaxSegmentSizeBytes() {
+        long max = 0;
+        for (VectorSegment seg : segments) {
+            if (seg.estimatedSizeBytes > max) {
+                max = seg.estimatedSizeBytes;
+            }
+        }
+        return max;
+    }
+
+    public long getMedianSegmentSizeBytes() {
+        List<VectorSegment> segs = new ArrayList<>(segments);
+        if (segs.isEmpty()) {
+            return 0;
+        }
+        segs.sort((a, b) -> Long.compare(a.estimatedSizeBytes, b.estimatedSizeBytes));
+        return segs.get(segs.size() / 2).estimatedSizeBytes;
     }
 
     public boolean isDirty() {
