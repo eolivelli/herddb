@@ -996,14 +996,6 @@ public class BookkeeperCommitLog extends CommitLog {
                 LOGGER.finer(tableSpaceDescription() + " next entry to read " + nextEntry + " from ledger "
                         + fContext.currentLedger.getId() + " lastAddConfiremd " + lastAddConfirmed);
             }
-            if (lastAddConfirmed < nextEntry) {
-                if (LOGGER.isLoggable(Level.FINER)) {
-                    LOGGER.finer(tableSpaceDescription() + " ledger not closed but there is nothing to read by now");
-                }
-                Thread.sleep(100);
-                return;
-            }
-
             ReadHandle lh = fContext.currentLedger;
 
             try (LastConfirmedAndEntry entryAndLac = lh.

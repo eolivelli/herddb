@@ -140,29 +140,32 @@ public class SimpleFollowerTest extends MultiServerBase {
             server_1.getManager().executeStatement(new CommitTransactionStatement("tblspace2", executeUpdateTransaction2.transactionId), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
                     TransactionContext.NO_TRANSACTION);
 
-            // force BK LAC
+            // Force sync writes to advance BookKeeper LAC so the follower
+            // can read all previous (deferred) entries.
             server_1.getManager().executeUpdate(new InsertStatement("tblspace1", "t1", RecordSerializer.makeRecord(table1, "c", 6)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
                     TransactionContext.NO_TRANSACTION);
             server_1.getManager().executeUpdate(new InsertStatement("tblspace2", "t2", RecordSerializer.makeRecord(table2, "c", 6)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
                     TransactionContext.NO_TRANSACTION);
 
             // wait for data to arrive on server_2
-            for (int i = 0; i < 100; i++) {
-                GetResult found = server_2.getManager().get(new GetStatement("tblspace1", "t1", Bytes.from_int(5), null, false), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
-                        TransactionContext.NO_TRANSACTION);
-                if (found.found()) {
-                    break;
+            TestUtils.waitForCondition(() -> {
+                try {
+                    return server_2.getManager().get(new GetStatement("tblspace1", "t1", Bytes.from_int(5), null, false),
+                            StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION).found();
+                } catch (Exception e) {
+                    return false;
                 }
-                Thread.sleep(100);
-            }
-            for (int i = 0; i < 100; i++) {
-                GetResult found = server_2.getManager().get(new GetStatement("tblspace2", "t2", Bytes.from_int(5), null, false), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
-                        TransactionContext.NO_TRANSACTION);
-                if (found.found()) {
-                    break;
+            }, TestUtils.NOOP, 100, "key 5 to arrive on follower tblspace1");
+
+            TestUtils.waitForCondition(() -> {
+                try {
+                    return server_2.getManager().get(new GetStatement("tblspace2", "t2", Bytes.from_int(5), null, false),
+                            StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION).found();
+                } catch (Exception e) {
+                    return false;
                 }
-                Thread.sleep(100);
-            }
+            }, TestUtils.NOOP, 100, "key 5 to arrive on follower tblspace2");
+
             for (int i = 1; i <= 5; i++) {
                 System.out.println("checking key c=" + i);
                 assertTrue(server_2.getManager().get(new GetStatement("tblspace1", "t1", Bytes.from_int(i), null, false),
