@@ -961,7 +961,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 return store.size();
             }
         });
-        indexStats.registerGauge("estimated_size_bytes", new Gauge<Long>() {
+        indexStats.registerGauge("live_vectors_estimated_memory_bytes", new Gauge<Long>() {
             @Override
             public Long getDefaultValue() {
                 return 0L;
@@ -1269,6 +1269,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     return v < 0 ? 0L : v;
                 }
             });
+            indexStats.registerGauge("ondisk_estimated_size_bytes", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getEstimatedSizeBytes();
+                }
+            });
+            pvs.setSegmentSizeStats(indexStats.getOpStatsLogger("segment_size_bytes"));
         }
     }
 

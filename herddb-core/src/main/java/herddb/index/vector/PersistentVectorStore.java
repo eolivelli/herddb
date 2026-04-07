@@ -84,6 +84,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.apache.bookkeeper.stats.OpStatsLogger;
 
 /**
  * Persistent vector store backed by jvector (OnHeapGraphIndex / HNSW-style) with
@@ -219,6 +220,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final long compactionIntervalMs;
     private final long maxVectorMemoryBytes;
     private final VectorMemoryBudget memoryBudget;
+
+    /** Optional stats logger for recording per-segment size distribution. */
+    private volatile OpStatsLogger segmentSizeStats;
 
     // -------------------------------------------------------------------------
     // In-memory state -- LIVE inserts (new since last checkpoint)
@@ -1509,6 +1513,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
             this.pendingCheckpointDeletes = null;
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
             dirty.set(totalLiveSize() > 0);
+
+            recordSegmentSizeDistribution();
         } finally {
             CountDownLatch latch = this.checkpointPhaseComplete;
             this.checkpointPhaseComplete = null;
@@ -2291,7 +2297,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, snapshotDimension);
         List<Long> mapPageIds = writeFusedPQMapData(
                 new VectorStorageRandomAccessVectorValues(partStorage, snapshotDimension), partNodeToPk);
-        long estimatedSize = (long) graphPageIds.size() * CHUNK_SIZE;
+        long estimatedSize = (long) (graphPageIds.size() + mapPageIds.size()) * CHUNK_SIZE;
         return new SegmentWriteResult(s.segmentId, graphPageIds, mapPageIds, estimatedSize);
     }
 
@@ -3326,6 +3332,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
             total += seg.estimatedSizeBytes;
         }
         return total;
+    }
+
+    public void setSegmentSizeStats(OpStatsLogger segmentSizeStats) {
+        this.segmentSizeStats = segmentSizeStats;
+    }
+
+    private void recordSegmentSizeDistribution() {
+        OpStatsLogger stats = this.segmentSizeStats;
+        if (stats == null) {
+            return;
+        }
+        stats.clear();
+        for (VectorSegment seg : segments) {
+            stats.registerSuccessfulValue(seg.estimatedSizeBytes);
+        }
     }
 
     public boolean isDirty() {
