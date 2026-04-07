@@ -271,19 +271,25 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     private static final long CATCHUP_POLL_INTERVAL_MS = 5000;
 
     @Override
-    public void waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber) throws InterruptedException {
+    public boolean waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber, long timeoutMs) throws InterruptedException {
         ServerSnapshot s = this.snapshot;
         for (Map.Entry<String, ManagedChannel> serverEntry : s.channels.entrySet()) {
             String server = serverEntry.getKey();
             ManagedChannel channel = serverEntry.getValue();
-            waitForInstanceCatchUp(server, channel, tablespace, sequenceNumber);
+            if (!waitForInstanceCatchUp(server, channel, tablespace, sequenceNumber, timeoutMs)) {
+                return false;
+            }
         }
+        return true;
     }
 
-    private void waitForInstanceCatchUp(String server, ManagedChannel channel,
+    private boolean waitForInstanceCatchUp(String server, ManagedChannel channel,
                                          String tablespace,
-                                         LogSequenceNumber target) throws InterruptedException {
-        while (true) {
+                                         LogSequenceNumber target,
+                                         long timeoutMs) throws InterruptedException {
+        long now = System.currentTimeMillis();
+        long deadline = (timeoutMs > Long.MAX_VALUE - now) ? Long.MAX_VALUE : now + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
             try {
                 IndexingServiceGrpc.IndexingServiceBlockingStub stub =
                         IndexingServiceGrpc.newBlockingStub(channel)
@@ -298,7 +304,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
                 if (instanceLsn.after(target) || instanceLsn.equals(target)) {
                     LOGGER.log(Level.INFO, "Instance {0} caught up for tablespace {1} to {2} (at {3})",
                             new Object[]{server, tablespace, target, instanceLsn});
-                    return;
+                    return true;
                 }
                 LOGGER.log(Level.INFO, "Instance {0} at {1} for tablespace {2}, waiting for {3} (status: {4})",
                         new Object[]{server, instanceLsn, tablespace, target, resp.getStatus()});
@@ -308,6 +314,9 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
             }
             Thread.sleep(CATCHUP_POLL_INTERVAL_MS);
         }
+        LOGGER.log(Level.WARNING, "Instance {0} did not catch up for tablespace {1} to {2} within timeout ({3} ms)",
+                new Object[]{server, tablespace, target, timeoutMs});
+        return false;
     }
 
     public List<String> getServers() {

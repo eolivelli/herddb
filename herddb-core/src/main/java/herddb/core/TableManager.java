@@ -2862,12 +2862,17 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
     @Override
     public TableCheckpoint fullCheckpoint(boolean pin) throws DataStorageManagerException {
-        return checkpoint(Double.NEGATIVE_INFINITY, fillThreshold, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, pin);
+        return checkpoint(Double.NEGATIVE_INFINITY, fillThreshold, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, pin, Long.MAX_VALUE);
     }
 
     @Override
     public TableCheckpoint checkpoint(boolean pin) throws DataStorageManagerException {
-        return checkpoint(dirtyThreshold, fillThreshold, checkpointTargetTime, cleanupTargetTime, compactionTargetTime, pin);
+        return checkpoint(dirtyThreshold, fillThreshold, checkpointTargetTime, cleanupTargetTime, compactionTargetTime, pin, Long.MAX_VALUE);
+    }
+
+    @Override
+    public TableCheckpoint checkpoint(boolean pin, long catchUpTimeoutMs) throws DataStorageManagerException {
+        return checkpoint(dirtyThreshold, fillThreshold, checkpointTargetTime, cleanupTargetTime, compactionTargetTime, pin, catchUpTimeoutMs);
     }
 
     @Override
@@ -3207,7 +3212,8 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
      */
     private TableCheckpoint checkpoint(
             double dirtyThreshold, double fillThreshold,
-            long checkpointTargetTime, long cleanupTargetTime, long compactionTargetTime, boolean pin
+            long checkpointTargetTime, long cleanupTargetTime, long compactionTargetTime, boolean pin,
+            long catchUpTimeoutMs
     ) throws DataStorageManagerException {
         LOGGER.log(Level.FINE, "tableCheckpoint dirtyThreshold: " + dirtyThreshold + ", {0}.{1} (pin: {2})", new Object[]{tableSpaceUUID, table.name, pin});
         if (createdInTransaction > 0) {
@@ -3429,7 +3435,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         if (indexes != null) {
             for (AbstractIndexManager indexManager : indexes.values()) {
                 // Checkpoint at the same position as this TableManager's sequenceNumber
-                actions.addAll(indexManager.checkpoint(sequenceNumber, pin));
+                actions.addAll(indexManager.checkpoint(sequenceNumber, pin, catchUpTimeoutMs));
             }
         }
 

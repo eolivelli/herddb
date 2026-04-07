@@ -21,7 +21,8 @@
 package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import herddb.indexing.IndexingServiceEngine.IndexStatusInfo;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
@@ -34,9 +35,6 @@ import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -130,41 +128,22 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
             // The phantom LSN that getLastSequenceNumber() would return after ledger rollover
             LogSequenceNumber phantomLsn = new LogSequenceNumber(2, -1);
 
-            // Demonstrate the bug: waitForCatchUp with phantom LSN should NOT complete
+            // waitForCatchUp with phantom LSN should return false (timeout)
             // because the tailer is at (1, 5) and can never reach (2, -1) — different ledger
-            try (IndexingServiceClient client = eis.createClient()) {
-                CompletableFuture<Void> catchUpFuture = CompletableFuture.runAsync(() -> {
-                    try {
-                        client.waitForCatchUp("tablespace1", phantomLsn);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                });
+            try (IndexingServiceClient client = new IndexingServiceClient(
+                    java.util.Arrays.asList(eis.getAddress()), 2)) {
+                // Use short gRPC timeout (2s) so the poll loop iterates quickly
+                boolean caughtUp = client.waitForCatchUp("tablespace1", phantomLsn, 5000);
+                assertFalse("waitForCatchUp with phantom LSN (2, -1) should return false (timeout)",
+                        caughtUp);
 
-                // This should time out — the bug means it would never complete
-                try {
-                    catchUpFuture.get(3, TimeUnit.SECONDS);
-                    fail("waitForCatchUp with phantom LSN (2, -1) should have timed out, "
-                            + "but it completed. This means the tailer unexpectedly advanced past ledger 2.");
-                } catch (TimeoutException expected) {
-                    // Expected: waitForCatchUp is stuck because phantom LSN is unreachable
-                    catchUpFuture.cancel(true);
-                }
-
-                // Demonstrate the fix: the correct target LSN is the last REAL entry (1, 5)
+                // The correct target LSN is the last REAL entry (1, 5)
                 // This is what getLastWrittenSequenceNumber() would return instead of (2, -1)
                 LogSequenceNumber correctLsn = new LogSequenceNumber(1, 5);
 
-                CompletableFuture<Void> fixedFuture = CompletableFuture.runAsync(() -> {
-                    try {
-                        client.waitForCatchUp("tablespace1", correctLsn);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                });
-
-                // This should complete immediately — the tailer is already at (1, 5)
-                fixedFuture.get(5, TimeUnit.SECONDS);
+                boolean fixedCaughtUp = client.waitForCatchUp("tablespace1", correctLsn, 30000);
+                assertTrue("waitForCatchUp with correct LSN (1, 5) should succeed",
+                        fixedCaughtUp);
             }
         }
     }

@@ -23,12 +23,9 @@ package herddb.remote;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
-import herddb.storage.DataStorageManagerException;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import java.io.ByteArrayInputStream;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.List;
 import java.util.Map;
 import org.junit.After;
@@ -65,7 +62,9 @@ public class RemoteRandomAccessReaderTest {
     /** Build a byte array where byte[i] = (byte)(i & 0xFF). */
     private static byte[] seqBytes(int length) {
         byte[] b = new byte[length];
-        for (int i = 0; i < length; i++) b[i] = (byte) (i & 0xFF);
+        for (int i = 0; i < length; i++) {
+            b[i] = (byte) (i & 0xFF);
+        }
         return b;
     }
 
@@ -80,7 +79,9 @@ public class RemoteRandomAccessReaderTest {
 
         byte[] buf = new byte[5];
         reader.readFully(buf);
-        for (int i = 0; i < 5; i++) assertEquals((byte) (10 + i), buf[i]);
+        for (int i = 0; i < 5; i++) {
+            assertEquals((byte) (10 + i), buf[i]);
+        }
         assertEquals(15, reader.getPosition());
     }
 
@@ -94,7 +95,9 @@ public class RemoteRandomAccessReaderTest {
         reader.seek(BLOCK_SIZE - 4);
         byte[] buf = new byte[8]; // crosses block boundary
         reader.readFully(buf);
-        for (int i = 0; i < 8; i++) assertEquals((byte) (BLOCK_SIZE - 4 + i), buf[i]);
+        for (int i = 0; i < 8; i++) {
+            assertEquals((byte) (BLOCK_SIZE - 4 + i), buf[i]);
+        }
     }
 
     @Test
@@ -130,7 +133,9 @@ public class RemoteRandomAccessReaderTest {
     public void testReadLong() throws Exception {
         long expected = 0x0102030405060708L;
         byte[] block = new byte[BLOCK_SIZE];
-        for (int i = 0; i < 8; i++) block[i] = (byte) (expected >>> (56 - i * 8));
+        for (int i = 0; i < 8; i++) {
+            block[i] = (byte) (expected >>> (56 - i * 8));
+        }
         client.writeMultipartFile("ts/idx/long", new ByteArrayInputStream(block), BLOCK_SIZE);
 
         RemoteRandomAccessReader reader = new RemoteRandomAccessReader(client, "ts/idx/long", BLOCK_SIZE, BLOCK_SIZE);

@@ -72,9 +72,11 @@ public interface RemoteVectorIndexService extends AutoCloseable {
      *
      * @param tablespace the tablespace whose commit log is being checkpointed
      * @param sequenceNumber the checkpoint LSN that all instances must reach
+     * @param timeoutMs maximum time to wait in milliseconds
+     * @return true if all instances caught up, false if timeout expired
      * @throws InterruptedException if the waiting thread is interrupted
      */
-    void waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber) throws InterruptedException;
+    boolean waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber, long timeoutMs) throws InterruptedException;
 
     /**
      * Status information for a remote vector index.

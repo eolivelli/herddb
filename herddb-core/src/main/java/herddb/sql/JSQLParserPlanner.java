@@ -1061,14 +1061,24 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
                 return new BeginTransactionStatement(tableSpaceName.toString());
             }
             case "CHECKPOINT": {
-                if (execute.getExprList() == null || execute.getExprList().getExpressions().size() != 1) {
+                int paramCount = execute.getExprList() == null ? 0 : execute.getExprList().getExpressions().size();
+                if (paramCount < 1 || paramCount > 2) {
                     throw new StatementExecutionException(
-                            "CHECKPOINT requires one parameter (EXECUTE CHECKPOINT tableSpaceName)");
+                            "CHECKPOINT requires 1 or 2 parameters (EXECUTE CHECKPOINT tableSpaceName [, timeoutSeconds])");
                 }
                 Object tableSpaceName = resolveValue(execute.getExprList().getExpressions().get(0), true);
                 if (tableSpaceName == null) {
                     throw new StatementExecutionException(
-                            "CHECKPOINT requires one parameter (EXECUTE CHECKPOINT tableSpaceName)");
+                            "CHECKPOINT requires a tableSpaceName parameter");
+                }
+                if (paramCount == 2) {
+                    Object timeoutObj = resolveValue(execute.getExprList().getExpressions().get(1), true);
+                    if (timeoutObj == null || !(timeoutObj instanceof Number)) {
+                        throw new StatementExecutionException(
+                                "CHECKPOINT timeout must be a number (seconds)");
+                    }
+                    long timeoutMs = ((Number) timeoutObj).longValue() * 1000;
+                    return new CheckpointStatement(tableSpaceName.toString(), timeoutMs);
                 }
                 return new CheckpointStatement(tableSpaceName.toString());
             }

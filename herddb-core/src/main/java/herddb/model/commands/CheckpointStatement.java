@@ -27,8 +27,20 @@ import herddb.model.Statement;
  */
 public class CheckpointStatement extends Statement {
 
+    public static final long DEFAULT_CATCHUP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+    private final long catchUpTimeoutMs;
+
     public CheckpointStatement(String tableSpace) {
-        super(tableSpace);
+        this(tableSpace, DEFAULT_CATCHUP_TIMEOUT_MS);
     }
 
+    public CheckpointStatement(String tableSpace, long catchUpTimeoutMs) {
+        super(tableSpace);
+        this.catchUpTimeoutMs = catchUpTimeoutMs;
+    }
+
+    public long getCatchUpTimeoutMs() {
+        return catchUpTimeoutMs;
+    }
 }

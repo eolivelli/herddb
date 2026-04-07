@@ -116,12 +116,26 @@ public class VectorIndexManager extends AbstractIndexManager {
     @Override
     public List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin)
             throws DataStorageManagerException {
-        LOGGER.log(Level.INFO, "checkpoint index {0} on table {1} tablespace {2}, targetLSN={3}, pin={4}",
-                new Object[]{index.name, index.table, tableSpaceUUID, sequenceNumber, pin});
+        return checkpoint(sequenceNumber, pin, DEFAULT_CATCHUP_TIMEOUT_MS);
+    }
+
+    private static final long DEFAULT_CATCHUP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+    @Override
+    public List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin, long catchUpTimeoutMs)
+            throws DataStorageManagerException {
+        LOGGER.log(Level.INFO, "checkpoint index {0} on table {1} tablespace {2}, targetLSN={3}, pin={4}, timeout={5}ms",
+                new Object[]{index.name, index.table, tableSpaceUUID, sequenceNumber, pin, catchUpTimeoutMs});
         long start = System.nanoTime();
         try {
-            remoteService().waitForCatchUp(tableSpaceUUID, sequenceNumber);
+            boolean caughtUp = remoteService().waitForCatchUp(tableSpaceUUID, sequenceNumber, catchUpTimeoutMs);
             long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            if (!caughtUp) {
+                LOGGER.log(Level.WARNING, "checkpoint index {0} on table {1} waitForCatchUp timed out after {2} ms",
+                        new Object[]{index.name, index.table, elapsedMs});
+                throw new DataStorageManagerException(
+                        "IndexingService catch-up timed out after " + elapsedMs + " ms for index " + index.name);
+            }
             LOGGER.log(Level.INFO, "checkpoint index {0} on table {1} waitForCatchUp completed in {2} ms",
                     new Object[]{index.name, index.table, elapsedMs});
         } catch (InterruptedException e) {
