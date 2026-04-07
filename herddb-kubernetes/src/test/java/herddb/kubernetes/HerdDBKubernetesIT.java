@@ -199,18 +199,23 @@ public class HerdDBKubernetesIT {
     static String execSqlWithTimeout(KubernetesClient client, String toolsPodName, String sql,
                                      int timeoutSeconds) throws Exception {
         return execInPod(client, toolsPodName, timeoutSeconds,
-                "herddb-cli", "--query", sql);
+                "bash", "-c", "herddb-cli --query " + shellQuote(sql) + "; echo \"EXIT_CODE:$?\"");
+    }
+
+    private static String shellQuote(String s) {
+        return "'" + s.replace("'", "'\\''") + "'";
     }
 
     /**
      * Execute a command in a pod and return stdout.
-     * Throws RuntimeException if the command fails.
+     * Uses bash wrapper with exit code marker to avoid relying on
+     * ExecListener.onClose which is unreliable in some fabric8 versions.
      */
     static String execInPod(KubernetesClient client, String podName, int timeoutSeconds,
                             String... command) throws Exception {
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        CompletableFuture<Integer> exitCodeFuture = new CompletableFuture<>();
+        CompletableFuture<Void> doneFuture = new CompletableFuture<>();
 
         try (ExecWatch exec = client.pods()
                 .inNamespace("default")
@@ -223,26 +228,41 @@ public class HerdDBKubernetesIT {
                     }
                     @Override
                     public void onFailure(Throwable t, Response failureResponse) {
-                        exitCodeFuture.completeExceptionally(t);
+                        doneFuture.completeExceptionally(t);
                     }
                     @Override
                     public void onClose(int code, String reason) {
-                        exitCodeFuture.complete(code);
+                        doneFuture.complete(null);
                     }
                 })
                 .exec(command)) {
-            int exitCode = exitCodeFuture.get(timeoutSeconds, TimeUnit.SECONDS);
+            doneFuture.get(timeoutSeconds, TimeUnit.SECONDS);
             String out = stdout.toString(StandardCharsets.UTF_8);
             String err = stderr.toString(StandardCharsets.UTF_8);
-            if (exitCode != 0 && exitCode != 1000) {
-                throw new RuntimeException("Command failed (exit=" + exitCode + "): " + err + "\nstdout: " + out);
+
+            // Parse exit code from our marker
+            int exitCode = 0;
+            String cleanOut = out;
+            int markerIdx = out.lastIndexOf("EXIT_CODE:");
+            if (markerIdx >= 0) {
+                String codeStr = out.substring(markerIdx + "EXIT_CODE:".length()).trim();
+                try {
+                    exitCode = Integer.parseInt(codeStr);
+                } catch (NumberFormatException e) {
+                    // ignore
+                }
+                cleanOut = out.substring(0, markerIdx).trim();
+            }
+
+            if (exitCode != 0) {
+                throw new RuntimeException("Command failed (exit=" + exitCode + "): " + err + "\nstdout: " + cleanOut);
             }
             if (err.contains("Exception") || err.contains("ERROR")) {
-                if (out.trim().isEmpty()) {
+                if (cleanOut.isEmpty()) {
                     throw new RuntimeException("Command produced error output: " + err);
                 }
             }
-            return out;
+            return cleanOut;
         }
     }
 
