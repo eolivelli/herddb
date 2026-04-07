@@ -462,6 +462,15 @@ public class SimpleFollowerTest extends MultiServerBase {
 
                 assertTrue(server_2.getManager().waitForTablespace(TableSpace.DEFAULT, 60000, false));
 
+                // Wait for the follower to catch up with the initial entries
+                // before creating the transaction.  This ensures the follower
+                // thread is actively tailing the leader's ledger.
+                TestUtils.waitForCondition(() -> {
+                    TableSpaceManager tsm = server_2.getManager().getTableSpaceManager(TableSpace.DEFAULT);
+                    return tsm != null && !tsm.isFailed()
+                            && tsm.getTableManager("t1") != null;
+                }, TestUtils.NOOP, 60, "table t1 visible on follower");
+
                 // start a transaction
                 DMLStatementExecutionResult executeUpdateRes =
                     server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.makeRecord(table, "c", 5)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
