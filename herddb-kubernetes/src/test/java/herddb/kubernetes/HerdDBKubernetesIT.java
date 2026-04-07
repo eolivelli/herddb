@@ -200,7 +200,11 @@ public class HerdDBKubernetesIT {
     static String execSqlViaKubectl(K3sContainer k3sContainer, String toolsPodName, String sql) throws Exception {
         // Use bash -c with 2>&1 to capture CLI errors in stdout
         // (kubectl stderr only shows generic "command terminated with exit code N")
-        String shellCmd = "herddb-cli --query '" + sql.replace("'", "'\\''") + "' 2>&1; echo \"__EXIT:$?\"";
+        // Use /opt/herddb/bin/herddb-cli.sh directly with extended client timeout
+        // (default 300s is too short for slow CI where first DDL can take minutes)
+        String shellCmd = "/opt/herddb/bin/herddb-cli.sh"
+                + " -x \"${HERDDB_JDBC_URL}?client.timeout=600000\""
+                + " --query '" + sql.replace("'", "'\\''") + "' 2>&1; echo \"__EXIT:$?\"";
         org.testcontainers.containers.Container.ExecResult result = k3sContainer.execInContainer(
                 "kubectl", "exec", toolsPodName, "--",
                 "bash", "-c", shellCmd);
