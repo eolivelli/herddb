@@ -1000,10 +1000,12 @@ public class BookkeeperCommitLog extends CommitLog {
                 if (LOGGER.isLoggable(Level.FINER)) {
                     LOGGER.finer(tableSpaceDescription() + " ledger not closed but there is nothing to read by now");
                 }
+                Thread.sleep(100);
                 return;
             }
 
             ReadHandle lh = fContext.currentLedger;
+
             try (LastConfirmedAndEntry entryAndLac = lh.
                     readLastAddConfirmedAndEntry(nextEntry, LONG_POLL_TIMEOUT, false)) {
                 if (entryAndLac.hasEntry()) {

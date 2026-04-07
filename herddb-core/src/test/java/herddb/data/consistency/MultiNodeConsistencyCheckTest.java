@@ -33,6 +33,7 @@ import herddb.model.commands.CreateTableSpaceStatement;
 import herddb.model.commands.CreateTableStatement;
 import herddb.model.commands.TableConsistencyCheckStatement;
 import herddb.utils.SystemInstrumentation;
+import herddb.utils.TestUtils;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -85,6 +86,11 @@ public class MultiNodeConsistencyCheckTest extends ReplicatedLogtestcase {
 
                 //The follower is always back 1, I make an entry to make him apply consistency log
                 execute(manager1, "INSERT INTO t2.table1 (id,name) values (?,?)", Arrays.asList("3", false));
+
+                // Wait for the follower to process the consistency check entry
+                TestUtils.waitForCondition(() -> callCount.get() >= 2,
+                        TestUtils.NOOP, 100,
+                        "follower to execute consistency check (callCount=" + callCount.get() + ")");
             }
         }
         //Expected 2 call for createChecksum (node1 and node2)
