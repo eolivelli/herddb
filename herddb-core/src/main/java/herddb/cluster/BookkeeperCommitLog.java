@@ -996,15 +996,22 @@ public class BookkeeperCommitLog extends CommitLog {
                 LOGGER.finer(tableSpaceDescription() + " next entry to read " + nextEntry + " from ledger "
                         + fContext.currentLedger.getId() + " lastAddConfiremd " + lastAddConfirmed);
             }
+            ReadHandle lh = fContext.currentLedger;
             if (lastAddConfirmed < nextEntry) {
-                if (LOGGER.isLoggable(Level.FINER)) {
-                    LOGGER.finer(tableSpaceDescription() + " ledger not closed but there is nothing to read by now");
+                // The bookie's LAC can lag behind due to piggybacking.
+                // Use readLastAddConfirmedAndEntry with a short timeout
+                // to wait for the entry to appear, rather than busy-waiting
+                // with tryReadLastAddConfirmed().  The timeout must be short
+                // so the FollowerThread can react promptly to shutdown.
+                try (LastConfirmedAndEntry entryAndLac = lh.
+                        readLastAddConfirmedAndEntry(nextEntry, 10, false)) {
+                    if (entryAndLac.hasEntry()) {
+                        acceptEntryForFollower(entryAndLac.getEntry(), consumer);
+                    }
                 }
-                Thread.sleep(100);
                 return;
             }
 
-            ReadHandle lh = fContext.currentLedger;
             try (LastConfirmedAndEntry entryAndLac = lh.
                     readLastAddConfirmedAndEntry(nextEntry, LONG_POLL_TIMEOUT, false)) {
                 if (entryAndLac.hasEntry()) {
