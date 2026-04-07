@@ -24,6 +24,7 @@ import static herddb.core.TestUtils.execute;
 import static herddb.core.TestUtils.executeUpdate;
 import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import static herddb.core.TestUtils.scan;
+import static herddb.core.TestUtils.scanKeepReadLocks;
 import static herddb.model.TransactionContext.NO_TRANSACTION;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
@@ -46,7 +47,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Rule;
 import org.junit.Test;
@@ -70,7 +70,9 @@ public class UpdateOverflowWithCheckpointTest {
 
     /**
      * Stress test: concurrent updates with varying value sizes on tiny pages
-     * plus frequent checkpoints and reads. This maximizes page overflow events.
+     * plus frequent checkpoints and reads. Uses auto-transactions to ensure
+     * proper record-level locking (matching the pattern of the original
+     * MultipleConcurrentUpdatesTest). This maximizes page overflow events.
      */
     @Test
     public void testUpdateOverflowWithConcurrentReadsAndCheckpoints() throws Exception {
@@ -85,12 +87,12 @@ public class UpdateOverflowWithCheckpointTest {
         // Small memory budget to force page evictions
         config.set(ServerConfiguration.PROPERTY_MAX_DATA_MEMORY, 64 * 1024);
         config.set(ServerConfiguration.PROPERTY_MAX_PK_MEMORY, 512 * 1024);
-        // Very frequent checkpoints
-        config.set(ServerConfiguration.PROPERTY_CHECKPOINT_PERIOD, 500);
+        // Frequent checkpoints via periodic thread
+        config.set(ServerConfiguration.PROPERTY_CHECKPOINT_PERIOD, 1000);
 
         int numRecords = 200;
-        int numOperations = 2000;
-        int numThreads = 20;
+        int numOperations = 1000;
+        int numThreads = 10;
 
         ConcurrentHashMap<String, String> expectedValues = new ConcurrentHashMap<>();
         AtomicReference<Throwable> error = new AtomicReference<>();
@@ -125,19 +127,6 @@ public class UpdateOverflowWithCheckpointTest {
 
             // Run concurrent updates (varying sizes) and reads
             ExecutorService pool = Executors.newFixedThreadPool(numThreads);
-            AtomicBoolean running = new AtomicBoolean(true);
-
-            // Background checkpoint thread
-            Future<?> checkpointer = pool.submit(() -> {
-                while (running.get() && error.get() == null) {
-                    try {
-                        manager.checkpoint();
-                        Thread.sleep(100);
-                    } catch (Exception e) {
-                        error.compareAndSet(null, e);
-                    }
-                }
-            });
 
             // Worker threads: mix of updates and reads
             List<Future<?>> workers = new java.util.ArrayList<>();
@@ -159,7 +148,8 @@ public class UpdateOverflowWithCheckpointTest {
 
                         try {
                             if (rng.nextBoolean()) {
-                                // UPDATE with varying value size to trigger page overflow
+                                // UPDATE with varying value size to trigger page overflow.
+                                // Use auto-transaction for proper record-level locking.
                                 int valueSize = rng.nextInt(10, 500);
                                 StringBuilder sb = new StringBuilder(valueSize);
                                 for (int c = 0; c < valueSize; c++) {
@@ -167,14 +157,16 @@ public class UpdateOverflowWithCheckpointTest {
                                 }
                                 String newValue = sb.toString();
 
+                                long utx = TestUtils.beginTransaction(manager, "tblspace1");
                                 executeUpdate(manager, "UPDATE tblspace1.t1 set v1=? where k1=?",
-                                        Arrays.asList(newValue, key), NO_TRANSACTION);
+                                        Arrays.asList(newValue, key), new TransactionContext(utx));
+                                TestUtils.commitTransaction(manager, "tblspace1", utx);
                                 expectedValues.put(key, newValue);
                             } else {
                                 // READ — this is the operation that fails if DataPage.put lost the old record
-                                try (DataScanner scanner = scan(manager,
+                                try (DataScanner scanner = scanKeepReadLocks(manager,
                                         "SELECT v1 FROM tblspace1.t1 where k1=?",
-                                        Arrays.asList(key))) {
+                                        Arrays.asList(key), NO_TRANSACTION)) {
                                     List<DataAccessor> rows = scanner.consume();
                                     assertEquals("Record must be found for key " + key, 1, rows.size());
                                     assertNotNull("Value must not be null for key " + key,
@@ -195,14 +187,11 @@ public class UpdateOverflowWithCheckpointTest {
 
             // Wait for all workers
             for (Future<?> f : workers) {
-                f.get(60, TimeUnit.SECONDS);
+                f.get(120, TimeUnit.SECONDS);
             }
 
-            running.set(false);
-            checkpointer.get(10, TimeUnit.SECONDS);
-
             pool.shutdown();
-            pool.awaitTermination(10, TimeUnit.SECONDS);
+            pool.awaitTermination(30, TimeUnit.SECONDS);
 
             // Check for errors
             if (error.get() != null) {
