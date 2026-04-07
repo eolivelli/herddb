@@ -14,10 +14,7 @@
 # specific language governing permissions and limitations under the License.
 #
 name: Java CI - HerdDB Core
-on:
-  pull_request:
-    paths:
-      - 'DISABLED_FOR_K8S_FIX'
+on: [pull_request]
 env:
   MAVEN_OPTS: -Dmaven.artifact.threads=4 -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn  -Dmaven.wagon.httpconnectionManager.ttlSeconds=25 -Dmaven.wagon.http.retryHandler.count=3
 jobs:
