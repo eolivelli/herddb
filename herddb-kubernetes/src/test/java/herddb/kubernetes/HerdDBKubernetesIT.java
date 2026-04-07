@@ -26,18 +26,14 @@ import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
-import io.fabric8.kubernetes.client.dsl.ExecListener;
-import io.fabric8.kubernetes.client.dsl.ExecWatch;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -143,18 +139,18 @@ public class HerdDBKubernetesIT {
         String toolsPod = getToolsPodName();
 
         // Wait for tablespace to be ready via CLI
-        waitForTablespace(kubernetesClient, toolsPod);
+        waitForTablespace(k3s, toolsPod);
 
         // CREATE TABLE
-        execSql(kubernetesClient, toolsPod, "CREATE TABLE test_table (id int primary key, name string)");
+        execSql(k3s, toolsPod, "CREATE TABLE test_table (id int primary key, name string)");
         LOG.info("Table created.");
 
         // INSERT
-        execSql(kubernetesClient, toolsPod, "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
+        execSql(k3s, toolsPod, "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
         LOG.info("Row inserted.");
 
         // SELECT and verify
-        String output = execSql(kubernetesClient, toolsPod, "SELECT id, name FROM test_table");
+        String output = execSql(k3s, toolsPod, "SELECT id, name FROM test_table");
         LOG.info("SELECT output: " + output);
         assertTrue("Expected 'hello' in output", output.contains("hello"));
         assertTrue("Expected '1' in output", output.contains("1"));
@@ -164,11 +160,11 @@ public class HerdDBKubernetesIT {
     /**
      * Wait for the HerdDB tablespace to be fully booted by polling via CLI.
      */
-    static void waitForTablespace(KubernetesClient client, String toolsPod) throws Exception {
+    static void waitForTablespace(K3sContainer k3sContainer, String toolsPod) throws Exception {
         long deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(10);
         while (System.currentTimeMillis() < deadline) {
             try {
-                execSqlWithTimeout(client, toolsPod, "SELECT * FROM systables LIMIT 1", 30);
+                execSqlViaKubectl(k3sContainer, toolsPod, "SELECT * FROM systables LIMIT 1");
                 LOG.info("Tablespace is ready.");
                 return;
             } catch (Exception e) {
@@ -192,78 +188,26 @@ public class HerdDBKubernetesIT {
      * Execute a SQL statement via herddb-cli in the tools pod.
      * Returns the CLI stdout output.
      */
-    static String execSql(KubernetesClient client, String toolsPodName, String sql) throws Exception {
-        return execSqlWithTimeout(client, toolsPodName, sql, 300);
-    }
-
-    static String execSqlWithTimeout(KubernetesClient client, String toolsPodName, String sql,
-                                     int timeoutSeconds) throws Exception {
-        return execInPod(client, toolsPodName, timeoutSeconds,
-                "bash", "-c", "herddb-cli --query " + shellQuote(sql) + "; echo \"EXIT_CODE:$?\"");
-    }
-
-    private static String shellQuote(String s) {
-        return "'" + s.replace("'", "'\\''") + "'";
+    static String execSql(K3sContainer k3sContainer, String toolsPodName, String sql) throws Exception {
+        return execSqlViaKubectl(k3sContainer, toolsPodName, sql);
     }
 
     /**
-     * Execute a command in a pod and return stdout.
-     * Uses bash wrapper with exit code marker to avoid relying on
-     * ExecListener.onClose which is unreliable in some fabric8 versions.
+     * Execute SQL via kubectl exec inside the K3s container.
+     * This is more reliable than the fabric8 exec API whose WebSocket
+     * onClose callback doesn't fire consistently on CI.
      */
-    static String execInPod(KubernetesClient client, String podName, int timeoutSeconds,
-                            String... command) throws Exception {
-        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
-        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        CompletableFuture<Void> doneFuture = new CompletableFuture<>();
-
-        try (ExecWatch exec = client.pods()
-                .inNamespace("default")
-                .withName(podName)
-                .writingOutput(stdout)
-                .writingError(stderr)
-                .usingListener(new ExecListener() {
-                    @Override
-                    public void onOpen() {
-                    }
-                    @Override
-                    public void onFailure(Throwable t, Response failureResponse) {
-                        doneFuture.completeExceptionally(t);
-                    }
-                    @Override
-                    public void onClose(int code, String reason) {
-                        doneFuture.complete(null);
-                    }
-                })
-                .exec(command)) {
-            doneFuture.get(timeoutSeconds, TimeUnit.SECONDS);
-            String out = stdout.toString(StandardCharsets.UTF_8);
-            String err = stderr.toString(StandardCharsets.UTF_8);
-
-            // Parse exit code from our marker
-            int exitCode = 0;
-            String cleanOut = out;
-            int markerIdx = out.lastIndexOf("EXIT_CODE:");
-            if (markerIdx >= 0) {
-                String codeStr = out.substring(markerIdx + "EXIT_CODE:".length()).trim();
-                try {
-                    exitCode = Integer.parseInt(codeStr);
-                } catch (NumberFormatException e) {
-                    // ignore
-                }
-                cleanOut = out.substring(0, markerIdx).trim();
-            }
-
-            if (exitCode != 0) {
-                throw new RuntimeException("Command failed (exit=" + exitCode + "): " + err + "\nstdout: " + cleanOut);
-            }
-            if (err.contains("Exception") || err.contains("ERROR")) {
-                if (cleanOut.isEmpty()) {
-                    throw new RuntimeException("Command produced error output: " + err);
-                }
-            }
-            return cleanOut;
+    static String execSqlViaKubectl(K3sContainer k3sContainer, String toolsPodName, String sql) throws Exception {
+        org.testcontainers.containers.Container.ExecResult result = k3sContainer.execInContainer(
+                "kubectl", "exec", toolsPodName, "--",
+                "herddb-cli", "--query", sql);
+        String out = result.getStdout();
+        String err = result.getStderr();
+        if (result.getExitCode() != 0) {
+            throw new RuntimeException("SQL failed (exit=" + result.getExitCode() + "): " + err
+                    + "\nstdout: " + out);
         }
+        return out;
     }
 
     private static String findHelmChartPath() {

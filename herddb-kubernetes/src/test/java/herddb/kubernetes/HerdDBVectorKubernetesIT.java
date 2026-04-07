@@ -217,20 +217,20 @@ public class HerdDBVectorKubernetesIT {
         String toolsPod = getToolsPodName();
 
         // Wait for tablespace to be ready via CLI
-        HerdDBKubernetesIT.waitForTablespace(kubernetesClient, toolsPod);
+        HerdDBKubernetesIT.waitForTablespace(k3s, toolsPod);
 
         // CREATE TABLE with vector column
-        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
+        HerdDBKubernetesIT.execSql(k3s, toolsPod,
                 "CREATE TABLE vec_test (id int primary key, name string, vec floata not null)");
         LOG.info("Table with vector column created.");
 
         // CREATE VECTOR INDEX (validates indexing services are connected)
-        HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
+        HerdDBKubernetesIT.execSql(k3s, toolsPod,
                 "CREATE VECTOR INDEX vidx ON vec_test(vec)");
         LOG.info("Vector index created.");
 
         // Verify table exists via systables
-        String output = HerdDBKubernetesIT.execSql(kubernetesClient, toolsPod,
+        String output = HerdDBKubernetesIT.execSql(k3s, toolsPod,
                 "SELECT table_name FROM systables WHERE table_name='vec_test'");
         assertTrue("Expected vec_test in systables", output.contains("vec_test"));
         LOG.info("Table verified in systables.");
