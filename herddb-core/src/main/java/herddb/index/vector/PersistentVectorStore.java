@@ -3343,7 +3343,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
         if (stats == null) {
             return;
         }
-        stats.clear();
         for (VectorSegment seg : segments) {
             stats.registerSuccessfulValue(seg.estimatedSizeBytes);
         }
