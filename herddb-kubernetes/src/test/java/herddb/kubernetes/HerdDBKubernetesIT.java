@@ -110,7 +110,22 @@ public class HerdDBKubernetesIT {
         LOG.info("Applying " + resources.size() + " Kubernetes resources...");
         kubernetesClient.resourceList(resources).createOrReplace();
 
-        // Wait for the server pod to be ready (readiness probe checks TCP port 7000)
+        // Wait for ZooKeeper and BookKeeper
+        LOG.info("Waiting for ZooKeeper pod to be ready...");
+        kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "zookeeper")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+        LOG.info("ZooKeeper pod is ready.");
+
+        LOG.info("Waiting for BookKeeper pod to be ready...");
+        kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "bookkeeper")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+        LOG.info("BookKeeper pod is ready.");
+
+        // Wait for the server pod to be ready
         LOG.info("Waiting for HerdDB server pod to be ready...");
         kubernetesClient.pods()
                 .inNamespace("default")
@@ -245,12 +260,32 @@ public class HerdDBKubernetesIT {
                 + "Looked in: " + String.join(", ", candidates));
     }
 
+    private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+            + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
+
     private static String helmTemplate(String chartPath) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
                 "helm", "template", "test-release", chartPath,
-                "--set", "server.mode=standalone",
+                "--set", "server.mode=cluster",
                 "--set", "server.replicaCount=1",
                 "--set", "tools.enabled=true",
+                "--set", "zookeeper.enabled=true",
+                "--set", "bookkeeper.enabled=true",
+                "--set", "bookkeeper.replicaCount=1",
+                "--set", "zookeeper.javaOpts=" + INFRA_JAVA_OPTS,
+                "--set", "zookeeper.resources.requests.memory=256Mi",
+                "--set", "zookeeper.resources.requests.cpu=0.5",
+                "--set", "zookeeper.resources.limits.memory=256Mi",
+                "--set", "zookeeper.resources.limits.cpu=0.5",
+                "--set", "zookeeper.storage.size=1Gi",
+                "--set", "bookkeeper.javaOpts=" + INFRA_JAVA_OPTS,
+                "--set", "bookkeeper.resources.requests.memory=256Mi",
+                "--set", "bookkeeper.resources.requests.cpu=0.5",
+                "--set", "bookkeeper.resources.limits.memory=256Mi",
+                "--set", "bookkeeper.resources.limits.cpu=0.5",
+                "--set", "bookkeeper.storage.journal.size=1Gi",
+                "--set", "bookkeeper.storage.ledger.size=1Gi",
                 "--set", "server.javaOpts=" + SERVER_JAVA_OPTS,
                 "--set", "server.resources.requests.memory=512Mi",
                 "--set", "server.resources.requests.cpu=0.5",
