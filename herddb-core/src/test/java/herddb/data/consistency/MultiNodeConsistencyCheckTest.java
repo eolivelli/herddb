@@ -22,6 +22,7 @@ package herddb.data.consistency;
 import static herddb.core.TestUtils.execute;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import herddb.utils.TestUtils;
 import herddb.core.DBManager;
 import herddb.core.ReplicatedLogtestcase;
 import herddb.model.ColumnTypes;
@@ -85,6 +86,11 @@ public class MultiNodeConsistencyCheckTest extends ReplicatedLogtestcase {
 
                 //The follower is always back 1, I make an entry to make him apply consistency log
                 execute(manager1, "INSERT INTO t2.table1 (id,name) values (?,?)", Arrays.asList("3", false));
+
+                // Wait for the follower to process the consistency check entry
+                TestUtils.waitForCondition(() -> callCount.get() >= 2,
+                        TestUtils.NOOP, 100,
+                        "follower to execute consistency check (callCount=" + callCount.get() + ")");
             }
         }
         //Expected 2 call for createChecksum (node1 and node2)
