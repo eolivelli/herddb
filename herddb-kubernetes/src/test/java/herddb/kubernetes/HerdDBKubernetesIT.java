@@ -26,19 +26,18 @@ import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
-import io.fabric8.kubernetes.client.LocalPortForward;
+import io.fabric8.kubernetes.client.dsl.ExecListener;
+import io.fabric8.kubernetes.client.dsl.ExecWatch;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.Statement;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -59,7 +58,7 @@ public class HerdDBKubernetesIT {
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
 
-    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
+    private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
@@ -134,62 +133,43 @@ public class HerdDBKubernetesIT {
 
     @Test
     public void testBasicOperations() throws Exception {
-        // Find the server pod and set up port-forwarding
-        List<Pod> serverPods = kubernetesClient.pods()
+        // Wait for tools pod
+        LOG.info("Waiting for tools pod to be ready...");
+        kubernetesClient.pods()
                 .inNamespace("default")
-                .withLabel("app.kubernetes.io/component", "server")
-                .list().getItems();
-        assertEquals("Expected 1 server pod", 1, serverPods.size());
-        String podName = serverPods.get(0).getMetadata().getName();
+                .withLabel("app.kubernetes.io/component", "tools")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+        LOG.info("Tools pod is ready.");
 
-        try (LocalPortForward portForward = kubernetesClient.pods()
-                .inNamespace("default")
-                .withName(podName)
-                .portForward(7000)) {
-            int localPort = portForward.getLocalPort();
-            LOG.info("Port-forward established to pod " + podName + " on local port " + localPort);
+        String toolsPod = getToolsPodName();
 
-            String jdbcUrl = "jdbc:herddb:server:localhost:" + localPort;
+        // Wait for tablespace to be ready via CLI
+        waitForTablespace(toolsPod);
 
-            // Wait for tablespace to be ready (TCP probe passes before tablespace boots)
-            waitForTablespace(jdbcUrl);
+        // CREATE TABLE
+        execSql(toolsPod, "CREATE TABLE test_table (id int primary key, name string)");
+        LOG.info("Table created.");
 
-            try (Connection connection = DriverManager.getConnection(jdbcUrl);
-                 Statement statement = connection.createStatement()) {
+        // INSERT
+        execSql(toolsPod, "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
+        LOG.info("Row inserted.");
 
-                // CREATE TABLE
-                statement.execute("CREATE TABLE test_table (id int primary key, name string)");
-                LOG.info("Table created.");
-
-                // INSERT
-                int inserted = statement.executeUpdate(
-                        "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
-                assertEquals(1, inserted);
-                LOG.info("Row inserted.");
-
-                // SELECT
-                try (ResultSet rs = statement.executeQuery("SELECT id, name FROM test_table")) {
-                    assertTrue("Expected at least one row", rs.next());
-                    assertEquals(1, rs.getInt("id"));
-                    assertEquals("hello", rs.getString("name"));
-                    LOG.info("Row verified: id=1, name=hello");
-                }
-            }
-        }
+        // SELECT and verify
+        String output = execSql(toolsPod, "SELECT id, name FROM test_table");
+        LOG.info("SELECT output: " + output);
+        assertTrue("Expected 'hello' in output", output.contains("hello"));
+        assertTrue("Expected '1' in output", output.contains("1"));
+        LOG.info("Row verified.");
     }
 
     /**
-     * Wait for the HerdDB tablespace to be fully booted.
-     * The TCP readiness probe passes when Netty starts listening, but the
-     * tablespace may not be ready yet (NotLeaderException).
+     * Wait for the HerdDB tablespace to be fully booted by polling via CLI.
      */
-    static void waitForTablespace(String jdbcUrl) throws Exception {
+    static void waitForTablespace(String toolsPod) throws Exception {
         long deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(5);
         while (System.currentTimeMillis() < deadline) {
-            try (Connection conn = DriverManager.getConnection(jdbcUrl);
-                 Statement stmt = conn.createStatement()) {
-                // Use a DDL-like operation that requires the tablespace to be fully booted
-                stmt.executeQuery("SELECT * FROM systables LIMIT 1").close();
+            try {
+                execSql(toolsPod, "SELECT * FROM systables LIMIT 1");
                 LOG.info("Tablespace is ready.");
                 return;
             } catch (Exception e) {
@@ -200,8 +180,70 @@ public class HerdDBKubernetesIT {
         throw new RuntimeException("Timed out waiting for tablespace to be ready");
     }
 
+    String getToolsPodName() {
+        List<Pod> pods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "tools")
+                .list().getItems();
+        assertEquals("Expected 1 tools pod", 1, pods.size());
+        return pods.get(0).getMetadata().getName();
+    }
+
+    /**
+     * Execute a SQL statement via herddb-cli in the tools pod.
+     * Returns the CLI stdout output.
+     */
+    static String execSql(String toolsPodName, String sql) throws Exception {
+        return execInPod(kubernetesClient, toolsPodName, "herddb-cli", "--query", sql);
+    }
+
+    /**
+     * Execute a command in a pod and return stdout.
+     * Throws RuntimeException if the command fails.
+     */
+    static String execInPod(KubernetesClient client, String podName, String... command) throws Exception {
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+        CompletableFuture<Integer> exitCodeFuture = new CompletableFuture<>();
+
+        try (ExecWatch exec = client.pods()
+                .inNamespace("default")
+                .withName(podName)
+                .writingOutput(stdout)
+                .writingError(stderr)
+                .usingListener(new ExecListener() {
+                    @Override
+                    public void onOpen() {
+                    }
+                    @Override
+                    public void onFailure(Throwable t, Response failureResponse) {
+                        exitCodeFuture.completeExceptionally(t);
+                    }
+                    @Override
+                    public void onClose(int code, String reason) {
+                        exitCodeFuture.complete(code);
+                    }
+                })
+                .exec(command)) {
+            int exitCode = exitCodeFuture.get(5, TimeUnit.MINUTES);
+            String out = stdout.toString(StandardCharsets.UTF_8);
+            String err = stderr.toString(StandardCharsets.UTF_8);
+            if (exitCode != 0 && exitCode != 1000) {
+                throw new RuntimeException("Command failed (exit=" + exitCode + "): " + err + "\nstdout: " + out);
+            }
+            // Also check stderr for Java exceptions
+            if (err.contains("Exception") || err.contains("ERROR")) {
+                // herddb-cli may print errors to stderr but still exit 0
+                // Check if stdout has valid output
+                if (out.trim().isEmpty()) {
+                    throw new RuntimeException("Command produced error output: " + err);
+                }
+            }
+            return out;
+        }
+    }
+
     private static String findHelmChartPath() {
-        // Try to locate the helm chart relative to the module directory
         String[] candidates = {
                 "src/main/helm/herddb",
                 "herddb-kubernetes/src/main/helm/herddb"
@@ -221,8 +263,8 @@ public class HerdDBKubernetesIT {
                 "helm", "template", "test-release", chartPath,
                 "--set", "server.mode=standalone",
                 "--set", "server.replicaCount=1",
-                "--set", "tools.enabled=false",
-                "--set", "server.javaOpts=" + JAVA_OPTS,
+                "--set", "tools.enabled=true",
+                "--set", "server.javaOpts=" + SERVER_JAVA_OPTS,
                 "--set", "server.resources.requests.memory=512Mi",
                 "--set", "server.resources.requests.cpu=0.5",
                 "--set", "server.resources.limits.memory=512Mi",

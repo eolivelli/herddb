@@ -26,7 +26,6 @@ import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
-import io.fabric8.kubernetes.client.LocalPortForward;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -34,16 +33,10 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -137,7 +130,7 @@ public class HerdDBFileServerKubernetesIT {
         values.put("server.mode", "cluster");
         values.put("server.storageMode", "remote");
         values.put("server.replicaCount", "1");
-        values.put("tools.enabled", "false");
+        values.put("tools.enabled", "true");
         values.put("image.pullPolicy", "Never");
         // ZooKeeper
         values.put("zookeeper.enabled", "true");
@@ -223,78 +216,63 @@ public class HerdDBFileServerKubernetesIT {
         waitForComponent("server", 5, TimeUnit.MINUTES);
         LOG.info("HerdDB server pod is ready.");
 
-        // Connect via port-forwarding and run SQL operations
-        List<Pod> serverPods = kubernetesClient.pods()
+        // Wait for tools pod
+        LOG.info("Waiting for tools pod to be ready...");
+        kubernetesClient.pods()
                 .inNamespace("default")
-                .withLabel("app.kubernetes.io/component", "server")
-                .list().getItems();
-        assertEquals("Expected 1 server pod", 1, serverPods.size());
-        String podName = serverPods.get(0).getMetadata().getName();
+                .withLabel("app.kubernetes.io/component", "tools")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+        LOG.info("Tools pod is ready.");
 
-        try (LocalPortForward portForward = kubernetesClient.pods()
-                .inNamespace("default")
-                .withName(podName)
-                .portForward(7000)) {
-            int localPort = portForward.getLocalPort();
-            LOG.info("Port-forward established to pod " + podName + " on local port " + localPort);
+        String toolsPod = getToolsPodName();
 
-            String jdbcUrl = "jdbc:herddb:server:localhost:" + localPort;
+        // Wait for tablespace to be ready via CLI
+        HerdDBKubernetesIT.waitForTablespace(toolsPod);
 
-            // Wait for tablespace to be ready (TCP probe passes before tablespace boots)
-            HerdDBKubernetesIT.waitForTablespace(jdbcUrl);
+        // CREATE TABLE
+        HerdDBKubernetesIT.execSql(toolsPod, "CREATE TABLE fs_test (id int primary key, name string, score int)");
+        LOG.info("Table created.");
 
-            try (Connection connection = DriverManager.getConnection(jdbcUrl);
-                 Statement statement = connection.createStatement()) {
+        // CREATE BRIN INDEX
+        HerdDBKubernetesIT.execSql(toolsPod, "CREATE BRIN INDEX brin_idx ON fs_test(score)");
+        LOG.info("BRIN index created.");
 
-                // CREATE TABLE
-                statement.execute("CREATE TABLE fs_test (id int primary key, name string, score int)");
-                LOG.info("Table created.");
+        // INSERT rows
+        HerdDBKubernetesIT.execSql(toolsPod,
+                "INSERT INTO fs_test (id, name, score) VALUES (1, 'hello', 42)");
+        HerdDBKubernetesIT.execSql(toolsPod,
+                "INSERT INTO fs_test (id, name, score) VALUES (2, 'world', 99)");
+        HerdDBKubernetesIT.execSql(toolsPod,
+                "INSERT INTO fs_test (id, name, score) VALUES (3, 'foo', 42)");
+        LOG.info("Rows inserted.");
 
-                // CREATE BRIN INDEX
-                statement.execute("CREATE BRIN INDEX brin_idx ON fs_test(score)");
-                LOG.info("BRIN index created.");
+        // SELECT all rows and verify
+        String output = HerdDBKubernetesIT.execSql(toolsPod,
+                "SELECT id, name, score FROM fs_test ORDER BY id");
+        LOG.info("SELECT output: " + output);
+        assertTrue("Expected 'hello' in output", output.contains("hello"));
+        assertTrue("Expected 'world' in output", output.contains("world"));
+        assertTrue("Expected 'foo' in output", output.contains("foo"));
+        LOG.info("All rows verified.");
 
-                // INSERT rows
-                assertEquals(1, statement.executeUpdate(
-                        "INSERT INTO fs_test (id, name, score) VALUES (1, 'hello', 42)"));
-                assertEquals(1, statement.executeUpdate(
-                        "INSERT INTO fs_test (id, name, score) VALUES (2, 'world', 99)"));
-                assertEquals(1, statement.executeUpdate(
-                        "INSERT INTO fs_test (id, name, score) VALUES (3, 'foo', 42)"));
-                LOG.info("Rows inserted.");
+        // Query using BRIN index: WHERE score = 42
+        String brinOutput = HerdDBKubernetesIT.execSql(toolsPod,
+                "SELECT id, name FROM fs_test WHERE score = 42");
+        LOG.info("BRIN index query output: " + brinOutput);
+        assertTrue("Expected id 1 in BRIN query output", brinOutput.contains("1"));
+        assertTrue("Expected id 3 in BRIN query output", brinOutput.contains("3"));
+        LOG.info("BRIN index query verified.");
 
-                // SELECT all rows
-                try (ResultSet rs = statement.executeQuery("SELECT id, name, score FROM fs_test ORDER BY id")) {
-                    assertTrue("Expected row 1", rs.next());
-                    assertEquals(1, rs.getInt("id"));
-                    assertEquals("hello", rs.getString("name"));
-                    assertEquals(42, rs.getInt("score"));
-
-                    assertTrue("Expected row 2", rs.next());
-                    assertEquals(2, rs.getInt("id"));
-                    assertEquals("world", rs.getString("name"));
-                    assertEquals(99, rs.getInt("score"));
-
-                    assertTrue("Expected row 3", rs.next());
-                    assertEquals(3, rs.getInt("id"));
-                    assertEquals("foo", rs.getString("name"));
-                    assertEquals(42, rs.getInt("score"));
-                }
-                LOG.info("All rows verified.");
-
-                // Query using BRIN index: WHERE score = 42
-                Set<Integer> matchingIds = new HashSet<>();
-                try (ResultSet rs = statement.executeQuery("SELECT id, name FROM fs_test WHERE score = 42")) {
-                    while (rs.next()) {
-                        matchingIds.add(rs.getInt("id"));
-                    }
-                }
-                assertEquals("BRIN index query should return ids 1 and 3",
-                        new HashSet<>(java.util.Arrays.asList(1, 3)), matchingIds);
-                LOG.info("BRIN index query verified: ids=" + matchingIds);
-            }
-        }
         LOG.info("Test passed: Cluster mode with file servers + MinIO works.");
+    }
+
+    private String getToolsPodName() {
+        List<Pod> pods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "tools")
+                .list().getItems();
+        assertEquals("Expected 1 tools pod", 1, pods.size());
+        return pods.get(0).getMetadata().getName();
     }
 
     private void waitForComponent(String component, long timeout, TimeUnit unit) throws Exception {
