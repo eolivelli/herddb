@@ -1279,36 +1279,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     return pvs.getEstimatedSizeBytes();
                 }
             });
-            indexStats.registerGauge("segment_size_min_bytes", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getMinSegmentSizeBytes();
-                }
-            });
-            indexStats.registerGauge("segment_size_max_bytes", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getMaxSegmentSizeBytes();
-                }
-            });
-            indexStats.registerGauge("segment_size_median_bytes", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getMedianSegmentSizeBytes();
-                }
-            });
+            pvs.setSegmentSizeStats(indexStats.getOpStatsLogger("segment_size_bytes"));
         }
     }
 

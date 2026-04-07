@@ -51,6 +51,7 @@ import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
+import org.apache.bookkeeper.stats.OpStatsLogger;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
@@ -219,6 +220,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final long compactionIntervalMs;
     private final long maxVectorMemoryBytes;
     private final VectorMemoryBudget memoryBudget;
+
+    /** Optional stats logger for recording per-segment size distribution. */
+    private volatile OpStatsLogger segmentSizeStats;
 
     // -------------------------------------------------------------------------
     // In-memory state -- LIVE inserts (new since last checkpoint)
@@ -1509,6 +1513,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
             this.pendingCheckpointDeletes = null;
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
             dirty.set(totalLiveSize() > 0);
+
+            recordSegmentSizeDistribution();
         } finally {
             CountDownLatch latch = this.checkpointPhaseComplete;
             this.checkpointPhaseComplete = null;
@@ -3328,33 +3334,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return total;
     }
 
-    public long getMinSegmentSizeBytes() {
-        long min = Long.MAX_VALUE;
-        for (VectorSegment seg : segments) {
-            if (seg.estimatedSizeBytes < min) {
-                min = seg.estimatedSizeBytes;
-            }
-        }
-        return min == Long.MAX_VALUE ? 0 : min;
+    public void setSegmentSizeStats(OpStatsLogger segmentSizeStats) {
+        this.segmentSizeStats = segmentSizeStats;
     }
 
-    public long getMaxSegmentSizeBytes() {
-        long max = 0;
+    private void recordSegmentSizeDistribution() {
+        OpStatsLogger stats = this.segmentSizeStats;
+        if (stats == null) {
+            return;
+        }
+        stats.clear();
         for (VectorSegment seg : segments) {
-            if (seg.estimatedSizeBytes > max) {
-                max = seg.estimatedSizeBytes;
-            }
+            stats.registerSuccessfulValue(seg.estimatedSizeBytes);
         }
-        return max;
-    }
-
-    public long getMedianSegmentSizeBytes() {
-        List<VectorSegment> segs = new ArrayList<>(segments);
-        if (segs.isEmpty()) {
-            return 0;
-        }
-        segs.sort((a, b) -> Long.compare(a.estimatedSizeBytes, b.estimatedSizeBytes));
-        return segs.get(segs.size() / 2).estimatedSizeBytes;
     }
 
     public boolean isDirty() {
