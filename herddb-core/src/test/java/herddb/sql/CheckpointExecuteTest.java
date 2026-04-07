@@ -83,7 +83,7 @@ public class CheckpointExecuteTest {
                 execute(manager, "EXECUTE CHECKPOINT", Collections.emptyList());
                 fail("Expected StatementExecutionException");
             } catch (StatementExecutionException e) {
-                assertTrue(e.getMessage().contains("CHECKPOINT requires one parameter"));
+                assertTrue(e.getMessage().contains("CHECKPOINT requires 1 or 2 parameters"));
             }
         }
     }

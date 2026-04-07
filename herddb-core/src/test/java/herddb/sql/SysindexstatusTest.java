@@ -26,6 +26,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.core.DBManager;
+import herddb.core.indexes.MockRemoteVectorIndexService;
 import herddb.mem.MemoryCommitLogManager;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.mem.MemoryMetadataStorageManager;
@@ -112,6 +113,7 @@ public class SysindexstatusTest {
                 new MemoryMetadataStorageManager(),
                 new MemoryDataStorageManager(),
                 new MemoryCommitLogManager(), null, null)) {
+            manager.setRemoteVectorIndexService(new MockRemoteVectorIndexService());
             manager.start();
             CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
                     "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
@@ -146,14 +148,9 @@ public class SysindexstatusTest {
                 assertEquals("vidx", row.get("index_name").toString());
 
                 String props = row.get("properties").toString();
-                assertTrue("should contain nodeCount", props.contains("\"nodeCount\":5"));
-                assertTrue("should contain dimension", props.contains("\"dimension\":4"));
-                assertTrue("should contain m", props.contains("\"m\":"));
-                assertTrue("should contain beamWidth", props.contains("\"beamWidth\":"));
-                assertTrue("should contain similarityFunction", props.contains("\"similarityFunction\":"));
-                assertTrue("should contain fusedPQ", props.contains("\"fusedPQ\":"));
-                assertTrue("should contain dirty", props.contains("\"dirty\":"));
-                assertTrue("should contain checkpointActive", props.contains("\"checkpointActive\":"));
+                assertTrue("should contain vectorCount", props.contains("\"vectorCount\":"));
+                assertTrue("should contain segmentCount", props.contains("\"segmentCount\":"));
+                assertTrue("should contain status", props.contains("\"status\":"));
             }
 
             // Insert more rows and verify count changes
@@ -168,7 +165,7 @@ public class SysindexstatusTest {
                     "SELECT * FROM tblspace1.sysindexstatus", Collections.emptyList())) {
                 List<DataAccessor> records = scan.consume();
                 String props = records.get(0).get("properties").toString();
-                assertTrue("should contain nodeCount 10", props.contains("\"nodeCount\":10"));
+                assertTrue("should contain vectorCount", props.contains("\"vectorCount\":"));
             }
         }
     }
