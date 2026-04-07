@@ -9,5 +9,5 @@ metadata:
 data:
   herddb-cli: |
     #!/bin/bash
-    exec /opt/herddb/bin/herddb-cli.sh -u "${HERDDB_JDBC_URL}" "$@"
+    exec /opt/herddb/bin/herddb-cli.sh -x "${HERDDB_JDBC_URL}" "$@"
 {{- end }}

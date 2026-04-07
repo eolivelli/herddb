@@ -28,6 +28,8 @@ spec:
           env:
             - name: HERDDB_JDBC_URL
               value: {{ include "herddb.jdbcUrl" . | quote }}
+            - name: JAVA_OPTS
+              value: {{ .Values.tools.javaOpts | default "-Xms128m -Xmx256m -Djava.net.preferIPv4Stack=true" | quote }}
           resources:
             {{- toYaml .Values.tools.resources | nindent 12 }}
           volumeMounts:

@@ -40,7 +40,7 @@ tests:
           path: spec.template.spec.containers[0].env
           content:
             name: HERDDB_JDBC_URL
-            value: "jdbc:herddb:server://RELEASE-NAME-herddb-server-0.RELEASE-NAME-herddb-server.NAMESPACE.svc.cluster.local:7000/herd"
+            value: "jdbc:herddb:server:RELEASE-NAME-herddb-server-0.RELEASE-NAME-herddb-server.NAMESPACE.svc.cluster.local:7000"
 
   - it: should mount the tools scripts configmap
     template: templates/tools-deployment.yaml

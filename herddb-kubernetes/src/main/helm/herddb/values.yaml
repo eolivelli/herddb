@@ -59,6 +59,10 @@ fileServer:
     # Credentials. When minio.enabled=true defaults to minio.adminUser/adminPassword.
     accessKey: ""
     secretKey: ""
+    # Name of an existing Kubernetes Secret containing S3_ACCESS_KEY and
+    # S3_SECRET_KEY entries. When set, credentials are read from the Secret
+    # instead of from accessKey/secretKey above.
+    credentialsSecret: ""
     # Optional key prefix within the bucket
     prefix: ""
     # Local disk cache size in bytes (default 1 GB). The PVC is always used as cache dir.
@@ -159,6 +163,8 @@ indexingService:
 # Tools pod — sleep + pre-configured CLI for kubectl exec
 tools:
   enabled: true
+  # JVM options for the CLI (defaults to lightweight settings)
+  javaOpts: ""
   resources:
     requests:
       memory: "256Mi"

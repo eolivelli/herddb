@@ -89,10 +89,11 @@ ZooKeeper connection address (first ZK pod via headless service).
 {{- end }}
 
 {{/*
-JDBC URL for the first server pod (used by the tools pod).
+JDBC URL for the tools pod.
+Uses a direct server connection to the first server pod (FQDN).
 */}}
 {{- define "herddb.jdbcUrl" -}}
-{{- printf "jdbc:herddb:server://%s-server-0.%s-server.%s.svc.cluster.local:%d/herd"
+{{- printf "jdbc:herddb:server:%s-server-0.%s-server.%s.svc.cluster.local:%d"
     (include "herddb.fullname" .)
     (include "herddb.fullname" .)
     .Release.Namespace
