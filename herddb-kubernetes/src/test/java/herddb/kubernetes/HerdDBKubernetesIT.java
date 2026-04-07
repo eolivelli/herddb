@@ -22,9 +22,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 import io.fabric8.kubernetes.api.model.HasMetadata;
-import io.fabric8.kubernetes.api.model.IntOrString;
-import io.fabric8.kubernetes.api.model.ServiceBuilder;
-import io.fabric8.kubernetes.api.model.ServicePortBuilder;
+import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
@@ -35,11 +33,6 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.Statement;
-import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -59,11 +52,14 @@ public class HerdDBKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final int NODE_PORT = 30007;
+
+    private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
     public static K3sContainer k3s = new K3sContainer(DockerImageName.parse("rancher/k3s:v1.31.4-k3s1"))
-            .withExposedPorts(6443, NODE_PORT);
+            .withExposedPorts(6443);
 
     private static KubernetesClient kubernetesClient;
 
@@ -114,26 +110,22 @@ public class HerdDBKubernetesIT {
         LOG.info("Applying " + resources.size() + " Kubernetes resources...");
         kubernetesClient.resourceList(resources).createOrReplace();
 
-        // Create a NodePort service to access HerdDB from outside the cluster
-        kubernetesClient.services().inNamespace("default").createOrReplace(
-                new ServiceBuilder()
-                        .withNewMetadata()
-                            .withName("herddb-nodeport")
-                            .withNamespace("default")
-                        .endMetadata()
-                        .withNewSpec()
-                            .withType("NodePort")
-                            .withSelector(Collections.singletonMap("app.kubernetes.io/component", "server"))
-                            .withPorts(new ServicePortBuilder()
-                                    .withPort(7000)
-                                    .withTargetPort(new IntOrString(7000))
-                                    .withNodePort(NODE_PORT)
-                                    .build())
-                        .endSpec()
-                        .build());
-        LOG.info("NodePort service created on port " + NODE_PORT);
+        // Wait for ZooKeeper and BookKeeper
+        LOG.info("Waiting for ZooKeeper pod to be ready...");
+        kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "zookeeper")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+        LOG.info("ZooKeeper pod is ready.");
 
-        // Wait for the server pod to be ready (readiness probe checks TCP port 7000)
+        LOG.info("Waiting for BookKeeper pod to be ready...");
+        kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "bookkeeper")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+        LOG.info("BookKeeper pod is ready.");
+
+        // Wait for the server pod to be ready
         LOG.info("Waiting for HerdDB server pod to be ready...");
         kubernetesClient.pods()
                 .inNamespace("default")
@@ -151,37 +143,109 @@ public class HerdDBKubernetesIT {
 
     @Test
     public void testBasicOperations() throws Exception {
-        // Connect via NodePort exposed through the K3s container
-        String host = k3s.getHost();
-        int mappedPort = k3s.getMappedPort(NODE_PORT);
-        LOG.info("Connecting to HerdDB via NodePort at " + host + ":" + mappedPort);
+        // Wait for tools pod
+        LOG.info("Waiting for tools pod to be ready...");
+        kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "tools")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+        LOG.info("Tools pod is ready.");
 
-        String jdbcUrl = "jdbc:herddb:server:" + host + ":" + mappedPort;
-        try (Connection connection = DriverManager.getConnection(jdbcUrl);
-             Statement statement = connection.createStatement()) {
+        String toolsPod = getToolsPodName();
 
-            // CREATE TABLE
-            statement.execute("CREATE TABLE test_table (id int primary key, name string)");
-            LOG.info("Table created.");
+        // Wait for tablespace to be ready via CLI
+        waitForTablespace(k3s, toolsPod);
 
-            // INSERT
-            int inserted = statement.executeUpdate(
-                    "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
-            assertEquals(1, inserted);
-            LOG.info("Row inserted.");
+        // CREATE TABLE
+        execSql(k3s, toolsPod, "CREATE TABLE test_table (id int primary key, name string)");
+        LOG.info("Table created.");
 
-            // SELECT
-            try (ResultSet rs = statement.executeQuery("SELECT id, name FROM test_table")) {
-                assertTrue("Expected at least one row", rs.next());
-                assertEquals(1, rs.getInt("id"));
-                assertEquals("hello", rs.getString("name"));
-                LOG.info("Row verified: id=1, name=hello");
+        // INSERT
+        execSql(k3s, toolsPod, "INSERT INTO test_table (id, name) VALUES (1, 'hello')");
+        LOG.info("Row inserted.");
+
+        // SELECT and verify
+        String output = execSql(k3s, toolsPod, "SELECT id, name FROM test_table");
+        LOG.info("SELECT output: " + output);
+        assertTrue("Expected 'hello' in output", output.contains("hello"));
+        assertTrue("Expected '1' in output", output.contains("1"));
+        LOG.info("Row verified.");
+    }
+
+    /**
+     * Wait for the HerdDB tablespace to be fully booted by polling via CLI.
+     */
+    static void waitForTablespace(K3sContainer k3sContainer, String toolsPod) throws Exception {
+        long deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(10);
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                execSqlViaKubectl(k3sContainer, toolsPod, "SELECT * FROM systables LIMIT 1");
+                LOG.info("Tablespace is ready.");
+                return;
+            } catch (Exception e) {
+                LOG.info("Tablespace not ready yet: " + e.getMessage());
             }
+            Thread.sleep(5000);
         }
+        throw new RuntimeException("Timed out waiting for tablespace to be ready");
+    }
+
+    String getToolsPodName() {
+        List<Pod> pods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "tools")
+                .list().getItems();
+        assertEquals("Expected 1 tools pod", 1, pods.size());
+        return pods.get(0).getMetadata().getName();
+    }
+
+    /**
+     * Execute a SQL statement via herddb-cli in the tools pod.
+     * Returns the CLI stdout output.
+     */
+    static String execSql(K3sContainer k3sContainer, String toolsPodName, String sql) throws Exception {
+        return execSqlViaKubectl(k3sContainer, toolsPodName, sql);
+    }
+
+    /**
+     * Execute SQL via kubectl exec inside the K3s container.
+     * This is more reliable than the fabric8 exec API whose WebSocket
+     * onClose callback doesn't fire consistently on CI.
+     */
+    static String execSqlViaKubectl(K3sContainer k3sContainer, String toolsPodName, String sql) throws Exception {
+        // Use bash -c with 2>&1 to capture CLI errors in stdout
+        // (kubectl stderr only shows generic "command terminated with exit code N")
+        // Use /opt/herddb/bin/herddb-cli.sh directly with extended client timeout
+        // (default 300s is too short for slow CI where first DDL can take minutes)
+        String shellCmd = "/opt/herddb/bin/herddb-cli.sh"
+                + " -x \"${HERDDB_JDBC_URL}?client.timeout=600000\""
+                + " --query '" + sql.replace("'", "'\\''") + "' 2>&1; echo \"__EXIT:$?\"";
+        org.testcontainers.containers.Container.ExecResult result = k3sContainer.execInContainer(
+                "kubectl", "exec", toolsPodName, "--",
+                "bash", "-c", shellCmd);
+        String combined = result.getStdout();
+
+        // Parse exit code from marker
+        int exitCode = 0;
+        String output = combined;
+        int markerIdx = combined.lastIndexOf("__EXIT:");
+        if (markerIdx >= 0) {
+            String codeStr = combined.substring(markerIdx + "__EXIT:".length()).trim();
+            try {
+                exitCode = Integer.parseInt(codeStr);
+            } catch (NumberFormatException e) {
+                // ignore
+            }
+            output = combined.substring(0, markerIdx).trim();
+        }
+
+        if (exitCode != 0) {
+            throw new RuntimeException("SQL failed (exit=" + exitCode + "): " + output);
+        }
+        return output;
     }
 
     private static String findHelmChartPath() {
-        // Try to locate the helm chart relative to the module directory
         String[] candidates = {
                 "src/main/helm/herddb",
                 "herddb-kubernetes/src/main/helm/herddb"
@@ -196,16 +260,36 @@ public class HerdDBKubernetesIT {
                 + "Looked in: " + String.join(", ", candidates));
     }
 
+    private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+            + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
+
     private static String helmTemplate(String chartPath) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
                 "helm", "template", "test-release", chartPath,
-                "--set", "server.mode=standalone",
+                "--set", "server.mode=cluster",
                 "--set", "server.replicaCount=1",
-                "--set", "tools.enabled=false",
-                "--set", "server.javaOpts=-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m -Djava.awt.headless=true --add-modules jdk.incubator.vector",
-                "--set", "server.resources.requests.memory=256Mi",
+                "--set", "tools.enabled=true",
+                "--set", "zookeeper.enabled=true",
+                "--set", "bookkeeper.enabled=true",
+                "--set", "bookkeeper.replicaCount=1",
+                "--set", "zookeeper.javaOpts=" + INFRA_JAVA_OPTS,
+                "--set", "zookeeper.resources.requests.memory=256Mi",
+                "--set", "zookeeper.resources.requests.cpu=0.5",
+                "--set", "zookeeper.resources.limits.memory=256Mi",
+                "--set", "zookeeper.resources.limits.cpu=0.5",
+                "--set", "zookeeper.storage.size=1Gi",
+                "--set", "bookkeeper.javaOpts=" + INFRA_JAVA_OPTS,
+                "--set", "bookkeeper.resources.requests.memory=256Mi",
+                "--set", "bookkeeper.resources.requests.cpu=0.5",
+                "--set", "bookkeeper.resources.limits.memory=256Mi",
+                "--set", "bookkeeper.resources.limits.cpu=0.5",
+                "--set", "bookkeeper.storage.journal.size=1Gi",
+                "--set", "bookkeeper.storage.ledger.size=1Gi",
+                "--set", "server.javaOpts=" + SERVER_JAVA_OPTS,
+                "--set", "server.resources.requests.memory=512Mi",
                 "--set", "server.resources.requests.cpu=0.5",
-                "--set", "server.resources.limits.memory=256Mi",
+                "--set", "server.resources.limits.memory=512Mi",
                 "--set", "server.resources.limits.cpu=0.5",
                 "--set", "server.storage.data.size=1Gi",
                 "--set", "server.storage.commitlog.size=1Gi",

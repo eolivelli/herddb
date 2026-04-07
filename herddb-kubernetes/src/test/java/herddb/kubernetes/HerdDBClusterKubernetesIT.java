@@ -22,10 +22,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 import io.fabric8.kubernetes.api.model.HasMetadata;
-import io.fabric8.kubernetes.api.model.IntOrString;
 import io.fabric8.kubernetes.api.model.Pod;
-import io.fabric8.kubernetes.api.model.ServiceBuilder;
-import io.fabric8.kubernetes.api.model.ServicePortBuilder;
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
@@ -36,12 +33,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -66,15 +58,17 @@ public class HerdDBClusterKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final int NODE_PORT = 30007;
 
-    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
+    private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
+    private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
     public static K3sContainer k3s = new K3sContainer(DockerImageName.parse("rancher/k3s:v1.31.4-k3s1"))
-            .withExposedPorts(6443, NODE_PORT);
+            .withExposedPorts(6443);
 
     private static KubernetesClient kubernetesClient;
     private static String helmChartPath;
@@ -82,7 +76,6 @@ public class HerdDBClusterKubernetesIT {
 
     @BeforeClass
     public static void setup() throws Exception {
-        // Check that the docker image exists locally
         Process checkImage = new ProcessBuilder("docker", "image", "inspect", FULL_IMAGE)
                 .redirectErrorStream(true)
                 .start();
@@ -90,7 +83,6 @@ public class HerdDBClusterKubernetesIT {
         assumeTrue("Docker image " + FULL_IMAGE + " must be built first "
                 + "(run: mvn package jib:dockerBuild@build -pl herddb-docker)", exitCode == 0);
 
-        // Save docker image to a tarball
         Path imageTar = Files.createTempFile("herddb-image", ".tar");
         try {
             LOG.info("Saving docker image to tarball...");
@@ -99,7 +91,6 @@ public class HerdDBClusterKubernetesIT {
                     .start();
             assertEquals("docker save failed", 0, save.waitFor());
 
-            // Copy tarball into K3S container and import
             LOG.info("Loading image into K3S...");
             k3s.copyFileToContainer(MountableFile.forHostPath(imageTar), "/tmp/herddb.tar");
             k3s.execInContainer("ctr", "--address", "/run/k3s/containerd/containerd.sock",
@@ -108,7 +99,6 @@ public class HerdDBClusterKubernetesIT {
             Files.deleteIfExists(imageTar);
         }
 
-        // Create Kubernetes client
         String kubeConfigYaml = k3s.getKubeConfigYaml();
         Config config = Config.fromKubeconfig(kubeConfigYaml);
         config.setNamespace("default");
@@ -136,25 +126,22 @@ public class HerdDBClusterKubernetesIT {
         values.put("zookeeper.enabled", "true");
         values.put("bookkeeper.enabled", "false");
         values.put("image.pullPolicy", "Never");
-        // ZooKeeper resources
-        values.put("zookeeper.javaOpts", JAVA_OPTS);
+        values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("zookeeper.resources.requests.memory", "256Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
         values.put("zookeeper.resources.limits.memory", "256Mi");
         values.put("zookeeper.resources.limits.cpu", "0.5");
         values.put("zookeeper.storage.size", "1Gi");
-        // Server resources (standalone alongside ZK)
-        values.put("server.javaOpts", JAVA_OPTS);
-        values.put("server.resources.requests.memory", "256Mi");
+        values.put("server.javaOpts", SERVER_JAVA_OPTS);
+        values.put("server.resources.requests.memory", "512Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "256Mi");
+        values.put("server.resources.limits.memory", "512Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
 
         applyHelmChart(values);
 
-        // Wait for ZooKeeper pod to be ready
         LOG.info("Waiting for ZooKeeper pod to be ready...");
         kubernetesClient.pods()
                 .inNamespace("default")
@@ -162,7 +149,6 @@ public class HerdDBClusterKubernetesIT {
                 .waitUntilReady(5, TimeUnit.MINUTES);
         LOG.info("ZooKeeper pod is ready.");
 
-        // Verify ZK pod is running
         List<Pod> zkPods = kubernetesClient.pods()
                 .inNamespace("default")
                 .withLabel("app.kubernetes.io/component", "zookeeper")
@@ -186,33 +172,29 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.enabled", "true");
         values.put("bookkeeper.replicaCount", "1");
         values.put("image.pullPolicy", "Never");
-        // ZooKeeper resources
-        values.put("zookeeper.javaOpts", JAVA_OPTS);
+        values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("zookeeper.resources.requests.memory", "256Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
         values.put("zookeeper.resources.limits.memory", "256Mi");
         values.put("zookeeper.resources.limits.cpu", "0.5");
         values.put("zookeeper.storage.size", "1Gi");
-        // BookKeeper resources
-        values.put("bookkeeper.javaOpts", JAVA_OPTS);
+        values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("bookkeeper.resources.requests.memory", "256Mi");
         values.put("bookkeeper.resources.requests.cpu", "0.5");
         values.put("bookkeeper.resources.limits.memory", "256Mi");
         values.put("bookkeeper.resources.limits.cpu", "0.5");
         values.put("bookkeeper.storage.journal.size", "1Gi");
         values.put("bookkeeper.storage.ledger.size", "1Gi");
-        // Server resources (standalone alongside ZK+BK)
-        values.put("server.javaOpts", JAVA_OPTS);
-        values.put("server.resources.requests.memory", "256Mi");
+        values.put("server.javaOpts", SERVER_JAVA_OPTS);
+        values.put("server.resources.requests.memory", "512Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "256Mi");
+        values.put("server.resources.limits.memory", "512Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
 
         applyHelmChart(values);
 
-        // Wait for ZooKeeper pod first
         LOG.info("Waiting for ZooKeeper pod to be ready...");
         kubernetesClient.pods()
                 .inNamespace("default")
@@ -220,12 +202,10 @@ public class HerdDBClusterKubernetesIT {
                 .waitUntilReady(5, TimeUnit.MINUTES);
         LOG.info("ZooKeeper pod is ready.");
 
-        // Wait for BookKeeper pod
         LOG.info("Waiting for BookKeeper pod to be ready...");
         waitForComponent("bookkeeper", 5, TimeUnit.MINUTES);
         LOG.info("BookKeeper pod is ready.");
 
-        // Verify both pods are running
         List<Pod> zkPods = kubernetesClient.pods()
                 .inNamespace("default")
                 .withLabel("app.kubernetes.io/component", "zookeeper")
@@ -251,105 +231,80 @@ public class HerdDBClusterKubernetesIT {
         Map<String, String> values = new LinkedHashMap<>();
         values.put("server.mode", "cluster");
         values.put("server.replicaCount", "1");
-        values.put("tools.enabled", "false");
+        values.put("tools.enabled", "true");
         values.put("zookeeper.enabled", "true");
         values.put("bookkeeper.enabled", "true");
         values.put("bookkeeper.replicaCount", "1");
         values.put("image.pullPolicy", "Never");
-        // ZooKeeper resources
-        values.put("zookeeper.javaOpts", JAVA_OPTS);
+        values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("zookeeper.resources.requests.memory", "256Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
         values.put("zookeeper.resources.limits.memory", "256Mi");
         values.put("zookeeper.resources.limits.cpu", "0.5");
         values.put("zookeeper.storage.size", "1Gi");
-        // BookKeeper resources
-        values.put("bookkeeper.javaOpts", JAVA_OPTS);
+        values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("bookkeeper.resources.requests.memory", "256Mi");
         values.put("bookkeeper.resources.requests.cpu", "0.5");
         values.put("bookkeeper.resources.limits.memory", "256Mi");
         values.put("bookkeeper.resources.limits.cpu", "0.5");
         values.put("bookkeeper.storage.journal.size", "1Gi");
         values.put("bookkeeper.storage.ledger.size", "1Gi");
-        // Server resources (cluster mode)
-        values.put("server.javaOpts", JAVA_OPTS);
-        values.put("server.resources.requests.memory", "256Mi");
+        values.put("server.javaOpts", SERVER_JAVA_OPTS);
+        values.put("server.resources.requests.memory", "512Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "256Mi");
+        values.put("server.resources.limits.memory", "512Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
 
         applyHelmChart(values);
 
-        // Wait for ZooKeeper
         LOG.info("Waiting for ZooKeeper pod to be ready...");
         kubernetesClient.pods()
                 .inNamespace("default")
                 .withLabel("app.kubernetes.io/component", "zookeeper")
                 .waitUntilReady(5, TimeUnit.MINUTES);
-        LOG.info("ZooKeeper pod is ready.");
 
-        // Wait for BookKeeper
         LOG.info("Waiting for BookKeeper pod to be ready...");
         waitForComponent("bookkeeper", 5, TimeUnit.MINUTES);
-        LOG.info("BookKeeper pod is ready.");
 
-        // Create a NodePort service to access HerdDB from outside the cluster
-        kubernetesClient.services().inNamespace("default").createOrReplace(
-                new ServiceBuilder()
-                        .withNewMetadata()
-                            .withName("herddb-cluster-nodeport")
-                            .withNamespace("default")
-                        .endMetadata()
-                        .withNewSpec()
-                            .withType("NodePort")
-                            .withSelector(Collections.singletonMap("app.kubernetes.io/component", "server"))
-                            .withPorts(new ServicePortBuilder()
-                                    .withPort(7000)
-                                    .withTargetPort(new IntOrString(7000))
-                                    .withNodePort(NODE_PORT)
-                                    .build())
-                        .endSpec()
-                        .build());
-        LOG.info("NodePort service created on port " + NODE_PORT);
-
-        // Wait for HerdDB server
         LOG.info("Waiting for HerdDB server pod to be ready...");
         kubernetesClient.pods()
                 .inNamespace("default")
                 .withLabel("app.kubernetes.io/component", "server")
                 .waitUntilReady(5, TimeUnit.MINUTES);
-        LOG.info("HerdDB server pod is ready.");
 
-        // Connect via NodePort and run JDBC operations
-        String host = k3s.getHost();
-        int mappedPort = k3s.getMappedPort(NODE_PORT);
-        LOG.info("Connecting to HerdDB cluster via NodePort at " + host + ":" + mappedPort);
+        LOG.info("Waiting for tools pod to be ready...");
+        kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "tools")
+                .waitUntilReady(5, TimeUnit.MINUTES);
 
-        String jdbcUrl = "jdbc:herddb:server:" + host + ":" + mappedPort;
-        try (Connection connection = DriverManager.getConnection(jdbcUrl);
-             Statement statement = connection.createStatement()) {
+        String toolsPod = getToolsPodName();
+        HerdDBKubernetesIT.waitForTablespace(k3s, toolsPod);
 
-            // CREATE TABLE
-            statement.execute("CREATE TABLE cluster_test (id int primary key, name string)");
-            LOG.info("Table created in cluster mode.");
+        // CREATE TABLE
+        HerdDBKubernetesIT.execSql(k3s, toolsPod, "CREATE TABLE cluster_test (id int primary key, name string)");
+        LOG.info("Table created in cluster mode.");
 
-            // INSERT
-            int inserted = statement.executeUpdate(
-                    "INSERT INTO cluster_test (id, name) VALUES (1, 'cluster-hello')");
-            assertEquals(1, inserted);
-            LOG.info("Row inserted.");
+        // INSERT
+        HerdDBKubernetesIT.execSql(k3s, toolsPod, "INSERT INTO cluster_test (id, name) VALUES (1, 'cluster-hello')");
+        LOG.info("Row inserted.");
 
-            // SELECT
-            try (ResultSet rs = statement.executeQuery("SELECT id, name FROM cluster_test")) {
-                assertTrue("Expected at least one row", rs.next());
-                assertEquals(1, rs.getInt("id"));
-                assertEquals("cluster-hello", rs.getString("name"));
-                LOG.info("Row verified: id=1, name=cluster-hello");
-            }
-        }
+        // SELECT
+        String output = HerdDBKubernetesIT.execSql(k3s, toolsPod, "SELECT id, name FROM cluster_test");
+        assertTrue("Expected 'cluster-hello' in output", output.contains("cluster-hello"));
+        LOG.info("Row verified: " + output.trim());
         LOG.info("Test 3 passed: Cluster mode with JDBC operations works.");
+    }
+
+    private String getToolsPodName() {
+        List<Pod> pods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "tools")
+                .list().getItems();
+        assertEquals("Expected 1 tools pod", 1, pods.size());
+        return pods.get(0).getMetadata().getName();
     }
 
     private void applyHelmChart(Map<String, String> values) throws Exception {
@@ -368,7 +323,6 @@ public class HerdDBClusterKubernetesIT {
             LOG.info("Deleting " + lastAppliedResources.size() + " previously applied resources...");
             kubernetesClient.resourceList(lastAppliedResources).delete();
 
-            // Wait for all pods to terminate
             LOG.info("Waiting for pods to terminate...");
             for (int i = 0; i < 60; i++) {
                 List<Pod> pods = kubernetesClient.pods().inNamespace("default")
@@ -387,7 +341,6 @@ public class HerdDBClusterKubernetesIT {
                 }
             }
 
-            // Also delete any PVCs left over from StatefulSets
             kubernetesClient.persistentVolumeClaims().inNamespace("default").delete();
             try {
                 Thread.sleep(3000);
@@ -406,10 +359,9 @@ public class HerdDBClusterKubernetesIT {
                     .withLabel("app.kubernetes.io/component", component)
                     .list().getItems();
             if (!pods.isEmpty()) {
-                Pod pod = pods.get(0);
                 logPodStatus(component);
-                // Try to get logs if the container is running or has terminated
                 try {
+                    Pod pod = pods.get(0);
                     String logs = kubernetesClient.pods()
                             .inNamespace("default")
                             .withName(pod.getMetadata().getName())
@@ -425,7 +377,6 @@ public class HerdDBClusterKubernetesIT {
                 } catch (Exception e) {
                     LOG.info("Could not get logs for " + component + ": " + e.getMessage());
                 }
-                // Check if ready
                 boolean ready = pods.stream().allMatch(p ->
                         p.getStatus() != null
                         && p.getStatus().getConditions() != null
@@ -439,7 +390,6 @@ public class HerdDBClusterKubernetesIT {
             }
             Thread.sleep(10000);
         }
-        // Final status dump before failing
         logPodStatus(component);
         throw new RuntimeException("Timed out waiting for " + component + " pod to be ready");
     }

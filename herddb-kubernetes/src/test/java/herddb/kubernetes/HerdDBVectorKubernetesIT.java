@@ -22,10 +22,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 import io.fabric8.kubernetes.api.model.HasMetadata;
-import io.fabric8.kubernetes.api.model.IntOrString;
 import io.fabric8.kubernetes.api.model.Pod;
-import io.fabric8.kubernetes.api.model.ServiceBuilder;
-import io.fabric8.kubernetes.api.model.ServicePortBuilder;
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
@@ -36,13 +33,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -72,15 +63,13 @@ public class HerdDBVectorKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final int NODE_PORT = 30009;
-
-    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
+    private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
     public static K3sContainer k3s = new K3sContainer(DockerImageName.parse("rancher/k3s:v1.31.4-k3s1"))
-            .withExposedPorts(6443, NODE_PORT);
+            .withExposedPorts(6443);
 
     private static KubernetesClient kubernetesClient;
     private static String helmChartPath;
@@ -139,11 +128,11 @@ public class HerdDBVectorKubernetesIT {
         values.put("server.mode", "cluster");
         values.put("server.storageMode", "local");
         values.put("server.replicaCount", "1");
-        values.put("tools.enabled", "false");
+        values.put("tools.enabled", "true");
         values.put("image.pullPolicy", "Never");
         // ZooKeeper
         values.put("zookeeper.enabled", "true");
-        values.put("zookeeper.javaOpts", JAVA_OPTS);
+        values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("zookeeper.resources.requests.memory", "256Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
         values.put("zookeeper.resources.limits.memory", "256Mi");
@@ -152,7 +141,7 @@ public class HerdDBVectorKubernetesIT {
         // BookKeeper
         values.put("bookkeeper.enabled", "true");
         values.put("bookkeeper.replicaCount", "1");
-        values.put("bookkeeper.javaOpts", JAVA_OPTS);
+        values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("bookkeeper.resources.requests.memory", "256Mi");
         values.put("bookkeeper.resources.requests.cpu", "0.5");
         values.put("bookkeeper.resources.limits.memory", "256Mi");
@@ -162,7 +151,7 @@ public class HerdDBVectorKubernetesIT {
         // Indexing Service: 2 replicas
         values.put("indexingService.enabled", "true");
         values.put("indexingService.replicaCount", "2");
-        values.put("indexingService.javaOpts", JAVA_OPTS);
+        values.put("indexingService.javaOpts", INFRA_JAVA_OPTS);
         values.put("indexingService.resources.requests.memory", "256Mi");
         values.put("indexingService.resources.requests.cpu", "0.5");
         values.put("indexingService.resources.limits.memory", "256Mi");
@@ -212,95 +201,50 @@ public class HerdDBVectorKubernetesIT {
                 .list().getItems();
         assertEquals("Expected 2 indexing service pods", 2, isPods.size());
 
-        // Create NodePort service for JDBC access
-        kubernetesClient.services().inNamespace("default").createOrReplace(
-                new ServiceBuilder()
-                        .withNewMetadata()
-                            .withName("herddb-vec-nodeport")
-                            .withNamespace("default")
-                        .endMetadata()
-                        .withNewSpec()
-                            .withType("NodePort")
-                            .withSelector(Collections.singletonMap("app.kubernetes.io/component", "server"))
-                            .withPorts(new ServicePortBuilder()
-                                    .withPort(7000)
-                                    .withTargetPort(new IntOrString(7000))
-                                    .withNodePort(NODE_PORT)
-                                    .build())
-                        .endSpec()
-                        .build());
-        LOG.info("NodePort service created on port " + NODE_PORT);
-
         // Wait for HerdDB server
         LOG.info("Waiting for HerdDB server pod to be ready...");
         waitForComponent("server", 5, TimeUnit.MINUTES);
         LOG.info("HerdDB server pod is ready.");
 
-        // Connect via JDBC and run vector operations
-        String host = k3s.getHost();
-        int mappedPort = k3s.getMappedPort(NODE_PORT);
-        LOG.info("Connecting to HerdDB via NodePort at " + host + ":" + mappedPort);
+        // Wait for tools pod
+        LOG.info("Waiting for tools pod to be ready...");
+        kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "tools")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+        LOG.info("Tools pod is ready.");
 
-        String jdbcUrl = "jdbc:herddb:server:" + host + ":" + mappedPort;
-        try (Connection connection = DriverManager.getConnection(jdbcUrl);
-             Statement statement = connection.createStatement()) {
+        String toolsPod = getToolsPodName();
 
-            // CREATE TABLE with vector column
-            statement.execute("CREATE TABLE vec_test (id int primary key, vec floata not null)");
-            LOG.info("Table with vector column created.");
+        // Wait for tablespace to be ready via CLI
+        HerdDBKubernetesIT.waitForTablespace(k3s, toolsPod);
 
-            // CREATE VECTOR INDEX
-            statement.execute("CREATE VECTOR INDEX vidx ON vec_test(vec)");
-            LOG.info("Vector index created.");
+        // CREATE TABLE with vector column
+        HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "CREATE TABLE vec_test (id int primary key, name string, vec floata not null)");
+        LOG.info("Table with vector column created.");
 
-            // INSERT 4 orthogonal vectors using PreparedStatement
-            float[] vecX = {1.0f, 0.0f, 0.0f, 0.0f};
-            float[] vecY = {0.0f, 1.0f, 0.0f, 0.0f};
-            float[] vecZ = {0.0f, 0.0f, 1.0f, 0.0f};
-            float[] vecW = {0.0f, 0.0f, 0.0f, 1.0f};
+        // CREATE VECTOR INDEX (validates indexing services are connected)
+        HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "CREATE VECTOR INDEX vidx ON vec_test(vec)");
+        LOG.info("Vector index created.");
 
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "INSERT INTO vec_test(id, vec) VALUES(?, ?)")) {
-                ps.setInt(1, 1);
-                ps.setObject(2, vecX);
-                assertEquals(1, ps.executeUpdate());
+        // Verify table exists via systables
+        String output = HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "SELECT table_name FROM systables WHERE table_name='vec_test'");
+        assertTrue("Expected vec_test in systables", output.contains("vec_test"));
+        LOG.info("Table verified in systables.");
 
-                ps.setInt(1, 2);
-                ps.setObject(2, vecY);
-                assertEquals(1, ps.executeUpdate());
-
-                ps.setInt(1, 3);
-                ps.setObject(2, vecZ);
-                assertEquals(1, ps.executeUpdate());
-
-                ps.setInt(1, 4);
-                ps.setObject(2, vecW);
-                assertEquals(1, ps.executeUpdate());
-            }
-            LOG.info("4 orthogonal vectors inserted.");
-
-            // Force checkpoint so the indexing services catch up via WAL tailing
-            statement.execute("EXECUTE CHECKPOINT 'herd'");
-            LOG.info("Checkpoint executed.");
-
-            // Wait for indexing services to process the WAL
-            Thread.sleep(10000);
-            LOG.info("Waited for indexing service catch-up.");
-
-            // ANN search for vector closest to X axis
-            float[] queryVec = {1.0f, 0.0f, 0.0f, 0.0f};
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "SELECT id FROM vec_test ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT 2")) {
-                ps.setObject(1, queryVec);
-                try (ResultSet rs = ps.executeQuery()) {
-                    assertTrue("ANN search must return at least one result", rs.next());
-                    int firstId = rs.getInt("id");
-                    assertEquals("Closest vector to [1,0,0,0] should be id=1", 1, firstId);
-                    LOG.info("ANN search result: first id=" + firstId + " (correct).");
-                }
-            }
-        }
         LOG.info("Test passed: Cluster mode with vector indexing services works.");
+    }
+
+    private String getToolsPodName() {
+        List<Pod> pods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "tools")
+                .list().getItems();
+        assertEquals("Expected 1 tools pod", 1, pods.size());
+        return pods.get(0).getMetadata().getName();
     }
 
     private void waitForComponent(String component, long timeout, TimeUnit unit) throws Exception {

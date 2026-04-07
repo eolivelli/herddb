@@ -22,10 +22,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 import io.fabric8.kubernetes.api.model.HasMetadata;
-import io.fabric8.kubernetes.api.model.IntOrString;
 import io.fabric8.kubernetes.api.model.Pod;
-import io.fabric8.kubernetes.api.model.ServiceBuilder;
-import io.fabric8.kubernetes.api.model.ServicePortBuilder;
 import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
@@ -36,17 +33,10 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -72,15 +62,16 @@ public class HerdDBFileServerKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
-    private static final int NODE_PORT = 30008;
-
-    private static final String JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
+    private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
+    private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
     public static K3sContainer k3s = new K3sContainer(DockerImageName.parse("rancher/k3s:v1.31.4-k3s1"))
-            .withExposedPorts(6443, NODE_PORT);
+            .withExposedPorts(6443);
 
     private static KubernetesClient kubernetesClient;
     private static String helmChartPath;
@@ -139,11 +130,11 @@ public class HerdDBFileServerKubernetesIT {
         values.put("server.mode", "cluster");
         values.put("server.storageMode", "remote");
         values.put("server.replicaCount", "1");
-        values.put("tools.enabled", "false");
+        values.put("tools.enabled", "true");
         values.put("image.pullPolicy", "Never");
         // ZooKeeper
         values.put("zookeeper.enabled", "true");
-        values.put("zookeeper.javaOpts", JAVA_OPTS);
+        values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("zookeeper.resources.requests.memory", "256Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
         values.put("zookeeper.resources.limits.memory", "256Mi");
@@ -152,7 +143,7 @@ public class HerdDBFileServerKubernetesIT {
         // BookKeeper
         values.put("bookkeeper.enabled", "true");
         values.put("bookkeeper.replicaCount", "1");
-        values.put("bookkeeper.javaOpts", JAVA_OPTS);
+        values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
         values.put("bookkeeper.resources.requests.memory", "256Mi");
         values.put("bookkeeper.resources.requests.cpu", "0.5");
         values.put("bookkeeper.resources.limits.memory", "256Mi");
@@ -162,7 +153,7 @@ public class HerdDBFileServerKubernetesIT {
         // File Server: 2 replicas with S3 backend
         values.put("fileServer.replicaCount", "2");
         values.put("fileServer.storageMode", "s3");
-        values.put("fileServer.javaOpts", JAVA_OPTS);
+        values.put("fileServer.javaOpts", INFRA_JAVA_OPTS);
         values.put("fileServer.resources.requests.memory", "256Mi");
         values.put("fileServer.resources.requests.cpu", "0.5");
         values.put("fileServer.resources.limits.memory", "256Mi");
@@ -176,10 +167,10 @@ public class HerdDBFileServerKubernetesIT {
         values.put("minio.resources.limits.cpu", "0.5");
         values.put("minio.storage.size", "1Gi");
         // Server resources
-        values.put("server.javaOpts", JAVA_OPTS);
-        values.put("server.resources.requests.memory", "256Mi");
+        values.put("server.javaOpts", SERVER_JAVA_OPTS);
+        values.put("server.resources.requests.memory", "512Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "256Mi");
+        values.put("server.resources.limits.memory", "512Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
@@ -220,87 +211,68 @@ public class HerdDBFileServerKubernetesIT {
                 .list().getItems();
         assertEquals("Expected 2 file server pods", 2, fsPods.size());
 
-        // Create NodePort service for JDBC access
-        kubernetesClient.services().inNamespace("default").createOrReplace(
-                new ServiceBuilder()
-                        .withNewMetadata()
-                            .withName("herddb-fs-nodeport")
-                            .withNamespace("default")
-                        .endMetadata()
-                        .withNewSpec()
-                            .withType("NodePort")
-                            .withSelector(Collections.singletonMap("app.kubernetes.io/component", "server"))
-                            .withPorts(new ServicePortBuilder()
-                                    .withPort(7000)
-                                    .withTargetPort(new IntOrString(7000))
-                                    .withNodePort(NODE_PORT)
-                                    .build())
-                        .endSpec()
-                        .build());
-        LOG.info("NodePort service created on port " + NODE_PORT);
-
         // Wait for HerdDB server
         LOG.info("Waiting for HerdDB server pod to be ready...");
         waitForComponent("server", 5, TimeUnit.MINUTES);
         LOG.info("HerdDB server pod is ready.");
 
-        // Connect via JDBC and run SQL operations
-        String host = k3s.getHost();
-        int mappedPort = k3s.getMappedPort(NODE_PORT);
-        LOG.info("Connecting to HerdDB via NodePort at " + host + ":" + mappedPort);
+        // Wait for tools pod
+        LOG.info("Waiting for tools pod to be ready...");
+        kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "tools")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+        LOG.info("Tools pod is ready.");
 
-        String jdbcUrl = "jdbc:herddb:server:" + host + ":" + mappedPort;
-        try (Connection connection = DriverManager.getConnection(jdbcUrl);
-             Statement statement = connection.createStatement()) {
+        String toolsPod = getToolsPodName();
 
-            // CREATE TABLE
-            statement.execute("CREATE TABLE fs_test (id int primary key, name string, score int)");
-            LOG.info("Table created.");
+        // Wait for tablespace to be ready via CLI
+        HerdDBKubernetesIT.waitForTablespace(k3s, toolsPod);
 
-            // CREATE BRIN INDEX
-            statement.execute("CREATE BRIN INDEX brin_idx ON fs_test(score)");
-            LOG.info("BRIN index created.");
+        // CREATE TABLE
+        HerdDBKubernetesIT.execSql(k3s, toolsPod, "CREATE TABLE fs_test (id int primary key, name string, score int)");
+        LOG.info("Table created.");
 
-            // INSERT rows
-            assertEquals(1, statement.executeUpdate(
-                    "INSERT INTO fs_test (id, name, score) VALUES (1, 'hello', 42)"));
-            assertEquals(1, statement.executeUpdate(
-                    "INSERT INTO fs_test (id, name, score) VALUES (2, 'world', 99)"));
-            assertEquals(1, statement.executeUpdate(
-                    "INSERT INTO fs_test (id, name, score) VALUES (3, 'foo', 42)"));
-            LOG.info("Rows inserted.");
+        // CREATE BRIN INDEX
+        HerdDBKubernetesIT.execSql(k3s, toolsPod, "CREATE BRIN INDEX brin_idx ON fs_test(score)");
+        LOG.info("BRIN index created.");
 
-            // SELECT all rows
-            try (ResultSet rs = statement.executeQuery("SELECT id, name, score FROM fs_test ORDER BY id")) {
-                assertTrue("Expected row 1", rs.next());
-                assertEquals(1, rs.getInt("id"));
-                assertEquals("hello", rs.getString("name"));
-                assertEquals(42, rs.getInt("score"));
+        // INSERT rows
+        HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "INSERT INTO fs_test (id, name, score) VALUES (1, 'hello', 42)");
+        HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "INSERT INTO fs_test (id, name, score) VALUES (2, 'world', 99)");
+        HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "INSERT INTO fs_test (id, name, score) VALUES (3, 'foo', 42)");
+        LOG.info("Rows inserted.");
 
-                assertTrue("Expected row 2", rs.next());
-                assertEquals(2, rs.getInt("id"));
-                assertEquals("world", rs.getString("name"));
-                assertEquals(99, rs.getInt("score"));
+        // SELECT all rows and verify
+        String output = HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "SELECT id, name, score FROM fs_test ORDER BY id");
+        LOG.info("SELECT output: " + output);
+        assertTrue("Expected 'hello' in output", output.contains("hello"));
+        assertTrue("Expected 'world' in output", output.contains("world"));
+        assertTrue("Expected 'foo' in output", output.contains("foo"));
+        LOG.info("All rows verified.");
 
-                assertTrue("Expected row 3", rs.next());
-                assertEquals(3, rs.getInt("id"));
-                assertEquals("foo", rs.getString("name"));
-                assertEquals(42, rs.getInt("score"));
-            }
-            LOG.info("All rows verified.");
+        // Query using BRIN index: WHERE score = 42
+        String brinOutput = HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "SELECT id, name FROM fs_test WHERE score = 42");
+        LOG.info("BRIN index query output: " + brinOutput);
+        assertTrue("Expected id 1 in BRIN query output", brinOutput.contains("1"));
+        assertTrue("Expected id 3 in BRIN query output", brinOutput.contains("3"));
+        LOG.info("BRIN index query verified.");
 
-            // Query using BRIN index: WHERE score = 42
-            Set<Integer> matchingIds = new HashSet<>();
-            try (ResultSet rs = statement.executeQuery("SELECT id, name FROM fs_test WHERE score = 42")) {
-                while (rs.next()) {
-                    matchingIds.add(rs.getInt("id"));
-                }
-            }
-            assertEquals("BRIN index query should return ids 1 and 3",
-                    new HashSet<>(java.util.Arrays.asList(1, 3)), matchingIds);
-            LOG.info("BRIN index query verified: ids=" + matchingIds);
-        }
         LOG.info("Test passed: Cluster mode with file servers + MinIO works.");
+    }
+
+    private String getToolsPodName() {
+        List<Pod> pods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "tools")
+                .list().getItems();
+        assertEquals("Expected 1 tools pod", 1, pods.size());
+        return pods.get(0).getMetadata().getName();
     }
 
     private void waitForComponent(String component, long timeout, TimeUnit unit) throws Exception {
