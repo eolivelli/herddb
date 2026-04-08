@@ -271,6 +271,16 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
             }
         }
 
+        // Ensure the metadata storage manager is started before building the
+        // data storage manager — it may need a ZK connection for file server
+        // discovery.  start() is idempotent, so this is safe even when we
+        // already started it above to generate a new node ID.
+        try {
+            metadataStorageManager.start();
+        } catch (MetadataStorageManagerException e) {
+            throw new RuntimeException("Failed to start metadata storage manager", e);
+        }
+
         this.commitLogManager = buildCommitLogManager();
         this.manager = new DBManager(nodeId,
                 metadataStorageManager,

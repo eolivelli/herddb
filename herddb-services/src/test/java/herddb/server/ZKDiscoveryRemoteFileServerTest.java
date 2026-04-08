@@ -398,6 +398,119 @@ public class ZKDiscoveryRemoteFileServerTest {
     }
 
     /**
+     * Tests that ZK discovery works after a server restart (when the node ID
+     * file already exists on disk). Before the fix, metadataStorageManager was
+     * not started before buildDataStorageManager() on the second boot, so ZK
+     * discovery silently failed and the hash ring stayed empty.
+     */
+    @Test
+    public void testZKOnlyDiscovery_serverRestart() throws Exception {
+        Path zkDir = folder.newFolder("zk").toPath();
+
+        org.apache.curator.test.TestingServer zookeeperServer =
+                new org.apache.curator.test.TestingServer(-1, zkDir.toFile(), true);
+        try {
+            String zkAddress = zookeeperServer.getConnectString();
+            String zkPath = "/herddb";
+
+            // Start RemoteFileServer
+            Path fileServerDataDir = folder.newFolder("fileserver").toPath();
+            RemoteFileServer fileServer = new RemoteFileServer("localhost", 0, fileServerDataDir);
+            fileServer.start();
+
+            try {
+                // Register file server in ZK
+                herddb.cluster.ZookeeperMetadataStorageManager registrationManager =
+                        new herddb.cluster.ZookeeperMetadataStorageManager(zkAddress, 40000, zkPath);
+                registrationManager.start();
+
+                try {
+                    String addr = "localhost:" + fileServer.getPort();
+                    registrationManager.registerFileServer("fs1", addr);
+
+                    // Use a fixed base directory so that the node ID persists across restarts
+                    String baseDir = folder.newFolder("herddb").getAbsolutePath();
+
+                    Properties serverProps = new Properties();
+                    try (InputStream in = SimpleClusterTest.class.getResourceAsStream(
+                            "/conf/test.server_cluster.properties")) {
+                        serverProps.load(in);
+                    }
+                    serverProps.put(ServerConfiguration.PROPERTY_BASEDIR, baseDir);
+                    serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkAddress);
+                    serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_PATH, zkPath);
+                    serverProps.put("http.enable", "false");
+                    serverProps.put(ServerConfiguration.PROPERTY_STORAGE_MODE,
+                            ServerConfiguration.PROPERTY_STORAGE_MODE_REMOTE);
+
+                    // --- First boot: generates and persists node ID ---
+                    ServerConfiguration serverConfig = new ServerConfiguration(serverProps);
+                    try (Server server = new Server(serverConfig)) {
+                        server.start();
+                        server.waitForStandaloneBoot();
+
+                        try (HDBClient hdbClient = new HDBClient(
+                                new ClientConfiguration(folder.newFolder().toPath()))) {
+                            hdbClient.setClientSideMetadataProvider(
+                                    new ZookeeperClientSideMetadataProvider(
+                                            zkAddress, 40000, zkPath));
+                            try (HDBConnection con = hdbClient.openConnection()) {
+                                con.executeUpdate(TableSpace.DEFAULT,
+                                        "CREATE TABLE tt (n1 string primary key, n2 int)",
+                                        0, false, true, Collections.emptyList());
+
+                                for (int i = 0; i < 10; i++) {
+                                    con.executeUpdate(TableSpace.DEFAULT,
+                                            "INSERT INTO tt(n1, n2) VALUES(?, ?)",
+                                            0, false, true,
+                                            Arrays.asList("key" + i, i));
+                                }
+
+                                server.getManager().checkpoint();
+                            }
+                        }
+                    }
+
+                    // --- Second boot: node ID file already exists ---
+                    // Before the fix, metadataStorageManager was not started
+                    // before buildDataStorageManager(), so ZK discovery failed
+                    // and the hash ring stayed empty.
+                    ServerConfiguration serverConfig2 = new ServerConfiguration(serverProps);
+                    try (Server server = new Server(serverConfig2)) {
+                        server.start();
+                        server.waitForStandaloneBoot();
+
+                        try (HDBClient hdbClient = new HDBClient(
+                                new ClientConfiguration(folder.newFolder().toPath()))) {
+                            hdbClient.setClientSideMetadataProvider(
+                                    new ZookeeperClientSideMetadataProvider(
+                                            zkAddress, 40000, zkPath));
+                            try (HDBConnection con = hdbClient.openConnection()) {
+                                // Checkpoint must succeed on second boot too
+                                server.getManager().checkpoint();
+
+                                try (ScanResultSet scan = con.executeScan(TableSpace.DEFAULT,
+                                        "SELECT count(*) as cnt FROM tt",
+                                        false, Collections.emptyList(), 0, 10, 10, false)) {
+                                    List<Map<String, Object>> rows = scan.consume();
+                                    assertEquals(1, rows.size());
+                                    assertEquals(10, ((Number) rows.get(0).get("cnt")).intValue());
+                                }
+                            }
+                        }
+                    }
+                } finally {
+                    registrationManager.close();
+                }
+            } finally {
+                fileServer.stop();
+            }
+        } finally {
+            zookeeperServer.close();
+        }
+    }
+
+    /**
      * Tests ZK-only discovery when the file server registers AFTER the
      * HerdDB server has started. The ZK watcher notification must reach
      * the client so that checkpoint succeeds.
