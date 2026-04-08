@@ -187,6 +187,17 @@ public class IndexingServer implements AutoCloseable {
                                         dynamicClient.updateServers(currentAddresses);
                                     }
                                 });
+                        // Re-query after listener registration to close the race window
+                        // between the initial listFileServers() and addServiceDiscoveryListener().
+                        try {
+                            List<String> currentServers = metadataStorageManager.listFileServers();
+                            if (!currentServers.isEmpty()) {
+                                dynamicClient.updateServers(currentServers);
+                            }
+                        } catch (Exception re) {
+                            LOGGER.log(Level.WARNING,
+                                    "Failed to re-query file servers after listener registration (indexing)", re);
+                        }
                     }
                     Class<?> storageClass = Class.forName("herddb.remote.RemoteFileDataStorageManager");
                     Constructor<?> ctor = storageClass.getConstructor(
