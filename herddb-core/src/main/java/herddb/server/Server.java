@@ -461,6 +461,18 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                                         dynamicClient.updateServers(currentAddresses);
                                     }
                                 });
+                        // Re-query after listener registration to close the race window
+                        // between the initial listFileServers() (which sets a one-shot ZK
+                        // watcher) and addServiceDiscoveryListener().  If the file server
+                        // registered in that gap the watcher notification was lost.
+                        try {
+                            List<String> currentServers = metadataStorageManager.listFileServers();
+                            if (!currentServers.isEmpty()) {
+                                dynamicClient.updateServers(currentServers);
+                            }
+                        } catch (Exception e) {
+                            LOGGER.log(Level.WARNING, "Failed to re-query file servers after listener registration", e);
+                        }
                     }
                     Class<?> storageClass = Class.forName("herddb.remote.RemoteFileDataStorageManager");
                     Constructor<?> ctor = storageClass.getConstructor(Path.class, Path.class, int.class, clientClass);
@@ -556,6 +568,17 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                                 dynamicClient.updateServers(currentAddresses);
                             }
                         });
+                // Re-query after listener registration to close the race window
+                // between the initial listFileServers() and addServiceDiscoveryListener().
+                try {
+                    List<String> currentServers = metadataStorageManager.listFileServers();
+                    if (!currentServers.isEmpty()) {
+                        dynamicClient.updateServers(currentServers);
+                    }
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING,
+                            "Failed to re-query file servers after listener registration (shared-storage)", e);
+                }
             }
             // Create SharedCheckpointMetadataManager + ReadReplicaDataStorageManager
             // wrapped in PromotableRemoteFileDataStorageManager for failover support

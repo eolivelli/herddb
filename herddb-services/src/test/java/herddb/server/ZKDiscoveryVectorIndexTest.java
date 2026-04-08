@@ -32,6 +32,7 @@ import herddb.indexing.IndexingServer;
 import herddb.indexing.IndexingServerConfiguration;
 import herddb.indexing.IndexingServiceClient;
 import herddb.indexing.IndexingServiceEngine;
+import herddb.metadata.MetadataStorageManager;
 import herddb.metadata.ServiceDiscoveryListener;
 import herddb.model.TableSpace;
 import java.io.InputStream;
@@ -389,6 +390,258 @@ public class ZKDiscoveryVectorIndexTest {
                     }
                     if (engine1 != null) {
                         engine1.close();
+                    }
+                }
+            }
+        } finally {
+            zookeeperServer.close();
+        }
+    }
+
+    /**
+     * Mimics the ZK-only discovery path in {@code ServerMain}: creates the
+     * {@link IndexingServiceClient} from {@code listIndexingServices()},
+     * registers the discovery listener, then re-queries (the fix).
+     * The indexing service is already registered in ZK before this wiring
+     * happens.
+     *
+     * <p>This is a regression test for the race condition between
+     * {@code listIndexingServices()} (one-shot ZK watcher) and
+     * {@code addServiceDiscoveryListener()}.
+     */
+    @Test
+    public void testZKOnlyDiscovery_indexingServiceAlreadyRegistered() throws Exception {
+        Path zkDir = folder.newFolder("zk").toPath();
+
+        org.apache.curator.test.TestingServer zookeeperServer =
+                new org.apache.curator.test.TestingServer(-1, zkDir.toFile(), true);
+        try {
+            String zkAddress = zookeeperServer.getConnectString();
+            String zkPath = "/herddb";
+
+            Properties serverProps = new Properties();
+            try (InputStream in = SimpleClusterTest.class.getResourceAsStream(
+                    "/conf/test.server_cluster.properties")) {
+                serverProps.load(in);
+            }
+            serverProps.put(ServerConfiguration.PROPERTY_BASEDIR,
+                    folder.newFolder("herddb").getAbsolutePath());
+            serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkAddress);
+            serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_PATH, zkPath);
+            serverProps.put("http.enable", "false");
+
+            ServerConfiguration serverConfig = new ServerConfiguration(serverProps);
+            try (Server server = new Server(serverConfig)) {
+                server.start();
+                server.waitForStandaloneBoot();
+
+                // Start and register indexing service in ZK BEFORE wiring the client
+                Properties indexingProps = buildIndexingProperties(zkAddress, zkPath, 0, 1);
+                IndexingServerConfiguration indexingConfig = new IndexingServerConfiguration(indexingProps);
+                Path indexingDir = folder.newFolder("indexing").toPath();
+                Path logDir = indexingDir.resolve("log");
+                Path dataDir = indexingDir.resolve("data");
+                java.nio.file.Files.createDirectories(logDir);
+                java.nio.file.Files.createDirectories(dataDir);
+
+                try (IndexingServiceEngine engine =
+                             new IndexingServiceEngine(logDir, dataDir, indexingConfig)) {
+                    IndexingServer indexingServer =
+                            new IndexingServer("localhost", 0, engine, indexingConfig);
+                    indexingServer.setMetadataStorageManager(server.getMetadataStorageManager());
+                    indexingServer.start();
+
+                    try {
+                        engine.start();
+
+                        // Now wire the client — this mimics ServerMain's ZK discovery code
+                        MetadataStorageManager msm = server.getMetadataStorageManager();
+                        List<String> discovered = msm.listIndexingServices();
+                        assertFalse("Indexing service should already be in ZK", discovered.isEmpty());
+
+                        IndexingServiceClient client = new IndexingServiceClient(discovered, 30);
+                        server.getManager().setRemoteVectorIndexService(client);
+
+                        msm.addServiceDiscoveryListener(new ServiceDiscoveryListener() {
+                            @Override
+                            public void onIndexingServicesChanged(List<String> currentAddresses) {
+                                client.updateServers(currentAddresses);
+                            }
+
+                            @Override
+                            public void onFileServersChanged(List<String> currentAddresses) {
+                            }
+                        });
+                        // Re-query after listener registration (the fix)
+                        List<String> currentServers = msm.listIndexingServices();
+                        if (!currentServers.isEmpty()) {
+                            client.updateServers(currentServers);
+                        }
+
+                        try {
+                            try (HDBClient hdbClient = new HDBClient(
+                                    new ClientConfiguration(folder.newFolder().toPath()))) {
+                                hdbClient.setClientSideMetadataProvider(
+                                        new ZookeeperClientSideMetadataProvider(
+                                                zkAddress, 40000, zkPath));
+                                try (HDBConnection con = hdbClient.openConnection()) {
+                                    con.executeUpdate(TableSpace.DEFAULT,
+                                            "CREATE TABLE t1 (id int primary key, vec floata not null)",
+                                            0, false, true, Collections.emptyList());
+                                    con.executeUpdate(TableSpace.DEFAULT,
+                                            "CREATE VECTOR INDEX vidx ON t1(vec)",
+                                            0, false, true, Collections.emptyList());
+
+                                    float[] vecX = {1.0f, 0.0f, 0.0f, 0.0f};
+                                    float[] vecY = {0.0f, 1.0f, 0.0f, 0.0f};
+                                    con.executeUpdate(TableSpace.DEFAULT,
+                                            "INSERT INTO t1(id, vec) VALUES(?, ?)",
+                                            0, false, true, Arrays.asList(1, vecX));
+                                    con.executeUpdate(TableSpace.DEFAULT,
+                                            "INSERT INTO t1(id, vec) VALUES(?, ?)",
+                                            0, false, true, Arrays.asList(2, vecY));
+
+                                    server.getManager().checkpoint();
+
+                                    float[] query = {1.0f, 0.0f, 0.0f, 0.0f};
+                                    try (ScanResultSet scan = con.executeScan(TableSpace.DEFAULT,
+                                            "SELECT id FROM t1 ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT 1",
+                                            false, Arrays.asList((Object) query), 0, 10, 10, false)) {
+                                        List<Map<String, Object>> rows = scan.consume();
+                                        assertEquals(1, rows.size());
+                                        assertEquals(1, ((Number) rows.get(0).get("id")).intValue());
+                                    }
+                                }
+                            }
+                        } finally {
+                            client.close();
+                        }
+                    } finally {
+                        indexingServer.stop();
+                    }
+                }
+            }
+        } finally {
+            zookeeperServer.close();
+        }
+    }
+
+    /**
+     * Mimics the ZK-only discovery path in {@code ServerMain} but the
+     * indexing service registers AFTER the client and listener are set up.
+     * The ZK watcher notification must reach the listener so that the
+     * client is updated.
+     */
+    @Test
+    public void testZKOnlyDiscovery_indexingServiceRegistersLate() throws Exception {
+        Path zkDir = folder.newFolder("zk").toPath();
+
+        org.apache.curator.test.TestingServer zookeeperServer =
+                new org.apache.curator.test.TestingServer(-1, zkDir.toFile(), true);
+        try {
+            String zkAddress = zookeeperServer.getConnectString();
+            String zkPath = "/herddb";
+
+            Properties serverProps = new Properties();
+            try (InputStream in = SimpleClusterTest.class.getResourceAsStream(
+                    "/conf/test.server_cluster.properties")) {
+                serverProps.load(in);
+            }
+            serverProps.put(ServerConfiguration.PROPERTY_BASEDIR,
+                    folder.newFolder("herddb").getAbsolutePath());
+            serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkAddress);
+            serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_PATH, zkPath);
+            serverProps.put("http.enable", "false");
+
+            ServerConfiguration serverConfig = new ServerConfiguration(serverProps);
+            try (Server server = new Server(serverConfig)) {
+                server.start();
+                server.waitForStandaloneBoot();
+
+                // Wire the client BEFORE the indexing service is registered (empty list)
+                MetadataStorageManager msm = server.getMetadataStorageManager();
+                List<String> discovered = msm.listIndexingServices();
+                assertTrue("No indexing service registered yet", discovered.isEmpty());
+
+                IndexingServiceClient client = new IndexingServiceClient(discovered, 30);
+                server.getManager().setRemoteVectorIndexService(client);
+
+                msm.addServiceDiscoveryListener(new ServiceDiscoveryListener() {
+                    @Override
+                    public void onIndexingServicesChanged(List<String> currentAddresses) {
+                        client.updateServers(currentAddresses);
+                    }
+
+                    @Override
+                    public void onFileServersChanged(List<String> currentAddresses) {
+                    }
+                });
+                // Re-query after listener registration (the fix) — still empty here
+                List<String> requeried = msm.listIndexingServices();
+                if (!requeried.isEmpty()) {
+                    client.updateServers(requeried);
+                }
+
+                // NOW start and register the indexing service — ZK watcher should fire
+                Properties indexingProps = buildIndexingProperties(zkAddress, zkPath, 0, 1);
+                IndexingServerConfiguration indexingConfig = new IndexingServerConfiguration(indexingProps);
+                Path indexingDir = folder.newFolder("indexing").toPath();
+                Path logDir = indexingDir.resolve("log");
+                Path dataDir = indexingDir.resolve("data");
+                java.nio.file.Files.createDirectories(logDir);
+                java.nio.file.Files.createDirectories(dataDir);
+
+                try (IndexingServiceEngine engine =
+                             new IndexingServiceEngine(logDir, dataDir, indexingConfig)) {
+                    IndexingServer indexingServer =
+                            new IndexingServer("localhost", 0, engine, indexingConfig);
+                    indexingServer.setMetadataStorageManager(msm);
+                    indexingServer.start();
+
+                    try {
+                        engine.start();
+
+                        // Give ZK watcher time to propagate
+                        Thread.sleep(2000);
+
+                        try (HDBClient hdbClient = new HDBClient(
+                                new ClientConfiguration(folder.newFolder().toPath()))) {
+                            hdbClient.setClientSideMetadataProvider(
+                                    new ZookeeperClientSideMetadataProvider(
+                                            zkAddress, 40000, zkPath));
+                            try (HDBConnection con = hdbClient.openConnection()) {
+                                con.executeUpdate(TableSpace.DEFAULT,
+                                        "CREATE TABLE t1 (id int primary key, vec floata not null)",
+                                        0, false, true, Collections.emptyList());
+                                con.executeUpdate(TableSpace.DEFAULT,
+                                        "CREATE VECTOR INDEX vidx ON t1(vec)",
+                                        0, false, true, Collections.emptyList());
+
+                                float[] vecX = {1.0f, 0.0f, 0.0f, 0.0f};
+                                float[] vecY = {0.0f, 1.0f, 0.0f, 0.0f};
+                                con.executeUpdate(TableSpace.DEFAULT,
+                                        "INSERT INTO t1(id, vec) VALUES(?, ?)",
+                                        0, false, true, Arrays.asList(1, vecX));
+                                con.executeUpdate(TableSpace.DEFAULT,
+                                        "INSERT INTO t1(id, vec) VALUES(?, ?)",
+                                        0, false, true, Arrays.asList(2, vecY));
+
+                                server.getManager().checkpoint();
+
+                                float[] query = {0.0f, 1.0f, 0.0f, 0.0f};
+                                try (ScanResultSet scan = con.executeScan(TableSpace.DEFAULT,
+                                        "SELECT id FROM t1 ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT 1",
+                                        false, Arrays.asList((Object) query), 0, 10, 10, false)) {
+                                    List<Map<String, Object>> rows = scan.consume();
+                                    assertEquals(1, rows.size());
+                                    assertEquals(2, ((Number) rows.get(0).get("id")).intValue());
+                                }
+                            }
+                        } finally {
+                            client.close();
+                        }
+                    } finally {
+                        indexingServer.stop();
                     }
                 }
             }

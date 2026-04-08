@@ -279,6 +279,18 @@ public class ServerMain implements AutoCloseable {
                                     // handled by Server.java for RemoteFileServiceClient
                                 }
                             });
+                    // Re-query after listener registration to close the race window
+                    // between the initial listIndexingServices() (which sets a one-shot
+                    // ZK watcher) and addServiceDiscoveryListener().
+                    try {
+                        List<String> currentServers = server.getMetadataStorageManager().listIndexingServices();
+                        if (!currentServers.isEmpty()) {
+                            client.updateServers(currentServers);
+                        }
+                    } catch (Exception re) {
+                        LOGGER.log(Level.WARNING,
+                                "Failed to re-query indexing services after listener registration", re);
+                    }
                 }
             } catch (Exception e) {
                 LOGGER.log(Level.FINE, "ZK-based indexing service discovery not available: {0}", e.getMessage());
