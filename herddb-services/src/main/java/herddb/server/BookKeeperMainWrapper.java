@@ -24,6 +24,7 @@ import herddb.daemons.PidFileLocker;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStreamReader;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,6 +37,12 @@ import org.apache.bookkeeper.common.component.Lifecycle;
 import org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory;
 import org.apache.bookkeeper.server.EmbeddedServer;
 import org.apache.bookkeeper.server.conf.BookieConfiguration;
+import org.apache.bookkeeper.stats.prometheus.PrometheusMetricsProvider;
+import org.apache.bookkeeper.stats.prometheus.PrometheusServlet;
+import org.apache.commons.configuration.PropertiesConfiguration;
+import org.eclipse.jetty.server.handler.ContextHandlerCollection;
+import org.eclipse.jetty.servlet.ServletContextHandler;
+import org.eclipse.jetty.servlet.ServletHolder;
 
 /**
  * Simple wrapper for standalone BookKeeper bookie server (for cluster mode)
@@ -46,15 +53,24 @@ public class BookKeeperMainWrapper implements AutoCloseable {
 
     private static final Logger LOG = Logger.getLogger(BookKeeperMainWrapper.class.getName());
 
+    static final String PROPERTY_HTTP_PORT = "httpServerPort";
+    static final int DEFAULT_HTTP_PORT = 8000;
+
     private final Properties configuration;
     private final PidFileLocker pidFileLocker;
     private EmbeddedServer embeddedServer;
+    private org.eclipse.jetty.server.Server httpServer;
+    private PrometheusMetricsProvider statsProvider;
 
     private static BookKeeperMainWrapper runningInstance;
 
     public BookKeeperMainWrapper(Properties configuration) {
         this.configuration = configuration;
         this.pidFileLocker = new PidFileLocker(Paths.get(System.getProperty("user.dir", ".")).toAbsolutePath());
+    }
+
+    static BookKeeperMainWrapper getRunningInstance() {
+        return runningInstance;
     }
 
     @Override
@@ -73,6 +89,18 @@ public class BookKeeperMainWrapper implements AutoCloseable {
             } finally {
                 embeddedServer = null;
             }
+        }
+        if (httpServer != null) {
+            try {
+                httpServer.stop();
+            } catch (Exception e) {
+                LOG.warning("Error stopping HTTP server: " + e.getMessage());
+            }
+            httpServer = null;
+        }
+        if (statsProvider != null) {
+            statsProvider.stop();
+            statsProvider = null;
         }
     }
 
@@ -155,6 +183,25 @@ public class BookKeeperMainWrapper implements AutoCloseable {
     public void run() throws Exception {
         pidFileLocker.lock();
 
+        // Start Prometheus metrics provider for JVM metrics
+        statsProvider = new PrometheusMetricsProvider();
+        PropertiesConfiguration statsProviderConfig = new PropertiesConfiguration();
+        statsProviderConfig.setProperty(PrometheusMetricsProvider.PROMETHEUS_STATS_HTTP_ENABLE, false);
+        statsProvider.start(statsProviderConfig);
+
+        // Start HTTP server for metrics
+        int httpPort = Integer.parseInt(configuration.getProperty(PROPERTY_HTTP_PORT,
+                String.valueOf(DEFAULT_HTTP_PORT)));
+        httpServer = new org.eclipse.jetty.server.Server(new InetSocketAddress("0.0.0.0", httpPort));
+        ContextHandlerCollection contexts = new ContextHandlerCollection();
+        httpServer.setHandler(contexts);
+        ServletContextHandler contextRoot = new ServletContextHandler(ServletContextHandler.GZIP);
+        contextRoot.setContextPath("/");
+        contextRoot.addServlet(new ServletHolder(new PrometheusServlet(statsProvider)), "/metrics");
+        contexts.addHandler(contextRoot);
+        httpServer.start();
+        LOG.info("BookKeeper metrics available at http://0.0.0.0:" + httpPort + "/metrics");
+
         org.apache.bookkeeper.conf.ServerConfiguration conf = new org.apache.bookkeeper.conf.ServerConfiguration();
 
         // Core settings
@@ -192,11 +239,16 @@ public class BookKeeperMainWrapper implements AutoCloseable {
         conf.setJournalFlushWhenQueueEmpty(true);
         conf.setStatisticsEnabled(true);
 
+        // Disable BK's native HTTP server — we handle metrics via our own Jetty server
+        conf.setHttpServerEnabled(false);
+
         // Apply all remaining properties from configuration file
         for (String key : configuration.stringPropertyNames()) {
             if (!key.equals("zkServers") && !key.equals("zkLedgersRootPath")
                     && !key.equals("bookiePort") && !key.equals("ledgerDirNames")
-                    && !key.equals("journalDirName")) {
+                    && !key.equals("journalDirName") && !key.equals("httpServerEnabled")
+                    && !key.equals(PROPERTY_HTTP_PORT)
+                    && !key.equals("prometheusStatsHttpPort")) {
                 conf.setProperty(key, configuration.getProperty(key));
             }
         }

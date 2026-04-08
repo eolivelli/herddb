@@ -642,6 +642,9 @@
 				<!-- Monitoring/observability configuration (Docker Compose, Prometheus, Grafana) -->
 				<exclude>**/monitor/**/*</exclude>
 
+				<!-- Dockerfile does not support standard license comment headers -->
+				<exclude>**/Dockerfile</exclude>
+
 				<!-- JSON files do not support license comment headers -->
 				<exclude>**/*.json</exclude>
                         </excludes>
