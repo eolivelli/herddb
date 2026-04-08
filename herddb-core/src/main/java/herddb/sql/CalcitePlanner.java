@@ -553,6 +553,9 @@ public class CalcitePlanner extends AbstractSQLPlanner {
         _rootSchema.add("ANN_OF", AnnOfFunction.INSTANCE);
         for (String tableSpace : manager.getLocalTableSpaces()) {
             TableSpaceManager tableSpaceManager = manager.getTableSpaceManager(tableSpace);
+            if (tableSpaceManager == null) {
+                continue;
+            }
             SchemaPlus schema = _rootSchema.add(tableSpace, new AbstractSchema());
             List<Table> tables = tableSpaceManager.getAllTablesForPlanner();
             for (Table table : tables) {
