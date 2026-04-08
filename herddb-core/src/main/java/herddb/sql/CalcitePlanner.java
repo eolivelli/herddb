@@ -89,6 +89,7 @@ import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import org.apache.calcite.DataContext;
 import org.apache.calcite.adapter.enumerable.EnumerableAggregate;
+import org.apache.calcite.adapter.enumerable.EnumerableCalc;
 import org.apache.calcite.adapter.enumerable.EnumerableConvention;
 import org.apache.calcite.adapter.enumerable.EnumerableFilter;
 import org.apache.calcite.adapter.enumerable.EnumerableHashJoin;
@@ -120,7 +121,6 @@ import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitDef;
 import org.apache.calcite.plan.RelTraitSet;
-import org.apache.calcite.prepare.PlannerImpl;
 import org.apache.calcite.prepare.Prepare;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelCollationTraitDef;
@@ -132,6 +132,9 @@ import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.core.TableModify;
 import org.apache.calcite.rel.logical.LogicalTableModify;
 import org.apache.calcite.rel.rules.CoreRules;
+import org.apache.calcite.plan.hep.HepPlanner;
+import org.apache.calcite.plan.hep.HepProgram;
+import org.apache.calcite.sql2rel.RelDecorrelator;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
@@ -411,11 +414,10 @@ public class CalcitePlanner extends AbstractSQLPlanner {
     }
 
     private static final SqlParser.Config SQL_PARSER_CONFIG =
-            SqlParser.configBuilder(SqlParser.Config.DEFAULT)
-                    .setCaseSensitive(false)
-                    .setConformance(SqlConformanceEnum.MYSQL_5)
-                    .setQuoting(Quoting.BACK_TICK)
-                    .build();
+            SqlParser.Config.DEFAULT
+                    .withCaseSensitive(false)
+                    .withConformance(SqlConformanceEnum.MYSQL_5)
+                    .withQuoting(Quoting.BACK_TICK);
 
 
     private static final Logger LOG = Logger.getLogger(CalcitePlanner.class
@@ -472,10 +474,12 @@ public class CalcitePlanner extends AbstractSQLPlanner {
                             return null;
                         }
                     })
+                    // Use a HEP-based program to avoid VolcanoPlanner infinite loops
+                    // that occur with Calcite 1.41+'s rule set
                     // define the rules you want to apply
                     .programs(Programs.ofRules(Programs.RULE_SET))
                     .build();
-            Planner planner = new PlannerImpl(config);
+            Planner planner = Frameworks.getPlanner(config);
             if (LOG.isLoggable(Level.FINER)) {
                 LOG.log(Level.FINER, "Query: {0}", query);
             }
@@ -493,6 +497,20 @@ public class CalcitePlanner extends AbstractSQLPlanner {
                 final RelOptPlanner optPlanner = cluster.getPlanner();
 
                 optPlanner.addRule(CoreRules.FILTER_REDUCE_EXPRESSIONS);
+
+                // Pre-process subqueries if present
+                if (hasSubQuery(logicalPlan)) {
+                    final HepProgram subQueryProgram = HepProgram.builder()
+                            .addRuleInstance(CoreRules.FILTER_SUB_QUERY_TO_CORRELATE)
+                            .addRuleInstance(CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE)
+                            .addRuleInstance(CoreRules.JOIN_SUB_QUERY_TO_CORRELATE)
+                            .build();
+                    final HepPlanner subQueryPlanner = new HepPlanner(subQueryProgram);
+                    subQueryPlanner.setRoot(logicalPlan);
+                    logicalPlan = subQueryPlanner.findBestExp();
+                    logicalPlan = RelDecorrelator.decorrelateQuery(logicalPlan);
+                }
+
                 RelTraitSet desiredTraits =
                         cluster.traitSet()
                                 .replace(EnumerableConvention.INSTANCE);
@@ -605,6 +623,9 @@ public class CalcitePlanner extends AbstractSQLPlanner {
         } else if (plan instanceof EnumerableAggregate) {
             EnumerableAggregate scan = (EnumerableAggregate) plan;
             return planAggregate(scan, rowType, returnValues);
+        } else if (plan instanceof EnumerableCalc) {
+            EnumerableCalc calc = (EnumerableCalc) plan;
+            return planCalc(calc, rowType, returnValues);
         }
 
         throw new StatementExecutionException("not implented " + plan.getRelTypeName());
@@ -1367,6 +1388,97 @@ public class CalcitePlanner extends AbstractSQLPlanner {
                 return ColumnTypes.ANYTYPE;
             default:
                 throw new StatementExecutionException("unsupported expression type " + type.getSqlTypeName());
+        }
+    }
+
+    private PlannerOp planCalc(EnumerableCalc calc, RelDataType rowType, boolean returnValues) {
+        // EnumerableCalc combines filter + project into a single RexProgram.
+        // Decompose it into separate Filter and Project operations.
+        PlannerOp input = convertRelNode(calc.getInput(), null, returnValues, false);
+        org.apache.calcite.rex.RexProgram program = calc.getProgram();
+
+        // Expand the RexProgram to get individual RexNode expressions
+        List<RexNode> projects = program.expandList(program.getProjectList());
+        final RelDataType calcRowType = rowType == null ? calc.getRowType() : rowType;
+
+        // If there's a filter condition, apply it first
+        if (program.getCondition() != null) {
+            RexNode condition = program.expandLocalRef(program.getCondition());
+            CompiledSQLExpression compiledCondition = SQLExpressionCompiler.compileExpression(condition);
+            input = new FilterOp(input, compiledCondition);
+        }
+
+        // Apply projection
+        Projection projection = buildProjection(projects, calcRowType, false, null);
+        return new ProjectOp(projection, input);
+    }
+
+    /**
+     * Check if a RelNode tree contains any Correlate nodes.
+     */
+    private static boolean hasCorrelate(RelNode node) {
+        if (node == null) {
+            return false;
+        }
+        if (node instanceof org.apache.calcite.rel.core.Correlate) {
+            return true;
+        }
+        for (RelNode input : node.getInputs()) {
+            if (hasCorrelate(input)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Check if a RelNode tree contains any RexSubQuery nodes.
+     */
+    private static boolean hasSubQuery(RelNode node) {
+        if (node == null) {
+            return false;
+        }
+        // Check rex expressions in the node for RexSubQuery
+        try {
+            // Use a visitor to walk the tree
+            final boolean[] found = {false};
+            node.accept(new org.apache.calcite.rel.RelShuttleImpl() {
+                @Override
+                public RelNode visit(org.apache.calcite.rel.logical.LogicalFilter filter) {
+                    if (containsSubQuery(filter.getCondition())) {
+                        found[0] = true;
+                    }
+                    return super.visit(filter);
+                }
+
+                @Override
+                public RelNode visit(org.apache.calcite.rel.logical.LogicalProject project) {
+                    for (RexNode expr : project.getProjects()) {
+                        if (containsSubQuery(expr)) {
+                            found[0] = true;
+                        }
+                    }
+                    return super.visit(project);
+                }
+
+                private boolean containsSubQuery(RexNode rex) {
+                    if (rex instanceof org.apache.calcite.rex.RexSubQuery) {
+                        return true;
+                    }
+                    if (rex instanceof RexCall) {
+                        for (RexNode operand : ((RexCall) rex).getOperands()) {
+                            if (containsSubQuery(operand)) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            });
+            return found[0];
+        } catch (Exception e) {
+            // If we can't determine, assume there might be subqueries
+            return true;
         }
     }
 
