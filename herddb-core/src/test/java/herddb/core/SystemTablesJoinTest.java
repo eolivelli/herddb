@@ -135,7 +135,7 @@ public class SystemTablesJoinTest {
                         + "systablespaces.tablespace_name,"
                         + "sysnodes.address FROM"
                         + " systablespaces "
-                        + " JOIN sysnodes ON systablespaces.leader = sysnodes.nodeid AND systablespaces.uuid <> ?"
+                        + " JOIN sysnodes ON systablespaces.leader = sysnodes.nodeid AND systablespaces.`uuid` <> ?"
                         + " ORDER BY tablespace_name DESC", Arrays.asList(tableSpaceUUid)).consumeAndClose();
                 for (DataAccessor t : tuples) {
                     assertEquals(3, t.getFieldNames().length);
