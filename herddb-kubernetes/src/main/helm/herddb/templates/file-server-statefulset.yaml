@@ -15,6 +15,10 @@ spec:
       app.kubernetes.io/component: file-server
   template:
     metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.fileServer.httpPort }}"
+        prometheus.io/path: "/metrics"
       labels:
         {{- include "herddb.labels" . | nindent 8 }}
         app.kubernetes.io/component: file-server

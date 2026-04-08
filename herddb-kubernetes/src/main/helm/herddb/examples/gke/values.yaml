@@ -18,6 +18,7 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
+  javaOpts: "-Xms16g -Xmx16g -Djava.net.preferIPv4Stack=true"
   storage:
     data:
       size: 10Gi
@@ -31,7 +32,8 @@ server:
       memory: "20Gi"
 
 fileServer:
-  replicaCount: 2
+  replicaCount: 1
+  javaOpts: "-Xms12g -Xmx12g -Djava.net.preferIPv4Stack=true"
   storageMode: s3
   s3:
     endpoint: "https://storage.googleapis.com"
@@ -41,6 +43,8 @@ fileServer:
     # Credentials are read from this Kubernetes Secret instead of
     # being embedded in the ConfigMap.
     credentialsSecret: "herddb-gcs-credentials"
+    # Local disk cache — sized to match the PVC (150 Gi = 161061273600 bytes)
+    cacheMaxBytes: 161061273600
   storage:
     size: 200Gi
   resources:
@@ -55,6 +59,7 @@ minio:
 
 zookeeper:
   enabled: true
+  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true"
   storage:
     size: 10Gi
   resources:
@@ -67,9 +72,12 @@ zookeeper:
 bookkeeper:
   enabled: true
   replicaCount: 1
+  javaOpts: "-Xms6g -Xmx6g -Djava.net.preferIPv4Stack=true"
+  extraConfig:
+    journalWriteData: "false"
   storage:
     journal:
-      size: 500Gi
+      size: 1Gi
     ledger:
       size: 500Gi
   resources:
@@ -82,6 +90,7 @@ bookkeeper:
 indexingService:
   enabled: true
   replicaCount: 2
+  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true"
   storage:
     data:
       size: 20Gi
@@ -99,3 +108,9 @@ tools:
 
 vectorBench:
   enabled: false
+
+prometheus:
+  enabled: true
+
+grafana:
+  enabled: true

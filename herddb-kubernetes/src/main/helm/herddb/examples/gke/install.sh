@@ -60,6 +60,14 @@ else
     echo "Bucket gs://${GCS_BUCKET} exists."
 fi
 
+# ── 2b. Optionally clean up the GCS bucket ───────────────────────
+read -rp "Clean up (delete all objects in) bucket gs://${GCS_BUCKET}? [y/N] " clean_bucket
+if [[ "$clean_bucket" =~ ^[Yy]$ ]]; then
+    echo "==> Deleting all objects in gs://${GCS_BUCKET}..."
+    gcloud storage rm "gs://${GCS_BUCKET}/**" --recursive 2>/dev/null || true
+    echo "Bucket cleaned."
+fi
+
 # ── 3. Check that the credentials Secret exists ──────────────────
 if ! kubectl get secret herddb-gcs-credentials >/dev/null 2>&1; then
     echo "Secret 'herddb-gcs-credentials' not found."

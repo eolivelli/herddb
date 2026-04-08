@@ -13,5 +13,10 @@ data:
     bookiePort={{ .Values.bookkeeper.bookiePort }}
     ledgerDirNames=/opt/herddb/bookie-data/ledgers
     journalDirName=/opt/herddb/bookie-data/journal
-    httpServerEnabled=false
+    httpServerEnabled=true
+    httpServerPort={{ .Values.bookkeeper.httpPort }}
+    prometheusStatsHttpPort={{ .Values.bookkeeper.httpPort }}
+{{- range $k, $v := .Values.bookkeeper.extraConfig }}
+    {{ $k }}={{ $v }}
+{{- end }}
 {{- end }}

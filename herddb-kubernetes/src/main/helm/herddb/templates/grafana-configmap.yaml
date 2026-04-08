@@ -1,0 +1,39 @@
+{{- if .Values.grafana.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "herddb.fullname" . }}-grafana-config
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://{{ include "herddb.fullname" . }}-prometheus:{{ .Values.prometheus.port }}
+        isDefault: true
+        editable: false
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: default
+        orgId: 1
+        folder: ''
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards
+          foldersFromFilesStructure: false
+  herddb-dashboard.json: |
+    {{- .Files.Get "monitor/grafana/dashboards/herddb-dashboard.json" | nindent 4 }}
+  indexing-service-dashboard.json: |
+    {{- .Files.Get "monitor/grafana/dashboards/indexing-service-dashboard.json" | nindent 4 }}
+  jvm-dashboard.json: |
+    {{- .Files.Get "monitor/grafana/dashboards/jvm-dashboard.json" | nindent 4 }}
+  remote-file-service-dashboard.json: |
+    {{- .Files.Get "monitor/grafana/dashboards/remote-file-service-dashboard.json" | nindent 4 }}
+{{- end }}

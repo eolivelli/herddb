@@ -15,6 +15,10 @@ spec:
       app.kubernetes.io/component: indexing-service
   template:
     metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.indexingService.httpPort }}"
+        prometheus.io/path: "/metrics"
       labels:
         {{- include "herddb.labels" . | nindent 8 }}
         app.kubernetes.io/component: indexing-service

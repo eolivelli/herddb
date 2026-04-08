@@ -70,6 +70,7 @@ fileServer:
   storage:
     size: 10Gi
     storageClass: ""
+  extraConfig: {}
   resources:
     requests:
       memory: "1Gi"
@@ -104,6 +105,7 @@ zookeeper:
   enabled: false
   replicaCount: 1
   clientPort: 2181
+  metricsPort: 7070
   javaOpts: ""
   storage:
     size: 2Gi
@@ -121,6 +123,7 @@ bookkeeper:
   enabled: false
   replicaCount: 1
   bookiePort: 3181
+  httpPort: 8000
   javaOpts: ""
   storage:
     journal:
@@ -136,6 +139,7 @@ bookkeeper:
     limits:
       memory: "512Mi"
       cpu: "0.5"
+  extraConfig: {}
 
 # Optional IndexingService for vector search (requires zookeeper.enabled=true
 # and bookkeeper.enabled=true in cluster mode).
@@ -198,3 +202,36 @@ vectorBench:
     limits:
       memory: "12Gi"
       cpu: "4"
+
+# Optional Prometheus instance for scraping HerdDB metrics.
+prometheus:
+  enabled: false
+  image:
+    repository: prom/prometheus
+    tag: "v2.53.0"
+  port: 9090
+  storage:
+    size: 10Gi
+    storageClass: ""
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "0.5"
+    limits:
+      memory: "512Mi"
+      cpu: "0.5"
+
+# Optional Grafana instance with pre-provisioned HerdDB dashboards.
+grafana:
+  enabled: false
+  image:
+    repository: grafana/grafana
+    tag: "11.1.0"
+  port: 3000
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "0.25"
+    limits:
+      memory: "256Mi"
+      cpu: "0.25"
