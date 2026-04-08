@@ -891,10 +891,10 @@ public class RawSQLTest {
                     assertEquals(1, count);
                 }
                 // use JDBC syntax, always use UTC timezone
-                assertEquals(1, executeUpdate(manager, "INSERT INTO tblspace1.tsql values('mykey4',1,'c',{ts '2012-12-13 10:34:33.15'})", Collections.emptyList()).getUpdateCount());
+                assertEquals(1, executeUpdate(manager, "INSERT INTO tblspace1.tsql values('mykey4',1,'c',{ts '2012-12-13 10:34:33'})", Collections.emptyList()).getUpdateCount());
                 fmt.setTimeZone(TimeZone.getTimeZone("UTC"));
                 timestamp = fmt.parse("2012-12-13 10:34:33.0");
-                try (DataScanner scanner = scan(manager, "SELECT t1 FROM tblspace1.tsql where t1={ts '2012-12-13 10:34:33.0'}", Collections.emptyList())) {
+                try (DataScanner scanner = scan(manager, "SELECT t1 FROM tblspace1.tsql where t1={ts '2012-12-13 10:34:33'}", Collections.emptyList())) {
                     int count = 0;
                     for (DataAccessor da : scanner.consume()) {
                         assertEquals(new java.sql.Timestamp(timestamp.getTime()), da.get(0));

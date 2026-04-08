@@ -132,6 +132,17 @@ public class SQLExpressionCompiler {
                     return new CompiledIsNullExpression(false, operands[0]);
                 case "SEARCH":
                     return convertSearchOperator(p);
+                case "IN": {
+                    // IN(col, val1, val2, ...) → col = val1 OR col = val2 OR ...
+                    CompiledSQLExpression[] eqExprs = new CompiledSQLExpression[operands.length - 1];
+                    for (int j = 0; j < eqExprs.length; j++) {
+                        eqExprs[j] = new CompiledEqualsExpression(operands[0], operands[j + 1]);
+                    }
+                    if (eqExprs.length == 1) {
+                        return eqExprs[0];
+                    }
+                    return new CompiledMultiOrExpression(eqExprs);
+                }
                 case "CAST":
                     return operands[0].cast(CalcitePlanner.convertToHerdType(p.type));
                 case "CASE":
