@@ -43,6 +43,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -242,6 +244,163 @@ public class ZKDiscoveryRemoteFileIndexingTest {
                     }
                 } finally {
                     fileServerRegistration.close();
+                }
+            } finally {
+                fileServer.stop();
+            }
+        } finally {
+            zookeeperServer.close();
+        }
+    }
+
+    /**
+     * Tests that the IndexingServer discovers a file server via ZK when
+     * the file server registers AFTER the IndexingServer has already started.
+     *
+     * <p>This is a regression test for the race condition in
+     * {@code IndexingServer} between {@code listFileServers()} (one-shot
+     * ZK watcher) and {@code addServiceDiscoveryListener()}.
+     */
+    @Test
+    public void testIndexingServiceWithRemoteStorage_fileServerRegistersLate() throws Exception {
+        Path zkDir = folder.newFolder("zk").toPath();
+        Path indexingDataDir = folder.newFolder("indexing-data").toPath();
+        Path fileServerDataDir = folder.newFolder("fileserver").toPath();
+
+        org.apache.curator.test.TestingServer zookeeperServer =
+                new org.apache.curator.test.TestingServer(-1, zkDir.toFile(), true);
+        try {
+            String zkAddress = zookeeperServer.getConnectString();
+            String zkPath = "/herddb";
+
+            // Start RemoteFileServer but do NOT register it in ZK yet
+            RemoteFileServer fileServer = new RemoteFileServer("localhost", 0, fileServerDataDir);
+            fileServer.start();
+
+            try {
+                // Prepare HerdDB server (cluster mode, embedded bookie)
+                Properties serverProps = new Properties();
+                try (InputStream in = SimpleClusterTest.class.getResourceAsStream(
+                        "/conf/test.server_cluster.properties")) {
+                    serverProps.load(in);
+                }
+                serverProps.put(ServerConfiguration.PROPERTY_BASEDIR,
+                        folder.newFolder("herddb").getAbsolutePath());
+                serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkAddress);
+                serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_PATH, zkPath);
+                serverProps.put("http.enable", "false");
+
+                ServerConfiguration serverConfig = new ServerConfiguration(serverProps);
+                try (Server server = new Server(serverConfig)) {
+                    server.start();
+                    server.waitForStandaloneBoot();
+
+                    // Start IndexingServer with remote storage, ZK discovery
+                    // File server is NOT yet registered in ZK
+                    Properties indexingProps = new Properties();
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_MODE,
+                            ServerConfiguration.PROPERTY_MODE_CLUSTER);
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkAddress);
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_ZOOKEEPER_PATH, zkPath);
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT,
+                            String.valueOf(40000));
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_LOG_TYPE, "bookkeeper");
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "remote");
+                    // No PROPERTY_REMOTE_FILE_SERVERS set — ZK discovery
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_GRPC_PORT, "0");
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_GRPC_HOST, "localhost");
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_TABLESPACE_NAME,
+                            TableSpace.DEFAULT);
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_INSTANCE_ID, "0");
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES, "1");
+                    indexingProps.setProperty(IndexingServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH,
+                            ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT);
+
+                    IndexingServerConfiguration indexingConfig = new IndexingServerConfiguration(indexingProps);
+                    Path indexingLogDir = indexingDataDir.resolve("log");
+                    Path indexingData = indexingDataDir.resolve("data");
+                    Files.createDirectories(indexingLogDir);
+                    Files.createDirectories(indexingData);
+
+                    try (IndexingServiceEngine engine =
+                                 new IndexingServiceEngine(indexingLogDir, indexingData, indexingConfig)) {
+                        IndexingServer indexingServer =
+                                new IndexingServer("localhost", 0, engine, indexingConfig);
+                        indexingServer.setMetadataStorageManager(server.getMetadataStorageManager());
+                        // start() sets up file server discovery (listFileServers → empty,
+                        // registers listener, re-queries → still empty)
+                        indexingServer.start();
+
+                        try {
+                            // NOW register the file server in ZK — the ZK watcher
+                            // notification should reach the IndexingServer's client
+                            herddb.cluster.ZookeeperMetadataStorageManager fileServerRegistration =
+                                    new herddb.cluster.ZookeeperMetadataStorageManager(zkAddress, 40000, zkPath);
+                            fileServerRegistration.start();
+
+                            try {
+                                String fileServerAddr = "localhost:" + fileServer.getPort();
+                                fileServerRegistration.registerFileServer("fs1", fileServerAddr);
+
+                                // Give ZK watcher time to propagate
+                                Thread.sleep(2000);
+
+                                // Start engine AFTER the file server is discoverable
+                                engine.start();
+
+                                // Wire indexing client to HerdDB server
+                                List<String> indexingServices =
+                                        server.getMetadataStorageManager().listIndexingServices();
+                                assertFalse("Indexing service should be discoverable",
+                                        indexingServices.isEmpty());
+                                IndexingServiceClient client = new IndexingServiceClient(indexingServices, 30);
+                                server.getManager().setRemoteVectorIndexService(client);
+
+                                try {
+                                    try (HDBClient hdbClient = new HDBClient(
+                                            new ClientConfiguration(folder.newFolder().toPath()))) {
+                                        hdbClient.setClientSideMetadataProvider(
+                                                new ZookeeperClientSideMetadataProvider(
+                                                        zkAddress, 40000, zkPath));
+                                        try (HDBConnection con = hdbClient.openConnection()) {
+                                            con.executeUpdate(TableSpace.DEFAULT,
+                                                    "CREATE TABLE t1 (id int primary key, vec floata not null)",
+                                                    0, false, true, Collections.emptyList());
+                                            con.executeUpdate(TableSpace.DEFAULT,
+                                                    "CREATE VECTOR INDEX vidx ON t1(vec)",
+                                                    0, false, true, Collections.emptyList());
+
+                                            float[] vecX = {1.0f, 0.0f, 0.0f, 0.0f};
+                                            float[] vecY = {0.0f, 1.0f, 0.0f, 0.0f};
+                                            con.executeUpdate(TableSpace.DEFAULT,
+                                                    "INSERT INTO t1(id, vec) VALUES(?, ?)",
+                                                    0, false, true, Arrays.asList(1, vecX));
+                                            con.executeUpdate(TableSpace.DEFAULT,
+                                                    "INSERT INTO t1(id, vec) VALUES(?, ?)",
+                                                    0, false, true, Arrays.asList(2, vecY));
+
+                                            server.getManager().checkpoint();
+
+                                            float[] query = {0.0f, 1.0f, 0.0f, 0.0f};
+                                            try (ScanResultSet scan = con.executeScan(TableSpace.DEFAULT,
+                                                    "SELECT id FROM t1 ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT 1",
+                                                    false, Arrays.asList((Object) query), 0, 10, 10, false)) {
+                                                List<Map<String, Object>> rows = scan.consume();
+                                                assertEquals(1, rows.size());
+                                                assertEquals(2, ((Number) rows.get(0).get("id")).intValue());
+                                            }
+                                        }
+                                    }
+                                } finally {
+                                    client.close();
+                                }
+                            } finally {
+                                fileServerRegistration.close();
+                            }
+                        } finally {
+                            indexingServer.stop();
+                        }
+                    }
                 }
             } finally {
                 fileServer.stop();
