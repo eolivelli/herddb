@@ -79,7 +79,6 @@
       <plugin>
         <groupId>com.google.cloud.tools</groupId>
         <artifactId>jib-maven-plugin</artifactId>
-        <version>2.5.2</version>
         <!--
         mvn package jib:build@build [-Dimage.server.image.registry=...] -> will be pushed
         mvn package jib:dockerBuild@build -> local docker image
@@ -159,6 +158,32 @@
       <activation>
         <property>
           <name>kubernetes</name>
+        </property>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>com.google.cloud.tools</groupId>
+            <artifactId>jib-maven-plugin</artifactId>
+            <version>2.5.2</version>
+            <executions>
+              <execution>
+                <id>build</id>
+                <phase>package</phase>
+                <goals>
+                  <goal>dockerBuild</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <profile>
+      <id>docker</id>
+      <activation>
+        <property>
+          <name>docker</name>
         </property>
       </activation>
       <build>
