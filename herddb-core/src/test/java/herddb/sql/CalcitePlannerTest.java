@@ -99,6 +99,7 @@ public class CalcitePlannerTest {
             manager.waitForTablespace("tblspace1", 10000);
 
             execute(manager, "CREATE TABLE tblspace1.tsql (k1 string primary key,n1 int,s1 string)", Collections.emptyList());
+            execute(manager, "CREATE TABLE tblspace1.tsql2 (k2 string primary key,n2 int,s2 string)", Collections.emptyList());
             execute(manager, "INSERT INTO tblspace1.tsql (k1,n1) values(?,?)", Arrays.asList("mykey", 1234), TransactionContext.NO_TRANSACTION);
 
             try (DataScanner scan = scan(manager, "SELECT * FROM tblspace1.tsql", Collections.emptyList())) {
@@ -140,19 +141,25 @@ public class CalcitePlannerTest {
             assertInstanceOf(plan(manager, "update tblspace1.tsql set n1=? where k1=?"), SimpleUpdateOp.class);
             assertInstanceOf(plan(manager, "update tblspace1.tsql set n1=? where k1=? and n1=?"), SimpleUpdateOp.class);
             if (manager.isFullSQLSupportEnabled()) {
-                // Calcite 1.41+ may optimize subquery-based updates to SimpleUpdateOp
+                // Calcite 1.40+ may optimize same-table subquery-based updates to SimpleUpdateOp
                 PlannerOp updatePlan = plan(manager, "update tblspace1.tsql set n1=?"
                         + " where n1 in (select b.n1*2 from tblspace1.tsql b)");
                 assertTrue("expecting UpdateOp or SimpleUpdateOp but found " + updatePlan.getClass().getName(),
                         updatePlan instanceof UpdateOp || updatePlan instanceof SimpleUpdateOp);
+                // Cross-table subquery always produces UpdateOp (semi-join cannot be simplified)
+                assertInstanceOf(plan(manager, "update tblspace1.tsql set n1=?"
+                        + " where n1 in (select n2 from tblspace1.tsql2)"), UpdateOp.class);
             }
             assertInstanceOf(plan(manager, "delete from tblspace1.tsql where k1=?"), SimpleDeleteOp.class);
             assertInstanceOf(plan(manager, "delete from tblspace1.tsql where k1=? and n1=?"), SimpleDeleteOp.class);
             if (manager.isFullSQLSupportEnabled()) {
-                // Calcite 1.41+ may optimize subquery-based deletes to SimpleDeleteOp
+                // Calcite 1.40+ may optimize same-table subquery-based deletes to SimpleDeleteOp
                 PlannerOp deletePlan = plan(manager, "delete from tblspace1.tsql where n1 in (select b.n1*2 from tblspace1.tsql b)");
                 assertTrue("expecting DeleteOp or SimpleDeleteOp but found " + deletePlan.getClass().getName(),
                         deletePlan instanceof DeleteOp || deletePlan instanceof SimpleDeleteOp);
+                // Cross-table subquery always produces DeleteOp (semi-join cannot be simplified)
+                assertInstanceOf(plan(manager, "delete from tblspace1.tsql"
+                        + " where n1 in (select n2 from tblspace1.tsql2)"), DeleteOp.class);
             }
             assertInstanceOf(plan(manager, "INSERT INTO tblspace1.tsql (k1,n1) values(?,?)"), SimpleInsertOp.class);
             assertInstanceOf(plan(manager, "INSERT INTO tblspace1.tsql (k1,n1) values(?,?),(?,?)"), InsertOp.class);
@@ -261,6 +268,7 @@ public class CalcitePlannerTest {
             manager.waitForTablespace("tblspace1", 10000);
 
             execute(manager, "\n\nCREATE TABLE tblspace1.tsql (k1 string primary key,n1 int,s1 string)", Collections.emptyList());
+            execute(manager, "CREATE TABLE tblspace1.tsql2 (k2 string primary key,n2 int,s2 string)", Collections.emptyList());
             execute(manager, "\n\nINSERT INTO tblspace1.tsql (k1,n1) values(?,?)", Arrays.asList("mykey", 1234), TransactionContext.NO_TRANSACTION);
             try (DataScanner scan = scan(manager, "SELECT n1,k1 FROM tblspace1.tsql where k1='mykey'", Collections.emptyList())) {
                 assertEquals(1, scan.consume().size());
@@ -276,19 +284,25 @@ public class CalcitePlannerTest {
             assertInstanceOf(plan(manager, "-- comment\nupdate tblspace1.tsql set n1=? where k1=?"), SimpleUpdateOp.class);
             assertInstanceOf(plan(manager, "/* multiline\ncomment */\nupdate tblspace1.tsql set n1=? where k1=? and n1=?"), SimpleUpdateOp.class);
             if (manager.isFullSQLSupportEnabled()) {
-                // Calcite 1.41+ may optimize subquery-based updates to SimpleUpdateOp
+                // Calcite 1.40+ may optimize same-table subquery-based updates to SimpleUpdateOp
                 PlannerOp updatePlan = plan(manager, "update tblspace1.tsql set n1=?"
                         + " where n1 in (select b.n1*2 from tblspace1.tsql b)");
                 assertTrue("expecting UpdateOp or SimpleUpdateOp but found " + updatePlan.getClass().getName(),
                         updatePlan instanceof UpdateOp || updatePlan instanceof SimpleUpdateOp);
+                // Cross-table subquery always produces UpdateOp (semi-join cannot be simplified)
+                assertInstanceOf(plan(manager, "update tblspace1.tsql set n1=?"
+                        + " where n1 in (select n2 from tblspace1.tsql2)"), UpdateOp.class);
             }
             assertInstanceOf(plan(manager, "-- comment\ndelete from tblspace1.tsql where k1=?"), SimpleDeleteOp.class);
             assertInstanceOf(plan(manager, "/* multiline\ncomment */\ndelete from tblspace1.tsql where k1=? and n1=?"), SimpleDeleteOp.class);
             if (manager.isFullSQLSupportEnabled()) {
-                // Calcite 1.41+ may optimize subquery-based deletes to SimpleDeleteOp
+                // Calcite 1.40+ may optimize same-table subquery-based deletes to SimpleDeleteOp
                 PlannerOp deletePlan = plan(manager, "\n\ndelete from tblspace1.tsql where n1 in (select b.n1*2 from tblspace1.tsql b)");
                 assertTrue("expecting DeleteOp or SimpleDeleteOp but found " + deletePlan.getClass().getName(),
                         deletePlan instanceof DeleteOp || deletePlan instanceof SimpleDeleteOp);
+                // Cross-table subquery always produces DeleteOp (semi-join cannot be simplified)
+                assertInstanceOf(plan(manager, "delete from tblspace1.tsql"
+                        + " where n1 in (select n2 from tblspace1.tsql2)"), DeleteOp.class);
             }
             assertInstanceOf(plan(manager, "INSERT INTO tblspace1.tsql (k1,n1) values(?,?)"), SimpleInsertOp.class);
             assertInstanceOf(plan(manager, "INSERT INTO tblspace1.tsql (k1,n1) values(?,?),(?,?)"), InsertOp.class);
