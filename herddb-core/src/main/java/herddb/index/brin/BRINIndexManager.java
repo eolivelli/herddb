@@ -362,6 +362,12 @@ public class BRINIndexManager extends AbstractIndexManager {
             page.metadata.forEach(b -> {
                 activePages.add(b.pageId);
             });
+            /* During data.checkpoint(), blocks are locked and checkpointed one by one.
+             * Between individual block checkpoints, concurrent DML can trigger block
+             * evictions which create new pages (via newPageId.getAndIncrement). These
+             * pages are NOT in the metadata but ARE the block's current pageId.
+             * Add them to activePages to prevent premature deletion. */
+            activePages.addAll(data.getActivePageIds());
             IndexStatus indexStatus = new IndexStatus(index.name, sequenceNumber, newPageId.get(), activePages, contents);
             List<PostCheckpointAction> result = new ArrayList<>();
             result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, indexStatus, pin));

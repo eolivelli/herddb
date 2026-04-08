@@ -2049,7 +2049,19 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
             if (changedRecords != null) {
                 for (Record r : changedRecords.values()) {
-                    applyUpdate(r.key, r.value);
+                    try {
+                        applyUpdate(r.key, r.value);
+                    } catch (IllegalStateException e) {
+                        if (recovery) {
+                            LOGGER.log(Level.FINE,
+                                    "{0}.{1} recovery: re-applying update for key {2} as delete+insert (transaction commit)",
+                                    new Object[]{table.tablespace, table.name, r.key});
+                            keyToPage.remove(r.key);
+                            applyInsert(r.key, r.value, false);
+                        } else {
+                            throw e;
+                        }
+                    }
                 }
             }
             Set<Bytes> deletedRecords = transaction.deletedRecords.get(table.name);
