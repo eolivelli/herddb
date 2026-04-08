@@ -132,16 +132,11 @@ public class TablespaceReplicasStateTest {
                 server_1.getManager().executeStatement(new AlterTableSpaceStatement(TableSpace.DEFAULT,
                         new HashSet<>(Arrays.asList("server1")), "server1", 1, 0), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
 
-                for (int i = 0; i < 100; i++) {
+                TestUtils.waitForCondition(() -> {
                     try (DataScanner scan = scan(server_1.getManager(), "SELECT * FROM systablespacereplicastate where nodeId='" + server_2.getNodeId() + "' and mode='stopped'", Collections.emptyList())) {
-                        if (scan.consume().size() > 0) {
-                            break;
-                        }
+                        return scan.consume().size() > 0;
                     }
-                }
-                try (DataScanner scan = scan(server_1.getManager(), "SELECT * FROM systablespacereplicastate where nodeId='" + server_2.getNodeId() + "' and mode='stopped'", Collections.emptyList())) {
-                    assertEquals(1, scan.consume().size());
-                }
+                }, TestUtils.NOOP, 60, "waiting for server2 replica state to become 'stopped'");
             }
         }
     }
@@ -205,28 +200,21 @@ public class TablespaceReplicasStateTest {
                 server_1.getManager().executeStatement(new AlterTableSpaceStatement(TableSpace.DEFAULT,
                         new HashSet<>(Arrays.asList("server1")), "server1", 1, 0), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
 
-                for (int i = 0; i < 100; i++) {
+                TestUtils.waitForCondition(() -> {
                     try (DataScanner scan = scan(server_1.getManager(), "SELECT * FROM systablespacereplicastate where nodeId='" + server_2.getNodeId() + "' and mode='stopped'", Collections.emptyList())) {
-                        if (scan.consume().size() > 0) {
-                            break;
-                        }
+                        return scan.consume().size() > 0;
                     }
-                }
-                try (DataScanner scan = scan(server_1.getManager(), "SELECT * FROM systablespacereplicastate where nodeId='" + server_2.getNodeId() + "' and mode='stopped'", Collections.emptyList())) {
-                    assertEquals(1, scan.consume().size());
-                }
+                }, TestUtils.NOOP, 60, "waiting for server2 replica state to become 'stopped'");
 
                 // add again server2 as follower
                 server_1.getManager().executeStatement(new AlterTableSpaceStatement(TableSpace.DEFAULT,
                         new HashSet<>(Arrays.asList("server1", "server2")), "server1", 1, 0), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
 
-                for (int i = 0; i < 100; i++) {
+                TestUtils.waitForCondition(() -> {
                     try (DataScanner scan = scan(server_1.getManager(), "SELECT * FROM systablespacereplicastate where nodeId='" + server_2.getNodeId() + "' and mode='follower'", Collections.emptyList())) {
-                        if (scan.consume().size() > 0) {
-                            break;
-                        }
+                        return scan.consume().size() > 0;
                     }
-                }
+                }, TestUtils.NOOP, 60, "waiting for server2 replica state to become 'follower' again");
 
                 // make server2 leader
                 server_1.getManager().executeStatement(new AlterTableSpaceStatement(TableSpace.DEFAULT,
@@ -236,22 +224,17 @@ public class TablespaceReplicasStateTest {
                 server_2.waitForTableSpaceBoot(TableSpace.DEFAULT, true);
                 server_1.waitForTableSpaceBoot(TableSpace.DEFAULT, false);
 
-                for (int i = 0; i < 100; i++) {
+                TestUtils.waitForCondition(() -> {
                     try (DataScanner scan = scan(server_2.getManager(), "SELECT * FROM systablespacereplicastate where nodeId='" + server_2.getNodeId() + "' and mode='leader'", Collections.emptyList())) {
-                        if (scan.consume().size() > 0) {
-                            break;
-                        }
+                        return scan.consume().size() > 0;
                     }
-                }
+                }, TestUtils.NOOP, 60, "waiting for server2 replica state to become 'leader'");
 
-
-                for (int i = 0; i < 100; i++) {
+                TestUtils.waitForCondition(() -> {
                     try (DataScanner scan = scan(server_2.getManager(), "SELECT * FROM systablespacereplicastate where nodeId='" + server_1.getNodeId() + "' and mode='follower'", Collections.emptyList())) {
-                        if (scan.consume().size() > 0) {
-                            break;
-                        }
+                        return scan.consume().size() > 0;
                     }
-                }
+                }, TestUtils.NOOP, 60, "waiting for server1 replica state to become 'follower'");
 
                 // the TableSpaceManager for a follower must not be able to perform a checkpoint
                 DataStorageManagerException err = TestUtils.expectThrows(DataStorageManagerException.class,
