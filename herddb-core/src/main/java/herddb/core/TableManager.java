@@ -2403,11 +2403,26 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 throw new IllegalStateException("page " + prevPageId + " for updated record at " + key
                         + " was not flushed to disk in table " + table.tablespace + "." + table.name);
             } else {
-                previous = prevPage.get(key);
-                if (previous == null) {
-                    throw new IllegalStateException("corrupted PK: old page " + prevPageId + " for updated record at " + key
-                            + " was not found in table" + table.tablespace + "." + table.name);
+                Record found = prevPage.get(key);
+                if (found == null && !prevPage.immutable) {
+                    /* During checkpoint Phase B, cleanAndCompactPages updates keyToPage
+                     * (pointing to the building page) before adding the record to that page.
+                     * The building page's write lock is held during this window, so acquiring
+                     * the read lock here will block until the record has been fully added.
+                     * This mirrors the retry logic in fetchRecord(). */
+                    final Lock lock = prevPage.pageLock.readLock();
+                    lock.lock();
+                    try {
+                        found = prevPage.get(key);
+                    } finally {
+                        lock.unlock();
+                    }
                 }
+                if (found == null) {
+                    throw new IllegalStateException("corrupted PK: old page " + prevPageId + " for updated record at " + key
+                            + " was not found in table " + table.tablespace + "." + table.name);
+                }
+                previous = found;
             }
         }
 
