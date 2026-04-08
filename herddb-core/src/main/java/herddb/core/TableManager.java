@@ -137,7 +137,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             getIntSystemProperty("herddb.tablemanager.checkpoint.lock.write.timeout", 60);
 
     private static final long CHECKPOINT_LOCK_READ_TIMEOUT = SystemProperties.
-            getIntSystemProperty("herddb.tablemanager.checkpoint.lock.read.timeout", 10);
+            getIntSystemProperty("herddb.tablemanager.checkpoint.lock.read.timeout", 30);
 
     private static final int SORTED_PAGE_ACCESS_WINDOW_SIZE = SystemProperties.
             getIntSystemProperty("herddb.tablemanager.sortedPageAccessWindowSize", 2000);

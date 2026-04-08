@@ -15,7 +15,6 @@
 #
 name: Java CI - Kubernetes tests
 on:
-  pull_request:
   push:
     branches:
       - master
