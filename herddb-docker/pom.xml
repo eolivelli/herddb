@@ -77,75 +77,44 @@
         </executions>
       </plugin>
       <plugin>
-        <groupId>com.google.cloud.tools</groupId>
-        <artifactId>jib-maven-plugin</artifactId>
-        <!--
-        mvn package jib:build@build [-Dimage.server.image.registry=...] -> will be pushed
-        mvn package jib:dockerBuild@build -> local docker image
-        -->
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-resources-plugin</artifactId>
         <executions>
           <execution>
-            <id>build</id>
-            <phase>none</phase>
+            <id>copy-log4j2</id>
+            <phase>prepare-package</phase>
+            <goals>
+              <goal>copy-resources</goal>
+            </goals>
             <configuration>
-              <containerizingMode>packaged</containerizingMode>
-              <extraDirectories>
-                <paths>
-                  <path>${project.build.directory}/workdir</path>
-                </paths>
-                <permissions>
-                  <permission>
-                    <file>/opt/herddb/bin/*</file>
-                    <mode>755</mode> <!-- Read/write/execute for owner, read/execute for group/other -->
-                  </permission>
-                </permissions>
-              </extraDirectories>
-              <from>
-                <image>eclipse-temurin:22-jdk</image>
-              </from>
-              <to>
-                <image>${image.server.image.name}</image>
-              </to>
-              <container>
-                <creationTime>USE_CURRENT_TIMESTAMP</creationTime>
-                <entrypoint>/opt/herddb/bin/service</entrypoint>
-                <args>
-                  <arg>server</arg>
-                  <arg>console</arg>
-                </args>
-                <appRoot>${image.workdir}</appRoot>
-                <workingDirectory>${image.workdir}</workingDirectory>
-                <environment>
-                  <HERDDB_USE_ENV>true</HERDDB_USE_ENV>
-                  <herddb_env_http_enable>true</herddb_env_http_enable>
-                  <herddb_env_http_host>0.0.0.0</herddb_env_http_host>
-                  <herddb_env_server_host>0.0.0.0</herddb_env_server_host>
-                  <herddb_env_herddb_local_nodeid>local</herddb_env_herddb_local_nodeid>
-                  <HERDDB_HOME>${image.workdir}</HERDDB_HOME>
-                  <LANG>en_US.UTF-8</LANG>
-                </environment>
-                <ports>
-                  <port>${image.port}</port>
-                  <port>${image.port2}</port>
-                  <port>${image.port3}</port>
-                </ports>
-                <labels>
-                  <org.herddb.maintainer>HerdDB Community</org.herddb.maintainer>
-                  <org.herddb.build-date>${maven.build.timestamp}</org.herddb.build-date>
-                  <org.herddb.git.repositories>${project.scm.url}</org.herddb.git.repositories>
-                  <org.herddb.name>HerdDB Server</org.herddb.name>
-                  <org.herddb.description>HerdDB Server</org.herddb.description>
-                  <org.herddb.url>https://github.com/diennea/herddb</org.herddb.url>
-                  <org.herddb.vendor>HerdDB</org.herddb.vendor>
-                  <org.herddb.version>${project.version}</org.herddb.version>
-                  <org.herddb.docker.metrics>http://localhost:9845/metrics</org.herddb.docker.metrics>
-                  <org.herddb.docker.params>
-                    _JAVA_OPTIONS=...
-                    herddb_env_config_name=....
-                  </org.herddb.docker.params>
-                  <org.herddb.docker.cmd>docker run -d -p ${image.port}:${image.port} ${image.port2}:${image.port2} herddb/herddb-server:${image.currentVersion}</org.herddb.docker.cmd>
-                </labels>
-              </container>
+              <outputDirectory>${project.build.directory}/workdir</outputDirectory>
+              <resources>
+                <resource>
+                  <directory>src/main/resources</directory>
+                  <includes>
+                    <include>log4j2.xml</include>
+                  </includes>
+                </resource>
+              </resources>
+            </configuration>
+          </execution>
+          <execution>
+            <id>copy-dockerfile</id>
+            <phase>prepare-package</phase>
+            <goals>
+              <goal>copy-resources</goal>
+            </goals>
+            <configuration>
+              <outputDirectory>${project.build.directory}/workdir</outputDirectory>
+              <resources>
+                <resource>
+                  <directory>src/main/docker</directory>
+                  <filtering>false</filtering>
+                  <includes>
+                    <include>Dockerfile</include>
+                  </includes>
+                </resource>
+              </resources>
             </configuration>
           </execution>
         </executions>
@@ -163,16 +132,28 @@
       <build>
         <plugins>
           <plugin>
-            <groupId>com.google.cloud.tools</groupId>
-            <artifactId>jib-maven-plugin</artifactId>
-            <version>2.5.2</version>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>exec-maven-plugin</artifactId>
+            <version>3.1.0</version>
             <executions>
               <execution>
-                <id>build</id>
+                <id>docker-build</id>
                 <phase>package</phase>
                 <goals>
-                  <goal>dockerBuild</goal>
+                  <goal>exec</goal>
                 </goals>
+                <configuration>
+                  <executable>docker</executable>
+                  <workingDirectory>${project.build.directory}/workdir</workingDirectory>
+                  <arguments>
+                    <argument>build</argument>
+                    <argument>-t</argument>
+                    <argument>${image.server.image.name}</argument>
+                    <argument>-f</argument>
+                    <argument>Dockerfile</argument>
+                    <argument>.</argument>
+                  </arguments>
+                </configuration>
               </execution>
             </executions>
           </plugin>
@@ -189,16 +170,28 @@
       <build>
         <plugins>
           <plugin>
-            <groupId>com.google.cloud.tools</groupId>
-            <artifactId>jib-maven-plugin</artifactId>
-            <version>2.5.2</version>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>exec-maven-plugin</artifactId>
+            <version>3.1.0</version>
             <executions>
               <execution>
-                <id>build</id>
+                <id>docker-build</id>
                 <phase>package</phase>
                 <goals>
-                  <goal>dockerBuild</goal>
+                  <goal>exec</goal>
                 </goals>
+                <configuration>
+                  <executable>docker</executable>
+                  <workingDirectory>${project.build.directory}/workdir</workingDirectory>
+                  <arguments>
+                    <argument>build</argument>
+                    <argument>-t</argument>
+                    <argument>${image.server.image.name}</argument>
+                    <argument>-f</argument>
+                    <argument>Dockerfile</argument>
+                    <argument>.</argument>
+                  </arguments>
+                </configuration>
               </execution>
             </executions>
           </plugin>
@@ -210,16 +203,28 @@
       <build>
         <plugins>
           <plugin>
-            <groupId>com.google.cloud.tools</groupId>
-            <artifactId>jib-maven-plugin</artifactId>
-            <version>2.5.2</version>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>exec-maven-plugin</artifactId>
+            <version>3.1.0</version>
             <executions>
               <execution>
-                <id>build</id>
+                <id>docker-build</id>
                 <phase>package</phase>
                 <goals>
-                  <goal>dockerBuild</goal>
+                  <goal>exec</goal>
                 </goals>
+                <configuration>
+                  <executable>docker</executable>
+                  <workingDirectory>${project.build.directory}/workdir</workingDirectory>
+                  <arguments>
+                    <argument>build</argument>
+                    <argument>-t</argument>
+                    <argument>${image.server.image.name}</argument>
+                    <argument>-f</argument>
+                    <argument>Dockerfile</argument>
+                    <argument>.</argument>
+                  </arguments>
+                </configuration>
               </execution>
             </executions>
           </plugin>
