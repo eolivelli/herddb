@@ -28,6 +28,7 @@ import herddb.client.HDBClient;
 import herddb.client.HDBConnection;
 import herddb.client.ScanResultSet;
 import herddb.codec.RecordSerializer;
+import herddb.core.ClusterTest;
 import herddb.model.ColumnTypes;
 import herddb.model.GetResult;
 import herddb.model.StatementEvaluationContext;
@@ -46,10 +47,12 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
 /**
  * Tests for reading from follower replicas.
  */
+@Category(ClusterTest.class)
 public class FollowerReadsTest extends MultiServerBase {
 
     @Test

@@ -32,6 +32,7 @@ import herddb.client.HDBConnection;
 import herddb.client.ScanResultSet;
 import herddb.client.impl.LeaderChangedException;
 import herddb.codec.RecordSerializer;
+import herddb.core.ClusterTest;
 import herddb.core.TableSpaceManager;
 import herddb.model.ColumnTypes;
 import herddb.model.GetResult;
@@ -52,6 +53,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
 /**
@@ -59,6 +61,7 @@ import org.junit.rules.TemporaryFolder;
  *
  * @author enrico.olivelli
  */
+@Category(ClusterTest.class)
 public class EmbeddedBookieTest {
 
     @Rule

@@ -23,6 +23,7 @@ import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import static org.junit.Assert.assertEquals;
 import herddb.codec.RecordSerializer;
 import herddb.core.ActivatorRunRequest;
+import herddb.core.ClusterTest;
 import herddb.core.MemoryManager;
 import herddb.core.TableSpaceManager;
 import herddb.model.ColumnTypes;
@@ -40,12 +41,14 @@ import herddb.server.ServerConfiguration;
 import java.util.Arrays;
 import java.util.HashSet;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
 /**
  * Tests about changing roles
  *
  * @author enrico.olivelli
  */
+@Category(ClusterTest.class)
 public class ChangeRoleTest extends MultiServerBase {
 
     @Test

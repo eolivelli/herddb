@@ -28,6 +28,7 @@ import static org.junit.Assert.fail;
 import herddb.cluster.BookkeeperCommitLog;
 import herddb.codec.RecordSerializer;
 import herddb.core.ActivatorRunRequest;
+import herddb.core.ClusterTest;
 import herddb.core.TableSpaceManager;
 import herddb.model.ColumnTypes;
 import herddb.model.DataScanner;
@@ -52,7 +53,9 @@ import org.apache.bookkeeper.client.api.LedgerMetadata;
 import org.apache.bookkeeper.net.BookieId;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
+@Category(ClusterTest.class)
 public class BookieNotAvailableTest extends BookkeeperFailuresBase {
 
     @Test

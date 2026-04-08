@@ -25,6 +25,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import herddb.core.ClusterTest;
 import herddb.metadata.MetadataStorageManagerException;
 import herddb.model.TableSpace;
 import herddb.utils.ZKTestEnv;
@@ -39,8 +40,10 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
+@Category(ClusterTest.class)
 public class ZookeeperMetadataStorageManagerTest {
 
     @Rule

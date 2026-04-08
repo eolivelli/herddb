@@ -27,12 +27,14 @@ import herddb.model.commands.CreateTableSpaceStatement;
 import java.util.Arrays;
 import java.util.HashSet;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
 /**
  * Basic functionality
  *
  * @author enrico.olivelli
  */
+@Category(ClusterTest.class)
 public class UnderreplicationTest extends ReplicatedLogtestcase {
 
     @Test

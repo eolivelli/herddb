@@ -23,6 +23,7 @@ package herddb.cluster;
 import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import static herddb.core.TestUtils.scan;
 import static org.junit.Assert.assertEquals;
+import herddb.core.ClusterTest;
 import herddb.model.ColumnTypes;
 import herddb.model.DataScanner;
 import herddb.model.StatementEvaluationContext;
@@ -41,6 +42,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
 /**
@@ -48,6 +50,7 @@ import org.junit.rules.TemporaryFolder;
  *
  * @author enrico.olivelli
  */
+@Category(ClusterTest.class)
 public class WaitForBookiesTest {
 
     @Rule

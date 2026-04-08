@@ -25,6 +25,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import herddb.cluster.BookkeeperCommitLog;
 import herddb.cluster.LedgersInfo;
+import herddb.core.ClusterTest;
 import herddb.model.ColumnTypes;
 import herddb.model.StatementEvaluationContext;
 import herddb.model.Table;
@@ -39,6 +40,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
 /**
@@ -46,6 +48,7 @@ import org.junit.rules.TemporaryFolder;
  *
  * @author enrico.olivelli
  */
+@Category(ClusterTest.class)
 public class LedgerManagementTest {
 
     @Rule

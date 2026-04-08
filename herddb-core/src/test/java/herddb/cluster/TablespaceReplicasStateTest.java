@@ -26,6 +26,7 @@ import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
+import herddb.core.ClusterTest;
 import herddb.model.ColumnTypes;
 import herddb.model.DataScanner;
 import herddb.model.StatementEvaluationContext;
@@ -49,6 +50,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
 /**
@@ -56,6 +58,7 @@ import org.junit.rules.TemporaryFolder;
  *
  * @author enrico.olivelli
  */
+@Category(ClusterTest.class)
 public class TablespaceReplicasStateTest {
 
     @Rule

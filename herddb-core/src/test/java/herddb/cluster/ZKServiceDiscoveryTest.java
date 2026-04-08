@@ -21,6 +21,7 @@ package herddb.cluster;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import herddb.core.ClusterTest;
 import herddb.metadata.ServiceDiscoveryListener;
 import herddb.utils.ZKTestEnv;
 import java.util.List;
@@ -31,8 +32,10 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
+@Category(ClusterTest.class)
 public class ZKServiceDiscoveryTest {
 
     @Rule

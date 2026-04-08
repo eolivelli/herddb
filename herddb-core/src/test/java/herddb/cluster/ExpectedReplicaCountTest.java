@@ -24,6 +24,7 @@ import static org.junit.Assert.assertEquals;
 import herddb.client.ClientConfiguration;
 import herddb.client.HDBClient;
 import herddb.client.HDBConnection;
+import herddb.core.ClusterTest;
 import herddb.core.TestUtils;
 import herddb.model.TableSpace;
 import herddb.model.TransactionContext;
@@ -44,6 +45,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
 /**
@@ -51,6 +53,7 @@ import org.junit.rules.TemporaryFolder;
  *
  * @author enrico.olivelli
  */
+@Category(ClusterTest.class)
 public class ExpectedReplicaCountTest {
 
     private static final Logger LOG = Logger.getLogger(ExpectedReplicaCountTest.class.getName());
