@@ -21,6 +21,7 @@
 package herddb.server;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import herddb.client.ClientConfiguration;
 import herddb.client.HDBClient;
 import herddb.client.HDBConnection;
@@ -35,6 +36,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -293,6 +295,198 @@ public class ZKDiscoveryRemoteFileServerTest {
             } finally {
                 fileServer2.stop();
                 fileServer1.stop();
+            }
+        } finally {
+            zookeeperServer.close();
+        }
+    }
+
+    /**
+     * Tests ZK-only discovery (no static {@code remote.file.servers} config).
+     * The file server is registered in ZK before the HerdDB server starts.
+     * The server must discover the file server via ZK and checkpoint
+     * must succeed.
+     *
+     * <p>This is a regression test for a race condition where the one-shot
+     * ZK watcher set by {@code listFileServers()} could fire before the
+     * service discovery listener was registered, causing the file server
+     * address to be lost and the hash ring to remain empty.
+     */
+    @Test
+    public void testZKOnlyDiscovery_fileServerAlreadyRegistered() throws Exception {
+        Path zkDir = folder.newFolder("zk").toPath();
+
+        org.apache.curator.test.TestingServer zookeeperServer =
+                new org.apache.curator.test.TestingServer(-1, zkDir.toFile(), true);
+        try {
+            String zkAddress = zookeeperServer.getConnectString();
+            String zkPath = "/herddb";
+
+            // Start RemoteFileServer
+            Path fileServerDataDir = folder.newFolder("fileserver").toPath();
+            RemoteFileServer fileServer = new RemoteFileServer("localhost", 0, fileServerDataDir);
+            fileServer.start();
+
+            try {
+                // Register file server in ZK BEFORE starting the HerdDB server
+                herddb.cluster.ZookeeperMetadataStorageManager registrationManager =
+                        new herddb.cluster.ZookeeperMetadataStorageManager(zkAddress, 40000, zkPath);
+                registrationManager.start();
+
+                try {
+                    String addr = "localhost:" + fileServer.getPort();
+                    registrationManager.registerFileServer("fs1", addr);
+
+                    // Prepare HerdDB server: ZK discovery only (no remote.file.servers)
+                    Properties serverProps = new Properties();
+                    try (InputStream in = SimpleClusterTest.class.getResourceAsStream(
+                            "/conf/test.server_cluster.properties")) {
+                        serverProps.load(in);
+                    }
+                    serverProps.put(ServerConfiguration.PROPERTY_BASEDIR,
+                            folder.newFolder("herddb").getAbsolutePath());
+                    serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkAddress);
+                    serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_PATH, zkPath);
+                    serverProps.put("http.enable", "false");
+                    serverProps.put(ServerConfiguration.PROPERTY_STORAGE_MODE,
+                            ServerConfiguration.PROPERTY_STORAGE_MODE_REMOTE);
+                    // NOTE: not setting PROPERTY_REMOTE_FILE_SERVERS — ZK discovery only
+
+                    ServerConfiguration serverConfig = new ServerConfiguration(serverProps);
+                    try (Server server = new Server(serverConfig)) {
+                        server.start();
+                        server.waitForStandaloneBoot();
+
+                        try (HDBClient hdbClient = new HDBClient(
+                                new ClientConfiguration(folder.newFolder().toPath()))) {
+                            hdbClient.setClientSideMetadataProvider(
+                                    new ZookeeperClientSideMetadataProvider(
+                                            zkAddress, 40000, zkPath));
+                            try (HDBConnection con = hdbClient.openConnection()) {
+                                con.executeUpdate(TableSpace.DEFAULT,
+                                        "CREATE TABLE tt (n1 string primary key, n2 int)",
+                                        0, false, true, Collections.emptyList());
+
+                                for (int i = 0; i < 10; i++) {
+                                    con.executeUpdate(TableSpace.DEFAULT,
+                                            "INSERT INTO tt(n1, n2) VALUES(?, ?)",
+                                            0, false, true,
+                                            Arrays.asList("key" + i, i));
+                                }
+
+                                // Checkpoint must succeed — this would fail with
+                                // "Hash ring is empty" before the fix
+                                server.getManager().checkpoint();
+
+                                try (ScanResultSet scan = con.executeScan(TableSpace.DEFAULT,
+                                        "SELECT count(*) as cnt FROM tt",
+                                        false, Collections.emptyList(), 0, 10, 10, false)) {
+                                    List<Map<String, Object>> rows = scan.consume();
+                                    assertEquals(1, rows.size());
+                                    assertEquals(10, ((Number) rows.get(0).get("cnt")).intValue());
+                                }
+                            }
+                        }
+                    }
+                } finally {
+                    registrationManager.close();
+                }
+            } finally {
+                fileServer.stop();
+            }
+        } finally {
+            zookeeperServer.close();
+        }
+    }
+
+    /**
+     * Tests ZK-only discovery when the file server registers AFTER the
+     * HerdDB server has started. The ZK watcher notification must reach
+     * the client so that checkpoint succeeds.
+     */
+    @Test
+    public void testZKOnlyDiscovery_fileServerRegistersLate() throws Exception {
+        Path zkDir = folder.newFolder("zk").toPath();
+
+        org.apache.curator.test.TestingServer zookeeperServer =
+                new org.apache.curator.test.TestingServer(-1, zkDir.toFile(), true);
+        try {
+            String zkAddress = zookeeperServer.getConnectString();
+            String zkPath = "/herddb";
+
+            // Start RemoteFileServer (but don't register in ZK yet)
+            Path fileServerDataDir = folder.newFolder("fileserver").toPath();
+            RemoteFileServer fileServer = new RemoteFileServer("localhost", 0, fileServerDataDir);
+            fileServer.start();
+
+            try {
+                // Prepare HerdDB server: ZK discovery only (no remote.file.servers)
+                Properties serverProps = new Properties();
+                try (InputStream in = SimpleClusterTest.class.getResourceAsStream(
+                        "/conf/test.server_cluster.properties")) {
+                    serverProps.load(in);
+                }
+                serverProps.put(ServerConfiguration.PROPERTY_BASEDIR,
+                        folder.newFolder("herddb").getAbsolutePath());
+                serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkAddress);
+                serverProps.put(ServerConfiguration.PROPERTY_ZOOKEEPER_PATH, zkPath);
+                serverProps.put("http.enable", "false");
+                serverProps.put(ServerConfiguration.PROPERTY_STORAGE_MODE,
+                        ServerConfiguration.PROPERTY_STORAGE_MODE_REMOTE);
+                // NOTE: not setting PROPERTY_REMOTE_FILE_SERVERS — ZK discovery only
+
+                ServerConfiguration serverConfig = new ServerConfiguration(serverProps);
+                try (Server server = new Server(serverConfig)) {
+                    server.start();
+                    server.waitForStandaloneBoot();
+
+                    // Now register the file server in ZK — the watcher should notify the client
+                    herddb.cluster.ZookeeperMetadataStorageManager registrationManager =
+                            new herddb.cluster.ZookeeperMetadataStorageManager(zkAddress, 40000, zkPath);
+                    registrationManager.start();
+
+                    try {
+                        String addr = "localhost:" + fileServer.getPort();
+                        registrationManager.registerFileServer("fs1", addr);
+
+                        // Give ZK watcher time to propagate
+                        Thread.sleep(2000);
+
+                        try (HDBClient hdbClient = new HDBClient(
+                                new ClientConfiguration(folder.newFolder().toPath()))) {
+                            hdbClient.setClientSideMetadataProvider(
+                                    new ZookeeperClientSideMetadataProvider(
+                                            zkAddress, 40000, zkPath));
+                            try (HDBConnection con = hdbClient.openConnection()) {
+                                con.executeUpdate(TableSpace.DEFAULT,
+                                        "CREATE TABLE tt (n1 string primary key, n2 int)",
+                                        0, false, true, Collections.emptyList());
+
+                                for (int i = 0; i < 10; i++) {
+                                    con.executeUpdate(TableSpace.DEFAULT,
+                                            "INSERT INTO tt(n1, n2) VALUES(?, ?)",
+                                            0, false, true,
+                                            Arrays.asList("key" + i, i));
+                                }
+
+                                // Checkpoint must succeed after late discovery
+                                server.getManager().checkpoint();
+
+                                try (ScanResultSet scan = con.executeScan(TableSpace.DEFAULT,
+                                        "SELECT count(*) as cnt FROM tt",
+                                        false, Collections.emptyList(), 0, 10, 10, false)) {
+                                    List<Map<String, Object>> rows = scan.consume();
+                                    assertEquals(1, rows.size());
+                                    assertEquals(10, ((Number) rows.get(0).get("cnt")).intValue());
+                                }
+                            }
+                        }
+                    } finally {
+                        registrationManager.close();
+                    }
+                }
+            } finally {
+                fileServer.stop();
             }
         } finally {
             zookeeperServer.close();
