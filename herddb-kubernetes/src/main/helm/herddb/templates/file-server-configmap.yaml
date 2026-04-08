@@ -48,4 +48,7 @@ data:
     server.zookeeper.path=/herd
     server.zookeeper.session.timeout=40000
     {{- end }}
+    {{- range $k, $v := .Values.fileServer.extraConfig }}
+    {{ $k }}={{ $v }}
+    {{- end }}
 {{- end }}

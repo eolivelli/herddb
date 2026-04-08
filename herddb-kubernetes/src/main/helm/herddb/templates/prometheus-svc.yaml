@@ -1,0 +1,19 @@
+{{- if .Values.prometheus.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "herddb.fullname" . }}-prometheus
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: prometheus
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.prometheus.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "herddb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: prometheus
+{{- end }}

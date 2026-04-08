@@ -11,4 +11,7 @@ data:
     tickTime=2000
     dataDir=/opt/herddb/zk-data
     clientPort={{ .Values.zookeeper.clientPort }}
+    metricsProvider.className=org.apache.zookeeper.metrics.prometheus.PrometheusMetricsProvider
+    metricsProvider.httpPort={{ .Values.zookeeper.metricsPort }}
+    metricsProvider.exportJvmInfo=true
 {{- end }}

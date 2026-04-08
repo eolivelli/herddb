@@ -20,3 +20,16 @@ Tools pod — run the CLI:
     deploy/{{ include "herddb.fullname" . }}-tools -- \
     herddb-cli -q "SELECT * FROM SYSTABLES"
 {{- end }}
+{{- if .Values.prometheus.enabled }}
+
+Prometheus:
+  kubectl port-forward -n {{ .Release.Namespace }} \
+    svc/{{ include "herddb.fullname" . }}-prometheus 9090:9090
+{{- end }}
+{{- if .Values.grafana.enabled }}
+
+Grafana:
+  kubectl port-forward -n {{ .Release.Namespace }} \
+    svc/{{ include "herddb.fullname" . }}-grafana 3000:3000
+  Default credentials: admin / admin
+{{- end }}

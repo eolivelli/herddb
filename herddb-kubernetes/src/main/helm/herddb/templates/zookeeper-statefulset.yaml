@@ -15,6 +15,10 @@ spec:
       app.kubernetes.io/component: zookeeper
   template:
     metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.zookeeper.metricsPort }}"
+        prometheus.io/path: "/metrics"
       labels:
         {{- include "herddb.labels" . | nindent 8 }}
         app.kubernetes.io/component: zookeeper
@@ -37,6 +41,9 @@ spec:
           ports:
             - name: client
               containerPort: {{ .Values.zookeeper.clientPort }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.zookeeper.metricsPort }}
               protocol: TCP
           readinessProbe:
             tcpSocket:

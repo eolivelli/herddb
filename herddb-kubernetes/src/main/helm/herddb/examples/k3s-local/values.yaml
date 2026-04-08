@@ -110,3 +110,25 @@ tools:
 
 vectorBench:
   enabled: false
+
+prometheus:
+  enabled: true
+  storage:
+    size: 2Gi
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "0.25"
+    limits:
+      memory: "256Mi"
+      cpu: "0.25"
+
+grafana:
+  enabled: true
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "0.1"
+    limits:
+      memory: "128Mi"
+      cpu: "0.25"
