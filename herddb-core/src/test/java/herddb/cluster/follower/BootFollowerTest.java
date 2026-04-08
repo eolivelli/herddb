@@ -26,6 +26,7 @@ import herddb.cluster.BookkeeperCommitLog;
 import herddb.cluster.LedgersInfo;
 import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.codec.RecordSerializer;
+import herddb.core.ClusterTest;
 import herddb.core.TableSpaceManager;
 import herddb.index.SecondaryIndexSeek;
 import herddb.log.LogSequenceNumber;
@@ -57,7 +58,9 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
+@Category(ClusterTest.class)
 public class BootFollowerTest extends MultiServerBase {
 
     @Test

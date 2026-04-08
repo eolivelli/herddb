@@ -23,18 +23,21 @@ package herddb.cluster;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import herddb.core.ClusterTest;
 import herddb.log.LogSequenceNumber;
 import herddb.utils.ZKTestEnv;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
 /**
  * ZooKeeper-backed tests for the replica-checkpoint-LSN tracking API used by the
  * shared-storage retention logic.
  */
+@Category(ClusterTest.class)
 public class ZkReplicaCheckpointLsnTest {
 
     @Rule

@@ -26,6 +26,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.client.ClientConfiguration;
 import herddb.codec.RecordSerializer;
+import herddb.core.ClusterTest;
 import herddb.core.TestUtils;
 import herddb.log.LogSequenceNumber;
 import herddb.model.Column;
@@ -57,6 +58,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
 
@@ -65,6 +67,7 @@ import org.junit.rules.TemporaryFolder;
  *
  * @author enrico.olivelli
  */
+@Category(ClusterTest.class)
 public class SimpleCDCTest {
 
     private static final Logger LOG = Logger.getLogger(SimpleCDCTest.class.getName());

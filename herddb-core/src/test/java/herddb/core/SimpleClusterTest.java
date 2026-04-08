@@ -48,11 +48,13 @@ import java.util.List;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
 /**
  * @author enrico.olivelli
  */
+@Category(ClusterTest.class)
 public class SimpleClusterTest extends BaseTestcase {
 
     @Rule

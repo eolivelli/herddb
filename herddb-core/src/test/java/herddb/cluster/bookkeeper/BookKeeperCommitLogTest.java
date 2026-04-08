@@ -28,6 +28,7 @@ import static org.junit.Assert.assertTrue;
 import herddb.cluster.BookkeeperCommitLog;
 import herddb.cluster.BookkeeperCommitLogManager;
 import herddb.cluster.ZookeeperMetadataStorageManager;
+import herddb.core.ClusterTest;
 import herddb.log.CommitLogResult;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
@@ -52,8 +53,10 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
+@Category(ClusterTest.class)
 public class BookKeeperCommitLogTest {
 
     @Rule

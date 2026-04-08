@@ -24,6 +24,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import herddb.cluster.BookkeeperCommitLog;
 import herddb.codec.RecordSerializer;
+import herddb.core.ClusterTest;
 import herddb.index.SecondaryIndexSeek;
 import herddb.model.ColumnTypes;
 import herddb.model.DataScanner;
@@ -48,7 +49,9 @@ import java.util.HashSet;
 import java.util.List;
 import org.apache.bookkeeper.net.BookieId;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
+@Category(ClusterTest.class)
 public class MultiBookieTest extends BookkeeperFailuresBase {
 
     @Test

@@ -33,6 +33,7 @@ import herddb.client.HDBConnection;
 import herddb.client.HDBException;
 import herddb.client.ScanResultSet;
 import herddb.core.ActivatorRunRequest;
+import herddb.core.ClusterTest;
 import herddb.core.DBManager;
 import herddb.core.TableSpaceManager;
 import herddb.core.TestUtils;
@@ -61,6 +62,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
 /**
@@ -68,6 +70,7 @@ import org.junit.rules.TemporaryFolder;
  *
  * @author enrico.olivelli
  */
+@Category(ClusterTest.class)
 public class RetryOnLeaderChangedTest {
 
     private static final Logger LOG = Logger.getLogger(RetryOnLeaderChangedTest.class.getName());

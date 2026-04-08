@@ -23,6 +23,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import herddb.client.impl.UnreachableServerException;
 import herddb.cluster.ZookeeperMetadataStorageManager;
+import herddb.core.ClusterTest;
 import herddb.model.NodeMetadata;
 import herddb.model.TableSpace;
 import herddb.network.ServerHostData;
@@ -34,8 +35,10 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
+@Category(ClusterTest.class)
 public class ZookeeperClientSideMetadataProviderTest {
 
     @Rule

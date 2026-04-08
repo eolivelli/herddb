@@ -25,6 +25,7 @@ import static org.junit.Assert.assertTrue;
 import herddb.codec.RecordSerializer;
 import herddb.core.AbstractTableManager;
 import herddb.core.ActivatorRunRequest;
+import herddb.core.ClusterTest;
 import herddb.core.TableSpaceManager;
 import herddb.log.LogSequenceNumber;
 import herddb.model.ColumnTypes;
@@ -56,7 +57,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
+@Category(ClusterTest.class)
 public class SimpleFollowerTest extends MultiServerBase {
 
     @Test

@@ -22,6 +22,7 @@ package herddb.cluster;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import herddb.core.ClusterTest;
 import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.HashSet;
@@ -30,10 +31,12 @@ import java.util.Set;
 import org.apache.bookkeeper.net.BookieId;
 import org.apache.bookkeeper.net.BookieSocketAddress;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
 /**
  * @author francesco.caliumi
  */
+@Category(ClusterTest.class)
 public class PreferLocalBookiePlacementPolicyTest {
 
     // CHECKSTYLE.OFF: ConstantName

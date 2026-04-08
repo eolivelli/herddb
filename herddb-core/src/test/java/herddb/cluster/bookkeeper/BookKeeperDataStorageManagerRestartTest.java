@@ -23,6 +23,7 @@ import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import herddb.cluster.BookKeeperDataStorageManager;
 import herddb.cluster.BookkeeperCommitLogManager;
 import herddb.cluster.ZookeeperMetadataStorageManager;
+import herddb.core.ClusterTest;
 import herddb.core.DBManager;
 import herddb.core.RestartTestBase;
 import herddb.server.ServerConfiguration;
@@ -31,7 +32,9 @@ import java.nio.file.Path;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.experimental.categories.Category;
 
+@Category(ClusterTest.class)
 public class BookKeeperDataStorageManagerRestartTest extends RestartTestBase {
 
     ZKTestEnv testEnv;

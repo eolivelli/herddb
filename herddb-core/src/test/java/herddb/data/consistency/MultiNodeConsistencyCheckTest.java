@@ -22,6 +22,7 @@ package herddb.data.consistency;
 import static herddb.core.TestUtils.execute;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import herddb.core.ClusterTest;
 import herddb.core.DBManager;
 import herddb.core.ReplicatedLogtestcase;
 import herddb.model.ColumnTypes;
@@ -38,12 +39,14 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
 
 /**
  *
  * @author hamado
  */
+@Category(ClusterTest.class)
 public class MultiNodeConsistencyCheckTest extends ReplicatedLogtestcase {
 
     final String tableName = "table1";

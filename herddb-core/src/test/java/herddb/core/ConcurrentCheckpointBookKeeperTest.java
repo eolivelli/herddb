@@ -32,11 +32,13 @@ import java.util.Collections;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
 /**
  * Integration tests for concurrent DML during checkpoint with the BookKeeper
  * commit log backend (ZooKeeper + BookKeeper via ZKTestEnv).
  */
+@Category(ClusterTest.class)
 public class ConcurrentCheckpointBookKeeperTest extends ReplicatedLogtestcase {
 
     /**

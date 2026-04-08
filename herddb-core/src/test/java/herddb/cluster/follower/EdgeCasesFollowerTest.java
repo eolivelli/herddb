@@ -27,6 +27,7 @@ import herddb.cluster.LedgersInfo;
 import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.codec.RecordSerializer;
 import herddb.core.AbstractTableManager;
+import herddb.core.ClusterTest;
 import herddb.index.SecondaryIndexSeek;
 import herddb.log.LogSequenceNumber;
 import herddb.model.ColumnTypes;
@@ -55,7 +56,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
+@Category(ClusterTest.class)
 public class EdgeCasesFollowerTest extends MultiServerBase {
 
     @Test

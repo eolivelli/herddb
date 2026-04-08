@@ -34,12 +34,14 @@ import herddb.utils.Bytes;
 import java.util.Arrays;
 import java.util.HashSet;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
 /**
  * Basic functionality
  *
  * @author enrico.olivelli
  */
+@Category(ClusterTest.class)
 public class SimpleReplicationTest extends ReplicatedLogtestcase {
 
     @Test

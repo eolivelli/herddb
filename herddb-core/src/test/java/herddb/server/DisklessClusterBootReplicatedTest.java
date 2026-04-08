@@ -21,6 +21,7 @@ package herddb.server;
 
 import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import static org.junit.Assert.assertEquals;
+import herddb.core.ClusterTest;
 import herddb.core.TestUtils;
 import herddb.model.TableSpace;
 import herddb.utils.DataAccessor;
@@ -31,8 +32,10 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 import org.junit.rules.TemporaryFolder;
 
+@Category(ClusterTest.class)
 public class DisklessClusterBootReplicatedTest {
 
     @Rule
