@@ -21,7 +21,6 @@
 package herddb.server;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
 import herddb.client.ClientConfiguration;
 import herddb.client.HDBClient;
 import herddb.client.HDBConnection;
@@ -36,7 +35,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.concurrent.TimeUnit;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
