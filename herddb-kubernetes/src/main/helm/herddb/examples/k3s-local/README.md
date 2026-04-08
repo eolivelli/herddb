@@ -1,7 +1,7 @@
-# HerdDB on Kind (local development)
+# HerdDB on k3s (local development)
 
 Deploy HerdDB with the full distributed stack on a local
-[Kind](https://kind.sigs.k8s.io/) cluster.
+[k3s](https://k3s.io/) cluster.
 
 ## Architecture
 
@@ -17,36 +17,77 @@ Deploy HerdDB with the full distributed stack on a local
 
 ## Prerequisites
 
-- [Kind](https://kind.sigs.k8s.io/) installed
+- [k3s](https://k3s.io/) installed (or use the install script below)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) configured
 - [Helm 3](https://helm.sh/docs/intro/install/)
-- Docker image available in the cluster (see below)
+- Docker (for building and saving images)
 
-## Quick start
+## Quick start (automated)
 
-### 1. Create a Kind cluster
-
-```bash
-kind create cluster --name herddb
-```
-
-### 2. Load the HerdDB Docker image
-
-If you built the image locally:
+Run the install script from this directory:
 
 ```bash
-kind load docker-image herddb/herddb-server:0.30.0-SNAPSHOT --name herddb
+./install.sh          # install k3s, import image, install chart
+./install.sh --build  # also rebuild Docker images with Maven first
 ```
 
-### 3. Install the Helm chart
+The script installs k3s if needed, imports the Docker image into k3s
+containerd, and installs the Helm chart. Pass `--build` to also rebuild
+the Docker images (`mvn clean install -DskipTests -Pdocker`) before
+importing.
+
+## Quick start (manual)
+
+### 1. Install k3s
+
+```bash
+curl -sfL https://get.k3s.io | sh -
+```
+
+k3s includes a local-path storage provisioner and Traefik ingress by default.
+
+### 2. Configure kubectl
+
+k3s writes its kubeconfig to `/etc/rancher/k3s/k3s.yaml`:
+
+```bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+```
+
+> **Note:** The kubeconfig file is owned by root. Either run commands with
+> `sudo` or copy it to your user:
+> ```bash
+> sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+> sudo chown $(id -u):$(id -g) ~/.kube/config
+> export KUBECONFIG=~/.kube/config
+> ```
+
+### 3. Import the HerdDB Docker image
+
+If you built the image locally with Docker, save and import it into k3s
+containerd:
+
+```bash
+docker save herddb/herddb-server:0.30.0-SNAPSHOT | sudo k3s ctr images import -
+```
+
+> **Tip:** If `k3s ctr` does not work on your version, use the containerd
+> CLI directly:
+> ```bash
+> docker save herddb/herddb-server:0.30.0-SNAPSHOT | \
+>   sudo ctr --address /run/k3s/containerd/containerd.sock \
+>            --namespace k8s.io images import -
+> ```
+
+### 4. Install the Helm chart
 
 From the `herddb-kubernetes/src/main/helm/herddb/` directory:
 
 ```bash
-helm install herddb . -f examples/kind-local/values.yaml
+helm install herddb . -f examples/k3s-local/values.yaml
 ```
 
-### 4. Wait for all pods to become ready
+### 5. Wait for all pods to become ready
 
 ```bash
 kubectl get pods -w
@@ -55,7 +96,7 @@ kubectl get pods -w
 You should see 7 pods (server, file-server, minio, zookeeper, bookkeeper,
 indexing-service, and tools) all reach `Running` / `Ready` status.
 
-### 5. Connect with the CLI
+### 6. Connect with the CLI
 
 ```bash
 kubectl exec -it deploy/herddb-tools -- herddb-cli
@@ -190,10 +231,23 @@ The column type for vector data is `floata` (float array).
 
 ## Teardown
 
+Remove the Helm release and PVCs:
+
 ```bash
-helm uninstall herddb
-kind delete cluster --name herddb
+./teardown.sh
 ```
 
-> **Note:** PersistentVolumeClaims are not deleted by `helm uninstall`.
-> Deleting the Kind cluster removes everything.
+To also uninstall k3s entirely:
+
+```bash
+./teardown.sh --remove-k3s
+```
+
+Or manually:
+
+```bash
+helm uninstall herddb
+kubectl delete pvc -l app.kubernetes.io/instance=herddb
+# Optional: uninstall k3s
+/usr/local/bin/k3s-uninstall.sh
+```

@@ -1,10 +1,10 @@
-# Full-stack HerdDB on a local Kind cluster.
+# Full-stack HerdDB on a local k3s cluster.
 #
 # Deploys: HerdDB server (cluster mode) + file server (S3 on MinIO) +
 #           indexing service + ZooKeeper + BookKeeper + MinIO + tools pod.
 #
 # Install:
-#   helm install herddb . -f examples/kind-local/values.yaml
+#   helm install herddb . -f examples/k3s-local/values.yaml
 
 server:
   mode: cluster

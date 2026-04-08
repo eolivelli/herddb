@@ -38,4 +38,20 @@ fi
 
 JAVA_HEAP="${VECTORBENCH_HEAP:--Xms1g -Xmx2g}"
 
-exec $JAVA $JAVA_HEAP -jar "$JAR" "$@"
+# Auto-wire JDBC URL from environment (set by the Helm chart) when the
+# user didn't pass -u / --url on the command line.
+EXTRA_ARGS=()
+if [ -n "$HERDDB_JDBC_URL" ]; then
+    HAS_URL=false
+    for arg in "$@"; do
+        if [ "$arg" = "-u" ] || [ "$arg" = "--url" ]; then
+            HAS_URL=true
+            break
+        fi
+    done
+    if [ "$HAS_URL" = false ]; then
+        EXTRA_ARGS+=("-u" "$HERDDB_JDBC_URL")
+    fi
+fi
+
+exec $JAVA $JAVA_HEAP -jar "$JAR" "${EXTRA_ARGS[@]}" "$@"
