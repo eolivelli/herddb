@@ -32,12 +32,14 @@ import java.io.IOException;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -827,6 +829,22 @@ public final class BlockRangeIndex<K extends Comparable<K> & SizeAwareObject, V 
 
     public int getNumBlocks() {
         return blocks.size();
+    }
+
+    /**
+     * Collects the current in-memory pageId from every block. This captures pages
+     * that may have been created by concurrent block evictions after the last
+     * {@link #checkpoint()} captured block metadata.
+     */
+    public Set<Long> getActivePageIds() {
+        Set<Long> result = new HashSet<>();
+        for (Block<K, V> block : blocks.values()) {
+            long pid = block.pageId;
+            if (pid > 0) {
+                result.add(pid);
+            }
+        }
+        return result;
     }
 
     private BlockRangeIndexMetadata.BlockMetadata<K> merge(Block<K, V> first, List<Block<K, V>> merging) throws IOException {

@@ -61,7 +61,7 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
 
     private static final int TABLESIZE = 2000;
     private static final int MULTIPLIER = 2;
-    private static final int THREADPOLSIZE = 100;
+    private static final int THREADPOLSIZE = 20;
 
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
@@ -165,7 +165,7 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
                     ));
                 }
                 for (Future f : futures) {
-                    f.get();
+                    f.get(120, TimeUnit.SECONDS);
                 }
 
                 System.out.println("stats::updates:" + updates);

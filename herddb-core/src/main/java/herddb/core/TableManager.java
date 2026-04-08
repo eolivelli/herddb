@@ -2049,13 +2049,36 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
             if (changedRecords != null) {
                 for (Record r : changedRecords.values()) {
-                    applyUpdate(r.key, r.value);
+                    try {
+                        applyUpdate(r.key, r.value);
+                    } catch (PageNotFoundException e) {
+                        if (recovery) {
+                            LOGGER.log(Level.FINE,
+                                    "{0}.{1} recovery: re-applying update for key {2} as delete+insert (transaction commit)",
+                                    new Object[]{table.tablespace, table.name, r.key});
+                            keyToPage.remove(r.key);
+                            applyInsert(r.key, r.value, false);
+                        } else {
+                            throw e;
+                        }
+                    }
                 }
             }
             Set<Bytes> deletedRecords = transaction.deletedRecords.get(table.name);
             if (deletedRecords != null) {
                 for (Bytes key : deletedRecords) {
-                    applyDelete(key);
+                    try {
+                        applyDelete(key);
+                    } catch (PageNotFoundException e) {
+                        if (recovery) {
+                            LOGGER.log(Level.FINE,
+                                    "{0}.{1} recovery: skipping delete for key {2} (transaction commit): {3}",
+                                    new Object[]{table.tablespace, table.name, key, e.getMessage()});
+                            keyToPage.remove(key);
+                        } else {
+                            throw e;
+                        }
+                    }
                 }
             }
         } finally {
@@ -2134,7 +2157,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 } else {
                     try {
                         applyDelete(key);
-                    } catch (IllegalStateException e) {
+                    } catch (PageNotFoundException e) {
                         if (recovery) {
                             // During recovery, the key may already have been deleted if it was
                             // deleted during the table checkpoint's Phase B, or the page may
@@ -2169,7 +2192,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 } else {
                     try {
                         applyUpdate(key, value);
-                    } catch (IllegalStateException e) {
+                    } catch (PageNotFoundException e) {
                         if (recovery) {
                             // During recovery, the key may have been updated during the table
                             // checkpoint's Phase B. The page data may not have been flushed.
@@ -2279,7 +2302,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 previous = page.get(key);
 
                 if (previous == null) {
-                    throw new IllegalStateException("corrupted PK: old page " + pageId + " for deleted record at " + key
+                    throw new PageNotFoundException("corrupted PK: old page " + pageId + " for deleted record at " + key
                             + " was not found in table " + table.tablespace + "." + table.name);
                 }
             } else {
@@ -2295,7 +2318,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             } else {
                 previous = page.get(key);
                 if (previous == null) {
-                    throw new IllegalStateException("corrupted PK: old page " + pageId + " for deleted record at " + key
+                    throw new PageNotFoundException("corrupted PK: old page " + pageId + " for deleted record at " + key
                             + " was not found in table " + table.tablespace + "." + table.name);
                 }
             }
@@ -2400,14 +2423,29 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 // during a concurrent checkpoint Phase B and the page wasn't persisted.
                 // We need the old record for index updates, so signal the caller to
                 // handle this as a delete+insert instead.
-                throw new IllegalStateException("page " + prevPageId + " for updated record at " + key
+                throw new PageNotFoundException("page " + prevPageId + " for updated record at " + key
                         + " was not flushed to disk in table " + table.tablespace + "." + table.name);
             } else {
-                previous = prevPage.get(key);
-                if (previous == null) {
-                    throw new IllegalStateException("corrupted PK: old page " + prevPageId + " for updated record at " + key
-                            + " was not found in table" + table.tablespace + "." + table.name);
+                Record found = prevPage.get(key);
+                if (found == null && !prevPage.immutable) {
+                    /* During checkpoint Phase B, cleanAndCompactPages updates keyToPage
+                     * (pointing to the building page) before adding the record to that page.
+                     * The building page's write lock is held during this window, so acquiring
+                     * the read lock here will block until the record has been fully added.
+                     * This mirrors the retry logic in fetchRecord(). */
+                    final Lock lock = prevPage.pageLock.readLock();
+                    lock.lock();
+                    try {
+                        found = prevPage.get(key);
+                    } finally {
+                        lock.unlock();
+                    }
                 }
+                if (found == null) {
+                    throw new PageNotFoundException("corrupted PK: old page " + prevPageId + " for updated record at " + key
+                            + " was not found in table " + table.tablespace + "." + table.name);
+                }
+                previous = found;
             }
         }
 
