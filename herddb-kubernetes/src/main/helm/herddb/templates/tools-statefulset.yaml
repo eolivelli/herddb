@@ -1,13 +1,17 @@
 {{- if .Values.tools.enabled -}}
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "herddb.fullname" . }}-tools
   labels:
     {{- include "herddb.labels" . | nindent 4 }}
     app.kubernetes.io/component: tools
 spec:
+  serviceName: {{ include "herddb.fullname" . }}-tools
   replicas: 1
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
   selector:
     matchLabels:
       {{- include "herddb.selectorLabels" . | nindent 6 }}
@@ -30,15 +34,30 @@ spec:
               value: {{ include "herddb.jdbcUrl" . | quote }}
             - name: JAVA_OPTS
               value: {{ .Values.tools.javaOpts | default "-Xms128m -Xmx256m -Djava.net.preferIPv4Stack=true" | quote }}
+            - name: VECTORBENCH_DATASET_DIR
+              value: /opt/herddb/vector-datasets
           resources:
             {{- toYaml .Values.tools.resources | nindent 12 }}
           volumeMounts:
             - name: tools-scripts
               mountPath: /usr/local/bin/herddb-cli
               subPath: herddb-cli
+            - name: datasets
+              mountPath: /opt/herddb/vector-datasets
       volumes:
         - name: tools-scripts
           configMap:
             name: {{ include "herddb.fullname" . }}-tools-scripts
             defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: datasets
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.tools.storage.datasets.storageClass }}
+        storageClassName: {{ .Values.tools.storage.datasets.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.tools.storage.datasets.size }}
 {{- end }}

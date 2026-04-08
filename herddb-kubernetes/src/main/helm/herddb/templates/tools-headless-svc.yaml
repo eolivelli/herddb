@@ -1,0 +1,16 @@
+{{- if .Values.tools.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "herddb.fullname" . }}-tools
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tools
+spec:
+  clusterIP: None
+  # No ports — this headless service exists solely to provide stable DNS for the
+  # tools StatefulSet pod (required by the StatefulSet serviceName field).
+  selector:
+    {{- include "herddb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: tools
+{{- end }}

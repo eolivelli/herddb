@@ -23,9 +23,15 @@ server:
       size: 10Gi
     commitlog:
       size: 5Gi
+  resources:
+    requests:
+      memory: "20Gi"
+      cpu: "8"
+    limits:
+      memory: "20Gi"
 
 fileServer:
-  replicaCount: 1
+  replicaCount: 2
   storageMode: s3
   s3:
     endpoint: "https://storage.googleapis.com"
@@ -36,7 +42,13 @@ fileServer:
     # being embedded in the ConfigMap.
     credentialsSecret: "herddb-gcs-credentials"
   storage:
-    size: 10Gi
+    size: 200Gi
+  resources:
+    requests:
+      memory: "16Gi"
+      cpu: "8"
+    limits:
+      memory: "16Gi"
 
 minio:
   enabled: false
@@ -44,24 +56,43 @@ minio:
 zookeeper:
   enabled: true
   storage:
-    size: 5Gi
+    size: 10Gi
+  resources:
+    requests:
+      memory: "4Gi"
+      cpu: "4"
+    limits:
+      memory: "4Gi"
 
 bookkeeper:
   enabled: true
+  replicaCount: 1
   storage:
     journal:
-      size: 5Gi
+      size: 500Gi
     ledger:
-      size: 10Gi
+      size: 500Gi
+  resources:
+    requests:
+      memory: "8Gi"
+      cpu: "4"
+    limits:
+      memory: "8Gi"
 
 indexingService:
   enabled: true
-  replicaCount: 1
+  replicaCount: 2
   storage:
     data:
-      size: 10Gi
+      size: 20Gi
     log:
       size: 5Gi
+  resources:
+    requests:
+      memory: "32Gi"
+      cpu: "16"
+    limits:
+      memory: "32Gi"
 
 tools:
   enabled: true

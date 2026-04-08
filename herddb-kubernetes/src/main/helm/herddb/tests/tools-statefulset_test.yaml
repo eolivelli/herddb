@@ -1,0 +1,139 @@
+suite: tools StatefulSet
+templates:
+  - templates/tools-statefulset.yaml
+  - templates/tools-configmap.yaml
+  - templates/tools-headless-svc.yaml
+tests:
+  - it: should render a StatefulSet when enabled
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - isKind:
+          of: StatefulSet
+
+  - it: should have exactly 1 replica
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 1
+
+  - it: should set serviceName for headless service
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.serviceName
+          value: RELEASE-NAME-herddb-tools
+
+  - it: should use the configured image
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "herddb/herddb-server:0.30.0-SNAPSHOT"
+
+  - it: should sleep as entrypoint
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value: ["sleep"]
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value: ["infinity"]
+
+  - it: should set HERDDB_JDBC_URL env var
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: HERDDB_JDBC_URL
+            value: "jdbc:herddb:server:RELEASE-NAME-herddb-server-0.RELEASE-NAME-herddb-server.NAMESPACE.svc.cluster.local:7000"
+
+  - it: should set VECTORBENCH_DATASET_DIR env var
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: VECTORBENCH_DATASET_DIR
+            value: /opt/herddb/vector-datasets
+
+  - it: should mount the tools scripts configmap
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tools-scripts
+            mountPath: /usr/local/bin/herddb-cli
+            subPath: herddb-cli
+
+  - it: should mount the datasets PVC
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: datasets
+            mountPath: /opt/herddb/vector-datasets
+
+  - it: should have a volumeClaimTemplate for datasets with default 30Gi
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: datasets
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.resources.requests.storage
+          value: 30Gi
+
+  - it: should not render when disabled
+    set:
+      tools.enabled: false
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: configmap should not render when tools disabled
+    set:
+      tools.enabled: false
+    template: templates/tools-configmap.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: configmap should contain the herddb-cli wrapper script
+    template: templates/tools-configmap.yaml
+    asserts:
+      - matchRegex:
+          path: data["herddb-cli"]
+          pattern: "herddb-cli\\.sh"
+      - matchRegex:
+          path: data["herddb-cli"]
+          pattern: "HERDDB_JDBC_URL"
+
+  - it: should use the configured service account
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: RELEASE-NAME-herddb
+
+  - it: headless service should render when enabled
+    template: templates/tools-headless-svc.yaml
+    asserts:
+      - isKind:
+          of: Service
+      - equal:
+          path: spec.clusterIP
+          value: None
+
+  - it: headless service should not render when disabled
+    set:
+      tools.enabled: false
+    template: templates/tools-headless-svc.yaml
+    asserts:
+      - hasDocuments:
+          count: 0

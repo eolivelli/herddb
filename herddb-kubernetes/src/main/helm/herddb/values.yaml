@@ -160,11 +160,16 @@ indexingService:
       memory: "1Gi"
       cpu: "4"
 
-# Tools pod — sleep + pre-configured CLI for kubectl exec
+# Tools pod — sleep + pre-configured CLI for kubectl exec.
+# Runs as a StatefulSet with a persistent PVC for vector benchmark datasets.
 tools:
   enabled: true
   # JVM options for the CLI (defaults to lightweight settings)
   javaOpts: ""
+  storage:
+    datasets:
+      size: 30Gi
+      storageClass: ""
   resources:
     requests:
       memory: "256Mi"
