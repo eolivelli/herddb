@@ -15,6 +15,7 @@
 #
 name: Java CI - Code validation (checkstyle,rat,spotbugs)
 on:
+  pull_request:
   push:
     branches:
       - master

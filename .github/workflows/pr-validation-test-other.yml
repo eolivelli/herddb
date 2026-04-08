@@ -15,6 +15,7 @@
 #
 name: Java CI - Other modules
 on:
+  pull_request:
   push:
     branches:
       - master
