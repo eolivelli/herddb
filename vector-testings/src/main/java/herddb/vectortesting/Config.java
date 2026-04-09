@@ -43,6 +43,7 @@ public class Config {
     int queryThreads = 4;
     int queryCount = 1000;
     int topK = 10;
+    boolean topKExplicit = false;
     int indexM = 16;
     int indexBeamWidth = 100;
     boolean skipIngest = false;
@@ -149,6 +150,7 @@ public class Config {
         }
         if (cmd.hasOption("k")) {
             cfg.topK = Integer.parseInt(cmd.getOptionValue("k"));
+            cfg.topKExplicit = true;
         }
         if (cmd.hasOption("m")) {
             cfg.indexM = Integer.parseInt(cmd.getOptionValue("m"));
@@ -299,8 +301,9 @@ public class Config {
             case "bigann", "sift1b" -> DatasetLoader.DatasetPreset.BIGANN;
             case "glove100", "glove-100", "glove" -> DatasetLoader.DatasetPreset.GLOVE_100;
             case "deep-image-96", "deep-image", "deepimage" -> DatasetLoader.DatasetPreset.DEEP_IMAGE_96;
+            case "custom" -> DatasetLoader.DatasetPreset.CUSTOM;
             default -> throw new IllegalArgumentException("Unknown dataset: " + value
-                    + ". Supported: sift10k, sift1m, gist1m, sift10m, bigann, glove100, deep-image-96");
+                    + ". Supported: sift10k, sift1m, gist1m, sift10m, bigann, glove100, deep-image-96, custom");
         };
     }
 
