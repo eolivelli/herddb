@@ -110,6 +110,11 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
 
     @Override
     public synchronized void updateServers(List<String> newServers) {
+        if (newServers.isEmpty()) {
+            LOGGER.log(Level.WARNING, "updateServers called with empty list, keeping current servers");
+            return;
+        }
+
         ServerSnapshot current = this.snapshot;
 
         // Compute diff
@@ -273,6 +278,10 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     @Override
     public boolean waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber, long timeoutMs) throws InterruptedException {
         ServerSnapshot s = this.snapshot;
+        if (s.servers.isEmpty()) {
+            LOGGER.log(Level.WARNING, "waitForCatchUp: no indexing service instances available");
+            return false;
+        }
         for (Map.Entry<String, ManagedChannel> serverEntry : s.channels.entrySet()) {
             String server = serverEntry.getKey();
             ManagedChannel channel = serverEntry.getValue();
