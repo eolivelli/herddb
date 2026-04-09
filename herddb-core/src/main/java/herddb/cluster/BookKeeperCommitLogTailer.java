@@ -37,6 +37,7 @@ import org.apache.bookkeeper.stats.NullStatsLogger;
 public class BookKeeperCommitLogTailer implements CommitLogTailing {
 
     private static final Logger LOGGER = Logger.getLogger(BookKeeperCommitLogTailer.class.getName());
+    private static final int MAX_CONSECUTIVE_ERRORS = 10;
 
     private final String zkAddress;
     private final int zkSessionTimeout;
@@ -48,6 +49,7 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
     private volatile LogSequenceNumber watermark;
     private volatile boolean running = true;
     private long entriesProcessed;
+    private int consecutiveErrors;
 
     private ZookeeperMetadataStorageManager metadataManager;
     private BookkeeperCommitLogManager commitLogManager;
@@ -83,37 +85,68 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
             return;
         }
 
-        try (CommitLog.FollowerContext context = commitLog.startFollowing(watermark)) {
-            while (running) {
-                try {
-                    commitLog.followTheLeader(watermark, (lsn, entry) -> {
+        while (running) {
+            try (CommitLog.FollowerContext context = commitLog.startFollowing(watermark)) {
+                consecutiveErrors = 0;
+                while (running) {
+                    try {
+                        commitLog.followTheLeader(watermark, (lsn, entry) -> {
+                            if (!running) {
+                                return false;
+                            }
+                            consumer.accept(lsn, entry);
+                            watermark = lsn;
+                            entriesProcessed++;
+                            return running;
+                        }, context);
+                        consecutiveErrors = 0;
+                    } catch (LogNotAvailableException e) {
                         if (!running) {
-                            return false;
+                            break;
                         }
-                        consumer.accept(lsn, entry);
-                        watermark = lsn;
-                        entriesProcessed++;
-                        return running;
-                    }, context);
-                } catch (LogNotAvailableException e) {
-                    if (running) {
-                        LOGGER.log(Level.WARNING, "Error tailing BookKeeper log, retrying", e);
+                        consecutiveErrors++;
+                        LOGGER.log(Level.WARNING,
+                                "Error tailing BookKeeper log (consecutive errors: {0}), retrying",
+                                consecutiveErrors);
+                        LOGGER.log(Level.FINE, "Tailing error details", e);
+                        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                            LOGGER.log(Level.WARNING,
+                                    "Too many consecutive errors ({0}), reinitializing BookKeeper connection",
+                                    consecutiveErrors);
+                            break;
+                        }
                         try {
                             Thread.sleep(1000);
                         } catch (InterruptedException ie) {
                             Thread.currentThread().interrupt();
+                            running = false;
                             break;
                         }
                     }
                 }
+            } catch (Exception e) {
+                if (running) {
+                    LOGGER.log(Level.SEVERE, "BookKeeperCommitLogTailer error in context lifecycle", e);
+                }
             }
-        } catch (Exception e) {
+
             if (running) {
-                LOGGER.log(Level.SEVERE, "BookKeeperCommitLogTailer fatal error", e);
+                closeBookKeeper();
+                try {
+                    Thread.sleep(2000);
+                    initBookKeeper();
+                    consecutiveErrors = 0;
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    running = false;
+                } catch (Exception e) {
+                    LOGGER.log(Level.SEVERE, "Failed to reinitialize BookKeeper connection", e);
+                    running = false;
+                }
             }
-        } finally {
-            closeBookKeeper();
         }
+
+        closeBookKeeper();
         LOGGER.info("BookKeeperCommitLogTailer stopped");
     }
 
@@ -139,9 +172,11 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Error closing commit log", e);
             }
+            commitLog = null;
         }
         if (commitLogManager != null) {
             commitLogManager.close();
+            commitLogManager = null;
         }
         if (metadataManager != null) {
             try {
@@ -149,6 +184,7 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Error closing metadata manager", e);
             }
+            metadataManager = null;
         }
     }
 
