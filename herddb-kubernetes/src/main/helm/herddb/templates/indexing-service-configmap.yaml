@@ -10,7 +10,7 @@ data:
   indexingservice.properties: |
     port={{ .Values.indexingService.port }}
     bind.host=0.0.0.0
-    indexing.storage.type=file
+    indexing.storage.type={{ .Values.indexingService.storageMode | default "file" }}
     indexing.http.enable=true
     indexing.http.port={{ .Values.indexingService.httpPort }}
     indexing.http.host=0.0.0.0

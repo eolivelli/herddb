@@ -2,6 +2,10 @@ image:
   repository: herddb/herddb-server
   tag: "0.30.0-SNAPSHOT"
   pullPolicy: IfNotPresent
+  # Secrets for pulling from private registries (e.g. ghcr.io).
+  # Each entry must have a "name" key matching a docker-registry Secret.
+  pullSecrets: []
+  # - name: ghcr-credentials
 
 nameOverride: ""
 fullnameOverride: ""
@@ -148,6 +152,8 @@ indexingService:
   replicaCount: 2
   port: 9850
   httpPort: 9851
+  # Storage mode: "file" (local), "memory" (testing), or "remote" (remote file server via ZK)
+  storageMode: file
   javaOpts: ""
   storage:
     data:
@@ -182,26 +188,6 @@ tools:
       memory: "256Mi"
       cpu: "0.5"
 
-# Vector benchmark runner — sleep pod with VectorBench installed and a persistent
-# PVC for downloaded datasets (sift1m, gist1m, deep-image-96, ...). Exec into it:
-#   kubectl exec -it <release>-vector-bench-0 -- /opt/herddb/bin/vector-bench.sh --dataset sift1m
-vectorBench:
-  enabled: false
-  # JVM heap options, exported as VECTORBENCH_HEAP and read by vector-bench.sh
-  javaOpts: "-Xms2g -Xmx8g"
-  # Persistent storage for downloaded datasets. PVC is retained across helm
-  # upgrades and StatefulSet deletions (whenDeleted/whenScaled: Retain).
-  storage:
-    datasets:
-      size: 100Gi
-      storageClass: ""
-  resources:
-    requests:
-      memory: "8Gi"
-      cpu: "2"
-    limits:
-      memory: "12Gi"
-      cpu: "4"
 
 # Optional Prometheus instance for scraping HerdDB metrics.
 prometheus:

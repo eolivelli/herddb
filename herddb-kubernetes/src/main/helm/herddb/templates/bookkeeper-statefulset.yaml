@@ -24,6 +24,10 @@ spec:
         app.kubernetes.io/component: bookkeeper
     spec:
       serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       initContainers:
         - name: wait-for-zookeeper
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
