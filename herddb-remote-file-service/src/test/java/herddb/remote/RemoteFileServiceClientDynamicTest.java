@@ -22,11 +22,14 @@ package herddb.remote;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -121,6 +124,55 @@ public class RemoteFileServiceClientDynamicTest {
             // Should still work
             client.writeFile("test/file.dat", "hello".getBytes());
             assertNotNull(client.readFile("test/file.dat"));
+        }
+    }
+
+    /**
+     * Reproducer for the indexing service startup crash: when the client starts
+     * with an empty server list (ZK discovery pending), readFileAsync() must
+     * retry with backoff until servers appear, not crash immediately with
+     * "Hash ring is empty".
+     */
+    @Test
+    public void testReadRetriesUntilServerAppears() throws Exception {
+        String addr1 = "localhost:" + server1.getPort();
+
+        try (RemoteFileServiceClient client = new RemoteFileServiceClient(
+                Collections.emptyList())) {
+
+            // Start an async read — hash ring is empty, so this must retry
+            CompletableFuture<byte[]> readFuture = client.readFileAsync("test/nonexistent.dat");
+
+            // Simulate ZK discovery arriving after a short delay
+            Thread.sleep(1500);
+            client.updateServers(Collections.singletonList(addr1));
+
+            // The read should eventually succeed (file doesn't exist → null)
+            byte[] result = readFuture.get(30, TimeUnit.SECONDS);
+            assertNull("Non-existent file should return null", result);
+        }
+    }
+
+    /**
+     * Verify that listFilesAsync also retries on synchronous failures from
+     * an initially empty hash ring.
+     */
+    @Test
+    public void testListRetriesUntilServerAppears() throws Exception {
+        String addr1 = "localhost:" + server1.getPort();
+
+        try (RemoteFileServiceClient client = new RemoteFileServiceClient(
+                Collections.emptyList())) {
+
+            // Start an async list — hash ring is empty, so this must retry
+            CompletableFuture<?> listFuture = client.listFilesAsync("test/");
+
+            // Simulate ZK discovery arriving after a short delay
+            Thread.sleep(1500);
+            client.updateServers(Collections.singletonList(addr1));
+
+            // The list should eventually succeed
+            listFuture.get(30, TimeUnit.SECONDS);
         }
     }
 }

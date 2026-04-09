@@ -629,7 +629,17 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
 
     private <T> CompletableFuture<T> retryAsync(AsyncAction<T> action, String opName, String path, int attempt) {
         CompletableFuture<T> result = new CompletableFuture<>();
-        action.execute().whenComplete((value, error) -> {
+        CompletableFuture<T> actionResult;
+        try {
+            actionResult = action.execute();
+        } catch (Exception e) {
+            // Handle synchronous failures (e.g. "Hash ring is empty" when no
+            // servers have been discovered yet) the same as async failures so
+            // that the retry logic below can kick in.
+            actionResult = new CompletableFuture<>();
+            actionResult.completeExceptionally(e);
+        }
+        actionResult.whenComplete((value, error) -> {
             if (error == null) {
                 result.complete(value);
                 return;
