@@ -24,14 +24,21 @@ import herddb.daemons.PidFileLocker;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStreamReader;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.Properties;
 import java.util.logging.LogManager;
 import java.util.logging.Logger;
+import org.apache.bookkeeper.stats.prometheus.PrometheusMetricsProvider;
+import org.apache.bookkeeper.stats.prometheus.PrometheusServlet;
+import org.apache.commons.configuration.PropertiesConfiguration;
 import org.apache.zookeeper.server.ServerConfig;
 import org.apache.zookeeper.server.ZooKeeperServerMain;
 import org.apache.zookeeper.server.quorum.QuorumPeerConfig;
+import org.eclipse.jetty.server.handler.ContextHandlerCollection;
+import org.eclipse.jetty.servlet.ServletContextHandler;
+import org.eclipse.jetty.servlet.ServletHolder;
 
 /**
  * Simple wrapper for standalone ZooKeeper server (for local demos/tests)
@@ -40,9 +47,16 @@ import org.apache.zookeeper.server.quorum.QuorumPeerConfig;
  */
 public class ZooKeeperMainWrapper implements AutoCloseable {
 
+    private static final Logger LOG = Logger.getLogger(ZooKeeperMainWrapper.class.getName());
+
+    static final String PROPERTY_HTTP_PORT = "http.port";
+    static final int DEFAULT_HTTP_PORT = 7070;
+
     private final Properties configuration;
     private final PidFileLocker pidFileLocker;
     private ZooKeeperServerMain server;
+    private org.eclipse.jetty.server.Server httpServer;
+    private PrometheusMetricsProvider statsProvider;
 
     private static ZooKeeperMainWrapper runningInstance;
 
@@ -51,9 +65,24 @@ public class ZooKeeperMainWrapper implements AutoCloseable {
         this.pidFileLocker = new PidFileLocker(Paths.get(System.getProperty("user.dir", ".")).toAbsolutePath());
     }
 
+    static ZooKeeperMainWrapper getRunningInstance() {
+        return runningInstance;
+    }
+
     @Override
     public void close() {
-
+        if (httpServer != null) {
+            try {
+                httpServer.stop();
+            } catch (Exception e) {
+                LOG.warning("Error stopping HTTP server: " + e.getMessage());
+            }
+            httpServer = null;
+        }
+        if (statsProvider != null) {
+            statsProvider.stop();
+            statsProvider = null;
+        }
     }
 
     public static void main(String... args) {
@@ -132,6 +161,7 @@ public class ZooKeeperMainWrapper implements AutoCloseable {
                     System.out.println("Ctrl-C trapped. Shutting down");
                     ZooKeeperMainWrapper _brokerMain = runningInstance;
                     if (_brokerMain != null) {
+                        _brokerMain.close();
                         Runtime.getRuntime().halt(0);
                     }
                 }
@@ -146,17 +176,43 @@ public class ZooKeeperMainWrapper implements AutoCloseable {
         }
     }
 
-    private static final Logger LOG = Logger.getLogger(ZooKeeperMainWrapper.class.getName());
-
     public void run() throws Exception {
         pidFileLocker.lock();
 
+        // Start Prometheus metrics provider for JVM metrics
+        statsProvider = new PrometheusMetricsProvider();
+        PropertiesConfiguration statsProviderConfig = new PropertiesConfiguration();
+        statsProviderConfig.setProperty(PrometheusMetricsProvider.PROMETHEUS_STATS_HTTP_ENABLE, false);
+        statsProvider.start(statsProviderConfig);
+
+        // Start HTTP server for metrics
+        int httpPort = Integer.parseInt(configuration.getProperty(PROPERTY_HTTP_PORT,
+                String.valueOf(DEFAULT_HTTP_PORT)));
+        httpServer = new org.eclipse.jetty.server.Server(new InetSocketAddress("0.0.0.0", httpPort));
+        ContextHandlerCollection contexts = new ContextHandlerCollection();
+        httpServer.setHandler(contexts);
+        ServletContextHandler contextRoot = new ServletContextHandler(ServletContextHandler.GZIP);
+        contextRoot.setContextPath("/");
+        contextRoot.addServlet(new ServletHolder(new PrometheusServlet(statsProvider)), "/metrics");
+        contexts.addHandler(contextRoot);
+        httpServer.start();
+        LOG.info("ZooKeeper metrics available at http://0.0.0.0:" + httpPort + "/metrics");
+
+        // Strip out metricsProvider.* properties — ZK's native prometheus metrics
+        // provider is not on the classpath; we handle metrics via our own Jetty server
+        Properties zkConfiguration = new Properties();
+        configuration.forEach((k, v) -> {
+            String key = k.toString();
+            if (!key.startsWith("metricsProvider.") && !key.equals(PROPERTY_HTTP_PORT)) {
+                zkConfiguration.put(k, v);
+            }
+        });
+
         server = new ZooKeeperServerMain();
         QuorumPeerConfig qp = new QuorumPeerConfig();
-        qp.parseProperties(configuration);
+        qp.parseProperties(zkConfiguration);
         ServerConfig sc = new ServerConfig();
         sc.readFrom(qp);
         server.runFromConfig(sc);
-
     }
 }

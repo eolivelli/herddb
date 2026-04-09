@@ -51,9 +51,15 @@ jobs:
       - name: 'Build with Maven'
         run: mvn -B install -DskipTests --file pom.xml -Pjenkins
       - name: 'Build docker images'
-        run: mvn -B -pl herddb-docker --file pom.xml package jib:dockerBuild@build
+        run: mvn -B -pl herddb-docker --file pom.xml package -Ddocker
       - name: 'Install Helm'
         uses: azure/setup-helm@v4
+      - name: 'Install helm-unittest plugin'
+        run: helm plugin install --verify=false https://github.com/helm-unittest/helm-unittest.git
+      - name: 'Helm lint'
+        run: helm lint herddb-kubernetes/src/main/helm/herddb
+      - name: 'Helm unit tests'
+        run: helm unittest herddb-kubernetes/src/main/helm/herddb
       - name: 'Run Kubernetes tests'
         run: mvn -B verify -pl herddb-kubernetes --file pom.xml -Pkubernetes
       - name: 'Remove Snapshots Before Caching'
