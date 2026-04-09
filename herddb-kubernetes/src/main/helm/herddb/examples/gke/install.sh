@@ -15,7 +15,7 @@
 #
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 CHART_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Collect any extra arguments to forward to helm install/upgrade.
@@ -39,7 +39,7 @@ EXTRA_ARGS+=(--set "fileServer.s3.bucket=$GCS_BUCKET")
 # ── 0c. Optionally build and push Docker image ─────────────────
 read -rp "Build and push Docker image ${IMAGE_REPO}:${IMAGE_TAG}? [y/N] " build_image
 if [[ "$build_image" =~ ^[Yy]$ ]]; then
-    REPO_ROOT="$(cd "$CHART_DIR/../../../.." && pwd)"
+    REPO_ROOT="$(cd "$CHART_DIR/../../../../.." && pwd)"
     echo "==> Building Docker image (this may take a few minutes)..."
     (cd "$REPO_ROOT" && mvn clean package -Ddocker -DskipTests)
     # The Maven build produces herddb/herddb-server:<version>

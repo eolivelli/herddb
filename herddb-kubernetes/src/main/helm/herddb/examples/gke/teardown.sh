@@ -7,6 +7,8 @@
 #
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
 # ── 1. Uninstall Helm release ────────────────────────────────────
 if helm status herddb >/dev/null 2>&1; then
     echo "==> Uninstalling Helm release 'herddb'..."
