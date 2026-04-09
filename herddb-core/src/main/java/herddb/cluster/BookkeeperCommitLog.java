@@ -947,21 +947,28 @@ public class BookkeeperCommitLog extends CommitLog {
             nextEntryToRead = 0;
         }
 
-        @Override
-        public void close() {
+        /**
+         * Resets the current ledger handle after a BK error so that the next
+         * {@link #ensureOpenReader} call re-opens it from ZooKeeper with fresh
+         * metadata (close status, LAC). Without this, a stale handle opened via
+         * {@code openLedgerNoRecovery} may never see that the server has closed
+         * the ledger, causing the tailer to retry forever on an empty/broken ledger.
+         */
+        void resetCurrentLedger() {
             if (currentLedger != null) {
                 try {
                     currentLedger.close();
-                } catch (org.apache.bookkeeper.client.api.BKException ex) {
-                    // not really a problem
-                    LOGGER.log(Level.FINE, null, ex);
-                } catch (InterruptedException ex) {
-                    // not really a problem
-                    Thread.currentThread().interrupt();
+                } catch (Exception ex) {
+                    LOGGER.log(Level.FINE, tableSpaceDescription() + " error closing stale ledger handle", ex);
                 } finally {
                     currentLedger = null;
                 }
             }
+        }
+
+        @Override
+        public void close() {
+            resetCurrentLedger();
         }
 
     }
@@ -1031,6 +1038,7 @@ public class BookkeeperCommitLog extends CommitLog {
             LOGGER.log(Level.FINE, "stop following " + tableSpaceDescription(), err);
         } catch (org.apache.bookkeeper.client.api.BKException err) {
             LOGGER.log(Level.SEVERE, tableSpaceDescription() + " internal BK error", err);
+            fContext.resetCurrentLedger();
             throw new LogNotAvailableException(err);
         } catch (InterruptedException err) {
             LOGGER.log(Level.SEVERE, tableSpaceDescription() + " interrupted", err);
