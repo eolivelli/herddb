@@ -23,6 +23,8 @@ package herddb.remote;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
@@ -173,6 +175,33 @@ public class RemoteFileServiceClientDynamicTest {
 
             // The list should eventually succeed
             listFuture.get(30, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Verify that writeFileAsync returns a failed CompletableFuture (rather
+     * than throwing synchronously) when the hash ring is empty.  Writes are
+     * not retried, so the future should complete exceptionally.
+     */
+    @Test
+    public void testWriteAsyncFailsGracefullyWithEmptyHashRing() throws Exception {
+        try (RemoteFileServiceClient client = new RemoteFileServiceClient(
+                Collections.emptyList())) {
+
+            CompletableFuture<Long> writeFuture = client.writeFileAsync(
+                    "test/file.dat", "hello".getBytes());
+
+            // The future must be returned (no synchronous throw) and must
+            // complete exceptionally because there are no servers.
+            try {
+                writeFuture.get(5, TimeUnit.SECONDS);
+                fail("Expected an exception from writeFileAsync with empty hash ring");
+            } catch (java.util.concurrent.ExecutionException e) {
+                // Verify the root cause is the empty hash ring
+                assertTrue("Expected IllegalStateException, got: " + e.getCause(),
+                        e.getCause() instanceof IllegalStateException);
+                assertTrue(e.getCause().getMessage().contains("Hash ring is empty"));
+            }
         }
     }
 }
