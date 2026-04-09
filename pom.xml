@@ -647,6 +647,9 @@
 
 				<!-- JSON files do not support license comment headers -->
 				<exclude>**/*.json</exclude>
+
+				<!-- Plain-text word lists (one word per line, no room for headers) -->
+				<exclude>**/src/main/resources/wordlists/*.txt</exclude>
                         </excludes>
                     </configuration>
                 </plugin>

@@ -103,6 +103,24 @@ public class VectorBench {
         DatasetLoader loader = new DatasetLoader(config.datasetDir, config.dataset, config.datasetUrl);
         loader.ensureDataset();
 
+        // For CUSTOM datasets, load descriptor and auto-configure
+        if (config.dataset == DatasetLoader.DatasetPreset.CUSTOM) {
+            DatasetLoader.DatasetDescriptor desc = loader.loadDescriptor();
+            if (config.similarity == null) {
+                config.similarity = desc.similarity;
+                System.out.println("Auto-configured similarity from descriptor: " + desc.similarity);
+            }
+            if (config.numRows == 100_000 && desc.totalVectors > 0) {
+                config.numRows = desc.totalVectors;
+                System.out.println("Auto-configured rows from descriptor: " + desc.totalVectors);
+            }
+            if (!config.topKExplicit && desc.groundTruthK > 0) {
+                config.topK = desc.groundTruthK;
+                System.out.println("Auto-configured topK from descriptor groundTruthK: " + desc.groundTruthK);
+            }
+            System.out.println();
+        }
+
         System.out.println("Loading query vectors...");
         loader.ensureQueryAndGroundTruth();
         List<float[]> queryVectors = loader.loadQueryVectors(config.queryCount);
@@ -358,6 +376,17 @@ public class VectorBench {
             recallQueries = recallResults.size();
             System.out.printf("%nRecall@%d: %.4f (computed on %d queries with ground truth)%n",
                     config.topK, recall, recallQueries);
+            if (config.dataset == DatasetLoader.DatasetPreset.CUSTOM && loader.getCustomDescriptor() != null) {
+                int gtK = loader.getCustomDescriptor().groundTruthK;
+                if (config.topK > gtK) {
+                    System.out.printf("WARNING: topK=%d exceeds ground truth K=%d from descriptor — "
+                            + "recall may be unreliable (ground truth has fewer neighbors than requested)%n",
+                            config.topK, gtK);
+                } else if (config.topKExplicit && config.topK != gtK) {
+                    System.out.printf("NOTE: topK=%d differs from descriptor groundTruthK=%d%n",
+                            config.topK, gtK);
+                }
+            }
         }
 
         // Final summary

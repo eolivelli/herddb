@@ -19,6 +19,8 @@
  */
 package herddb.vectortesting;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.jhdf.HdfFile;
 import io.jhdf.api.Dataset;
 import java.io.BufferedInputStream;
@@ -43,6 +45,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.zip.GZIPInputStream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 import org.apache.commons.net.ftp.FTP;
 import org.apache.commons.net.ftp.FTPClient;
 
@@ -63,6 +67,10 @@ public class DatasetLoader {
     }
 
     public void ensureDataset() throws IOException {
+        if (preset == DatasetPreset.CUSTOM) {
+            ensureCustomDataset();
+            return;
+        }
         File dir = getDatasetSubDir();
         File baseFile = new File(dir, preset.baseFile);
         File baseFileGz = new File(dir, preset.baseFile + ".gz");
@@ -105,8 +113,8 @@ public class DatasetLoader {
     }
 
     public void ensureQueryAndGroundTruth() throws IOException {
-        // For HDF5 datasets, query and ground truth are inside the same file
-        if (preset.baseFormat == VecFormat.HDF5) {
+        // For CUSTOM and HDF5 datasets, query and ground truth are already present
+        if (preset == DatasetPreset.CUSTOM || preset.baseFormat == VecFormat.HDF5) {
             return;
         }
 
@@ -145,6 +153,152 @@ public class DatasetLoader {
             if (!archive.renameTo(targetGz)) {
                 throw new IOException("Failed to move " + archive + " to " + targetGz);
             }
+        }
+    }
+
+    /**
+     * For CUSTOM datasets, the datasetUrl points to either:
+     * <ul>
+     *   <li>A ZIP file (e.g., gs://bucket/path/my_dataset.zip) containing the
+     *       descriptor JSON and all data files</li>
+     *   <li>A descriptor JSON file (e.g., gs://bucket/path/my_descriptor.json)
+     *       with sibling data files at the same URL path</li>
+     * </ul>
+     */
+    private void ensureCustomDataset() throws IOException {
+        File dir = getDatasetSubDir();
+        dir.mkdirs();
+
+        // Check if descriptor already exists locally
+        File[] existing = dir.listFiles((d, name) -> name.endsWith("_descriptor.json"));
+        if (existing != null && existing.length > 0) {
+            System.out.println("Custom dataset already present at " + dir.getAbsolutePath());
+            return;
+        }
+
+        if (datasetUrl == null || datasetUrl.isEmpty()) {
+            throw new IOException("CUSTOM dataset requires --dataset-url pointing to a ZIP file or "
+                    + "descriptor JSON URL (e.g., gs://bucket/path/dataset.zip or "
+                    + "gs://bucket/path/my_descriptor.json)");
+        }
+
+        if (datasetUrl.endsWith(".zip")) {
+            ensureCustomDatasetFromZip(dir);
+        } else {
+            ensureCustomDatasetFromDescriptor(dir);
+        }
+    }
+
+    private void ensureCustomDatasetFromZip(File dir) throws IOException {
+        String zipUrl = datasetUrl;
+        String zipName = zipUrl.substring(zipUrl.lastIndexOf('/') + 1);
+        File zipFile = new File(dir, zipName);
+
+        if (!zipFile.exists()) {
+            System.out.println("Downloading dataset ZIP from " + zipUrl + " ...");
+            downloadSmartUrl(zipUrl, zipFile);
+            System.out.println("Download complete: " + zipFile.length() + " bytes");
+        }
+
+        System.out.println("Extracting " + zipName + " ...");
+        extractZip(zipFile, dir);
+        System.out.println("Extraction complete.");
+
+        // Verify descriptor was extracted
+        File[] descriptors = dir.listFiles((d, name) -> name.endsWith("_descriptor.json"));
+        if (descriptors == null || descriptors.length == 0) {
+            throw new IOException("ZIP file does not contain a descriptor JSON: " + zipName);
+        }
+    }
+
+    private void ensureCustomDatasetFromDescriptor(File dir) throws IOException {
+        String descriptorUrl = datasetUrl;
+        String baseUrl = descriptorUrl.substring(0, descriptorUrl.lastIndexOf('/'));
+
+        // Download descriptor
+        String descriptorName = descriptorUrl.substring(descriptorUrl.lastIndexOf('/') + 1);
+        File descriptorFile = new File(dir, descriptorName);
+        System.out.println("Downloading descriptor from " + descriptorUrl + " ...");
+        downloadSmartUrl(descriptorUrl, descriptorFile);
+
+        // Parse descriptor to find data files
+        DatasetDescriptor desc = DatasetDescriptor.load(descriptorFile);
+
+        // Download each data file
+        for (String fileName : new String[]{desc.baseFile, desc.queryFile, desc.groundTruthFile}) {
+            if (fileName == null) {
+                continue;
+            }
+            File target = new File(dir, fileName);
+            if (!target.exists()) {
+                String fileUrl = baseUrl + "/" + fileName;
+                System.out.println("Downloading " + fileName + " ...");
+                downloadSmartUrl(fileUrl, target);
+            }
+        }
+        System.out.println("Custom dataset download complete.");
+    }
+
+    private static void extractZip(File zipFile, File destDir) throws IOException {
+        byte[] buffer = new byte[256 * 1024];
+        try (ZipInputStream zis = new ZipInputStream(new BufferedInputStream(new FileInputStream(zipFile)))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.isDirectory()) {
+                    continue;
+                }
+                // Flatten: extract all files directly into destDir regardless of ZIP path
+                String name = entry.getName();
+                if (name.contains("/")) {
+                    name = name.substring(name.lastIndexOf('/') + 1);
+                }
+                File out = new File(destDir, name);
+                System.out.println("  Extracting: " + name);
+                try (FileOutputStream fos = new FileOutputStream(out);
+                     BufferedOutputStream bos = new BufferedOutputStream(fos, 256 * 1024)) {
+                    int len;
+                    while ((len = zis.read(buffer)) > 0) {
+                        bos.write(buffer, 0, len);
+                    }
+                }
+                zis.closeEntry();
+            }
+        }
+    }
+
+    /**
+     * Downloads a file, routing gs:// URLs through gsutil (which handles
+     * authentication for private buckets) and all other URLs through HTTP/FTP.
+     */
+    private void downloadSmartUrl(String url, File dest) throws IOException {
+        if (url.startsWith("gs://")) {
+            downloadGsFile(url, dest);
+        } else {
+            downloadFile(url, dest);
+        }
+    }
+
+    /**
+     * Downloads a file from Google Cloud Storage using gsutil, which inherits
+     * the user's gcloud authentication and supports private buckets.
+     */
+    private static void downloadGsFile(String gsUrl, File dest) throws IOException {
+        dest.getParentFile().mkdirs();
+        System.out.println("  Using gsutil to download from " + gsUrl);
+        ProcessBuilder pb = new ProcessBuilder("gsutil", "cp", gsUrl, dest.getAbsolutePath())
+                .inheritIO();
+        try {
+            int exitCode = pb.start().waitFor();
+            if (exitCode != 0) {
+                throw new IOException("gsutil cp failed with exit code " + exitCode
+                        + ". Ensure gcloud is authenticated: gcloud auth login");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("gsutil download interrupted", e);
+        }
+        if (!dest.exists()) {
+            throw new IOException("gsutil reported success but file not found: " + dest);
         }
     }
 
@@ -376,7 +530,9 @@ public class DatasetLoader {
         if (preset.baseFormat == VecFormat.HDF5) {
             return loadHdf5Vectors("train", maxVectors);
         }
-        File file = new File(getDatasetSubDir(), preset.baseFile);
+        String baseFileName = preset == DatasetPreset.CUSTOM && customDescriptor != null
+                ? customDescriptor.baseFile : preset.baseFile;
+        File file = new File(getDatasetSubDir(), baseFileName);
         if (preset.baseFormat == VecFormat.BVECS) {
             return loadBvecs(openInputStream(file), maxVectors);
         } else {
@@ -398,7 +554,9 @@ public class DatasetLoader {
         if (preset.baseFormat == VecFormat.HDF5) {
             return streamHdf5Vectors(skipVectors, maxVectors);
         }
-        File file = new File(getDatasetSubDir(), preset.baseFile);
+        String baseFileName = preset == DatasetPreset.CUSTOM && customDescriptor != null
+                ? customDescriptor.baseFile : preset.baseFile;
+        File file = new File(getDatasetSubDir(), baseFileName);
         InputStream in = openInputStream(file);
         DataInputStream dis = new DataInputStream(in);
         VecFormat format = preset.baseFormat;
@@ -547,7 +705,9 @@ public class DatasetLoader {
         if (preset.baseFormat == VecFormat.HDF5) {
             return loadHdf5Vectors("test", maxVectors);
         }
-        File file = new File(getDatasetSubDir(), preset.queryFile);
+        String queryFileName = preset == DatasetPreset.CUSTOM && customDescriptor != null
+                ? customDescriptor.queryFile : preset.queryFile;
+        File file = new File(getDatasetSubDir(), queryFileName);
         if (preset.queryFormat == VecFormat.BVECS) {
             return loadBvecs(openInputStream(file), maxVectors);
         } else {
@@ -559,7 +719,9 @@ public class DatasetLoader {
         if (preset.baseFormat == VecFormat.HDF5) {
             return loadHdf5GroundTruth(maxVectors);
         }
-        File file = new File(getDatasetSubDir(), preset.groundTruthFile);
+        String gtFileName = preset == DatasetPreset.CUSTOM && customDescriptor != null
+                ? customDescriptor.groundTruthFile : preset.groundTruthFile;
+        File file = new File(getDatasetSubDir(), gtFileName);
         return loadIvecs(openInputStream(file), maxVectors);
     }
 
@@ -643,6 +805,79 @@ public class DatasetLoader {
         return ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
     }
 
+    /**
+     * Descriptor for a custom generated dataset (loaded from JSON).
+     */
+    static class DatasetDescriptor {
+        final String name;
+        final String similarity;
+        final int dimensions;
+        final int totalVectors;
+        final int numQueries;
+        final int groundTruthK;
+        final String baseFile;
+        final String queryFile;
+        final String groundTruthFile;
+
+        DatasetDescriptor(String name, String similarity, int dimensions, int totalVectors,
+                          int numQueries, int groundTruthK,
+                          String baseFile, String queryFile, String groundTruthFile) {
+            this.name = name;
+            this.similarity = similarity;
+            this.dimensions = dimensions;
+            this.totalVectors = totalVectors;
+            this.numQueries = numQueries;
+            this.groundTruthK = groundTruthK;
+            this.baseFile = baseFile;
+            this.queryFile = queryFile;
+            this.groundTruthFile = groundTruthFile;
+        }
+
+        static DatasetDescriptor load(File jsonFile) throws IOException {
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode root = mapper.readTree(jsonFile);
+            return new DatasetDescriptor(
+                    root.path("name").asText("custom"),
+                    root.path("similarity").asText("euclidean"),
+                    root.path("dimensions").asInt(0),
+                    root.path("totalVectors").asInt(0),
+                    root.path("numQueries").asInt(0),
+                    root.path("groundTruthK").asInt(0),
+                    root.path("baseFile").asText(null),
+                    root.path("queryFile").asText(null),
+                    root.path("groundTruthFile").asText(null)
+            );
+        }
+    }
+
+    private DatasetDescriptor customDescriptor;
+
+    /**
+     * Load and configure from a descriptor JSON file (for custom generated datasets).
+     * Call this after construction with CUSTOM preset to populate file paths and similarity.
+     */
+    public DatasetDescriptor loadDescriptor() throws IOException {
+        File dir = getDatasetSubDir();
+        // Find descriptor JSON in the dataset directory
+        File[] descriptors = dir.listFiles((d, name) -> name.endsWith("_descriptor.json"));
+        if (descriptors == null || descriptors.length == 0) {
+            throw new IOException("No descriptor JSON found in " + dir.getAbsolutePath());
+        }
+        customDescriptor = DatasetDescriptor.load(descriptors[0]);
+        System.out.println("Loaded dataset descriptor: " + descriptors[0].getName());
+        System.out.println("  Name: " + customDescriptor.name
+                + ", Vectors: " + customDescriptor.totalVectors
+                + ", Dimensions: " + customDescriptor.dimensions
+                + ", Similarity: " + customDescriptor.similarity
+                + ", Queries: " + customDescriptor.numQueries
+                + ", GroundTruth-K: " + customDescriptor.groundTruthK);
+        return customDescriptor;
+    }
+
+    public DatasetDescriptor getCustomDescriptor() {
+        return customDescriptor;
+    }
+
     enum VecFormat { FVECS, BVECS, HDF5 }
 
     enum DatasetPreset {
@@ -701,6 +936,14 @@ public class DatasetLoader {
                 null, VecFormat.HDF5,
                 null,
                 "cosine"
+        ),
+        CUSTOM(
+                "custom",
+                null,
+                null, VecFormat.FVECS,
+                null, VecFormat.FVECS,
+                null,
+                "euclidean"
         );
 
         final String subDir;
