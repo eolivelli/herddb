@@ -22,8 +22,8 @@ CHART_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 EXTRA_ARGS=("$@")
 
 # ── 0. Ask for Docker image name and version ─────────────────────
-read -rp "Docker image repository [eolivelli/herddb]: " IMAGE_REPO
-IMAGE_REPO="${IMAGE_REPO:-eolivelli/herddb}"
+read -rp "Docker image repository [ghcr.io/eolivelli/herddb]: " IMAGE_REPO
+IMAGE_REPO="${IMAGE_REPO:-ghcr.io/eolivelli/herddb}"
 
 read -rp "Docker image tag [0.30.0-SNAPSHOT]: " IMAGE_TAG
 IMAGE_TAG="${IMAGE_TAG:-0.30.0-SNAPSHOT}"
@@ -35,6 +35,44 @@ read -rp "GCS bucket name [herddb-pages]: " GCS_BUCKET
 GCS_BUCKET="${GCS_BUCKET:-herddb-pages}"
 
 EXTRA_ARGS+=(--set "fileServer.s3.bucket=$GCS_BUCKET")
+
+# ── 0c. Optionally build and push Docker image ─────────────────
+read -rp "Build and push Docker image ${IMAGE_REPO}:${IMAGE_TAG}? [y/N] " build_image
+if [[ "$build_image" =~ ^[Yy]$ ]]; then
+    REPO_ROOT="$(cd "$CHART_DIR/../../../.." && pwd)"
+    echo "==> Building Docker image (this may take a few minutes)..."
+    (cd "$REPO_ROOT" && mvn clean package -Ddocker -DskipTests)
+    # The Maven build produces herddb/herddb-server:<version>
+    BUILD_VERSION="$(cd "$REPO_ROOT" && mvn help:evaluate -Dexpression=project.version -q -DforceStdout)"
+    SOURCE_IMAGE="herddb/herddb-server:${BUILD_VERSION}"
+    if [[ "$SOURCE_IMAGE" != "${IMAGE_REPO}:${IMAGE_TAG}" ]]; then
+        echo "==> Tagging ${SOURCE_IMAGE} as ${IMAGE_REPO}:${IMAGE_TAG}..."
+        docker tag "$SOURCE_IMAGE" "${IMAGE_REPO}:${IMAGE_TAG}"
+    fi
+    echo "==> Pushing ${IMAGE_REPO}:${IMAGE_TAG}..."
+    docker push "${IMAGE_REPO}:${IMAGE_TAG}"
+    echo "Image pushed successfully."
+fi
+
+# ── 0d. Check / create GHCR image-pull secret ────────────────────
+if ! kubectl get secret ghcr-credentials >/dev/null 2>&1; then
+    echo "Secret 'ghcr-credentials' not found (needed to pull from ghcr.io)."
+    read -rp "Create it now? [Y/n] " create_ghcr
+    if [[ ! "$create_ghcr" =~ ^[Nn]$ ]]; then
+        read -rp "GitHub username: " GHCR_USER
+        read -rsp "GitHub Personal Access Token (with read:packages scope): " GHCR_TOKEN
+        echo ""
+        kubectl create secret docker-registry ghcr-credentials \
+            --docker-server=ghcr.io \
+            --docker-username="$GHCR_USER" \
+            --docker-password="$GHCR_TOKEN"
+        echo "Secret 'ghcr-credentials' created."
+    else
+        echo "WARNING: Without 'ghcr-credentials' pods may fail to pull from ghcr.io."
+    fi
+else
+    echo "==> Secret 'ghcr-credentials' found."
+fi
 
 # ── 1. Verify cluster connectivity ────────────────────────────────
 echo "==> Verifying cluster connectivity..."

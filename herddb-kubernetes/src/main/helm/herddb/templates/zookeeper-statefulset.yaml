@@ -24,6 +24,10 @@ spec:
         app.kubernetes.io/component: zookeeper
     spec:
       serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: zookeeper
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

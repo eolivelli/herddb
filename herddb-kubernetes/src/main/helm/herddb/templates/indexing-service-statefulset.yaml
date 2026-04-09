@@ -24,6 +24,10 @@ spec:
         app.kubernetes.io/component: indexing-service
     spec:
       serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- if .Values.zookeeper.enabled }}
       initContainers:
         - name: wait-for-zookeeper

@@ -24,6 +24,10 @@ spec:
         app.kubernetes.io/component: file-server
     spec:
       serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: file-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

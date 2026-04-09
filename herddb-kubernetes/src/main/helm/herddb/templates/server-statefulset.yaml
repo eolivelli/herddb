@@ -23,6 +23,27 @@ spec:
         app.kubernetes.io/component: server
     spec:
       serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if eq .Values.server.mode "cluster" }}
+      initContainers:
+        - name: wait-for-zookeeper
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["bash", "-c"]
+          args:
+            - |
+              ZK_HOST="{{ include "herddb.fullname" . }}-zookeeper-0.{{ include "herddb.fullname" . }}-zookeeper.{{ .Release.Namespace }}.svc.cluster.local"
+              ZK_PORT={{ .Values.zookeeper.clientPort }}
+              echo "Waiting for ZooKeeper at ${ZK_HOST}:${ZK_PORT}..."
+              while ! (echo ruok 2>/dev/null > /dev/tcp/${ZK_HOST}/${ZK_PORT}); do
+                echo "ZooKeeper not ready, retrying in 2s..."
+                sleep 2
+              done
+              echo "ZooKeeper is ready."
+      {{- end }}
       containers:
         - name: server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

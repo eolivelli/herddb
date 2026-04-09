@@ -23,6 +23,10 @@ spec:
         app.kubernetes.io/component: tools
     spec:
       serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: tools
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
