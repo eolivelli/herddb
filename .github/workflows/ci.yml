@@ -134,4 +134,54 @@ jobs:
           name: maven-build-artifacts
           path: ~/.m2/repository
       - name: 'Test other modules'
-        run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins -pl !herddb-core
+        run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins -pl !herddb-core,!herddb-remote-file-service,!herddb-indexing-service
+
+  test-remote-file-service:
+    name: Remote File Service tests
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: 'Set up JDK 22'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '22'
+          distribution: 'oracle'
+      - name: 'Cache Maven packages'
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: 'cache'
+          restore-keys: 'cache'
+      - name: 'Download build artifacts'
+        uses: actions/download-artifact@v4
+        with:
+          name: maven-build-artifacts
+          path: ~/.m2/repository
+      - name: 'Test herddb-remote-file-service'
+        run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins -pl herddb-remote-file-service
+
+  test-indexing-service:
+    name: Indexing Service tests
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: 'Set up JDK 22'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '22'
+          distribution: 'oracle'
+      - name: 'Cache Maven packages'
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: 'cache'
+          restore-keys: 'cache'
+      - name: 'Download build artifacts'
+        uses: actions/download-artifact@v4
+        with:
+          name: maven-build-artifacts
+          path: ~/.m2/repository
+      - name: 'Test herddb-indexing-service'
+        run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins -pl herddb-indexing-service
