@@ -256,7 +256,14 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
     private CompletableFuture<Long> writeFileAsync(String path, ByteString content) {
         // Writes are not idempotent — no retry
         CompletableFuture<Long> future = new CompletableFuture<>();
-        asyncStubForPath(path).writeFile(
+        RemoteFileServiceGrpc.RemoteFileServiceStub stub;
+        try {
+            stub = asyncStubForPath(path);
+        } catch (Exception e) {
+            future.completeExceptionally(e);
+            return future;
+        }
+        stub.writeFile(
                 WriteFileRequest.newBuilder()
                         .setPath(path)
                         .setContent(content)
