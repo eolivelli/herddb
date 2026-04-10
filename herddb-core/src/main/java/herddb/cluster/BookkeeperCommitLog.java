@@ -496,15 +496,35 @@ public class BookkeeperCommitLog extends CommitLog {
             writer = new CommitFileWriter();
             pendingLedgerId = writer.getLedgerId();
             writer.writeLedgerHeader();
-            pendingLedgerId = null;
+            long previousCurrentLedgerId = currentLedgerId;
+            long previousFirstLedger = actualLedgersList.getFirstLedger();
             currentLedgerId = writer.getLedgerId();
             LOGGER.log(Level.INFO, "Tablespace {1}, opened new ledger:{0}, expectedReplicaCount {2}",
                     new Object[]{currentLedgerId, tableSpaceDescription(), expectedReplicaCount});
-            if (actualLedgersList.getFirstLedger() < 0) {
+            boolean firstLedgerWasUnset = previousFirstLedger < 0;
+            if (firstLedgerWasUnset) {
                 actualLedgersList.setFirstLedger(currentLedgerId);
             }
             actualLedgersList.addLedger(currentLedgerId);
-            metadataManager.saveActualLedgersList(tableSpaceUUID, actualLedgersList);
+            try {
+                metadataManager.saveActualLedgersList(tableSpaceUUID, actualLedgersList);
+            } catch (LogNotAvailableException zkError) {
+                // ZK persistence failed: the BK ledger we just created is not
+                // reachable through the ledgers list (e.g. indexing service only
+                // discovers ledgers via ZK). Roll back the in-memory list, drop
+                // the writer reference (so close() doesn't try to talk to a
+                // ledger that the finally block is about to delete), and let the
+                // finally block delete the orphan BK ledger, so BK and ZK stay in
+                // sync. See issue #48.
+                actualLedgersList.removeLedger(currentLedgerId);
+                if (firstLedgerWasUnset) {
+                    actualLedgersList.setFirstLedger(previousFirstLedger);
+                }
+                currentLedgerId = previousCurrentLedgerId;
+                writer = null;
+                throw zkError;
+            }
+            pendingLedgerId = null;
             return writer;
         } catch (LogNotAvailableException err) {
             signalLogFailed();

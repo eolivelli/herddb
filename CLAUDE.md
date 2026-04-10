@@ -29,3 +29,10 @@ tests or small batches using Maven's `-Dtest=...` selector, for example:
 mvn -pl herddb-core -Dtest=MyChangedTest test
 mvn -pl herddb-core -Dtest='Foo*Test,BarTest#someMethod' test
 ```
+
+## Catching Exceptions
+Never catch `Throwable` or bare `Exception` unless strictly necessary. Catch the
+narrowest exception type(s) the code in the `try` block can actually throw. If a broad
+catch is unavoidable (e.g. isolating a plugin boundary, preventing a background thread
+from dying, top-level request handlers), add a comment explaining *why* the broad catch
+is required.
