@@ -43,6 +43,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -68,6 +69,13 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     private volatile ServerSnapshot snapshot;
     private final long timeoutSeconds;
     private final ClientInterceptor clientInterceptor;
+    /**
+     * Released once the client has seen at least one non-empty server list,
+     * either at construction or via {@link #updateServers(List)}. Used by
+     * {@link #awaitServersReady(long)} to let callers block on cold-cluster
+     * ZK discovery before issuing the first RPC.
+     */
+    private final CountDownLatch serversReadyLatch = new CountDownLatch(1);
 
     private static class ServerSnapshot {
         final List<String> servers;
@@ -91,6 +99,9 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
             channels.put(server, buildChannel(server));
         }
         this.snapshot = new ServerSnapshot(servers, channels);
+        if (!servers.isEmpty()) {
+            this.serversReadyLatch.countDown();
+        }
     }
 
     public IndexingServiceClient(List<String> servers) {
@@ -106,6 +117,11 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
             b.intercept(clientInterceptor);
         }
         return b.build();
+    }
+
+    @Override
+    public boolean awaitServersReady(long timeoutMs) throws InterruptedException {
+        return serversReadyLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
     @Override
@@ -136,6 +152,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         }
 
         this.snapshot = new ServerSnapshot(newServers, newChannels);
+        serversReadyLatch.countDown();
 
         LOGGER.log(Level.INFO, "Updated indexing service servers: {0} (added: {1}, removed: {2})",
                 new Object[]{newServers, added, removed});

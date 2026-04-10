@@ -20,22 +20,22 @@
 
 package herddb.server;
 
-import java.util.List;
-
 /**
- * Interface for clients that support dynamic server list updates.
- *
- * @author enrico.olivelli
+ * Minimal blocking file-service client contract, lifted into herddb-core so
+ * modules that cannot take a compile-time dependency on
+ * {@code herddb-remote-file-service} (e.g. {@code herddb-indexing-service})
+ * can still invoke the client through an interface instead of reflection.
  */
-public interface DynamicServiceClient {
-    void updateServers(List<String> servers);
+public interface RemoteFileClient extends DynamicServiceClient {
 
     /**
-     * Blocks for up to {@code timeoutMs} milliseconds until the client has at
-     * least one server in its routing table. Returns {@code true} as soon as a
-     * server is visible, {@code false} on timeout. Intended for use at
-     * bootstrap on a cold cluster where service discovery may not yet have
-     * populated the server list by the time the first RPC is issued.
+     * Writes the given content to {@code path}, creating or overwriting.
      */
-    boolean awaitServersReady(long timeoutMs) throws InterruptedException;
+    void writeFile(String path, byte[] content);
+
+    /**
+     * Reads the bytes at {@code path}, or returns {@code null} if the file
+     * does not exist.
+     */
+    byte[] readFile(String path);
 }

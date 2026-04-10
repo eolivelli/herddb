@@ -20,22 +20,23 @@
 
 package herddb.server;
 
-import java.util.List;
+import java.io.IOException;
+import java.nio.file.Path;
 
 /**
- * Interface for clients that support dynamic server list updates.
- *
- * @author enrico.olivelli
+ * Minimal view of the shared checkpoint metadata manager exposed to modules
+ * that cannot take a compile-time dependency on
+ * {@code herddb-remote-file-service}.
  */
-public interface DynamicServiceClient {
-    void updateServers(List<String> servers);
+public interface SharedCheckpointMetadata {
 
     /**
-     * Blocks for up to {@code timeoutMs} milliseconds until the client has at
-     * least one server in its routing table. Returns {@code true} as soon as a
-     * server is visible, {@code false} on timeout. Intended for use at
-     * bootstrap on a cold cluster where service discovery may not yet have
-     * populated the server list by the time the first RPC is issued.
+     * Downloads the checkpoint metadata files for the given tableSpace from
+     * shared storage into {@code localMetadataDir}, so the local
+     * {@code FileDataStorageManager} can read them as if they had always been
+     * on disk.
+     *
+     * @return number of files hydrated
      */
-    boolean awaitServersReady(long timeoutMs) throws InterruptedException;
+    int hydrateLocalMetadataDir(Path localMetadataDir, String tableSpace) throws IOException;
 }

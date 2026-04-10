@@ -37,7 +37,7 @@ import herddb.remote.proto.WriteFileBlockRequest;
 import herddb.remote.proto.WriteFileBlockResponse;
 import herddb.remote.proto.WriteFileRequest;
 import herddb.remote.proto.WriteFileResponse;
-import herddb.server.DynamicServiceClient;
+import herddb.server.RemoteFileClient;
 import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -53,6 +53,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -69,7 +70,7 @@ import java.util.logging.Logger;
  *
  * @author enrico.olivelli
  */
-public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceClient {
+public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient {
 
     private static final Logger LOGGER = Logger.getLogger(RemoteFileServiceClient.class.getName());
 
@@ -96,6 +97,13 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
     }
 
     private volatile ServerSnapshot snapshot;
+    /**
+     * Released once the client has seen at least one non-empty server list,
+     * either at construction or via {@link #updateServers(List)}. Lets
+     * bootstrap callers block on cold-cluster ZK discovery before issuing
+     * the first RPC. See {@link #awaitServersReady(long)}.
+     */
+    private final CountDownLatch serversReadyLatch = new CountDownLatch(1);
     private final int maxRetries;
     private final long clientTimeoutSeconds;
     private final int blockSize;
@@ -127,6 +135,9 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
             channels.put(server, buildChannel(server));
         }
         this.snapshot = new ServerSnapshot(new ConsistentHashRouter(servers), channels);
+        if (!servers.isEmpty()) {
+            this.serversReadyLatch.countDown();
+        }
 
         if (servers.isEmpty()) {
             LOGGER.log(Level.INFO,
@@ -195,6 +206,7 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
         }
 
         this.snapshot = new ServerSnapshot(new ConsistentHashRouter(newServers), newChannels);
+        serversReadyLatch.countDown();
 
         LOGGER.log(Level.INFO, "Updated remote file servers: {0} (added: {1}, removed: {2})",
                 new Object[]{newServers, added, removed});
@@ -221,6 +233,27 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
             shutdownThread.setDaemon(true);
             shutdownThread.start();
         }
+    }
+
+    /**
+     * Returns {@code true} if the client currently has at least one server in
+     * its consistent-hash ring. Used by callers that need to block on cold-boot
+     * ZK discovery before issuing the first RPC.
+     */
+    public boolean hasServers() {
+        ServerSnapshot s = this.snapshot;
+        return !s.channels.isEmpty();
+    }
+
+    /**
+     * Blocks for up to {@code timeoutMs} milliseconds until {@link #hasServers()}
+     * returns {@code true}. Returns {@code true} as soon as a server is visible,
+     * {@code false} on timeout. Intended for use at bootstrap on a cold cluster
+     * where ZK service discovery may not yet have populated the server list by
+     * the time the first RPC is issued.
+     */
+    public boolean awaitServersReady(long timeoutMs) throws InterruptedException {
+        return serversReadyLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
     private RemoteFileServiceGrpc.RemoteFileServiceBlockingStub blockingStubForPath(String path) {
@@ -566,6 +599,7 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
 
     // --- Synchronous APIs (wrappers around async) ---
 
+    @Override
     public void writeFile(String path, byte[] content) {
         getUnchecked(writeFileAsync(path, content));
     }
@@ -574,6 +608,7 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
         getUnchecked(writeFileAsync(path, buf, offset, len));
     }
 
+    @Override
     public byte[] readFile(String path) {
         return getUnchecked(readFileAsync(path));
     }
@@ -643,6 +678,10 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
             // Handle synchronous failures (e.g. "Hash ring is empty" when no
             // servers have been discovered yet) the same as async failures so
             // that the retry logic below can kick in.
+            LOGGER.log(Level.INFO,
+                    "remote file {0} synchronous failure for path {1} on attempt {2}, "
+                            + "scheduling retry: {3}",
+                    new Object[]{opName, path, attempt, e.toString()});
             actionResult = new CompletableFuture<>();
             actionResult.completeExceptionally(e);
         }

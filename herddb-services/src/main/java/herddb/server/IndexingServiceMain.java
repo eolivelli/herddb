@@ -33,6 +33,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -47,6 +48,21 @@ public class IndexingServiceMain {
     private static IndexingServer runningServer;
 
     public static void main(String... args) throws Exception {
+        try {
+            runMain(args);
+        } catch (Throwable t) {
+            // Any failure before shutdownLatch.await() leaves a zombie pod:
+            // the gRPC port is closed by the finally blocks, but non-daemon
+            // ZK/BK/scheduler threads keep the JVM alive, so the readiness
+            // probe fails forever and Kubernetes never restarts the pod.
+            // Exit non-zero so the kubelet sees a crash and replaces us.
+            // See #42.
+            LOG.log(Level.SEVERE, "Indexing service failed to start, exiting", t);
+            System.exit(1);
+        }
+    }
+
+    private static void runMain(String... args) throws Exception {
         Properties configuration = new Properties();
 
         // Pass 1: find and load config file (lowest priority)

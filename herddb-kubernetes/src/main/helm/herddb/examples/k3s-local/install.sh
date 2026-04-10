@@ -61,14 +61,22 @@ elif docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
     docker start "$CONTAINER_NAME" >/dev/null
 else
     echo "==> Starting k3s container '$CONTAINER_NAME' (rancher/k3s:$K3S_VERSION)..."
+    # Provide CoreDNS with a real upstream resolver. On hosts using
+    # systemd-resolved, /etc/resolv.conf points at 127.0.0.53, which is
+    # unreachable from inside the k3s container and leaves CoreDNS
+    # resolving every external name to 127.0.0.1.
+    RESOLV_CONF="$SCRIPT_DIR/.resolv.conf"
+    printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > "$RESOLV_CONF"
     docker run -d \
         --name "$CONTAINER_NAME" \
         --privileged \
         --tmpfs /run --tmpfs /var/run \
         -p 6443:6443 \
         -e K3S_KUBECONFIG_MODE=666 \
+        -v "$RESOLV_CONF:/etc/k3s-resolv.conf:ro" \
         "rancher/k3s:$K3S_VERSION" \
-        server --disable traefik --disable metrics-server >/dev/null
+        server --disable traefik --disable metrics-server \
+               --resolv-conf /etc/k3s-resolv.conf >/dev/null
 fi
 
 echo "==> Waiting for k3s API to be reachable..."
