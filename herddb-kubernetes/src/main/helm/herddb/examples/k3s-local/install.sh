@@ -73,7 +73,7 @@ fi
 
 echo "==> Waiting for k3s API to be reachable..."
 for i in {1..60}; do
-    if docker exec "$CONTAINER_NAME" k3s kubectl get --raw=/readyz >/dev/null 2>&1; then
+    if docker exec "$CONTAINER_NAME" kubectl get --raw=/readyz >/dev/null 2>&1; then
         break
     fi
     sleep 2
@@ -91,6 +91,17 @@ docker cp "$CONTAINER_NAME:/etc/rancher/k3s/k3s.yaml" "$KUBECONFIG_FILE" 2>/dev/
 chmod 600 "$KUBECONFIG_FILE"
 echo "==> Wrote kubeconfig to $KUBECONFIG_FILE"
 
+echo "==> Waiting for node to register..."
+for i in {1..60}; do
+    if [[ -n "$(kubectl get nodes -o name 2>/dev/null)" ]]; then
+        break
+    fi
+    sleep 1
+    if [[ $i -eq 60 ]]; then
+        echo "ERROR: no nodes registered within 60s." >&2
+        exit 1
+    fi
+done
 echo "==> Waiting for node to become Ready..."
 kubectl wait --for=condition=ready node --all --timeout=120s >/dev/null
 
@@ -115,13 +126,49 @@ else
 fi
 
 # ── 6. Wait for pods ────────────────────────────────────────────────
+#
+# The indexing service has a cold-start race (see issue #42) where it
+# can lose the ZK file-server discovery window and die with
+# "Hash ring is empty", ending up as a zombie pod (Running but 0/1).
+# As a workaround we retry: after the first wait, any pod still not
+# Ready is deleted and the wait restarts. A clean restart of the
+# indexing service works because ZK has the file-server registered
+# by then.
+wait_pods_ready() {
+    local timeout="$1"
+    kubectl wait --for=condition=ready pod \
+        -l app.kubernetes.io/instance=herddb \
+        --all --timeout="$timeout"
+}
+
+restart_unready_pods() {
+    # Delete any pod owned by the herddb release that is not Ready.
+    # Kubernetes recreates it via the StatefulSet/Deployment owner.
+    local pods
+    pods=$(kubectl get pods -l app.kubernetes.io/instance=herddb \
+        -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==false)]}{.metadata.name}{"\n"}{end}')
+    if [[ -z "$pods" ]]; then
+        return 0
+    fi
+    echo "==> Restarting unready pods: $pods" >&2
+    # shellcheck disable=SC2086
+    kubectl delete pod $pods --wait=false >/dev/null
+}
+
 if $WAIT; then
-    echo "==> Waiting for all pods to become ready (timeout 5m)..."
-    kubectl wait --for=condition=ready pod --all --timeout=300s || {
-        echo "WARNING: not all pods became ready in time." >&2
-        kubectl get pods
-        exit 1
-    }
+    echo "==> Waiting for all HerdDB pods to become ready (timeout 5m)..."
+    if ! wait_pods_ready 300s; then
+        echo "==> Some pods not Ready on first attempt, restarting them..." >&2
+        kubectl get pods >&2
+        restart_unready_pods
+        echo "==> Waiting again (timeout 3m)..."
+        if ! wait_pods_ready 180s; then
+            echo "ERROR: pods still not Ready after restart." >&2
+            kubectl get pods >&2
+            exit 1
+        fi
+    fi
+    kubectl get pods
 fi
 
 cat <<EOF
