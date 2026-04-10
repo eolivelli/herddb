@@ -2,10 +2,27 @@
 #
 # Deploys: HerdDB server (cluster mode, remote storage) + file server
 # (S3 on MinIO) + indexing service + ZooKeeper + BookKeeper + MinIO +
-# tools pod + Prometheus + Grafana.
+# tools pod.
 #
 # Mirrors the structure of examples/gke/values.yaml but with resources
-# and PVCs sized for a developer laptop. No PVC exceeds 10 GiB.
+# and PVCs sized for a developer laptop / workstation. No PVC exceeds 10 GiB.
+#
+# Prometheus and Grafana are disabled by default to save RAM; enable them
+# ad-hoc with --set prometheus.enabled=true --set grafana.enabled=true.
+#
+# File-server and indexing-service heap are sized for large-scale vector
+# benchmarks (e.g. gist1m / sift1m with 1M × 960-dim vectors). The
+# file-server needs ≥ 4 g because a single 960-dim segment can reach
+# ~1.2 GB of raw float data and the CachingObjectStorage reads it into
+# the JVM heap during compaction.
+#
+# Server heap raised to 2 g: checkpointing 1M rows × 128-dim vectors
+# requires ~1.5 GB peak heap for dirty-page serialisation; the old
+# 1 g heap caused OOM in flushNewPageForCheckpoint.
+#
+# Tools heap raised to 2 g: loading the sift1m base set (1M × 128 × 4 B
+# = 512 MB) into the vector-bench JVM plus JVM overhead exceeds 512 Mi;
+# the old 512 Mi container limit caused OOMKill during ingest.
 #
 # Install via ./install.sh (which runs k3s inside a Docker container
 # and imports the HerdDB image into containerd so imagePullPolicy=Never
@@ -18,24 +35,35 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  javaOpts: "-Xms1g -Xmx1g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms1g -Xmx2g -Djava.net.preferIPv4Stack=true"
   storage:
     data:
       size: 5Gi
     commitlog:
       size: 2Gi
+  # Raise the gRPC deadline for server→indexing-service calls from the
+  # default 30 s to 300 s (5 min).  On a local k3s-in-Docker cluster,
+  # MinIO throughput is ~4 MB/s, so cold-loading the 208 MB FusedPQ graph
+  # for a sift1m segment takes ~52 s — far beyond the 30 s default and
+  # causing every query to fail with DEADLINE_EXCEEDED on first search.
+  extraConfig:
+    indexing.service.timeout: "300"
   resources:
     requests:
-      memory: "2Gi"
+      memory: "3Gi"
       cpu: "0.5"
     limits:
-      memory: "2Gi"
+      memory: "3Gi"
       cpu: "1"
 
 fileServer:
   replicaCount: 1
   storageMode: s3
-  javaOpts: "-Xms1g -Xmx1g -Djava.net.preferIPv4Stack=true"
+  # Heap raised to 4 g: gist1m segments (310k+ vectors × 960 dim × 4 B) can
+  # exceed 1 GB; the previous 1 g heap caused OOM in CachingObjectStorage
+  # during compaction. Allow -Xms2g so the JVM starts with headroom and
+  # can grow to 4 g on demand.
+  javaOpts: "-Xms2g -Xmx4g -Djava.net.preferIPv4Stack=true"
   # S3 endpoint, bucket, and credentials are auto-wired from the
   # minio section below.
   storage:
@@ -44,10 +72,10 @@ fileServer:
   cacheMaxBytes: 10737418240
   resources:
     requests:
-      memory: "1536Mi"
+      memory: "5Gi"
       cpu: "0.5"
     limits:
-      memory: "1536Mi"
+      memory: "5Gi"
       cpu: "1"
 
 minio:
@@ -98,7 +126,9 @@ indexingService:
   enabled: true
   storageMode: remote
   replicaCount: 1
-  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
+  # Heap raised to 3 g for extra GC headroom during large-dataset compaction
+  # coordination (was 2 g).
+  javaOpts: "-Xms2g -Xmx3g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
   storage:
     data:
       size: 5Gi
@@ -106,10 +136,10 @@ indexingService:
       size: 2Gi
   resources:
     requests:
-      memory: "3Gi"
+      memory: "4Gi"
       cpu: "0.5"
     limits:
-      memory: "3Gi"
+      memory: "4Gi"
       cpu: "1"
 
 tools:
@@ -117,16 +147,21 @@ tools:
   storage:
     datasets:
       size: 10Gi
+  # Heap raised to 2 g: sift1m base set (512 MB) plus JVM overhead exceeds
+  # the old 512 Mi container limit, causing OOMKill during ingest.
+  javaOpts: "-Xms512m -Xmx1536m -Djava.net.preferIPv4Stack=true"
   resources:
     requests:
-      memory: "512Mi"
+      memory: "2Gi"
       cpu: "0.25"
     limits:
-      memory: "512Mi"
+      memory: "2Gi"
       cpu: "0.5"
 
 prometheus:
-  enabled: true
+  # Disabled by default to save ~512 Mi RAM during vector benchmarks.
+  # Re-enable with: --set prometheus.enabled=true
+  enabled: false
   storage:
     size: 1Gi
   resources:
@@ -138,7 +173,9 @@ prometheus:
       cpu: "0.25"
 
 grafana:
-  enabled: true
+  # Disabled by default to save ~256 Mi RAM during vector benchmarks.
+  # Re-enable with: --set grafana.enabled=true
+  enabled: false
   resources:
     requests:
       memory: "128Mi"
