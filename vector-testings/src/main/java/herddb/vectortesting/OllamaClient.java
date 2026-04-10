@@ -19,28 +19,35 @@
  */
 package herddb.vectortesting;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
  * HTTP client for the Ollama embedding API ({@code POST /api/embed}).
+ *
+ * <p>Thread-safe: the underlying {@link HttpClient} and {@link JsonFactory} are both safe
+ * to share across threads, so a single {@code OllamaClient} can be reused by multiple
+ * worker threads performing concurrent {@link #embed(List)} calls.
  */
 public class OllamaClient implements Closeable {
 
     private final HttpClient httpClient;
     private final String baseUrl;
     private final String model;
-    private final ObjectMapper mapper = new ObjectMapper();
+    private final JsonFactory jsonFactory = new JsonFactory();
 
     public OllamaClient(String baseUrl, String model) {
         this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
@@ -54,43 +61,103 @@ public class OllamaClient implements Closeable {
      * Embed a batch of sentences. Returns one float[] per input sentence.
      */
     public float[][] embed(List<String> sentences) throws IOException, InterruptedException {
-        ObjectNode requestBody = mapper.createObjectNode();
-        requestBody.put("model", model);
-        ArrayNode inputArray = requestBody.putArray("input");
-        for (String s : sentences) {
-            inputArray.add(s);
-        }
+        byte[] requestBody = buildRequestBody(sentences);
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl + "/api/embed"))
                 .header("Content-Type", "application/json")
                 .timeout(Duration.ofSeconds(300))
-                .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(requestBody)))
+                .POST(HttpRequest.BodyPublishers.ofByteArray(requestBody))
                 .build();
 
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<InputStream> response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
 
         if (response.statusCode() != 200) {
-            throw new IOException("Ollama API returned HTTP " + response.statusCode() + ": " + response.body());
+            String snippet = readErrorSnippet(response.body());
+            throw new IOException("Ollama API returned HTTP " + response.statusCode() + ": " + snippet);
         }
 
-        JsonNode root = mapper.readTree(response.body());
-        JsonNode embeddings = root.get("embeddings");
-        if (embeddings == null || !embeddings.isArray()) {
-            throw new IOException("Unexpected Ollama response: missing 'embeddings' array. Response: "
-                    + response.body().substring(0, Math.min(500, response.body().length())));
+        try (InputStream body = response.body()) {
+            return parseEmbeddings(body);
         }
+    }
 
-        float[][] result = new float[embeddings.size()][];
-        for (int i = 0; i < embeddings.size(); i++) {
-            JsonNode vec = embeddings.get(i);
-            float[] floats = new float[vec.size()];
-            for (int j = 0; j < vec.size(); j++) {
-                floats[j] = (float) vec.get(j).doubleValue();
+    private byte[] buildRequestBody(List<String> sentences) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream(256 + sentences.size() * 64);
+        try (JsonGenerator gen = jsonFactory.createGenerator(baos)) {
+            gen.writeStartObject();
+            gen.writeStringField("model", model);
+            gen.writeArrayFieldStart("input");
+            for (String s : sentences) {
+                gen.writeString(s);
             }
-            result[i] = floats;
+            gen.writeEndArray();
+            gen.writeEndObject();
         }
-        return result;
+        return baos.toByteArray();
+    }
+
+    private float[][] parseEmbeddings(InputStream body) throws IOException {
+        try (JsonParser p = jsonFactory.createParser(body)) {
+            if (p.nextToken() != JsonToken.START_OBJECT) {
+                throw new IOException("Unexpected Ollama response: not a JSON object");
+            }
+            while (p.nextToken() != JsonToken.END_OBJECT) {
+                String field = p.currentName();
+                p.nextToken();
+                if ("embeddings".equals(field)) {
+                    if (p.currentToken() != JsonToken.START_ARRAY) {
+                        throw new IOException("Unexpected Ollama response: 'embeddings' is not an array");
+                    }
+                    List<float[]> rows = new ArrayList<>();
+                    while (p.nextToken() == JsonToken.START_ARRAY) {
+                        rows.add(readFloatArray(p));
+                    }
+                    // skip the rest of the object (e.g. "model", "total_duration", ...)
+                    while (p.nextToken() != null && p.currentToken() != JsonToken.END_OBJECT) {
+                        p.skipChildren();
+                    }
+                    return rows.toArray(new float[0][]);
+                } else {
+                    p.skipChildren();
+                }
+            }
+            throw new IOException("Unexpected Ollama response: missing 'embeddings' field");
+        }
+    }
+
+    private static float[] readFloatArray(JsonParser p) throws IOException {
+        // Grow on demand; typical embedding dims are 128..4096.
+        float[] buf = new float[512];
+        int n = 0;
+        while (p.nextToken() != JsonToken.END_ARRAY) {
+            if (n == buf.length) {
+                float[] bigger = new float[buf.length * 2];
+                System.arraycopy(buf, 0, bigger, 0, n);
+                buf = bigger;
+            }
+            buf[n++] = p.getFloatValue();
+        }
+        if (n == buf.length) {
+            return buf;
+        }
+        float[] out = new float[n];
+        System.arraycopy(buf, 0, out, 0, n);
+        return out;
+    }
+
+    private static String readErrorSnippet(InputStream body) {
+        try (InputStream in = body) {
+            byte[] buf = new byte[500];
+            int total = 0;
+            int r;
+            while (total < buf.length && (r = in.read(buf, total, buf.length - total)) > 0) {
+                total += r;
+            }
+            return new String(buf, 0, total, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            return "<unreadable body: " + e.getMessage() + ">";
+        }
     }
 
     /**

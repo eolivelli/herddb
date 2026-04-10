@@ -28,8 +28,15 @@ import java.io.FileOutputStream;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -39,6 +46,18 @@ import java.util.zip.ZipOutputStream;
  * with ground truth for recall evaluation.
  */
 public class DatasetGenerator {
+
+    private static final class BatchResult {
+        final int startIdx;
+        final List<String> sentences;
+        final float[][] embeddings;
+
+        BatchResult(int startIdx, List<String> sentences, float[][] embeddings) {
+            this.startIdx = startIdx;
+            this.sentences = sentences;
+            this.embeddings = embeddings;
+        }
+    }
 
     public static void main(String[] args) throws Exception {
         GeneratorConfig config = GeneratorConfig.parse(args);
@@ -72,6 +91,16 @@ public class DatasetGenerator {
 
         long startTime = System.currentTimeMillis();
 
+        System.out.println("Using " + config.threads + " parallel embedding worker(s)");
+        AtomicInteger threadCounter = new AtomicInteger();
+        ThreadFactory threadFactory = r -> {
+            Thread t = new Thread(r, "ollama-embed-" + threadCounter.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        };
+        ExecutorService pool = Executors.newFixedThreadPool(config.threads, threadFactory);
+        int maxInFlight = Math.max(2, config.threads * 2);
+
         try (SiftWriter baseWriter = new SiftWriter(baseFile);
              SiftWriter queryWriter = new SiftWriter(queryFile);
              PrintWriter csvWriter = config.csv
@@ -82,15 +111,45 @@ public class DatasetGenerator {
                 csvWriter.println("id,sentence,vector");
             }
 
-            int generated = 0;
-            while (generated < config.total) {
-                int batchCount = Math.min(config.batchSize, config.total - generated);
-                List<String> sentences = sentenceGen.generateBatch(batchCount);
-                float[][] embeddings = ollama.embed(sentences);
+            ArrayDeque<Future<BatchResult>> inFlight = new ArrayDeque<>();
+            int submitted = 0;
+            int written = 0;
 
-                for (int i = 0; i < embeddings.length; i++) {
-                    int globalIdx = generated + i;
-                    float[] vec = embeddings[i];
+            while (written < config.total) {
+                // Submit until the in-flight window is full or all batches are queued.
+                while (submitted < config.total && inFlight.size() < maxInFlight) {
+                    int batchCount = Math.min(config.batchSize, config.total - submitted);
+                    int startIdx = submitted;
+                    List<String> sentences = sentenceGen.generateBatch(batchCount);
+                    final OllamaClient ollamaRef = ollama;
+                    inFlight.add(pool.submit(() -> {
+                        float[][] embeddings = ollamaRef.embed(sentences);
+                        return new BatchResult(startIdx, sentences, embeddings);
+                    }));
+                    submitted += batchCount;
+                }
+
+                // Drain the head batch in submission order (single-writer side).
+                BatchResult batch;
+                try {
+                    batch = inFlight.removeFirst().get();
+                } catch (ExecutionException ee) {
+                    for (Future<BatchResult> f : inFlight) {
+                        f.cancel(true);
+                    }
+                    Throwable cause = ee.getCause();
+                    if (cause instanceof RuntimeException) {
+                        throw (RuntimeException) cause;
+                    }
+                    if (cause instanceof Exception) {
+                        throw (Exception) cause;
+                    }
+                    throw ee;
+                }
+
+                for (int i = 0; i < batch.embeddings.length; i++) {
+                    int globalIdx = batch.startIdx + i;
+                    float[] vec = batch.embeddings[i];
 
                     baseWriter.writeFvec(vec);
 
@@ -114,20 +173,22 @@ public class DatasetGenerator {
                     if (csvWriter != null) {
                         csvWriter.print(globalIdx);
                         csvWriter.print(',');
-                        csvWriter.print(escapeCsv(sentences.get(i)));
+                        csvWriter.print(escapeCsv(batch.sentences.get(i)));
                         csvWriter.print(',');
                         csvWriter.println(vectorToString(vec));
                     }
                 }
 
-                generated += embeddings.length;
+                written += batch.embeddings.length;
                 long elapsed = System.currentTimeMillis() - startTime;
-                double rate = generated * 1000.0 / elapsed;
-                double eta = (config.total - generated) / rate;
+                double rate = written * 1000.0 / Math.max(1, elapsed);
+                double eta = (config.total - written) / Math.max(1e-6, rate);
                 System.out.printf("\r  Generated %,d / %,d vectors (%.0f vec/s, ETA: %.0fs)    ",
-                        generated, config.total, rate, eta);
+                        written, config.total, rate, eta);
             }
             System.out.println();
+        } finally {
+            pool.shutdown();
         }
 
         // Handle edge case where total == numQueries (tracker never initialized in the else-if branch)

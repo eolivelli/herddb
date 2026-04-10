@@ -38,6 +38,7 @@ public class GeneratorConfig {
     boolean zip = false;
     int batchSize = 100;
     String similarity = "euclidean";
+    int threads = 2;
 
     private static Options buildOptions() {
         Options opts = new Options();
@@ -52,6 +53,7 @@ public class GeneratorConfig {
         opts.addOption(null, "zip", false, "Compress output files into a ZIP archive");
         opts.addOption(null, "batch-size", true, "Sentences per Ollama API call (default: 100)");
         opts.addOption(null, "similarity", true, "Distance function: euclidean, cosine (default: euclidean)");
+        opts.addOption(null, "threads", true, "Parallel Ollama embedding workers (default: 2)");
         opts.addOption("h", "help", false, "Show help");
         return opts;
     }
@@ -100,7 +102,14 @@ public class GeneratorConfig {
         if (cmd.hasOption("similarity")) {
             cfg.similarity = cmd.getOptionValue("similarity");
         }
+        if (cmd.hasOption("threads")) {
+            cfg.threads = Integer.parseInt(cmd.getOptionValue("threads"));
+        }
 
+        if (cfg.threads <= 0) {
+            System.err.println("ERROR: --threads must be positive.");
+            System.exit(1);
+        }
         if (cfg.total <= 0) {
             System.err.println("ERROR: --total is required and must be positive.");
             new HelpFormatter().printHelp("dataset-generator", opts);
@@ -129,6 +138,7 @@ public class GeneratorConfig {
                 + ", zip=" + zip
                 + ", batchSize=" + batchSize
                 + ", similarity=" + similarity
+                + ", threads=" + threads
                 + '}';
     }
 }
