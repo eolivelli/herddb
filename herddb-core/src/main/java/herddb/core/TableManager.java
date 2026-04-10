@@ -2282,32 +2282,43 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
          * When index is enabled we need the old value to update them, we'll force the page load only if that
          * record is really needed.
          */
-        final DataPage page;
+        /*
+         * Write target MUST come strictly from newPages. See issue #46.
+         * newPages entries are DML-owned pages (created via createNewPage). The 'pages'
+         * map additionally holds checkpoint building pages created via createMutablePage
+         * (which are NOT in newPages); those are iterated/filled by Phase B and must
+         * never be written in-place by applyUpdate/applyDelete. Writing to a checkpoint
+         * source page or buildingPage would orphan the key.
+         */
+        final DataPage writeTargetPage;
+        final DataPage readPage;
         final Record previous;
         if (indexes == null) {
             /* We don't need the page if isn't loaded or isn't a mutable new page */
-            DataPage foundPage = newPages.get(pageId);
-            if (foundPage == null) {
-                /* The page may be a building page (non-blocking checkpoint compaction) that is
-                 * in 'pages' but not in 'newPages'. Treat it like a mutable new page. */
+            writeTargetPage = newPages.get(pageId);
+            DataPage foundReadPage = writeTargetPage;
+            if (foundReadPage == null) {
+                /* Read-only fallback: the page may still be a non-immutable entry in
+                 * 'pages' (e.g. a Phase B source page). Use it only to read the old
+                 * record; never as a write target. */
                 final DataPage candidate = pages.get(pageId);
                 if (candidate != null && !candidate.immutable) {
-                    foundPage = candidate;
+                    foundReadPage = candidate;
                 }
             }
-            page = foundPage;
+            readPage = foundReadPage;
 
-            if (page != null) {
-                pageReplacementPolicy.pageHit(page);
-                Record found = page.get(key);
-                if (found == null && !page.immutable) {
+            if (readPage != null) {
+                pageReplacementPolicy.pageHit(readPage);
+                Record found = readPage.get(key);
+                if (found == null && !readPage.immutable) {
                     /* Same building-page race as in applyUpdate: keyToPage can be updated
                      * before the record is published into the building page. Retry under
                      * the page read lock to wait for Phase B compaction to finish the put. */
-                    final Lock lock = page.pageLock.readLock();
+                    final Lock lock = readPage.pageLock.readLock();
                     lock.lock();
                     try {
-                        found = page.get(key);
+                        found = readPage.get(key);
                     } finally {
                         lock.unlock();
                     }
@@ -2322,13 +2333,14 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
         } else {
             /* We really need the page for update index old values */
-            page = loadPageToMemory(pageId, false);
-            if (page == null) {
+            writeTargetPage = newPages.get(pageId);
+            readPage = loadPageToMemory(pageId, false);
+            if (readPage == null) {
                 // Page was never flushed to disk — can happen if the key was inserted
                 // during a concurrent checkpoint Phase B and the page wasn't persisted.
                 previous = null;
             } else {
-                previous = page.get(key);
+                previous = readPage.get(key);
                 if (previous == null) {
                     throw new PageNotFoundException("corrupted PK: old page " + pageId + " for deleted record at " + key
                             + " was not found in table " + table.tablespace + "." + table.name);
@@ -2336,23 +2348,27 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
         }
 
-        if (page == null || page.immutable) {
-            /* Unloaded or immutable, set it as dirty.
-             * Skip if page is not in pageSet: this happens during crash recovery when keyToPage
-             * references an unflushed DML page (P5) that was captured in the PK checkpoint but
-             * never persisted to storage. The WAL replay will re-apply the delete correctly. */
-            if (page != null || pageSet.containsActivePage(pageId)) {
+        if (writeTargetPage == null || writeTargetPage.immutable) {
+            /* Not a safe write target — go through the dirty path so the delete is
+             * applied via page-set dirty tracking instead of an in-place remove that
+             * could race with checkpoint Phase B.
+             * Skip setPageDirty if page is not in pageSet: this happens during crash recovery
+             * when keyToPage references an unflushed DML page (P5) that was captured in the PK
+             * checkpoint but never persisted to storage, and it also covers transient building
+             * pages that are in 'pages' but not yet active. The WAL replay will re-apply the delete. */
+            if (pageSet.containsActivePage(pageId)) {
                 pageSet.setPageDirty(pageId, previous);
             }
         } else {
-            /* Mutable page, need to check if still modifiable or already unloaded */
-            final Lock lock = page.pageLock.readLock();
+            /* Mutable page safe for in-place writes (from newPages or a transient building
+             * page not in pageSet.activePages). Check if still modifiable or already unloaded. */
+            final Lock lock = writeTargetPage.pageLock.readLock();
             lock.lock();
             try {
-                if (page.writable) {
+                if (writeTargetPage.writable) {
                     /* We can modify the page directly */
-                    page.remove(key);
-                } else {
+                    writeTargetPage.remove(key);
+                } else if (pageSet.containsActivePage(pageId)) {
                     /* Unfortunately is not writable (anymore), set it as dirty */
                     pageSet.setPageDirty(pageId, previous);
                 }
@@ -2399,35 +2415,46 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
          * When index is enabled we need the old value to update them, we'll force the page load only if that
          * record is really needed.
          */
-        final DataPage prevPage;
+        /*
+         * Write target MUST come strictly from newPages. See issue #46.
+         * newPages entries are DML-owned pages (created via createNewPage). The 'pages'
+         * map additionally holds checkpoint building pages created via createMutablePage
+         * (which are NOT in newPages); those are iterated/filled by Phase B and must
+         * never be written in-place by applyUpdate/applyDelete. Writing to a checkpoint
+         * source page or buildingPage would orphan the key.
+         */
+        final DataPage writeTargetPage;
+        final DataPage readPage;
         final Record previous;
         boolean insertedInSamePage = false;
         if (indexes == null) {
             /* We don't need the page if isn't loaded or isn't a mutable new page*/
-            DataPage foundPrevPage = newPages.get(prevPageId);
-            if (foundPrevPage == null) {
-                /* The page may be a building page (non-blocking checkpoint compaction) that is
-                 * in 'pages' but not in 'newPages'. Treat it like a mutable new page. */
+            writeTargetPage = newPages.get(prevPageId);
+            DataPage foundReadPage = writeTargetPage;
+            if (foundReadPage == null) {
+                /* Read-only fallback: the page may still be a non-immutable entry in
+                 * 'pages' (e.g. a Phase B source page). Use it only to read the old
+                 * record value; never as a write target. */
                 final DataPage candidate = pages.get(prevPageId);
                 if (candidate != null && !candidate.immutable) {
-                    foundPrevPage = candidate;
+                    foundReadPage = candidate;
                 }
             }
-            prevPage = foundPrevPage;
+            readPage = foundReadPage;
 
-            if (prevPage != null) {
-                pageReplacementPolicy.pageHit(prevPage);
-                Record found = prevPage.get(key);
-                if (found == null && !prevPage.immutable) {
+            if (readPage != null) {
+                pageReplacementPolicy.pageHit(readPage);
+                Record found = readPage.get(key);
+                if (found == null && !readPage.immutable) {
                     /* During checkpoint Phase B, cleanAndCompactPages updates keyToPage
                      * (pointing to the building page) before adding the record to that page.
                      * The building page's write lock is held during this window, so acquiring
                      * the read lock here will block until the record has been fully added.
                      * This mirrors the retry logic in fetchRecord(). */
-                    final Lock lock = prevPage.pageLock.readLock();
+                    final Lock lock = readPage.pageLock.readLock();
                     lock.lock();
                     try {
-                        found = prevPage.get(key);
+                        found = readPage.get(key);
                     } finally {
                         lock.unlock();
                     }
@@ -2443,8 +2470,9 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
         } else {
             /* We really need the page for update index old values */
-            prevPage = loadPageToMemory(prevPageId, false);
-            if (prevPage == null) {
+            writeTargetPage = newPages.get(prevPageId);
+            readPage = loadPageToMemory(prevPageId, false);
+            if (readPage == null) {
                 // Page was never flushed to disk — can happen if the key was inserted
                 // during a concurrent checkpoint Phase B and the page wasn't persisted.
                 // We need the old record for index updates, so signal the caller to
@@ -2452,17 +2480,17 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 throw new PageNotFoundException("page " + prevPageId + " for updated record at " + key
                         + " was not flushed to disk in table " + table.tablespace + "." + table.name);
             } else {
-                Record found = prevPage.get(key);
-                if (found == null && !prevPage.immutable) {
+                Record found = readPage.get(key);
+                if (found == null && !readPage.immutable) {
                     /* During checkpoint Phase B, cleanAndCompactPages updates keyToPage
                      * (pointing to the building page) before adding the record to that page.
                      * The building page's write lock is held during this window, so acquiring
                      * the read lock here will block until the record has been fully added.
                      * This mirrors the retry logic in fetchRecord(). */
-                    final Lock lock = prevPage.pageLock.readLock();
+                    final Lock lock = readPage.pageLock.readLock();
                     lock.lock();
                     try {
-                        found = prevPage.get(key);
+                        found = readPage.get(key);
                     } finally {
                         lock.unlock();
                     }
@@ -2475,24 +2503,28 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
         }
 
-        if (prevPage == null || prevPage.immutable) {
-            /* Unloaded or immutable, set it as dirty.
-             * Skip if page is not in pageSet: this happens during crash recovery when keyToPage
-             * references an unflushed DML page (P5) that was captured in the PK checkpoint but
-             * never persisted to storage. The WAL replay will re-insert the record into the
-             * current DML page below. */
-            if (prevPage != null || pageSet.containsActivePage(prevPageId)) {
+        if (writeTargetPage == null || writeTargetPage.immutable) {
+            /* Not a safe write target — go through the dirty path so the record is
+             * re-inserted onto currentDirtyRecordsPage and keyToPage is updated. This
+             * avoids writing to a Phase B source page.
+             * Skip setPageDirty if page is not in pageSet: this happens during crash recovery
+             * when keyToPage references an unflushed DML page (P5) that was captured in the PK
+             * checkpoint but never persisted to storage, and it also covers transient building
+             * pages that are in 'pages' but not yet active. The WAL replay will re-insert the
+             * record into the current DML page below. */
+            if (pageSet.containsActivePage(prevPageId)) {
                 pageSet.setPageDirty(prevPageId, previous);
             }
         } else {
-            /* Mutable page, need to check if still modifiable or already unloaded */
-            final Lock lock = prevPage.pageLock.readLock();
+            /* Mutable page safe for in-place writes (from newPages or a transient building
+             * page not in pageSet.activePages). Check if still modifiable or already unloaded. */
+            final Lock lock = writeTargetPage.pageLock.readLock();
             lock.lock();
             try {
-                if (prevPage.writable) {
+                if (writeTargetPage.writable) {
                     /* We can try to modify the page directly */
-                    insertedInSamePage = prevPage.put(record);
-                } else {
+                    insertedInSamePage = writeTargetPage.put(record);
+                } else if (pageSet.containsActivePage(prevPageId)) {
                     /* Unfortunately is not writable (anymore), set it as dirty */
                     pageSet.setPageDirty(prevPageId, previous);
                 }
@@ -3086,7 +3118,12 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                     LOGGER.log(Level.FINEST, "loaded dirty page {0} for table {1}.{2} on tmp buffer: {3} records",
                             new Object[] { page.pageId, table.tablespace, table.name, records.size() });
                 } else {
-                    records = dataPage.getRecordsForFlush();
+                    /* Snapshot-copy into a stable list so the downstream iteration is not
+                     * affected by any concurrent modification. With the newPages-only write
+                     * target invariant enforced in applyUpdate/applyDelete (issue #46),
+                     * source pages are effectively frozen during Phase B, so a plain copy
+                     * without any lock is safe here. */
+                    records = new ArrayList<>(dataPage.getRecordsForFlush());
 
                     /* The page was found in memory. Currently built page should go into memory */
                     currentPageWasInMemory = true;
@@ -3532,6 +3569,39 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             } else {
                 /* Remove unused empty building page from memory */
                 pages.remove(buildingPage.pageId);
+            }
+
+            /*
+             * Flush any remaining newPages (the current DML page created by Phase A plus any
+             * additional pages allocated by allocateLivePage during Phase B). Without this, keys
+             * that were inserted/updated during Phase B live on a page whose content was never
+             * persisted, and keyToPage.checkpoint below would record a mapping to that unflushed
+             * page — a recovery scan would then fail with "no record in memory for K" because
+             * the page is missing from activePages and from storage (issue #46).
+             *
+             * Phase C holds checkpointLock.asWriteLock(), so no concurrent DML can reach
+             * applyInsert/applyUpdate/applyDelete while we flush these pages. After the flush,
+             * newPages is empty and the block at the end of Phase C allocates a fresh live page
+             * via allocateLivePage.
+             */
+            if (!newPages.isEmpty()) {
+                final List<DataPage> remainingNewPages = new ArrayList<>(newPages.values());
+                for (DataPage dataPage : remainingNewPages) {
+                    /* flushNewPageForCheckpoint publishes the page to pageSet.activePages and
+                     * removes it from newPages. Do NOT add it to flushedPages: those are the
+                     * source pages that checkpointDone below removes from activePages. */
+                    flushNewPageForCheckpoint(dataPage, null);
+                    if (!dataPage.isEmpty()) {
+                        ++flushedNewPages;
+                        flushedRecords += dataPage.size();
+                    }
+                }
+                /* newPages is now empty. Allocate a fresh current DML page directly via
+                 * createNewPage (under the checkpoint write lock, no concurrency on nextPageId).
+                 * Do NOT use allocateLivePage here: it would try to re-add the just-flushed
+                 * (now immutable) previous DML page to pageReplacementPolicy, which throws
+                 * "Added a page twice". */
+                createNewPage(nextPageId++);
             }
 
             /*
