@@ -140,6 +140,18 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_REMOTE_FILE_CLIENT_RETRIES = "remote.file.client.retries";
     public static final int PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT = 10;
 
+    /**
+     * Maximum time (in milliseconds) to block at bootstrap waiting for at
+     * least one remote file server to be discovered (via ZK) before giving up
+     * and failing startup. Guards against a cold-cluster race where the
+     * indexing service starts before the file-server pod has registered
+     * itself in ZK and the consistent-hash ring is still empty when the first
+     * {@code readFile} for the watermark is issued.
+     */
+    public static final String PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS =
+            "remote.file.bootstrap.wait.ms";
+    public static final long PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS_DEFAULT = 30_000L;
+
     // Instance identity and clustering
     public static final String PROPERTY_INSTANCE_ID = "indexing.instance.id";
     public static final int PROPERTY_INSTANCE_ID_DEFAULT = 0;

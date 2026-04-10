@@ -21,6 +21,7 @@
 package herddb.remote;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -135,6 +136,50 @@ public class RemoteFileServiceClientDynamicTest {
      * retry with backoff until servers appear, not crash immediately with
      * "Hash ring is empty".
      */
+    /**
+     * awaitServersReady returns false on timeout when no servers are ever
+     * discovered, and true as soon as updateServers is called with a
+     * non-empty list from another thread. Guards the #42 cold-boot fix in
+     * IndexingServer.bootstrapRemoteStateForTablespace.
+     */
+    @Test
+    public void testAwaitServersReady() throws Exception {
+        String addr1 = "localhost:" + server1.getPort();
+
+        try (RemoteFileServiceClient client = new RemoteFileServiceClient(
+                Collections.emptyList())) {
+
+            assertFalse("fresh client should have no servers", client.hasServers());
+            long t0 = System.nanoTime();
+            assertFalse("no servers → should time out", client.awaitServersReady(200));
+            long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+            assertTrue("timeout must be honored, got " + elapsedMs + "ms", elapsedMs >= 150);
+
+            // Populate from another thread while the main thread is blocked.
+            Thread populator = new Thread(() -> {
+                try {
+                    Thread.sleep(300);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                client.updateServers(Collections.singletonList(addr1));
+            }, "populator");
+            populator.start();
+            try {
+                long t1 = System.nanoTime();
+                assertTrue("should wake up when servers appear",
+                        client.awaitServersReady(5_000));
+                long waitMs = (System.nanoTime() - t1) / 1_000_000L;
+                assertTrue("should wake up promptly after updateServers, got " + waitMs + "ms",
+                        waitMs < 2_000);
+                assertTrue(client.hasServers());
+            } finally {
+                populator.join(5_000);
+            }
+        }
+    }
+
     @Test
     public void testReadRetriesUntilServerAppears() throws Exception {
         String addr1 = "localhost:" + server1.getPort();
