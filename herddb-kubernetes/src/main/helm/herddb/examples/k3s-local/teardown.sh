@@ -1,51 +1,51 @@
 #!/usr/bin/env bash
 #
-# Teardown HerdDB from a local k3s cluster.
+# Tear down HerdDB from a local k3s-in-docker cluster.
 #
 # Usage:
-#   ./teardown.sh              # uninstall Helm release and delete PVCs
-#   ./teardown.sh --remove-k3s # also uninstall k3s entirely
+#   ./teardown.sh                   # uninstall chart AND remove k3s container
+#   ./teardown.sh --keep-container  # only uninstall chart, leave k3s running
+#   ./teardown.sh --name mycluster  # use a non-default container name
 #
 set -euo pipefail
 
-KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
-export KUBECONFIG
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
-# Fall back to the k3s default if the user kubeconfig doesn't exist yet.
-if [[ ! -f "$KUBECONFIG" ]] && [[ -f /etc/rancher/k3s/k3s.yaml ]]; then
-    KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-    export KUBECONFIG
-fi
+CONTAINER_NAME="herddb-k3s"
+KEEP_CONTAINER=false
 
-REMOVE_K3S=false
-if [[ "${1:-}" == "--remove-k3s" ]]; then
-    REMOVE_K3S=true
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --keep-container) KEEP_CONTAINER=true; shift ;;
+        --name)           CONTAINER_NAME="$2"; shift 2 ;;
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+
+KUBECONFIG_FILE="$SCRIPT_DIR/.kubeconfig"
+if [[ -f "$KUBECONFIG_FILE" ]]; then
+    export KUBECONFIG="$KUBECONFIG_FILE"
 fi
 
 # ── 1. Uninstall Helm release ───────────────────────────────────────
-if helm status herddb >/dev/null 2>&1; then
+if [[ -f "$KUBECONFIG_FILE" ]] && helm status herddb >/dev/null 2>&1; then
     echo "==> Uninstalling Helm release 'herddb'..."
-    helm uninstall herddb
+    helm uninstall herddb || true
+    echo "==> Deleting PersistentVolumeClaims..."
+    kubectl delete pvc -l app.kubernetes.io/instance=herddb --ignore-not-found || true
 else
     echo "==> Helm release 'herddb' not found, skipping."
 fi
 
-# ── 2. Delete PersistentVolumeClaims ────────────────────────────────
-echo "==> Deleting PersistentVolumeClaims..."
-kubectl delete pvc -l app.kubernetes.io/instance=herddb --ignore-not-found
-
-# ── 3. Optionally uninstall k3s ─────────────────────────────────────
-if $REMOVE_K3S; then
-    if [[ -x /usr/local/bin/k3s-uninstall.sh ]]; then
-        echo "==> Uninstalling k3s..."
-        /usr/local/bin/k3s-uninstall.sh
-    else
-        echo "==> k3s uninstall script not found at /usr/local/bin/k3s-uninstall.sh"
-    fi
+# ── 2. Stop and remove k3s container ────────────────────────────────
+if $KEEP_CONTAINER; then
+    echo "==> Leaving k3s container '$CONTAINER_NAME' running (--keep-container)."
+elif docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+    echo "==> Removing k3s container '$CONTAINER_NAME'..."
+    docker rm -f "$CONTAINER_NAME" >/dev/null
+    rm -f "$KUBECONFIG_FILE"
 else
-    echo ""
-    echo "k3s is still running. To remove it entirely:"
-    echo "  /usr/local/bin/k3s-uninstall.sh"
+    echo "==> k3s container '$CONTAINER_NAME' not found."
 fi
 
 echo ""

@@ -1,111 +1,93 @@
-# HerdDB on k3s (local development)
+# HerdDB on k3s (local development, in Docker)
 
 Deploy HerdDB with the full distributed stack on a local
-[k3s](https://k3s.io/) cluster.
+[k3s](https://k3s.io/) cluster that runs **inside a Docker container**.
+Nothing is installed on the host: no `sudo`, no `/etc/rancher`, no
+system service. Tearing down removes the container and all state.
 
 ## Architecture
 
 | Component        | Replicas | Purpose                                         |
 |------------------|----------|-------------------------------------------------|
-| HerdDB server    | 1        | JDBC endpoint, metadata (ZooKeeper), commit log (BookKeeper) |
+| HerdDB server    | 1        | JDBC endpoint, metadata (ZooKeeper), commit log (BookKeeper), remote page storage |
 | File server      | 1        | gRPC page storage, backed by MinIO (S3)         |
 | MinIO            | 1        | S3-compatible object store for data and indexes  |
 | ZooKeeper        | 1        | Cluster coordination and metadata storage        |
 | BookKeeper       | 1        | Distributed commit log                           |
 | Indexing service | 1        | Vector indexing service                          |
-| Tools pod        | 1        | Pre-configured CLI for interactive queries       |
+| Tools pod        | 1        | Pre-configured CLI and `vector-bench.sh`         |
+| Prometheus       | 1        | Metrics scraping                                 |
+| Grafana          | 1        | Dashboards                                       |
+
+The values mirror `examples/gke/values.yaml` (cluster mode, remote
+storage, indexing service enabled) but with resources and PVCs sized for
+a laptop — no PVC exceeds 10 GiB.
 
 ## Prerequisites
 
-- [k3s](https://k3s.io/) installed (or use the install script below)
-- [kubectl](https://kubernetes.io/docs/tasks/tools/) configured
+- Docker (to run the k3s container and build the HerdDB image)
+- [kubectl](https://kubernetes.io/docs/tasks/tools/)
 - [Helm 3](https://helm.sh/docs/intro/install/)
-- Docker (for building and saving images)
 
-## Quick start (automated)
+## Quick start
 
 Run the install script from this directory:
 
 ```bash
-./install.sh          # install k3s, import image, install chart
+./install.sh          # start k3s container, import image, install chart
 ./install.sh --build  # also rebuild Docker images with Maven first
 ```
 
-The script installs k3s if needed, imports the Docker image into k3s
-containerd, and installs the Helm chart. Pass `--build` to also rebuild
-the Docker images (`mvn clean install -DskipTests -Pdocker`) before
-importing.
+The script:
 
-## Quick start (manual)
+1. (optional) runs `mvn clean install -DskipTests -Pdocker` at the repo root
+2. starts a privileged `rancher/k3s` container named `herddb-k3s` with
+   port 6443 published on localhost
+3. extracts the kubeconfig to `./.kubeconfig` (gitignored) — the other
+   scripts pick it up automatically
+4. `docker save`s the HerdDB image and imports it into the k3s
+   container's containerd via `ctr images import`
+5. `helm install`s the chart against `values.yaml`
+6. waits for all pods to become Ready
 
-### 1. Install k3s
+All subsequent `kubectl` / `helm` commands in this directory need
+`KUBECONFIG=./.kubeconfig`. The helper scripts under `scripts/` set this
+automatically.
 
-```bash
-curl -sfL https://get.k3s.io | sh -
-```
-
-k3s includes a local-path storage provisioner and Traefik ingress by default.
-
-### 2. Configure kubectl
-
-k3s writes its kubeconfig to `/etc/rancher/k3s/k3s.yaml`:
-
-```bash
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-```
-
-> **Note:** The kubeconfig file is owned by root. Either run commands with
-> `sudo` or copy it to your user:
-> ```bash
-> sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
-> sudo chown $(id -u):$(id -g) ~/.kube/config
-> export KUBECONFIG=~/.kube/config
-> ```
-
-### 3. Import the HerdDB Docker image
-
-If you built the image locally with Docker, save and import it into k3s
-containerd:
+Connect with the CLI:
 
 ```bash
-docker save herddb/herddb-server:0.30.0-SNAPSHOT | sudo k3s ctr images import -
-```
-
-> **Tip:** If `k3s ctr` does not work on your version, use the containerd
-> CLI directly:
-> ```bash
-> docker save herddb/herddb-server:0.30.0-SNAPSHOT | \
->   sudo ctr --address /run/k3s/containerd/containerd.sock \
->            --namespace k8s.io images import -
-> ```
-
-### 4. Install the Helm chart
-
-From the `herddb-kubernetes/src/main/helm/herddb/` directory:
-
-```bash
-helm install herddb . -f examples/k3s-local/values.yaml
-```
-
-### 5. Wait for all pods to become ready
-
-```bash
-kubectl get pods -w
-```
-
-You should see 7 pods (server, file-server, minio, zookeeper, bookkeeper,
-indexing-service, and tools) all reach `Running` / `Ready` status.
-
-### 6. Connect with the CLI
-
-```bash
-kubectl exec -it deploy/herddb-tools -- herddb-cli
+export KUBECONFIG=$PWD/.kubeconfig
+kubectl exec -it sts/herddb-tools -- herddb-cli
 ```
 
 Run a test query:
 
 ```sql
 SELECT * FROM SYSTABLES;
+```
+
+## Helper scripts
+
+The `scripts/` directory contains small, independently-callable shell
+scripts intended to be driven either by a human or by the
+`herddb-k3s-bench` Claude subagent:
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/check-cluster.sh` | Print pod status, exit non-zero if any HerdDB pod is not Ready. |
+| `scripts/run-bench.sh <args>` | Forward args to `vector-bench.sh` inside the tools pod, tee output to `reports/run-<ts>.log`. |
+| `scripts/collect-logs.sh` | Dump `kubectl logs` + describe + events into `reports/logs-<ts>/`. |
+| `scripts/write-report.sh <run-log>` | Turn a run log into a markdown report with metrics + cluster state. |
+| `scripts/open-issue.sh --title … --body-file … --logs-dir …` | Open a GH issue with logs attached as collapsible blocks. `--dry-run` skips the API call. |
+
+Example end-to-end benchmark run:
+
+```bash
+./install.sh --build
+./scripts/check-cluster.sh
+./scripts/run-bench.sh --dataset sift10k -n 10000 -k 100 --checkpoint
+./scripts/write-report.sh reports/run-*.log
 ```
 
 ## Vector search example
@@ -116,10 +98,10 @@ Here is a quick walkthrough using the CLI's Groovy scripting support.
 ### Create a table with a vector column and an index
 
 ```bash
-kubectl exec deploy/herddb-tools -- herddb-cli \
+kubectl exec sts/herddb-tools -- herddb-cli \
   -q "CREATE TABLE documents (id int primary key, content string, embedding floata not null)"
 
-kubectl exec deploy/herddb-tools -- herddb-cli \
+kubectl exec sts/herddb-tools -- herddb-cli \
   -q "CREATE VECTOR INDEX vidx ON documents(embedding)"
 ```
 
@@ -131,7 +113,7 @@ Vector data must be inserted through JDBC prepared statements. The CLI's
 Create a file called `vector_demo.groovy` on the tools pod:
 
 ```bash
-kubectl exec deploy/herddb-tools -- bash -c 'cat > /tmp/vector_demo.groovy << '\''SCRIPT'\''
+kubectl exec sts/herddb-tools -- bash -c 'cat > /tmp/vector_demo.groovy << '\''SCRIPT'\''
 import java.sql.*
 
 // Insert sample documents with 3-dimensional embeddings
@@ -196,7 +178,7 @@ SCRIPT
 Run the script:
 
 ```bash
-kubectl exec deploy/herddb-tools -- herddb-cli -g /tmp/vector_demo.groovy
+kubectl exec sts/herddb-tools -- herddb-cli -g /tmp/vector_demo.groovy
 ```
 
 Expected output:
@@ -231,23 +213,24 @@ The column type for vector data is `floata` (float array).
 
 ## Teardown
 
-Remove the Helm release and PVCs:
+Remove the Helm release, delete PVCs, and destroy the k3s container:
 
 ```bash
 ./teardown.sh
 ```
 
-To also uninstall k3s entirely:
+Keep the k3s container around (e.g., to re-install quickly):
 
 ```bash
-./teardown.sh --remove-k3s
+./teardown.sh --keep-container
 ```
 
-Or manually:
+Manual teardown:
 
 ```bash
+export KUBECONFIG=$PWD/.kubeconfig
 helm uninstall herddb
 kubectl delete pvc -l app.kubernetes.io/instance=herddb
-# Optional: uninstall k3s
-/usr/local/bin/k3s-uninstall.sh
+docker rm -f herddb-k3s
+rm -f .kubeconfig
 ```
