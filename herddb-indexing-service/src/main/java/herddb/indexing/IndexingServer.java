@@ -403,31 +403,17 @@ public class IndexingServer implements AutoCloseable {
                 IndexingServerConfiguration.PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS,
                 IndexingServerConfiguration.PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS_DEFAULT);
         try {
-            boolean ready = (Boolean) clientRef.getClass()
-                    .getMethod("awaitServersReady", long.class)
-                    .invoke(clientRef, bootstrapWaitMs);
+            boolean ready = ((DynamicServiceClient) clientRef).awaitServersReady(bootstrapWaitMs);
             if (!ready) {
                 throw new RuntimeException(
                         "Timed out after " + bootstrapWaitMs + "ms waiting for remote file"
                                 + " servers to be discovered via ZK for tableSpace "
                                 + tableSpaceUUID);
             }
-        } catch (NoSuchMethodException nsme) {
-            // Older client jar without awaitServersReady: log and continue;
-            // retryAsync in the client should still save us, just noisier.
-            LOGGER.log(Level.WARNING,
-                    "RemoteFileServiceClient has no awaitServersReady(long) method; "
-                            + "skipping bootstrap wait. Upgrade herddb-remote-file-service to fix.");
-        } catch (java.lang.reflect.InvocationTargetException ite) {
-            Throwable cause = ite.getCause();
-            if (cause instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException(
-                        "Interrupted while waiting for remote file servers to be discovered", cause);
-            }
-            throw new RuntimeException(cause);
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(
+                    "Interrupted while waiting for remote file servers to be discovered", ie);
         }
 
         S3WatermarkStore.RemoteFileIO io = new S3WatermarkStore.RemoteFileIO() {

@@ -29,4 +29,13 @@ import java.util.List;
  */
 public interface DynamicServiceClient {
     void updateServers(List<String> servers);
+
+    /**
+     * Blocks for up to {@code timeoutMs} milliseconds until the client has at
+     * least one server in its routing table. Returns {@code true} as soon as a
+     * server is visible, {@code false} on timeout. Intended for use at
+     * bootstrap on a cold cluster where service discovery may not yet have
+     * populated the server list by the time the first RPC is issued.
+     */
+    boolean awaitServersReady(long timeoutMs) throws InterruptedException;
 }
