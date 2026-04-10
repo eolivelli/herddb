@@ -27,6 +27,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import herddb.cluster.BookkeeperCommitLog;
 import herddb.cluster.BookkeeperCommitLogManager;
+import herddb.cluster.LedgersInfo;
 import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.core.ClusterTest;
 import herddb.log.CommitLogResult;
@@ -39,6 +40,7 @@ import herddb.model.TableSpace;
 import herddb.server.ServerConfiguration;
 import herddb.utils.TestUtils;
 import herddb.utils.ZKTestEnv;
+import java.nio.charset.StandardCharsets;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -46,6 +48,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import org.apache.bookkeeper.client.BookKeeper;
+import org.apache.bookkeeper.client.BookKeeperAdmin;
+import org.apache.bookkeeper.client.api.LedgerMetadata;
 import org.apache.bookkeeper.common.concurrent.FutureUtils;
 import org.apache.bookkeeper.net.BookieId;
 import org.apache.bookkeeper.stats.NullStatsLogger;
@@ -431,6 +436,127 @@ public class BookKeeperCommitLogTest {
             }
 
         }
+    }
+
+    /**
+     * Regression test for issue #48.
+     *
+     * <p>Simulates a failure of {@code saveActualLedgersList} in the middle of
+     * {@code openNewLedger}. The BookKeeper ledger has already been created at
+     * that point, but ZooKeeper has not yet recorded it. Without the fix, the
+     * BK ledger would be orphaned: BK metadata contains it, but the ZK ledgers
+     * list does not, so downstream consumers (e.g. the indexing service, which
+     * discovers ledgers only via ZK) would never see it, causing
+     * {@code waitForInstanceCatchUp} to block forever.
+     *
+     * <p>The fix reorders {@code openNewLedger} so that the BK ledger is
+     * considered committed only after the ZK save succeeds; on ZK failure the
+     * in-memory list is rolled back and the finally block deletes the orphan
+     * BK ledger, keeping BK and ZK consistent.
+     */
+    @Test
+    public void testOpenNewLedgerRollbacksBkWhenZkWriteFails() throws Exception {
+        runOpenNewLedgerRollbackTest(() -> new LogNotAvailableException(new Exception("injected ZK failure")));
+    }
+
+    /**
+     * The original incident in issue #48 was triggered by an
+     * {@link OutOfMemoryError} thrown from inside the ZooKeeper client thread,
+     * not by a {@code LogNotAvailableException}. Because {@code OutOfMemoryError}
+     * is an {@link Error}, it bypasses the {@code catch (Exception)} inside
+     * {@code saveActualLedgersList} and propagates raw to the caller. The fix
+     * must therefore roll back the in-memory ledger list and delete the orphan
+     * BK ledger for any failure mode, not just the checked exception path.
+     */
+    @Test
+    public void testOpenNewLedgerRollbacksBkWhenZkWriteThrowsError() throws Exception {
+        runOpenNewLedgerRollbackTest(() -> new OutOfMemoryError("injected OOM during ZK save"));
+    }
+
+    private void runOpenNewLedgerRollbackTest(java.util.function.Supplier<Throwable> failureSupplier) throws Exception {
+        final String tableSpaceUUID = UUID.randomUUID().toString();
+        final String name = TableSpace.DEFAULT;
+        final String nodeid = "nodeid";
+        ServerConfiguration serverConfiguration = newServerConfigurationWithAutoPort();
+
+        java.util.concurrent.atomic.AtomicBoolean failNextSave = new java.util.concurrent.atomic.AtomicBoolean();
+        try (ZookeeperMetadataStorageManager man = new ZookeeperMetadataStorageManager(testEnv.getAddress(),
+                testEnv.getTimeout(), testEnv.getPath()) {
+            @Override
+            public void saveActualLedgersList(String tsUUID, LedgersInfo info) throws LogNotAvailableException {
+                if (failNextSave.compareAndSet(true, false)) {
+                    Throwable t = failureSupplier.get();
+                    if (t instanceof LogNotAvailableException) {
+                        throw (LogNotAvailableException) t;
+                    } else if (t instanceof RuntimeException) {
+                        throw (RuntimeException) t;
+                    } else if (t instanceof Error) {
+                        throw (Error) t;
+                    } else {
+                        throw new LogNotAvailableException(new Exception(t));
+                    }
+                }
+                super.saveActualLedgersList(tsUUID, info);
+            }
+        };
+                BookkeeperCommitLogManager logManager = new BookkeeperCommitLogManager(man, serverConfiguration, NullStatsLogger.INSTANCE)) {
+            man.start();
+            logManager.start();
+
+            List<Long> zkLedgersBeforeRoll;
+            Set<Long> bkLedgersBeforeRoll;
+            try (BookkeeperCommitLog writer = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
+                writer.startWriting(1);
+                writer.log(LogEntryFactory.beginTransaction(1), true).getLogSequenceNumber();
+
+                // snapshot ZK and BK state right before injecting the failure
+                zkLedgersBeforeRoll = man.getActualLedgersList(tableSpaceUUID).getActiveLedgers();
+                bkLedgersBeforeRoll = listLedgersForTableSpace(tableSpaceUUID);
+
+                // arm the failure injection and trigger a roll: the next ZK save
+                // (inside openNewLedger) must fail and the BK side must be rolled back
+                failNextSave.set(true);
+                try {
+                    writer.rollNewLedger();
+                    org.junit.Assert.fail("rollNewLedger was expected to throw");
+                } catch (LogNotAvailableException | Error expected) {
+                    // either flavour is acceptable: the fix must handle both
+                }
+
+                assertTrue(writer.isFailed());
+            }
+
+            // ZK ledgers list must be unchanged after the failed roll
+            LedgersInfo afterFailure = man.getActualLedgersList(tableSpaceUUID);
+            assertEquals(zkLedgersBeforeRoll, afterFailure.getActiveLedgers());
+
+            // BK must not contain any orphan ledger for this tablespace: the set
+            // of ledgers known to BK must match the set known to ZK
+            Set<Long> bkLedgersAfterRoll = listLedgersForTableSpace(tableSpaceUUID);
+            assertEquals("orphan BK ledger left behind after failed roll: "
+                            + "before=" + bkLedgersBeforeRoll + " after=" + bkLedgersAfterRoll,
+                    bkLedgersBeforeRoll, bkLedgersAfterRoll);
+            assertEquals("BK ledgers do not match ZK ledgers list",
+                    new HashSet<>(zkLedgersBeforeRoll), bkLedgersAfterRoll);
+        }
+    }
+
+    private Set<Long> listLedgersForTableSpace(String tableSpaceUUID) throws Exception {
+        Set<Long> result = new HashSet<>();
+        org.apache.bookkeeper.conf.ClientConfiguration clientConfiguration = new org.apache.bookkeeper.conf.ClientConfiguration();
+        clientConfiguration.setZkServers(testEnv.getAddress());
+        clientConfiguration.setZkLedgersRootPath(ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT);
+        try (BookKeeper bk = BookKeeper.forConfig(clientConfiguration).build();
+                BookKeeperAdmin admin = new BookKeeperAdmin(bk)) {
+            for (long lId : admin.listLedgers()) {
+                LedgerMetadata md = bk.getLedgerManager().readLedgerMetadata(lId).get().getValue();
+                byte[] tsUuidBytes = md.getCustomMetadata().get("tablespaceuuid");
+                if (tsUuidBytes != null && tableSpaceUUID.equals(new String(tsUuidBytes, StandardCharsets.UTF_8))) {
+                    result.add(lId);
+                }
+            }
+        }
+        return result;
     }
 
     @Test
