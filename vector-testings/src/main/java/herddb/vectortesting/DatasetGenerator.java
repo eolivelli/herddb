@@ -99,6 +99,13 @@ public class DatasetGenerator {
             return t;
         };
         ExecutorService pool = Executors.newFixedThreadPool(config.threads, threadFactory);
+        AtomicInteger trackerCounter = new AtomicInteger();
+        ThreadFactory trackerFactory = r -> {
+            Thread t = new Thread(r, "tracker-shard-" + trackerCounter.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        };
+        ExecutorService trackerPool = Executors.newFixedThreadPool(config.threads, trackerFactory);
         int maxInFlight = Math.max(2, config.threads * 2);
 
         try (SiftWriter baseWriter = new SiftWriter(baseFile);
@@ -147,6 +154,11 @@ public class DatasetGenerator {
                     throw ee;
                 }
 
+                // If the tracker already exists at batch start, everything in this batch
+                // needs to be offered. Otherwise we may initialize mid-batch and only
+                // offer the suffix after initialization.
+                int trackerOfferStart = (tracker != null) ? 0 : -1;
+
                 for (int i = 0; i < batch.embeddings.length; i++) {
                     int globalIdx = batch.startIdx + i;
                     float[] vec = batch.embeddings[i];
@@ -163,11 +175,8 @@ public class DatasetGenerator {
                         float[][] queryVectors = queryVectorsList.toArray(new float[0][]);
                         tracker = new GroundTruthTracker(queryVectors, config.groundTruthK, config.similarity);
                         // Offer all query vectors to the tracker (they are part of the base set)
-                        for (int j = 0; j < queryVectors.length; j++) {
-                            tracker.offer(j, queryVectors[j]);
-                        }
-                    } else if (tracker != null) {
-                        tracker.offer(globalIdx, vec);
+                        tracker.offerBatch(trackerPool, config.threads, 0, queryVectors);
+                        trackerOfferStart = i + 1;
                     }
 
                     if (csvWriter != null) {
@@ -177,6 +186,14 @@ public class DatasetGenerator {
                         csvWriter.print(',');
                         csvWriter.println(vectorToString(vec));
                     }
+                }
+
+                if (tracker != null && trackerOfferStart >= 0 && trackerOfferStart < batch.embeddings.length) {
+                    int len = batch.embeddings.length - trackerOfferStart;
+                    float[][] subVecs = new float[len][];
+                    System.arraycopy(batch.embeddings, trackerOfferStart, subVecs, 0, len);
+                    tracker.offerBatch(trackerPool, config.threads,
+                            batch.startIdx + trackerOfferStart, subVecs);
                 }
 
                 written += batch.embeddings.length;
@@ -189,15 +206,7 @@ public class DatasetGenerator {
             System.out.println();
         } finally {
             pool.shutdown();
-        }
-
-        // Handle edge case where total == numQueries (tracker never initialized in the else-if branch)
-        if (tracker == null && !queryVectorsList.isEmpty()) {
-            float[][] queryVectors = queryVectorsList.toArray(new float[0][]);
-            tracker = new GroundTruthTracker(queryVectors, config.groundTruthK, config.similarity);
-            for (int j = 0; j < queryVectors.length; j++) {
-                tracker.offer(j, queryVectors[j]);
-            }
+            trackerPool.shutdown();
         }
 
         // Write ground truth

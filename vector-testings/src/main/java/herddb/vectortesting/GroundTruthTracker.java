@@ -19,8 +19,14 @@
  */
 package herddb.vectortesting;
 
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.List;
 import java.util.PriorityQueue;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 
 /**
  * Tracks the K nearest neighbors for each query vector using bounded max-heaps.
@@ -58,7 +64,11 @@ public class GroundTruthTracker {
      * the top-K heaps accordingly.
      */
     public void offer(int vectorId, float[] vector) {
-        for (int i = 0; i < queryVectors.length; i++) {
+        offerRange(0, queryVectors.length, vectorId, vector);
+    }
+
+    private void offerRange(int fromQuery, int toQuery, int vectorId, float[] vector) {
+        for (int i = fromQuery; i < toQuery; i++) {
             float dist = cosine
                     ? cosineDistance(queryVectors[i], vector)
                     : euclideanDistanceSq(queryVectors[i], vector);
@@ -68,6 +78,60 @@ public class GroundTruthTracker {
             } else if (dist < heap.peek().distance) {
                 heap.poll();
                 heap.add(new Neighbor(dist, vectorId));
+            }
+        }
+    }
+
+    /**
+     * Offer a contiguous batch of base vectors, sharding the distance computation
+     * across {@code shards} parallel tasks. Each shard owns an exclusive slice of
+     * the query array (and its heaps), so no locking is needed. Within a shard,
+     * vectors are processed in order so that ties between equal distances are
+     * broken by insertion order just like the single-threaded path.
+     *
+     * @param pool     executor used to run the shards
+     * @param shards   desired parallelism (clamped to {@code queryVectors.length})
+     * @param startId  id of {@code vectors[0]}; subsequent vectors get sequential ids
+     * @param vectors  base vectors to offer
+     */
+    public void offerBatch(ExecutorService pool, int shards, int startId, float[][] vectors)
+            throws InterruptedException {
+        if (vectors.length == 0) {
+            return;
+        }
+        int numQueries = queryVectors.length;
+        int effectiveShards = Math.max(1, Math.min(shards, numQueries));
+        if (effectiveShards == 1) {
+            for (int v = 0; v < vectors.length; v++) {
+                offerRange(0, numQueries, startId + v, vectors[v]);
+            }
+            return;
+        }
+        List<Callable<Void>> tasks = new ArrayList<>(effectiveShards);
+        int base = numQueries / effectiveShards;
+        int rem = numQueries % effectiveShards;
+        int cursor = 0;
+        for (int s = 0; s < effectiveShards; s++) {
+            final int from = cursor;
+            final int to = from + base + (s < rem ? 1 : 0);
+            cursor = to;
+            tasks.add(() -> {
+                for (int v = 0; v < vectors.length; v++) {
+                    offerRange(from, to, startId + v, vectors[v]);
+                }
+                return null;
+            });
+        }
+        List<Future<Void>> results = pool.invokeAll(tasks);
+        for (Future<Void> f : results) {
+            try {
+                f.get();
+            } catch (ExecutionException ee) {
+                Throwable cause = ee.getCause();
+                if (cause instanceof RuntimeException) {
+                    throw (RuntimeException) cause;
+                }
+                throw new RuntimeException(cause);
             }
         }
     }
