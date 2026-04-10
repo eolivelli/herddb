@@ -17,3 +17,15 @@ This includes any test that:
 
 CI runs cluster and core tests in separate workflows. Forgetting the annotation means the test
 will only run in the core workflow and will likely fail there due to missing infrastructure.
+
+## Testing Code Changes
+Always cover code changes with unit or integration tests. Run the new tests locally and ensure
+they pass before opening a PR. Also run the existing tests related to the code touched by the
+current work to catch regressions.
+
+Never run the full `herddb-core` test suite — it takes a very long time. Instead, run single
+tests or small batches using Maven's `-Dtest=...` selector, for example:
+```
+mvn -pl herddb-core -Dtest=MyChangedTest test
+mvn -pl herddb-core -Dtest='Foo*Test,BarTest#someMethod' test
+```
