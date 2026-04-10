@@ -6,7 +6,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 EXAMPLE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPORTS_DIR="$EXAMPLE_DIR/reports"
+
+# If $HERDDB_TESTS_HOME is set, keep reports there (outside the chart tree
+# so they are never bundled into the Helm release Secret).
+# Otherwise fall back to the in-tree reports/ directory.
+REPORTS_DIR="${HERDDB_TESTS_HOME:-$EXAMPLE_DIR/reports}"
 
 KUBECONFIG_FILE="$EXAMPLE_DIR/.kubeconfig"
 if [[ -f "$KUBECONFIG_FILE" ]]; then
