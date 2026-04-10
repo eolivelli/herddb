@@ -1,56 +1,66 @@
 suite: file-server StatefulSet
 templates:
   - templates/file-server-statefulset.yaml
+  - templates/file-server-configmap.yaml
 tests:
   - it: should have default replica count of 2
+    template: templates/file-server-statefulset.yaml
     asserts:
       - equal:
           path: spec.replicas
           value: 2
 
   - it: should reference the correct headless service
+    template: templates/file-server-statefulset.yaml
     asserts:
       - equal:
           path: spec.serviceName
           value: RELEASE-NAME-herddb-file-server
 
   - it: should use the configured image
+    template: templates/file-server-statefulset.yaml
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
           value: "herddb/herddb-server:0.30.0-SNAPSHOT"
 
   - it: should pass file-server role to service launcher
+    template: templates/file-server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].args
           content: file-server
 
   - it: should pass console command to service launcher
+    template: templates/file-server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].args
           content: console
 
   - it: should pass default port as CLI arg
+    template: templates/file-server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].args
           content: "--port=9846"
 
   - it: should pass data-dir as CLI arg
+    template: templates/file-server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].args
           content: "--data-dir=/opt/herddb/filedata"
 
   - it: should pass config file path as CLI arg
+    template: templates/file-server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].args
           content: "/opt/herddb/conf/fileserver.properties"
 
   - it: should mount config volume at /opt/herddb/conf
+    template: templates/file-server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
@@ -59,6 +69,7 @@ tests:
             mountPath: /opt/herddb/conf
 
   - it: should include config volume sourced from configmap
+    template: templates/file-server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.volumes
@@ -68,6 +79,7 @@ tests:
               name: RELEASE-NAME-herddb-file-server-config
 
   - it: should expose grpc port 9846
+    template: templates/file-server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].ports
@@ -77,12 +89,14 @@ tests:
             protocol: TCP
 
   - it: should have one volumeClaimTemplate
+    template: templates/file-server-statefulset.yaml
     asserts:
       - lengthEqual:
           path: spec.volumeClaimTemplates
           count: 1
 
   - it: should mount data PVC at /opt/herddb/filedata
+    template: templates/file-server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
@@ -91,6 +105,7 @@ tests:
             mountPath: /opt/herddb/filedata
 
   - it: should allow overriding replica count
+    template: templates/file-server-statefulset.yaml
     set:
       fileServer.replicaCount: 4
     asserts:
@@ -99,6 +114,7 @@ tests:
           value: 4
 
   - it: should use custom port in args when overridden
+    template: templates/file-server-statefulset.yaml
     set:
       fileServer.port: 9900
     asserts:
@@ -107,6 +123,7 @@ tests:
           content: "--port=9900"
 
   - it: should set default memory and cpu resources
+    template: templates/file-server-statefulset.yaml
     asserts:
       - equal:
           path: spec.template.spec.containers[0].resources.requests.memory
@@ -116,6 +133,7 @@ tests:
           value: "4"
 
   - it: should mount configmap to conf-ro and emptyDir to conf when credentialsSecret is set
+    template: templates/file-server-statefulset.yaml
     set:
       fileServer.s3.credentialsSecret: "my-secret"
     asserts:
@@ -137,6 +155,7 @@ tests:
             emptyDir: {}
 
   - it: should have S3 env vars from secret when credentialsSecret is set
+    template: templates/file-server-statefulset.yaml
     set:
       fileServer.s3.credentialsSecret: "my-secret"
     asserts:
@@ -158,6 +177,7 @@ tests:
                 key: S3_SECRET_KEY
 
   - it: should use bash command when credentialsSecret is set without zookeeper
+    template: templates/file-server-statefulset.yaml
     set:
       fileServer.s3.credentialsSecret: "my-secret"
     asserts:
@@ -166,7 +186,17 @@ tests:
           value: ["/bin/bash", "-c"]
 
   - it: should use the configured service account
+    template: templates/file-server-statefulset.yaml
     asserts:
       - equal:
           path: spec.template.spec.serviceAccountName
           value: RELEASE-NAME-herddb
+
+  - it: should have a checksum/config annotation that rolls pods on ConfigMap changes
+    template: templates/file-server-statefulset.yaml
+    asserts:
+      - isNotNullOrEmpty:
+          path: spec.template.metadata.annotations["checksum/config"]
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: ^[a-f0-9]{64}$

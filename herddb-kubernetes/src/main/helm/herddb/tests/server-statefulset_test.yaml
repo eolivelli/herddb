@@ -1,26 +1,31 @@
 suite: server StatefulSet
 templates:
   - templates/server-statefulset.yaml
+  - templates/server-configmap.yaml
 tests:
   - it: should have default replica count of 1
+    template: templates/server-statefulset.yaml
     asserts:
       - equal:
           path: spec.replicas
           value: 1
 
   - it: should reference the correct headless service
+    template: templates/server-statefulset.yaml
     asserts:
       - equal:
           path: spec.serviceName
           value: RELEASE-NAME-herddb-server
 
   - it: should use the configured image
+    template: templates/server-statefulset.yaml
     asserts:
       - equal:
           path: spec.template.spec.containers[0].image
           value: "herddb/herddb-server:0.30.0-SNAPSHOT"
 
   - it: should expose jdbc port 7000
+    template: templates/server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].ports
@@ -30,6 +35,7 @@ tests:
             protocol: TCP
 
   - it: should expose http port 9845
+    template: templates/server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].ports
@@ -39,12 +45,14 @@ tests:
             protocol: TCP
 
   - it: should have two volumeClaimTemplates (data and commitlog)
+    template: templates/server-statefulset.yaml
     asserts:
       - lengthEqual:
           path: spec.volumeClaimTemplates
           count: 2
 
   - it: should mount the server config file
+    template: templates/server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
@@ -54,6 +62,7 @@ tests:
             subPath: server.properties
 
   - it: should mount data PVC at /opt/herddb/data
+    template: templates/server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
@@ -62,6 +71,7 @@ tests:
             mountPath: /opt/herddb/data
 
   - it: should mount commitlog PVC at /opt/herddb/commitlog
+    template: templates/server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
@@ -70,6 +80,7 @@ tests:
             mountPath: /opt/herddb/commitlog
 
   - it: should allow overriding replica count
+    template: templates/server-statefulset.yaml
     set:
       server.replicaCount: 3
     asserts:
@@ -78,6 +89,7 @@ tests:
           value: 3
 
   - it: should set default memory and cpu resources
+    template: templates/server-statefulset.yaml
     asserts:
       - equal:
           path: spec.template.spec.containers[0].resources.requests.memory
@@ -87,13 +99,41 @@ tests:
           value: "4"
 
   - it: should use the configured service account
+    template: templates/server-statefulset.yaml
     asserts:
       - equal:
           path: spec.template.spec.serviceAccountName
           value: RELEASE-NAME-herddb
 
   - it: should pass config file as argument
+    template: templates/server-statefulset.yaml
     asserts:
       - contains:
           path: spec.template.spec.containers[0].args
           content: /opt/herddb/conf/server.properties
+
+  - it: should have a checksum/config annotation that rolls pods on ConfigMap changes
+    template: templates/server-statefulset.yaml
+    asserts:
+      - isNotNullOrEmpty:
+          path: spec.template.metadata.annotations["checksum/config"]
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: ^[a-f0-9]{64}$
+
+  - it: checksum/config should change when server.extraConfig changes
+    template: templates/server-statefulset.yaml
+    set:
+      server.extraConfig.foo: "bar"
+    asserts:
+      - isNotNullOrEmpty:
+          path: spec.template.metadata.annotations["checksum/config"]
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: ^[a-f0-9]{64}$
+      # Regression guard for issue #49: the hash below is the default-values
+      # checksum. If this assertion passes, it means the extraConfig change
+      # did NOT propagate — which is exactly the bug we fixed.
+      - notEqual:
+          path: spec.template.metadata.annotations["checksum/config"]
+          value: e03e1ab6bd1f6b88466ef23b2b312809927b3b628dd1ff9f59737e6e3a8cdfd0

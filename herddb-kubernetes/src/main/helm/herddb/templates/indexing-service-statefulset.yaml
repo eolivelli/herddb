@@ -16,6 +16,7 @@ spec:
   template:
     metadata:
       annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/indexing-service-configmap.yaml") . | sha256sum }}
         prometheus.io/scrape: "true"
         prometheus.io/port: "{{ .Values.indexingService.httpPort }}"
         prometheus.io/path: "/metrics"

@@ -18,6 +18,8 @@ spec:
       app.kubernetes.io/component: tools
   template:
     metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/tools-configmap.yaml") . | sha256sum }}
       labels:
         {{- include "herddb.labels" . | nindent 8 }}
         app.kubernetes.io/component: tools

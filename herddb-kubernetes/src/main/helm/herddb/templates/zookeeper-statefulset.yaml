@@ -16,6 +16,7 @@ spec:
   template:
     metadata:
       annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/zookeeper-configmap.yaml") . | sha256sum }}
         prometheus.io/scrape: "true"
         prometheus.io/port: "{{ .Values.zookeeper.metricsPort }}"
         prometheus.io/path: "/metrics"
