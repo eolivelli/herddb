@@ -29,6 +29,7 @@ import herddb.mem.MemoryDataStorageManager;
 import herddb.metadata.MetadataStorageManager;
 import herddb.metadata.ServiceDiscoveryListener;
 import herddb.server.DynamicServiceClient;
+import herddb.server.RemoteFileClient;
 import herddb.storage.DataStorageManager;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
@@ -74,7 +75,7 @@ public class IndexingServer implements AutoCloseable {
 
     // When storage.type=remote, these are set by buildDataStorageManager
     // and consumed by the tablespace-resolved hook.
-    private DynamicServiceClient remoteFileServiceClient;
+    private RemoteFileClient remoteFileServiceClient;
     private Object sharedCheckpointMetadataManager;
     private Object remoteDataStorageManager;
     private Path remoteMetaDir;
@@ -234,9 +235,9 @@ public class IndexingServer implements AutoCloseable {
 
                     // Store for later use by the tablespace-resolved hook.
                     // client was created reflectively but is guaranteed to
-                    // implement DynamicServiceClient (the constructor target
+                    // implement RemoteFileClient (the constructor target
                     // class, RemoteFileServiceClient, declares it).
-                    this.remoteFileServiceClient = (DynamicServiceClient) client;
+                    this.remoteFileServiceClient = (RemoteFileClient) client;
                     this.sharedCheckpointMetadataManager = shared;
                     this.remoteDataStorageManager = dsm;
                     this.remoteMetaDir = metaDir;
@@ -394,7 +395,7 @@ public class IndexingServer implements AutoCloseable {
         // Install S3WatermarkStore for this tablespace UUID + instanceId.
         int instanceId = config.getInt(IndexingServerConfiguration.PROPERTY_INSTANCE_ID,
                 IndexingServerConfiguration.PROPERTY_INSTANCE_ID_DEFAULT);
-        final DynamicServiceClient client = remoteFileServiceClient;
+        final RemoteFileClient client = remoteFileServiceClient;
 
         // Before issuing the first readFile for the watermark, block until the
         // remote file client has at least one server in its consistent-hash
@@ -422,26 +423,12 @@ public class IndexingServer implements AutoCloseable {
         S3WatermarkStore.RemoteFileIO io = new S3WatermarkStore.RemoteFileIO() {
             @Override
             public void writeFile(String path, byte[] content) {
-                try {
-                    client.getClass().getMethod("writeFile", String.class, byte[].class)
-                            .invoke(client, path, content);
-                } catch (java.lang.reflect.InvocationTargetException ite) {
-                    throw new RuntimeException(ite.getCause());
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
+                client.writeFile(path, content);
             }
 
             @Override
             public byte[] readFile(String path) {
-                try {
-                    return (byte[]) client.getClass().getMethod("readFile", String.class)
-                            .invoke(client, path);
-                } catch (java.lang.reflect.InvocationTargetException ite) {
-                    throw new RuntimeException(ite.getCause());
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
+                return client.readFile(path);
             }
         };
         S3WatermarkStore s3WatermarkStore = new S3WatermarkStore(io, tableSpaceUUID, instanceId);

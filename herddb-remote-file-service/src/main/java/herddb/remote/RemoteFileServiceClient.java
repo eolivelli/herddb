@@ -37,7 +37,7 @@ import herddb.remote.proto.WriteFileBlockRequest;
 import herddb.remote.proto.WriteFileBlockResponse;
 import herddb.remote.proto.WriteFileRequest;
 import herddb.remote.proto.WriteFileResponse;
-import herddb.server.DynamicServiceClient;
+import herddb.server.RemoteFileClient;
 import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -70,7 +70,7 @@ import java.util.logging.Logger;
  *
  * @author enrico.olivelli
  */
-public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceClient {
+public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient {
 
     private static final Logger LOGGER = Logger.getLogger(RemoteFileServiceClient.class.getName());
 
@@ -599,6 +599,7 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
 
     // --- Synchronous APIs (wrappers around async) ---
 
+    @Override
     public void writeFile(String path, byte[] content) {
         getUnchecked(writeFileAsync(path, content));
     }
@@ -607,6 +608,7 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
         getUnchecked(writeFileAsync(path, buf, offset, len));
     }
 
+    @Override
     public byte[] readFile(String path) {
         return getUnchecked(readFileAsync(path));
     }
