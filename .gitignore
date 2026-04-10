@@ -39,4 +39,5 @@ vector-testings/datasets/
 
 
 # Claude
-.claude/
+.claude/*
+!.claude/agents/

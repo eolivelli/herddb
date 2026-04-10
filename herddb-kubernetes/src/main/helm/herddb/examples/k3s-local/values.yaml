@@ -1,126 +1,140 @@
-# Full-stack HerdDB on a local k3s cluster.
+# Full-stack HerdDB on a local k3s-in-docker cluster.
 #
-# Deploys: HerdDB server (cluster mode) + file server (S3 on MinIO) +
-#           indexing service + ZooKeeper + BookKeeper + MinIO + tools pod.
+# Deploys: HerdDB server (cluster mode, remote storage) + file server
+# (S3 on MinIO) + indexing service + ZooKeeper + BookKeeper + MinIO +
+# tools pod + Prometheus + Grafana.
 #
-# Install:
-#   helm install herddb . -f examples/k3s-local/values.yaml
+# Mirrors the structure of examples/gke/values.yaml but with resources
+# and PVCs sized for a developer laptop. No PVC exceeds 10 GiB.
+#
+# Install via ./install.sh (which runs k3s inside a Docker container
+# and imports the HerdDB image into containerd so imagePullPolicy=Never
+# works).
+
+image:
+  pullPolicy: Never
 
 server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  javaOpts: "-Xms512m -Xmx512m"
+  javaOpts: "-Xms1g -Xmx1g -Djava.net.preferIPv4Stack=true"
   storage:
     data:
-      size: 2Gi
+      size: 5Gi
     commitlog:
-      size: 1Gi
+      size: 2Gi
   resources:
     requests:
-      memory: "768Mi"
+      memory: "2Gi"
       cpu: "0.5"
     limits:
-      memory: "768Mi"
+      memory: "2Gi"
       cpu: "1"
 
 fileServer:
   replicaCount: 1
   storageMode: s3
-  javaOpts: "-Xms256m -Xmx384m -Djava.net.preferIPv4Stack=true"
-  # S3 endpoint, bucket, and credentials are auto-configured from the
-  # minio section below — no need to set them explicitly.
+  javaOpts: "-Xms1g -Xmx1g -Djava.net.preferIPv4Stack=true"
+  # S3 endpoint, bucket, and credentials are auto-wired from the
+  # minio section below.
   storage:
-    size: 2Gi
+    size: 10Gi
+  # Local disk cache sized to match the PVC (10 GiB = 10737418240 bytes).
+  cacheMaxBytes: 10737418240
   resources:
     requests:
-      memory: "512Mi"
+      memory: "1536Mi"
       cpu: "0.5"
     limits:
-      memory: "512Mi"
+      memory: "1536Mi"
       cpu: "1"
 
 minio:
   enabled: true
   storage:
-    size: 5Gi
+    size: 10Gi
   resources:
     requests:
       memory: "256Mi"
       cpu: "0.25"
     limits:
-      memory: "256Mi"
+      memory: "512Mi"
       cpu: "0.5"
 
 zookeeper:
   enabled: true
-  javaOpts: "-Xms128m -Xmx256m"
-  storage:
-    size: 1Gi
-  resources:
-    requests:
-      memory: "512Mi"
-      cpu: "0.25"
-    limits:
-      memory: "512Mi"
-      cpu: "0.5"
-
-bookkeeper:
-  enabled: true
-  javaOpts: "-Xms256m -Xmx384m"
-  storage:
-    journal:
-      size: 1Gi
-    ledger:
-      size: 2Gi
-  resources:
-    requests:
-      memory: "512Mi"
-      cpu: "0.25"
-    limits:
-      memory: "512Mi"
-      cpu: "0.5"
-
-indexingService:
-  enabled: true
-  replicaCount: 1
-  javaOpts: "-Xms384m -Xmx512m -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
-  storage:
-    data:
-      size: 2Gi
-    log:
-      size: 1Gi
-  resources:
-    requests:
-      memory: "768Mi"
-      cpu: "0.5"
-    limits:
-      memory: "768Mi"
-      cpu: "1"
-
-tools:
-  enabled: true
-  resources:
-    requests:
-      memory: "512Mi"
-      cpu: "0.25"
-    limits:
-      memory: "512Mi"
-      cpu: "0.5"
-
-vectorBench:
-  enabled: false
-
-prometheus:
-  enabled: true
+  javaOpts: "-Xms512m -Xmx512m -Djava.net.preferIPv4Stack=true"
   storage:
     size: 2Gi
   resources:
     requests:
-      memory: "256Mi"
+      memory: "768Mi"
       cpu: "0.25"
     limits:
+      memory: "768Mi"
+      cpu: "0.5"
+
+bookkeeper:
+  enabled: true
+  replicaCount: 1
+  javaOpts: "-Xms512m -Xmx512m -Djava.net.preferIPv4Stack=true"
+  extraConfig:
+    journalWriteData: "false"
+  storage:
+    journal:
+      size: 1Gi
+    ledger:
+      size: 5Gi
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "0.25"
+    limits:
+      memory: "1Gi"
+      cpu: "0.5"
+
+indexingService:
+  enabled: true
+  storageMode: remote
+  replicaCount: 1
+  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
+  storage:
+    data:
+      size: 5Gi
+    log:
+      size: 2Gi
+  resources:
+    requests:
+      memory: "3Gi"
+      cpu: "0.5"
+    limits:
+      memory: "3Gi"
+      cpu: "1"
+
+tools:
+  enabled: true
+  storage:
+    datasets:
+      size: 10Gi
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "0.25"
+    limits:
+      memory: "512Mi"
+      cpu: "0.5"
+
+prometheus:
+  enabled: true
+  storage:
+    size: 1Gi
+  resources:
+    requests:
       memory: "256Mi"
+      cpu: "0.1"
+    limits:
+      memory: "512Mi"
       cpu: "0.25"
 
 grafana:
@@ -130,5 +144,5 @@ grafana:
       memory: "128Mi"
       cpu: "0.1"
     limits:
-      memory: "128Mi"
+      memory: "256Mi"
       cpu: "0.25"
