@@ -5,7 +5,7 @@
 # tools pod.
 #
 # Mirrors the structure of examples/gke/values.yaml but with resources
-# and PVCs sized for a developer laptop / workstation. No PVC exceeds 10 GiB.
+# and PVCs sized for a developer laptop / workstation.
 #
 # Prometheus and Grafana are disabled by default to save RAM; enable them
 # ad-hoc with --set prometheus.enabled=true --set grafana.enabled=true.
@@ -23,6 +23,14 @@
 # Tools heap raised to 2 g: loading the sift1m base set (1M × 128 × 4 B
 # = 512 MB) into the vector-bench JVM plus JVM overhead exceeds 512 Mi;
 # the old 512 Mi container limit caused OOMKill during ingest.
+#
+# File-server cache and MinIO storage are sized to hold the complete
+# index + data pages for gist1m M=32 without any MinIO round-trips on
+# warm queries:
+#   - gist1m data pages  : ~3.7 GB (1M × 960-dim rows via remote storage)
+#   - gist1m M=32 segment: ~4.8 GB (FusedPQ graph)
+#   - sift1m  M=32 segment: ~0.8 GB
+#   Peak single-run total: ≈ 8.5 GB → 30 GiB cache/PVC gives ~3.5× headroom.
 #
 # Install via ./install.sh (which runs k3s inside a Docker container
 # and imports the HerdDB image into containerd so imagePullPolicy=Never
@@ -67,9 +75,12 @@ fileServer:
   # S3 endpoint, bucket, and credentials are auto-wired from the
   # minio section below.
   storage:
-    size: 10Gi
-  # Local disk cache sized to match the PVC (10 GiB = 10737418240 bytes).
-  cacheMaxBytes: 10737418240
+    # 30 GiB: large enough to cache the full gist1m index (M=32 ≈ 4.8 GB)
+    # plus data pages (~3.7 GB) with ~3.5× headroom so warm queries never
+    # fall back to MinIO.
+    size: 30Gi
+  # Local disk cache set to the full PVC (30 GiB = 32212254720 bytes).
+  cacheMaxBytes: 32212254720
   resources:
     requests:
       memory: "5Gi"
@@ -81,7 +92,9 @@ fileServer:
 minio:
   enabled: true
   storage:
-    size: 10Gi
+    # 20 GiB: holds gist1m data (~8.5 GB) plus multiple benchmark runs
+    # without running out of object-storage space.
+    size: 20Gi
   resources:
     requests:
       memory: "256Mi"
