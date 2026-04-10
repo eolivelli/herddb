@@ -2145,14 +2145,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * through a {@link PageStoreReader.Supplier} that reads graph bytes on
      * demand from the page store, with a small bounded LRU cache.
      *
-     * <p>The {@code graphPageIds} list <em>must</em> already be populated on
-     * {@code seg} before this method is called.
+     * <p>Either {@code seg.graphFilePath} (multipart mode) or
+     * {@code seg.graphPageIds} (page-based mode) must be populated
+     * before this method is called.
      */
     private void loadFusedPQSegment(VectorSegment seg, Path mapFile, int dim, int savedNextNodeId)
             throws IOException, DataStorageManagerException {
-        if (seg.graphPageIds == null || seg.graphPageIds.isEmpty()) {
+        if (seg.graphFilePath == null && (seg.graphPageIds == null || seg.graphPageIds.isEmpty())) {
             throw new IllegalStateException(
-                    "loadFusedPQSegment requires seg.graphPageIds to be populated");
+                    "loadFusedPQSegment requires either seg.graphFilePath (multipart) "
+                    + "or seg.graphPageIds (page-based) to be populated");
         }
         createSegmentBLinks(seg);
 
