@@ -1,0 +1,16 @@
+suite: bookkeeper StatefulSet
+templates:
+  - templates/bookkeeper-statefulset.yaml
+  - templates/bookkeeper-configmap.yaml
+tests:
+  - it: should have a checksum/config annotation that rolls pods on ConfigMap changes
+    template: templates/bookkeeper-statefulset.yaml
+    set:
+      server.mode: cluster
+      bookkeeper.enabled: true
+    asserts:
+      - isNotNullOrEmpty:
+          path: spec.template.metadata.annotations["checksum/config"]
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: ^[a-f0-9]{64}$
