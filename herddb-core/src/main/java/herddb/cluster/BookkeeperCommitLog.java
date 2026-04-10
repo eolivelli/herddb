@@ -506,23 +506,32 @@ public class BookkeeperCommitLog extends CommitLog {
                 actualLedgersList.setFirstLedger(currentLedgerId);
             }
             actualLedgersList.addLedger(currentLedgerId);
+            // Use try/finally (not try/catch) so the rollback fires for any failure
+            // mode: LogNotAvailableException, OOM, or any other Error/Throwable.
+            // saveActualLedgersList declares LogNotAvailableException, but the ZK
+            // client can also throw OutOfMemoryError mid-call (the original
+            // scenario in issue #48), and OOM is an Error, not an Exception.
+            // pendingLedgerId is intentionally cleared only after a successful
+            // save: if anything goes wrong, the outer finally block deletes the
+            // orphan BK ledger so BK and ZK stay in sync.
+            boolean savedToZk = false;
             try {
                 metadataManager.saveActualLedgersList(tableSpaceUUID, actualLedgersList);
-            } catch (LogNotAvailableException zkError) {
-                // ZK persistence failed: the BK ledger we just created is not
-                // reachable through the ledgers list (e.g. indexing service only
-                // discovers ledgers via ZK). Roll back the in-memory list, drop
-                // the writer reference (so close() doesn't try to talk to a
-                // ledger that the finally block is about to delete), and let the
-                // finally block delete the orphan BK ledger, so BK and ZK stay in
-                // sync. See issue #48.
-                actualLedgersList.removeLedger(currentLedgerId);
-                if (firstLedgerWasUnset) {
-                    actualLedgersList.setFirstLedger(previousFirstLedger);
+                savedToZk = true;
+            } finally {
+                if (!savedToZk) {
+                    actualLedgersList.removeLedger(currentLedgerId);
+                    if (firstLedgerWasUnset) {
+                        actualLedgersList.setFirstLedger(previousFirstLedger);
+                    }
+                    currentLedgerId = previousCurrentLedgerId;
+                    writer = null;
+                    // mark the log as failed regardless of the exception type
+                    // (the outer catch only catches LogNotAvailableException, so
+                    // an Error escaping from saveActualLedgersList would otherwise
+                    // leave the log in a half-initialized state)
+                    signalLogFailed();
                 }
-                currentLedgerId = previousCurrentLedgerId;
-                writer = null;
-                throw zkError;
             }
             pendingLedgerId = null;
             return writer;

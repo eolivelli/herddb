@@ -48,7 +48,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.bookkeeper.client.BookKeeper;
 import org.apache.bookkeeper.client.BookKeeperAdmin;
 import org.apache.bookkeeper.client.api.LedgerMetadata;
@@ -457,20 +456,45 @@ public class BookKeeperCommitLogTest {
      */
     @Test
     public void testOpenNewLedgerRollbacksBkWhenZkWriteFails() throws Exception {
+        runOpenNewLedgerRollbackTest(() -> new LogNotAvailableException(new Exception("injected ZK failure")));
+    }
+
+    /**
+     * The original incident in issue #48 was triggered by an
+     * {@link OutOfMemoryError} thrown from inside the ZooKeeper client thread,
+     * not by a {@code LogNotAvailableException}. Because {@code OutOfMemoryError}
+     * is an {@link Error}, it bypasses the {@code catch (Exception)} inside
+     * {@code saveActualLedgersList} and propagates raw to the caller. The fix
+     * must therefore roll back the in-memory ledger list and delete the orphan
+     * BK ledger for any failure mode, not just the checked exception path.
+     */
+    @Test
+    public void testOpenNewLedgerRollbacksBkWhenZkWriteThrowsError() throws Exception {
+        runOpenNewLedgerRollbackTest(() -> new OutOfMemoryError("injected OOM during ZK save"));
+    }
+
+    private void runOpenNewLedgerRollbackTest(java.util.function.Supplier<Throwable> failureSupplier) throws Exception {
         final String tableSpaceUUID = UUID.randomUUID().toString();
         final String name = TableSpace.DEFAULT;
         final String nodeid = "nodeid";
         ServerConfiguration serverConfiguration = newServerConfigurationWithAutoPort();
 
         java.util.concurrent.atomic.AtomicBoolean failNextSave = new java.util.concurrent.atomic.AtomicBoolean();
-        AtomicInteger saveCalls = new AtomicInteger();
         try (ZookeeperMetadataStorageManager man = new ZookeeperMetadataStorageManager(testEnv.getAddress(),
                 testEnv.getTimeout(), testEnv.getPath()) {
             @Override
             public void saveActualLedgersList(String tsUUID, LedgersInfo info) throws LogNotAvailableException {
-                saveCalls.incrementAndGet();
                 if (failNextSave.compareAndSet(true, false)) {
-                    throw new LogNotAvailableException(new Exception("injected ZK failure"));
+                    Throwable t = failureSupplier.get();
+                    if (t instanceof LogNotAvailableException) {
+                        throw (LogNotAvailableException) t;
+                    } else if (t instanceof RuntimeException) {
+                        throw (RuntimeException) t;
+                    } else if (t instanceof Error) {
+                        throw (Error) t;
+                    } else {
+                        throw new LogNotAvailableException(new Exception(t));
+                    }
                 }
                 super.saveActualLedgersList(tsUUID, info);
             }
@@ -492,7 +516,12 @@ public class BookKeeperCommitLogTest {
                 // arm the failure injection and trigger a roll: the next ZK save
                 // (inside openNewLedger) must fail and the BK side must be rolled back
                 failNextSave.set(true);
-                TestUtils.assertThrows(LogNotAvailableException.class, writer::rollNewLedger);
+                try {
+                    writer.rollNewLedger();
+                    org.junit.Assert.fail("rollNewLedger was expected to throw");
+                } catch (LogNotAvailableException | Error expected) {
+                    // either flavour is acceptable: the fix must handle both
+                }
 
                 assertTrue(writer.isFailed());
             }
