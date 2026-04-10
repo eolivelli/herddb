@@ -74,7 +74,7 @@ public class IndexingServer implements AutoCloseable {
 
     // When storage.type=remote, these are set by buildDataStorageManager
     // and consumed by the tablespace-resolved hook.
-    private Object remoteFileServiceClient;
+    private DynamicServiceClient remoteFileServiceClient;
     private Object sharedCheckpointMetadataManager;
     private Object remoteDataStorageManager;
     private Path remoteMetaDir;
@@ -233,7 +233,10 @@ public class IndexingServer implements AutoCloseable {
                             .invoke(dsm, shared);
 
                     // Store for later use by the tablespace-resolved hook.
-                    this.remoteFileServiceClient = client;
+                    // client was created reflectively but is guaranteed to
+                    // implement DynamicServiceClient (the constructor target
+                    // class, RemoteFileServiceClient, declares it).
+                    this.remoteFileServiceClient = (DynamicServiceClient) client;
                     this.sharedCheckpointMetadataManager = shared;
                     this.remoteDataStorageManager = dsm;
                     this.remoteMetaDir = metaDir;
@@ -391,7 +394,7 @@ public class IndexingServer implements AutoCloseable {
         // Install S3WatermarkStore for this tablespace UUID + instanceId.
         int instanceId = config.getInt(IndexingServerConfiguration.PROPERTY_INSTANCE_ID,
                 IndexingServerConfiguration.PROPERTY_INSTANCE_ID_DEFAULT);
-        final Object clientRef = remoteFileServiceClient;
+        final DynamicServiceClient client = remoteFileServiceClient;
 
         // Before issuing the first readFile for the watermark, block until the
         // remote file client has at least one server in its consistent-hash
@@ -403,7 +406,7 @@ public class IndexingServer implements AutoCloseable {
                 IndexingServerConfiguration.PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS,
                 IndexingServerConfiguration.PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS_DEFAULT);
         try {
-            boolean ready = ((DynamicServiceClient) clientRef).awaitServersReady(bootstrapWaitMs);
+            boolean ready = client.awaitServersReady(bootstrapWaitMs);
             if (!ready) {
                 throw new RuntimeException(
                         "Timed out after " + bootstrapWaitMs + "ms waiting for remote file"
@@ -420,8 +423,8 @@ public class IndexingServer implements AutoCloseable {
             @Override
             public void writeFile(String path, byte[] content) {
                 try {
-                    clientRef.getClass().getMethod("writeFile", String.class, byte[].class)
-                            .invoke(clientRef, path, content);
+                    client.getClass().getMethod("writeFile", String.class, byte[].class)
+                            .invoke(client, path, content);
                 } catch (java.lang.reflect.InvocationTargetException ite) {
                     throw new RuntimeException(ite.getCause());
                 } catch (Exception e) {
@@ -432,8 +435,8 @@ public class IndexingServer implements AutoCloseable {
             @Override
             public byte[] readFile(String path) {
                 try {
-                    return (byte[]) clientRef.getClass().getMethod("readFile", String.class)
-                            .invoke(clientRef, path);
+                    return (byte[]) client.getClass().getMethod("readFile", String.class)
+                            .invoke(client, path);
                 } catch (java.lang.reflect.InvocationTargetException ite) {
                     throw new RuntimeException(ite.getCause());
                 } catch (Exception e) {
