@@ -256,7 +256,14 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
     private CompletableFuture<Long> writeFileAsync(String path, ByteString content) {
         // Writes are not idempotent — no retry
         CompletableFuture<Long> future = new CompletableFuture<>();
-        asyncStubForPath(path).writeFile(
+        RemoteFileServiceGrpc.RemoteFileServiceStub stub;
+        try {
+            stub = asyncStubForPath(path);
+        } catch (Exception e) {
+            future.completeExceptionally(e);
+            return future;
+        }
+        stub.writeFile(
                 WriteFileRequest.newBuilder()
                         .setPath(path)
                         .setContent(content)
@@ -629,7 +636,17 @@ public class RemoteFileServiceClient implements AutoCloseable, DynamicServiceCli
 
     private <T> CompletableFuture<T> retryAsync(AsyncAction<T> action, String opName, String path, int attempt) {
         CompletableFuture<T> result = new CompletableFuture<>();
-        action.execute().whenComplete((value, error) -> {
+        CompletableFuture<T> actionResult;
+        try {
+            actionResult = action.execute();
+        } catch (Exception e) {
+            // Handle synchronous failures (e.g. "Hash ring is empty" when no
+            // servers have been discovered yet) the same as async failures so
+            // that the retry logic below can kick in.
+            actionResult = new CompletableFuture<>();
+            actionResult.completeExceptionally(e);
+        }
+        actionResult.whenComplete((value, error) -> {
             if (error == null) {
                 result.complete(value);
                 return;

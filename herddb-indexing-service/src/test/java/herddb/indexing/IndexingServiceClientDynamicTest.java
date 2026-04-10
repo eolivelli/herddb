@@ -21,6 +21,9 @@
 package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.fail;
+import herddb.log.LogSequenceNumber;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
@@ -86,5 +89,55 @@ public class IndexingServiceClientDynamicTest {
 
         // Verify search still works after update (empty index returns empty results)
         client.search("herd", "testtable", "testindex", new float[]{1.0f, 2.0f, 3.0f}, 10);
+    }
+
+    @Test
+    public void testUpdateServersEmptyListKeepsCurrent() throws Exception {
+        String addr1 = service1.getAddress();
+
+        client = new IndexingServiceClient(Collections.singletonList(addr1));
+        assertEquals(1, client.getServers().size());
+
+        // Empty list should be ignored
+        client.updateServers(Collections.emptyList());
+
+        // Server list should be unchanged
+        assertEquals(1, client.getServers().size());
+        assertEquals(addr1, client.getServers().get(0));
+
+        // Search should still work
+        client.search("herd", "testtable", "testindex", new float[]{1.0f, 2.0f, 3.0f}, 10);
+    }
+
+    @Test
+    public void testSearchThrowsWithEmptyServerList() {
+        client = new IndexingServiceClient(Collections.emptyList());
+
+        try {
+            client.search("herd", "testtable", "testindex", new float[]{1.0f, 2.0f, 3.0f}, 10);
+            fail("Expected RuntimeException");
+        } catch (RuntimeException e) {
+            assertEquals("No indexing service instances available", e.getMessage());
+        }
+    }
+
+    @Test
+    public void testGetIndexStatusThrowsWithEmptyServerList() {
+        client = new IndexingServiceClient(Collections.emptyList());
+
+        try {
+            client.getIndexStatus("herd", "testtable", "testindex");
+            fail("Expected RuntimeException");
+        } catch (RuntimeException e) {
+            assertEquals("No indexing service instances available", e.getMessage());
+        }
+    }
+
+    @Test
+    public void testWaitForCatchUpReturnsFalseWithEmptyServerList() throws Exception {
+        client = new IndexingServiceClient(Collections.emptyList());
+
+        boolean result = client.waitForCatchUp("herd", new LogSequenceNumber(1, 0), 5000);
+        assertFalse("waitForCatchUp should return false when no servers are available", result);
     }
 }
