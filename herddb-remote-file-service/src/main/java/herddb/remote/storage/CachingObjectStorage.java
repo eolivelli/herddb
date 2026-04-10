@@ -22,7 +22,6 @@ package herddb.remote.storage;
 
 import com.github.benmanes.caffeine.cache.AsyncLoadingCache;
 import com.github.benmanes.caffeine.cache.Caffeine;
-import com.github.benmanes.caffeine.cache.RemovalListener;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,11 +35,43 @@ import java.util.logging.Logger;
 import java.util.stream.Stream;
 
 /**
- * Decorator that wraps an inner {@link ObjectStorage} (e.g. S3) with a local disk cache
- * backed by a Caffeine {@link AsyncLoadingCache}.
- * <p>
- * The cache directory is cleared on construction. Cache files are stored flat in
- * {@code cacheDir} with {@code /} replaced by {@code _} in filenames.
+ * Two-tier cache decorator for {@link ObjectStorage} (e.g. S3 / MinIO).
+ *
+ * <h3>Caching tiers</h3>
+ * <ol>
+ *   <li><b>L1 – JVM heap</b>: a Caffeine {@link AsyncLoadingCache} limited to
+ *       {@code maxCacheBytes} of raw byte array weight.  Items are kept in heap
+ *       for the fastest possible access; they are evicted when the total weight
+ *       exceeds the limit.</li>
+ *   <li><b>L2 – local disk</b>: when a block is first fetched from object storage
+ *       it is written to a flat file under {@code cacheDir}.  The disk file is
+ *       <em>not</em> deleted when the item is evicted from the heap cache — it is
+ *       retained as a disk-backed fallback.  On a subsequent Caffeine miss the
+ *       loader reads the disk file first (local I/O, typically ≥ 100 MB/s) instead
+ *       of re-fetching from MinIO (~4 MB/s in a local Docker cluster).</li>
+ *   <li><b>L3 – object storage (MinIO)</b>: fallback when neither heap nor disk
+ *       has the item.</li>
+ * </ol>
+ *
+ * <h3>Why disk files are retained on heap eviction</h3>
+ * The previous implementation deleted disk files in the Caffeine eviction listener.
+ * This made the "disk cache" a pure mirror of the heap cache rather than an
+ * independent tier: once an item was evicted from heap (and its disk file removed),
+ * the next access had to re-fetch from MinIO, causing repeated multi-second stalls
+ * for large FusedPQ graph blocks during vector-search benchmarks.
+ *
+ * <h3>Disk cache lifecycle</h3>
+ * <ul>
+ *   <li>Created/updated: whenever a block is written ({@link #writeBlock}) or a
+ *       small object is written ({@link #write}), and whenever the L3 loader fetches
+ *       from MinIO ({@link #loadFromObjectStorage}).</li>
+ *   <li>Deleted: only via an explicit {@link #deleteLogical}, {@link #delete}, or
+ *       {@link #deleteByPrefix} call, or when the cache directory is cleared on
+ *       construction ({@link #clearCacheDir}).</li>
+ * </ul>
+ *
+ * Cache files are stored flat in {@code cacheDir} with {@code /} replaced by
+ * {@code _} in filenames.
  *
  * @author enrico.olivelli
  */
@@ -62,21 +93,49 @@ public class CachingObjectStorage implements ObjectStorage {
         this.cache = Caffeine.newBuilder()
                 .maximumWeight(maxCacheBytes)
                 .weigher((String key, byte[] value) -> value.length)
-                .evictionListener((RemovalListener<String, byte[]>) (key, value, cause) -> {
-                    // Synchronous: called on the maintenance thread before removal completes.
-                    if (key != null) {
-                        deleteCacheFile(key);
-                    }
-                })
-                .buildAsync((path, exec) ->
-                        inner.read(path).thenApply(result -> {
-                            if (result.status() == ReadResult.Status.NOT_FOUND) {
-                                return null;
-                            }
-                            byte[] bytes = result.content();
-                            writeCacheFile(path, bytes);
-                            return bytes;
-                        }));
+                // Do NOT delete disk files on heap eviction: the disk file continues
+                // to serve as an L2 cache, sparing a MinIO round-trip on the next access.
+                .buildAsync((path, exec) -> loadFromDiskOrObjectStorage(path, executor));
+    }
+
+    /**
+     * L2/L3 loader: try the local disk cache first; fall back to object storage if
+     * the disk file does not exist or cannot be read.
+     */
+    private CompletableFuture<byte[]> loadFromDiskOrObjectStorage(String path, ExecutorService executor) {
+        Path diskFile = cacheFilePath(path);
+        if (Files.exists(diskFile)) {
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    byte[] bytes = Files.readAllBytes(diskFile);
+                    LOGGER.fine(() -> "cache L2 hit (disk): " + path + " (" + bytes.length + " bytes)");
+                    return bytes;
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Failed to read disk cache file, falling back to object storage: " + path, e);
+                    return null;
+                }
+            }, executor).thenCompose(bytes -> {
+                if (bytes != null) {
+                    return CompletableFuture.completedFuture(bytes);
+                }
+                return loadFromObjectStorage(path);
+            });
+        }
+        return loadFromObjectStorage(path);
+    }
+
+    /**
+     * L3 loader: fetch from object storage (MinIO) and persist to disk for future L2 hits.
+     */
+    private CompletableFuture<byte[]> loadFromObjectStorage(String path) {
+        return inner.read(path).thenApply(result -> {
+            if (result.status() == ReadResult.Status.NOT_FOUND) {
+                return null;
+            }
+            byte[] bytes = result.content();
+            writeCacheFile(path, bytes);
+            return bytes;
+        });
     }
 
     private void clearCacheDir() throws IOException {
@@ -151,7 +210,7 @@ public class CachingObjectStorage implements ObjectStorage {
         long blockIndex = offset / blockSize;
         int offsetInBlock = (int) (offset % blockSize);
         String blockPath = path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex;
-        // Load the whole block from cache (or from inner storage), then slice
+        // Load the whole block from L1 heap (or L2 disk, or L3 MinIO), then slice
         return cache.get(blockPath).thenApply(blockBytes -> {
             if (blockBytes == null) {
                 return ReadResult.notFound();
@@ -169,7 +228,7 @@ public class CachingObjectStorage implements ObjectStorage {
 
     @Override
     public CompletableFuture<Boolean> deleteLogical(String path) {
-        // Invalidate all cached entries for this logical file
+        // Invalidate all cached entries for this logical file and delete disk files
         String multipartPrefix = path + ObjectStorage.MULTIPART_SUFFIX + "/";
         List<String> toInvalidate = new ArrayList<>(cache.synchronous().asMap().keySet());
         toInvalidate.stream()

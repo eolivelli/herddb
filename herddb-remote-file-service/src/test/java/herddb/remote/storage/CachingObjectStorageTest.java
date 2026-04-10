@@ -259,11 +259,15 @@ public class CachingObjectStorageTest {
         assertFalse(Files.exists(caching.cacheFilePath("pfx/b.page")));
     }
 
+    /**
+     * Disk files must survive heap eviction so they can serve as an L2 cache,
+     * avoiding a MinIO round-trip when the heap entry is re-accessed after eviction.
+     */
     @Test
-    public void testEvictionDeletesLocalFile() throws Exception {
+    public void testEvictionRetainsDiskFile() throws Exception {
         FakeObjectStorage inner = new FakeObjectStorage();
         Path cacheDir = folder.newFolder("cache3").toPath();
-        // 1 byte max cache — any write will be evicted
+        // 1 byte max heap cache — any write will be evicted from L1
         CachingObjectStorage caching = new CachingObjectStorage(inner, cacheDir, executor, 1);
 
         byte[] data = new byte[100];
@@ -272,7 +276,32 @@ public class CachingObjectStorageTest {
         // Force Caffeine to process pending evictions
         caching.cleanUp();
 
+        // The disk file must NOT be deleted — it is the L2 cache
         Path cacheFile = caching.cacheFilePath("evict/big.page");
-        assertFalse("evicted entry's local file should be deleted", Files.exists(cacheFile));
+        assertTrue("evicted entry's local file must be retained as L2 cache", Files.exists(cacheFile));
+    }
+
+    /**
+     * After a heap eviction, the next read must be served from the disk L2 cache,
+     * not from object storage.
+     */
+    @Test
+    public void testEvictedEntryServedFromDisk() throws Exception {
+        FakeObjectStorage inner = new FakeObjectStorage();
+        Path cacheDir = folder.newFolder("cache4").toPath();
+        // 1 byte max heap cache — forces immediate eviction
+        CachingObjectStorage caching = new CachingObjectStorage(inner, cacheDir, executor, 1);
+
+        byte[] data = "disk-cached payload".getBytes();
+        caching.write("l2/test.page", data).get();
+        caching.cleanUp(); // evict from heap
+
+        // Read should hit disk L2, not object storage
+        int readsBefore = inner.readCalls.get();
+        ReadResult result = caching.read("l2/test.page").get();
+        assertEquals(ReadResult.Status.FOUND, result.status());
+        assertArrayEquals(data, result.content());
+        assertEquals("read should be served from disk L2 cache, not object storage",
+                readsBefore, inner.readCalls.get());
     }
 }

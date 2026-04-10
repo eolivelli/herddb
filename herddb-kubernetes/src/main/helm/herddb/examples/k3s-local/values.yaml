@@ -5,7 +5,7 @@
 # tools pod.
 #
 # Mirrors the structure of examples/gke/values.yaml but with resources
-# and PVCs sized for a developer laptop / workstation. No PVC exceeds 10 GiB.
+# and PVCs sized for a developer laptop / workstation.
 #
 # Prometheus and Grafana are disabled by default to save RAM; enable them
 # ad-hoc with --set prometheus.enabled=true --set grafana.enabled=true.
@@ -23,6 +23,21 @@
 # Tools heap raised to 2 g: loading the sift1m base set (1M × 128 × 4 B
 # = 512 MB) into the vector-bench JVM plus JVM overhead exceeds 512 Mi;
 # the old 512 Mi container limit caused OOMKill during ingest.
+#
+# File-server two-tier cache (L1 heap + L2 disk):
+#   CachingObjectStorage keeps hot blocks in JVM heap (L1, bounded by
+#   s3.cacheMaxBytes) and retains disk copies when items are evicted from heap
+#   (L2).  On a Caffeine miss the loader reads from disk first (~GB/s) and
+#   only falls back to MinIO (~4 MB/s in Docker) when the disk file is absent.
+#   s3.cacheMaxBytes controls the L1 heap allocation; the PVC holds the L2
+#   disk files (retained across evictions, cleared only on pod restart).
+#
+#   Sizing for sift1m M=8 through gist1m M=32:
+#   - sift1m M=8  graph : ~280 MB across ~7 segments
+#   - gist1m M=32 graph : ~4.8 GB across ~7 segments
+#   - gist1m data pages : ~3.7 GB
+#   Peak L1 demand      : ~5 GB → 6 GiB L1 gives ~1.2× headroom
+#   Peak L2 disk demand : ~8.5 GB → 50 GiB PVC gives ~6× headroom
 #
 # Install via ./install.sh (which runs k3s inside a Docker container
 # and imports the HerdDB image into containerd so imagePullPolicy=Never
@@ -59,29 +74,39 @@ server:
 fileServer:
   replicaCount: 1
   storageMode: s3
-  # Heap raised to 4 g: gist1m segments (310k+ vectors × 960 dim × 4 B) can
-  # exceed 1 GB; the previous 1 g heap caused OOM in CachingObjectStorage
-  # during compaction. Allow -Xms2g so the JVM starts with headroom and
-  # can grow to 4 g on demand.
-  javaOpts: "-Xms2g -Xmx4g -Djava.net.preferIPv4Stack=true"
+  # Heap raised to 8 g: CachingObjectStorage L1 heap cache (6 GiB) plus JVM
+  # overhead requires ~8 GB.  The previous 4 g heap caused OOM when multiple
+  # concurrent queries each held a 200+ MB graph block in the Caffeine cache
+  # and cacheMaxBytes was set larger than the available heap.
+  javaOpts: "-Xms2g -Xmx8g -Djava.net.preferIPv4Stack=true"
   # S3 endpoint, bucket, and credentials are auto-wired from the
   # minio section below.
+  s3:
+    # L1 heap cache: 6 GiB — Caffeine evicts entries from heap once total
+    # weight exceeds this value.  Evicted entries are retained on disk (L2)
+    # so subsequent reads hit local disk instead of MinIO.
+    # NOTE: this key must be under fileServer.s3 — the Helm template reads
+    # .Values.fileServer.s3.cacheMaxBytes (not .Values.fileServer.cacheMaxBytes).
+    cacheMaxBytes: 6442450944
   storage:
-    size: 10Gi
-  # Local disk cache sized to match the PVC (10 GiB = 10737418240 bytes).
-  cacheMaxBytes: 10737418240
+    # 50 GiB L2 disk cache: holds the complete gist1m index (~4.8 GB) plus
+    # data pages (~3.7 GB) with ~5× headroom.  Entries survive heap eviction
+    # and are only cleared on pod restart.
+    size: 50Gi
   resources:
     requests:
-      memory: "5Gi"
+      memory: "9Gi"
       cpu: "0.5"
     limits:
-      memory: "5Gi"
+      memory: "10Gi"
       cpu: "1"
 
 minio:
   enabled: true
   storage:
-    size: 10Gi
+    # 20 GiB: holds gist1m data (~8.5 GB) plus multiple benchmark runs
+    # without running out of object-storage space.
+    size: 20Gi
   resources:
     requests:
       memory: "256Mi"
