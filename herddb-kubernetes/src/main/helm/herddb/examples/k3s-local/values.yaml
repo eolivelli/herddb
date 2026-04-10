@@ -74,13 +74,16 @@ fileServer:
   javaOpts: "-Xms2g -Xmx4g -Djava.net.preferIPv4Stack=true"
   # S3 endpoint, bucket, and credentials are auto-wired from the
   # minio section below.
+  s3:
+    # Local disk cache set to the full PVC (30 GiB = 32212254720 bytes).
+    # NOTE: this key must be under fileServer.s3 — the template reads
+    # .Values.fileServer.s3.cacheMaxBytes (not .Values.fileServer.cacheMaxBytes).
+    cacheMaxBytes: 32212254720
   storage:
     # 30 GiB: large enough to cache the full gist1m index (M=32 ≈ 4.8 GB)
     # plus data pages (~3.7 GB) with ~3.5× headroom so warm queries never
     # fall back to MinIO.
     size: 30Gi
-  # Local disk cache set to the full PVC (30 GiB = 32212254720 bytes).
-  cacheMaxBytes: 32212254720
   resources:
     requests:
       memory: "5Gi"
