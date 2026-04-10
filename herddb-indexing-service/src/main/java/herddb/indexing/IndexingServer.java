@@ -28,13 +28,14 @@ import herddb.file.FileDataStorageManager;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.metadata.MetadataStorageManager;
 import herddb.metadata.ServiceDiscoveryListener;
-import herddb.server.DynamicServiceClient;
 import herddb.server.RemoteFileClient;
+import herddb.server.RemoteFileServiceFactory;
+import herddb.server.RemoteFileStorageManager;
+import herddb.server.SharedCheckpointMetadata;
 import herddb.storage.DataStorageManager;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import java.io.IOException;
-import java.lang.reflect.Constructor;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
@@ -76,8 +77,8 @@ public class IndexingServer implements AutoCloseable {
     // When storage.type=remote, these are set by buildDataStorageManager
     // and consumed by the tablespace-resolved hook.
     private RemoteFileClient remoteFileServiceClient;
-    private Object sharedCheckpointMetadataManager;
-    private Object remoteDataStorageManager;
+    private SharedCheckpointMetadata sharedCheckpointMetadataManager;
+    private RemoteFileStorageManager remoteDataStorageManager;
     private Path remoteMetaDir;
 
     public IndexingServer(String host, int port, IndexingServiceEngine engine, IndexingServerConfiguration config) {
@@ -168,11 +169,9 @@ public class IndexingServer implements AutoCloseable {
                         config.getInt(IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
                                 IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT));
                 try {
-                    Class<?> clientClass = Class.forName("herddb.remote.RemoteFileServiceClient");
-                    Object client = clientClass.getConstructor(List.class, Map.class)
-                            .newInstance(servers, clientConfig);
-                    if (useZKDiscovery && client instanceof DynamicServiceClient) {
-                        DynamicServiceClient dynamicClient = (DynamicServiceClient) client;
+                    RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
+                    RemoteFileClient client = factory.createClient(servers, clientConfig);
+                    if (useZKDiscovery) {
                         metadataStorageManager.addServiceDiscoveryListener(
                                 new ServiceDiscoveryListener() {
                                     @Override
@@ -185,7 +184,7 @@ public class IndexingServer implements AutoCloseable {
                                         LOGGER.log(Level.INFO,
                                                 "Remote file servers for indexing changed via ZK: {0}",
                                                 currentAddresses);
-                                        dynamicClient.updateServers(currentAddresses);
+                                        client.updateServers(currentAddresses);
                                     }
                                 });
                         // Re-query after listener registration to close the race window
@@ -193,16 +192,13 @@ public class IndexingServer implements AutoCloseable {
                         try {
                             List<String> currentServers = metadataStorageManager.listFileServers();
                             if (!currentServers.isEmpty()) {
-                                dynamicClient.updateServers(currentServers);
+                                client.updateServers(currentServers);
                             }
                         } catch (Exception re) {
                             LOGGER.log(Level.WARNING,
                                     "Failed to re-query file servers after listener registration (indexing)", re);
                         }
                     }
-                    Class<?> storageClass = Class.forName("herddb.remote.RemoteFileDataStorageManager");
-                    Constructor<?> ctor = storageClass.getConstructor(
-                            Path.class, Path.class, int.class, clientClass);
                     // Give the RemoteFileDataStorageManager its own subdir
                     // under the indexing data dir. The wrapped
                     // FileDataStorageManager wipes its tmp dir on close(),
@@ -219,33 +215,23 @@ public class IndexingServer implements AutoCloseable {
                     Path remoteTmpDir = dataDir.resolve("remote-tmp");
                     java.nio.file.Files.createDirectories(metaDir);
                     java.nio.file.Files.createDirectories(remoteTmpDir);
-                    Object dsm = ctor.newInstance(
+                    DataStorageManager dsm = factory.createDataStorageManager(
                             metaDir, remoteTmpDir, Integer.MAX_VALUE, client);
 
-                    // Create a SharedCheckpointMetadataManager and wire it into
-                    // the RemoteFileDataStorageManager so that every
+                    // Create a SharedCheckpointMetadata manager and wire it into
+                    // the RemoteFileStorageManager so that every
                     // indexCheckpoint publishes its IndexStatus to S3, and a
                     // restart on a wiped disk can hydrate {metaDir} from S3.
-                    Class<?> sharedClass = Class.forName(
-                            "herddb.remote.SharedCheckpointMetadataManager");
-                    Object shared = sharedClass.getConstructor(clientClass)
-                            .newInstance(client);
-                    storageClass.getMethod("setSharedCheckpointMetadataManager", sharedClass)
-                            .invoke(dsm, shared);
+                    SharedCheckpointMetadata shared = factory.createSharedCheckpointMetadata(client);
+                    ((RemoteFileStorageManager) dsm).setSharedCheckpointMetadataManager(shared);
 
                     // Store for later use by the tablespace-resolved hook.
-                    // client was created reflectively but is guaranteed to
-                    // implement RemoteFileClient (the constructor target
-                    // class, RemoteFileServiceClient, declares it).
-                    this.remoteFileServiceClient = (RemoteFileClient) client;
+                    this.remoteFileServiceClient = client;
                     this.sharedCheckpointMetadataManager = shared;
-                    this.remoteDataStorageManager = dsm;
+                    this.remoteDataStorageManager = (RemoteFileStorageManager) dsm;
                     this.remoteMetaDir = metaDir;
 
-                    return (DataStorageManager) dsm;
-                } catch (ReflectiveOperationException e) {
-                    throw new RuntimeException("Cannot create RemoteFileDataStorageManager. "
-                            + "Ensure herddb-remote-file-service is on the classpath.", e);
+                    return dsm;
                 } catch (java.io.IOException e) {
                     throw new RuntimeException(
                             "Cannot create RemoteFileDataStorageManager metadata directory", e);
@@ -376,9 +362,8 @@ public class IndexingServer implements AutoCloseable {
             // Hydrate local metadata dir from S3 if it is empty.
             boolean localEmpty = isMetadataDirEmpty(remoteMetaDir, tableSpaceUUID);
             if (localEmpty) {
-                int count = (Integer) sharedCheckpointMetadataManager.getClass()
-                        .getMethod("hydrateLocalMetadataDir", Path.class, String.class)
-                        .invoke(sharedCheckpointMetadataManager, remoteMetaDir, tableSpaceUUID);
+                int count = sharedCheckpointMetadataManager.hydrateLocalMetadataDir(
+                        remoteMetaDir, tableSpaceUUID);
                 LOGGER.log(Level.INFO,
                         "hydrated {0} checkpoint file(s) for tableSpace {1} from S3",
                         new Object[]{count, tableSpaceUUID});
@@ -387,7 +372,7 @@ public class IndexingServer implements AutoCloseable {
                         "local metadata already present for tableSpace {0}, skipping S3 hydrate",
                         tableSpaceUUID);
             }
-        } catch (Exception e) {
+        } catch (IOException e) {
             throw new RuntimeException(
                     "Failed to hydrate local metadata from S3 for " + tableSpaceUUID, e);
         }

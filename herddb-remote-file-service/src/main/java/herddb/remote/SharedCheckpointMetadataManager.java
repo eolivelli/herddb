@@ -65,7 +65,7 @@ import java.util.logging.Logger;
  *
  * @author enrico.olivelli
  */
-public class SharedCheckpointMetadataManager {
+public class SharedCheckpointMetadataManager implements herddb.server.SharedCheckpointMetadata {
 
     private static final Logger LOGGER = Logger.getLogger(SharedCheckpointMetadataManager.class.getName());
 
@@ -480,6 +480,7 @@ public class SharedCheckpointMetadataManager {
      *
      * @return the number of files hydrated (0 if nothing was found on remote)
      */
+    @Override
     public int hydrateLocalMetadataDir(Path localMetadataDir, String tableSpace) throws IOException {
         String prefix = metadataPrefix(tableSpace);
         List<String> remoteFiles;

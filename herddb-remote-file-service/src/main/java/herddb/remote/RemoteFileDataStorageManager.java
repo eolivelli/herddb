@@ -67,7 +67,8 @@ import org.apache.bookkeeper.stats.NullStatsLogger;
  *
  * @author enrico.olivelli
  */
-public class RemoteFileDataStorageManager extends DataStorageManager {
+public class RemoteFileDataStorageManager extends DataStorageManager
+        implements herddb.server.RemoteFileStorageManager {
 
     private static final Logger LOGGER = Logger.getLogger(RemoteFileDataStorageManager.class.getName());
 
@@ -133,8 +134,9 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
     /**
      * Enables publication of checkpoint metadata to remote storage for shared-storage read replicas.
      */
-    public void setSharedCheckpointMetadataManager(SharedCheckpointMetadataManager manager) {
-        this.sharedCheckpointMetadataManager = manager;
+    @Override
+    public void setSharedCheckpointMetadataManager(herddb.server.SharedCheckpointMetadata manager) {
+        this.sharedCheckpointMetadataManager = (SharedCheckpointMetadataManager) manager;
     }
 
     /**
@@ -148,6 +150,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager {
      * @param maxRetentionMillis maximum time a page can be retained; after this, it is force-deleted
      *        even if some replicas are still behind (they will need to re-bootstrap)
      */
+    @Override
     public void setRetentionPolicy(
             Function<String, LogSequenceNumber> minReplicaLsnSupplier,
             long minRetentionMillis,

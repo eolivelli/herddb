@@ -55,7 +55,6 @@ import herddb.security.UserManager;
 import herddb.storage.DataStorageManager;
 import herddb.utils.Version;
 import java.io.IOException;
-import java.lang.reflect.Constructor;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -451,84 +450,74 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
                         configuration.getInt(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
                                 ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT));
-                try {
-                    Class<?> clientClass = Class.forName("herddb.remote.RemoteFileServiceClient");
-                    Object client = clientClass.getConstructor(List.class, Map.class).newInstance(servers, clientConfig);
-                    // Set up ZK-based discovery listener if applicable
-                    if (useZKDiscovery && client instanceof DynamicServiceClient) {
-                        DynamicServiceClient dynamicClient = (DynamicServiceClient) client;
-                        metadataStorageManager.addServiceDiscoveryListener(
-                                new herddb.metadata.ServiceDiscoveryListener() {
-                                    @Override
-                                    public void onIndexingServicesChanged(List<String> currentAddresses) {
-                                        // handled by ServerMain for IndexingServiceClient
-                                    }
+                RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
+                RemoteFileClient client = factory.createClient(servers, clientConfig);
+                // Set up ZK-based discovery listener if applicable
+                if (useZKDiscovery) {
+                    metadataStorageManager.addServiceDiscoveryListener(
+                            new herddb.metadata.ServiceDiscoveryListener() {
+                                @Override
+                                public void onIndexingServicesChanged(List<String> currentAddresses) {
+                                    // handled by ServerMain for IndexingServiceClient
+                                }
 
-                                    @Override
-                                    public void onFileServersChanged(List<String> currentAddresses) {
-                                        LOGGER.log(Level.INFO, "Remote file servers changed via ZK: {0}",
-                                                currentAddresses);
-                                        dynamicClient.updateServers(currentAddresses);
-                                    }
-                                });
-                        // Re-query after listener registration to close the race window
-                        // between the initial listFileServers() (which sets a one-shot ZK
-                        // watcher) and addServiceDiscoveryListener().  If the file server
-                        // registered in that gap the watcher notification was lost.
-                        try {
-                            List<String> currentServers = metadataStorageManager.listFileServers();
-                            if (!currentServers.isEmpty()) {
-                                dynamicClient.updateServers(currentServers);
-                            }
-                        } catch (Exception e) {
-                            LOGGER.log(Level.WARNING, "Failed to re-query file servers after listener registration", e);
+                                @Override
+                                public void onFileServersChanged(List<String> currentAddresses) {
+                                    LOGGER.log(Level.INFO, "Remote file servers changed via ZK: {0}",
+                                            currentAddresses);
+                                    client.updateServers(currentAddresses);
+                                }
+                            });
+                    // Re-query after listener registration to close the race window
+                    // between the initial listFileServers() (which sets a one-shot ZK
+                    // watcher) and addServiceDiscoveryListener().  If the file server
+                    // registered in that gap the watcher notification was lost.
+                    try {
+                        List<String> currentServers = metadataStorageManager.listFileServers();
+                        if (!currentServers.isEmpty()) {
+                            client.updateServers(currentServers);
                         }
+                    } catch (Exception e) {
+                        LOGGER.log(Level.WARNING, "Failed to re-query file servers after listener registration", e);
                     }
-                    Class<?> storageClass = Class.forName("herddb.remote.RemoteFileDataStorageManager");
-                    Constructor<?> ctor = storageClass.getConstructor(Path.class, Path.class, int.class, clientClass);
-                    Object dsm = ctor.newInstance(dataDirectory, tmpDirectory, diskswapThreshold, client);
-
-                    // Optionally enable checkpoint metadata publication to S3 for read replicas
-                    boolean publishToRemote = configuration.getBoolean(
-                            ServerConfiguration.PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE,
-                            ServerConfiguration.PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE_DEFAULT);
-                    if (publishToRemote) {
-                        LOGGER.log(Level.INFO, "Checkpoint metadata publication to remote storage enabled");
-                        Class<?> metaMgrClass = Class.forName("herddb.remote.SharedCheckpointMetadataManager");
-                        Object metaMgr = metaMgrClass.getConstructor(clientClass).newInstance(client);
-                        storageClass.getMethod("setSharedCheckpointMetadataManager", metaMgrClass)
-                                .invoke(dsm, metaMgr);
-
-                        // Enable deferred page deletion so replicas can safely consume old pages.
-                        long minRetentionMillis = configuration.getLong(
-                                ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MIN_MILLIS,
-                                ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MIN_MILLIS_DEFAULT);
-                        long maxRetentionMillis = configuration.getLong(
-                                ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MAX_MILLIS,
-                                ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MAX_MILLIS_DEFAULT);
-                        final MetadataStorageManager msm = metadataStorageManager;
-                        java.util.function.Function<String, herddb.log.LogSequenceNumber> supplier = tableSpaceUuid -> {
-                            try {
-                                return msm.getMinReplicaCheckpointLsn(tableSpaceUuid);
-                            } catch (Exception e) {
-                                LOGGER.log(Level.WARNING,
-                                        "Failed to read min replica LSN from metadata for " + tableSpaceUuid, e);
-                                return null;
-                            }
-                        };
-                        storageClass.getMethod("setRetentionPolicy",
-                                java.util.function.Function.class, long.class, long.class)
-                                .invoke(dsm, supplier, minRetentionMillis, maxRetentionMillis);
-                        LOGGER.log(Level.INFO,
-                                "Replica-aware page retention enabled: min={0}ms, max={1}ms",
-                                new Object[]{minRetentionMillis, maxRetentionMillis});
-                    }
-
-                    return (DataStorageManager) dsm;
-                } catch (ReflectiveOperationException e) {
-                    throw new RuntimeException("Cannot create RemoteFileDataStorageManager. "
-                            + "Ensure herddb-remote-file-service is on the classpath.", e);
                 }
+                DataStorageManager dsm = factory.createDataStorageManager(
+                        dataDirectory, tmpDirectory, diskswapThreshold, client);
+
+                // Optionally enable checkpoint metadata publication to S3 for read replicas
+                boolean publishToRemote = configuration.getBoolean(
+                        ServerConfiguration.PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE,
+                        ServerConfiguration.PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE_DEFAULT);
+                if (publishToRemote) {
+                    LOGGER.log(Level.INFO, "Checkpoint metadata publication to remote storage enabled");
+                    SharedCheckpointMetadata metaMgr = factory.createSharedCheckpointMetadata(client);
+                    RemoteFileStorageManager remoteDsm = (RemoteFileStorageManager) dsm;
+                    remoteDsm.setSharedCheckpointMetadataManager(metaMgr);
+
+                    // Enable deferred page deletion so replicas can safely consume old pages.
+                    long minRetentionMillis = configuration.getLong(
+                            ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MIN_MILLIS,
+                            ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MIN_MILLIS_DEFAULT);
+                    long maxRetentionMillis = configuration.getLong(
+                            ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MAX_MILLIS,
+                            ServerConfiguration.PROPERTY_CHECKPOINT_REPLICA_RETENTION_MAX_MILLIS_DEFAULT);
+                    final MetadataStorageManager msm = metadataStorageManager;
+                    java.util.function.Function<String, herddb.log.LogSequenceNumber> supplier = tableSpaceUuid -> {
+                        try {
+                            return msm.getMinReplicaCheckpointLsn(tableSpaceUuid);
+                        } catch (Exception e) {
+                            LOGGER.log(Level.WARNING,
+                                    "Failed to read min replica LSN from metadata for " + tableSpaceUuid, e);
+                            return null;
+                        }
+                    };
+                    remoteDsm.setRetentionPolicy(supplier, minRetentionMillis, maxRetentionMillis);
+                    LOGGER.log(Level.INFO,
+                            "Replica-aware page retention enabled: min={0}ms, max={1}ms",
+                            new Object[]{minRetentionMillis, maxRetentionMillis});
+                }
+
+                return dsm;
             }
             default:
                 throw new RuntimeException("invalid " + ServerConfiguration.PROPERTY_STORAGE_MODE + "=" + storageMode);
@@ -560,53 +549,39 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
                 configuration.getInt(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
                         ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT));
-        try {
-            Class<?> clientClass = Class.forName("herddb.remote.RemoteFileServiceClient");
-            Object client = clientClass.getConstructor(List.class, Map.class).newInstance(servers, clientConfig);
-            // Set up ZK-based discovery listener if applicable
-            if (useZKDiscovery && client instanceof DynamicServiceClient) {
-                DynamicServiceClient dynamicClient = (DynamicServiceClient) client;
-                metadataStorageManager.addServiceDiscoveryListener(
-                        new herddb.metadata.ServiceDiscoveryListener() {
-                            @Override
-                            public void onIndexingServicesChanged(List<String> currentAddresses) {
-                            }
-                            @Override
-                            public void onFileServersChanged(List<String> currentAddresses) {
-                                LOGGER.log(Level.INFO, "Remote file servers changed via ZK (shared-storage): {0}",
-                                        currentAddresses);
-                                dynamicClient.updateServers(currentAddresses);
-                            }
-                        });
-                // Re-query after listener registration to close the race window
-                // between the initial listFileServers() and addServiceDiscoveryListener().
-                try {
-                    List<String> currentServers = metadataStorageManager.listFileServers();
-                    if (!currentServers.isEmpty()) {
-                        dynamicClient.updateServers(currentServers);
-                    }
-                } catch (Exception e) {
-                    LOGGER.log(Level.WARNING,
-                            "Failed to re-query file servers after listener registration (shared-storage)", e);
+        RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
+        RemoteFileClient client = factory.createClient(servers, clientConfig);
+        // Set up ZK-based discovery listener if applicable
+        if (useZKDiscovery) {
+            metadataStorageManager.addServiceDiscoveryListener(
+                    new herddb.metadata.ServiceDiscoveryListener() {
+                        @Override
+                        public void onIndexingServicesChanged(List<String> currentAddresses) {
+                        }
+                        @Override
+                        public void onFileServersChanged(List<String> currentAddresses) {
+                            LOGGER.log(Level.INFO, "Remote file servers changed via ZK (shared-storage): {0}",
+                                    currentAddresses);
+                            client.updateServers(currentAddresses);
+                        }
+                    });
+            // Re-query after listener registration to close the race window
+            // between the initial listFileServers() and addServiceDiscoveryListener().
+            try {
+                List<String> currentServers = metadataStorageManager.listFileServers();
+                if (!currentServers.isEmpty()) {
+                    client.updateServers(currentServers);
                 }
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING,
+                        "Failed to re-query file servers after listener registration (shared-storage)", e);
             }
-            // Create SharedCheckpointMetadataManager + ReadReplicaDataStorageManager
-            // wrapped in PromotableRemoteFileDataStorageManager for failover support
-            Class<?> metaMgrClass = Class.forName("herddb.remote.SharedCheckpointMetadataManager");
-            Object metaMgr = metaMgrClass.getConstructor(clientClass).newInstance(client);
-            Class<?> readReplicaClass = Class.forName("herddb.remote.ReadReplicaDataStorageManager");
-            Constructor<?> readReplicaCtor = readReplicaClass.getConstructor(clientClass, metaMgrClass, Path.class, int.class);
-            Object readReplica = readReplicaCtor.newInstance(client, metaMgr, tmpDirectory, diskswapThreshold);
-
-            Class<?> promotableClass = Class.forName("herddb.remote.PromotableRemoteFileDataStorageManager");
-            Constructor<?> promotableCtor = promotableClass.getConstructor(
-                    readReplicaClass, clientClass, metaMgrClass, Path.class, Path.class, int.class);
-            return (DataStorageManager) promotableCtor.newInstance(
-                    readReplica, client, metaMgr, dataDirectory, tmpDirectory, diskswapThreshold);
-        } catch (ReflectiveOperationException e) {
-            throw new RuntimeException("Cannot create PromotableRemoteFileDataStorageManager. "
-                    + "Ensure herddb-remote-file-service is on the classpath.", e);
         }
+        // Create SharedCheckpointMetadata + PromotableRemoteFileDataStorageManager
+        // (wraps a ReadReplicaDataStorageManager) for failover support.
+        SharedCheckpointMetadata metaMgr = factory.createSharedCheckpointMetadata(client);
+        return factory.createPromotableDataStorageManager(
+                client, metaMgr, dataDirectory, tmpDirectory, diskswapThreshold);
     }
 
     protected CommitLogManager buildCommitLogManager() {
