@@ -88,7 +88,8 @@ public class ZooKeeperMainWrapper implements AutoCloseable {
     public static void main(String... args) {
         try {
             String here = new File(System.getProperty("user.dir")).getAbsolutePath();
-            LOG.severe("Starting ZookKeeper version from HerdDB package version" + herddb.utils.Version.getVERSION());
+            LOG.severe("Starting ZooKeeper from HerdDB package version " + herddb.utils.Version.getVERSION()
+                    + ", git commit " + herddb.utils.Version.getGitCommit());
             Properties configuration = new Properties();
 
             boolean configFileFromParameter = false;

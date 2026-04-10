@@ -107,7 +107,8 @@ public class BookKeeperMainWrapper implements AutoCloseable {
     public static void main(String... args) {
         try {
             String here = new File(System.getProperty("user.dir")).getAbsolutePath();
-            LOG.severe("Starting BookKeeper bookie from HerdDB package version " + herddb.utils.Version.getVERSION());
+            LOG.severe("Starting BookKeeper bookie from HerdDB package version " + herddb.utils.Version.getVERSION()
+                    + ", git commit " + herddb.utils.Version.getGitCommit());
             Properties configuration = new Properties();
 
             boolean configFileFromParameter = false;
