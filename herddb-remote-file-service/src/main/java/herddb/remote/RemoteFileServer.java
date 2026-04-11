@@ -70,6 +70,7 @@ import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
 public class RemoteFileServer implements AutoCloseable {
 
     private static final Logger LOGGER = Logger.getLogger(RemoteFileServer.class.getName());
+    /** Default disk cache budget for {@link CachingObjectStorage}: 1 GB. */
     private static final long DEFAULT_CACHE_MAX_BYTES = 1024L * 1024 * 1024; // 1 GB
     static final int DEFAULT_IO_RATIO = 70;
     /** Default block size for multipart files: 4 MB. */
@@ -205,6 +206,9 @@ public class RemoteFileServer implements AutoCloseable {
         String accessKey = config.getProperty("s3.access.key");
         String secretKey = config.getProperty("s3.secret.key");
         String s3Prefix = config.getProperty("s3.prefix", "");
+        // cache.max.bytes is the local DISK cache budget for CachingObjectStorage.
+        // It is NOT an in-heap cache: byte[] values are never retained in the JVM heap;
+        // the OS page cache serves hot data under kernel-managed memory pressure.
         long cacheMaxBytes = Long.parseLong(
                 config.getProperty("cache.max.bytes", String.valueOf(DEFAULT_CACHE_MAX_BYTES)));
 
