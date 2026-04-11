@@ -45,6 +45,8 @@ public class RemoteFileServerMain {
     private static RemoteFileServer runningServer;
 
     public static void main(String... args) throws Exception {
+        LOG.severe("Starting HerdDB RemoteFileServer, HerdDB version " + herddb.utils.Version.getVERSION()
+                + ", git commit " + herddb.utils.Version.getGitCommit());
         Properties configuration = new Properties();
 
         // Pass 1: find and load config file (lowest priority)

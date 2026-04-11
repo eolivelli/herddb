@@ -63,6 +63,8 @@ public class IndexingServiceMain {
     }
 
     private static void runMain(String... args) throws Exception {
+        LOG.log(Level.INFO, "Starting HerdDB IndexingService, HerdDB version {0}, git commit {1}",
+                new Object[]{herddb.utils.Version.getVERSION(), herddb.utils.Version.getGitCommit()});
         Properties configuration = new Properties();
 
         // Pass 1: find and load config file (lowest priority)

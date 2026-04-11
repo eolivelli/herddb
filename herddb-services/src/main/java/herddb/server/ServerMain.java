@@ -118,7 +118,8 @@ public class ServerMain implements AutoCloseable {
             useEnv();
         }
         try {
-            LOG.log(Level.INFO, "Starting HerdDB version {0}", herddb.utils.Version.getVERSION());
+            LOG.log(Level.INFO, "Starting HerdDB version {0}, git commit {1}",
+                    new Object[]{herddb.utils.Version.getVERSION(), herddb.utils.Version.getGitCommit()});
             Properties configuration = new Properties();
 
             boolean configFileFromParameter = false;

@@ -39,8 +39,39 @@
         <dependency>
             <groupId>net.jpountz.lz4</groupId>
             <artifactId>lz4</artifactId>
-        </dependency>        
+        </dependency>
     </dependencies>
+    <build>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>buildnumber-maven-plugin</artifactId>
+                <version>1.4</version>
+                <executions>
+                    <execution>
+                        <phase>validate</phase>
+                        <goals>
+                            <goal>create</goal>
+                        </goals>
+                        <configuration>
+                            <shortRevisionLength>11</shortRevisionLength>
+                            <revisionOnScmFailure>unknown</revisionOnScmFailure>
+                        </configuration>
+                    </execution>
+                </executions>
+                <configuration>
+                    <shortRevisionLength>11</shortRevisionLength>
+                    <revisionOnScmFailure>unknown</revisionOnScmFailure>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
     <profiles>
         <profile>
             <id>jdk10</id>
