@@ -1,4 +1,4 @@
-FROM eclipse-temurin:22-jdk
+FROM eclipse-temurin:25-jdk
 
 # Install diagnostic tools and Google Cloud SDK (for gsutil)
 RUN apt-get update && \
