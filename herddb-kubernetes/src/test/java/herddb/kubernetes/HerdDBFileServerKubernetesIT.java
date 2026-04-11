@@ -18,6 +18,7 @@
 */
 package herddb.kubernetes;
 
+import static herddb.kubernetes.DockerProcessUtil.dockerProcess;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
@@ -79,7 +80,7 @@ public class HerdDBFileServerKubernetesIT {
     @BeforeClass
     public static void setup() throws Exception {
         // Check that the docker image exists locally
-        Process checkImage = new ProcessBuilder("docker", "image", "inspect", FULL_IMAGE)
+        Process checkImage = dockerProcess("docker", "image", "inspect", FULL_IMAGE)
                 .redirectErrorStream(true)
                 .start();
         int exitCode = checkImage.waitFor();
@@ -90,7 +91,7 @@ public class HerdDBFileServerKubernetesIT {
         Path imageTar = Files.createTempFile("herddb-image", ".tar");
         try {
             LOG.info("Saving docker image to tarball...");
-            Process save = new ProcessBuilder("docker", "save", FULL_IMAGE, "-o", imageTar.toString())
+            Process save = dockerProcess("docker", "save", FULL_IMAGE, "-o", imageTar.toString())
                     .redirectErrorStream(true)
                     .start();
             assertEquals("docker save failed", 0, save.waitFor());
