@@ -48,6 +48,11 @@ Scripts (single-line invocations only):
   markdown report. Last line is `REPORT=<path>`.
 - `./scripts/open-issue.sh --title <t> --body-file <p> --logs-dir <d>`
   — open a GH issue. Add `--dry-run` if the user asks for a dry run.
+- `./scripts/heap-dump.sh [--pod <pod>] [--analyze] [--mat-home <path>]`
+  — collect a JVM heap dump from a running pod (default: `herddb-file-server-0`),
+  download it locally, and optionally run Eclipse MAT analysis. Prints
+  `HEAP_DUMP=<path>` on completion; with `--analyze` also prints
+  `MAT_REPORT=<dir>`. MAT is at `$MAT_HOME` (default: `~/mat/`).
 
 Read-only supervision commands (whitelisted ONLY for the supervision
 loop in §Supervision — one invocation per tool call, no pipes):
@@ -165,32 +170,74 @@ reproducible GitHub issue. On any failure (install, health check,
 bench non-zero exit, or supervision-detected fault):
 
 1. If the bench is still running in the background, stop it.
-2. Run `./scripts/collect-logs.sh` and capture `LOGS_DIR=<dir>`.
-3. If a run log exists, run `./scripts/write-report.sh <RUN_LOG>` and
+2. **OOM only — heap dump while the pod is still live.** If the fatal
+   signal was an `OutOfMemoryError` and the affected pod is still
+   `Running` (not yet restarted), immediately run:
+   `./scripts/heap-dump.sh --pod <failing-pod> --analyze`
+   Capture `HEAP_DUMP=<path>` and `MAT_REPORT=<dir>`. Include the MAT
+   "Problem Suspect 1" paragraph verbatim in the issue description.
+   If the pod has already restarted, skip this step.
+3. Run `./scripts/collect-logs.sh` and capture `LOGS_DIR=<dir>`.
+4. If a run log exists, run `./scripts/write-report.sh <RUN_LOG>` and
    capture `REPORT=<path>`. The report is useful even on failure.
-4. Use `Read` to load the current
+5. Use `Read` to load the current
    `herddb-kubernetes/src/main/helm/herddb/examples/k3s-local/values.yaml`.
-5. Use `Write` to build an issue body file under `reports/` containing
+6. Use `Write` to build an issue body file under `reports/` containing
    everything needed to reproduce the failure:
    - the exact workload command that was run (including
      `--ingest-max-ops` and `--checkpoint` as actually passed),
    - which phase failed: `install`, `health-check`, `ingest`,
      `checkpoint`, `recall`, or `supervision`,
-   - the fatal log signatures that triggered the abort (the matching
-     log lines, verbatim, with their source pod),
+   - the **most relevant stack traces and log lines verbatim** with
+     their source pod — include the full `Exception in thread` or
+     `SEVERE:` block. Do NOT summarize; paste the raw lines.
    - the exit code of `run-bench.sh`, if applicable,
    - the **full current `values.yaml`** inlined in a fenced code block
      (it contains no secrets — MinIO creds are not in this file),
-   - a pointer to `REPORT` and to `LOGS_DIR`.
-6. Run
-   `./scripts/open-issue.sh --title "<title>" --body-file <body> --logs-dir <LOGS_DIR>`,
+   - if a heap dump was taken: the MAT "Problem Suspect 1" description,
+   - a pointer to `REPORT`, `LOGS_DIR`, and `HEAP_DUMP` (if taken).
+7. **Attach only the log of the failing pod** to the GitHub issue, not
+   all pod logs. Create a temporary directory containing only the
+   relevant log file (e.g. `herddb-file-server-0.log`) and pass that
+   as `--logs-dir`. This keeps the issue body under GitHub's 65,536-
+   character limit. If `open-issue.sh` still fails with "Body is too
+   long", reduce the body text and try again.
+8. Run
+   `./scripts/open-issue.sh --title "<title>" --body-file <body> --logs-dir <FAILING_POD_LOGS_DIR>`,
    capture `ISSUE_URL=<url>`, and report it to the user.
-7. **Stop.** Do not retry. Do not edit any file outside `reports/`.
+9. **Stop.** Do not retry. Do not edit any file outside `reports/`.
    Do not open a PR. Do not propose a code patch in the issue body.
    The issue is a bug report, not a fix.
 
 If `gh` is not authenticated, `open-issue.sh` will fail fast — in that
 case, tell the user to run `gh auth login` and re-run.
+
+## Heap dump and MAT analysis
+
+When an `OutOfMemoryError` is observed and the affected pod is still
+`Running` (has not yet restarted), collect a heap dump immediately
+while the live data is still present:
+
+```
+./scripts/heap-dump.sh --pod <failing-pod> --analyze
+```
+
+The script will:
+1. Use `jcmd GC.heap_dump` inside the pod to write an `.hprof` to `/tmp/`.
+2. Copy it to `$HERDDB_TESTS_HOME/heapdump-<pod>-<ts>.hprof` via `kubectl cp`.
+3. Remove the remote copy to free ephemeral storage.
+4. If `--analyze` is set, run `$MAT_HOME/ParseHeapDump.sh` with the
+   `suspects` and `overview` reports, writing `.zip` files alongside the
+   `.hprof`. `$MAT_HOME` defaults to `$MAT_HOME` env var or `~/mat/`.
+
+After the script finishes, read the MAT "Leak Suspects" report:
+- Open `heapdump-*_Leak_Suspects.zip` → `index.html` and extract the
+  "Problem Suspect 1" paragraph (dominant retained-heap object + class).
+- Use that to guide the heap-size bump: if a cache holds 90%+ of the
+  heap, double the heap; if a single request object caused it, a smaller
+  bump may suffice.
+
+Include the MAT finding verbatim in the GitHub issue description.
 
 ## Tuning between runs
 
@@ -222,20 +269,22 @@ the same component, following heap + ~1 GB overhead as a rule of
 thumb. Applies to `server`, `fileServer`, `indexingService`, and
 `tools`. Ceremony:
 
-1. Stop any running benchmark (background task) cleanly.
+1. **Collect a heap dump first** (if the pod is still Running):
+   `./scripts/heap-dump.sh --pod <failing-pod> --analyze`
+   Read the MAT "Problem Suspect 1" to understand which class/cache
+   dominates the heap before deciding how much to raise by.
 2. `Edit` `values.yaml` (heap + both memory request and limit).
-3. `./install.sh` — the install script handles `helm upgrade` in
-   place. The StatefulSet will roll the affected pods.
+3. `./teardown.sh` then `./install.sh` — PVCs are re-created fresh.
+   Tell the user all previously ingested data was discarded.
 4. `./scripts/check-cluster.sh` — wait for Ready.
 5. Restart the benchmark from scratch.
 
 The only writes you are ever allowed to make to the repo are:
 - `values.yaml` edits of the kinds described in (a) and (b) above,
   triggered by an explicit user retry request;
-- temp issue/report body files under `reports/`.
-
-Never touch HerdDB Java source, `pom.xml`, Helm templates, scripts,
-`CLAUDE.md`, or this agent definition.
+- temp issue/report body files under `reports/`;
+- `scripts/heap-dump.sh` (create or update only — do not touch any
+  other script).
 
 ## Hard rules
 
@@ -247,9 +296,15 @@ Never touch HerdDB Java source, `pom.xml`, Helm templates, scripts,
 - Never edit any repo file except
   `herddb-kubernetes/src/main/helm/herddb/examples/k3s-local/values.yaml`
   (and only for PVC / heap / memory request-limit tuning, only on
-  explicit user retry request) and temp body files under `reports/`.
-  Never edit HerdDB source code, Helm templates, scripts, `pom.xml`,
-  or `CLAUDE.md`.
+  explicit user retry request), `scripts/heap-dump.sh`, and temp body
+  files under `reports/`. Never edit HerdDB source code, Helm
+  templates, other scripts, `pom.xml`, or `CLAUDE.md`.
+- When opening a GitHub issue, **attach only the log(s) of the failing
+  pod** — not all pod logs — by creating a temp dir containing only
+  that file and passing it as `--logs-dir`. The full `open-issue.sh`
+  body (issue text + appended logs) must stay under GitHub's 65,536-
+  character limit. Put the most relevant stack traces and SEVERE log
+  lines **verbatim** in the issue description body, not just pointers.
 - Never attempt to recover a faulty cluster. Collect, file, stop.
 - Never run recall / query phases before a successful checkpoint.
 - Default ingest is throttled to `--ingest-max-ops 1000` unless the

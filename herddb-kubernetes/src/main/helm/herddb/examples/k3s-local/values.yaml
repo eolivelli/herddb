@@ -43,35 +43,26 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  javaOpts: "-Xms1g -Xmx2g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms2g -Xmx3g -Djava.net.preferIPv4Stack=true"
   storage:
     data:
       size: 5Gi
     commitlog:
       size: 2Gi
-  # Raise the gRPC deadline for server→indexing-service calls from the
-  # default 30 s to 300 s (5 min).  On a local k3s-in-Docker cluster,
-  # MinIO throughput is ~4 MB/s, so cold-loading the 208 MB FusedPQ graph
-  # for a sift1m segment takes ~52 s — far beyond the 30 s default and
-  # causing every query to fail with DEADLINE_EXCEEDED on first search.
   extraConfig:
     indexing.service.timeout: "300"
   resources:
     requests:
-      memory: "3Gi"
-      cpu: "0.5"
+      memory: "4Gi"
+      cpu: "2"
     limits:
-      memory: "3Gi"
-      cpu: "1"
+      memory: "4Gi"
+      cpu: "2"
 
 fileServer:
   replicaCount: 1
   storageMode: s3
-  # Heap raised to 4 g: gist1m segments (310k+ vectors × 960 dim × 4 B) can
-  # exceed 1 GB; the previous 1 g heap caused OOM in CachingObjectStorage
-  # during compaction. Allow -Xms2g so the JVM starts with headroom and
-  # can grow to 4 g on demand.
-  javaOpts: "-Xms2g -Xmx4g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true"
   # S3 endpoint, bucket, and credentials are auto-wired from the
   # minio section below.
   s3:
@@ -86,10 +77,10 @@ fileServer:
     size: 30Gi
   resources:
     requests:
-      memory: "5Gi"
+      memory: "3Gi"
       cpu: "0.5"
     limits:
-      memory: "5Gi"
+      memory: "3Gi"
       cpu: "1"
 
 minio:
@@ -141,10 +132,10 @@ bookkeeper:
 indexingService:
   enabled: true
   storageMode: remote
-  replicaCount: 1
+  replicaCount: 2
   # Heap raised to 3 g for extra GC headroom during large-dataset compaction
   # coordination (was 2 g).
-  javaOpts: "-Xms2g -Xmx3g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
+  javaOpts: "-Xms11g -Xmx11g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
   storage:
     data:
       size: 5Gi
@@ -152,11 +143,11 @@ indexingService:
       size: 2Gi
   resources:
     requests:
-      memory: "4Gi"
-      cpu: "0.5"
+      memory: "12Gi"
+      cpu: "8"
     limits:
-      memory: "4Gi"
-      cpu: "1"
+      memory: "12Gi"
+      cpu: "8"
 
 tools:
   enabled: true
