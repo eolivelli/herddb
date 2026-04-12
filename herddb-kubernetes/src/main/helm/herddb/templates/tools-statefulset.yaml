@@ -42,6 +42,18 @@ spec:
               value: {{ .Values.tools.javaOpts | default "-Xms128m -Xmx256m -Djava.net.preferIPv4Stack=true" | quote }}
             - name: VECTORBENCH_DATASET_DIR
               value: /opt/herddb/vector-datasets
+            {{- if .Values.tools.gcs.credentialsSecret }}
+            - name: GCS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.tools.gcs.credentialsSecret }}
+                  key: S3_ACCESS_KEY
+            - name: GCS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.tools.gcs.credentialsSecret }}
+                  key: S3_SECRET_KEY
+            {{- end }}
           resources:
             {{- toYaml .Values.tools.resources | nindent 12 }}
           volumeMounts:

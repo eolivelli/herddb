@@ -122,6 +122,8 @@ indexingService:
 
 tools:
   enabled: true
+  gcs:
+    credentialsSecret: "herddb-gcs-credentials"
   storage:
     datasets:
       size: 200Gi
