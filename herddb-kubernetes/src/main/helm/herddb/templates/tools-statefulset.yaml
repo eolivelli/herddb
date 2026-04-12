@@ -55,6 +55,13 @@ spec:
           configMap:
             name: {{ include "herddb.fullname" . }}-tools-scripts
             defaultMode: 0755
+        {{- if .Values.tools.storage.datasets.hostPath }}
+        - name: datasets
+          hostPath:
+            path: {{ .Values.tools.storage.datasets.hostPath | quote }}
+            type: DirectoryOrCreate
+        {{- end }}
+  {{- if not .Values.tools.storage.datasets.hostPath }}
   volumeClaimTemplates:
     - metadata:
         name: datasets
@@ -66,4 +73,5 @@ spec:
         resources:
           requests:
             storage: {{ .Values.tools.storage.datasets.size }}
+  {{- end }}
 {{- end }}
