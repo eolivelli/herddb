@@ -180,6 +180,9 @@ tools:
     datasets:
       size: 30Gi
       storageClass: ""
+      # When set, uses a hostPath volume instead of a PVC.
+      # The path must exist on the Kubernetes node (or the k3s container).
+      hostPath: ""
   resources:
     requests:
       memory: "256Mi"

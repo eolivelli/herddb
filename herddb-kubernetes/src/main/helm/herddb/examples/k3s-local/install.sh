@@ -13,6 +13,7 @@
 #   ./install.sh --build              # also rebuild Docker images with Maven first
 #   ./install.sh --k3s-version vX.Y.Z # pin a different rancher/k3s tag
 #   ./install.sh --name mycluster     # use a different container name
+#   ./install.sh --datasets-dir /path  # mount host dir for reusable datasets
 #   ./install.sh --no-wait            # skip waiting for pods to become ready
 #
 set -euo pipefail
@@ -26,6 +27,7 @@ K3S_VERSION="v1.31.4-k3s1"
 CONTAINER_NAME="herddb-k3s"
 BUILD=false
 WAIT=true
+DATASETS_DIR=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -33,9 +35,15 @@ while [[ $# -gt 0 ]]; do
         --k3s-version)  K3S_VERSION="$2"; shift 2 ;;
         --name)         CONTAINER_NAME="$2"; shift 2 ;;
         --no-wait)      WAIT=false; shift ;;
+        --datasets-dir) DATASETS_DIR="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
+
+# Auto-detect datasets directory from environment if not set via flag.
+if [[ -z "$DATASETS_DIR" && -n "${HERDDB_TESTS_HOME:-}" ]]; then
+    DATASETS_DIR="$HERDDB_TESTS_HOME"
+fi
 
 KUBECONFIG_FILE="$SCRIPT_DIR/.kubeconfig"
 export KUBECONFIG="$KUBECONFIG_FILE"
@@ -56,6 +64,9 @@ fi
 # ── 2. Start the k3s container ──────────────────────────────────────
 if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
     echo "==> k3s container '$CONTAINER_NAME' is already running."
+    if [[ -n "$DATASETS_DIR" ]]; then
+        echo "    NOTE: --datasets-dir only takes effect on new containers. Run teardown.sh first to change the mount."
+    fi
 elif docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
     echo "==> Starting existing k3s container '$CONTAINER_NAME'..."
     docker start "$CONTAINER_NAME" >/dev/null
@@ -67,6 +78,12 @@ else
     # resolving every external name to 127.0.0.1.
     RESOLV_CONF="$SCRIPT_DIR/.resolv.conf"
     printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > "$RESOLV_CONF"
+    DATASETS_MOUNT_ARGS=()
+    if [[ -n "$DATASETS_DIR" ]]; then
+        mkdir -p "$DATASETS_DIR"
+        DATASETS_MOUNT_ARGS=(-v "$DATASETS_DIR:/datasets:rw")
+        echo "==> Mounting host datasets dir: $DATASETS_DIR -> /datasets in k3s container"
+    fi
     docker run -d \
         --name "$CONTAINER_NAME" \
         --privileged \
@@ -74,6 +91,7 @@ else
         -p 6443:6443 \
         -e K3S_KUBECONFIG_MODE=666 \
         -v "$RESOLV_CONF:/etc/k3s-resolv.conf:ro" \
+        "${DATASETS_MOUNT_ARGS[@]}" \
         "rancher/k3s:$K3S_VERSION" \
         server --disable traefik --disable metrics-server \
                --resolv-conf /etc/k3s-resolv.conf >/dev/null
@@ -125,12 +143,17 @@ docker exec "$CONTAINER_NAME" \
 docker exec "$CONTAINER_NAME" rm -f /tmp/herddb.tar
 
 # ── 5. Install Helm chart ───────────────────────────────────────────
+HELM_EXTRA_ARGS=()
+if [[ -n "$DATASETS_DIR" ]]; then
+    HELM_EXTRA_ARGS=(--set "tools.storage.datasets.hostPath=/datasets")
+fi
+
 if helm status herddb >/dev/null 2>&1; then
     echo "==> Helm release 'herddb' already exists, upgrading..."
-    helm upgrade herddb "$CHART_DIR" -f "$SCRIPT_DIR/values.yaml"
+    helm upgrade herddb "$CHART_DIR" -f "$SCRIPT_DIR/values.yaml" "${HELM_EXTRA_ARGS[@]}"
 else
     echo "==> Installing Helm chart..."
-    helm install herddb "$CHART_DIR" -f "$SCRIPT_DIR/values.yaml"
+    helm install herddb "$CHART_DIR" -f "$SCRIPT_DIR/values.yaml" "${HELM_EXTRA_ARGS[@]}"
 fi
 
 # ── 6. Wait for pods ────────────────────────────────────────────────
