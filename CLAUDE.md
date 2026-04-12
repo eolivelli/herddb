@@ -1,5 +1,9 @@
 # HerdDB - Development Guidelines
 
+## Git Workflow
+Never push commits directly to the `master` branch. Always create a feature branch and
+open a pull request so that CI runs and changes can be reviewed before merging.
+
 ## Before Sending a PR
 Run the code validation checks locally before opening a pull request:
 ```
