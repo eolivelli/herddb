@@ -176,6 +176,10 @@ tools:
   enabled: true
   # JVM options for the CLI (defaults to lightweight settings)
   javaOpts: ""
+  gcs:
+    # Kubernetes Secret containing GCS HMAC credentials (keys: S3_ACCESS_KEY, S3_SECRET_KEY).
+    # When set, the tools pod can download datasets from gs:// URLs using the S3-compatible API.
+    credentialsSecret: ""
   storage:
     datasets:
       size: 30Gi

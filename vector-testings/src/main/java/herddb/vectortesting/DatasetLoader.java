@@ -49,6 +49,13 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import org.apache.commons.net.ftp.FTP;
 import org.apache.commons.net.ftp.FTPClient;
+import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3Configuration;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 
 public class DatasetLoader {
 
@@ -267,8 +274,8 @@ public class DatasetLoader {
     }
 
     /**
-     * Downloads a file, routing gs:// URLs through gsutil (which handles
-     * authentication for private buckets) and all other URLs through HTTP/FTP.
+     * Downloads a file, routing gs:// URLs through the S3-compatible GCS API
+     * and all other URLs through HTTP/FTP.
      */
     private void downloadSmartUrl(String url, File dest) throws IOException {
         if (url.startsWith("gs://")) {
@@ -279,26 +286,67 @@ public class DatasetLoader {
     }
 
     /**
-     * Downloads a file from Google Cloud Storage using gsutil, which inherits
-     * the user's gcloud authentication and supports private buckets.
+     * Downloads a file from Google Cloud Storage using the S3-compatible API.
+     * Uses HMAC credentials from GCS_ACCESS_KEY / GCS_SECRET_KEY environment
+     * variables when available, or anonymous access for public buckets.
      */
     private static void downloadGsFile(String gsUrl, File dest) throws IOException {
         dest.getParentFile().mkdirs();
-        System.out.println("  Using gsutil to download from " + gsUrl);
-        ProcessBuilder pb = new ProcessBuilder("gsutil", "cp", gsUrl, dest.getAbsolutePath())
-                .inheritIO();
-        try {
-            int exitCode = pb.start().waitFor();
-            if (exitCode != 0) {
-                throw new IOException("gsutil cp failed with exit code " + exitCode
-                        + ". Ensure gcloud is authenticated: gcloud auth login");
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("gsutil download interrupted", e);
+
+        // Parse gs://bucket/key
+        String path = gsUrl.substring("gs://".length());
+        int slash = path.indexOf('/');
+        if (slash <= 0) {
+            throw new IOException("Invalid gs:// URL (expected gs://bucket/key): " + gsUrl);
         }
+        String bucket = path.substring(0, slash);
+        String key = path.substring(slash + 1);
+
+        String accessKey = System.getenv("GCS_ACCESS_KEY");
+        String secretKey = System.getenv("GCS_SECRET_KEY");
+        boolean hasCredentials = accessKey != null && !accessKey.isEmpty()
+                && secretKey != null && !secretKey.isEmpty();
+
+        System.out.println("  Downloading from " + gsUrl + " via S3-compatible API"
+                + (hasCredentials ? " (HMAC credentials)" : " (anonymous)"));
+
+        var clientBuilder = S3Client.builder()
+                .region(Region.of("auto"))
+                .endpointOverride(URI.create("https://storage.googleapis.com"))
+                .serviceConfiguration(S3Configuration.builder()
+                        .pathStyleAccessEnabled(true)
+                        .build());
+
+        if (hasCredentials) {
+            clientBuilder.credentialsProvider(StaticCredentialsProvider.create(
+                    AwsBasicCredentials.create(accessKey, secretKey)));
+        } else {
+            clientBuilder.credentialsProvider(AnonymousCredentialsProvider.create());
+        }
+
+        try (S3Client s3 = clientBuilder.build()) {
+            GetObjectRequest req = GetObjectRequest.builder()
+                    .bucket(bucket)
+                    .key(key)
+                    .build();
+            try (InputStream in = s3.getObject(req);
+                 FileOutputStream out = new FileOutputStream(dest)) {
+                byte[] buf = new byte[8192];
+                long totalBytes = 0;
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    out.write(buf, 0, n);
+                    totalBytes += n;
+                    if (totalBytes % (50 * 1024 * 1024) < 8192) {
+                        System.out.printf("    Downloaded %.1f MB...%n", totalBytes / (1024.0 * 1024.0));
+                    }
+                }
+                System.out.printf("    Download complete: %.1f MB%n", totalBytes / (1024.0 * 1024.0));
+            }
+        }
+
         if (!dest.exists()) {
-            throw new IOException("gsutil reported success but file not found: " + dest);
+            throw new IOException("S3 download reported success but file not found: " + dest);
         }
     }
 
