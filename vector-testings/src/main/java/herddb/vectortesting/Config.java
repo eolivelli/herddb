@@ -56,6 +56,7 @@ public class Config {
     boolean indexBeforeIngest = true;
     int resumeFrom = 0; // skip first N vectors; row IDs start from N
     int ingestMaxOpsPerSecond = 100_000; // 0 = unlimited
+    int checkpointTimeoutSeconds = 300;
 
     private static Options buildOptions() {
         Options opts = new Options();
@@ -84,6 +85,7 @@ public class Config {
         opts.addOption(null, "index-before-ingest", false, "Create vector index before ingestion instead of after");
         opts.addOption(null, "resume-from", true, "Skip first N vectors and start row IDs from N (default: 0)");
         opts.addOption(null, "ingest-max-ops", true, "Max ingestion ops/s across all threads, 0=unlimited (default: 100000)");
+        opts.addOption(null, "checkpoint-timeout-seconds", true, "Seconds to wait for the Indexing Service to catch up during --checkpoint (default: 300)");
         opts.addOption(null, "config", true, "Path to properties file");
         opts.addOption("h", "help", false, "Show help");
         return opts;
@@ -188,6 +190,9 @@ public class Config {
         if (cmd.hasOption("ingest-max-ops")) {
             cfg.ingestMaxOpsPerSecond = Integer.parseInt(cmd.getOptionValue("ingest-max-ops"));
         }
+        if (cmd.hasOption("checkpoint-timeout-seconds")) {
+            cfg.checkpointTimeoutSeconds = Integer.parseInt(cmd.getOptionValue("checkpoint-timeout-seconds"));
+        }
 
         // Fall back to VECTORBENCH_DATASET_DIR env var when no explicit CLI/config-file value was given.
         // This lets the Kubernetes StatefulSet set the dataset path once via env, without every kubectl
@@ -278,6 +283,9 @@ public class Config {
         if (props.containsKey("ingest-max-ops")) {
             ingestMaxOpsPerSecond = Integer.parseInt(props.getProperty("ingest-max-ops"));
         }
+        if (props.containsKey("checkpoint-timeout-seconds")) {
+            checkpointTimeoutSeconds = Integer.parseInt(props.getProperty("checkpoint-timeout-seconds"));
+        }
     }
 
     /** Returns the similarity function: CLI override if set, otherwise dataset default. */
@@ -331,6 +339,7 @@ public class Config {
                 + ", skipVerify=" + skipVerify
                 + ", dropTable=" + dropTable
                 + ", checkpoint=" + checkpoint
+                + ", checkpointTimeoutSeconds=" + checkpointTimeoutSeconds
                 + ", clientTimeoutSeconds=" + clientTimeoutSeconds
                 + '}';
     }

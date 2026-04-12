@@ -286,10 +286,11 @@ public class VectorBench {
 
         // Phase 4b: Checkpoint after ingestion
         if (config.checkpoint && !config.skipIngest) {
+            System.out.println("Executing checkpoint with timeout " + config.checkpointTimeoutSeconds + "s ...");
             checkpointPostIngestSecs = runWithProgress("=== CHECKPOINT (post-ingest) ===", () -> {
                 try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
                      Statement stmt = conn.createStatement()) {
-                    stmt.execute("EXECUTE CHECKPOINT 'herd'");
+                    stmt.execute("EXECUTE CHECKPOINT 'herd', " + config.checkpointTimeoutSeconds);
                 }
             });
             System.out.println();
@@ -316,10 +317,11 @@ public class VectorBench {
 
         // Phase 5b: Checkpoint after index creation
         if (config.checkpoint && !config.skipIndex && !config.indexBeforeIngest) {
+            System.out.println("Executing checkpoint with timeout " + config.checkpointTimeoutSeconds + "s ...");
             checkpointPostIndexSecs = runWithProgress("=== CHECKPOINT (post-index) ===", () -> {
                 try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
                      Statement stmt = conn.createStatement()) {
-                    stmt.execute("EXECUTE CHECKPOINT 'herd'");
+                    stmt.execute("EXECUTE CHECKPOINT 'herd', " + config.checkpointTimeoutSeconds);
                 }
             });
             System.out.println();

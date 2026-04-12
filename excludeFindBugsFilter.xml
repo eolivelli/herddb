@@ -60,4 +60,9 @@
     <!-- Pre-existing: resource handling in benchmark QueryWorker -->
     <Bug pattern="OBL_UNSATISFIED_OBLIGATION"/>
     <Bug pattern="ODR_OPEN_DATABASE_RESOURCE"/>
+    <!-- Benchmark tool builds SQL from trusted config values (int fields), not user input -->
+    <Match>
+        <Class name="herddb.vectortesting.VectorBench"/>
+        <Bug pattern="SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE"/>
+    </Match>
 </FindBugsFilter>
