@@ -145,6 +145,18 @@ class VectorBenchTest {
         assertArrayEquals(new float[]{3.0f}, result.get(2), 0.001f);
     }
 
+    @Test
+    void configCheckpointTimeoutDefaultIs300() throws Exception {
+        Config cfg = Config.parse(new String[]{});
+        assertEquals(300, cfg.checkpointTimeoutSeconds);
+    }
+
+    @Test
+    void configCheckpointTimeoutParsedFromCli() throws Exception {
+        Config cfg = Config.parse(new String[]{"--checkpoint-timeout-seconds", "7200"});
+        assertEquals(7200, cfg.checkpointTimeoutSeconds);
+    }
+
     private static void writeLittleEndianInt(DataOutputStream dos, int value) throws Exception {
         byte[] buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array();
         dos.write(buf);
