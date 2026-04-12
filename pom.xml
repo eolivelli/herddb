@@ -112,7 +112,7 @@
         <libs.protobuf>3.25.5</libs.protobuf>
         <libs.caffeine>3.1.8</libs.caffeine>
         <libs.awssdk>2.25.70</libs.awssdk>
-        <libs.testcontainers>1.20.6</libs.testcontainers>
+        <libs.testcontainers>1.21.4</libs.testcontainers>
     </properties>
 
     <dependencies>
@@ -936,7 +936,7 @@
                     <plugin>
                         <groupId>org.jacoco</groupId>
                         <artifactId>jacoco-maven-plugin</artifactId>
-                        <version>0.8.6</version>
+                        <version>0.8.13</version>
                         <executions>
                             <execution>
                                 <goals>

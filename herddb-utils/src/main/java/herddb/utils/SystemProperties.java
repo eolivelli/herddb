@@ -20,8 +20,6 @@
 
 package herddb.utils;
 
-import java.security.AccessController;
-import java.security.PrivilegedAction;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -74,9 +72,7 @@ public class SystemProperties {
     }
 
     private static String getProperty(String name, String defaultvalue) {
-        String res = AccessController.doPrivileged((PrivilegedAction<String>) (() -> {
-            return System.getProperty(name, defaultvalue);
-        }));
+        String res = System.getProperty(name, defaultvalue);
         LOGGER.log(Level.CONFIG, "read system property: {0}={1}", new Object[] {name, res});
         return res;
     }
