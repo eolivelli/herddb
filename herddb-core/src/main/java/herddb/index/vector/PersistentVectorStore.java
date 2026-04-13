@@ -152,19 +152,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * checkpoints bypass the gate; the very first checkpoint on an empty
      * index also bypasses it so the index never sits entirely in memory.
      *
-     * <p><b>Opt-in.</b> Defaults to 0 (gate disabled) to preserve legacy
-     * checkpoint cadence in tests and small workloads. Production indexing
-     * services running catch-up-heavy workloads (e.g. the k3s-bench 1M-vector
-     * gist1m ingest in issue #90) set this to 50 000 or higher via system
-     * property {@code herddb.vectorindex.minLiveVectorsForCheckpoint} to
-     * amortize Phase B across larger batches.
+     * <p><b>Default 50 000.</b> Tuned for the 1M-vector gist1m catch-up
+     * workload in issue #90: during catch-up the tailer drains past 50 000
+     * vectors within seconds, so the gate adds zero latency on the hot
+     * path. Small-workload unit tests that rely on multiple back-to-back
+     * checkpoints override this to 0 in {@code @Before}. Set to 0 globally
+     * to restore pre-fix behaviour.
      *
-     * <p>Non-final to let unit tests override after class load; production
-     * code should only read, never write.
+     * <p>Initialized from system property
+     * {@code herddb.vectorindex.minLiveVectorsForCheckpoint}. Non-final to
+     * let unit tests override after class load; production code should only
+     * read, never write.
      */
     public static volatile int minLiveVectorsForCheckpoint =
             Math.max(0, Integer.getInteger(
-                    "herddb.vectorindex.minLiveVectorsForCheckpoint", 0));
+                    "herddb.vectorindex.minLiveVectorsForCheckpoint", 50_000));
 
     /**
      * Maximum time the {@link #minLiveVectorsForCheckpoint} gate may defer
