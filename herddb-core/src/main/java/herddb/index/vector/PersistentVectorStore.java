@@ -144,6 +144,47 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     "herddb.vectorindex.maxLiveVectorsPerCheckpoint", 0));
 
     /**
+     * Minimum number of live vectors that must have accumulated in the live
+     * shard before a non-bootstrap Phase A is allowed to run. Below this
+     * threshold, {@code doCheckpointUnderLock} defers the cycle (subject to
+     * {@link #maxCheckpointDeferralMs}) so the tailer has time to drain a
+     * larger batch of entries. Memory-pressure checkpoints and segment-merge
+     * checkpoints bypass the gate; the very first checkpoint on an empty
+     * index also bypasses it so the index never sits entirely in memory.
+     *
+     * <p><b>Default 50 000.</b> Tuned for the 1M-vector gist1m catch-up
+     * workload in issue #90: during catch-up the tailer drains past 50 000
+     * vectors within seconds, so the gate adds zero latency on the hot
+     * path. Small-workload unit tests that rely on multiple back-to-back
+     * checkpoints override this to 0 in {@code @Before}. Set to 0 globally
+     * to restore pre-fix behaviour.
+     *
+     * <p>Initialized from system property
+     * {@code herddb.vectorindex.minLiveVectorsForCheckpoint}. Non-final to
+     * let unit tests override after class load; production code should only
+     * read, never write.
+     */
+    public static volatile int minLiveVectorsForCheckpoint =
+            Math.max(0, Integer.getInteger(
+                    "herddb.vectorindex.minLiveVectorsForCheckpoint", 50_000));
+
+    /**
+     * Maximum time the {@link #minLiveVectorsForCheckpoint} gate may defer
+     * a pending checkpoint. Once {@code now - lastSuccessfulCheckpointMs}
+     * exceeds this bound, the gate unconditionally releases and Phase A runs
+     * even with a partial live shard. Guarantees bounded flush latency when
+     * ingest has stopped mid-shard (issue #90).
+     *
+     * <p>Initialized from system property
+     * {@code herddb.vectorindex.maxCheckpointDeferralMs}. Default: 60 s.
+     * Non-final to let unit tests override after class load; production
+     * code should only read, never write.
+     */
+    public static volatile long maxCheckpointDeferralMs =
+            Math.max(0L, Long.getLong(
+                    "herddb.vectorindex.maxCheckpointDeferralMs", 60_000L));
+
+    /**
      * How many Phase B segment builds may run concurrently. Each parallel
      * segment build allocates ~{@code segSize × dim × 4} bytes for the live
      * vector copy plus PQ codebooks, so the default is deliberately low;
@@ -294,11 +335,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final AtomicLong totalCheckpointCount = new AtomicLong(0);
     private final AtomicLong totalFusedPQCheckpointCount = new AtomicLong(0);
     private final AtomicLong totalSimpleCheckpointCount = new AtomicLong(0);
+    /**
+     * Number of times {@link #doCheckpointUnderLock} skipped a cycle because
+     * the min-live-vectors gate tripped and the max-deferral bound had not
+     * yet elapsed. Incremented only on the deferral path — not on the
+     * "nothing dirty" early return, which represents a durable state.
+     */
+    private final AtomicLong totalCheckpointsDeferred = new AtomicLong(0);
     private final AtomicLong lastCheckpointVectorsProcessed = new AtomicLong(0);
     /** Approximate bytes written by the last completed Phase B. */
     private final AtomicLong lastPhaseBBytesWritten = new AtomicLong(0);
     /** Pages reclaimed by the most recent failure recovery. */
     private final AtomicLong lastRolledBackPages = new AtomicLong(0);
+    /**
+     * Wall-clock time of the most recent checkpoint that left the store in a
+     * fully durable state (successful Phase C, or an early return that
+     * reflects already-durable state). Used by the min-live-vectors gate to
+     * bound how long a partial live shard may be deferred.
+     */
+    private volatile long lastSuccessfulCheckpointMs = System.currentTimeMillis();
 
     // -------------------------------------------------------------------------
     // Memory back-pressure statistics
@@ -1178,28 +1233,39 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /**
      * Performs a checkpoint, persisting live state to disk.
      * Uses three-phase checkpoint for FusedPQ format or simple format for small indexes.
+     *
+     * @return {@code true} if, at return time, the on-disk state fully covers
+     *         every vector this store has observed so far (i.e. the watermark
+     *         may safely advance past any LSN already applied to the live
+     *         shard); {@code false} if the caller did no work AND the live
+     *         shard may contain un-persisted vectors. A {@code false} return
+     *         happens only on the two deferral paths: another checkpoint was
+     *         already in progress (tryLock-skip), or the min-live-vectors
+     *         gate deferred this cycle. In both cases {@code dirty} stays set
+     *         and the caller MUST NOT advance the watermark based on this
+     *         call — retry on the next trigger.
      */
-    public void checkpoint() throws DataStorageManagerException {
+    public boolean checkpoint() throws DataStorageManagerException {
         try {
-            doCheckpoint();
+            return doCheckpoint();
         } catch (IOException e) {
             throw new DataStorageManagerException(e);
         }
     }
 
-    private void doCheckpoint() throws IOException, DataStorageManagerException {
+    private boolean doCheckpoint() throws IOException, DataStorageManagerException {
         if (!checkpointLock.tryLock()) {
             LOGGER.log(Level.INFO, "checkpoint {0}: skipped (another checkpoint in progress)", indexName);
-            return;
+            return false;
         }
         try {
-            doCheckpointUnderLock();
+            return doCheckpointUnderLock();
         } finally {
             checkpointLock.unlock();
         }
     }
 
-    private void doCheckpointUnderLock() throws IOException, DataStorageManagerException {
+    private boolean doCheckpointUnderLock() throws IOException, DataStorageManagerException {
         long checkpointStartMs = System.currentTimeMillis();
         LogSequenceNumber sequenceNumber = LogSequenceNumber.START_OF_TIME;
 
@@ -1208,7 +1274,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
             boolean anySegmentDirty = segments.stream().anyMatch(s -> s.dirty);
             if (!dirty.get() && !anySegmentDirty) {
                 LOGGER.log(Level.FINE, "checkpoint {0}: skipped (no changes)", indexName);
-                return;
+                lastSuccessfulCheckpointMs = System.currentTimeMillis();
+                return true;
             }
 
             int totalLiveVectors = totalLiveSize();
@@ -1221,7 +1288,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 dataStorageManager.indexCheckpoint(tableSpaceUUID, indexUUID, emptyStatus, false);
                 dirty.set(false);
                 LOGGER.log(Level.INFO, "checkpoint {0}: empty", indexName);
-                return;
+                lastSuccessfulCheckpointMs = System.currentTimeMillis();
+                return true;
             }
 
             if (dimension == 0) {
@@ -1230,7 +1298,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 dataStorageManager.indexCheckpoint(tableSpaceUUID, indexUUID, emptyStatus, false);
                 dirty.set(false);
                 LOGGER.log(Level.INFO, "checkpoint {0}: empty dimension", indexName);
-                return;
+                lastSuccessfulCheckpointMs = System.currentTimeMillis();
+                return true;
             }
 
             int totalActiveVectors = (int) onDiskNodeToPkSize() + totalLiveVectors;
@@ -1247,12 +1316,50 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 dataStorageManager.indexCheckpoint(tableSpaceUUID, indexUUID, emptyStatus, false);
                 dirty.set(false);
                 LOGGER.log(Level.INFO, "checkpoint {0}: all vectors deleted, saving empty", indexName);
-                return;
+                lastSuccessfulCheckpointMs = System.currentTimeMillis();
+                return true;
             }
 
             boolean useFusedPQ = fusedPQ
                     && dimension >= MIN_DIM_FOR_FUSED_PQ
                     && totalActiveVectors >= MIN_VECTORS_FOR_FUSED_PQ;
+
+            // Min-live-vectors deferral gate (issue #90).
+            //
+            // During catch-up the live shard blows past the threshold in
+            // seconds and this gate never trips. It only matters when the
+            // compaction loop is about to run a Phase A on a small partial
+            // shard — then we defer the cycle so the tailer can accumulate
+            // more vectors before we pay the Phase B cost. The deferral
+            // is bounded by MAX_CHECKPOINT_DEFERRAL_MS so a partial shard
+            // left behind by stopped ingest is guaranteed to flush.
+            //
+            // Bypasses: bootstrap (segments.isEmpty()), segment-merge
+            // trigger (anySegmentDirty), memory pressure, and the simple
+            // (non-FusedPQ) path for very small indexes.
+            int minLiveGate = minLiveVectorsForCheckpoint;
+            long deferralBoundMs = maxCheckpointDeferralMs;
+            if (useFusedPQ
+                    && minLiveGate > 0
+                    && totalLiveVectors < minLiveGate
+                    && !anySegmentDirty
+                    && !segments.isEmpty()
+                    && !shouldTriggerMemoryPressureCheckpoint()) {
+                long elapsed = System.currentTimeMillis() - lastSuccessfulCheckpointMs;
+                if (elapsed < deferralBoundMs) {
+                    LOGGER.log(Level.FINE,
+                            "checkpoint {0}: deferred ({1} live vectors < {2} threshold, "
+                                    + "{3} ms since last success < {4} ms deferral bound)",
+                            new Object[]{indexName, totalLiveVectors, minLiveGate,
+                                    elapsed, deferralBoundMs});
+                    totalCheckpointsDeferred.incrementAndGet();
+                    return false;
+                }
+                LOGGER.log(Level.INFO,
+                        "checkpoint {0}: deferral bound reached ({1} ms >= {2} ms), "
+                                + "running Phase A with {3} live vectors",
+                        new Object[]{indexName, elapsed, deferralBoundMs, totalLiveVectors});
+            }
 
             if (!useFusedPQ) {
                 doCheckpointSimpleUnderLock(sequenceNumber);
@@ -1260,7 +1367,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 totalCheckpointCount.incrementAndGet();
                 lastCheckpointVectorsProcessed.set(totalActiveVectors);
                 lastCheckpointDurationMs.set(System.currentTimeMillis() - checkpointStartMs);
-                return;
+                lastSuccessfulCheckpointMs = System.currentTimeMillis();
+                return true;
             }
         } finally {
             stateLock.writeLock().unlock();
@@ -1271,6 +1379,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
         totalFusedPQCheckpointCount.incrementAndGet();
         totalCheckpointCount.incrementAndGet();
         lastCheckpointDurationMs.set(System.currentTimeMillis() - checkpointStartMs);
+        lastSuccessfulCheckpointMs = System.currentTimeMillis();
+        return true;
     }
 
     /**
@@ -1455,13 +1565,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
         uploadBytesTotal.set(0);
         List<SegmentWriteResult> newSegmentResults;
         try {
+            newSegmentResults = doCheckpointFusedPQPhaseB(
+                    snapshotShards, snapshotDimension, sealedSegments, mergeableSegments, sequenceNumber);
+
+            // Hook fires AFTER the heavy Phase B work but still while holding
+            // the checkpoint lock, so the concurrent-tryLock-skip test can
+            // park here without having to race slow PQ training on the
+            // release path.
             Runnable hook = checkpointPhaseBHook;
             if (hook != null) {
                 hook.run();
             }
-
-            newSegmentResults = doCheckpointFusedPQPhaseB(
-                    snapshotShards, snapshotDimension, sealedSegments, mergeableSegments, sequenceNumber);
         } catch (IOException | RuntimeException e) {
             LOGGER.log(Level.SEVERE, "checkpoint " + indexName + ": Phase B exception", e);
             rollbackProvisionalPages();
@@ -3559,6 +3673,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public long getTotalSimpleCheckpointCount() {
         return totalSimpleCheckpointCount.get();
+    }
+
+    public long getTotalCheckpointsDeferred() {
+        return totalCheckpointsDeferred.get();
+    }
+
+    public long getLastSuccessfulCheckpointMs() {
+        return lastSuccessfulCheckpointMs;
     }
 
     public long getLastCheckpointVectorsProcessed() {

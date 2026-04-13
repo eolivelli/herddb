@@ -126,6 +126,24 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_APPLY_QUEUE_CAPACITY = "indexing.apply.queue.capacity";
     public static final int PROPERTY_APPLY_QUEUE_CAPACITY_DEFAULT = 1000;
 
+    /**
+     * Tailer-driven watermark checkpoint trigger: after this many entries are
+     * processed by the tailer, {@code IndexingServiceEngine} drains pending
+     * DML, forces a checkpoint on every {@code PersistentVectorStore}, and
+     * (if all checkpoints succeed) saves the watermark.
+     *
+     * <p>This is a <em>backstop</em> — the primary checkpoint driver is the
+     * per-store background compaction loop
+     * ({@link #PROPERTY_COMPACTION_INTERVAL}). The tailer trigger exists to
+     * guarantee watermark liveness when the compaction loop is idle. It must
+     * be large enough that it does not coincide with the compaction loop's
+     * cadence during catch-up (see issue #90): a low value causes back-to-back
+     * Phase B/C cycles on the tailer thread, starving BK reads.
+     */
+    public static final String PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES =
+            "indexing.watermark.checkpoint.interval.entries";
+    public static final long PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES_DEFAULT = 100_000L;
+
     // Storage
     public static final String PROPERTY_STORAGE_TYPE = "indexing.storage.type";
     public static final String PROPERTY_STORAGE_TYPE_DEFAULT = "file";

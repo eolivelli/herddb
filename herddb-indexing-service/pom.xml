@@ -189,6 +189,24 @@
                     <includes>
                         <include>**/*Test.java</include>
                     </includes>
+                    <!--
+                      Disable the PersistentVectorStore min-live-vectors
+                      checkpoint gate for all tests in this module.
+                      Production deployments keep the 50 000 default
+                      (see PersistentVectorStore.minLiveVectorsForCheckpoint),
+                      which is tuned for the 1M-vector gist1m catch-up
+                      workload in issue #90. Unit tests here use small
+                      vector counts (<= a few thousand) and rely on
+                      back-to-back store.checkpoint() calls, so we disable
+                      the gate at the JVM level. Tests that specifically
+                      exercise the gate (PersistentVectorStoreConcurrentCheckpointTest,
+                      CheckpointAndSaveWatermarkTest) override the static
+                      field directly in @Before, so this property does
+                      not affect them.
+                    -->
+                    <systemPropertyVariables>
+                        <herddb.vectorindex.minLiveVectorsForCheckpoint>0</herddb.vectorindex.minLiveVectorsForCheckpoint>
+                    </systemPropertyVariables>
                 </configuration>
             </plugin>
             <!--
