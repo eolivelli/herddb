@@ -283,6 +283,14 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
     }
 
     @Override
+    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                          java.nio.file.Path tempFile,
+                                          java.util.function.LongConsumer progress)
+            throws java.io.IOException, DataStorageManagerException {
+        return activeDelegate.writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile, progress);
+    }
+
+    @Override
     public io.github.jbellis.jvector.disk.ReaderSupplier multipartIndexReaderSupplier(
             String tableSpace, String uuid, String fileType, long fileSize)
             throws DataStorageManagerException {

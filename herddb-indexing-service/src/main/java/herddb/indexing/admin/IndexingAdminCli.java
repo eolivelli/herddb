@@ -365,6 +365,9 @@ public final class IndexingAdminCli {
                 out.printf(Locale.ROOT, "  apply_parallelism           = %d%n", response.getApplyParallelism());
                 out.printf(Locale.ROOT, "  loaded_index_count          = %d%n", response.getLoadedIndexCount());
                 out.printf(Locale.ROOT, "  total_estimated_memory_bytes= %d%n", response.getTotalEstimatedMemoryBytes());
+                out.printf(Locale.ROOT, "  jvm_heap                    = %d / %d bytes (%d%%)%n",
+                        response.getJvmHeapUsedBytes(), response.getJvmHeapMaxBytes(),
+                        response.getJvmHeapUsedPct());
             }
         }
         return 0;
@@ -474,6 +477,12 @@ public final class IndexingAdminCli {
         m.put("beam_width", r.getBeamWidth());
         m.put("persistent", r.getPersistent());
         m.put("store_class", r.getStoreClass());
+        m.put("compaction_phase", r.getCompactionPhase());
+        m.put("compaction_progress", r.getCompactionProgress());
+        m.put("compaction_nodes_done", r.getCompactionNodesDone());
+        m.put("compaction_nodes_total", r.getCompactionNodesTotal());
+        m.put("upload_bytes_done", r.getUploadBytesDone());
+        m.put("upload_bytes_total", r.getUploadBytesTotal());
         return m;
     }
 
@@ -489,6 +498,9 @@ public final class IndexingAdminCli {
         m.put("apply_parallelism", r.getApplyParallelism());
         m.put("loaded_index_count", r.getLoadedIndexCount());
         m.put("total_estimated_memory_bytes", r.getTotalEstimatedMemoryBytes());
+        m.put("jvm_heap_used_bytes", r.getJvmHeapUsedBytes());
+        m.put("jvm_heap_max_bytes", r.getJvmHeapMaxBytes());
+        m.put("jvm_heap_used_pct", r.getJvmHeapUsedPct());
         return m;
     }
 
@@ -528,6 +540,20 @@ public final class IndexingAdminCli {
         out.printf(Locale.ROOT, "  m / beam_width        = %d / %d%n", r.getM(), r.getBeamWidth());
         out.printf(Locale.ROOT, "  last_lsn              = %d/%d%n",
                 r.getLastLsnLedger(), r.getLastLsnOffset());
+        String phase = r.getCompactionPhase();
+        if (phase != null && !phase.isEmpty() && !"idle".equals(phase)) {
+            if ("uploading-segment".equals(phase)) {
+                out.printf(Locale.ROOT, "  compaction            = %s %d%% (%d/%d bytes)%n",
+                        phase, r.getCompactionProgress(),
+                        r.getUploadBytesDone(), r.getUploadBytesTotal());
+            } else {
+                out.printf(Locale.ROOT, "  compaction            = %s %d%% (%d/%d nodes)%n",
+                        phase, r.getCompactionProgress(),
+                        r.getCompactionNodesDone(), r.getCompactionNodesTotal());
+            }
+        } else {
+            out.printf(Locale.ROOT, "  compaction            = idle%n");
+        }
     }
 
     static String toHex(byte[] arr) {

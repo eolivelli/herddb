@@ -109,6 +109,15 @@ message DescribeIndexResponse {
     int32 beam_width = 16;
     bool persistent = 17;
     string store_class = 18;
+    // Compaction progress (issue #80). compaction_phase is one of
+    // "idle", "writing-graph", "uploading-segment". compaction_progress
+    // is an integer 0..100, or -1 when idle.
+    string compaction_phase = 19;
+    int32 compaction_progress = 20;
+    int64 compaction_nodes_done = 21;
+    int64 compaction_nodes_total = 22;
+    int64 upload_bytes_done = 23;
+    int64 upload_bytes_total = 24;
 }
 
 message ListPrimaryKeysRequest {
@@ -139,6 +148,10 @@ message GetEngineStatsResponse {
     int64 total_estimated_memory_bytes = 8;
     int32 loaded_index_count = 9;
     int32 apply_parallelism = 10;
+    // JVM heap (issue #80): read from ManagementFactory.getMemoryMXBean()
+    int64 jvm_heap_used_bytes = 11;
+    int64 jvm_heap_max_bytes = 12;
+    int32 jvm_heap_used_pct = 13;
 }
 
 message GetInstanceInfoRequest {

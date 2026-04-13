@@ -1024,6 +1024,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             d.fusedPQEnabled = pvs.isFusedPQEnabled();
             d.m = pvs.getM();
             d.beamWidth = pvs.getBeamWidth();
+            d.compactionPhase = pvs.getCompactionPhase();
+            d.compactionProgress = pvs.getCompactionProgressPercent();
+            d.compactionNodesDone = pvs.getCompactionNodesDone();
+            d.compactionNodesTotal = pvs.getCompactionNodesTotal();
+            d.uploadBytesDone = pvs.getUploadBytesDone();
+            d.uploadBytesTotal = pvs.getUploadBytesTotal();
+            if (!"idle".equals(d.compactionPhase)) {
+                d.status = d.compactionPhase;
+            }
         } else if (store instanceof InMemoryVectorStore) {
             d.similarity = ((InMemoryVectorStore) store).getSimilarityType().name();
             d.segmentCount = 1;
@@ -1430,6 +1439,80 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     return pvs.getLastPhaseBBytesWritten();
                 }
             });
+            // Compaction progress gauges (issue #80). compaction_phase is not
+            // a scalar, so we expose two 0/1 "active" gauges and let clients
+            // derive the phase from whichever is non-zero.
+            indexStats.registerGauge("compaction_nodes_done", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getCompactionNodesDone();
+                }
+            });
+            indexStats.registerGauge("compaction_nodes_total", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getCompactionNodesTotal();
+                }
+            });
+            indexStats.registerGauge("compaction_progress_pct", new Gauge<Integer>() {
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    int v = pvs.getCompactionProgressPercent();
+                    return v < 0 ? 0 : v;
+                }
+            });
+            indexStats.registerGauge("upload_bytes_done", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getUploadBytesDone();
+                }
+            });
+            indexStats.registerGauge("upload_bytes_total", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getUploadBytesTotal();
+                }
+            });
+            indexStats.registerGauge("writing_graph_active", new Gauge<Integer>() {
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.getWritingGraphActiveCount() > 0 ? 1 : 0;
+                }
+            });
+            indexStats.registerGauge("uploading_segment_active", new Gauge<Integer>() {
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.getUploadingActiveCount() > 0 ? 1 : 0;
+                }
+            });
             indexStats.registerGauge("phase_b_vectors_per_second", new Gauge<Long>() {
                 @Override
                 public Long getDefaultValue() {
@@ -1704,5 +1787,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         public int beamWidth;
         public boolean persistent;
         public String storeClass;
+        // Compaction progress (issue #80). compactionPhase is "idle" when
+        // no Phase-B activity is in flight; progress is -1 when idle.
+        public String compactionPhase = "idle";
+        public int compactionProgress = -1;
+        public long compactionNodesDone;
+        public long compactionNodesTotal;
+        public long uploadBytesDone;
+        public long uploadBytesTotal;
     }
 }
