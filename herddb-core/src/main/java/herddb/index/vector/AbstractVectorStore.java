@@ -23,6 +23,7 @@ package herddb.index.vector;
 import herddb.utils.Bytes;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Predicate;
 
 /**
  * Abstract base class for vector stores.
@@ -53,6 +54,20 @@ public abstract class AbstractVectorStore implements AutoCloseable {
     public abstract long estimatedMemoryUsageBytes();
 
     public abstract void start() throws Exception;
+
+    /**
+     * Visits every primary key currently stored in the vector store. Used by
+     * the indexing-admin diagnostic CLI. The visitor returns {@code false} to
+     * stop the traversal early.
+     *
+     * @param includeOnDisk if true, also visit primary keys that live only in
+     *                      on-disk segments (ignored by in-memory stores)
+     * @param visitor callback invoked for each PK; return false to stop
+     */
+    public void forEachPrimaryKey(boolean includeOnDisk, Predicate<Bytes> visitor) {
+        throw new UnsupportedOperationException(
+                "forEachPrimaryKey not implemented by " + getClass().getName());
+    }
 
     @Override
     public void close() throws Exception {

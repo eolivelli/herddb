@@ -107,4 +107,12 @@ public class SchemaTracker {
                 .filter(idx -> Index.TYPE_VECTOR.equals(idx.type) && tableName.equals(idx.table))
                 .collect(Collectors.toList());
     }
+
+    /**
+     * Returns a snapshot of every tracked index. Used by the indexing-admin
+     * diagnostic CLI to enumerate indexes without knowing the table name.
+     */
+    public Collection<Index> getAllIndexes() {
+        return new java.util.ArrayList<>(indexes.values());
+    }
 }

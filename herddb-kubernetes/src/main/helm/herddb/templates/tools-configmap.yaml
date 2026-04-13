@@ -10,4 +10,7 @@ data:
   herddb-cli: |
     #!/bin/bash
     exec /opt/herddb/bin/herddb-cli.sh -x "${HERDDB_JDBC_URL}" "$@"
+  indexing-admin: |
+    #!/bin/bash
+    exec /opt/herddb/bin/indexing-admin.sh "$@"
 {{- end }}

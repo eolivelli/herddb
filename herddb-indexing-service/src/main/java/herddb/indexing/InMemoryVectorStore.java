@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Predicate;
 
 /**
  * In-memory brute-force vector store used by the IndexingServiceEngine.
@@ -104,6 +105,19 @@ class InMemoryVectorStore extends AbstractVectorStore {
             results.sort((a, b) -> Float.compare(b.getValue(), a.getValue()));
         }
         return results.size() <= topK ? results : results.subList(0, topK);
+    }
+
+    @Override
+    public void forEachPrimaryKey(boolean includeOnDisk, Predicate<Bytes> visitor) {
+        List<VectorEntry> snapshot;
+        synchronized (entries) {
+            snapshot = new ArrayList<>(entries);
+        }
+        for (VectorEntry entry : snapshot) {
+            if (!visitor.test(entry.pk)) {
+                return;
+            }
+        }
     }
 
     @Override
