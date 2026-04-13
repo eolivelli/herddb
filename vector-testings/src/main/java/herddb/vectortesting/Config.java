@@ -30,6 +30,11 @@ import org.apache.commons.cli.ParseException;
 
 public class Config {
 
+    public enum OutputFormat {
+        TEXT,
+        JSON
+    }
+
     String jdbcUrl = "jdbc:herddb:server:localhost:7000";
     String username = "sa";
     String password = "hdb";
@@ -57,6 +62,8 @@ public class Config {
     int resumeFrom = 0; // skip first N vectors; row IDs start from N
     int ingestMaxOpsPerSecond = 100_000; // 0 = unlimited
     int checkpointTimeoutSeconds = 300;
+    boolean noProgress = false;
+    OutputFormat outputFormat = OutputFormat.TEXT;
 
     private static Options buildOptions() {
         Options opts = new Options();
@@ -86,6 +93,11 @@ public class Config {
         opts.addOption(null, "resume-from", true, "Skip first N vectors and start row IDs from N (default: 0)");
         opts.addOption(null, "ingest-max-ops", true, "Max ingestion ops/s across all threads, 0=unlimited (default: 100000)");
         opts.addOption(null, "checkpoint-timeout-seconds", true, "Seconds to wait for the Indexing Service to catch up during --checkpoint (default: 300)");
+        opts.addOption(null, "no-progress", false,
+                "Disable animated spinner; emit one plain \\n-terminated line per progress sample "
+                        + "(implicitly enabled when VECTOR_BENCH_NO_PROGRESS=1 or --output-format=json)");
+        opts.addOption(null, "output-format", true,
+                "Output format: text (default) or json (NDJSON, one object per line). json implies --no-progress.");
         opts.addOption(null, "config", true, "Path to properties file");
         opts.addOption("h", "help", false, "Show help");
         return opts;
@@ -193,6 +205,31 @@ public class Config {
         if (cmd.hasOption("checkpoint-timeout-seconds")) {
             cfg.checkpointTimeoutSeconds = Integer.parseInt(cmd.getOptionValue("checkpoint-timeout-seconds"));
         }
+        if (cmd.hasOption("no-progress")) {
+            cfg.noProgress = true;
+        }
+        if (cmd.hasOption("output-format")) {
+            cfg.outputFormat = parseOutputFormat(cmd.getOptionValue("output-format"));
+        }
+
+        // Env var fallbacks (only applied when the CLI flag was not set).
+        if (!cmd.hasOption("no-progress") && !cfg.noProgress) {
+            String envNoProgress = System.getenv("VECTOR_BENCH_NO_PROGRESS");
+            if (isTruthy(envNoProgress)) {
+                cfg.noProgress = true;
+            }
+        }
+        if (!cmd.hasOption("output-format") && cfg.outputFormat == OutputFormat.TEXT) {
+            String envFmt = System.getenv("VECTOR_BENCH_OUTPUT_FORMAT");
+            if (envFmt != null && !envFmt.isEmpty()) {
+                cfg.outputFormat = parseOutputFormat(envFmt);
+            }
+        }
+
+        // JSON output implies --no-progress: there is no spinner in NDJSON mode.
+        if (cfg.outputFormat == OutputFormat.JSON) {
+            cfg.noProgress = true;
+        }
 
         // Fall back to VECTORBENCH_DATASET_DIR env var when no explicit CLI/config-file value was given.
         // This lets the Kubernetes StatefulSet set the dataset path once via env, without every kubectl
@@ -286,6 +323,32 @@ public class Config {
         if (props.containsKey("checkpoint-timeout-seconds")) {
             checkpointTimeoutSeconds = Integer.parseInt(props.getProperty("checkpoint-timeout-seconds"));
         }
+        if (props.containsKey("no-progress")) {
+            noProgress = Boolean.parseBoolean(props.getProperty("no-progress"));
+        }
+        if (props.containsKey("output-format")) {
+            outputFormat = parseOutputFormat(props.getProperty("output-format"));
+        }
+    }
+
+    private static OutputFormat parseOutputFormat(String raw) {
+        if (raw == null) {
+            throw new IllegalArgumentException("output-format cannot be null");
+        }
+        return switch (raw.toLowerCase()) {
+            case "text" -> OutputFormat.TEXT;
+            case "json", "ndjson" -> OutputFormat.JSON;
+            default -> throw new IllegalArgumentException("Unknown output-format: " + raw
+                    + ". Supported: text, json");
+        };
+    }
+
+    private static boolean isTruthy(String value) {
+        if (value == null) {
+            return false;
+        }
+        String v = value.trim().toLowerCase();
+        return v.equals("1") || v.equals("true") || v.equals("yes") || v.equals("on");
     }
 
     /** Returns the similarity function: CLI override if set, otherwise dataset default. */
@@ -341,6 +404,8 @@ public class Config {
                 + ", checkpoint=" + checkpoint
                 + ", checkpointTimeoutSeconds=" + checkpointTimeoutSeconds
                 + ", clientTimeoutSeconds=" + clientTimeoutSeconds
+                + ", noProgress=" + noProgress
+                + ", outputFormat=" + outputFormat
                 + '}';
     }
 }

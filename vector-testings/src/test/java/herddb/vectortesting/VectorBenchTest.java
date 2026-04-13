@@ -157,6 +157,60 @@ class VectorBenchTest {
         assertEquals(7200, cfg.checkpointTimeoutSeconds);
     }
 
+    @Test
+    void configNoProgressDefaultIsFalse() throws Exception {
+        Config cfg = Config.parse(new String[]{});
+        assertEquals(false, cfg.noProgress);
+        assertEquals(Config.OutputFormat.TEXT, cfg.outputFormat);
+    }
+
+    @Test
+    void configNoProgressParsedFromCli() throws Exception {
+        Config cfg = Config.parse(new String[]{"--no-progress"});
+        assertEquals(true, cfg.noProgress);
+        assertEquals(Config.OutputFormat.TEXT, cfg.outputFormat);
+    }
+
+    @Test
+    void configOutputFormatJsonImpliesNoProgress() throws Exception {
+        Config cfg = Config.parse(new String[]{"--output-format", "json"});
+        assertEquals(Config.OutputFormat.JSON, cfg.outputFormat);
+        assertEquals(true, cfg.noProgress);
+    }
+
+    @Test
+    void configOutputFormatTextLeavesNoProgressFalse() throws Exception {
+        Config cfg = Config.parse(new String[]{"--output-format", "text"});
+        assertEquals(Config.OutputFormat.TEXT, cfg.outputFormat);
+        assertEquals(false, cfg.noProgress);
+    }
+
+    @Test
+    void configOutputFormatNdjsonAliasIsJson() throws Exception {
+        Config cfg = Config.parse(new String[]{"--output-format", "NDJSON"});
+        assertEquals(Config.OutputFormat.JSON, cfg.outputFormat);
+        assertEquals(true, cfg.noProgress);
+    }
+
+    @Test
+    void configOutputFormatBogusRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> Config.parse(new String[]{"--output-format", "yaml"}));
+    }
+
+    @Test
+    void configNoProgressFromPropertiesFile(@TempDir File tmpDir) throws Exception {
+        File props = new File(tmpDir, "bench.properties");
+        try (java.io.PrintWriter pw = new java.io.PrintWriter(props)) {
+            pw.println("no-progress=true");
+            pw.println("output-format=json");
+        }
+        Config cfg = Config.parse(new String[]{"--config", props.getAbsolutePath()});
+        assertEquals(true, cfg.noProgress);
+        assertEquals(Config.OutputFormat.JSON, cfg.outputFormat);
+    }
+
     private static void writeLittleEndianInt(DataOutputStream dos, int value) throws Exception {
         byte[] buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array();
         dos.write(buf);
