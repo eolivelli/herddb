@@ -1565,13 +1565,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
         uploadBytesTotal.set(0);
         List<SegmentWriteResult> newSegmentResults;
         try {
+            newSegmentResults = doCheckpointFusedPQPhaseB(
+                    snapshotShards, snapshotDimension, sealedSegments, mergeableSegments, sequenceNumber);
+
+            // Hook fires AFTER the heavy Phase B work but still while holding
+            // the checkpoint lock, so the concurrent-tryLock-skip test can
+            // park here without having to race slow PQ training on the
+            // release path.
             Runnable hook = checkpointPhaseBHook;
             if (hook != null) {
                 hook.run();
             }
-
-            newSegmentResults = doCheckpointFusedPQPhaseB(
-                    snapshotShards, snapshotDimension, sealedSegments, mergeableSegments, sequenceNumber);
         } catch (IOException | RuntimeException e) {
             LOGGER.log(Level.SEVERE, "checkpoint " + indexName + ": Phase B exception", e);
             rollbackProvisionalPages();
