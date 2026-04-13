@@ -75,14 +75,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private static final Logger LOGGER = Logger.getLogger(IndexingServiceEngine.class.getName());
 
     /**
-     * Minimum number of entries to process between forced checkpoint+watermark
-     * saves. Each trigger calls {@code checkpoint()} on every persistent vector
-     * store and then (on success) writes the watermark. Tuned to keep the cost
-     * of the synchronous S3 write ~ once every few thousand entries (vs every
-     * 1000 previously), since the new policy requires a full checkpoint on
-     * each save.
+     * Minimum number of entries processed between tailer-driven checkpoint
+     * attempts. Each trigger drains pending DML, calls {@code checkpoint()}
+     * on every persistent vector store and — only if all checkpoints complete
+     * successfully — writes the watermark.
+     *
+     * <p>This is a <em>backstop</em>: the primary checkpoint driver is the
+     * per-store background compaction loop
+     * ({@code indexing.compaction.interval}, default 60 s). A low interval
+     * here caused the FusedPQ Phase B on the tailer thread to starve BK
+     * tailing during catch-up (issue #90), so the default is intentionally
+     * large. Configurable via
+     * {@link IndexingServerConfiguration#PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES}.
      */
-    private static final long WATERMARK_CHECKPOINT_INTERVAL_ENTRIES = 5000;
+    private long watermarkCheckpointIntervalEntries;
 
     private final Path logDirectory;
     private final Path dataDirectory;
@@ -344,6 +350,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // tablespace UUID is resolved, because a remote-backed watermark store
         // addresses its S3 object by tablespace UUID).
         entriesSinceLastCheckpoint = 0;
+        watermarkCheckpointIntervalEntries = Math.max(1L, config.getLong(
+                IndexingServerConfiguration.PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES,
+                IndexingServerConfiguration.PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES_DEFAULT));
+        LOGGER.log(Level.INFO, "watermark checkpoint interval: {0} entries",
+                watermarkCheckpointIntervalEntries);
 
         schemaTracker = new SchemaTracker();
         transactionBuffer = new TransactionBuffer();
@@ -590,7 +601,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             // The watermark is saved ONLY after all stores successfully
             // checkpoint — never at any other time. See
             // {@link WatermarkStore} for the save contract.
-            if (entriesSinceLastCheckpoint >= WATERMARK_CHECKPOINT_INTERVAL_ENTRIES) {
+            if (entriesSinceLastCheckpoint >= watermarkCheckpointIntervalEntries) {
                 checkpointAndSaveWatermark();
             }
         } catch (Exception e) {
@@ -685,6 +696,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     // package-private for testing
     void awaitPendingWorkForTest() {
         awaitPendingWork();
+    }
+
+    /**
+     * Sets the "last processed LSN" that
+     * {@link #checkpointAndSaveWatermark()} will capture and persist. Used
+     * by tests that drive the engine via
+     * {@link #applySingleEntryForTest(LogSequenceNumber, herddb.log.LogEntry)}
+     * instead of the real tailer, because that path bypasses
+     * {@code processEntry()} where {@code lastProcessedLsn} would normally
+     * advance.
+     */
+    // package-private for testing
+    void setLastProcessedLsnForTest(LogSequenceNumber lsn) {
+        this.lastProcessedLsn = lsn;
     }
 
     /**
@@ -883,20 +908,39 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             LogSequenceNumber checkpointLsn = lastProcessedLsn;
             entriesSinceLastCheckpoint = 0;
 
-            boolean allCheckpointsSucceeded = true;
-            for (AbstractVectorStore store : vectorStores.values()) {
+            boolean allCheckpointsDurable = true;
+            for (Map.Entry<String, AbstractVectorStore> entry : vectorStores.entrySet()) {
+                AbstractVectorStore store = entry.getValue();
                 if (store instanceof PersistentVectorStore) {
                     try {
-                        ((PersistentVectorStore) store).checkpoint();
+                        boolean durable = ((PersistentVectorStore) store).checkpoint();
+                        if (!durable) {
+                            // Either another checkpoint is in progress
+                            // (tryLock-skip) or the min-live-vectors gate
+                            // deferred this cycle. In both cases the live
+                            // shard may contain vectors not yet on disk, so
+                            // advancing the watermark would violate the
+                            // "watermark <= durable-state LSN" invariant.
+                            // Retry on the next tailer trigger — with the
+                            // raised watermark interval the retry cost is
+                            // negligible.
+                            LOGGER.log(Level.INFO,
+                                    "watermark NOT advanced: checkpoint on store {0} was deferred "
+                                            + "(concurrent cycle or min-live-vectors gate); "
+                                            + "will retry on next trigger",
+                                    entry.getKey());
+                            allCheckpointsDurable = false;
+                            break;
+                        }
                     } catch (Exception e) {
                         LOGGER.log(Level.WARNING,
                                 "checkpoint failed, watermark will NOT be advanced: " + e.getMessage(), e);
-                        allCheckpointsSucceeded = false;
+                        allCheckpointsDurable = false;
                         break;
                     }
                 }
             }
-            if (!allCheckpointsSucceeded) {
+            if (!allCheckpointsDurable) {
                 return;
             }
             // Only now — all stores have durably persisted state covering

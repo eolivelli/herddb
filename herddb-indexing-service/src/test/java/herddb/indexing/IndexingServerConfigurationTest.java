@@ -91,9 +91,21 @@ public class IndexingServerConfigurationTest {
         assertEquals(2, config.getInt(
                 IndexingServerConfiguration.PROPERTY_COMPACTION_THREADS,
                 IndexingServerConfiguration.PROPERTY_COMPACTION_THREADS_DEFAULT));
+        assertEquals(100_000L, config.getLong(
+                IndexingServerConfiguration.PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES,
+                IndexingServerConfiguration.PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES_DEFAULT));
         assertEquals("file", config.getString(
                 IndexingServerConfiguration.PROPERTY_STORAGE_TYPE,
                 IndexingServerConfiguration.PROPERTY_STORAGE_TYPE_DEFAULT));
+    }
+
+    @Test
+    public void testWatermarkCheckpointIntervalOverride() {
+        IndexingServerConfiguration config = new IndexingServerConfiguration();
+        config.set(IndexingServerConfiguration.PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES, 250_000L);
+        assertEquals(250_000L, config.getLong(
+                IndexingServerConfiguration.PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES,
+                IndexingServerConfiguration.PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES_DEFAULT));
     }
 
     @Test
