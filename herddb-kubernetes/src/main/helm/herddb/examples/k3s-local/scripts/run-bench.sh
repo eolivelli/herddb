@@ -4,6 +4,11 @@
 # All arguments are forwarded to /opt/herddb/bin/vector-bench.sh inside
 # the tools pod.
 #
+# The Java client is always driven with --no-progress so that the captured
+# run log is \n-terminated line-per-sample output (rather than \r-overwritten
+# spinner frames), making the log tail-friendly for supervision agents and
+# much smaller on long runs. See issue #89 for background.
+#
 # Usage:
 #   ./scripts/run-bench.sh --dataset sift10k -n 10000 -k 100 --checkpoint
 #   ./scripts/run-bench.sh --dataset sift1m -n 100000 --checkpoint
@@ -40,7 +45,7 @@ echo ""
 
 set +e
 kubectl -n default exec sts/herddb-tools -- \
-    /opt/herddb/bin/vector-bench.sh "$@" 2>&1 | tee -a "$RUN_LOG"
+    /opt/herddb/bin/vector-bench.sh --no-progress "$@" 2>&1 | tee -a "$RUN_LOG"
 status=${PIPESTATUS[0]}
 set -e
 
