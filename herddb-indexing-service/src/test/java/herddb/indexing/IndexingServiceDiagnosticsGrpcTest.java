@@ -134,6 +134,15 @@ public class IndexingServiceDiagnosticsGrpcTest {
         assertEquals(1, response.getSegmentCount());
         assertTrue(response.getEstimatedMemoryBytes() > 0);
         assertTrue(!response.getPersistent());
+        // Compaction progress defaults (issue #80): idle, zero counters.
+        // InMemoryVectorStore never enters Phase B, so the values should
+        // stay at their zero/idle defaults regardless of what was seeded.
+        assertEquals("idle", response.getCompactionPhase());
+        assertEquals(-1, response.getCompactionProgress());
+        assertEquals(0L, response.getCompactionNodesDone());
+        assertEquals(0L, response.getCompactionNodesTotal());
+        assertEquals(0L, response.getUploadBytesDone());
+        assertEquals(0L, response.getUploadBytesTotal());
     }
 
     @Test
@@ -213,6 +222,11 @@ public class IndexingServiceDiagnosticsGrpcTest {
         assertTrue(response.getApplyParallelism() >= 1);
         assertTrue(response.getApplyQueueCapacity() > 0);
         assertTrue(response.getTotalEstimatedMemoryBytes() > 0);
+        // JVM heap fields (issue #80).
+        assertTrue("jvm_heap_used_bytes should be > 0", response.getJvmHeapUsedBytes() > 0);
+        assertTrue("jvm_heap_max_bytes should be > 0", response.getJvmHeapMaxBytes() > 0);
+        assertTrue("jvm_heap_used_pct should be in [0,100]",
+                response.getJvmHeapUsedPct() >= 0 && response.getJvmHeapUsedPct() <= 100);
     }
 
     @Test

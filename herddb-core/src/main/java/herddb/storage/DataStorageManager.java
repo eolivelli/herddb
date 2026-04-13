@@ -40,6 +40,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -158,6 +159,18 @@ public abstract class DataStorageManager implements AutoCloseable {
                                           Path tempFile)
             throws IOException, DataStorageManagerException {
         return null; // default: not supported; caller falls back to page-based writes
+    }
+
+    /**
+     * Overload that reports upload progress to the caller via {@code progress}.
+     * The callback is invoked with the number of bytes written since the last
+     * invocation (a delta, not a running total). Default implementation ignores
+     * {@code progress} and delegates to the non-progress overload.
+     */
+    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                          Path tempFile, LongConsumer progress)
+            throws IOException, DataStorageManagerException {
+        return writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile);
     }
 
     /**

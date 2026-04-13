@@ -218,7 +218,13 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setM(details.m)
                     .setBeamWidth(details.beamWidth)
                     .setPersistent(details.persistent)
-                    .setStoreClass(nullToEmpty(details.storeClass));
+                    .setStoreClass(nullToEmpty(details.storeClass))
+                    .setCompactionPhase(nullToEmpty(details.compactionPhase))
+                    .setCompactionProgress(details.compactionProgress)
+                    .setCompactionNodesDone(details.compactionNodesDone)
+                    .setCompactionNodesTotal(details.compactionNodesTotal)
+                    .setUploadBytesDone(details.uploadBytesDone)
+                    .setUploadBytesTotal(details.uploadBytesTotal);
             responseObserver.onNext(builder.build());
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
@@ -280,6 +286,11 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
             long start = engine.getStartTimeMillis();
             long uptime = start > 0 ? System.currentTimeMillis() - start : 0L;
             LogSequenceNumber lsn = engine.getLastProcessedLsn();
+            java.lang.management.MemoryUsage heap =
+                    java.lang.management.ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+            long heapUsed = heap.getUsed();
+            long heapMax = heap.getMax();
+            int heapPct = heapMax > 0 ? (int) Math.min(100L, (100L * heapUsed) / heapMax) : -1;
             GetEngineStatsResponse response = GetEngineStatsResponse.newBuilder()
                     .setUptimeMillis(uptime)
                     .setTailerWatermarkLedger(lsn != null ? lsn.ledgerId : -1L)
@@ -291,6 +302,9 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setTotalEstimatedMemoryBytes(engine.getTotalEstimatedMemoryBytes())
                     .setLoadedIndexCount(engine.getLoadedIndexCount())
                     .setApplyParallelism(engine.getApplyParallelism())
+                    .setJvmHeapUsedBytes(heapUsed)
+                    .setJvmHeapMaxBytes(heapMax)
+                    .setJvmHeapUsedPct(heapPct)
                     .build();
             responseObserver.onNext(response);
             responseObserver.onCompleted();

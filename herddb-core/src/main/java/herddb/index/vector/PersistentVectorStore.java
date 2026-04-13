@@ -335,6 +335,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /** Metric: total checkpoint failures over the lifetime of the store. */
     private final AtomicLong totalCheckpointFailures = new AtomicLong(0);
 
+    // Compaction progress counters (issue #80).
+    //
+    // The supervisor loop (indexing-admin + Grafana) needs to see Phase-B
+    // progress without grepping logs. Counters are reset at the start of
+    // each Phase B and left populated after it finishes so a post-hoc
+    // describe-index still shows the final totals of the last compaction.
+    private final AtomicInteger writingGraphActive = new AtomicInteger();
+    private final AtomicInteger uploadingActive = new AtomicInteger();
+    private final AtomicLong compactionNodesDone = new AtomicLong();
+    private final AtomicLong compactionNodesTotal = new AtomicLong();
+    private final AtomicLong uploadBytesDone = new AtomicLong();
+    private final AtomicLong uploadBytesTotal = new AtomicLong();
+
     public long getTotalRolledBackPages() {
         return totalRolledBackPages.get();
     }
@@ -345,6 +358,66 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public long getTotalCheckpointFailures() {
         return totalCheckpointFailures.get();
+    }
+
+    /**
+     * Returns the current compaction phase: {@code "idle"},
+     * {@code "writing-graph"}, or {@code "uploading-segment"}. Priority is
+     * upload &gt; graph-write, so when segment writes overlap (Phase B
+     * parallelism) the most advanced phase wins.
+     */
+    public String getCompactionPhase() {
+        if (uploadingActive.get() > 0) {
+            return "uploading-segment";
+        }
+        if (writingGraphActive.get() > 0) {
+            return "writing-graph";
+        }
+        return "idle";
+    }
+
+    public int getWritingGraphActiveCount() {
+        return writingGraphActive.get();
+    }
+
+    public int getUploadingActiveCount() {
+        return uploadingActive.get();
+    }
+
+    public long getCompactionNodesDone() {
+        return compactionNodesDone.get();
+    }
+
+    public long getCompactionNodesTotal() {
+        return compactionNodesTotal.get();
+    }
+
+    public long getUploadBytesDone() {
+        return uploadBytesDone.get();
+    }
+
+    public long getUploadBytesTotal() {
+        return uploadBytesTotal.get();
+    }
+
+    /**
+     * Returns the progress percentage of whichever phase is currently
+     * active, or {@code -1} when idle. During {@code uploading-segment} it
+     * reflects bytes-based progress; during {@code writing-graph} it
+     * reflects node-count progress.
+     */
+    public int getCompactionProgressPercent() {
+        if (uploadingActive.get() > 0) {
+            long total = uploadBytesTotal.get();
+            long done = uploadBytesDone.get();
+            return total > 0 ? (int) Math.min(100L, (100L * done) / total) : 0;
+        }
+        if (writingGraphActive.get() > 0) {
+            long total = compactionNodesTotal.get();
+            long done = compactionNodesDone.get();
+            return total > 0 ? (int) Math.min(100L, (100L * done) / total) : 0;
+        }
+        return -1;
     }
 
     // -------------------------------------------------------------------------
@@ -1374,6 +1447,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // can reclaim partially-written pages instead of leaking them until the
         // next (possibly never-arriving) successful checkpoint.
         this.provisionalPageIds = Collections.synchronizedList(new ArrayList<>());
+        // Reset compaction progress counters so a describe-index sampled
+        // mid-Phase-B reflects this checkpoint's totals, not the previous one.
+        compactionNodesDone.set(0);
+        compactionNodesTotal.set(0);
+        uploadBytesDone.set(0);
+        uploadBytesTotal.set(0);
         List<SegmentWriteResult> newSegmentResults;
         try {
             Runnable hook = checkpointPhaseBHook;
@@ -2265,24 +2344,42 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // Try multipart write via storage manager
         Path graphTempFile = writeFusedPQGraphToTempFile(partVectors, partNodeToPk, snapshotDimension);
         try {
-            String graphFilePath = dataStorageManager.writeMultipartIndexFile(
-                    tableSpaceUUID,
-                    indexUUID + "_seg" + s.segmentId,
-                    "graph",
-                    graphTempFile);
+            long graphTempSize = Files.size(graphTempFile);
+            uploadBytesTotal.addAndGet(graphTempSize);
+            String graphFilePath;
+            uploadingActive.incrementAndGet();
+            try {
+                graphFilePath = dataStorageManager.writeMultipartIndexFile(
+                        tableSpaceUUID,
+                        indexUUID + "_seg" + s.segmentId,
+                        "graph",
+                        graphTempFile,
+                        uploadBytesDone::addAndGet);
+            } finally {
+                uploadingActive.decrementAndGet();
+            }
             if (graphFilePath != null) {
-                long graphFileSize = Files.size(graphTempFile);
+                long graphFileSize = graphTempSize;
                 // Map data
                 Path mapTempFile = writeFusedPQMapDataToTempFile(
                         new VectorStorageRandomAccessVectorValues(partStorage, snapshotDimension),
                         partNodeToPk);
                 try {
-                    String mapFilePath = dataStorageManager.writeMultipartIndexFile(
-                            tableSpaceUUID,
-                            indexUUID + "_seg" + s.segmentId,
-                            "map",
-                            mapTempFile);
-                    long mapFileSize = Files.size(mapTempFile);
+                    long mapTempSize = Files.size(mapTempFile);
+                    uploadBytesTotal.addAndGet(mapTempSize);
+                    String mapFilePath;
+                    uploadingActive.incrementAndGet();
+                    try {
+                        mapFilePath = dataStorageManager.writeMultipartIndexFile(
+                                tableSpaceUUID,
+                                indexUUID + "_seg" + s.segmentId,
+                                "map",
+                                mapTempFile,
+                                uploadBytesDone::addAndGet);
+                    } finally {
+                        uploadingActive.decrementAndGet();
+                    }
+                    long mapFileSize = mapTempSize;
                     long estimatedSize = graphFileSize + mapFileSize;
                     return new SegmentWriteResult(s.segmentId,
                             graphFilePath, graphFileSize,
@@ -2467,77 +2564,82 @@ public class PersistentVectorStore extends AbstractVectorStore {
             Path empty = Files.createTempFile(tmpDirectory, "herddb-vector-empty-", ".idx");
             return empty;
         }
-        int totalVectors = allNodeToPk.size();
-        VectorStorage allStorage = new VectorStorage(allVectors.size());
-        allVectors.forEach(allStorage::set);
-        VectorStorageRandomAccessVectorValues allMravv =
-                new VectorStorageRandomAccessVectorValues(allStorage, dim, allVectors.size());
-        BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(allMravv, similarityFunction);
-        GraphIndexBuilder mergedBuilder = new GraphIndexBuilder(
-                bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH,
-                PhysicalCoreExecutor.pool(), CHECKPOINT_POOL);
-
-        int progressInterval = Math.max(1000, totalVectors / 10);
-        AtomicInteger nodesAdded = new AtomicInteger(0);
-        java.util.concurrent.ForkJoinTask<?> graphTask = CHECKPOINT_POOL.submit(() ->
-                allVectors.entrySet().parallelStream()
-                    .filter(e -> allNodeToPk.containsKey(e.getKey()))
-                    .forEach(e -> {
-                        mergedBuilder.addGraphNode(e.getKey(), e.getValue());
-                        int count = nodesAdded.incrementAndGet();
-                        if (count % progressInterval == 0) {
-                            LOGGER.log(Level.INFO,
-                                    "writeFusedPQGraphToTempFile {0}: added {1}/{2} nodes ({3}%)",
-                                    new Object[]{indexName, count, totalVectors,
-                                            (int) (100.0 * count / totalVectors)});
-                        }
-                    })
-        );
+        writingGraphActive.incrementAndGet();
         try {
-            graphTask.get();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("writeFusedPQGraphToTempFile interrupted", e);
-        } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof IOException) {
-                throw (IOException) cause;
-            }
-            throw new IOException("writeFusedPQGraphToTempFile failed", cause);
-        }
-        mergedBuilder.cleanup();
-        OnHeapGraphIndex mergedGraph = (OnHeapGraphIndex) mergedBuilder.getGraph();
+            int totalVectors = allNodeToPk.size();
+            compactionNodesTotal.addAndGet(totalVectors);
+            VectorStorage allStorage = new VectorStorage(allVectors.size());
+            allVectors.forEach(allStorage::set);
+            VectorStorageRandomAccessVectorValues allMravv =
+                    new VectorStorageRandomAccessVectorValues(allStorage, dim, allVectors.size());
+            BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(allMravv, similarityFunction);
+            GraphIndexBuilder mergedBuilder = new GraphIndexBuilder(
+                    bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH,
+                    PhysicalCoreExecutor.pool(), CHECKPOINT_POOL);
 
-        int pqSubspaces = Math.max(1, dim / 4);
-        ProductQuantization pq = ProductQuantization.compute(allMravv, pqSubspaces, 256, true);
-        PQVectors pqv = pq.encodeAll(allMravv, PhysicalCoreExecutor.pool());
-
-        Path tempFile = Files.createTempFile(tmpDirectory, "herddb-vector-", ".idx");
-        boolean success = false;
-        try {
-            try (OnDiskGraphIndexWriter writer = new OnDiskGraphIndexWriter.Builder(mergedGraph, tempFile)
-                    .with(new FusedPQ(mergedGraph.maxDegree(), pq))
-                    .with(new InlineVectors(dim))
-                    .build()) {
-                ImmutableGraphIndex.View view = mergedGraph.getView();
-                EnumMap<FeatureId, IntFunction<io.github.jbellis.jvector.graph.disk.feature.Feature.State>> suppliers =
-                        new EnumMap<>(FeatureId.class);
-                suppliers.put(FeatureId.FUSED_PQ, ordinal -> new FusedPQ.State(view, pqv, ordinal));
-                suppliers.put(FeatureId.INLINE_VECTORS,
-                        ordinal -> new InlineVectors.State(allMravv.getVector(ordinal)));
-                writer.write(suppliers);
-            }
-            success = true;
-            return tempFile;
-        } finally {
-            if (!success) {
-                Files.deleteIfExists(tempFile);
-            }
+            int progressInterval = Math.max(1000, totalVectors / 10);
+            java.util.concurrent.ForkJoinTask<?> graphTask = CHECKPOINT_POOL.submit(() ->
+                    allVectors.entrySet().parallelStream()
+                        .filter(e -> allNodeToPk.containsKey(e.getKey()))
+                        .forEach(e -> {
+                            mergedBuilder.addGraphNode(e.getKey(), e.getValue());
+                            long count = compactionNodesDone.incrementAndGet();
+                            if (count % progressInterval == 0) {
+                                LOGGER.log(Level.INFO,
+                                        "writeFusedPQGraphToTempFile {0}: added {1}/{2} nodes ({3}%)",
+                                        new Object[]{indexName, count, totalVectors,
+                                                (int) (100.0 * count / totalVectors)});
+                            }
+                        })
+            );
             try {
-                mergedBuilder.close();
-            } catch (IOException e) {
-                // ignore
+                graphTask.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("writeFusedPQGraphToTempFile interrupted", e);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof IOException) {
+                    throw (IOException) cause;
+                }
+                throw new IOException("writeFusedPQGraphToTempFile failed", cause);
             }
+            mergedBuilder.cleanup();
+            OnHeapGraphIndex mergedGraph = (OnHeapGraphIndex) mergedBuilder.getGraph();
+
+            int pqSubspaces = Math.max(1, dim / 4);
+            ProductQuantization pq = ProductQuantization.compute(allMravv, pqSubspaces, 256, true);
+            PQVectors pqv = pq.encodeAll(allMravv, PhysicalCoreExecutor.pool());
+
+            Path tempFile = Files.createTempFile(tmpDirectory, "herddb-vector-", ".idx");
+            boolean success = false;
+            try {
+                try (OnDiskGraphIndexWriter writer = new OnDiskGraphIndexWriter.Builder(mergedGraph, tempFile)
+                        .with(new FusedPQ(mergedGraph.maxDegree(), pq))
+                        .with(new InlineVectors(dim))
+                        .build()) {
+                    ImmutableGraphIndex.View view = mergedGraph.getView();
+                    EnumMap<FeatureId, IntFunction<io.github.jbellis.jvector.graph.disk.feature.Feature.State>> suppliers =
+                            new EnumMap<>(FeatureId.class);
+                    suppliers.put(FeatureId.FUSED_PQ, ordinal -> new FusedPQ.State(view, pqv, ordinal));
+                    suppliers.put(FeatureId.INLINE_VECTORS,
+                            ordinal -> new InlineVectors.State(allMravv.getVector(ordinal)));
+                    writer.write(suppliers);
+                }
+                success = true;
+                return tempFile;
+            } finally {
+                if (!success) {
+                    Files.deleteIfExists(tempFile);
+                }
+                try {
+                    mergedBuilder.close();
+                } catch (IOException e) {
+                    // ignore
+                }
+            }
+        } finally {
+            writingGraphActive.decrementAndGet();
         }
     }
 

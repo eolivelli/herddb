@@ -57,6 +57,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.LongConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.bookkeeper.stats.NullStatsLogger;
@@ -461,16 +462,58 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
                                           Path tempFile)
             throws IOException, DataStorageManagerException {
+        return writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile, null);
+    }
+
+    @Override
+    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                          Path tempFile, LongConsumer progress)
+            throws IOException, DataStorageManagerException {
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
         int blockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
         long totalBytes;
-        try (java.io.InputStream in = java.nio.file.Files.newInputStream(tempFile)) {
+        try (java.io.InputStream raw = java.nio.file.Files.newInputStream(tempFile);
+             java.io.InputStream in = progress != null
+                     ? new CountingInputStream(raw, progress)
+                     : raw) {
             totalBytes = client.writeMultipartFile(logicalPath, in, blockSize);
         }
         LOGGER.log(Level.INFO,
                 "writeMultipartIndexFile: {0} written {1} bytes in blocks of {2}",
                 new Object[]{logicalPath, totalBytes, blockSize});
         return logicalPath;
+    }
+
+    /**
+     * Wraps an InputStream and reports the number of bytes read since the last
+     * report via a {@link LongConsumer}. Used by Phase-B multipart uploads so
+     * that the PersistentVectorStore can expose mid-flight upload progress.
+     */
+    private static final class CountingInputStream extends java.io.FilterInputStream {
+        private final LongConsumer progress;
+
+        CountingInputStream(java.io.InputStream in, LongConsumer progress) {
+            super(in);
+            this.progress = progress;
+        }
+
+        @Override
+        public int read() throws IOException {
+            int r = super.read();
+            if (r >= 0) {
+                progress.accept(1L);
+            }
+            return r;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            int r = super.read(b, off, len);
+            if (r > 0) {
+                progress.accept(r);
+            }
+            return r;
+        }
     }
 
     @Override
