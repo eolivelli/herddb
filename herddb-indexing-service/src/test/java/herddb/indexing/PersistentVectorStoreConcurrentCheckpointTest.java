@@ -23,6 +23,7 @@ package herddb.indexing;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import herddb.core.MemoryManager;
 import herddb.index.vector.PersistentVectorStore;
 import herddb.mem.MemoryDataStorageManager;
@@ -163,25 +164,28 @@ public class PersistentVectorStoreConcurrentCheckpointTest {
             store.setCheckpointPhaseBHook(() -> {
                 phaseBEntered.countDown();
                 try {
-                    releasePhaseB.await(30, TimeUnit.SECONDS);
+                    // Long enough to survive slow CI machines; the test
+                    // releases the latch as soon as the second checkpoint
+                    // call returns, so the usual wait is sub-millisecond.
+                    releasePhaseB.await(120, TimeUnit.SECONDS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
             });
 
             AtomicBoolean firstResult = new AtomicBoolean();
-            AtomicReference<Exception> error = new AtomicReference<>();
+            AtomicReference<Throwable> error = new AtomicReference<>();
             Thread parked = new Thread(() -> {
                 try {
                     firstResult.set(store.checkpoint());
-                } catch (Exception e) {
-                    error.compareAndSet(null, e);
+                } catch (Throwable t) {
+                    error.compareAndSet(null, t);
                 }
             }, "cp-parked");
             parked.start();
 
-            assertTrue("first checkpoint did not reach Phase B",
-                    phaseBEntered.await(30, TimeUnit.SECONDS));
+            assertTrue("first checkpoint did not reach Phase B within 60s",
+                    phaseBEntered.await(60, TimeUnit.SECONDS));
 
             // The second caller races the tryLock and must get false back
             // immediately, without blocking on the parked Phase B.
@@ -194,9 +198,19 @@ public class PersistentVectorStoreConcurrentCheckpointTest {
                     elapsed < 5_000);
 
             releasePhaseB.countDown();
-            parked.join(30_000);
+            // Generous timeout: Phase B + Phase C on 512 tiny vectors is
+            // usually sub-second locally but can be much slower on CI
+            // runners under load.
+            parked.join(120_000);
+            if (parked.isAlive()) {
+                StringBuilder dump = new StringBuilder("cp-parked thread did not finish within 120s, stack:\n");
+                for (StackTraceElement f : parked.getStackTrace()) {
+                    dump.append("  at ").append(f).append('\n');
+                }
+                fail(dump.toString());
+            }
             if (error.get() != null) {
-                throw error.get();
+                throw new AssertionError("parked checkpoint threw", error.get());
             }
             assertTrue("first checkpoint should have returned true", firstResult.get());
             assertEquals("vectors lost after parked checkpoint",
