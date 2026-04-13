@@ -40,6 +40,18 @@ before running anything. All paths below are relative to that directory.
 - `./scripts/run-bench.sh <vector-bench args>` — run the workload. The last
   line of stdout is `RUN_LOG=<path>` — capture it. Must be launched with
   `run_in_background: true` so the supervision loop can run in parallel.
+  The script always prepends `--no-progress` to `vector-bench.sh`, so the
+  captured `RUN_LOG` is `\n`-terminated plain-text output (no `\r` spinner
+  frames). You can and should `Read` this file during supervision to see
+  the current phase and live progress samples (one line every ~5 s) — see
+  §Supervision. If the user explicitly asks for structured output, pass
+  `--output-format json` through to `run-bench.sh` and the log will become
+  NDJSON (one JSON object per line with `event` values `config`,
+  `phase_start`, `progress`, `phase_end`, `summary`, `done`, or `error`).
+  `--output-format json` implicitly enables `--no-progress`.
+  `write-report.sh` still parses plain mode (`^phase=` lines + SUMMARY
+  block) — do not switch to NDJSON unless the user asks for it, or
+  `write-report.sh` will not produce a report.
 - `./scripts/collect-logs.sh` — dump pod logs into a timestamped dir. Last
   line is `LOGS_DIR=<path>`.
 - `./scripts/write-report.sh <run-log-path>` — turn a run log into a markdown
@@ -182,6 +194,19 @@ Rules that apply to every workload, including user-specified ones:
 While `run-bench.sh` runs in the background, poll the cluster at least every
 60 seconds (minimum 30 s, maximum 90 s between polls). On each tick, in
 order:
+
+0. **Tail the run log** — `Read` the `RUN_LOG` path (use `offset` to skip to
+   near the end on large files) to see the current phase and most recent
+   progress sample. Because `run-bench.sh` runs `vector-bench.sh` with
+   `--no-progress`, the log is plain-text line-per-sample (~one line every
+   5 s) and phase boundaries are visible as `phase=<name> ...` lines. Note
+   the current phase on each tick — you'll need it for the failure report
+   and to know when the run transitions from ingest → checkpoint → recall.
+   If the log has not produced a new line for more than ~60 s during a
+   phase that should be emitting progress (ingest or recall), treat it as
+   a warning and correlate with cluster state before deciding if it is
+   fatal. If the user asked for `--output-format json`, parse NDJSON events
+   instead.
 
 1. `./scripts/check-cluster.sh` — any non-zero exit is a fatal signal.
 
@@ -448,6 +473,11 @@ is inactive; prefer the direct `--server` flag.
 
 ### Supervision loop
 The agent supervises a running benchmark at ≤60 s cadence. Each tick:
+0. `Read` the `RUN_LOG` (tail) — `run-bench.sh` drives `vector-bench.sh`
+   with `--no-progress` so the log is `\n`-terminated plain-text
+   (~one progress line every 5 s, phase boundaries visible as
+   `phase=<name>` lines). `--output-format json` is also available for
+   NDJSON consumers.
 1. `./scripts/check-cluster.sh`
 2. `kubectl get pods -o wide` — watch RESTARTS column
 3. `kubectl logs --tail=200 <pod>` for each component — scan for OOM/Exception/FATAL
