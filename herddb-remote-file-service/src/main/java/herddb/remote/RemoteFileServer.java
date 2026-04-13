@@ -25,6 +25,7 @@ import herddb.auth.oidc.OidcTokenValidator;
 import herddb.auth.oidc.grpc.JwtAuthServerInterceptor;
 import herddb.metadata.MetadataStorageManager;
 import herddb.remote.storage.CachingObjectStorage;
+import herddb.remote.storage.InMemoryBlockCacheObjectStorage;
 import herddb.remote.storage.LocalObjectStorage;
 import herddb.remote.storage.ObjectStorage;
 import herddb.remote.storage.S3ObjectStorage;
@@ -45,6 +46,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.apache.bookkeeper.stats.Gauge;
 import org.apache.bookkeeper.stats.StatsLogger;
 import org.apache.bookkeeper.stats.prometheus.PrometheusMetricsProvider;
 import org.apache.bookkeeper.stats.prometheus.PrometheusServlet;
@@ -75,6 +77,10 @@ public class RemoteFileServer implements AutoCloseable {
     static final int DEFAULT_IO_RATIO = 70;
     /** Default block size for multipart files: 4 MB. */
     public static final int DEFAULT_BLOCK_SIZE = 4 * 1024 * 1024;
+    /** Config key: in-heap block cache byte budget. */
+    public static final String CONFIG_BLOCK_CACHE_MAX_BYTES = "block.cache.max.bytes";
+    /** Config key: enable/disable the in-heap block cache. */
+    public static final String CONFIG_BLOCK_CACHE_ENABLED = "block.cache.enabled";
 
     private final String host;
     private final int port;
@@ -128,12 +134,33 @@ public class RemoteFileServer implements AutoCloseable {
             objectStorage = new LocalObjectStorage(dataDirectory, metadataExecutor);
         }
 
+        // Wrap with in-heap block cache if enabled. Sits in front of the inner storage
+        // (local or S3+disk-cache) so hot graph blocks never re-touch disk/S3.
+        boolean blockCacheEnabled = Boolean.parseBoolean(
+                config.getProperty(CONFIG_BLOCK_CACHE_ENABLED, "true"));
+        InMemoryBlockCacheObjectStorage blockCache = null;
+        if (blockCacheEnabled) {
+            long blockCacheMaxBytes = Long.parseLong(
+                    config.getProperty(CONFIG_BLOCK_CACHE_MAX_BYTES,
+                            String.valueOf(defaultBlockCacheMaxBytes())));
+            blockCache = new InMemoryBlockCacheObjectStorage(objectStorage, blockCacheMaxBytes);
+            objectStorage = blockCache;
+            LOGGER.log(Level.INFO,
+                    "In-heap block cache enabled: maxBytes={0} ({1} MB)",
+                    new Object[]{blockCacheMaxBytes, blockCacheMaxBytes / (1024 * 1024)});
+        } else {
+            LOGGER.log(Level.INFO, "In-heap block cache disabled");
+        }
+
         // Initialize metrics
         statsProvider = new PrometheusMetricsProvider();
         PropertiesConfiguration statsConfig = new PropertiesConfiguration();
         statsConfig.setProperty(PrometheusMetricsProvider.PROMETHEUS_STATS_HTTP_ENABLE, false);
         statsProvider.start(statsConfig);
         StatsLogger statsLogger = statsProvider.getStatsLogger("");
+        if (blockCache != null) {
+            registerBlockCacheGauges(statsLogger, blockCache);
+        }
 
         int ioRatio = Integer.getInteger("herddb.fileserver.netty.ioRatio", DEFAULT_IO_RATIO);
         this.blockSize = Integer.parseInt(config.getProperty("block.size",
@@ -251,6 +278,97 @@ public class RemoteFileServer implements AutoCloseable {
             s3Client.close();
             throw e;
         }
+    }
+
+    /** Default in-heap block-cache budget: 1/4 of the JVM max heap. */
+    static long defaultBlockCacheMaxBytes() {
+        long max = Runtime.getRuntime().maxMemory();
+        if (max == Long.MAX_VALUE) {
+            // -Xmx unset: fall back to total memory so we don't allocate everything in sight.
+            max = Runtime.getRuntime().totalMemory();
+        }
+        return Math.max(1, max / 4);
+    }
+
+    private static void registerBlockCacheGauges(StatsLogger root, InMemoryBlockCacheObjectStorage cache) {
+        StatsLogger scope = root.scope("rfs").scope("block_cache");
+        scope.registerGauge("max_bytes", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.getMaxBytes();
+            }
+        });
+        scope.registerGauge("size_bytes", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.estimatedBytes();
+            }
+        });
+        scope.registerGauge("entries", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.estimatedSize();
+            }
+        });
+        scope.registerGauge("hits", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.stats().hitCount();
+            }
+        });
+        scope.registerGauge("misses", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.stats().missCount();
+            }
+        });
+        scope.registerGauge("evictions", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.stats().evictionCount();
+            }
+        });
+        scope.registerGauge("evicted_bytes", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.stats().evictionWeight();
+            }
+        });
     }
 
     public int getPort() {
