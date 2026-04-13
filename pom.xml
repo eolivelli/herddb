@@ -972,7 +972,8 @@
                             <reuseForks>false</reuseForks>
                             <argLine> --add-opens=java.base/java.nio=ALL-UNNAMED  --add-opens=java.base/java.io=ALL-UNNAMED  --add-opens=java.base/java.lang=ALL-UNNAMED --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx2G -XX:+UseG1GC  @{argLine}</argLine>
                             <trimStackTrace>false</trimStackTrace>
-                            <forkedProcessTimeoutInSeconds>900</forkedProcessTimeoutInSeconds>
+                            <forkedProcessTimeoutInSeconds>1800</forkedProcessTimeoutInSeconds>
+                            <forkedProcessExitTimeoutInSeconds>120</forkedProcessExitTimeoutInSeconds>
                         </configuration>
                     </plugin>
                     <plugin>

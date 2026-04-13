@@ -85,6 +85,16 @@ jobs:
           path: ~/.m2/repository
       - name: 'Test herddb-core (non-cluster)'
         run: mvn -B verify -DforkCount=2 -Dtest.excludedGroups=herddb.core.ClusterTest -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -pl herddb-core -Pjenkins
+      - name: 'Upload surefire reports'
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-core
+          path: |
+            **/target/surefire-reports/**
+            **/hs_err_pid*.log
+          retention-days: 7
+          if-no-files-found: ignore
 
   test-cluster:
     name: HerdDB Core Cluster tests
@@ -110,6 +120,16 @@ jobs:
           path: ~/.m2/repository
       - name: 'Test herddb-core (cluster)'
         run: mvn -B verify -DforkCount=2 -Dtest.groups=herddb.core.ClusterTest -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -pl herddb-core -Pjenkins
+      - name: 'Upload surefire reports'
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-cluster
+          path: |
+            **/target/surefire-reports/**
+            **/hs_err_pid*.log
+          retention-days: 7
+          if-no-files-found: ignore
 
   test-other:
     name: Other modules tests
@@ -135,6 +155,16 @@ jobs:
           path: ~/.m2/repository
       - name: 'Test other modules'
         run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins -pl !herddb-core,!herddb-remote-file-service,!herddb-indexing-service
+      - name: 'Upload surefire reports'
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-other
+          path: |
+            **/target/surefire-reports/**
+            **/hs_err_pid*.log
+          retention-days: 7
+          if-no-files-found: ignore
 
   test-remote-file-service:
     name: Remote File Service tests
@@ -160,6 +190,16 @@ jobs:
           path: ~/.m2/repository
       - name: 'Test herddb-remote-file-service'
         run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins -pl herddb-remote-file-service
+      - name: 'Upload surefire reports'
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-remote-file-service
+          path: |
+            **/target/surefire-reports/**
+            **/hs_err_pid*.log
+          retention-days: 7
+          if-no-files-found: ignore
 
   test-indexing-service:
     name: Indexing Service tests
@@ -185,3 +225,13 @@ jobs:
           path: ~/.m2/repository
       - name: 'Test herddb-indexing-service'
         run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins -pl herddb-indexing-service
+      - name: 'Upload surefire reports'
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-indexing-service
+          path: |
+            **/target/surefire-reports/**
+            **/hs_err_pid*.log
+          retention-days: 7
+          if-no-files-found: ignore
