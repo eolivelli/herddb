@@ -16,9 +16,9 @@
 # ~1.2 GB of raw float data and the CachingObjectStorage reads it into
 # the JVM heap during compaction.
 #
-# Server heap raised to 6 g: gist1m checkpointing (1M × 960-dim vectors)
-# requires headroom well above the 3 g that was previously set; 6 g heap
-# pairs with 7 Gi container memory (heap + ~1 GB JVM overhead).
+# Server heap raised to 8 g: multi-iteration gist1m runs (3+ iterations
+# with --drop-table) require more headroom; OOM was observed at 6 g on
+# iter 3 ingest (issue #88). 8 g heap pairs with 9 Gi container memory.
 #
 # Tools heap raised to 2 g: loading the sift1m base set (1M × 128 × 4 B
 # = 512 MB) into the vector-bench JVM plus JVM overhead exceeds 512 Mi;
@@ -43,7 +43,7 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  javaOpts: "-Xms6g -Xmx6g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms8g -Xmx8g -Djava.net.preferIPv4Stack=true"
   storage:
     data:
       size: 5Gi
@@ -53,10 +53,10 @@ server:
     indexing.service.timeout: "300"
   resources:
     requests:
-      memory: "7Gi"
+      memory: "9Gi"
       cpu: "2"
     limits:
-      memory: "7Gi"
+      memory: "9Gi"
       cpu: "2"
 
 fileServer:
@@ -120,7 +120,7 @@ bookkeeper:
     journal:
       size: 1Gi
     ledger:
-      size: 5Gi
+      size: 10Gi
   resources:
     requests:
       memory: "1Gi"
