@@ -25,6 +25,7 @@ import herddb.utils.ExtendedDataInputStream;
 import herddb.utils.ExtendedDataOutputStream;
 import java.io.IOException;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -61,7 +62,8 @@ public final class PageSet {
             this.dirt = new LongAdder();
         }
 
-        private DataPageMetaData(long size, long avgRecordSize, long dirt) {
+        // package-private — constructed from raw fields in tests (same package)
+        DataPageMetaData(long size, long avgRecordSize, long dirt) {
             super();
             this.size = size;
             this.avgRecordSize = avgRecordSize;
@@ -96,6 +98,20 @@ public final class PageSet {
 
     Map<Long, DataPageMetaData> getActivePages() {
         return new HashMap<>(activePages);
+    }
+
+    /**
+     * Return an unmodifiable live view of the active-page map. Unlike
+     * {@link #getActivePages()}, this does not allocate a defensive copy and
+     * is therefore O(1) regardless of the number of pages in the table. The
+     * returned view is backed by a {@link ConcurrentHashMap} — its iterator
+     * is weakly consistent. Callers are responsible for ensuring that no
+     * concurrent modification would confuse them; in practice the sole
+     * caller is {@code TableManager.checkpoint()}, which only reads the map
+     * during Phase A (brief write lock) and Phase C (write lock held).
+     */
+    Map<Long, DataPageMetaData> getActivePagesView() {
+        return Collections.unmodifiableMap(activePages);
     }
 
     int getActivePagesCount() {
