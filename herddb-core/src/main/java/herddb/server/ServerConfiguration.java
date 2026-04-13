@@ -310,6 +310,17 @@ public final class ServerConfiguration {
     public static final String PROPERTY_COMPACTION_DURATION = "server.checkpoint.compaction";
     public static final long PROPERTY_COMPACTION_DURATION_DEFAULT = 1000L;
 
+    /**
+     * Soft upper bound on the number of {@code PostCheckpointAction} entries a
+     * single checkpoint is allowed to accumulate before emitting a SEVERE log
+     * entry. Exceeding it is not treated as an error (the checkpoint still
+     * runs) but flags a pathological accumulation that warrants investigation.
+     * Set to 0 to disable the guard.
+     */
+    public static final String PROPERTY_CHECKPOINT_MAX_ACTIONS_PER_CYCLE =
+            "server.checkpoint.max.actions.per.cycle";
+    public static final int PROPERTY_CHECKPOINT_MAX_ACTIONS_PER_CYCLE_DEFAULT = 100_000;
+
     public static final String PROPERTY_ZOOKEEPER_ADDRESS_DEFAULT = "localhost:1281";
     public static final String PROPERTY_ZOOKEEPER_PATH_DEFAULT = "/herd";
     public static final int PROPERTY_PORT_DEFAULT = 7000;

@@ -264,6 +264,13 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
      */
     private final long compactionTargetTime;
 
+    /**
+     * Soft upper bound on the number of {@link PostCheckpointAction} entries a
+     * checkpoint is allowed to accumulate before a SEVERE warning is emitted.
+     * {@code 0} disables the guard.
+     */
+    private final int maxActionsPerCheckpointCycle;
+
     private final TableManagerStats stats;
 
     private final Counter checkpointProcessedDirtyRecords;
@@ -487,6 +494,11 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 ServerConfiguration.PROPERTY_COMPACTION_DURATION_DEFAULT);
 
         this.compactionTargetTime = compactionTargetTime < 0 ? Long.MAX_VALUE : compactionTargetTime;
+
+        int maxActionsPerCheckpointCycle = tableSpaceManager.getDbmanager().getServerConfiguration().getInt(
+                ServerConfiguration.PROPERTY_CHECKPOINT_MAX_ACTIONS_PER_CYCLE,
+                ServerConfiguration.PROPERTY_CHECKPOINT_MAX_ACTIONS_PER_CYCLE_DEFAULT);
+        this.maxActionsPerCheckpointCycle = Math.max(0, maxActionsPerCheckpointCycle);
 
 
         StatsLogger tableMetrics = tableSpaceManager.tablespaceStasLogger.scope("table_" + table.name);
@@ -3019,6 +3031,26 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         return total < 0 ? Long.MAX_VALUE : total;
     }
 
+    /**
+     * Emit a SEVERE log entry if a checkpoint's accumulated
+     * {@link PostCheckpointAction} list exceeds the configured soft cap. This
+     * is a diagnostic guard — we do not abort the checkpoint. An accumulation
+     * above the cap is a strong signal that an index or storage manager is
+     * generating an unreasonable number of stale-file cleanup actions.
+     */
+    private void maybeWarnOnActionAccumulation(List<PostCheckpointAction> actions) {
+        final int cap = maxActionsPerCheckpointCycle;
+        if (cap > 0 && actions.size() > cap) {
+            LOGGER.log(Level.SEVERE,
+                    "checkpoint for table {0}.{1} accumulated {2} PostCheckpointActions,"
+                            + " exceeding the soft cap of {3} ({4}). This is not a functional error,"
+                            + " but indicates an unusually large cleanup backlog — investigate stale"
+                            + " page files and checkpoint frequency.",
+                    new Object[]{table.tablespace, table.name, actions.size(), cap,
+                            ServerConfiguration.PROPERTY_CHECKPOINT_MAX_ACTIONS_PER_CYCLE});
+        }
+    }
+
     private static class CleanAndCompactResult {
 
         private final DataPage buildingPage;
@@ -3372,7 +3404,14 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             checkPointRunning = true;
             checkpointLimitInstant = sumOverflowWise(getlock, checkpointTargetTime);
 
-            final Map<Long, DataPageMetaData> activePages = pageSet.getActivePages();
+            /*
+             * Use an unmodifiable live view over pageSet.activePages — no defensive
+             * copy. Safe here because Phase A holds the checkpoint write lock, so no
+             * concurrent modifications can reach PageSet while we iterate. This
+             * removes one of the two O(#pages) HashMap snapshots per checkpoint
+             * (issue #69).
+             */
+            final Map<Long, DataPageMetaData> activePages = pageSet.getActivePagesView();
 
             flushingDirtyPages = new ArrayList<>();
             flushingSmallPages = new ArrayList<>();
@@ -3539,6 +3578,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 actions.addAll(indexManager.checkpoint(sequenceNumber, pin, catchUpTimeoutMs));
             }
         }
+        maybeWarnOnActionAccumulation(actions);
 
         indexcheckpoint = System.currentTimeMillis();
 
@@ -3627,15 +3667,23 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
              * which is required by BLink's checkpoint() contract.
              */
             actions.addAll(keyToPage.checkpoint(sequenceNumber, pin));
+            maybeWarnOnActionAccumulation(actions);
             keytopagecheckpoint = System.currentTimeMillis();
 
             pageSet.checkpointDone(flushedPages);
 
+            /*
+             * Use a live unmodifiable view of pageSet.activePages here — no defensive
+             * copy. Safe because Phase C holds the checkpoint write lock for the
+             * entire lifetime of `tableStatus` (it is consumed by
+             * dataStorageManager.tableCheckpoint below and discarded).
+             */
             TableStatus tableStatus = new TableStatus(table.name, sequenceNumber,
                     Bytes.longToByteArray(nextPrimaryKeyValue.get()), nextPageId,
-                    pageSet.getActivePages());
+                    pageSet.getActivePagesView());
 
             actions.addAll(dataStorageManager.tableCheckpoint(tableSpaceUUID, table.uuid, tableStatus, pin));
+            maybeWarnOnActionAccumulation(actions);
             tablecheckpoint = System.currentTimeMillis();
 
             /*
