@@ -44,6 +44,7 @@ import herddb.utils.Bytes;
 import herddb.utils.XXHash64Utils;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -55,6 +56,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.bookkeeper.stats.Gauge;
@@ -111,6 +113,18 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private ExecutorService[] applyWorkers;
     private int applyParallelism;
     private volatile Throwable asyncError;
+
+    /**
+     * Wall-clock time at which {@link #start()} finished, used by the
+     * admin CLI to compute engine uptime.
+     */
+    private volatile long startTimeMillis;
+
+    /**
+     * Human-readable identifier for this engine instance, populated by
+     * {@link IndexingServer} once the gRPC endpoint is bound. Nullable.
+     */
+    private volatile String instanceIdLabel;
 
     /**
      * Hook invoked after the tablespace UUID has been resolved but before the
@@ -174,6 +188,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     public Path getDataDirectory() {
         return dataDirectory;
+    }
+
+    public IndexingServerConfiguration getConfig() {
+        return config;
     }
 
     /**
@@ -457,9 +475,77 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         tailerThread.setDaemon(true);
         tailerThread.start();
 
+        this.startTimeMillis = System.currentTimeMillis();
+
         LOGGER.log(Level.INFO,
                 "IndexingServiceEngine started, watermark={0}, tailerStart={1}",
                 new Object[]{watermark, tailerStart});
+    }
+
+    /**
+     * Injects the human-readable identifier for this engine instance (usually
+     * {@code host:port} once gRPC has bound to a port). Used by the admin CLI.
+     */
+    public void setInstanceIdLabel(String instanceIdLabel) {
+        this.instanceIdLabel = instanceIdLabel;
+    }
+
+    public String getInstanceIdLabel() {
+        return instanceIdLabel;
+    }
+
+    public String getTableSpaceUUID() {
+        return tableSpaceUUID;
+    }
+
+    public long getStartTimeMillis() {
+        return startTimeMillis;
+    }
+
+    public int getApplyParallelism() {
+        return applyParallelism;
+    }
+
+    public int getLoadedIndexCount() {
+        return vectorStores.size();
+    }
+
+    public int getApplyQueueSize() {
+        ExecutorService[] workers = this.applyWorkers;
+        if (workers == null) {
+            return 0;
+        }
+        int total = 0;
+        for (ExecutorService w : workers) {
+            if (w instanceof ThreadPoolExecutor) {
+                total += ((ThreadPoolExecutor) w).getQueue().size();
+            }
+        }
+        return total;
+    }
+
+    public int getApplyQueueCapacity() {
+        ExecutorService[] workers = this.applyWorkers;
+        if (workers == null || workers.length == 0 || !(workers[0] instanceof ThreadPoolExecutor)) {
+            return 0;
+        }
+        BlockingQueue<?> q = ((ThreadPoolExecutor) workers[0]).getQueue();
+        int perStripeCapacity = q.size() + q.remainingCapacity();
+        return perStripeCapacity * workers.length;
+    }
+
+    public long getTailerEntriesProcessed() {
+        CommitLogTailing t = tailer;
+        return t != null ? t.getEntriesProcessed() : 0L;
+    }
+
+    public boolean isTailerRunning() {
+        CommitLogTailing t = tailer;
+        return t != null && t.isRunning();
+    }
+
+    public LogSequenceNumber getLastProcessedLsn() {
+        return lastProcessedLsn;
     }
 
     /**
@@ -847,6 +933,152 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 lastProcessedLsn != null ? lastProcessedLsn.ledgerId : -1,
                 lastProcessedLsn != null ? lastProcessedLsn.offset : -1,
                 "tailing");
+    }
+
+    /**
+     * Test-only helper: registers a pre-built vector store under the given
+     * index, so diagnostic RPCs can be exercised without replaying a commit
+     * log. Visible for tests within the same package.
+     */
+    // package-private for testing
+    void registerIndexForTest(Index index, AbstractVectorStore store) {
+        if (schemaTracker == null) {
+            schemaTracker = new SchemaTracker();
+        }
+        // Simulate what applyEntry would do for a CREATE_INDEX record.
+        java.util.Map<String, Index> tracked =
+                getSchemaTrackerIndexes();
+        tracked.put(index.name, index);
+        vectorStores.put(storeKey(index.table, index.name), store);
+    }
+
+    /**
+     * Reflection-free accessor used only by
+     * {@link #registerIndexForTest(Index, AbstractVectorStore)}. Exposes the
+     * private {@code indexes} map on {@link SchemaTracker} so tests can seed
+     * it. We avoid a public setter on {@code SchemaTracker} because the
+     * production code only mutates it via log entries.
+     */
+    @SuppressWarnings("unchecked")
+    private java.util.Map<String, Index> getSchemaTrackerIndexes() {
+        try {
+            java.lang.reflect.Field f = SchemaTracker.class.getDeclaredField("indexes");
+            f.setAccessible(true);
+            return (java.util.Map<String, Index>) f.get(schemaTracker);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to access SchemaTracker.indexes", e);
+        }
+    }
+
+    /**
+     * Enumerates every vector index loaded by this engine instance. Used by
+     * the indexing-admin CLI.
+     */
+    public List<IndexDescriptor> listIndexes() {
+        List<IndexDescriptor> out = new ArrayList<>(vectorStores.size());
+        if (schemaTracker == null) {
+            return out;
+        }
+        for (Index idx : schemaTracker.getAllIndexes()) {
+            if (!Index.TYPE_VECTOR.equals(idx.type)) {
+                continue;
+            }
+            AbstractVectorStore store = vectorStores.get(storeKey(idx.table, idx.name));
+            long vectorCount = store != null ? store.size() : 0;
+            String status = store != null ? "tailing" : "missing";
+            out.add(new IndexDescriptor(idx.tablespace, idx.table, idx.name, vectorCount, status));
+        }
+        return out;
+    }
+
+    /**
+     * Returns extended diagnostic information for a single vector index.
+     * Returns {@code null} if the index is not loaded on this instance.
+     */
+    public IndexDetails describeIndex(String tablespace, String table, String index) {
+        AbstractVectorStore store = vectorStores.get(storeKey(table, index));
+        if (store == null) {
+            return null;
+        }
+        IndexDetails d = new IndexDetails();
+        d.tablespace = tablespace;
+        d.table = table;
+        d.index = index;
+        d.vectorCount = store.size();
+        d.status = "tailing";
+        d.estimatedMemoryBytes = store.estimatedMemoryUsageBytes();
+        d.liveVectorsMemoryBytes = store.estimatedMemoryUsageBytes();
+        d.storeClass = store.getClass().getSimpleName();
+        d.persistent = store instanceof PersistentVectorStore;
+        if (store instanceof PersistentVectorStore) {
+            PersistentVectorStore pvs = (PersistentVectorStore) store;
+            d.dimension = pvs.getDimension();
+            d.similarity = pvs.getSimilarityFunction();
+            d.liveNodeCount = pvs.getLiveNodeCount();
+            d.onDiskNodeCount = pvs.getOnDiskNodeCount();
+            d.segmentCount = pvs.getSegmentCount();
+            d.liveShardCount = pvs.getLiveShardCount();
+            d.liveVectorsMemoryBytes = pvs.getLiveVectorsMemoryBytes();
+            d.onDiskSizeBytes = pvs.getEstimatedSizeBytes();
+            d.dirty = pvs.isDirty();
+            d.fusedPQEnabled = pvs.isFusedPQEnabled();
+            d.m = pvs.getM();
+            d.beamWidth = pvs.getBeamWidth();
+        } else if (store instanceof InMemoryVectorStore) {
+            d.similarity = ((InMemoryVectorStore) store).getSimilarityType().name();
+            d.segmentCount = 1;
+            d.liveNodeCount = store.size();
+            d.liveShardCount = 1;
+        }
+        LogSequenceNumber lsn = lastProcessedLsn;
+        if (lsn != null) {
+            d.lastLsnLedger = lsn.ledgerId;
+            d.lastLsnOffset = lsn.offset;
+        } else {
+            d.lastLsnLedger = -1L;
+            d.lastLsnOffset = -1L;
+        }
+        return d;
+    }
+
+    /**
+     * Streams every primary key held by the given vector index through the
+     * supplied visitor. Returns the total number of PKs visited. The visitor
+     * may return {@code false} to stop the walk early (e.g. the server handler
+     * uses this to implement a chunked-response limit).
+     *
+     * @param limit maximum number of PKs to visit, or {@code <= 0} for no cap
+     */
+    public long streamPrimaryKeys(String tablespace, String table, String index,
+                                   boolean includeOnDisk, long limit,
+                                   Predicate<Bytes> visitor) {
+        AbstractVectorStore store = vectorStores.get(storeKey(table, index));
+        if (store == null) {
+            return 0;
+        }
+        long[] count = new long[]{0L};
+        store.forEachPrimaryKey(includeOnDisk, pk -> {
+            count[0]++;
+            if (limit > 0 && count[0] > limit) {
+                return false;
+            }
+            return visitor.test(pk);
+        });
+        if (limit > 0 && count[0] > limit) {
+            count[0] = limit;
+        }
+        return count[0];
+    }
+
+    /**
+     * Sum of estimated memory used by every loaded vector store.
+     */
+    public long getTotalEstimatedMemoryBytes() {
+        long total = 0;
+        for (AbstractVectorStore store : vectorStores.values()) {
+            total += store.estimatedMemoryUsageBytes();
+        }
+        return total;
     }
 
     public void setStatsLogger(StatsLogger statsLogger) {
@@ -1403,5 +1635,74 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         public String getStatus() {
             return status;
         }
+    }
+
+    /**
+     * Lightweight per-index row for {@link #listIndexes()}.
+     */
+    public static final class IndexDescriptor {
+        private final String tablespace;
+        private final String table;
+        private final String index;
+        private final long vectorCount;
+        private final String status;
+
+        public IndexDescriptor(String tablespace, String table, String index, long vectorCount, String status) {
+            this.tablespace = tablespace;
+            this.table = table;
+            this.index = index;
+            this.vectorCount = vectorCount;
+            this.status = status;
+        }
+
+        public String getTablespace() {
+            return tablespace;
+        }
+
+        public String getTable() {
+            return table;
+        }
+
+        public String getIndex() {
+            return index;
+        }
+
+        public long getVectorCount() {
+            return vectorCount;
+        }
+
+        public String getStatus() {
+            return status;
+        }
+    }
+
+    /**
+     * Extended per-index diagnostic record returned by
+     * {@link #describeIndex(String, String, String)}. Fields are mutable so
+     * {@code describeIndex} can assemble the record lazily.
+     */
+    public static final class IndexDetails {
+        public String tablespace;
+        public String table;
+        public String index;
+        public long vectorCount;
+        public String status;
+        public int dimension;
+        public String similarity;
+        public long liveNodeCount;
+        public long onDiskNodeCount;
+        public int segmentCount;
+        public int liveShardCount;
+        public long estimatedMemoryBytes;
+        public long liveVectorsMemoryBytes;
+        public long onDiskSizeBytes;
+        public boolean dirty;
+        public long lastLsnLedger;
+        public long lastLsnOffset;
+        public boolean fusedPQEnabled;
+        public int m;
+        public int beamWidth;
+        public boolean persistent;
+        public String storeClass;
     }
 }

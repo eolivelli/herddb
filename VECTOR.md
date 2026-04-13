@@ -894,3 +894,93 @@ mvn -f vector-testings/pom.xml package -DskipTests
 | `sift1m` | 1M | 128 | ~170 MB |
 | `sift10m` | 10M | 128 | ~98 GB |
 | `bigann` | 1B | 128 | ~98 GB |
+
+---
+
+## indexing-admin — diagnostic CLI
+
+`indexing-admin` is a lightweight gRPC CLI for inspecting the internal state
+of a **single** indexing service instance. It's bundled with `herddb-services`
+at `bin/indexing-admin.sh` and pre-wired into the k3s tools pod as
+`/usr/local/bin/indexing-admin`. Use it when you need to understand what an
+indexing replica is actually holding — loaded indexes, live/on-disk node
+counts, tailer lag, apply-queue backpressure, or the set of primary keys
+backing an index — without scraping Prometheus or reading `sysindexstatus`
+from the main HerdDB server.
+
+All commands talk to **one** instance at a time. `list-instances` is the only
+command that reads ZooKeeper; every other sub-command takes `--server host:port`
+pointing at the specific replica you want to inspect.
+
+### Sub-commands
+
+| Command | Purpose |
+|---|---|
+| `list-instances` | Read ZooKeeper and print every registered indexing service address |
+| `list-indexes` | Enumerate the indexes loaded by one instance (tablespace, table, index, vector count, status) |
+| `describe-index` | Full per-index detail: dimension, similarity, live vs on-disk node counts, segments, shards, memory, LSN, FusedPQ/M/beam-width, dirty flag |
+| `status` | One-line wrapper over the legacy `GetIndexStatus` RPC |
+| `list-pks` | Stream the list of primary keys backing an index (hex or base64 output, optional `--include-ondisk`, `--limit`) |
+| `engine-stats` | Tailer watermark, entries processed, apply queue size/capacity/parallelism, loaded index count, total estimated memory, uptime |
+| `instance-info` | Instance id, gRPC host:port, storage type, data dir, tablespace name + UUID, ordinal/numInstances, JVM max heap |
+
+### gRPC methods exposed by the indexing service
+
+Five new RPCs were added to `indexing_service.proto` to back the CLI
+(`ListIndexes`, `DescribeIndex`, `ListPrimaryKeys` — server-streamed —
+`GetEngineStats`, `GetInstanceInfo`). They are strictly additive; the existing
+`Search` and `GetIndexStatus` wire format is unchanged.
+
+### Examples
+
+```bash
+# Build and run locally against a released zip
+mvn -pl herddb-indexing-service,herddb-services -am package -DskipTests
+./target/herddb-services-*/bin/indexing-admin.sh list-indexes \
+    --server localhost:9850
+
+# Extended view of a single index
+./target/herddb-services-*/bin/indexing-admin.sh describe-index \
+    --server localhost:9850 \
+    --tablespace herd --table docs --index emb_hnsw
+
+# Dump up to 1000 PKs as hex (live graph only)
+./target/herddb-services-*/bin/indexing-admin.sh list-pks \
+    --server localhost:9850 \
+    --table docs --index emb_hnsw --limit 1000
+
+# Engine snapshot in JSON
+./target/herddb-services-*/bin/indexing-admin.sh engine-stats \
+    --server localhost:9850 --json
+```
+
+### In the k3s tools pod
+
+The helm chart mounts the CLI as `indexing-admin` in `$PATH` and injects
+`HERDDB_INDEXING_ZK` into the tools container. `list-instances` picks up the
+ZK connect string automatically; every other command still requires an
+explicit `--server` so the operator is aware which replica they are talking
+to.
+
+```bash
+kubectl exec -it herddb-tools-0 -- indexing-admin list-instances
+kubectl exec -it herddb-tools-0 -- indexing-admin list-indexes \
+    --server herddb-indexing-service-0.herddb-indexing-service:9850
+kubectl exec -it herddb-tools-0 -- indexing-admin engine-stats \
+    --server herddb-indexing-service-0.herddb-indexing-service:9850 --json
+```
+
+Setting `HERDDB_INDEXING_SERVER=host:port` in the environment lets the wrapper
+auto-fill `--server` for commands that need it — useful for scripted health
+checks that target one replica at a time.
+
+### Out of scope (v1)
+
+- Live TUI / dashboards. `watch -n2 indexing-admin engine-stats` covers the
+  live case with stdlib tools.
+- Write operations (force-checkpoint, drop-segment, etc.). This tool is
+  diagnostic; destructive verbs belong to a separate change.
+- Automated tuning suggestions. The raw numbers are exposed today; a future
+  `indexing-admin advise` sub-command can layer rules on top of
+  `describe-index` + `engine-stats`.
+

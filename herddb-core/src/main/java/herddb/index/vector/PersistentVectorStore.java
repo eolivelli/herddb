@@ -80,6 +80,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.IntFunction;
+import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -3318,6 +3319,54 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public int getOnDiskNodeCount() {
         return (int) onDiskNodeToPkSize();
+    }
+
+    /**
+     * Visits every primary key currently stored in this vector store.
+     * Walks live shards (and frozen shards, if a checkpoint is running)
+     * first, then, if {@code includeOnDisk} is true, walks on-disk segments
+     * via {@link VectorSegment#scanNodeToPk()}.
+     *
+     * <p>The visitor returns {@code false} to stop the traversal early.
+     *
+     * <p>PKs that only exist in sealed on-disk segments may collide with
+     * live PKs when the live graph still holds a newer copy of the same
+     * record; callers that need deduplication must track seen PKs
+     * themselves.
+     */
+    @Override
+    public void forEachPrimaryKey(boolean includeOnDisk, Predicate<Bytes> visitor) {
+        for (LiveGraphShard shard : liveShards) {
+            for (Bytes pk : shard.nodeToPk.values()) {
+                if (!visitor.test(pk)) {
+                    return;
+                }
+            }
+        }
+        List<LiveGraphShard> frozen = this.frozenShards;
+        if (frozen != null) {
+            for (LiveGraphShard shard : frozen) {
+                for (Bytes pk : shard.nodeToPk.values()) {
+                    if (!visitor.test(pk)) {
+                        return;
+                    }
+                }
+            }
+        }
+        if (!includeOnDisk) {
+            return;
+        }
+        for (VectorSegment seg : segments) {
+            try (Stream<Map.Entry<Bytes, Bytes>> stream = seg.scanNodeToPk()) {
+                java.util.Iterator<Map.Entry<Bytes, Bytes>> it = stream.iterator();
+                while (it.hasNext()) {
+                    Bytes pk = it.next().getValue();
+                    if (!visitor.test(pk)) {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     public int getSegmentCount() {

@@ -323,7 +323,10 @@ public class IndexingServer implements AutoCloseable {
             } catch (Exception e) {
                 LOGGER.log(Level.SEVERE, "Failed to register indexing service", e);
             }
+        } else {
+            registeredServiceId = host + ":" + server.getPort();
         }
+        engine.setInstanceIdLabel(registeredServiceId);
 
         LOGGER.log(Level.INFO, "IndexingServer started on port {0}", getPort());
     }

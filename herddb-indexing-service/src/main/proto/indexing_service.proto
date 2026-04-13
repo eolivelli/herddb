@@ -26,6 +26,13 @@ package indexing;
 service IndexingService {
     rpc Search (SearchRequest) returns (SearchResponse);
     rpc GetIndexStatus (GetIndexStatusRequest) returns (GetIndexStatusResponse);
+
+    // Diagnostic RPCs used by the indexing-admin CLI.
+    rpc ListIndexes (ListIndexesRequest) returns (ListIndexesResponse);
+    rpc DescribeIndex (DescribeIndexRequest) returns (DescribeIndexResponse);
+    rpc ListPrimaryKeys (ListPrimaryKeysRequest) returns (stream PrimaryKeysChunk);
+    rpc GetEngineStats (GetEngineStatsRequest) returns (GetEngineStatsResponse);
+    rpc GetInstanceInfo (GetInstanceInfoRequest) returns (GetInstanceInfoResponse);
 }
 
 message SearchRequest {
@@ -58,4 +65,94 @@ message GetIndexStatusResponse {
     int64 last_lsn_ledger = 3;
     int64 last_lsn_offset = 4;
     string status = 5;
+}
+
+// ---- Diagnostic RPCs ----
+
+message IndexDescriptor {
+    string tablespace = 1;
+    string table = 2;
+    string index = 3;
+    int64 vector_count = 4;
+    string status = 5;
+}
+
+message ListIndexesRequest {
+}
+
+message ListIndexesResponse {
+    repeated IndexDescriptor indexes = 1;
+}
+
+message DescribeIndexRequest {
+    string tablespace = 1;
+    string table = 2;
+    string index = 3;
+}
+
+message DescribeIndexResponse {
+    IndexDescriptor basic = 1;
+    int32 dimension = 2;
+    string similarity = 3;
+    int64 live_node_count = 4;
+    int64 ondisk_node_count = 5;
+    int32 segment_count = 6;
+    int32 live_shard_count = 7;
+    int64 estimated_memory_bytes = 8;
+    int64 live_vectors_memory_bytes = 9;
+    int64 ondisk_size_bytes = 10;
+    bool dirty = 11;
+    int64 last_lsn_ledger = 12;
+    int64 last_lsn_offset = 13;
+    bool fused_pq_enabled = 14;
+    int32 m = 15;
+    int32 beam_width = 16;
+    bool persistent = 17;
+    string store_class = 18;
+}
+
+message ListPrimaryKeysRequest {
+    string tablespace = 1;
+    string table = 2;
+    string index = 3;
+    int32 chunk_size = 4;
+    bool include_ondisk = 5;
+    int64 limit = 6;
+}
+
+message PrimaryKeysChunk {
+    repeated bytes primary_keys = 1;
+    bool last = 2;
+}
+
+message GetEngineStatsRequest {
+}
+
+message GetEngineStatsResponse {
+    int64 uptime_millis = 1;
+    int64 tailer_watermark_ledger = 2;
+    int64 tailer_watermark_offset = 3;
+    int64 tailer_entries_processed = 4;
+    bool tailer_running = 5;
+    int32 apply_queue_size = 6;
+    int32 apply_queue_capacity = 7;
+    int64 total_estimated_memory_bytes = 8;
+    int32 loaded_index_count = 9;
+    int32 apply_parallelism = 10;
+}
+
+message GetInstanceInfoRequest {
+}
+
+message GetInstanceInfoResponse {
+    string instance_id = 1;
+    string grpc_host = 2;
+    int32 grpc_port = 3;
+    string storage_type = 4;
+    string data_dir = 5;
+    int64 jvm_max_heap_bytes = 6;
+    string tablespace_name = 7;
+    string tablespace_uuid = 8;
+    int32 instance_ordinal = 9;
+    int32 num_instances = 10;
 }

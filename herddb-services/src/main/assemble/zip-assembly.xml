@@ -93,6 +93,16 @@
         <dependencySet>
             <useProjectArtifact>true</useProjectArtifact>
             <useStrictFiltering>true</useStrictFiltering>
+            <unpack>false</unpack>
+            <includes>
+                <include>org.herddb:herddb-indexing-service:jar:admin-cli</include>
+            </includes>
+            <outputDirectory>indexing-admin</outputDirectory>
+            <outputFileNameMapping>herddb-indexing-admin-${project.version}.jar</outputFileNameMapping>
+        </dependencySet>
+        <dependencySet>
+            <useProjectArtifact>true</useProjectArtifact>
+            <useStrictFiltering>true</useStrictFiltering>
             <unpack>true</unpack>           
             <includes>
                 <include>org.herddb:herddb-ui:war:war-no-libs</include>                                
