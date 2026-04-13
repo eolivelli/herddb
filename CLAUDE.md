@@ -43,24 +43,47 @@ is required.
 
 ## k3s-local Vector Benchmark — Monitoring
 
+### Supervision loop
+The agent supervises a running benchmark at ≤60 s cadence. Each tick:
+1. `./scripts/check-cluster.sh`
+2. `kubectl get pods -o wide` — watch RESTARTS column
+3. `kubectl logs --tail=200 <pod>` for each component — scan for OOM/Exception/FATAL
+4. `indexing-admin engine-stats --json` per IS replica — watch `apply_queue_size`,
+   `total_estimated_memory_bytes`, `tailer_watermark_ledger`
+5. File-server metrics via `curl http://localhost:9847/metrics` every few ticks
+
+### indexing-admin
+Available as `/usr/local/bin/indexing-admin` in the tools pod. Run via:
+```
+kubectl exec herddb-tools-0 -- indexing-admin <cmd> --server <IS>:9850 [--json]
+```
+Commands: `engine-stats`, `describe-index`, `list-indexes`, `instance-info`, `list-pks`.
+Use pod DNS `herddb-indexing-service-<N>.herddb-indexing-service:9850`.
+`list-instances` (ZK-based) may return empty — use `--server` directly.
+
+### diagnostics.sh
+`scripts/diagnostics.sh` handles both heap dumps and async-profiler profiles:
+- Heap dump: `./scripts/diagnostics.sh [--pod <pod>] [--analyze]`
+- Profiles:  `./scripts/diagnostics.sh --pod <pod> --profile [--profile-duration 30]`
+  Collects cpu / wall / alloc / lock HTML flamegraphs from `/opt/profiler/bin/asprof`.
+  Downloads to `$HERDDB_TESTS_HOME/profiles-<pod>-<ts>/`.
+
 ### File Server Metrics
-The file server exposes Prometheus-format metrics on HTTP port **9847**.  Query them from
-inside the cluster with:
+The file server exposes Prometheus-format metrics on HTTP port **9847**:
 ```
 kubectl --kubeconfig herddb-kubernetes/src/main/helm/herddb/examples/k3s-local/.kubeconfig \
   exec herddb-file-server-0 -- curl -s http://localhost:9847/metrics
 ```
 
-Key metrics to watch:
+Key metrics:
 
 | Metric | Meaning |
 |---|---|
-| `rfs_readrange_bytes` | Total bytes served to the indexing service (read from MinIO or cache) |
-| `rfs_readrange_requests` | Number of `readFileRange` calls from the indexing service |
-| `rfs_writeblock_bytes` | Total bytes written by the indexing service during checkpoint |
+| `rfs_readrange_bytes` | Total bytes served to IS (from cache or MinIO) |
+| `rfs_readrange_requests` | Number of `readFileRange` calls from IS |
+| `rfs_writeblock_bytes` | Bytes written by IS during checkpoint |
 
-If `rfs_readrange_bytes` keeps growing during query phases (not just during
-`--checkpoint`), the disk cache is overflowing and every read falls through to MinIO.
+Growing `rfs_readrange_bytes` during query phases = cache overflow → reads hitting MinIO.
 
 ### Verifying the Cache Configuration
 The effective `cache.max.bytes` is written into the file server's properties file.
@@ -71,11 +94,9 @@ kubectl --kubeconfig herddb-kubernetes/src/main/helm/herddb/examples/k3s-local/.
 ```
 The value should be **32212254720** (30 GiB) for the k3s-local benchmark cluster.
 
-### Common Cache Misconfiguration
-The Helm template reads `.Values.fileServer.s3.cacheMaxBytes`, **not**
-`.Values.fileServer.cacheMaxBytes`.  Placing the value at the wrong YAML level silently
-falls back to the 1 GB default (`1073741824`), causing enormous MinIO re-read traffic
-and multi-minute query latencies.  The correct structure in `k3s-local/values.yaml` is:
+### Cache Configuration
+The Helm template reads `.Values.fileServer.s3.cacheMaxBytes` (**not**
+`.Values.fileServer.cacheMaxBytes`). Wrong placement silently uses 1 GiB default.
 ```yaml
 fileServer:
   s3:
