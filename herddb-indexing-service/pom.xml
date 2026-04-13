@@ -95,10 +95,16 @@
             <artifactId>jetty-servlet</artifactId>
             <version>9.4.51.v20230217</version>
         </dependency>
+        <!--
+          slf4j-jdk14 is bundled at runtime so the shaded admin-cli uber jar
+          always has an slf4j provider that routes to JUL (the logging
+          framework actually used by HerdDB). Without it slf4j-api 2.x would
+          fall through to the NOP logger and print a "No SLF4J providers
+          were found" warning (issue #85).
+        -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-jdk14</artifactId>
-            <scope>test</scope>
         </dependency>
         <!-- BookKeeper test dependencies for BK commit log tailing tests -->
         <dependency>
@@ -223,6 +229,23 @@
                                         <exclude>META-INF/*.SF</exclude>
                                         <exclude>META-INF/*.DSA</exclude>
                                         <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                                <!--
+                                  log4j-slf4j-impl is pulled in transitively
+                                  via bookkeeper-server. It targets the
+                                  slf4j 1.7 API and does not register as a
+                                  ServiceLoader provider for slf4j 2.x, so
+                                  leaving it in the uber jar produces a
+                                  spurious "No SLF4J providers were found"
+                                  warning and a log4j getCallerClass warning
+                                  on modern JDKs. slf4j-jdk14 (above) is the
+                                  actual provider we want to use.
+                                -->
+                                <filter>
+                                    <artifact>org.apache.logging.log4j:log4j-slf4j-impl</artifact>
+                                    <excludes>
+                                        <exclude>**</exclude>
                                     </excludes>
                                 </filter>
                             </filters>
