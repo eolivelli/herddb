@@ -16,9 +16,9 @@
 # ~1.2 GB of raw float data and the CachingObjectStorage reads it into
 # the JVM heap during compaction.
 #
-# Server heap raised to 2 g: checkpointing 1M rows × 128-dim vectors
-# requires ~1.5 GB peak heap for dirty-page serialisation; the old
-# 1 g heap caused OOM in flushNewPageForCheckpoint.
+# Server heap raised to 6 g: gist1m checkpointing (1M × 960-dim vectors)
+# requires headroom well above the 3 g that was previously set; 6 g heap
+# pairs with 7 Gi container memory (heap + ~1 GB JVM overhead).
 #
 # Tools heap raised to 2 g: loading the sift1m base set (1M × 128 × 4 B
 # = 512 MB) into the vector-bench JVM plus JVM overhead exceeds 512 Mi;
@@ -43,7 +43,7 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  javaOpts: "-Xms2g -Xmx3g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms6g -Xmx6g -Djava.net.preferIPv4Stack=true"
   storage:
     data:
       size: 5Gi
@@ -53,16 +53,16 @@ server:
     indexing.service.timeout: "300"
   resources:
     requests:
-      memory: "4Gi"
+      memory: "7Gi"
       cpu: "2"
     limits:
-      memory: "4Gi"
+      memory: "7Gi"
       cpu: "2"
 
 fileServer:
   replicaCount: 1
   storageMode: s3
-  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms4g -Xmx4g -Djava.net.preferIPv4Stack=true"
   # S3 endpoint, bucket, and credentials are auto-wired from the
   # minio section below.
   s3:
@@ -77,10 +77,10 @@ fileServer:
     size: 30Gi
   resources:
     requests:
-      memory: "3Gi"
+      memory: "5Gi"
       cpu: "0.5"
     limits:
-      memory: "3Gi"
+      memory: "5Gi"
       cpu: "1"
 
 minio:
