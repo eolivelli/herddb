@@ -26,6 +26,7 @@ import static org.junit.Assert.assertNotNull;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import java.io.ByteArrayInputStream;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import org.junit.After;
@@ -169,6 +170,127 @@ public class RemoteRandomAccessReaderTest {
 
         RemoteRandomAccessReader reader = new RemoteRandomAccessReader(client, "ts/idx/len", data.length, BLOCK_SIZE);
         assertEquals(150, reader.length());
+    }
+
+    /**
+     * Issue #104 — the vector-search read-buffer size is configurable via the
+     * {@code herddb.vector.remote.read.bufferSize} system property and defaults
+     * to 4096 bytes.
+     */
+    @Test
+    public void testReadBufferSizeDefault() {
+        assertEquals("herddb.vector.remote.read.bufferSize",
+                RemoteFileDataStorageManager.READ_BUFFER_SIZE_PROPERTY);
+        assertEquals(4096, RemoteFileDataStorageManager.READ_BUFFER_SIZE);
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #104 — readFully across buffer boundaries
+    //
+    // These tests pin the reader behaviour when the internal buffer window is
+    // smaller than the write block, which is the configuration the vector-search
+    // path will use in production (writeBlockSize=4MiB, bufferSize=4KiB).
+    // They use writeBlockSize=64 and bufferSize=16 so that 4 buffer windows fit
+    // in one write block. Every test reads the same underlying sequence and
+    // asserts that the bytes returned exactly match the expected slice.
+    // -------------------------------------------------------------------------
+
+    private static final int READFULLY_WRITE_BLOCK = 64;
+    private static final int READFULLY_BUFFER = 16;
+
+    /** Write a single file used by the {@code testReadFully_*} group. */
+    private byte[] writeReadFullyFile(String path) throws Exception {
+        // 3 write blocks + partial tail ⇒ 200 bytes, spans >>= 2 buffer windows.
+        byte[] data = seqBytes(READFULLY_WRITE_BLOCK * 3 + 8);
+        client.writeMultipartFile(path, new ByteArrayInputStream(data), READFULLY_WRITE_BLOCK);
+        return data;
+    }
+
+    private RemoteRandomAccessReader openReadFullyReader(String path, long totalSize) {
+        return new RemoteRandomAccessReader(
+                client, path, totalSize, READFULLY_WRITE_BLOCK, READFULLY_BUFFER);
+    }
+
+    /** Read fewer bytes than one buffer window. */
+    @Test
+    public void testReadFully_lessThanOneBuffer() throws Exception {
+        byte[] data = writeReadFullyFile("ts/idx/rf-less");
+        try (RemoteRandomAccessReader reader = openReadFullyReader("ts/idx/rf-less", data.length)) {
+            reader.seek(0);
+            byte[] buf = new byte[READFULLY_BUFFER - 5]; // 11 bytes
+            reader.readFully(buf);
+            assertArrayEquals(Arrays.copyOfRange(data, 0, buf.length), buf);
+            assertEquals(buf.length, reader.getPosition());
+        }
+    }
+
+    /** Read exactly one full buffer window. */
+    @Test
+    public void testReadFully_exactlyOneBuffer() throws Exception {
+        byte[] data = writeReadFullyFile("ts/idx/rf-exact1");
+        try (RemoteRandomAccessReader reader = openReadFullyReader("ts/idx/rf-exact1", data.length)) {
+            reader.seek(0);
+            byte[] buf = new byte[READFULLY_BUFFER]; // 16 bytes
+            reader.readFully(buf);
+            assertArrayEquals(Arrays.copyOfRange(data, 0, READFULLY_BUFFER), buf);
+            assertEquals(READFULLY_BUFFER, reader.getPosition());
+        }
+    }
+
+    /** Read more than one but less than two buffer windows — forces a second load mid-read. */
+    @Test
+    public void testReadFully_moreThanOneBuffer() throws Exception {
+        byte[] data = writeReadFullyFile("ts/idx/rf-more1");
+        try (RemoteRandomAccessReader reader = openReadFullyReader("ts/idx/rf-more1", data.length)) {
+            reader.seek(0);
+            byte[] buf = new byte[READFULLY_BUFFER + 5]; // 21 bytes
+            reader.readFully(buf);
+            assertArrayEquals(Arrays.copyOfRange(data, 0, buf.length), buf);
+            assertEquals(buf.length, reader.getPosition());
+        }
+    }
+
+    /** Read exactly two back-to-back full buffer windows. */
+    @Test
+    public void testReadFully_exactlyTwoBuffers() throws Exception {
+        byte[] data = writeReadFullyFile("ts/idx/rf-exact2");
+        try (RemoteRandomAccessReader reader = openReadFullyReader("ts/idx/rf-exact2", data.length)) {
+            reader.seek(0);
+            byte[] buf = new byte[READFULLY_BUFFER * 2]; // 32 bytes
+            reader.readFully(buf);
+            assertArrayEquals(Arrays.copyOfRange(data, 0, buf.length), buf);
+            assertEquals(buf.length, reader.getPosition());
+        }
+    }
+
+    /** Read two full buffer windows plus a partial third window. */
+    @Test
+    public void testReadFully_twoBuffersAndMore() throws Exception {
+        byte[] data = writeReadFullyFile("ts/idx/rf-more2");
+        try (RemoteRandomAccessReader reader = openReadFullyReader("ts/idx/rf-more2", data.length)) {
+            reader.seek(0);
+            byte[] buf = new byte[READFULLY_BUFFER * 2 + 7]; // 39 bytes
+            reader.readFully(buf);
+            assertArrayEquals(Arrays.copyOfRange(data, 0, buf.length), buf);
+            assertEquals(buf.length, reader.getPosition());
+        }
+    }
+
+    /** Start mid-buffer so the first copy is a partial-tail of the first window. */
+    @Test
+    public void testReadFully_startingMidBuffer() throws Exception {
+        byte[] data = writeReadFullyFile("ts/idx/rf-mid");
+        try (RemoteRandomAccessReader reader = openReadFullyReader("ts/idx/rf-mid", data.length)) {
+            // Seek 3 bytes before the end of the first buffer window, read across the boundary.
+            long start = READFULLY_BUFFER - 3L;
+            reader.seek(start);
+            byte[] buf = new byte[READFULLY_BUFFER + 10]; // 26 bytes → spans 3 windows
+            reader.readFully(buf);
+            assertArrayEquals(
+                    Arrays.copyOfRange(data, (int) start, (int) start + buf.length),
+                    buf);
+            assertEquals(start + buf.length, reader.getPosition());
+        }
     }
 
     /**

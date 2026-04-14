@@ -278,6 +278,17 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     private static final int MULTIPART_BLOCK_SIZE =
             Integer.getInteger(MULTIPART_BLOCK_SIZE_PROPERTY, 4 * 1024 * 1024);
 
+    /**
+     * System property to override the read-buffer size used by
+     * {@link RemoteRandomAccessReader} when serving vector-index searches over
+     * remote multipart graph files. Default: 4096 bytes. See issue #104 —
+     * this buffer is intentionally decoupled from {@link #MULTIPART_BLOCK_SIZE}
+     * so that HNSW graph traversals do not fetch multi-MiB windows per miss.
+     */
+    public static final String READ_BUFFER_SIZE_PROPERTY = "herddb.vector.remote.read.bufferSize";
+    static final int READ_BUFFER_SIZE =
+            Integer.getInteger(READ_BUFFER_SIZE_PROPERTY, 4096);
+
     private static String remoteMultipartPath(String tableSpace, String uuid, String fileType) {
         return tableSpace + "/" + uuid + "/multipart/" + fileType;
     }
@@ -521,8 +532,9 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             String tableSpace, String uuid, String fileType, long fileSize)
             throws DataStorageManagerException {
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
-        int blockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
-        return new RemoteRandomAccessReader.Supplier(client, logicalPath, fileSize, blockSize);
+        int writeBlockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
+        return new RemoteRandomAccessReader.Supplier(
+                client, logicalPath, fileSize, writeBlockSize, READ_BUFFER_SIZE);
     }
 
     @Override

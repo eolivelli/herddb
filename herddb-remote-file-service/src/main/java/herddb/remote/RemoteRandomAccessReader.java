@@ -28,8 +28,18 @@ import java.nio.ByteOrder;
 
 /**
  * A {@link RandomAccessReader} that reads from a remote multipart file via
- * {@link RemoteFileServiceClient}. Buffers one block at a time to avoid
- * redundant network round-trips when jvector reads sequentially within a block.
+ * {@link RemoteFileServiceClient}. Buffers one {@code bufferSize}-sized window
+ * at a time to avoid redundant network round-trips when jvector reads
+ * sequentially within that window.
+ *
+ * <p>The buffer size is intentionally decoupled from the multipart write block
+ * size (which is a GCS multipart-upload requirement and is typically 4 MiB).
+ * For vector-index searches the buffer should be small (e.g. 4 KiB) so that
+ * each cache miss only transfers a few KiB instead of several MiB — see
+ * issue #104. {@code writeBlockSize} is still passed to the server because it
+ * is what {@code LocalObjectStorage.readRange} uses to locate the on-disk
+ * chunk file ({@code blockIndex = offset / writeBlockSize}); changing it would
+ * break chunk lookup.
  *
  * <p>Instances are NOT thread-safe (one per reader thread as expected by jvector).
  *
@@ -40,18 +50,52 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
     private final RemoteFileServiceClient client;
     private final String path;
     private final long totalSize;
-    private final int blockSize;
+    private final int writeBlockSize;
+    private final int bufferSize;
 
     private long position;
     private byte[] blockBuffer;
     private long bufferedBlockIndex = -1;
 
+    /**
+     * Full constructor with separate write block size (routing / chunk lookup)
+     * and read buffer size (internal window for sequential reads).
+     *
+     * @param writeBlockSize the multipart chunk size used by the writer; must
+     *                       be a multiple of the effective buffer size so that
+     *                       a buffer window never crosses a chunk boundary
+     * @param bufferSize     the read-side buffer window; capped to
+     *                       {@code writeBlockSize} if larger
+     */
     public RemoteRandomAccessReader(RemoteFileServiceClient client, String path,
-                                    long totalSize, int blockSize) {
+                                    long totalSize, int writeBlockSize, int bufferSize) {
+        if (writeBlockSize <= 0) {
+            throw new IllegalArgumentException("writeBlockSize must be > 0, got " + writeBlockSize);
+        }
+        if (bufferSize <= 0) {
+            throw new IllegalArgumentException("bufferSize must be > 0, got " + bufferSize);
+        }
+        int effective = Math.min(bufferSize, writeBlockSize);
+        if (writeBlockSize % effective != 0) {
+            throw new IllegalArgumentException(
+                    "bufferSize (" + bufferSize + ") must divide writeBlockSize ("
+                            + writeBlockSize + ")");
+        }
         this.client = client;
         this.path = path;
         this.totalSize = totalSize;
-        this.blockSize = blockSize;
+        this.writeBlockSize = writeBlockSize;
+        this.bufferSize = effective;
+    }
+
+    /**
+     * Convenience constructor for the case where the caller has no distinct
+     * read-buffer size. Equivalent to
+     * {@code RemoteRandomAccessReader(client, path, totalSize, blockSize, blockSize)}.
+     */
+    public RemoteRandomAccessReader(RemoteFileServiceClient client, String path,
+                                    long totalSize, int blockSize) {
+        this(client, path, totalSize, blockSize, blockSize);
     }
 
     @Override
@@ -101,7 +145,7 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         int destOffset = 0;
         while (remaining > 0) {
             ensureBlockLoaded();
-            int offsetInBlock = (int) (position % blockSize);
+            int offsetInBlock = (int) (position % bufferSize);
             int available = blockBuffer.length - offsetInBlock;
             int toCopy = Math.min(available, remaining);
             System.arraycopy(blockBuffer, offsetInBlock, dest, destOffset, toCopy);
@@ -148,22 +192,22 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
     }
 
     private void ensureBlockLoaded() throws IOException {
-        long blockIndex = position / blockSize;
-        if (blockIndex == bufferedBlockIndex && blockBuffer != null) {
+        long bufferIndex = position / bufferSize;
+        if (bufferIndex == bufferedBlockIndex && blockBuffer != null) {
             return;
         }
-        long blockOffset = blockIndex * (long) blockSize;
-        int requestLength = (int) Math.min(blockSize, totalSize - blockOffset);
+        long bufferOffset = bufferIndex * (long) bufferSize;
+        int requestLength = (int) Math.min(bufferSize, totalSize - bufferOffset);
         if (requestLength <= 0) {
             throw new IOException("Read past end of file: position=" + position
                     + " totalSize=" + totalSize);
         }
-        byte[] data = client.readFileRange(path, blockOffset, requestLength, blockSize);
+        byte[] data = client.readFileRange(path, bufferOffset, requestLength, writeBlockSize);
         if (data == null) {
-            throw new IOException("Block not found: path=" + path + " blockIndex=" + blockIndex);
+            throw new IOException("Block not found: path=" + path + " bufferIndex=" + bufferIndex);
         }
         blockBuffer = data;
-        bufferedBlockIndex = blockIndex;
+        bufferedBlockIndex = bufferIndex;
     }
 
     /**
@@ -175,19 +219,30 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         private final RemoteFileServiceClient client;
         private final String path;
         private final long totalSize;
-        private final int blockSize;
+        private final int writeBlockSize;
+        private final int bufferSize;
 
         public Supplier(RemoteFileServiceClient client, String path,
-                        long totalSize, int blockSize) {
+                        long totalSize, int writeBlockSize, int bufferSize) {
             this.client = client;
             this.path = path;
             this.totalSize = totalSize;
-            this.blockSize = blockSize;
+            this.writeBlockSize = writeBlockSize;
+            this.bufferSize = bufferSize;
+        }
+
+        /**
+         * Convenience constructor that uses the same value for the write block
+         * size and the read-buffer size.
+         */
+        public Supplier(RemoteFileServiceClient client, String path,
+                        long totalSize, int blockSize) {
+            this(client, path, totalSize, blockSize, blockSize);
         }
 
         @Override
         public RandomAccessReader get() throws IOException {
-            return new RemoteRandomAccessReader(client, path, totalSize, blockSize);
+            return new RemoteRandomAccessReader(client, path, totalSize, writeBlockSize, bufferSize);
         }
 
         @Override

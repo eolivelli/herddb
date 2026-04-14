@@ -106,11 +106,13 @@ public class ReadReplicaDataStorageManager extends DataStorageManager {
             String tableSpace, String uuid, String fileType, long fileSize)
             throws DataStorageManagerException {
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
-        int blockSize = client.getBlockSize();
+        int writeBlockSize = client.getBlockSize();
+        int bufferSize = RemoteFileDataStorageManager.READ_BUFFER_SIZE;
         LOGGER.log(Level.FINE,
-                "multipartIndexReaderSupplier: {0} fileSize={1} blockSize={2}",
-                new Object[]{logicalPath, fileSize, blockSize});
-        return new RemoteRandomAccessReader.Supplier(client, logicalPath, fileSize, blockSize);
+                "multipartIndexReaderSupplier: {0} fileSize={1} writeBlockSize={2} bufferSize={3}",
+                new Object[]{logicalPath, fileSize, writeBlockSize, bufferSize});
+        return new RemoteRandomAccessReader.Supplier(
+                client, logicalPath, fileSize, writeBlockSize, bufferSize);
     }
 
     // -------------------------------------------------------------------------
