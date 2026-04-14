@@ -460,6 +460,129 @@ public class VectorIndexTest {
         }
     }
 
+    /**
+     * Simulates the window where the remote indexing service has not yet
+     * consumed a DELETE from the CommitLog. The vector index still returns
+     * the PK of a row that no longer exists in the table; VectorANNScanOp
+     * must silently skip those entries and return fewer rows, not crash.
+     */
+    @Test
+    public void testStalePkFromVectorIndexIsSkipped() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        MockRemoteVectorIndexService mockService = new MockRemoteVectorIndexService();
+
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+
+            manager.setRemoteVectorIndexService(mockService);
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton("localhost"), "localhost", 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            float[] vecX = {1.0f, 0.0f, 0.0f};
+            float[] vecY = {0.0f, 1.0f, 0.0f};
+            float[] vecZ = {0.0f, 0.0f, 1.0f};
+
+            executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                    Arrays.asList(1, vecX));
+            executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                    Arrays.asList(2, vecY));
+            executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                    Arrays.asList(3, vecZ));
+
+            // Pretend the indexing service has caught up through the inserts.
+            mockService.addVector("t1", "vidx",
+                    herddb.utils.Bytes.from_int(1), vecX);
+            mockService.addVector("t1", "vidx",
+                    herddb.utils.Bytes.from_int(2), vecY);
+            mockService.addVector("t1", "vidx",
+                    herddb.utils.Bytes.from_int(3), vecZ);
+
+            // Delete row id=2 from the table, but leave the entry in the mock:
+            // this is the async-lag window the test targets.
+            executeUpdate(manager, "DELETE FROM tblspace1.t1 WHERE id=?",
+                    Arrays.asList(2));
+
+            // Query vector pointing at vecY — the stale PK ranks first in
+            // the mock's result list, so the skip path is exercised on the
+            // very first ANN entry.
+            float[] queryY = {0.0f, 1.0f, 0.0f};
+
+            // Case 1: explicit LIMIT equal to the number of indexed rows.
+            // Limit is pushed into VectorANNScanOp (topK = 3) and the loop
+            // must return only the 2 surviving rows, not throw an NPE.
+            try (DataScanner scan = scan(manager,
+                    "SELECT id FROM tblspace1.t1"
+                            + " ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT 3",
+                    Arrays.asList((Object) queryY))) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals("stale pk must be skipped, expected fewer rows",
+                        2, results.size());
+                for (DataAccessor row : results) {
+                    assertTrue("deleted row id=2 must not appear",
+                            ((Number) row.get("id")).intValue() != 2);
+                }
+            }
+
+            // Case 2: LIMIT larger than the mock's population. Covers the
+            // topK = limit + offset path with the same stale-skip outcome.
+            try (DataScanner scan = scan(manager,
+                    "SELECT id FROM tblspace1.t1"
+                            + " ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT 10",
+                    Arrays.asList((Object) queryY))) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals("stale pk must be skipped under large LIMIT too",
+                        2, results.size());
+                for (DataAccessor row : results) {
+                    assertTrue("deleted row id=2 must not appear",
+                            ((Number) row.get("id")).intValue() != 2);
+                }
+            }
+
+            // Case 3: stale PK sitting in the middle of the result list.
+            // Add id=4, delete it, leave the mock untouched. A query close
+            // to X ranks id=1 first, id=4 (stale) second, id=2 (stale)
+            // third, id=3 last. With LIMIT 10 we fetch all four from the
+            // mock and must be left with exactly {1, 3}.
+            float[] vecX2 = {0.95f, 0.05f, 0.0f};
+            executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                    Arrays.asList(4, vecX2));
+            mockService.addVector("t1", "vidx",
+                    herddb.utils.Bytes.from_int(4), vecX2);
+            executeUpdate(manager, "DELETE FROM tblspace1.t1 WHERE id=?",
+                    Arrays.asList(4));
+
+            float[] queryX = {1.0f, 0.0f, 0.0f};
+            try (DataScanner scan = scan(manager,
+                    "SELECT id FROM tblspace1.t1"
+                            + " ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT 10",
+                    Arrays.asList((Object) queryX))) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals("two stale pks must be skipped", 2, results.size());
+                for (DataAccessor row : results) {
+                    int id = ((Number) row.get("id")).intValue();
+                    assertTrue("deleted rows 2 and 4 must not appear",
+                            id != 2 && id != 4);
+                }
+            }
+        }
+    }
+
     private static VectorANNScanOp findVectorANNScanOp(PlannerOp op) {
         if (op instanceof VectorANNScanOp) {
             return (VectorANNScanOp) op;
