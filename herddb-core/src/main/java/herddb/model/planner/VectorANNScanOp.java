@@ -185,6 +185,11 @@ public class VectorANNScanOp implements PlannerOp {
                 topK = Integer.MAX_VALUE;
             }
         } else {
+            // LimitOp stayed external (e.g. because a WHERE predicate prevents
+            // absorbing the limit into this op). The outer LimitOp still applies
+            // the final row cap; fetch as much as the index has so the outer
+            // limit sees enough post-predicate rows. IndexingServiceClient caps
+            // the PriorityQueue initial capacity so this is safe.
             topK = Integer.MAX_VALUE;
         }
 

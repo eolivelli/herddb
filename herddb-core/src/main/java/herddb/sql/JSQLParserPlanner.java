@@ -2131,6 +2131,12 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
         CompiledSQLExpression queryVecExpr =
                 SQLParserExpressionCompiler.compileExpression(secondArg, schema);
 
+        if (plainSelect.getLimit() == null && plainSelect.getTop() == null) {
+            throw new StatementExecutionException(
+                    "ORDER BY ann_of(column, ?) requires a LIMIT clause — "
+                            + "unbounded vector-search queries are not supported");
+        }
+
         return new VectorANNScanOp(
                 primaryTableSchema.tableSpace, tableImpl, columnName,
                 queryVecExpr,

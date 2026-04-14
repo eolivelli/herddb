@@ -1287,6 +1287,9 @@ public class CalcitePlanner extends AbstractSQLPlanner {
         // and optimize immediately so that the limit is pushed into
         // VectorANNScanOp (LimitOp.optimize() won't be called later
         // because ProjectOp.optimize() does not recurse into children).
+        // When LIMIT is on a separate EnumerableLimit node above the Sort,
+        // planLimit() wraps the result in a LimitOp and optimizes it so the
+        // limit is pushed into VectorANNScanOp whenever possible.
         if (op.fetch != null) {
             CompiledSQLExpression maxRows = SQLExpressionCompiler.compileExpression(op.fetch);
             CompiledSQLExpression offset = op.offset != null
@@ -1305,8 +1308,12 @@ public class CalcitePlanner extends AbstractSQLPlanner {
         PlannerOp input = convertRelNode(op.getInput(), rowType, false, false);
         CompiledSQLExpression maxRows = SQLExpressionCompiler.compileExpression(op.fetch);
         CompiledSQLExpression offset = SQLExpressionCompiler.compileExpression(op.offset);
-        return new LimitOp(input, maxRows, offset);
-
+        // Optimize immediately so the limit is pushed into any underlying
+        // VectorANNScanOp (LimitOp.optimize() won't be called later because
+        // ProjectOp.optimize() does not recurse into children). This matters
+        // for plans shaped like Project(Limit(Sort(ann_of))) where Calcite
+        // did not fuse the LIMIT into the Sort node.
+        return new LimitOp(input, maxRows, offset).optimize();
     }
 
     private PlannerOp planFilter(EnumerableFilter op, RelDataType rowType, boolean returnValues) {
