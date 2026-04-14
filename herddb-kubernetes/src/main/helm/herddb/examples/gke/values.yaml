@@ -22,6 +22,9 @@
 #     --set fileServer.s3.bucket=<your-bucket-name>
 
 image:
+  # Always re-pull so that re-pushed tags (common during active
+  # benchmark iteration) are picked up on every pod restart.
+  pullPolicy: Always
   pullSecrets:
     - name: ghcr-credentials
 
@@ -124,12 +127,19 @@ tools:
   enabled: true
   gcs:
     credentialsSecret: "herddb-gcs-credentials"
+    # Shared bucket of reusable benchmark datasets. The tools pod
+    # gets VECTORBENCH_DATASETS_BUCKET=gs://herddb-datasets, which
+    # run-bench.sh and the herddb-gke-bench agent use as the default
+    # prefix for custom --dataset-url values. Standard presets
+    # (sift1m, gist1m, …) still resolve through DatasetLoader's
+    # built-in public URLs.
+    datasetsBucket: "herddb-datasets"
   storage:
     datasets:
       size: 200Gi
 
 prometheus:
-  enabled: true
+  enabled: false
 
 grafana:
-  enabled: true
+  enabled: false

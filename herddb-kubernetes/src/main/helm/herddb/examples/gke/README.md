@@ -217,6 +217,93 @@ ANN search results (uses vector index):
 Vectors are passed as JDBC parameters with `CAST(? AS FLOAT ARRAY)`.
 The column type for vector data is `floata` (float array).
 
+## Running the vector benchmark
+
+Once HerdDB is up and the `herddb-tools` StatefulSet is Ready, you
+can run the `vector-bench` workload with the helper scripts under
+`scripts/`. They mirror the k3s-local benchmark helpers and are used
+by the `herddb-gke-bench` Claude Code agent (see
+`.claude/agents/herddb-gke-bench.md`).
+
+### Scripted install
+
+For agent-driven workflows, `install.sh` accepts a `--non-interactive`
+flag that consumes flags or environment variables instead of
+prompting:
+
+```bash
+./install.sh --non-interactive \
+    --image-tag 0.30.0-SNAPSHOT \
+    --bucket my-herddb-pages \
+    --location us-central1
+```
+
+All three flags have sensible defaults; the image, HMAC secret, and
+GHCR pull secret must already exist in the cluster (the script
+refuses to create them in non-interactive mode).
+
+### Running a workload
+
+```bash
+./scripts/check-cluster.sh    # health check
+
+./scripts/run-bench.sh \
+    --dataset sift10k -n 10000 -k 100 \
+    --ingest-max-ops 1000 --checkpoint
+```
+
+`run-bench.sh` executes `vector-bench.sh` inside the tools pod and
+tees plain-text output (`--no-progress` is always on) to
+`reports/run-<timestamp>.log`. The last line of stdout is
+`RUN_LOG=<path>`. Turn it into a markdown report with:
+
+```bash
+./scripts/write-report.sh reports/run-20260414-101530.log
+```
+
+### Custom datasets from gs://herddb-datasets
+
+Standard presets (`sift10k`, `sift1m`, `gist1m`, …) are resolved via
+the built-in public URLs in `DatasetLoader`. Custom datasets live in
+the shared bucket `gs://herddb-datasets`. The GKE values set
+`tools.gcs.datasetsBucket=herddb-datasets`, which causes the tools
+StatefulSet to export `VECTORBENCH_DATASETS_BUCKET=gs://herddb-datasets`.
+Pass an explicit `--dataset-url` through `run-bench.sh` to fetch one:
+
+```bash
+./scripts/run-bench.sh \
+    --dataset-url "$VECTORBENCH_DATASETS_BUCKET/my-corpus.fvecs.gz" \
+    -n 100000 --checkpoint
+```
+
+The service account backing `herddb-gcs-credentials` needs
+`roles/storage.objectViewer` on `gs://herddb-datasets` in addition
+to `roles/storage.objectAdmin` on the pages bucket.
+
+### Resetting between runs
+
+`scripts/reset-cluster.sh` scales every HerdDB StatefulSet except
+the tools pod down to zero, deletes their PVCs, empties the
+file-server pages bucket (**never** touching `gs://herddb-datasets`),
+and scales back up. The tools pod and its dataset cache PVC are
+preserved so downloaded datasets don't need to be re-fetched.
+
+```bash
+./scripts/reset-cluster.sh --yes
+```
+
+The script reads the pages bucket name from `helm get values herddb`
+and refuses to run if the resolved name looks like a datasets
+bucket.
+
+### Diagnostics
+
+`scripts/diagnostics.sh` collects either a JVM heap dump (default)
+or async-profiler flamegraphs (`--profile`) from a running pod. See
+the script's `--help` header for details. `scripts/collect-logs.sh`
+dumps per-pod logs into a timestamped directory, and
+`scripts/open-issue.sh` publishes them as a GitHub issue via `gh`.
+
 ## Teardown
 
 ```bash
