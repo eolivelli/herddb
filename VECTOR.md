@@ -755,16 +755,44 @@ Client INSERT → HerdDB Server → CommitLog (.txlog)
 
 ```
 Client SELECT ... ORDER BY ann_of(vec, ?) DESC LIMIT k
-  → CalcitePlanner intercepts ORDER BY ann_of()
+  → CalcitePlanner intercepts ORDER BY ann_of()  (LIMIT is mandatory; rejected otherwise)
   → VectorANNScanOp.execute()
   → VectorIndexManager.search(queryVector, topK)
-  → gRPC call to IndexingService
-  → IndexingServiceEngine.search()
-  → PersistentVectorStore.search(queryVector, topK)
-  → hybrid search: on-disk segments + live shards + frozen shards
-  → results returned via gRPC to VectorANNScanOp
+  → IndexingServiceClient.search() — parallel fan-out to ALL IS instances
+      ├── gRPC call to IS instance 1 ─┐
+      ├── gRPC call to IS instance 2 ─┤ (dispatched concurrently,
+      └── gRPC call to IS instance N ─┘  each with its own deadline)
+  → each IS: IndexingServiceEngine.search()
+           → PersistentVectorStore.search(queryVector, topK)
+           → hybrid search: on-disk segments + live shards + frozen shards
+  → client waits for ALL futures, merges into a bounded top-K min-heap
+      (fails fast and cancels in-flight RPCs if any instance errors)
+  → results returned to VectorANNScanOp
   → PK fetch + WHERE filter + projection
 ```
+
+**LIMIT is required** for `ORDER BY ann_of(...)` queries. The JSQL
+planner rejects unbounded `ORDER BY ann_of(...)` with
+`StatementExecutionException` so the cluster never fans out an
+unbounded search. With the Calcite planner the LIMIT is pushed into
+`VectorANNScanOp` whenever possible (no `WHERE` predicate); when a
+predicate forces the outer `LimitOp` to stay around, the scan op
+still requests the full result set from the index and the outer
+`LimitOp` truncates the post-predicate output.
+
+**Parallel fan-out.** Each indexing-service instance holds a subset of
+the graph shards (see `IndexingServiceEngine`:
+`shardId % numInstances == instanceId`). Partial results would be
+incorrect, so the client queries **every** configured instance for
+every search, in parallel. If any RPC fails or exceeds its deadline,
+the whole query fails fast and the remaining in-flight RPCs are
+cancelled. Results from the successful instances are merged into a
+top-K min-heap ordered by score ascending: the heap evicts its
+weakest entry whenever a better candidate arrives, so it keeps only
+the globally highest-scoring `topK` PKs across all instances. After
+all futures complete, the heap is drained and sorted descending for
+the final response. A single-instance deployment takes a blocking
+fast-path that skips the future machinery.
 
 ### Checkpoint path
 

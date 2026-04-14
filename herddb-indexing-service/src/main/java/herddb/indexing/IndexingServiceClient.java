@@ -20,6 +20,7 @@
 
 package herddb.indexing;
 
+import com.google.common.util.concurrent.ListenableFuture;
 import herddb.index.vector.RemoteVectorIndexService;
 import herddb.indexing.proto.GetIndexStatusRequest;
 import herddb.indexing.proto.GetIndexStatusResponse;
@@ -42,9 +43,12 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -182,8 +186,18 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     }
 
     /**
-     * Searches all IndexingService instances and merges results by score.
-     * If only one instance exists and returnScore is false, results are passed through.
+     * Searches the IndexingService cluster and returns the top-{@code limit}
+     * entries by score.
+     *
+     * <p>With multiple instances, the search RPC is fanned out to <b>every</b>
+     * configured instance in parallel (each instance owns a subset of the
+     * graph shards, so partial results would be incorrect). Results are
+     * merged into a bounded min-heap of size {@code limit} as each future
+     * completes. If any RPC fails, the remaining in-flight RPCs are
+     * cancelled and the whole call fails fast.
+     *
+     * <p>With a single instance, a blocking fast-path skips the future
+     * machinery.
      */
     public List<Map.Entry<Bytes, Float>> search(String tablespace, String table, String index,
                                                   float[] vector, int limit) {
@@ -191,6 +205,9 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
 
         if (s.servers.isEmpty()) {
             throw new RuntimeException("No indexing service instances available");
+        }
+        if (limit <= 0) {
+            throw new IllegalArgumentException("search limit must be positive, got " + limit);
         }
 
         boolean multiInstance = s.servers.size() > 1;
@@ -212,7 +229,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         SearchRequest request = requestBuilder.build();
 
         if (!multiInstance) {
-            // Single instance: pass through
+            // Single instance: blocking fast-path
             ManagedChannel channel = s.channels.values().iterator().next();
             IndexingServiceGrpc.IndexingServiceBlockingStub stub =
                     IndexingServiceGrpc.newBlockingStub(channel)
@@ -225,29 +242,88 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
             return results;
         }
 
-        // Multiple instances: fan out, merge by score
-        List<Map.Entry<Bytes, Float>> merged = new ArrayList<>();
+        // Multiple instances: parallel fan-out with fail-fast and bounded top-K merge.
+        // Dispatch ALL RPCs up front so per-call gRPC deadlines run concurrently.
+        List<Map.Entry<String, ListenableFuture<SearchResponse>>> inflight =
+                new ArrayList<>(s.channels.size());
         for (Map.Entry<String, ManagedChannel> entry : s.channels.entrySet()) {
-            try {
-                IndexingServiceGrpc.IndexingServiceBlockingStub stub =
-                        IndexingServiceGrpc.newBlockingStub(entry.getValue())
-                                .withDeadlineAfter(timeoutSeconds, TimeUnit.SECONDS);
-                SearchResponse response = stub.search(request);
-                merged.addAll(toEntryList(response));
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "Search failed on instance " + entry.getKey(), e);
-            }
+            IndexingServiceGrpc.IndexingServiceFutureStub stub =
+                    IndexingServiceGrpc.newFutureStub(entry.getValue())
+                            .withDeadlineAfter(timeoutSeconds, TimeUnit.SECONDS);
+            inflight.add(new AbstractMap.SimpleImmutableEntry<>(entry.getKey(), stub.search(request)));
         }
 
-        // Re-rank by score descending and limit
-        merged.sort(Comparator.<Map.Entry<Bytes, Float>, Float>comparing(Map.Entry::getValue).reversed());
-        if (merged.size() > limit) {
-            merged = merged.subList(0, limit);
+        // Bounded min-heap: peek() returns the weakest (smallest-score) entry currently
+        // held, so it is the one to evict when a better candidate arrives. After the
+        // loop we drain and sort descending for the final response.
+        //
+        // The heap grows dynamically, so initial capacity is just an optimization.
+        // Cap it to avoid an Integer.MAX_VALUE allocation when callers (e.g. a
+        // VectorANNScanOp with a WHERE predicate wrapped in an external LimitOp)
+        // pass an unbounded limit — the eviction loop below still respects `limit`.
+        int initialCapacity = Math.max(1, Math.min(limit, 1024));
+        PriorityQueue<Map.Entry<Bytes, Float>> topK =
+                new PriorityQueue<>(initialCapacity, Comparator.comparing(Map.Entry::getValue));
+
+        try {
+            for (Map.Entry<String, ListenableFuture<SearchResponse>> f : inflight) {
+                SearchResponse response = f.getValue().get(timeoutSeconds, TimeUnit.SECONDS);
+                for (Map.Entry<Bytes, Float> e : toEntryList(response)) {
+                    if (topK.size() < limit) {
+                        topK.offer(e);
+                    } else if (e.getValue() > topK.peek().getValue()) {
+                        topK.poll();
+                        topK.offer(e);
+                    }
+                }
+            }
+        } catch (ExecutionException e) {
+            cancelAll(inflight);
+            throw new RuntimeException("Search failed on indexing-service instance: "
+                    + failingAddress(inflight) + " — " + e.getCause(), e.getCause());
+        } catch (TimeoutException e) {
+            cancelAll(inflight);
+            throw new RuntimeException("Search timed out waiting for indexing-service instances after "
+                    + timeoutSeconds + "s", e);
+        } catch (InterruptedException e) {
+            cancelAll(inflight);
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Search interrupted while waiting for indexing-service instances", e);
         }
+
+        List<Map.Entry<Bytes, Float>> out = new ArrayList<>(topK);
+        out.sort(Comparator.<Map.Entry<Bytes, Float>, Float>comparing(Map.Entry::getValue).reversed());
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
         LOGGER.log(Level.FINE, "client search completed (multi-instance fan-out): index={0}, {1} results in {2} ms",
-                new Object[]{index, merged.size(), elapsedMs});
-        return merged;
+                new Object[]{index, out.size(), elapsedMs});
+        return out;
+    }
+
+    private static void cancelAll(List<Map.Entry<String, ListenableFuture<SearchResponse>>> futures) {
+        for (Map.Entry<String, ListenableFuture<SearchResponse>> f : futures) {
+            if (!f.getValue().isDone()) {
+                f.getValue().cancel(true);
+            }
+        }
+    }
+
+    private static String failingAddress(List<Map.Entry<String, ListenableFuture<SearchResponse>>> futures) {
+        for (Map.Entry<String, ListenableFuture<SearchResponse>> f : futures) {
+            ListenableFuture<SearchResponse> lf = f.getValue();
+            if (lf.isDone() && !lf.isCancelled()) {
+                try {
+                    lf.get(0, TimeUnit.MILLISECONDS);
+                } catch (ExecutionException ex) {
+                    return f.getKey();
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    return f.getKey();
+                } catch (TimeoutException ex) {
+                    // still running — not the culprit
+                }
+            }
+        }
+        return "<unknown>";
     }
 
     @Override

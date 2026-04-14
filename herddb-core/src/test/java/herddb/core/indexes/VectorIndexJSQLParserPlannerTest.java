@@ -225,6 +225,62 @@ public class VectorIndexJSQLParserPlannerTest {
         }
     }
 
+    /**
+     * ORDER BY ann_of(...) without a LIMIT clause must be rejected by the planner.
+     * The bounded top-K merge in IndexingServiceClient relies on a finite limit.
+     */
+    @Test
+    public void testAnnOfWithoutLimitIsRejectedJSQLParser() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmo").toPath();
+
+        final String nodeId = "localhost";
+
+        final float[] vecX = {1.0f, 0.0f, 0.0f};
+        final float[] query = {0.05f, 0.99f, 0.0f};
+        normalize(query);
+
+        MockRemoteVectorIndexService mockService = new MockRemoteVectorIndexService();
+        mockService.addVector("t1", "vidx", Bytes.from_int(1), vecX);
+
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmoDir, nodeId, mockService)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            execute(manager, "CREATE TABLE tblspace1.t1 (id int primary key, vec floata not null)",
+                    Collections.emptyList());
+            execute(manager, "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+            executeUpdate(manager, "INSERT INTO tblspace1.t1(id, vec) VALUES(?, ?)",
+                    Arrays.asList(1, vecX));
+
+            // No LIMIT → planner must reject.
+            try (DataScanner scan = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, ?) DESC",
+                    Arrays.asList((Object) query))) {
+                scan.consume();
+                fail("Expected StatementExecutionException for unbounded ORDER BY ann_of(...)");
+            } catch (StatementExecutionException e) {
+                assertTrue("Exception must mention LIMIT requirement: " + e.getMessage(),
+                        e.getMessage().contains("LIMIT"));
+            }
+
+            // Same query *with* LIMIT must still plan and execute fine.
+            try (DataScanner scan = scan(manager,
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, ?) DESC LIMIT 10",
+                    Arrays.asList((Object) query))) {
+                List<DataAccessor> results = scan.consume();
+                assertEquals("bounded query must succeed", 1, results.size());
+            }
+        }
+    }
+
     private static void normalize(float[] v) {
         float norm = 0;
         for (float f : v) {

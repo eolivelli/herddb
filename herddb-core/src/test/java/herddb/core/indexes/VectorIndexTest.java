@@ -302,7 +302,7 @@ public class VectorIndexTest {
                     Arrays.asList(3, vecZ));
 
             try (DataScanner scan = scan(manager,
-                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC",
+                    "SELECT id FROM tblspace1.t1 ORDER BY ann_of(vec, cast(? as FLOAT ARRAY)) DESC LIMIT 10",
                     Arrays.asList((Object) query))) {
                 List<DataAccessor> results = scan.consume();
                 assertEquals(3, results.size());
