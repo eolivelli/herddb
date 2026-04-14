@@ -175,13 +175,14 @@ public class RemoteRandomAccessReaderTest {
     /**
      * Issue #104 — the vector-search read-buffer size is configurable via the
      * {@code herddb.vector.remote.read.bufferSize} system property and defaults
-     * to 4096 bytes.
+     * to 16 KiB (sized to absorb a single jvector raw-vector re-rank read for
+     * up to ~4096 dimensions in one gRPC call).
      */
     @Test
     public void testReadBufferSizeDefault() {
         assertEquals("herddb.vector.remote.read.bufferSize",
                 RemoteFileDataStorageManager.READ_BUFFER_SIZE_PROPERTY);
-        assertEquals(4096, RemoteFileDataStorageManager.READ_BUFFER_SIZE);
+        assertEquals(16 * 1024, RemoteFileDataStorageManager.READ_BUFFER_SIZE);
     }
 
     // -------------------------------------------------------------------------

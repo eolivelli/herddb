@@ -34,12 +34,14 @@ import java.nio.ByteOrder;
  *
  * <p>The buffer size is intentionally decoupled from the multipart write block
  * size (which is a GCS multipart-upload requirement and is typically 4 MiB).
- * For vector-index searches the buffer should be small (e.g. 4 KiB) so that
- * each cache miss only transfers a few KiB instead of several MiB — see
- * issue #104. {@code writeBlockSize} is still passed to the server because it
- * is what {@code LocalObjectStorage.readRange} uses to locate the on-disk
- * chunk file ({@code blockIndex = offset / writeBlockSize}); changing it would
- * break chunk lookup.
+ * For vector-index searches the buffer should be small — see issue #104 —
+ * but still large enough to absorb a single jvector logical read (notably
+ * {@code OnDiskGraphIndex.getVectorInto}, which reads {@code dimension * 4}
+ * bytes for the re-rank raw vector) in one gRPC call. The default is 16 KiB.
+ * {@code writeBlockSize} is still passed to the server because it is what
+ * {@code LocalObjectStorage.readRange} uses to locate the on-disk chunk file
+ * ({@code blockIndex = offset / writeBlockSize}); changing it would break
+ * chunk lookup.
  *
  * <p>Instances are NOT thread-safe (one per reader thread as expected by jvector).
  *
