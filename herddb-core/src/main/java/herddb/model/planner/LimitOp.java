@@ -121,7 +121,12 @@ public class LimitOp implements PlannerOp, ScanLimits {
             return new LimitedSortOp(sortOp.getInput(), sortOp, maxRows, offset);
         } else if (input instanceof VectorANNScanOp) {
             VectorANNScanOp vecOp = (VectorANNScanOp) input;
-            if (vecOp.getPredicate() == null && !vecOp.hasLimit()) {
+            // Push the limit into the ANN op unconditionally — when a WHERE
+            // predicate is present, the op budgets an initial over-fetch of
+            // limit * factor and keeps pulling more from the indexing service
+            // via VectorIndexManager.searchStream until it has `limit` rows
+            // that satisfy the predicate (or the index is exhausted).
+            if (!vecOp.hasLimit()) {
                 return vecOp.withLimit(maxRows, offset);
             }
         }
