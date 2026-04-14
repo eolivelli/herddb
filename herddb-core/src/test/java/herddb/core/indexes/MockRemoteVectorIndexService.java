@@ -28,6 +28,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * In-memory mock of RemoteVectorIndexService for testing.
@@ -37,6 +38,44 @@ import java.util.concurrent.ConcurrentHashMap;
 public class MockRemoteVectorIndexService implements RemoteVectorIndexService {
 
     private final ConcurrentHashMap<String, List<VectorEntry>> indexes = new ConcurrentHashMap<>();
+    private final AtomicInteger searchCallCount = new AtomicInteger();
+    private final java.util.List<Integer> requestedLimits =
+            java.util.Collections.synchronizedList(new ArrayList<>());
+    private volatile RuntimeException nextSearchThrows;
+
+    /**
+     * Returns the number of times {@link #search} has been invoked since this
+     * mock was created. Tests use this to verify the expansion loop in
+     * {@code VectorIndexManager.searchStream}.
+     */
+    public int getSearchCallCount() {
+        return searchCallCount.get();
+    }
+
+    /**
+     * Returns the {@code topK} value passed to each {@link #search} call,
+     * in call order.
+     */
+    public List<Integer> getRequestedLimits() {
+        synchronized (requestedLimits) {
+            return new ArrayList<>(requestedLimits);
+        }
+    }
+
+    /**
+     * Arms the mock to throw the given exception on the next {@link #search}
+     * call. The exception is consumed (cleared) by that call.
+     */
+    public void setNextSearchThrows(RuntimeException e) {
+        this.nextSearchThrows = e;
+    }
+
+    public void resetSearchCallCount() {
+        searchCallCount.set(0);
+        synchronized (requestedLimits) {
+            requestedLimits.clear();
+        }
+    }
 
     private static String indexKey(String table, String index) {
         return table + "." + index;
@@ -59,6 +98,13 @@ public class MockRemoteVectorIndexService implements RemoteVectorIndexService {
     @Override
     public List<Map.Entry<Bytes, Float>> search(String tablespace, String table, String index,
                                                   float[] vector, int topK) {
+        searchCallCount.incrementAndGet();
+        requestedLimits.add(topK);
+        RuntimeException toThrow = this.nextSearchThrows;
+        if (toThrow != null) {
+            this.nextSearchThrows = null;
+            throw toThrow;
+        }
         String key = indexKey(table, index);
         List<VectorEntry> entries = indexes.getOrDefault(key, Collections.emptyList());
         List<Map.Entry<Bytes, Float>> results = new ArrayList<>();

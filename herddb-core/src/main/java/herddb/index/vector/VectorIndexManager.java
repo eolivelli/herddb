@@ -32,9 +32,14 @@ import herddb.model.TableContext;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -203,6 +208,192 @@ public class VectorIndexManager extends AbstractIndexManager {
             LOGGER.log(Level.SEVERE, "search index {0} on table {1} failed after {2} ms: {3}",
                     new Object[]{index.name, index.table, elapsedMs, e.getMessage()});
             throw new StatementExecutionException("remote vector index search failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Opens an expanding iterator over the remote vector index, used by
+     * {@code VectorANNScanOp} when a WHERE predicate (or stale-PK skipping)
+     * may force fetching more than {@code targetK} hits to produce
+     * {@code targetK} result rows.
+     *
+     * <p>The iterator calls {@link RemoteVectorIndexService#search} with an
+     * initial budget of {@code max(minInitial, ceil(targetK * factor))} and,
+     * if the caller drains that batch without stopping, doubles the budget
+     * and calls search again, up to {@code maxExpansions} expansions.
+     * Each call returns a superset (by rank) of the previous one — entries
+     * already emitted are filtered out via a PK {@code seen} set. When the
+     * service returns fewer rows than requested, the index is exhausted and
+     * {@code hasNext()} goes {@code false}.
+     */
+    public SearchIterator searchStream(float[] queryVector, int targetK,
+                                        float factor, int minInitial, int maxExpansions)
+            throws StatementExecutionException {
+        if (targetK <= 0) {
+            throw new IllegalArgumentException("targetK must be positive, got " + targetK);
+        }
+        if (factor < 1.0f) {
+            throw new IllegalArgumentException("factor must be >= 1.0, got " + factor);
+        }
+        if (maxExpansions < 0) {
+            throw new IllegalArgumentException("maxExpansions must be >= 0, got " + maxExpansions);
+        }
+        int initialBudget = Math.max(minInitial, (int) Math.ceil((double) targetK * factor));
+        if (initialBudget <= 0) {
+            initialBudget = 1;
+        }
+        return new ExpandingSearchIterator(remoteService(), tableSpaceUUID,
+                index.table, index.name, queryVector, initialBudget, maxExpansions);
+    }
+
+    /**
+     * Test-only factory: builds an {@link ExpandingSearchIterator} directly
+     * against a {@link RemoteVectorIndexService} without needing a fully
+     * constructed {@link VectorIndexManager}. Used by the unit tests to
+     * exercise the expansion/dedupe logic in isolation. Not called from
+     * production code.
+     */
+    public static SearchIterator newSearchIteratorForTest(RemoteVectorIndexService service,
+                                                    String tablespace, String table, String indexName,
+                                                    float[] queryVector, int targetK,
+                                                    float factor, int minInitial, int maxExpansions) {
+        if (targetK <= 0) {
+            throw new IllegalArgumentException("targetK must be positive, got " + targetK);
+        }
+        if (factor < 1.0f) {
+            throw new IllegalArgumentException("factor must be >= 1.0, got " + factor);
+        }
+        if (maxExpansions < 0) {
+            throw new IllegalArgumentException("maxExpansions must be >= 0, got " + maxExpansions);
+        }
+        int initialBudget = Math.max(minInitial, (int) Math.ceil((double) targetK * factor));
+        if (initialBudget <= 0) {
+            initialBudget = 1;
+        }
+        return new ExpandingSearchIterator(service, tablespace, table, indexName,
+                queryVector, initialBudget, maxExpansions);
+    }
+
+    /**
+     * Pull-based iterator over vector search results. Implementations may
+     * transparently issue additional RPCs to fetch more candidates. Callers
+     * MUST call {@link #close()} when done.
+     */
+    public interface SearchIterator extends AutoCloseable {
+        boolean hasNext() throws StatementExecutionException;
+
+        Map.Entry<Bytes, Float> next() throws StatementExecutionException;
+
+        @Override
+        void close();
+    }
+
+    static final class ExpandingSearchIterator implements SearchIterator {
+
+        private final RemoteVectorIndexService service;
+        private final String tablespace;
+        private final String table;
+        private final String indexName;
+        private final float[] queryVector;
+        private final int maxExpansions;
+        private final Set<Bytes> seen = new HashSet<>();
+        private final Deque<Map.Entry<Bytes, Float>> buffer = new ArrayDeque<>();
+        private final long startNanos = System.nanoTime();
+
+        private int budget;
+        private int expansionsUsed;
+        private boolean exhausted;
+        private boolean closed;
+        private int emittedTotal;
+
+        ExpandingSearchIterator(RemoteVectorIndexService service,
+                                 String tablespace, String table, String indexName,
+                                 float[] queryVector, int initialBudget, int maxExpansions) {
+            this.service = service;
+            this.tablespace = tablespace;
+            this.table = table;
+            this.indexName = indexName;
+            this.queryVector = queryVector;
+            this.budget = initialBudget;
+            this.maxExpansions = maxExpansions;
+        }
+
+        @Override
+        public boolean hasNext() throws StatementExecutionException {
+            if (closed) {
+                return false;
+            }
+            if (!buffer.isEmpty()) {
+                return true;
+            }
+            while (buffer.isEmpty() && !exhausted && expansionsUsed <= maxExpansions) {
+                fetchNextBatch();
+            }
+            return !buffer.isEmpty();
+        }
+
+        @Override
+        public Map.Entry<Bytes, Float> next() throws StatementExecutionException {
+            if (!hasNext()) {
+                throw new java.util.NoSuchElementException();
+            }
+            emittedTotal++;
+            return buffer.pollFirst();
+        }
+
+        private void fetchNextBatch() throws StatementExecutionException {
+            int requested = budget;
+            long rpcStart = System.nanoTime();
+            List<Map.Entry<Bytes, Float>> results;
+            try {
+                results = service.search(tablespace, table, indexName, queryVector, requested);
+            } catch (RuntimeException e) {
+                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - rpcStart);
+                LOGGER.log(Level.SEVERE,
+                        "searchStream expansion {0} failed for index {1} after {2} ms: {3}",
+                        new Object[]{expansionsUsed, indexName, elapsedMs, e.getMessage()});
+                throw new StatementExecutionException(
+                        "remote vector index search failed: " + e.getMessage(), e);
+            }
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - rpcStart);
+            int returned = results.size();
+            int newlyAdded = 0;
+            List<Map.Entry<Bytes, Float>> newEntries = new ArrayList<>();
+            for (Map.Entry<Bytes, Float> e : results) {
+                if (seen.add(e.getKey())) {
+                    newEntries.add(e);
+                    newlyAdded++;
+                }
+            }
+            buffer.addAll(newEntries);
+            LOGGER.log(Level.FINE,
+                    "searchStream expansion {0} index={1} budget={2} returned={3} new={4} in {5} ms",
+                    new Object[]{expansionsUsed, indexName, requested, returned, newlyAdded, elapsedMs});
+
+            // Exhaustion signal: the remote returned strictly fewer rows than
+            // we asked for, so the underlying index has no more candidates.
+            if (returned < requested) {
+                exhausted = true;
+            }
+            expansionsUsed++;
+            if (budget > Integer.MAX_VALUE / 2) {
+                budget = Integer.MAX_VALUE;
+            } else {
+                budget *= 2;
+            }
+        }
+
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            buffer.clear();
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+            LOGGER.log(Level.FINE,
+                    "searchStream close index={0} emitted={1} expansions={2} elapsed={3} ms exhausted={4}",
+                    new Object[]{indexName, emittedTotal, expansionsUsed, elapsedMs, exhausted});
         }
     }
 

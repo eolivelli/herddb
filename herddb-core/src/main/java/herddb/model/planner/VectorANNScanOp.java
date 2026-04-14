@@ -57,6 +57,30 @@ import java.util.Map;
  */
 public class VectorANNScanOp implements PlannerOp {
 
+    /**
+     * Over-fetch factor for the initial batch when a WHERE predicate is
+     * present: we ask the indexing service for {@code ceil((limit+offset) * FACTOR)}
+     * hits up front, expecting some to be filtered out by the predicate or
+     * by stale/deleted PK skipping.
+     */
+    private static final float PREDICATE_OVER_FETCH_FACTOR = 1.5f;
+
+    /**
+     * Minimum size of the initial ANN batch when a predicate is present.
+     * Keeps tiny {@code LIMIT 1} queries from burning many expansion round
+     * trips in the common case where the predicate hits something within the
+     * first handful of candidates.
+     */
+    private static final int PREDICATE_MIN_INITIAL = 16;
+
+    /**
+     * Maximum number of times the streaming iterator will double the search
+     * budget before giving up. With an initial budget {@code B}, the hard
+     * ceiling is {@code B * 2^MAX_EXPANSIONS}. Prevents an unbounded loop
+     * when the predicate filters almost every candidate.
+     */
+    private static final int PREDICATE_MAX_EXPANSIONS = 6;
+
     private final String tableSpace;
     private final Table tableDef;
     private final String columnName;
@@ -173,9 +197,9 @@ public class VectorANNScanOp implements PlannerOp {
         Object qvObj = queryVectorExpr.evaluate(DataAccessor.NULL, context);
         float[] queryVector = (float[]) RecordSerializer.convert(ColumnTypes.FLOATARRAY, qvObj);
 
-        int topK;
         int limit = -1;
         int offset = 0;
+        int topK;
         if (limitExpr != null) {
             limit = ((Number) limitExpr.evaluate(DataAccessor.NULL, context)).intValue();
             offset = offsetExpr != null
@@ -185,15 +209,11 @@ public class VectorANNScanOp implements PlannerOp {
                 topK = Integer.MAX_VALUE;
             }
         } else {
-            // LimitOp stayed external (e.g. because a WHERE predicate prevents
-            // absorbing the limit into this op). The outer LimitOp still applies
-            // the final row cap; fetch as much as the index has so the outer
-            // limit sees enough post-predicate rows. IndexingServiceClient caps
-            // the PriorityQueue initial capacity so this is safe.
+            // No LimitOp could be pushed into this op — this only happens for
+            // non-top-level patterns (e.g. ANN inside a subquery). Fetch
+            // everything the index has and let the outer operators cap it.
             topK = Integer.MAX_VALUE;
         }
-
-        List<Map.Entry<Bytes, Float>> annResults = vim.search(queryVector, topK);
 
         Transaction transaction = tableSpaceManager.getTransaction(transactionContext.transactionId);
         String[] fieldNames = (innerProjection != null) ? innerProjection.getFieldNames()
@@ -202,35 +222,94 @@ public class VectorANNScanOp implements PlannerOp {
         MaterializedRecordSet recordSet = tableSpaceManager.getDbmanager().getRecordSetFactory()
                 .createRecordSet(fieldNames, cols);
 
-        int skipped = 0;
-        int added = 0;
-        for (Map.Entry<Bytes, Float> entry : annResults) {
-            Bytes pk = entry.getKey();
-            GetStatement get = new GetStatement(tableSpace, tableDef.name, pk, null, false);
-            GetResult getResult = tableSpaceManager.getDbmanager().get(get, context, transactionContext);
-            if (!getResult.found()) {
-                continue;
-            }
-            Record record = getResult.getRecord();
-            if (predicate != null && !predicate.evaluate(record, context)) {
-                continue;
-            }
-            if (limitExpr != null && skipped < offset) {
-                skipped++;
-                continue;
-            }
-            DataAccessor fullRow = record.getDataAccessor(tableDef);
-            DataAccessor scanRow = (scanProjection != null) ? scanProjection.map(fullRow, context) : fullRow;
-            DataAccessor projectedRow = (innerProjection != null) ? innerProjection.map(scanRow, context) : scanRow;
-            recordSet.add(projectedRow);
-            added++;
-            if (limit > 0 && added >= limit) {
-                break;
+        if (predicate != null && limitExpr != null) {
+            // Streaming path: start with an over-fetch of topK * factor and
+            // keep pulling more from the indexing service until we have
+            // `limit` rows that satisfy the predicate (or the index is
+            // exhausted). Stale/deleted PKs are skipped identically to
+            // predicate-filtered rows.
+            streamFilteredResults(vim, queryVector, topK, limit, offset,
+                    tableSpaceManager, transactionContext, context, recordSet);
+        } else {
+            // Fast path: no predicate, or no limit pushed down. Keep the
+            // single-shot behavior for back-compat and lower latency.
+            List<Map.Entry<Bytes, Float>> annResults = vim.search(queryVector, topK);
+            int skipped = 0;
+            int added = 0;
+            for (Map.Entry<Bytes, Float> entry : annResults) {
+                Bytes pk = entry.getKey();
+                GetStatement get = new GetStatement(tableSpace, tableDef.name, pk, null, false);
+                GetResult getResult = tableSpaceManager.getDbmanager().get(get, context, transactionContext);
+                if (!getResult.found()) {
+                    continue;
+                }
+                Record record = getResult.getRecord();
+                if (predicate != null && !predicate.evaluate(record, context)) {
+                    continue;
+                }
+                if (limitExpr != null && skipped < offset) {
+                    skipped++;
+                    continue;
+                }
+                DataAccessor fullRow = record.getDataAccessor(tableDef);
+                DataAccessor scanRow = (scanProjection != null) ? scanProjection.map(fullRow, context) : fullRow;
+                DataAccessor projectedRow = (innerProjection != null) ? innerProjection.map(scanRow, context) : scanRow;
+                recordSet.add(projectedRow);
+                added++;
+                if (limit > 0 && added >= limit) {
+                    break;
+                }
             }
         }
 
         recordSet.writeFinished();
         return new ScanResult(transactionContext.transactionId, new SimpleDataScanner(transaction, recordSet));
+    }
+
+    private void streamFilteredResults(
+            VectorIndexManager vim,
+            float[] queryVector,
+            int targetK,
+            int limit,
+            int offset,
+            TableSpaceManager tableSpaceManager,
+            TransactionContext transactionContext,
+            StatementEvaluationContext context,
+            MaterializedRecordSet recordSet
+    ) throws StatementExecutionException {
+        VectorIndexManager.SearchIterator it = vim.searchStream(queryVector, targetK,
+                PREDICATE_OVER_FETCH_FACTOR, PREDICATE_MIN_INITIAL, PREDICATE_MAX_EXPANSIONS);
+        try {
+            int skipped = 0;
+            int added = 0;
+            while (it.hasNext()) {
+                Map.Entry<Bytes, Float> entry = it.next();
+                Bytes pk = entry.getKey();
+                GetStatement get = new GetStatement(tableSpace, tableDef.name, pk, null, false);
+                GetResult getResult = tableSpaceManager.getDbmanager().get(get, context, transactionContext);
+                if (!getResult.found()) {
+                    continue;
+                }
+                Record record = getResult.getRecord();
+                if (!predicate.evaluate(record, context)) {
+                    continue;
+                }
+                if (skipped < offset) {
+                    skipped++;
+                    continue;
+                }
+                DataAccessor fullRow = record.getDataAccessor(tableDef);
+                DataAccessor scanRow = (scanProjection != null) ? scanProjection.map(fullRow, context) : fullRow;
+                DataAccessor projectedRow = (innerProjection != null) ? innerProjection.map(scanRow, context) : scanRow;
+                recordSet.add(projectedRow);
+                added++;
+                if (limit > 0 && added >= limit) {
+                    break;
+                }
+            }
+        } finally {
+            it.close();
+        }
     }
 
     private VectorIndexManager findVectorIndex(TableSpaceManager tableSpaceManager) {

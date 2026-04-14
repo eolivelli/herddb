@@ -258,9 +258,9 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         // loop we drain and sort descending for the final response.
         //
         // The heap grows dynamically, so initial capacity is just an optimization.
-        // Cap it to avoid an Integer.MAX_VALUE allocation when callers (e.g. a
-        // VectorANNScanOp with a WHERE predicate wrapped in an external LimitOp)
-        // pass an unbounded limit — the eviction loop below still respects `limit`.
+        // Cap it to a reasonable value to avoid giant up-front allocations when
+        // callers pass very large limits (e.g. the outer expansion loop of
+        // VectorIndexManager.searchStream doubling the budget on each pass).
         int initialCapacity = Math.max(1, Math.min(limit, 1024));
         PriorityQueue<Map.Entry<Bytes, Float>> topK =
                 new PriorityQueue<>(initialCapacity, Comparator.comparing(Map.Entry::getValue));
