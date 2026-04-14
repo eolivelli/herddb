@@ -135,13 +135,13 @@ for s in "${TARGET_STS[@]}"; do
     kubectl -n default scale sts "$s" --replicas=0
 done
 
-echo "  Waiting for pods to terminate (up to 5m)..."
+echo "  Waiting for pods to terminate (up to 5m per StatefulSet)..."
 for s in "${TARGET_STS[@]}"; do
-    # Wait per-StatefulSet so a single slow shutdown doesn't mask the
-    # others. `--for=delete` watches for the pod objects to disappear.
-    kubectl -n default wait --for=delete pod \
-        -l "app.kubernetes.io/instance=herddb,statefulset.kubernetes.io/pod-name" \
-        --timeout=300s >/dev/null 2>&1 || true
+    # Wait for each StatefulSet individually using `rollout status`.
+    # When replicas==0 this returns immediately. Using rollout status
+    # avoids the false-positive timeout caused by matching other
+    # running pods (e.g. herddb-tools) with a broad label selector.
+    kubectl -n default rollout status sts "$s" --timeout=300s 2>/dev/null || true
 done
 kubectl -n default get pods -l app.kubernetes.io/instance=herddb -o wide || true
 

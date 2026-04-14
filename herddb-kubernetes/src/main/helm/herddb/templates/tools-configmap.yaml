@@ -13,4 +13,7 @@ data:
   indexing-admin: |
     #!/bin/bash
     exec /opt/herddb/bin/indexing-admin.sh "$@"
+  vector-bench: |
+    #!/bin/bash
+    exec /opt/herddb/bin/vector-bench.sh "$@"
 {{- end }}

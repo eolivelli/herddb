@@ -47,7 +47,7 @@ server:
       cpu: "8"
 
 fileServer:
-  replicaCount: 1
+  replicaCount: 2
   javaOpts: "-Xms12g -Xmx12g -Djava.net.preferIPv4Stack=true"
   storageMode: s3
   s3:
@@ -58,7 +58,11 @@ fileServer:
     # Credentials are read from this Kubernetes Secret instead of
     # being embedded in the ConfigMap.
     credentialsSecret: "herddb-gcs-credentials"
-    # Local disk cache — sized to match the PVC (150 Gi = 161061273600 bytes)
+    # On-disk cache limit: maximum bytes the file server may keep in its
+    # local disk cache (backed by the PVC below). This is NOT an in-memory
+    # cache — pages are stored on the PVC's block device and evicted to GCS
+    # when the limit is reached. Set it slightly below the PVC size to leave
+    # headroom for temporary write buffers.  150 Gi = 161061273600 bytes.
     cacheMaxBytes: 161061273600
   storage:
     size: 200Gi

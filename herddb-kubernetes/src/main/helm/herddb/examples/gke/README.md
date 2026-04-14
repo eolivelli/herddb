@@ -8,11 +8,17 @@ the object store via its S3-compatible endpoint.
 | Component        | Replicas | Purpose                                          |
 |------------------|----------|--------------------------------------------------|
 | HerdDB server    | 1        | JDBC endpoint, metadata (ZooKeeper), commit log (BookKeeper) |
-| File server      | 1        | gRPC page storage, backed by GCS (S3 endpoint)   |
+| File server      | 2        | gRPC page storage, backed by GCS (S3 endpoint). Each replica maintains an independent **on-disk** page cache (PVC-backed, up to `cacheMaxBytes`). More replicas distribute I/O load across pods. |
 | ZooKeeper        | 1        | Cluster coordination and metadata storage         |
 | BookKeeper       | 1        | Distributed commit log                            |
-| Indexing service | 1        | Vector indexing service                           |
+| Indexing service | 2        | Vector indexing service                           |
 | Tools pod        | 1        | Pre-configured CLI for interactive queries        |
+
+> **File-server cache note:** `fileServer.s3.cacheMaxBytes` is the
+> **on-disk** cache limit — it controls how much of the PVC the file server
+> uses as a local page cache before evicting blocks to GCS.  It is *not* an
+> in-memory cache.  The PVC size (`fileServer.storage.size`) must be larger
+> than `cacheMaxBytes` to leave room for write buffers.
 
 MinIO is **not** deployed; the file server connects directly to GCS.
 
