@@ -88,11 +88,21 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
     private static class ServerSnapshot {
         final ConsistentHashRouter router;
-        final Map<String, ManagedChannel> channels;
+        /**
+         * Read-plane channels, one per server. Keyed by server id. Separate from
+         * {@link #writeChannels} so read and write RPCs sit on independent TCP
+         * connections and cannot share HTTP/2 stream budgets (issue #100).
+         */
+        final Map<String, ManagedChannel> readChannels;
+        /** Write-plane channels. Same keys as {@link #readChannels}. */
+        final Map<String, ManagedChannel> writeChannels;
 
-        ServerSnapshot(ConsistentHashRouter router, Map<String, ManagedChannel> channels) {
+        ServerSnapshot(ConsistentHashRouter router,
+                       Map<String, ManagedChannel> readChannels,
+                       Map<String, ManagedChannel> writeChannels) {
             this.router = router;
-            this.channels = Collections.unmodifiableMap(new HashMap<>(channels));
+            this.readChannels = Collections.unmodifiableMap(new HashMap<>(readChannels));
+            this.writeChannels = Collections.unmodifiableMap(new HashMap<>(writeChannels));
         }
     }
 
@@ -130,11 +140,13 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
             return t;
         });
 
-        Map<String, ManagedChannel> channels = new HashMap<>();
+        Map<String, ManagedChannel> readChannels = new HashMap<>();
+        Map<String, ManagedChannel> writeChannels = new HashMap<>();
         for (String server : servers) {
-            channels.put(server, buildChannel(server));
+            readChannels.put(server, buildChannel(server));
+            writeChannels.put(server, buildChannel(server));
         }
-        this.snapshot = new ServerSnapshot(new ConsistentHashRouter(servers), channels);
+        this.snapshot = new ServerSnapshot(new ConsistentHashRouter(servers), readChannels, writeChannels);
         if (!servers.isEmpty()) {
             this.serversReadyLatch.countDown();
         }
@@ -172,11 +184,21 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         return path + "#block" + blockIndex;
     }
 
-    private RemoteFileServiceGrpc.RemoteFileServiceStub asyncStubForBlock(String path, long blockIndex) {
+    /** Read-plane stub for a specific block (issue #100). */
+    private RemoteFileServiceGrpc.RemoteFileServiceStub readStubForBlock(String path, long blockIndex) {
         String key = blockRoutingKey(path, blockIndex);
         ServerSnapshot s = this.snapshot;
         String server = s.router.getServer(key);
-        return RemoteFileServiceGrpc.newStub(s.channels.get(server))
+        return RemoteFileServiceGrpc.newStub(s.readChannels.get(server))
+                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
+    }
+
+    /** Write-plane stub for a specific block (issue #100). */
+    private RemoteFileServiceGrpc.RemoteFileServiceStub writeStubForBlock(String path, long blockIndex) {
+        String key = blockRoutingKey(path, blockIndex);
+        ServerSnapshot s = this.snapshot;
+        String server = s.router.getServer(key);
+        return RemoteFileServiceGrpc.newStub(s.writeChannels.get(server))
                 .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
     }
 
@@ -190,34 +212,38 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         ServerSnapshot current = this.snapshot;
 
         Set<String> added = new LinkedHashSet<>(newServers);
-        added.removeAll(current.channels.keySet());
+        added.removeAll(current.readChannels.keySet());
 
-        Set<String> removed = new LinkedHashSet<>(current.channels.keySet());
+        Set<String> removed = new LinkedHashSet<>(current.readChannels.keySet());
         removed.removeAll(new HashSet<>(newServers));
 
-        Map<String, ManagedChannel> newChannels = new HashMap<>();
+        Map<String, ManagedChannel> newReadChannels = new HashMap<>();
+        Map<String, ManagedChannel> newWriteChannels = new HashMap<>();
         for (String server : newServers) {
-            ManagedChannel existing = current.channels.get(server);
-            if (existing != null) {
-                newChannels.put(server, existing);
-            } else {
-                newChannels.put(server, buildChannel(server));
-            }
+            ManagedChannel existingRead = current.readChannels.get(server);
+            ManagedChannel existingWrite = current.writeChannels.get(server);
+            newReadChannels.put(server, existingRead != null ? existingRead : buildChannel(server));
+            newWriteChannels.put(server, existingWrite != null ? existingWrite : buildChannel(server));
         }
 
-        this.snapshot = new ServerSnapshot(new ConsistentHashRouter(newServers), newChannels);
+        this.snapshot = new ServerSnapshot(new ConsistentHashRouter(newServers),
+                newReadChannels, newWriteChannels);
         serversReadyLatch.countDown();
 
         LOGGER.log(Level.INFO, "Updated remote file servers: {0} (added: {1}, removed: {2})",
                 new Object[]{newServers, added, removed});
 
-        // Gracefully shutdown removed channels in background
+        // Gracefully shutdown removed channel pairs in background
         if (!removed.isEmpty()) {
             List<ManagedChannel> toShutdown = new ArrayList<>();
             for (String server : removed) {
-                ManagedChannel ch = current.channels.get(server);
-                if (ch != null) {
-                    toShutdown.add(ch);
+                ManagedChannel readCh = current.readChannels.get(server);
+                if (readCh != null) {
+                    toShutdown.add(readCh);
+                }
+                ManagedChannel writeCh = current.writeChannels.get(server);
+                if (writeCh != null) {
+                    toShutdown.add(writeCh);
                 }
             }
             Thread shutdownThread = new Thread(() -> {
@@ -242,7 +268,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
      */
     public boolean hasServers() {
         ServerSnapshot s = this.snapshot;
-        return !s.channels.isEmpty();
+        return !s.readChannels.isEmpty();
     }
 
     /**
@@ -256,23 +282,33 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         return serversReadyLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
-    private RemoteFileServiceGrpc.RemoteFileServiceBlockingStub blockingStubForPath(String path) {
+    /** Read-plane async stub for a path. */
+    private RemoteFileServiceGrpc.RemoteFileServiceStub readStubForPath(String path) {
         ServerSnapshot s = this.snapshot;
         String server = s.router.getServer(path);
-        return RemoteFileServiceGrpc.newBlockingStub(s.channels.get(server))
+        return RemoteFileServiceGrpc.newStub(s.readChannels.get(server))
                 .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
     }
 
-    private RemoteFileServiceGrpc.RemoteFileServiceStub asyncStubForPath(String path) {
+    /** Write-plane async stub for a path. */
+    private RemoteFileServiceGrpc.RemoteFileServiceStub writeStubForPath(String path) {
         ServerSnapshot s = this.snapshot;
         String server = s.router.getServer(path);
-        return RemoteFileServiceGrpc.newStub(s.channels.get(server))
+        return RemoteFileServiceGrpc.newStub(s.writeChannels.get(server))
                 .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
     }
 
-    private RemoteFileServiceGrpc.RemoteFileServiceStub asyncStubForServer(String server) {
+    /** Read-plane async stub targeting a specific server (used by listFiles fan-out). */
+    private RemoteFileServiceGrpc.RemoteFileServiceStub readStubForServer(String server) {
         ServerSnapshot s = this.snapshot;
-        return RemoteFileServiceGrpc.newStub(s.channels.get(server))
+        return RemoteFileServiceGrpc.newStub(s.readChannels.get(server))
+                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
+    }
+
+    /** Write-plane async stub targeting a specific server (used by deleteByPrefix fan-out). */
+    private RemoteFileServiceGrpc.RemoteFileServiceStub writeStubForServer(String server) {
+        ServerSnapshot s = this.snapshot;
+        return RemoteFileServiceGrpc.newStub(s.writeChannels.get(server))
                 .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
     }
 
@@ -291,7 +327,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         CompletableFuture<Long> future = new CompletableFuture<>();
         RemoteFileServiceGrpc.RemoteFileServiceStub stub;
         try {
-            stub = asyncStubForPath(path);
+            stub = writeStubForPath(path);
         } catch (Exception e) {
             future.completeExceptionally(e);
             return future;
@@ -328,7 +364,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
     private CompletableFuture<byte[]> doReadFileAsync(String path) {
         CompletableFuture<byte[]> future = new CompletableFuture<>();
-        asyncStubForPath(path).readFile(
+        readStubForPath(path).readFile(
                 ReadFileRequest.newBuilder().setPath(path).build(),
                 new StreamObserver<ReadFileResponse>() {
                     private byte[] result;
@@ -359,7 +395,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
     private CompletableFuture<Boolean> doDeleteFileAsync(String path) {
         CompletableFuture<Boolean> future = new CompletableFuture<>();
-        asyncStubForPath(path).deleteFile(
+        writeStubForPath(path).deleteFile(
                 DeleteFileRequest.newBuilder().setPath(path).build(),
                 new StreamObserver<DeleteFileResponse>() {
                     private boolean deleted;
@@ -389,8 +425,8 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     private CompletableFuture<List<String>> doListFilesAsync(String prefix) {
         ServerSnapshot s = this.snapshot;
         List<CompletableFuture<List<String>>> futures = new ArrayList<>();
-        for (String server : s.channels.keySet()) {
-            RemoteFileServiceGrpc.RemoteFileServiceStub stub = asyncStubForServer(server);
+        for (String server : s.readChannels.keySet()) {
+            RemoteFileServiceGrpc.RemoteFileServiceStub stub = readStubForServer(server);
             CompletableFuture<List<String>> serverFuture = new CompletableFuture<>();
             List<String> paths = Collections.synchronizedList(new ArrayList<>());
             stub.listFiles(
@@ -431,7 +467,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
      */
     public CompletableFuture<Void> writeFileBlockAsync(String path, long blockIndex, byte[] content) {
         CompletableFuture<Void> future = new CompletableFuture<>();
-        asyncStubForBlock(path, blockIndex).writeFileBlock(
+        writeStubForBlock(path, blockIndex).writeFileBlock(
                 WriteFileBlockRequest.newBuilder()
                         .setPath(path)
                         .setBlockIndex(blockIndex)
@@ -494,7 +530,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         return retryAsync(() -> {
             long blockIndex = offset / blockSize;
             CompletableFuture<byte[]> future = new CompletableFuture<>();
-            asyncStubForBlock(path, blockIndex).readFileRange(
+            readStubForBlock(path, blockIndex).readFileRange(
                     ReadFileRangeRequest.newBuilder()
                             .setPath(path)
                             .setOffset(offset)
@@ -562,8 +598,8 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     private CompletableFuture<Integer> doDeleteByPrefixAsync(String prefix) {
         ServerSnapshot s = this.snapshot;
         List<CompletableFuture<Integer>> futures = new ArrayList<>();
-        for (String server : s.channels.keySet()) {
-            RemoteFileServiceGrpc.RemoteFileServiceStub stub = asyncStubForServer(server);
+        for (String server : s.writeChannels.keySet()) {
+            RemoteFileServiceGrpc.RemoteFileServiceStub stub = writeStubForServer(server);
             CompletableFuture<Integer> serverFuture = new CompletableFuture<>();
             stub.deleteByPrefix(
                     DeleteByPrefixRequest.newBuilder().setPrefix(prefix).build(),
@@ -652,12 +688,18 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     public void close() {
         retryScheduler.shutdownNow();
         ServerSnapshot s = this.snapshot;
-        for (Map.Entry<String, ManagedChannel> entry : s.channels.entrySet()) {
+        shutdownChannels(s.readChannels, "read");
+        shutdownChannels(s.writeChannels, "write");
+    }
+
+    private static void shutdownChannels(Map<String, ManagedChannel> channels, String planeName) {
+        for (Map.Entry<String, ManagedChannel> entry : channels.entrySet()) {
             try {
                 entry.getValue().shutdown().awaitTermination(5, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                LOGGER.log(Level.WARNING, "Interrupted while shutting down channel to " + entry.getKey(), e);
+                LOGGER.log(Level.WARNING,
+                        "Interrupted while shutting down " + planeName + " channel to " + entry.getKey(), e);
             }
         }
     }
