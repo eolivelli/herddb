@@ -3214,6 +3214,263 @@
       "showTitle": false,
       "title": "Status RPC",
       "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "File-server lane executor queue depth. Under checkpoint pressure the write series should spike while the read series stays flat — that is the issue #100 fix working.",
+          "fill": 1,
+          "id": 100,
+          "legend": {
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 3,
+          "targets": [
+            {
+              "expr": "rfs_read_executor_queue_size{instance=~\"$fs_instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} read",
+              "refId": "A"
+            },
+            {
+              "expr": "rfs_write_executor_queue_size{instance=~\"$fs_instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} write",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "File Server Executor Queue Size (read vs write)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "File-server lane executor active thread count.",
+          "fill": 1,
+          "id": 101,
+          "legend": {
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 3,
+          "targets": [
+            {
+              "expr": "rfs_read_executor_active_count{instance=~\"$fs_instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} read",
+              "refId": "A"
+            },
+            {
+              "expr": "rfs_write_executor_active_count{instance=~\"$fs_instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} write",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "File Server Executor Active Threads (read vs write)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "File-server readFileRange p99 latency during contention. Should stay low even while writes are in flight.",
+          "fill": 1,
+          "id": 102,
+          "legend": {
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 3,
+          "targets": [
+            {
+              "expr": "rfs_readrange_latency{success=\"true\",quantile=\"0.99\",instance=~\"$fs_instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} p99",
+              "refId": "A"
+            },
+            {
+              "expr": "rfs_readrange_latency{success=\"true\",quantile=\"0.5\",instance=~\"$fs_instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} p50",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "File Server Read-Range Latency (p50 / p99)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "µs",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "File-server request rate split by operation type — confirms which lane is under pressure.",
+          "fill": 1,
+          "id": 103,
+          "legend": {
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 3,
+          "targets": [
+            {
+              "expr": "rate(rfs_readrange_requests{instance=~\"$fs_instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} read-range",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(rfs_writeblock_requests{instance=~\"$fs_instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} write-block",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "File Server Request Rate (read-range vs write-block)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "ops",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "File Server I/O Isolation (issue #100)",
+      "titleSize": "h6"
     }
   ],
   "schemaVersion": 14,
@@ -3290,6 +3547,23 @@
         "refresh": 1,
         "regex": "/vidx_(.+?)_node_count/",
         "sort": 1,
+        "type": "query",
+        "useTags": false
+      },
+      {
+        "allValue": ".+",
+        "current": {},
+        "datasource": "Prometheus",
+        "hide": 0,
+        "includeAll": true,
+        "label": "File Server",
+        "multi": true,
+        "name": "fs_instance",
+        "options": [],
+        "query": "label_values(rfs_read_requests, instance)",
+        "refresh": 1,
+        "regex": "",
+        "sort": 0,
         "type": "query",
         "useTags": false
       }

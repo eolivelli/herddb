@@ -41,7 +41,9 @@ import java.util.Properties;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
@@ -81,6 +83,10 @@ public class RemoteFileServer implements AutoCloseable {
     public static final String CONFIG_BLOCK_CACHE_MAX_BYTES = "block.cache.max.bytes";
     /** Config key: enable/disable the in-heap block cache. */
     public static final String CONFIG_BLOCK_CACHE_ENABLED = "block.cache.enabled";
+    /** Config key: thread count for the dedicated read-lane executor (issue #100). */
+    public static final String CONFIG_READ_EXECUTOR_THREADS = "fileserver.read.executor.threads";
+    /** Config key: thread count for the dedicated write-lane executor (issue #100). */
+    public static final String CONFIG_WRITE_EXECUTOR_THREADS = "fileserver.write.executor.threads";
 
     private final String host;
     private final int port;
@@ -91,6 +97,8 @@ public class RemoteFileServer implements AutoCloseable {
     private NioEventLoopGroup bossGroup;
     private NioEventLoopGroup workerGroup;
     private ExecutorService metadataExecutor;
+    private ThreadPoolExecutor readExecutor;
+    private ThreadPoolExecutor writeExecutor;
     private int blockSize;
     private ObjectStorage objectStorage;
     private PrometheusMetricsProvider statsProvider;
@@ -126,6 +134,13 @@ public class RemoteFileServer implements AutoCloseable {
             return t;
         };
         metadataExecutor = Executors.newFixedThreadPool(ioThreads, threadFactory);
+
+        int readExecutorThreads = Integer.parseInt(
+                config.getProperty(CONFIG_READ_EXECUTOR_THREADS, String.valueOf(ioThreads)));
+        int writeExecutorThreads = Integer.parseInt(
+                config.getProperty(CONFIG_WRITE_EXECUTOR_THREADS, String.valueOf(ioThreads)));
+        readExecutor = buildLaneExecutor("remote-file-read-exec-", readExecutorThreads);
+        writeExecutor = buildLaneExecutor("remote-file-write-exec-", writeExecutorThreads);
 
         String storageMode = config.getProperty("storage.mode", "local");
         if ("s3".equals(storageMode)) {
@@ -169,7 +184,9 @@ public class RemoteFileServer implements AutoCloseable {
         workerGroup = new NioEventLoopGroup(ioThreads);
         workerGroup.setIoRatio(ioRatio);
 
-        RemoteFileServiceImpl serviceImpl = new RemoteFileServiceImpl(objectStorage, statsLogger);
+        RemoteFileServiceImpl serviceImpl = new RemoteFileServiceImpl(
+                objectStorage, statsLogger, readExecutor, writeExecutor);
+        registerLaneExecutorGauges(statsLogger);
         NettyServerBuilder grpcBuilder = NettyServerBuilder.forPort(port)
                 .bossEventLoopGroup(bossGroup)
                 .workerEventLoopGroup(workerGroup)
@@ -222,8 +239,66 @@ public class RemoteFileServer implements AutoCloseable {
         }
 
         LOGGER.log(Level.INFO,
-                "RemoteFileServer started on port {0}, storage: {1}, io threads: {2}, ioRatio: {3}, blockSize: {4}",
-                new Object[]{port, storageMode, ioThreads, ioRatio, this.blockSize});
+                "RemoteFileServer started on port {0}, storage: {1}, io threads: {2}, ioRatio: {3}, "
+                        + "blockSize: {4}, readLane: {5}, writeLane: {6}",
+                new Object[]{port, storageMode, ioThreads, ioRatio, this.blockSize,
+                        readExecutorThreads, writeExecutorThreads});
+    }
+
+    private ThreadPoolExecutor buildLaneExecutor(String namePrefix, int threads) {
+        AtomicInteger counter = new AtomicInteger();
+        ThreadFactory factory = r -> {
+            Thread t = new Thread(r, namePrefix + counter.getAndIncrement());
+            t.setDaemon(true);
+            return t;
+        };
+        return new ThreadPoolExecutor(
+                threads, threads,
+                0L, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(),
+                factory);
+    }
+
+    private void registerLaneExecutorGauges(StatsLogger root) {
+        registerExecutorGauges(root, "read_executor", readExecutor);
+        registerExecutorGauges(root, "write_executor", writeExecutor);
+    }
+
+    private static void registerExecutorGauges(StatsLogger root, String name, ThreadPoolExecutor exec) {
+        StatsLogger scope = root.scope("rfs").scope(name);
+        scope.registerGauge("queue_size", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return (long) exec.getQueue().size();
+            }
+        });
+        scope.registerGauge("active_count", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return (long) exec.getActiveCount();
+            }
+        });
+        scope.registerGauge("pool_size", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return (long) exec.getPoolSize();
+            }
+        });
     }
 
     private ObjectStorage buildS3ObjectStorage() throws IOException {
@@ -425,6 +500,14 @@ public class RemoteFileServer implements AutoCloseable {
         if (metadataExecutor != null) {
             metadataExecutor.shutdown();
             metadataExecutor.awaitTermination(30, TimeUnit.SECONDS);
+        }
+        if (readExecutor != null) {
+            readExecutor.shutdown();
+            readExecutor.awaitTermination(30, TimeUnit.SECONDS);
+        }
+        if (writeExecutor != null) {
+            writeExecutor.shutdown();
+            writeExecutor.awaitTermination(30, TimeUnit.SECONDS);
         }
         if (objectStorage != null) {
             try {

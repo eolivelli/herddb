@@ -40,7 +40,10 @@ import herddb.remote.storage.ObjectStorage;
 import herddb.remote.storage.ReadResult;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.bookkeeper.stats.Counter;
@@ -58,6 +61,8 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
     private static final Logger LOGGER = Logger.getLogger(RemoteFileServiceImpl.class.getName());
 
     private final ObjectStorage storage;
+    private final Executor readExecutor;
+    private final Executor writeExecutor;
 
     private final Counter writeRequests;
     private final Counter writeErrors;
@@ -94,11 +99,28 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
     private final OpStatsLogger readRangeLatency;
 
     public RemoteFileServiceImpl(ObjectStorage storage) {
-        this(storage, NullStatsLogger.INSTANCE);
+        this(storage, NullStatsLogger.INSTANCE, null, null);
     }
 
     public RemoteFileServiceImpl(ObjectStorage storage, StatsLogger statsLogger) {
+        this(storage, statsLogger, null, null);
+    }
+
+    /**
+     * Creates the service with dedicated read/write execution lanes (issue #100).
+     * Each RPC handler dispatches its storage call and its completion callback onto
+     * {@code readExecutor} or {@code writeExecutor} according to operation type, so
+     * slow write-path callbacks cannot starve read-path responses.
+     *
+     * <p>If either executor is {@code null}, handlers fall back to
+     * {@code whenComplete} on the storage future's default thread, preserving the
+     * legacy behavior.
+     */
+    public RemoteFileServiceImpl(ObjectStorage storage, StatsLogger statsLogger,
+                                 Executor readExecutor, Executor writeExecutor) {
         this.storage = storage;
+        this.readExecutor = readExecutor;
+        this.writeExecutor = writeExecutor;
 
         StatsLogger scope = statsLogger.scope("rfs");
 
@@ -139,11 +161,15 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
 
     @Override
     public void writeFile(WriteFileRequest request, StreamObserver<WriteFileResponse> responseObserver) {
+        runOnLane(writeExecutor, () -> writeFileImpl(request, responseObserver));
+    }
+
+    private void writeFileImpl(WriteFileRequest request, StreamObserver<WriteFileResponse> responseObserver) {
         long start = System.nanoTime();
         writeRequests.inc();
         byte[] content = request.getContent().toByteArray();
-        storage.write(request.getPath(), content)
-                .whenComplete((v, t) -> {
+        attachCallback(storage.write(request.getPath(), content), writeExecutor,
+                (v, t) -> {
                     long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
                     if (t != null) {
                         writeErrors.inc();
@@ -166,10 +192,14 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
 
     @Override
     public void readFile(ReadFileRequest request, StreamObserver<ReadFileResponse> responseObserver) {
+        runOnLane(readExecutor, () -> readFileImpl(request, responseObserver));
+    }
+
+    private void readFileImpl(ReadFileRequest request, StreamObserver<ReadFileResponse> responseObserver) {
         long start = System.nanoTime();
         readRequests.inc();
-        storage.read(request.getPath())
-                .whenComplete((result, t) -> {
+        attachCallback(storage.read(request.getPath()), readExecutor,
+                (result, t) -> {
                     long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
                     if (t != null) {
                         readErrors.inc();
@@ -202,11 +232,16 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
     @Override
     public void writeFileBlock(WriteFileBlockRequest request,
                                StreamObserver<WriteFileBlockResponse> responseObserver) {
+        runOnLane(writeExecutor, () -> writeFileBlockImpl(request, responseObserver));
+    }
+
+    private void writeFileBlockImpl(WriteFileBlockRequest request,
+                                    StreamObserver<WriteFileBlockResponse> responseObserver) {
         long start = System.nanoTime();
         writeBlockRequests.inc();
         byte[] content = request.getContent().toByteArray();
-        storage.writeBlock(request.getPath(), request.getBlockIndex(), content)
-                .whenComplete((v, t) -> {
+        attachCallback(storage.writeBlock(request.getPath(), request.getBlockIndex(), content), writeExecutor,
+                (v, t) -> {
                     long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
                     if (t != null) {
                         writeBlockErrors.inc();
@@ -232,10 +267,17 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
     @Override
     public void readFileRange(ReadFileRangeRequest request,
                               StreamObserver<ReadFileRangeResponse> responseObserver) {
+        runOnLane(readExecutor, () -> readFileRangeImpl(request, responseObserver));
+    }
+
+    private void readFileRangeImpl(ReadFileRangeRequest request,
+                                   StreamObserver<ReadFileRangeResponse> responseObserver) {
         long start = System.nanoTime();
         readRangeRequests.inc();
-        storage.readRange(request.getPath(), request.getOffset(), request.getLength(), request.getBlockSize())
-                .whenComplete((result, t) -> {
+        attachCallback(
+                storage.readRange(request.getPath(), request.getOffset(), request.getLength(), request.getBlockSize()),
+                readExecutor,
+                (result, t) -> {
                     long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
                     if (t != null) {
                         readRangeErrors.inc();
@@ -266,10 +308,14 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
 
     @Override
     public void deleteFile(DeleteFileRequest request, StreamObserver<DeleteFileResponse> responseObserver) {
+        runOnLane(writeExecutor, () -> deleteFileImpl(request, responseObserver));
+    }
+
+    private void deleteFileImpl(DeleteFileRequest request, StreamObserver<DeleteFileResponse> responseObserver) {
         long start = System.nanoTime();
         deleteRequests.inc();
-        storage.deleteLogical(request.getPath())
-                .whenComplete((deleted, t) -> {
+        attachCallback(storage.deleteLogical(request.getPath()), writeExecutor,
+                (deleted, t) -> {
                     long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
                     if (t != null) {
                         deleteErrors.inc();
@@ -289,10 +335,14 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
 
     @Override
     public void listFiles(ListFilesRequest request, StreamObserver<ListFilesEntry> responseObserver) {
+        runOnLane(readExecutor, () -> listFilesImpl(request, responseObserver));
+    }
+
+    private void listFilesImpl(ListFilesRequest request, StreamObserver<ListFilesEntry> responseObserver) {
         long start = System.nanoTime();
         listRequests.inc();
-        storage.listLogical(request.getPrefix())
-                .whenComplete((paths, t) -> {
+        attachCallback(storage.listLogical(request.getPrefix()), readExecutor,
+                (paths, t) -> {
                     long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
                     if (t != null) {
                         listErrors.inc();
@@ -329,10 +379,15 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
     @Override
     public void deleteByPrefix(DeleteByPrefixRequest request,
                                StreamObserver<DeleteByPrefixResponse> responseObserver) {
+        runOnLane(writeExecutor, () -> deleteByPrefixImpl(request, responseObserver));
+    }
+
+    private void deleteByPrefixImpl(DeleteByPrefixRequest request,
+                                    StreamObserver<DeleteByPrefixResponse> responseObserver) {
         long start = System.nanoTime();
         deleteByPrefixRequests.inc();
-        storage.deleteByPrefix(request.getPrefix())
-                .whenComplete((count, t) -> {
+        attachCallback(storage.deleteByPrefix(request.getPrefix()), writeExecutor,
+                (count, t) -> {
                     long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
                     if (t != null) {
                         deleteByPrefixErrors.inc();
@@ -354,5 +409,33 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
 
     private static long elapsedMs(long startNanos) {
         return (System.nanoTime() - startNanos) / 1_000_000;
+    }
+
+    /**
+     * Executes {@code task} on the given lane executor, or inline if the executor is
+     * {@code null} (legacy single-lane mode). Lane executors hop handler work off the
+     * Netty worker thread so checkpoint and search paths cannot block each other.
+     */
+    private static void runOnLane(Executor lane, Runnable task) {
+        if (lane != null) {
+            lane.execute(task);
+        } else {
+            task.run();
+        }
+    }
+
+    /**
+     * Attaches {@code callback} to {@code future} using {@code executor} when non-null
+     * ({@code whenCompleteAsync}), otherwise falls back to {@code whenComplete}. Keeps
+     * the existing legacy path byte-for-byte when lanes are disabled.
+     */
+    private static <T> void attachCallback(CompletableFuture<T> future,
+                                           Executor executor,
+                                           BiConsumer<? super T, ? super Throwable> callback) {
+        if (executor != null) {
+            future.whenCompleteAsync(callback, executor);
+        } else {
+            future.whenComplete(callback);
+        }
     }
 }
