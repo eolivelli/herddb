@@ -44,6 +44,10 @@ spec:
               value: {{ .Values.tools.javaOpts | default "-Xms128m -Xmx256m -Djava.net.preferIPv4Stack=true" | quote }}
             - name: VECTORBENCH_DATASET_DIR
               value: /opt/herddb/vector-datasets
+            {{- if .Values.tools.gcs.datasetsBucket }}
+            - name: VECTORBENCH_DATASETS_BUCKET
+              value: "gs://{{ .Values.tools.gcs.datasetsBucket }}"
+            {{- end }}
             {{- if .Values.tools.gcs.credentialsSecret }}
             - name: GCS_ACCESS_KEY
               valueFrom:
