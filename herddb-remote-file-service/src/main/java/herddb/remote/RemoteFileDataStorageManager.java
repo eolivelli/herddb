@@ -278,6 +278,28 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     private static final int MULTIPART_BLOCK_SIZE =
             Integer.getInteger(MULTIPART_BLOCK_SIZE_PROPERTY, 4 * 1024 * 1024);
 
+    /**
+     * System property to override the read-buffer size used by
+     * {@link RemoteRandomAccessReader} when serving vector-index searches over
+     * remote multipart graph files. Default: 16384 bytes (16 KiB). See
+     * issue #104 — this buffer is intentionally decoupled from
+     * {@link #MULTIPART_BLOCK_SIZE} so that HNSW graph traversals do not fetch
+     * multi-MiB windows per miss.
+     *
+     * <p>The 16 KiB default is sized to absorb a single jvector logical read in
+     * one gRPC call. The dominant per-node read during search is the full-
+     * resolution vector fetched by {@code OnDiskGraphIndex.getVectorInto}
+     * for re-ranking, which reads {@code dimension * 4} bytes in a single
+     * {@code readFloatVector} call — 3840 bytes for GIST1M (dim=960), 6144 bytes
+     * for 1536-dim embeddings. A 4 KiB buffer would split those reads across
+     * two gRPC round-trips whenever the position is unaligned; 16 KiB keeps a
+     * raw vector up to ~4096 dimensions in a single fetch while still being
+     * 256× smaller than the 4 MiB write block and an exact divisor of it.
+     */
+    public static final String READ_BUFFER_SIZE_PROPERTY = "herddb.vector.remote.read.bufferSize";
+    static final int READ_BUFFER_SIZE =
+            Integer.getInteger(READ_BUFFER_SIZE_PROPERTY, 16 * 1024);
+
     private static String remoteMultipartPath(String tableSpace, String uuid, String fileType) {
         return tableSpace + "/" + uuid + "/multipart/" + fileType;
     }
@@ -521,8 +543,9 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             String tableSpace, String uuid, String fileType, long fileSize)
             throws DataStorageManagerException {
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
-        int blockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
-        return new RemoteRandomAccessReader.Supplier(client, logicalPath, fileSize, blockSize);
+        int writeBlockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
+        return new RemoteRandomAccessReader.Supplier(
+                client, logicalPath, fileSize, writeBlockSize, READ_BUFFER_SIZE);
     }
 
     @Override
