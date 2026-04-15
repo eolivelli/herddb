@@ -1,0 +1,8 @@
+# Patterns to exclude from the Helm chart package.
+# examples/ contains install scripts, reports, and test artifacts that must
+# not be bundled into the Helm release Secret (Kubernetes limits Secret data
+# to 1 MiB; including examples/ pushes the archive well past that limit).
+examples/
+*.log
+*.hprof
+reports/

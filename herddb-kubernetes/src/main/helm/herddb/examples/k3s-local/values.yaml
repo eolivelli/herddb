@@ -16,9 +16,10 @@
 # ~1.2 GB of raw float data and the CachingObjectStorage reads it into
 # the JVM heap during compaction.
 #
-# Server heap raised to 8 g: multi-iteration gist1m runs (3+ iterations
-# with --drop-table) require more headroom; OOM was observed at 6 g on
-# iter 3 ingest (issue #88). 8 g heap pairs with 9 Gi container memory.
+# Server heap raised to 12 g: sift10m background activator checkpoint
+# serializes all 5,257+ dirty pages (~1 MiB each via VisibleByteArrayOutputStream)
+# during a full 10M-row flush; 8 g was insufficient (issue #111).
+# 12 g heap + 1 GiB JVM overhead → 13 GiB container memory.
 #
 # Tools heap raised to 2 g: loading the sift1m base set (1M × 128 × 4 B
 # = 512 MB) into the vector-bench JVM plus JVM overhead exceeds 512 Mi;
@@ -43,7 +44,7 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  javaOpts: "-Xms8g -Xmx8g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms12g -Xmx12g -Djava.net.preferIPv4Stack=true"
   storage:
     data:
       size: 5Gi
@@ -53,10 +54,10 @@ server:
     indexing.service.timeout: "300"
   resources:
     requests:
-      memory: "9Gi"
+      memory: "13Gi"
       cpu: "2"
     limits:
-      memory: "9Gi"
+      memory: "13Gi"
       cpu: "2"
 
 fileServer:
