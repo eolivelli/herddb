@@ -262,6 +262,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final long compactionIntervalMs;
     private final long maxVectorMemoryBytes;
     private final VectorMemoryBudget memoryBudget;
+    private final long maxLiveBytesPerCheckpoint;
 
     /** Optional stats logger for recording per-segment size distribution. */
     private volatile OpStatsLogger segmentSizeStats;
@@ -293,6 +294,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /** Frozen shards from Phase A. */
     private volatile List<LiveGraphShard> frozenShards;
+
+    /**
+     * Live shards deferred from Phase A because the byte cap was reached;
+     * prepended to {@link #liveShards} at Phase C or restored on Phase B failure.
+     */
+    private volatile List<LiveGraphShard> deferredShards;
 
     /** PKs deleted during Phase B. */
     private volatile Set<Bytes> pendingCheckpointDeletes;
@@ -403,6 +410,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final AtomicLong uploadBytesDone = new AtomicLong();
     private final AtomicLong uploadBytesTotal = new AtomicLong();
 
+    // Deferred shard metrics (issue #107).
+    //
+    // Track shard deferral due to Phase A byte-cap logic, for visibility into
+    // when the checkpoint memory budget is constraining shards across cycles.
+    private final AtomicInteger deferralEvents = new AtomicInteger();
+    private final AtomicLong currentDeferredVectors = new AtomicLong();
+    private final AtomicLong totalDeferredVectors = new AtomicLong();
+
     public long getTotalRolledBackPages() {
         return totalRolledBackPages.get();
     }
@@ -475,6 +490,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return -1;
     }
 
+    public int getDeferralEvents() {
+        return deferralEvents.get();
+    }
+
+    public long getCurrentDeferredVectors() {
+        return currentDeferredVectors.get();
+    }
+
+    public long getTotalDeferredVectors() {
+        return totalDeferredVectors.get();
+    }
+
     // -------------------------------------------------------------------------
     // Test hook
     // -------------------------------------------------------------------------
@@ -497,10 +524,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
                                  long compactionIntervalMs) {
-        this(indexName, tableName, tableSpaceUUID, vectorColumnName, tmpDirectory,
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName,
+                indexName + "_" + tableName + "_" + System.nanoTime(), tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                VectorSimilarityFunction.COSINE, Long.MAX_VALUE);
+                VectorSimilarityFunction.COSINE, Long.MAX_VALUE, null, 0);
     }
 
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
@@ -511,10 +539,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
                                  long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction) {
-        this(indexName, tableName, tableSpaceUUID, vectorColumnName, tmpDirectory,
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName,
+                indexName + "_" + tableName + "_" + System.nanoTime(), tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, Long.MAX_VALUE);
+                similarityFunction, Long.MAX_VALUE, null, 0);
     }
 
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
@@ -526,10 +555,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes) {
-        this(indexName, tableName, tableSpaceUUID, vectorColumnName, tmpDirectory,
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName,
+                indexName + "_" + tableName + "_" + System.nanoTime(), tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, maxVectorMemoryBytes, null);
+                similarityFunction, maxVectorMemoryBytes, null, 0);
     }
 
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
@@ -541,7 +571,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes,
-                                 VectorMemoryBudget memoryBudget) {
+                                 VectorMemoryBudget memoryBudget,
+                                 long maxLiveBytesPerCheckpoint) {
         super(vectorColumnName);
         this.indexName = indexName;
         this.tableName = tableName;
@@ -561,6 +592,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.compactionIntervalMs = compactionIntervalMs;
         this.maxVectorMemoryBytes = maxVectorMemoryBytes;
         this.memoryBudget = memoryBudget;
+        this.maxLiveBytesPerCheckpoint = maxLiveBytesPerCheckpoint > 0 ? maxLiveBytesPerCheckpoint : 10L * 1024 * 1024 * 1024;
     }
 
     /**
@@ -577,7 +609,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                VectorSimilarityFunction.COSINE, Long.MAX_VALUE);
+                VectorSimilarityFunction.COSINE, Long.MAX_VALUE, null, 0);
     }
 
     /**
@@ -594,7 +626,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, Long.MAX_VALUE);
+                similarityFunction, Long.MAX_VALUE, null, 0);
     }
 
     /**
@@ -612,12 +644,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, maxVectorMemoryBytes, null);
+                similarityFunction, maxVectorMemoryBytes, null, 0);
     }
 
     /**
      * Constructor that accepts an explicit indexUUID, similarity function, memory limit,
-     * and global memory budget.
+     * global memory budget, and live-shard snapshot byte cap.
      */
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
                                  String vectorColumnName, String indexUUID, Path tmpDirectory,
@@ -628,7 +660,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes,
-                                 VectorMemoryBudget memoryBudget) {
+                                 VectorMemoryBudget memoryBudget,
+                                 long maxLiveBytesPerCheckpoint) {
         super(vectorColumnName);
         this.indexName = indexName;
         this.tableName = tableName;
@@ -648,6 +681,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.compactionIntervalMs = compactionIntervalMs;
         this.maxVectorMemoryBytes = maxVectorMemoryBytes;
         this.memoryBudget = memoryBudget;
+        this.maxLiveBytesPerCheckpoint = maxLiveBytesPerCheckpoint > 0 ? maxLiveBytesPerCheckpoint : 10L * 1024 * 1024 * 1024;
     }
 
     // -------------------------------------------------------------------------
@@ -974,6 +1008,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
             }
             this.frozenShards = null;
+            this.deferredShards = null;
+            currentDeferredVectors.set(0);
         }
         this.pendingCheckpointDeletes = null;
         this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
@@ -1146,19 +1182,34 @@ public class PersistentVectorStore extends AbstractVectorStore {
             for (LiveGraphShard shard : frozen) {
                 if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
                     int k = Math.min(perSourceK, shard.nodeToPk.size());
-                    try {
-                        ImmutableGraphIndex graph = shard.builder.getGraph();
-                        SearchResult result = GraphSearcher.search(
-                                qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
-                        for (SearchResult.NodeScore ns : result.getNodes()) {
-                            Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
-                            if (pk != null && (pending == null || !pending.contains(pk))) {
-                                results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
-                            }
+                    ImmutableGraphIndex graph = shard.builder.getGraph();
+                    SearchResult result = GraphSearcher.search(
+                            qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
+                    for (SearchResult.NodeScore ns : result.getNodes()) {
+                        Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
+                        if (pk != null && (pending == null || !pending.contains(pk))) {
+                            results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
                         }
-                    } catch (Exception e) {
-                        LOGGER.log(Level.WARNING,
-                                "error searching frozen shard for " + indexName, e);
+                    }
+                }
+            }
+        }
+
+        // Search deferred shards (live shards held back by the shard cap during Phase B)
+        List<LiveGraphShard> deferred = deferredShards;
+        if (deferred != null) {
+            Set<Bytes> pending = pendingCheckpointDeletes;
+            for (LiveGraphShard shard : deferred) {
+                if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
+                    int k = Math.min(perSourceK, shard.nodeToPk.size());
+                    ImmutableGraphIndex graph = shard.builder.getGraph();
+                    SearchResult result = GraphSearcher.search(
+                            qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
+                    for (SearchResult.NodeScore ns : result.getNodes()) {
+                        Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
+                        if (pk != null && (pending == null || !pending.contains(pk))) {
+                            results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+                        }
                     }
                 }
             }
@@ -1185,7 +1236,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 frozenCount += shard.nodeToPk.size();
             }
         }
-        return totalLiveSize() + frozenCount + (int) onDiskNodeToPkSize();
+        int deferredCount = 0;
+        List<LiveGraphShard> deferred = deferredShards;
+        if (deferred != null) {
+            for (LiveGraphShard shard : deferred) {
+                deferredCount += shard.nodeToPk.size();
+            }
+        }
+        return totalLiveSize() + frozenCount + deferredCount + (int) onDiskNodeToPkSize();
     }
 
     /**
@@ -1209,6 +1267,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         List<LiveGraphShard> frozen = frozenShards;
         if (frozen != null) {
             for (LiveGraphShard shard : frozen) {
+                total += shardMemoryBytes(shard);
+            }
+        }
+        List<LiveGraphShard> deferred = deferredShards;
+        if (deferred != null) {
+            for (LiveGraphShard shard : deferred) {
                 total += shardMemoryBytes(shard);
             }
         }
@@ -1505,7 +1569,46 @@ public class PersistentVectorStore extends AbstractVectorStore {
         stateLock.writeLock().lock();
         try {
             snapshotDimension = dimension;
-            snapshotShards = this.liveShards;
+
+            // Phase A: byte-cap split — if snapshot would exceed the budget,
+            // take only the oldest shards that fit and defer the rest.
+            List<LiveGraphShard> allShards = this.liveShards;
+            long byteCap = maxLiveBytesPerCheckpoint;
+            long bytesPerVec = (byteCap > 0 && snapshotDimension > 0)
+                    ? estimatedBytesPerVector(snapshotDimension, m, neighborOverflow) : 0L;
+            int capIndex = allShards.size();   // default: take all
+            if (bytesPerVec > 0) {
+                long accumulated = 0;
+                for (int i = 0; i < allShards.size(); i++) {
+                    long shardVecs = allShards.get(i).nodeToPk.size();
+                    // Always include at least one shard to guarantee progress.
+                    if (i > 0 && (accumulated + shardVecs) * bytesPerVec > byteCap) {
+                        capIndex = i;
+                        break;
+                    }
+                    accumulated += shardVecs;
+                }
+            }
+            if (capIndex < allShards.size()) {
+                snapshotShards = new ArrayList<>(allShards.subList(0, capIndex));
+                this.deferredShards = new ArrayList<>(allShards.subList(capIndex, allShards.size()));
+                long snapshotVectors = snapshotShards.stream().mapToInt(s -> s.nodeToPk.size()).sum();
+                long deferredVectors = this.deferredShards.stream().mapToInt(s -> s.nodeToPk.size()).sum();
+                deferralEvents.incrementAndGet();
+                currentDeferredVectors.set(deferredVectors);
+                totalDeferredVectors.addAndGet(deferredVectors);
+                LOGGER.log(Level.WARNING,
+                        "checkpoint {0} Phase A: byte cap {1} reached; snapshotting {2} shards "
+                                + "({3} vectors, ~{4} MB), deferring {5} shards ({6} vectors) to next cycle",
+                        new Object[]{indexName, byteCap, capIndex, snapshotVectors,
+                                snapshotVectors * bytesPerVec / (1024 * 1024),
+                                allShards.size() - capIndex, deferredVectors});
+            } else {
+                snapshotShards = allShards;
+                this.deferredShards = null;
+                // No deferral needed; all shards fit within the byte cap
+                currentDeferredVectors.set(0);
+            }
 
             sealedSegments = new ArrayList<>();
             mergeableSegments = new ArrayList<>();
@@ -1529,10 +1632,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
             for (LiveGraphShard shard : snapshotShards) {
                 totalSnapshotSize += shard.nodeToPk.size();
             }
+            // Include deferred shards in the frozen count so Phase B back-pressure
+            // is appropriately tight.
+            int deferredSize = 0;
+            List<LiveGraphShard> def = this.deferredShards;
+            if (def != null) {
+                for (LiveGraphShard s : def) {
+                    deferredSize += s.nodeToPk.size();
+                }
+            }
             long effectiveBudget = maxVectorMemoryBytes != Long.MAX_VALUE ? maxVectorMemoryBytes
                     : (memoryBudget != null ? memoryBudget.maxMemoryBytes() : Long.MAX_VALUE);
             this.liveVectorCapDuringCheckpoint = computeLiveVectorCapDuringCheckpoint(
-                    totalSnapshotSize, snapshotDimension, m, neighborOverflow,
+                    totalSnapshotSize + deferredSize, snapshotDimension, m, neighborOverflow,
                     effectiveBudget, computeEffectiveMaxLiveGraphSize());
 
             initEmptyLiveShards(snapshotDimension, beamWidth, neighborOverflow, alpha);
@@ -1646,16 +1758,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
 
             if (newSegmentResults != null) {
-                for (VectorSegment seg : mergeableSegments) {
-                    seg.close();
-                    dropSegmentBLinkStorage(seg);
-                }
-
                 List<VectorSegment> newSegments = new java.util.concurrent.CopyOnWriteArrayList<>();
+                // Preserve existing sealed segments
                 for (VectorSegment sealed : sealedSegments) {
                     sealed.dirty = false;
                     newSegments.add(sealed);
                 }
+                // Preserve existing mergeable segments (old compaction targets)
+                for (VectorSegment mergeable : mergeableSegments) {
+                    mergeable.dirty = false;
+                    newSegments.add(mergeable);
+                }
+                // Add newly written segments from this checkpoint
                 newSegments.addAll(preloadedSegments);
 
                 Set<Bytes> pending = this.pendingCheckpointDeletes;
@@ -1703,7 +1817,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // Shrink the backing array if most slots were freed
             vectorStorage.compact(nextNodeId.get());
 
+            // Rejoin deferred shards before clearing so the next checkpoint cycle processes them.
+            List<LiveGraphShard> deferred = this.deferredShards;
+            if (deferred != null && !deferred.isEmpty()) {
+                List<LiveGraphShard> merged = new ArrayList<>(deferred);
+                merged.addAll(this.liveShards);
+                this.liveShards = merged;
+            }
+
             this.frozenShards = null;
+            this.deferredShards = null;
+            currentDeferredVectors.set(0);  // Deferred shards have been restored to live set
             this.pendingCheckpointDeletes = null;
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
             dirty.set(totalLiveSize() > 0);
@@ -1733,182 +1857,196 @@ public class PersistentVectorStore extends AbstractVectorStore {
             LogSequenceNumber sequenceNumber)
             throws IOException, DataStorageManagerException {
 
+        long phaseBStartMs = System.currentTimeMillis();
+
+        // Cleanup all shard builders first (finalizes HNSW diversity/refine)
         for (LiveGraphShard shard : snapshotShards) {
             if (shard.builder != null) {
                 shard.builder.cleanup();
             }
         }
 
-        // Collect all vectors from snapshot shards + mergeable segments
-        List<VectorFloat<?>> poolVectorsList = new ArrayList<>();
-        List<Bytes> poolPkList = new ArrayList<>();
+        // NEW: Per-shard FusedPQ write (no pooling!)
+        // Each shard's already-built OnHeapGraphIndex is serialized directly.
+        // This avoids the mega-pool and graph rebuild that caused the OOM.
+        // Write shards in parallel for efficiency and proper error propagation.
+        List<SegmentWriteResult> newSegmentResults = new ArrayList<>();
+        int totalShardVectors = 0;
 
+        // Build list of per-shard write tasks
+        List<ShardWriteTask> shardTasks = new ArrayList<>();
         for (LiveGraphShard shard : snapshotShards) {
-            for (Map.Entry<Integer, Bytes> e : shard.nodeToPk.entrySet()) {
-                VectorFloat<?> vec = vectorStorage.get(e.getKey());
-                if (vec != null) {
-                    poolVectorsList.add(vec);
-                    poolPkList.add(e.getValue());
-                }
-            }
-        }
-
-        for (VectorSegment seg : mergeableSegments) {
-            if (seg.onDiskGraph != null) {
-                try (OnDiskGraphIndex.View view = seg.onDiskGraph.getView();
-                     Stream<Map.Entry<Bytes, Bytes>> scanStream = seg.scanNodeToPk()) {
-                    scanStream.forEach(e -> {
-                        int ordinal = bytesToOrdinal(e.getKey());
-                        VectorFloat<?> vec = view.getVector(ordinal);
-                        poolVectorsList.add(vec);
-                        poolPkList.add(e.getValue());
-                    });
-                }
-            }
-        }
-
-        // If pool too small for FusedPQ, unseal smallest sealed segments
-        while (poolVectorsList.size() < MIN_VECTORS_FOR_FUSED_PQ && !sealedSegments.isEmpty()) {
-            VectorSegment smallest = sealedSegments.stream()
-                    .min((a, b) -> Long.compare(a.estimatedSizeBytes, b.estimatedSizeBytes))
-                    .get();
-            sealedSegments.remove(smallest);
-            mergeableSegments.add(smallest);
-            if (smallest.onDiskGraph != null) {
-                try (OnDiskGraphIndex.View view = smallest.onDiskGraph.getView();
-                     Stream<Map.Entry<Bytes, Bytes>> scanStream = smallest.scanNodeToPk()) {
-                    scanStream.forEach(e -> {
-                        int ordinal = bytesToOrdinal(e.getKey());
-                        VectorFloat<?> vec = view.getVector(ordinal);
-                        poolVectorsList.add(vec);
-                        poolPkList.add(e.getValue());
-                    });
-                }
-            }
-        }
-
-        // If pool still too small, fall back to simple path
-        if (poolVectorsList.size() < MIN_VECTORS_FOR_FUSED_PQ && !poolVectorsList.isEmpty()) {
-            for (VectorSegment seg : mergeableSegments) {
-                seg.close();
-                dropSegmentBLinkStorage(seg);
-            }
-            for (VectorSegment seg : sealedSegments) {
-                seg.close();
-                dropSegmentBLinkStorage(seg);
-            }
-            stateLock.writeLock().lock();
-            try {
-                segments = new java.util.concurrent.CopyOnWriteArrayList<>();
-                nextSegmentId.set(0);
-            } finally {
-                stateLock.writeLock().unlock();
-            }
-
-            // Build maps from pool for simple checkpoint
-            VectorStorage poolStorage = new VectorStorage(poolVectorsList.size());
-            ConcurrentHashMap<Integer, Bytes> poolNodeToPk = new ConcurrentHashMap<>();
-            for (int i = 0; i < poolVectorsList.size(); i++) {
-                poolStorage.set(i, poolVectorsList.get(i));
-                poolNodeToPk.put(i, poolPkList.get(i));
-            }
-            VectorStorageRandomAccessVectorValues poolMravv =
-                    new VectorStorageRandomAccessVectorValues(poolStorage, snapshotDimension);
-            BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(poolMravv, similarityFunction);
-            GraphIndexBuilder poolBuilder = new GraphIndexBuilder(
-                    bsp, snapshotDimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
-            for (int i = 0; i < poolVectorsList.size(); i++) {
-                poolBuilder.addGraphNode(i, poolVectorsList.get(i));
-            }
-            poolBuilder.cleanup();
-
-            List<Long> graphPageIds;
-            Path graphTmpFile = Files.createTempFile(tmpDirectory, "herddb-vector-graph-", ".tmp");
-            try {
-                try (java.io.DataOutputStream graphDos = new java.io.DataOutputStream(
-                        new BufferedOutputStream(new FileOutputStream(graphTmpFile.toFile()), CHUNK_SIZE))) {
-                    ((OnHeapGraphIndex) poolBuilder.getGraph()).save(graphDos);
-                }
-                graphPageIds = writeChunks(graphTmpFile, TYPE_VECTOR_GRAPHCHUNK);
-            } finally {
-                Files.deleteIfExists(graphTmpFile);
-            }
-            List<Long> mapPageIds;
-            Path mapTmpFile = serializeMapDataToFile(poolStorage, poolNodeToPk);
-            try {
-                mapPageIds = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
-            } finally {
-                Files.deleteIfExists(mapTmpFile);
-            }
-            try {
-                poolBuilder.close();
-            } catch (IOException e) {
-                // ignore
-            }
-            persistIndexStatusSimple(graphPageIds, mapPageIds, poolNodeToPk.size(), false, sequenceNumber);
-            lastCheckpointVectorsProcessed.set(poolNodeToPk.size());
-            LOGGER.log(Level.INFO,
-                    "checkpoint {0}: {1} nodes (simple fallback from FusedPQ)",
-                    new Object[]{indexName, poolNodeToPk.size()});
-            return null;
-        }
-
-        // Estimate avgBytesPerVector
-        long avgBytesPerVector = (long) snapshotDimension * Float.BYTES * 2;
-        for (VectorSegment seg : mergeableSegments) {
-            long segSize = seg.size();
-            if (segSize > 0 && seg.estimatedSizeBytes > 0) {
-                avgBytesPerVector = seg.estimatedSizeBytes / segSize;
-                break;
-            }
-        }
-        if (avgBytesPerVector == (long) snapshotDimension * Float.BYTES * 2) {
-            for (VectorSegment seg : sealedSegments) {
-                long segSize = seg.size();
-                if (segSize > 0 && seg.estimatedSizeBytes > 0) {
-                    avgBytesPerVector = seg.estimatedSizeBytes / segSize;
-                    break;
-                }
-            }
-        }
-
-        int maxNodesPerSegment = (int) Math.max(MIN_VECTORS_FOR_FUSED_PQ,
-                maxSegmentSize / Math.max(1, avgBytesPerVector));
-
-        int totalSegments = (int) Math.ceil((double) poolVectorsList.size() / maxNodesPerSegment);
-        long phaseBStartMs = System.currentTimeMillis();
-        LOGGER.log(Level.INFO,
-                "checkpoint {0} Phase B: writing {1} vectors across ~{2} segments (parallelism={3})",
-                new Object[]{indexName, poolVectorsList.size(), totalSegments,
-                        PHASE_B_SEGMENT_PARALLELISM});
-
-        // Slice the pool into segment-sized chunks up-front, so each task is
-        // self-contained and we can parallelise independent segment builds.
-        // Each slice carries its assigned segmentId so the allocation order is
-        // deterministic and observable.
-        List<SegmentSlice> slices = new ArrayList<>();
-        int start = 0;
-        int segmentIndex = 0;
-        int totalPoolSize = poolVectorsList.size();
-        while (start < totalPoolSize) {
-            int end = Math.min(start + maxNodesPerSegment, totalPoolSize);
-            if (end < totalPoolSize
-                    && (totalPoolSize - end) < MIN_VECTORS_FOR_FUSED_PQ) {
-                end = totalPoolSize;
-            }
-            segmentIndex++;
             int segId = nextSegmentId.getAndIncrement();
-            slices.add(new SegmentSlice(segId, segmentIndex, start, end));
-            start = end;
+            shardTasks.add(new ShardWriteTask(shard, segId, snapshotDimension));
         }
 
-        List<SegmentWriteResult> newSegmentResults =
-                buildSegmentsInParallel(slices, poolVectorsList, poolPkList,
-                        snapshotDimension, totalSegments);
+        // Execute shard writes in parallel with proper error handling
+        if (!shardTasks.isEmpty()) {
+            int parallelism = Math.min(PHASE_B_SEGMENT_PARALLELISM, shardTasks.size());
+            if (parallelism == 1) {
+                // Fast path: serial execution
+                for (ShardWriteTask task : shardTasks) {
+                    SegmentWriteResult result = writeShardAsFusedPQSegment(
+                            task.shard, task.segmentId, snapshotDimension);
+                    if (result != null) {
+                        newSegmentResults.add(result);
+                        totalShardVectors += task.shard.nodeToPk.size();
+                    }
+                }
+            } else {
+                // Parallel execution with proper error handling
+                java.util.concurrent.ExecutorService executor =
+                        java.util.concurrent.Executors.newFixedThreadPool(parallelism, r -> {
+                            Thread t = new Thread(r, "persistent-vector-store-phaseB-shard-" + indexName);
+                            t.setDaemon(true);
+                            return t;
+                        });
+                try {
+                    List<java.util.concurrent.Future<SegmentWriteResult>> futures = new ArrayList<>();
+                    for (ShardWriteTask task : shardTasks) {
+                        // Capture task values locally to avoid lambda capture issues
+                        LiveGraphShard shard = task.shard;
+                        int segId = task.segmentId;
+                        futures.add(executor.submit(() -> writeShardAsFusedPQSegment(
+                                shard, segId, snapshotDimension)));
+                    }
 
+                    Throwable firstFailure = null;
+                    for (int i = 0; i < futures.size(); i++) {
+                        try {
+                            SegmentWriteResult r = futures.get(i).get();
+                            if (r != null) {
+                                newSegmentResults.add(r);
+                                totalShardVectors += shardTasks.get(i).shard.nodeToPk.size();
+                            }
+                        } catch (java.util.concurrent.ExecutionException ee) {
+                            if (firstFailure == null) {
+                                firstFailure = ee.getCause() != null ? ee.getCause() : ee;
+                            }
+                            // Cancel remaining futures
+                            for (int j = i + 1; j < futures.size(); j++) {
+                                futures.get(j).cancel(true);
+                            }
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            if (firstFailure == null) {
+                                firstFailure = ie;
+                            }
+                        }
+                    }
+
+                    if (firstFailure != null) {
+                        if (firstFailure instanceof IOException) {
+                            throw (IOException) firstFailure;
+                        }
+                        if (firstFailure instanceof DataStorageManagerException) {
+                            throw (DataStorageManagerException) firstFailure;
+                        }
+                        if (firstFailure instanceof RuntimeException) {
+                            throw (RuntimeException) firstFailure;
+                        }
+                        throw new IOException("Phase B parallel shard write failed", firstFailure);
+                    }
+                } finally {
+                    executor.shutdownNow();
+                }
+            }
+        }
+
+        // Fallback: if no live shards or all too small, try to write on-disk mergeable segments
+        // (For now, skip this and let them be compacted in the next cycle)
+
+        // If we wrote nothing, fall back to simple path
+        if (newSegmentResults.isEmpty()) {
+            // Collect all vectors from mergeable segments
+            List<VectorFloat<?>> poolVectorsList = new ArrayList<>();
+            List<Bytes> poolPkList = new ArrayList<>();
+
+            for (VectorSegment seg : mergeableSegments) {
+                if (seg.onDiskGraph != null) {
+                    try (OnDiskGraphIndex.View view = seg.onDiskGraph.getView();
+                         Stream<Map.Entry<Bytes, Bytes>> scanStream = seg.scanNodeToPk()) {
+                        scanStream.forEach(e -> {
+                            int ordinal = bytesToOrdinal(e.getKey());
+                            VectorFloat<?> vec = view.getVector(ordinal);
+                            poolVectorsList.add(vec);
+                            poolPkList.add(e.getValue());
+                        });
+                    }
+                }
+            }
+
+            // If pool too small or empty, fall back to simple path
+            if (poolVectorsList.size() < MIN_VECTORS_FOR_FUSED_PQ && !poolVectorsList.isEmpty()) {
+                for (VectorSegment seg : mergeableSegments) {
+                    seg.close();
+                    dropSegmentBLinkStorage(seg);
+                }
+                for (VectorSegment seg : sealedSegments) {
+                    seg.close();
+                    dropSegmentBLinkStorage(seg);
+                }
+                stateLock.writeLock().lock();
+                try {
+                    segments = new java.util.concurrent.CopyOnWriteArrayList<>();
+                    nextSegmentId.set(0);
+                } finally {
+                    stateLock.writeLock().unlock();
+                }
+
+                // Build maps from pool for simple checkpoint
+                VectorStorage poolStorage = new VectorStorage(poolVectorsList.size());
+                ConcurrentHashMap<Integer, Bytes> poolNodeToPk = new ConcurrentHashMap<>();
+                for (int i = 0; i < poolVectorsList.size(); i++) {
+                    poolStorage.set(i, poolVectorsList.get(i));
+                    poolNodeToPk.put(i, poolPkList.get(i));
+                }
+                VectorStorageRandomAccessVectorValues poolMravv =
+                        new VectorStorageRandomAccessVectorValues(poolStorage, snapshotDimension);
+                BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(poolMravv, similarityFunction);
+                GraphIndexBuilder poolBuilder = new GraphIndexBuilder(
+                        bsp, snapshotDimension, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+                for (int i = 0; i < poolVectorsList.size(); i++) {
+                    poolBuilder.addGraphNode(i, poolVectorsList.get(i));
+                }
+                poolBuilder.cleanup();
+
+                List<Long> graphPageIds;
+                Path graphTmpFile = Files.createTempFile(tmpDirectory, "herddb-vector-graph-", ".tmp");
+                try {
+                    try (java.io.DataOutputStream graphDos = new java.io.DataOutputStream(
+                            new BufferedOutputStream(new FileOutputStream(graphTmpFile.toFile()), CHUNK_SIZE))) {
+                        ((OnHeapGraphIndex) poolBuilder.getGraph()).save(graphDos);
+                    }
+                    graphPageIds = writeChunks(graphTmpFile, TYPE_VECTOR_GRAPHCHUNK);
+                } finally {
+                    Files.deleteIfExists(graphTmpFile);
+                }
+                List<Long> mapPageIds;
+                Path mapTmpFile = serializeMapDataToFile(poolStorage, poolNodeToPk);
+                try {
+                    mapPageIds = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
+                } finally {
+                    Files.deleteIfExists(mapTmpFile);
+                }
+                try {
+                    poolBuilder.close();
+                } catch (IOException e) {
+                    // ignore
+                }
+                persistIndexStatusSimple(graphPageIds, mapPageIds, poolNodeToPk.size(), false, sequenceNumber);
+                lastCheckpointVectorsProcessed.set(poolNodeToPk.size());
+                LOGGER.log(Level.INFO,
+                        "checkpoint {0}: {1} nodes (simple fallback from FusedPQ)",
+                        new Object[]{indexName, poolNodeToPk.size()});
+                return null;
+            }
+        }
+
+        // Log per-shard write summary
         long phaseBElapsedMs = System.currentTimeMillis() - phaseBStartMs;
         lastCheckpointPhaseBDurationMs.set(phaseBElapsedMs);
-        lastCheckpointVectorsProcessed.set(totalPoolSize);
+        lastCheckpointVectorsProcessed.set(totalShardVectors);
         long bytesWritten = 0L;
         for (SegmentWriteResult r : newSegmentResults) {
             if (r.isMultipart()) {
@@ -1920,14 +2058,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
         lastPhaseBBytesWritten.set(bytesWritten);
         LOGGER.log(Level.INFO,
-                "checkpoint {0} Phase B: completed in {1} ms ({2} segments, {3} total vectors, {4} bytes)",
+                "checkpoint {0} Phase B: completed in {1} ms ({2} shard segments, {3} total vectors, {4} bytes)",
                 new Object[]{indexName, phaseBElapsedMs, newSegmentResults.size(),
-                        totalPoolSize, bytesWritten});
+                        totalShardVectors, bytesWritten});
 
         // Order the results by segmentId so that the persisted IndexStatus and
         // the in-memory segment list are both deterministic.
         newSegmentResults.sort(java.util.Comparator.comparingInt(r -> r.segmentId));
-        persistIndexStatusMultiSegment(sealedSegments, newSegmentResults, sequenceNumber);
+        persistIndexStatusMultiSegment(sealedSegments, mergeableSegments, newSegmentResults, sequenceNumber);
 
         return newSegmentResults;
     }
@@ -1978,6 +2116,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         SEGMENT_MERGE_THRESHOLD});
     }
 
+    /** Task descriptor: one shard to write in Phase B (per-shard FusedPQ approach). */
+    private static final class ShardWriteTask {
+        final LiveGraphShard shard;
+        final int segmentId;
+        final int snapshotDimension;
+
+        ShardWriteTask(LiveGraphShard shard, int segmentId, int snapshotDimension) {
+            this.shard = shard;
+            this.segmentId = segmentId;
+            this.snapshotDimension = snapshotDimension;
+        }
+    }
+
     /** Slice descriptor: one FusedPQ segment to build in Phase B. */
     private static final class SegmentSlice {
         final int segmentId;
@@ -1994,6 +2145,194 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         int size() {
             return toExclusive - fromInclusive;
+        }
+    }
+
+    /**
+     * Zero-copy view over vectorStorage for a single live shard.
+     * Maps ordinal i (0-based within shard) to vectorStorage.get(startNodeId + i).
+     * Implements RandomAccessVectorValues for use with PQ training and OnDiskGraphIndexWriter.
+     */
+    private final class VectorStorageShardView implements io.github.jbellis.jvector.graph.RandomAccessVectorValues {
+        private final int startNodeId;
+        private final int size;
+        private final int dimension;
+
+        VectorStorageShardView(int startNodeId, int size, int dimension) {
+            this.startNodeId = startNodeId;
+            this.size = size;
+            this.dimension = dimension;
+        }
+
+        @Override
+        public int size() {
+            return size;
+        }
+
+        @Override
+        public int dimension() {
+            return dimension;
+        }
+
+        @Override
+        public VectorFloat<?> getVector(int i) {
+            return vectorStorage.get(startNodeId + i);
+        }
+
+        @Override
+        public boolean isValueShared() {
+            return true;
+        }
+
+        @Override
+        public VectorStorageShardView copy() {
+            return this;
+        }
+    }
+
+    /**
+     * Builds a ConcurrentHashMap from shard-relative ordinal (0-based) to PK.
+     * For each entry in the shard's nodeToPk, computes ordinal as (nodeId - shard.startNodeId).
+     */
+    private ConcurrentHashMap<Integer, Bytes> buildOrdinalToPk(LiveGraphShard shard) {
+        ConcurrentHashMap<Integer, Bytes> result = new ConcurrentHashMap<>(shard.nodeToPk.size());
+        for (Map.Entry<Integer, Bytes> e : shard.nodeToPk.entrySet()) {
+            result.put(e.getKey() - shard.startNodeId, e.getValue());
+        }
+        return result;
+    }
+
+    /**
+     * Serializes a single live shard's already-built OnHeapGraphIndex to FusedPQ format.
+     * The shard's builder must already have been cleaned up (shard.builder.cleanup() called).
+     *
+     * Ordinals in the shard graph are 0-based (nodeId - shard.startNodeId), so
+     * OnDiskGraphIndexWriter can consume the graph directly without remapping.
+     *
+     * @return SegmentWriteResult for this shard's segment, or null if fallback to simple format
+     */
+    private SegmentWriteResult writeShardAsFusedPQSegment(
+            LiveGraphShard shard,
+            int segmentId,
+            int snapshotDimension) throws IOException, DataStorageManagerException {
+
+        int shardSize = shard.nodeToPk.size();
+        if (shardSize == 0) {
+            // Empty shard, skip it
+            return null;
+        }
+
+        // Update compaction metrics for this shard
+        compactionNodesTotal.addAndGet(shardSize);
+
+        writingGraphActive.incrementAndGet();
+        try {
+            // Create a zero-copy view over vectorStorage for this shard's ordinals
+            VectorStorageShardView shardView = new VectorStorageShardView(
+                    shard.startNodeId, shardSize, snapshotDimension);
+
+            // Get the shard's already-built OnHeapGraphIndex (no rebuild!)
+            OnHeapGraphIndex shardGraph = (OnHeapGraphIndex) shard.builder.getGraph();
+
+            // Compute PQ over just this shard's vectors (50K vs 900K pooled = 18× fewer elements)
+            int pqSubspaces = Math.max(1, snapshotDimension / 4);
+            boolean useFusedPQForShard = shardSize >= MIN_VECTORS_FOR_FUSED_PQ;
+            int pqClusters = useFusedPQForShard ? 256 : Math.min(256, shardSize);
+            ProductQuantization pq = ProductQuantization.compute(
+                    shardView, pqSubspaces, pqClusters, true);
+            PQVectors pqv = pq.encodeAll(shardView, PhysicalCoreExecutor.pool());
+
+            // Write graph + features to temp file, streaming via suppliers
+            Path tempFile = Files.createTempFile(
+                    tmpDirectory, "herddb-vector-shard-", ".idx");
+            boolean success = false;
+            try {
+                OnDiskGraphIndexWriter.Builder builder = new OnDiskGraphIndexWriter.Builder(
+                        shardGraph, tempFile);
+                if (useFusedPQForShard) {
+                    builder.with(new FusedPQ(shardGraph.maxDegree(), pq));
+                }
+                try (OnDiskGraphIndexWriter writer = builder
+                        .with(new InlineVectors(snapshotDimension))
+                        .build()) {
+                    ImmutableGraphIndex.View view = shardGraph.getView();
+                    EnumMap<FeatureId, IntFunction<io.github.jbellis.jvector.graph.disk.feature.Feature.State>> suppliers =
+                            new EnumMap<>(FeatureId.class);
+                    if (useFusedPQForShard) {
+                        suppliers.put(FeatureId.FUSED_PQ,
+                                ordinal -> new FusedPQ.State(view, pqv, ordinal));
+                    }
+                    suppliers.put(FeatureId.INLINE_VECTORS,
+                            ordinal -> new InlineVectors.State(shardView.getVector(ordinal)));
+                    writer.write(suppliers);
+                }
+                success = true;
+
+                // Upload graph file
+                long graphSize = Files.size(tempFile);
+                uploadBytesTotal.addAndGet(graphSize);
+                uploadingActive.incrementAndGet();
+                String graphFilePath;
+                try {
+                    graphFilePath = dataStorageManager.writeMultipartIndexFile(
+                            tableSpaceUUID,
+                            indexUUID + "_seg" + segmentId, "graph",
+                            tempFile, uploadBytesDone::addAndGet);
+                } finally {
+                    uploadingActive.decrementAndGet();
+                }
+
+                if (graphFilePath != null) {
+                    // Multipart upload succeeded; also write map file
+                    ConcurrentHashMap<Integer, Bytes> ordinalToPk = buildOrdinalToPk(shard);
+                    Path mapFile = writeFusedPQMapDataToTempFile(shardView, ordinalToPk);
+                    try {
+                        long mapSize = Files.size(mapFile);
+                        uploadBytesTotal.addAndGet(mapSize);
+                        uploadingActive.incrementAndGet();
+                        String mapFilePath;
+                        try {
+                            mapFilePath = dataStorageManager.writeMultipartIndexFile(
+                                    tableSpaceUUID,
+                                    indexUUID + "_seg" + segmentId, "map",
+                                    mapFile, uploadBytesDone::addAndGet);
+                        } finally {
+                            uploadingActive.decrementAndGet();
+                        }
+                        compactionNodesDone.addAndGet(shardSize);
+                        return new SegmentWriteResult(segmentId,
+                                graphFilePath, graphSize,
+                                mapFilePath, mapSize,
+                                graphSize + mapSize);
+                    } finally {
+                        Files.deleteIfExists(mapFile);
+                    }
+                } else {
+                    // Fallback to page-based write if multipart not supported
+                    ConcurrentHashMap<Integer, Bytes> ordinalToPk = buildOrdinalToPk(shard);
+                    List<Long> graphPages = writeChunks(tempFile, TYPE_VECTOR_GRAPHCHUNK);
+                    List<Long> mapPages = writeFusedPQMapData(shardView, ordinalToPk);
+                    compactionNodesDone.addAndGet(shardSize);
+                    return new SegmentWriteResult(segmentId, graphPages, mapPages,
+                            (long) (graphPages.size() + mapPages.size()) * CHUNK_SIZE);
+                }
+            } finally {
+                // Always delete temp file - it's been uploaded/written to persistent storage
+                try {
+                    Files.deleteIfExists(tempFile);
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "error deleting temp file for " + indexName, e);
+                }
+                try {
+                    if (shard.builder != null) {
+                        shard.builder.close();
+                    }
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "error closing shard builder for " + indexName, e);
+                }
+            }
+        } finally {
+            writingGraphActive.decrementAndGet();
         }
     }
 
@@ -2194,7 +2533,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
 
             this.liveShards = new ArrayList<>(snapshotShards);
+            // Restore deferred shards so they rejoin the live set intact.
+            // The existing merge of Phase B new vectors into lastSnapshot is unaffected —
+            // initEmptyLiveShards put only a fresh empty shard in this.liveShards during Phase A.
+            List<LiveGraphShard> deferred = this.deferredShards;
+            if (deferred != null) {
+                this.liveShards.addAll(deferred);
+            }
             this.frozenShards = null;
+            this.deferredShards = null;
+            currentDeferredVectors.set(0);  // Deferred shards have been restored to live set
             this.pendingCheckpointDeletes = null;
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
             dirty.set(true);
@@ -2782,6 +3130,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     Bytes pk = allNodeToPk.get(oldId);
                     byte[] pkBytes = pk.to_array();
                     VectorFloat<?> vec = allVectors.getVector(oldId);
+                    if (vec == null) {
+                        throw new IOException("writeFusedPQMapDataToTempFile: null vector at ordinal " + oldId);
+                    }
                     writeInt(bos, newOrdinal);
                     writeInt(bos, pkBytes.length);
                     bos.write(pkBytes);
@@ -3007,10 +3358,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     private void persistIndexStatusMultiSegment(
-            List<VectorSegment> sealedSegments, List<SegmentWriteResult> newSegmentResults,
+            List<VectorSegment> sealedSegments, List<VectorSegment> mergeableSegments,
+            List<SegmentWriteResult> newSegmentResults,
             LogSequenceNumber sequenceNumber) throws DataStorageManagerException {
 
-        int totalSegments = sealedSegments.size() + newSegmentResults.size();
+        int totalSegments = sealedSegments.size() + mergeableSegments.size() + newSegmentResults.size();
         Set<Long> activePages = new HashSet<>();
 
         VisibleByteArrayOutputStream baos = new VisibleByteArrayOutputStream(256);
@@ -3027,6 +3379,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
             dos.writeInt(totalSegments);
 
             for (VectorSegment seg : sealedSegments) {
+                writeSegmentMeta(dos, activePages,
+                        seg.segmentId, seg.estimatedSizeBytes,
+                        seg.graphPageIds, seg.mapPageIds,
+                        seg.graphFilePath, seg.graphFileSize,
+                        seg.mapFilePath, seg.mapFileSize);
+            }
+            for (VectorSegment seg : mergeableSegments) {
                 writeSegmentMeta(dos, activePages,
                         seg.segmentId, seg.estimatedSizeBytes,
                         seg.graphPageIds, seg.mapPageIds,

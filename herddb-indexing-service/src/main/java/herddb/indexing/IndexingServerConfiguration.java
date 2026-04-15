@@ -112,6 +112,11 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_VECTOR_MAX_LIVE_GRAPH_SIZE = "indexing.vector.maxLiveGraphSize";
     public static final int PROPERTY_VECTOR_MAX_LIVE_GRAPH_SIZE_DEFAULT = 0;
 
+    public static final String PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT =
+            "indexing.vector.maxLiveBytesPerCheckpoint";
+    public static final long PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT =
+            10L * 1024 * 1024 * 1024; // 10 GiB
+
     // Compaction
     public static final String PROPERTY_COMPACTION_INTERVAL = "indexing.compaction.interval";
     public static final long PROPERTY_COMPACTION_INTERVAL_DEFAULT = 60000L;

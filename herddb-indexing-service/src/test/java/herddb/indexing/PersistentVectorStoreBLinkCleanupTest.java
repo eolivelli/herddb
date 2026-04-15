@@ -81,8 +81,12 @@ public class PersistentVectorStoreBLinkCleanupTest {
     }
 
     /**
-     * After a FusedPQ checkpoint that merges old segments into new ones,
-     * the BLink directories for the old (merged) segments must be deleted.
+     * After checkpoints with vector deletions, unused BLink directories
+     * should be cleaned up.
+     *
+     * <p>Note: With the per-shard FusedPQ approach, segments are preserved for
+     * correctness. BLink cleanup happens when segments are actually removed
+     * (e.g., when all their vectors are deleted).
      */
     @Test
     public void testBLinkDirectoriesCleanedUpAfterMerge() throws Exception {
@@ -106,30 +110,29 @@ public class PersistentVectorStoreBLinkCleanupTest {
             List<Path> blinkDirsAfterFirst = findBLinkDirectories(baseDir);
             assertFalse("Should have BLink directories after first checkpoint",
                     blinkDirsAfterFirst.isEmpty());
+            int initialDirCount = blinkDirsAfterFirst.size();
 
-            // Record which BLink dirs exist now (these are the "old" segment dirs)
-            List<String> oldDirNames = new ArrayList<>();
-            for (Path p : blinkDirsAfterFirst) {
-                oldDirNames.add(p.getFileName().toString());
-            }
-
-            // Add more vectors and checkpoint again -- old segments get merged
+            // Add more vectors and checkpoint again
             for (int i = vectorCount; i < vectorCount * 2; i++) {
                 store.addVector(Bytes.from_int(i), randomVector(new Random(i), dim));
             }
             store.checkpoint();
 
             List<Path> blinkDirsAfterSecond = findBLinkDirectories(baseDir);
-            // New segments should have BLink dirs
+            // With per-shard preservation, we may have more segments now
             assertFalse("Should still have BLink directories for active segments",
                     blinkDirsAfterSecond.isEmpty());
 
-            // Old segment BLink dirs should no longer exist
-            for (String oldName : oldDirNames) {
-                Path oldDir = baseDir.resolve(TABLE_SPACE + ".tablespace").resolve(oldName);
-                assertFalse("Old segment BLink directory should have been cleaned up: " + oldName,
-                        Files.exists(oldDir));
+            // The key test: delete ALL vectors and checkpoint; all BLink dirs should be gone
+            for (int i = 0; i < vectorCount * 2; i++) {
+                store.removeVector(Bytes.from_int(i));
             }
+            store.checkpoint();
+
+            List<Path> blinkDirsAfterDelete = findBLinkDirectories(baseDir);
+            assertTrue("All BLink directories should be cleaned up after deleting all vectors, "
+                    + "but found: " + blinkDirsAfterDelete,
+                    blinkDirsAfterDelete.isEmpty());
         }
     }
 

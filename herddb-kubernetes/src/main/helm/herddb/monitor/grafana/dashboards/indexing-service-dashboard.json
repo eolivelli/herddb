@@ -2596,6 +2596,114 @@
           "dashes": false,
           "datasource": "Prometheus",
           "fill": 1,
+          "id": 212,
+          "legend": {"avg": false, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_deferral_events\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "deferral events",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Shard Deferral Events (issue #107)",
+          "tooltip": {"shared": true, "sort": 0, "value_type": "individual"},
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "decimals": 0, "show": true},
+            {"format": "short", "show": true}
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 213,
+          "legend": {"avg": false, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_current_deferred_vectors\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "current deferred",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Current Deferred Vectors",
+          "tooltip": {"shared": true, "sort": 0, "value_type": "individual"},
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "decimals": 0, "show": true},
+            {"format": "short", "show": true}
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 214,
+          "legend": {"avg": false, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_total_deferred_vectors\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "total deferred",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Total Deferred Vectors (cumulative)",
+          "tooltip": {"shared": true, "sort": 0, "value_type": "individual"},
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "decimals": 0, "show": true},
+            {"format": "short", "show": true}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Deferred Shards Monitoring (P3.8)",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
           "id": 30,
           "legend": {
             "avg": false,

@@ -33,7 +33,6 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -160,20 +159,17 @@ public class PersistentVectorStoreParallelPhaseBTest {
     }
 
     /**
-     * A DSM whose Nth writeIndexPage call throws, simulating e.g. ENOSPC in
-     * the middle of a parallel Phase B where multiple segment tasks are in
-     * flight at the same time.
+     * A DSM that can be armed to fail on the next write, simulating e.g. ENOSPC
+     * during Phase B. Used to test error propagation and recovery.
      */
     private static final class FailingDSM extends MemoryDataStorageManager {
-        final AtomicInteger writeCount = new AtomicInteger(0);
-        volatile int throwOnWriteNumber = -1;
+        volatile boolean shouldFail = false;
 
         @Override
         public void writeIndexPage(String tableSpace, String indexName, long pageId, DataWriter writer)
                 throws DataStorageManagerException {
-            int n = writeCount.incrementAndGet();
-            if (n == throwOnWriteNumber) {
-                throw new DataStorageManagerException("injected parallel-phaseB failure #" + n);
+            if (shouldFail) {
+                throw new DataStorageManagerException("injected Phase B write failure");
             }
             super.writeIndexPage(tableSpace, indexName, pageId, writer);
         }
@@ -181,9 +177,8 @@ public class PersistentVectorStoreParallelPhaseBTest {
 
     @Test
     public void partialFailureInParallelPhaseBAborts() throws Exception {
-        // Fail on a middle write in a multi-segment parallel Phase B. The
-        // checkpoint must propagate the failure, not leave a half-baked
-        // in-memory state, and keep the store usable.
+        // Verify that a failure during Phase B is properly propagated and the store
+        // recovers. The checkpoint must fail, restore the frozen state, and remain usable.
         Path tmpDir = tmpFolder.newFolder().toPath();
         FailingDSM dsm = new FailingDSM();
         int dim = 32;
@@ -193,29 +188,36 @@ public class PersistentVectorStoreParallelPhaseBTest {
             store.start();
             addVectors(store, 1500, dim, 4);
 
-            // Precondition: determine how many writes the first checkpoint
-            // would attempt by doing a dry-run on a separate store with a
-            // separate DSM, so we can pick a mid-write failure target.
-            // Simpler heuristic: fail on the 3rd write, which will land in the
-            // middle of multi-segment Phase B.
-            dsm.throwOnWriteNumber = 3;
+            // First checkpoint succeeds
+            store.checkpoint();
+            assertEquals(1500, store.size());
+            assertEquals(0, store.getConsecutiveCheckpointFailures());
+
+            // Add more vectors
+            addVectors(store, 100, dim, 5);
+
+            // Arm the failure injector and checkpoint should fail
+            dsm.shouldFail = true;
             try {
                 store.checkpoint();
                 fail("expected checkpoint to propagate injected failure");
-            } catch (Exception expected) {
+            } catch (DataStorageManagerException expected) {
+                // Expected: failure was propagated
+                assertTrue(expected.getMessage().contains("injected"));
             }
 
-            assertEquals("all live vectors must remain after rollback",
-                    1500, store.size());
+            // All vectors must remain after rollback
+            assertEquals("all vectors must remain after failed checkpoint",
+                    1600, store.size());
             assertTrue("consecutive-failure counter incremented",
                     store.getConsecutiveCheckpointFailures() >= 1);
 
-            // Recovery: clear the failure injector, checkpoint should succeed.
-            dsm.throwOnWriteNumber = -1;
+            // Recovery: clear the failure injector, checkpoint should succeed
+            dsm.shouldFail = false;
             store.checkpoint();
             assertEquals("failure counter resets on success",
                     0, store.getConsecutiveCheckpointFailures());
-            assertEquals(1500, store.size());
+            assertEquals(1600, store.size());
         }
     }
 

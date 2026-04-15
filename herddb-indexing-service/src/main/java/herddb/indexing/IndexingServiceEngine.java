@@ -321,6 +321,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final long compactionInterval = config.getLong(
                     IndexingServerConfiguration.PROPERTY_COMPACTION_INTERVAL,
                     IndexingServerConfiguration.PROPERTY_COMPACTION_INTERVAL_DEFAULT);
+            final long maxLiveBytesPerCheckpoint = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT);
+            LOGGER.log(Level.INFO, "vector index maxLiveBytesPerCheckpoint: {0} bytes",
+                    maxLiveBytesPerCheckpoint);
 
             final long vectorMemLimit = maxVectorMemoryBytes;
             final VectorMemoryBudget budget = this;
@@ -333,7 +338,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         m, beamWidth, neighborOverflow, alpha,
                         fusedPQ, maxSegmentSize, maxLiveGraphSize,
                         compactionInterval,
-                        similarityFunction, vectorMemLimit, budget);
+                        similarityFunction, vectorMemLimit, budget, maxLiveBytesPerCheckpoint);
                 try {
                     store.start();
                 } catch (Exception e) {
