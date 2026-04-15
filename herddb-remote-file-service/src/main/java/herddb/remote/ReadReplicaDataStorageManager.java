@@ -112,7 +112,7 @@ public class ReadReplicaDataStorageManager extends DataStorageManager {
                 "multipartIndexReaderSupplier: {0} fileSize={1} writeBlockSize={2} bufferSize={3}",
                 new Object[]{logicalPath, fileSize, writeBlockSize, bufferSize});
         return new RemoteRandomAccessReader.Supplier(
-                client, logicalPath, fileSize, writeBlockSize, bufferSize);
+                client, logicalPath, fileSize, writeBlockSize, bufferSize, null);
     }
 
     // -------------------------------------------------------------------------

@@ -34,8 +34,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import javax.annotation.Nullable;
+import org.apache.bookkeeper.stats.Counter;
+import org.apache.bookkeeper.stats.OpStatsLogger;
+import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
  * Local filesystem implementation of {@link ObjectStorage}.
@@ -50,10 +55,27 @@ public class LocalObjectStorage implements ObjectStorage {
     private final Path baseDirectory;
     private final ExecutorService metadataExecutor;
     private final AsyncLoadingCache<Path, Boolean> knownDirectories;
+    @Nullable
+    private final OpStatsLogger diskReadLatency;
+    @Nullable
+    private final Counter diskReadBytes;
+    @Nullable
+    private final Counter diskReadRequests;
 
-    public LocalObjectStorage(Path baseDirectory, ExecutorService metadataExecutor) throws IOException {
+    public LocalObjectStorage(Path baseDirectory, ExecutorService metadataExecutor,
+                              @Nullable StatsLogger statsLogger) throws IOException {
         this.baseDirectory = baseDirectory.toAbsolutePath();
         this.metadataExecutor = metadataExecutor;
+        if (statsLogger != null) {
+            StatsLogger diskScope = statsLogger.scope("rfs").scope("disk");
+            this.diskReadLatency = diskScope.getOpStatsLogger("read_latency");
+            this.diskReadBytes = diskScope.getCounter("read_bytes");
+            this.diskReadRequests = diskScope.getCounter("read_requests");
+        } else {
+            this.diskReadLatency = null;
+            this.diskReadBytes = null;
+            this.diskReadRequests = null;
+        }
         Files.createDirectories(this.baseDirectory);
         this.knownDirectories = Caffeine.newBuilder()
                 .maximumSize(1000)
@@ -72,6 +94,13 @@ public class LocalObjectStorage implements ObjectStorage {
                     .filter(Files::isDirectory)
                     .forEach(dir -> knownDirectories.put(dir, CompletableFuture.completedFuture(true)));
         }
+    }
+
+    /**
+     * Backward-compatible constructor without metrics logging.
+     */
+    public LocalObjectStorage(Path baseDirectory, ExecutorService metadataExecutor) throws IOException {
+        this(baseDirectory, metadataExecutor, null);
     }
 
     private Path resolvePath(String path) {
@@ -201,11 +230,18 @@ public class LocalObjectStorage implements ObjectStorage {
         if (!Files.exists(target)) {
             return CompletableFuture.completedFuture(ReadResult.notFound());
         }
+        if (diskReadRequests != null) {
+            diskReadRequests.inc();
+        }
         CompletableFuture<ReadResult> result = new CompletableFuture<>();
+        final long startNanos = System.nanoTime();
         try {
             long fileSize = Files.size(target);
             int available = (int) (fileSize - offsetInBlock);
             if (available <= 0) {
+                if (diskReadLatency != null) {
+                    diskReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                }
                 return CompletableFuture.completedFuture(ReadResult.notFound());
             }
             int toRead = Math.min(length, available);
@@ -221,6 +257,15 @@ public class LocalObjectStorage implements ObjectStorage {
                     buffer.flip();
                     byte[] content = new byte[buffer.remaining()];
                     buffer.get(content);
+                    if (diskReadLatency != null) {
+                        diskReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                    }
+                    if (diskReadRequests != null) {
+                        diskReadRequests.inc();
+                    }
+                    if (diskReadBytes != null) {
+                        diskReadBytes.inc();
+                    }
                     result.complete(ReadResult.found(content));
                 }
                 @Override
@@ -229,10 +274,16 @@ public class LocalObjectStorage implements ObjectStorage {
                         channel.close();
                     } catch (IOException ignored) {
                     }
+                    if (diskReadLatency != null) {
+                        diskReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                    }
                     result.completeExceptionally(exc);
                 }
             });
         } catch (Throwable t) {
+            if (diskReadLatency != null) {
+                diskReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+            }
             result.completeExceptionally(t);
         }
         return result;

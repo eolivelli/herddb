@@ -137,6 +137,13 @@ public class RemoteFileServer implements AutoCloseable {
 
         int readExecutorThreads = Integer.parseInt(
                 config.getProperty(CONFIG_READ_EXECUTOR_THREADS, String.valueOf(ioThreads)));
+        // Initialize metrics first (needed for storage layers)
+        statsProvider = new PrometheusMetricsProvider();
+        PropertiesConfiguration statsConfig = new PropertiesConfiguration();
+        statsConfig.setProperty(PrometheusMetricsProvider.PROMETHEUS_STATS_HTTP_ENABLE, false);
+        statsProvider.start(statsConfig);
+        StatsLogger statsLogger = statsProvider.getStatsLogger("");
+
         int writeExecutorThreads = Integer.parseInt(
                 config.getProperty(CONFIG_WRITE_EXECUTOR_THREADS, String.valueOf(ioThreads)));
         readExecutor = buildLaneExecutor("remote-file-read-exec-", readExecutorThreads);
@@ -144,9 +151,9 @@ public class RemoteFileServer implements AutoCloseable {
 
         String storageMode = config.getProperty("storage.mode", "local");
         if ("s3".equals(storageMode)) {
-            objectStorage = buildS3ObjectStorage();
+            objectStorage = buildS3ObjectStorage(statsLogger);
         } else {
-            objectStorage = new LocalObjectStorage(dataDirectory, metadataExecutor);
+            objectStorage = new LocalObjectStorage(dataDirectory, metadataExecutor, statsLogger);
         }
 
         // Wrap with in-heap block cache if enabled. Sits in front of the inner storage
@@ -166,13 +173,6 @@ public class RemoteFileServer implements AutoCloseable {
         } else {
             LOGGER.log(Level.INFO, "In-heap block cache disabled");
         }
-
-        // Initialize metrics
-        statsProvider = new PrometheusMetricsProvider();
-        PropertiesConfiguration statsConfig = new PropertiesConfiguration();
-        statsConfig.setProperty(PrometheusMetricsProvider.PROMETHEUS_STATS_HTTP_ENABLE, false);
-        statsProvider.start(statsConfig);
-        StatsLogger statsLogger = statsProvider.getStatsLogger("");
         if (blockCache != null) {
             registerBlockCacheGauges(statsLogger, blockCache);
         }
@@ -301,7 +301,7 @@ public class RemoteFileServer implements AutoCloseable {
         });
     }
 
-    private ObjectStorage buildS3ObjectStorage() throws IOException {
+    private ObjectStorage buildS3ObjectStorage(StatsLogger statsLogger) throws IOException {
         String endpoint = config.getProperty("s3.endpoint");
         String bucket = config.getProperty("s3.bucket");
         String region = config.getProperty("s3.region", "us-east-1");
@@ -346,7 +346,7 @@ public class RemoteFileServer implements AutoCloseable {
                 dataDirectory.resolve("s3-cache").toString());
         Path cacheDirPath = Paths.get(cacheDir).toAbsolutePath();
 
-        S3ObjectStorage s3Storage = new S3ObjectStorage(s3Client, bucket, s3Prefix);
+        S3ObjectStorage s3Storage = new S3ObjectStorage(s3Client, bucket, s3Prefix, statsLogger);
         try {
             return new CachingObjectStorage(s3Storage, cacheDirPath, metadataExecutor, cacheMaxBytes);
         } catch (IOException e) {

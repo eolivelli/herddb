@@ -69,6 +69,7 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
     private final Counter searchRequests;
     private final Counter searchErrors;
     private final OpStatsLogger searchLatency;
+    private final Counter searchBytes;
     private final Counter statusRequests;
     private final Counter statusErrors;
 
@@ -78,6 +79,7 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
         this.searchRequests = scope.getCounter("search_requests");
         this.searchErrors = scope.getCounter("search_errors");
         this.searchLatency = scope.getOpStatsLogger("search_latency");
+        this.searchBytes = scope.getCounter("search_bytes");
         this.statusRequests = scope.getCounter("status_requests");
         this.statusErrors = scope.getCounter("status_errors");
     }
@@ -110,9 +112,11 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                 responseBuilder.addResults(resultBuilder);
             }
 
+            SearchResponse response = responseBuilder.build();
             long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
             searchLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-            responseObserver.onNext(responseBuilder.build());
+            searchBytes.inc();
+            responseObserver.onNext(response);
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
             searchErrors.inc();

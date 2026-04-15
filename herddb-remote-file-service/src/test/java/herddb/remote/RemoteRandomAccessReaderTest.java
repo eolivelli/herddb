@@ -209,7 +209,7 @@ public class RemoteRandomAccessReaderTest {
 
     private RemoteRandomAccessReader openReadFullyReader(String path, long totalSize) {
         return new RemoteRandomAccessReader(
-                client, path, totalSize, READFULLY_WRITE_BLOCK, READFULLY_BUFFER);
+                client, path, totalSize, READFULLY_WRITE_BLOCK, READFULLY_BUFFER, null);
     }
 
     /** Read fewer bytes than one buffer window. */
