@@ -410,6 +410,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final AtomicLong uploadBytesDone = new AtomicLong();
     private final AtomicLong uploadBytesTotal = new AtomicLong();
 
+    // Deferred shard metrics (issue #107).
+    //
+    // Track shard deferral due to Phase A byte-cap logic, for visibility into
+    // when the checkpoint memory budget is constraining shards across cycles.
+    private final AtomicInteger deferralEvents = new AtomicInteger();
+    private final AtomicLong currentDeferredVectors = new AtomicLong();
+    private final AtomicLong totalDeferredVectors = new AtomicLong();
+
     public long getTotalRolledBackPages() {
         return totalRolledBackPages.get();
     }
@@ -480,6 +488,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
             return total > 0 ? (int) Math.min(100L, (100L * done) / total) : 0;
         }
         return -1;
+    }
+
+    public int getDeferralEvents() {
+        return deferralEvents.get();
+    }
+
+    public long getCurrentDeferredVectors() {
+        return currentDeferredVectors.get();
+    }
+
+    public long getTotalDeferredVectors() {
+        return totalDeferredVectors.get();
     }
 
     // -------------------------------------------------------------------------
@@ -989,6 +1009,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
             this.frozenShards = null;
             this.deferredShards = null;
+            currentDeferredVectors.set(0);
         }
         this.pendingCheckpointDeletes = null;
         this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
@@ -1161,19 +1182,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
             for (LiveGraphShard shard : frozen) {
                 if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
                     int k = Math.min(perSourceK, shard.nodeToPk.size());
-                    try {
-                        ImmutableGraphIndex graph = shard.builder.getGraph();
-                        SearchResult result = GraphSearcher.search(
-                                qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
-                        for (SearchResult.NodeScore ns : result.getNodes()) {
-                            Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
-                            if (pk != null && (pending == null || !pending.contains(pk))) {
-                                results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
-                            }
+                    ImmutableGraphIndex graph = shard.builder.getGraph();
+                    SearchResult result = GraphSearcher.search(
+                            qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
+                    for (SearchResult.NodeScore ns : result.getNodes()) {
+                        Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
+                        if (pk != null && (pending == null || !pending.contains(pk))) {
+                            results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
                         }
-                    } catch (Exception e) {
-                        LOGGER.log(Level.WARNING,
-                                "error searching frozen shard for " + indexName, e);
                     }
                 }
             }
@@ -1186,19 +1202,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
             for (LiveGraphShard shard : deferred) {
                 if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
                     int k = Math.min(perSourceK, shard.nodeToPk.size());
-                    try {
-                        ImmutableGraphIndex graph = shard.builder.getGraph();
-                        SearchResult result = GraphSearcher.search(
-                                qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
-                        for (SearchResult.NodeScore ns : result.getNodes()) {
-                            Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
-                            if (pk != null && (pending == null || !pending.contains(pk))) {
-                                results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
-                            }
+                    ImmutableGraphIndex graph = shard.builder.getGraph();
+                    SearchResult result = GraphSearcher.search(
+                            qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
+                    for (SearchResult.NodeScore ns : result.getNodes()) {
+                        Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
+                        if (pk != null && (pending == null || !pending.contains(pk))) {
+                            results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
                         }
-                    } catch (Exception e) {
-                        LOGGER.log(Level.WARNING,
-                                "error searching deferred shard for " + indexName, e);
                     }
                 }
             }
@@ -1582,15 +1593,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 snapshotShards = new ArrayList<>(allShards.subList(0, capIndex));
                 this.deferredShards = new ArrayList<>(allShards.subList(capIndex, allShards.size()));
                 long snapshotVectors = snapshotShards.stream().mapToInt(s -> s.nodeToPk.size()).sum();
+                long deferredVectors = this.deferredShards.stream().mapToInt(s -> s.nodeToPk.size()).sum();
+                deferralEvents.incrementAndGet();
+                currentDeferredVectors.set(deferredVectors);
+                totalDeferredVectors.addAndGet(deferredVectors);
                 LOGGER.log(Level.WARNING,
                         "checkpoint {0} Phase A: byte cap {1} reached; snapshotting {2} shards "
-                                + "({3} vectors, ~{4} MB), deferring {5} shards to next cycle",
+                                + "({3} vectors, ~{4} MB), deferring {5} shards ({6} vectors) to next cycle",
                         new Object[]{indexName, byteCap, capIndex, snapshotVectors,
                                 snapshotVectors * bytesPerVec / (1024 * 1024),
-                                allShards.size() - capIndex});
+                                allShards.size() - capIndex, deferredVectors});
             } else {
                 snapshotShards = allShards;
                 this.deferredShards = null;
+                // No deferral needed; all shards fit within the byte cap
+                currentDeferredVectors.set(0);
             }
 
             sealedSegments = new ArrayList<>();
@@ -1808,6 +1825,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
             this.frozenShards = null;
             this.deferredShards = null;
+            currentDeferredVectors.set(0);  // Deferred shards have been restored to live set
             this.pendingCheckpointDeletes = null;
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
             dirty.set(totalLiveSize() > 0);
@@ -2307,6 +2325,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
             this.frozenShards = null;
             this.deferredShards = null;
+            currentDeferredVectors.set(0);  // Deferred shards have been restored to live set
             this.pendingCheckpointDeletes = null;
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
             dirty.set(true);
