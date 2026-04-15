@@ -376,10 +376,14 @@ public class VectorIndexManager extends AbstractIndexManager {
             } catch (RuntimeException e) {
                 long elapsedNanos = System.nanoTime() - rpcStart;
                 if (!firstBatchProcessed) {
-                    queryLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+                    if (queryLatency != null) {
+                        queryLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+                    }
                     firstBatchProcessed = true;
                 }
-                queryErrors.inc();
+                if (queryErrors != null) {
+                    queryErrors.inc();
+                }
                 long elapsedMs = TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
                 LOGGER.log(Level.SEVERE,
                         "searchStream expansion {0} failed for index {1} after {2} ms: {3}",
@@ -389,7 +393,9 @@ public class VectorIndexManager extends AbstractIndexManager {
             }
             long elapsedNanos = System.nanoTime() - rpcStart;
             if (!firstBatchProcessed) {
-                queryLatency.registerSuccessfulEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+                if (queryLatency != null) {
+                    queryLatency.registerSuccessfulEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+                }
                 firstBatchProcessed = true;
             }
             long elapsedMs = TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
