@@ -42,6 +42,8 @@ import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -322,6 +324,18 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         return writeFileAsync(path, UnsafeByteOperations.unsafeWrap(buf, offset, len));
     }
 
+    /**
+     * Writes a file from a pooled ByteBuf. Zero-copy to gRPC ByteString.
+     * The ByteBuf is NOT released by this method; caller must release after completion.
+     */
+    public CompletableFuture<Long> writeFileAsync(String path, ByteBuf content) {
+        ByteString bs = content.hasArray()
+                ? UnsafeByteOperations.unsafeWrap(content.array(),
+                        content.arrayOffset() + content.readerIndex(), content.readableBytes())
+                : UnsafeByteOperations.unsafeWrap(content.nioBuffer());
+        return writeFileAsync(path, bs);
+    }
+
     private CompletableFuture<Long> writeFileAsync(String path, ByteString content) {
         // Writes are not idempotent — no retry
         CompletableFuture<Long> future = new CompletableFuture<>();
@@ -378,6 +392,48 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
                     @Override
                     public void onError(Throwable t) {
+                        future.completeExceptionally(t);
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        future.complete(result);
+                    }
+                });
+        return future;
+    }
+
+    /**
+     * Reads a file into a pooled ByteBuf. Returns null if file not found.
+     * Caller must release the ByteBuf after use.
+     */
+    public CompletableFuture<ByteBuf> readFileAsByteBufAsync(String path) {
+        return retryAsync(() -> doReadFileAsByteBufAsync(path), "readFile", path, 0);
+    }
+
+    private CompletableFuture<ByteBuf> doReadFileAsByteBufAsync(String path) {
+        CompletableFuture<ByteBuf> future = new CompletableFuture<>();
+        readStubForPath(path).readFile(
+                ReadFileRequest.newBuilder().setPath(path).build(),
+                new StreamObserver<ReadFileResponse>() {
+                    private ByteBuf result;
+
+                    @Override
+                    public void onNext(ReadFileResponse response) {
+                        if (response.getFound()) {
+                            ByteString content = response.getContent();
+                            ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(content.size());
+                            buf.writeBytes(content.asReadOnlyByteBuffer());
+                            result = buf;
+                        }
+                    }
+
+                    @Override
+                    public void onError(Throwable t) {
+                        if (result != null) {
+                            result.release();
+                            result = null;
+                        }
                         future.completeExceptionally(t);
                     }
 
@@ -492,6 +548,41 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     /**
+     * Writes one block of a multipart file from a ByteBuf. Not retried (not idempotent).
+     * Routes via consistent hash of {@code path#block{blockIndex}}.
+     * The ByteBuf is NOT released by this method; caller must release after completion.
+     */
+    public CompletableFuture<Void> writeFileBlockAsync(String path, long blockIndex, ByteBuf content) {
+        ByteString bs = content.hasArray()
+                ? UnsafeByteOperations.unsafeWrap(content.array(),
+                        content.arrayOffset() + content.readerIndex(), content.readableBytes())
+                : UnsafeByteOperations.unsafeWrap(content.nioBuffer());
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        writeStubForBlock(path, blockIndex).writeFileBlock(
+                WriteFileBlockRequest.newBuilder()
+                        .setPath(path)
+                        .setBlockIndex(blockIndex)
+                        .setContent(bs)
+                        .build(),
+                new StreamObserver<WriteFileBlockResponse>() {
+                    @Override
+                    public void onNext(WriteFileBlockResponse response) {
+                    }
+
+                    @Override
+                    public void onError(Throwable t) {
+                        future.completeExceptionally(t);
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        future.complete(null);
+                    }
+                });
+        return future;
+    }
+
+    /**
      * Reads a range of bytes from a (possibly multipart) file.
      * Routes to the server responsible for the block containing {@code offset}.
      * If the range spans two blocks, two sequential requests are made.
@@ -563,26 +654,34 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
     /**
      * Writes an {@link InputStream} as a multipart file, splitting into blocks of {@code blockSize}.
+     * Uses a pooled heap ByteBuf internally to avoid per-block allocations.
      * Blocks are written sequentially. Returns the total number of bytes written.
      */
     public long writeMultipartFile(String path, InputStream in, int blockSize) throws IOException {
-        byte[] buf = new byte[blockSize];
         long blockIndex = 0;
         long totalBytes = 0;
-        int read;
-        while ((read = readFully(in, buf)) > 0) {
-            byte[] block = read == blockSize ? buf : java.util.Arrays.copyOf(buf, read);
-            getUnchecked(writeFileBlockAsync(path, blockIndex, block));
-            blockIndex++;
-            totalBytes += read;
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(blockSize, blockSize);
+        try {
+            byte[] backingArray = buf.array();
+            int startOffset = buf.arrayOffset();
+            int read;
+            while ((read = readFully(in, backingArray, startOffset, blockSize)) > 0) {
+                buf.setIndex(0, read); // set readerIndex=0, writerIndex=read
+                totalBytes += read;
+                getUnchecked(writeFileBlockAsync(path, blockIndex, buf)); // synchronous via getUnchecked
+                buf.clear(); // reset for next iteration; safe because writeFileBlockAsync is blocking
+                blockIndex++;
+            }
+        } finally {
+            buf.release();
         }
         return totalBytes;
     }
 
-    private static int readFully(InputStream in, byte[] buf) throws IOException {
+    private static int readFully(InputStream in, byte[] buf, int offset, int len) throws IOException {
         int total = 0;
-        while (total < buf.length) {
-            int read = in.read(buf, total, buf.length - total);
+        while (total < len) {
+            int read = in.read(buf, offset + total, len - total);
             if (read == -1) {
                 break;
             }
@@ -663,6 +762,22 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
     public void writeFileBlock(String path, long blockIndex, byte[] content) {
         getUnchecked(writeFileBlockAsync(path, blockIndex, content));
+    }
+
+    public void writeFile(String path, ByteBuf content) {
+        getUnchecked(writeFileAsync(path, content));
+    }
+
+    public void writeFileBlock(String path, long blockIndex, ByteBuf content) {
+        getUnchecked(writeFileBlockAsync(path, blockIndex, content));
+    }
+
+    /**
+     * Reads a file into a pooled ByteBuf. Returns null if file not found.
+     * Caller must release the ByteBuf after use.
+     */
+    public ByteBuf readFileAsByteBuf(String path) {
+        return getUnchecked(readFileAsByteBufAsync(path));
     }
 
     public byte[] readFileRange(String path, long offset, int length, int blockSize) {
