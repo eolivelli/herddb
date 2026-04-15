@@ -172,7 +172,7 @@ public class S3ObjectStorage implements ObjectStorage {
                         s3ReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
                     }
                     if (s3ReadBytes != null) {
-                        s3ReadBytes.add(slice.length);
+                        s3ReadBytes.add((long) slice.length);
                     }
                     return ReadResult.found(slice);
                 })

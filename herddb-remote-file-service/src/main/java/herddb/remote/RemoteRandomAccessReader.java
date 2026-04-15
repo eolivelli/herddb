@@ -254,7 +254,7 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
             clientReadLatency.registerSuccessfulEvent(elapsedNanos, TimeUnit.NANOSECONDS);
         }
         if (clientReadBytes != null) {
-            clientReadBytes.add(data.length);
+            clientReadBytes.add((long) data.length);
         }
         blockBuffer = data;
         bufferedBlockIndex = bufferIndex;

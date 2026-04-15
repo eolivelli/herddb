@@ -545,7 +545,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
         int writeBlockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
         return new RemoteRandomAccessReader.Supplier(
-                client, logicalPath, fileSize, writeBlockSize, READ_BUFFER_SIZE);
+                client, logicalPath, fileSize, writeBlockSize, READ_BUFFER_SIZE, null);
     }
 
     @Override
