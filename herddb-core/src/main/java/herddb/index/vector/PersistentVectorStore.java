@@ -1869,14 +1869,87 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // NEW: Per-shard FusedPQ write (no pooling!)
         // Each shard's already-built OnHeapGraphIndex is serialized directly.
         // This avoids the mega-pool and graph rebuild that caused the OOM.
+        // Write shards in parallel for efficiency and proper error propagation.
         List<SegmentWriteResult> newSegmentResults = new ArrayList<>();
         int totalShardVectors = 0;
+
+        // Build list of per-shard write tasks
+        List<ShardWriteTask> shardTasks = new ArrayList<>();
         for (LiveGraphShard shard : snapshotShards) {
             int segId = nextSegmentId.getAndIncrement();
-            SegmentWriteResult result = writeShardAsFusedPQSegment(shard, segId, snapshotDimension);
-            if (result != null) {
-                newSegmentResults.add(result);
-                totalShardVectors += shard.nodeToPk.size();
+            shardTasks.add(new ShardWriteTask(shard, segId, snapshotDimension));
+        }
+
+        // Execute shard writes in parallel with proper error handling
+        if (!shardTasks.isEmpty()) {
+            int parallelism = Math.min(PHASE_B_SEGMENT_PARALLELISM, shardTasks.size());
+            if (parallelism == 1) {
+                // Fast path: serial execution
+                for (ShardWriteTask task : shardTasks) {
+                    SegmentWriteResult result = writeShardAsFusedPQSegment(
+                            task.shard, task.segmentId, snapshotDimension);
+                    if (result != null) {
+                        newSegmentResults.add(result);
+                        totalShardVectors += task.shard.nodeToPk.size();
+                    }
+                }
+            } else {
+                // Parallel execution with proper error handling
+                java.util.concurrent.ExecutorService executor =
+                        java.util.concurrent.Executors.newFixedThreadPool(parallelism, r -> {
+                            Thread t = new Thread(r, "persistent-vector-store-phaseB-shard-" + indexName);
+                            t.setDaemon(true);
+                            return t;
+                        });
+                try {
+                    List<java.util.concurrent.Future<SegmentWriteResult>> futures = new ArrayList<>();
+                    for (ShardWriteTask task : shardTasks) {
+                        // Capture task values locally to avoid lambda capture issues
+                        LiveGraphShard shard = task.shard;
+                        int segId = task.segmentId;
+                        futures.add(executor.submit(() -> writeShardAsFusedPQSegment(
+                                shard, segId, snapshotDimension)));
+                    }
+
+                    Throwable firstFailure = null;
+                    for (int i = 0; i < futures.size(); i++) {
+                        try {
+                            SegmentWriteResult r = futures.get(i).get();
+                            if (r != null) {
+                                newSegmentResults.add(r);
+                                totalShardVectors += shardTasks.get(i).shard.nodeToPk.size();
+                            }
+                        } catch (java.util.concurrent.ExecutionException ee) {
+                            if (firstFailure == null) {
+                                firstFailure = ee.getCause() != null ? ee.getCause() : ee;
+                            }
+                            // Cancel remaining futures
+                            for (int j = i + 1; j < futures.size(); j++) {
+                                futures.get(j).cancel(true);
+                            }
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            if (firstFailure == null) {
+                                firstFailure = ie;
+                            }
+                        }
+                    }
+
+                    if (firstFailure != null) {
+                        if (firstFailure instanceof IOException) {
+                            throw (IOException) firstFailure;
+                        }
+                        if (firstFailure instanceof DataStorageManagerException) {
+                            throw (DataStorageManagerException) firstFailure;
+                        }
+                        if (firstFailure instanceof RuntimeException) {
+                            throw (RuntimeException) firstFailure;
+                        }
+                        throw new IOException("Phase B parallel shard write failed", firstFailure);
+                    }
+                } finally {
+                    executor.shutdownNow();
+                }
             }
         }
 
@@ -2041,6 +2114,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         + "(sealed={2}, threshold={3})",
                 new Object[]{indexName, demotions.size(), sealedSegments.size(),
                         SEGMENT_MERGE_THRESHOLD});
+    }
+
+    /** Task descriptor: one shard to write in Phase B (per-shard FusedPQ approach). */
+    private static final class ShardWriteTask {
+        final LiveGraphShard shard;
+        final int segmentId;
+        final int snapshotDimension;
+
+        ShardWriteTask(LiveGraphShard shard, int segmentId, int snapshotDimension) {
+            this.shard = shard;
+            this.segmentId = segmentId;
+            this.snapshotDimension = snapshotDimension;
+        }
     }
 
     /** Slice descriptor: one FusedPQ segment to build in Phase B. */
