@@ -206,7 +206,7 @@ public class IndexingServiceClientPredicateFanOutTest {
         try (VectorIndexManager.SearchIterator it =
                      VectorIndexManager.newSearchIteratorForTest(client,
                              "herd", "t1", "vidx", new float[]{1, 0, 0},
-                             10, 1.0f, 16, 6)) {
+                             10, 1.0f, 16, 6, null, null)) {
             // Drain exactly 16 entries without calling hasNext after the
             // final next() — we want to avoid triggering the expansion
             // RPC inside the drain loop and keep the fail-fast assertion
