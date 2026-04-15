@@ -203,25 +203,33 @@ final class PageStoreReader implements RandomAccessReader {
         final long totalLength;
         private final int maxCachedPages;
         private final LinkedHashMap<Integer, byte[]> cache;
+        private final SharedSegmentPageCache sharedCache;
         /** Observability: number of page loads that hit the cache. */
         final AtomicLong cacheHits = new AtomicLong(0);
         /** Observability: number of page loads that missed and read from the page store. */
         final AtomicLong cacheMisses = new AtomicLong(0);
 
         /**
-         * Builds the PageSource by reading each page once to learn its length.
-         * This is a single linear pass over {@code pageIds}; after it returns
-         * the cache may be warmed with up to {@code maxCachedPages} entries.
+         * Builds the PageSource with lazy loading. Page sizes must be provided up-front
+         * (from segment metadata), so the prefix-sum table can be built without reading
+         * any page content. Pages are fetched on-demand during search.
+         *
+         * @param pageIds logical page IDs in DataStorageManager
+         * @param pageSizes payload size (in bytes) for each page, pre-computed at write time
+         * @param expectedChunkType type tag to validate when reading pages
+         * @param maxCachedPages per-segment LRU page cache size
+         * @param sharedCache optional global page cache; if non-null, pages are stored here first
          */
         PageSource(DataStorageManager dsm, String tableSpace, String indexName,
-                   long[] pageIds, int expectedChunkType, int maxCachedPages)
-                throws IOException, DataStorageManagerException {
+                   long[] pageIds, int[] pageSizes, int expectedChunkType, int maxCachedPages,
+                   SharedSegmentPageCache sharedCache) {
             this.dsm = dsm;
             this.tableSpace = tableSpace;
             this.indexName = indexName;
             this.pageIds = pageIds;
             this.expectedChunkType = expectedChunkType;
-            this.pageSizes = new int[pageIds.length];
+            this.pageSizes = pageSizes;
+            this.sharedCache = sharedCache;
             this.prefixSum = new long[pageIds.length + 1];
             this.maxCachedPages = Math.max(1, maxCachedPages);
             this.cache = new LinkedHashMap<Integer, byte[]>(maxCachedPages + 1, 0.75f, true) {
@@ -231,16 +239,10 @@ final class PageStoreReader implements RandomAccessReader {
                 }
             };
 
-            // First pass: read every page once to discover its length. We keep
-            // the last `maxCachedPages` in the cache as a warm start — no extra
-            // reads required if the caller immediately iterates forward.
+            // Build prefix-sum table from pre-computed page sizes (no I/O).
+            // Pages are fetched lazily in loadPage() only when accessed during search.
             for (int i = 0; i < pageIds.length; i++) {
-                byte[] payload = readPayload(pageIds[i], expectedChunkType);
-                pageSizes[i] = payload.length;
-                prefixSum[i + 1] = prefixSum[i] + payload.length;
-                synchronized (cache) {
-                    cache.put(i, payload);
-                }
+                prefixSum[i + 1] = prefixSum[i] + pageSizes[i];
             }
             this.totalLength = prefixSum[pageIds.length];
         }
@@ -273,6 +275,9 @@ final class PageStoreReader implements RandomAccessReader {
         }
 
         byte[] loadPage(int pageIndex) {
+            long pageId = pageIds[pageIndex];
+
+            // Check per-segment LRU first
             byte[] page;
             synchronized (cache) {
                 page = cache.get(pageIndex);
@@ -281,15 +286,35 @@ final class PageStoreReader implements RandomAccessReader {
                     return page;
                 }
             }
+
+            // Check shared global cache (if enabled)
+            if (sharedCache != null) {
+                page = sharedCache.get(pageId);
+                if (page != null) {
+                    // Store in per-segment LRU too for locality
+                    synchronized (cache) {
+                        cache.put(pageIndex, page);
+                        cacheHits.incrementAndGet();
+                    }
+                    return page;
+                }
+            }
+
+            // Cache miss: fetch from storage
             try {
-                page = readPayload(pageIds[pageIndex], expectedChunkType);
+                page = readPayload(pageId, expectedChunkType);
             } catch (IOException | DataStorageManagerException e) {
                 throw new RuntimeException(
-                        "failed to read page " + pageIds[pageIndex] + " for index " + indexName, e);
+                        "failed to read page " + pageId + " for index " + indexName, e);
             }
+
+            // Store in both caches
             synchronized (cache) {
                 cache.put(pageIndex, page);
                 cacheMisses.incrementAndGet();
+            }
+            if (sharedCache != null) {
+                sharedCache.put(pageId, page);
             }
             return page;
         }
@@ -329,10 +354,11 @@ final class PageStoreReader implements RandomAccessReader {
         private final PageSource source;
 
         Supplier(DataStorageManager dsm, String tableSpace, String indexName,
-                 long[] pageIds, int expectedChunkType, int maxCachedPages)
-                throws IOException, DataStorageManagerException {
+                 long[] pageIds, int[] pageSizes, int expectedChunkType, int maxCachedPages,
+                 SharedSegmentPageCache sharedCache) {
             this.source = new PageSource(
-                    dsm, tableSpace, indexName, pageIds, expectedChunkType, maxCachedPages);
+                    dsm, tableSpace, indexName, pageIds, pageSizes, expectedChunkType,
+                    maxCachedPages, sharedCache);
         }
 
         @Override
@@ -342,9 +368,15 @@ final class PageStoreReader implements RandomAccessReader {
 
         @Override
         public void close() {
-            // Drop cached pages to free memory promptly.
+            // Drop cached pages to free memory promptly
             synchronized (source.cache) {
                 source.cache.clear();
+            }
+            // Also invalidate entries from shared cache
+            if (source.sharedCache != null) {
+                for (long pageId : source.pageIds) {
+                    source.sharedCache.invalidate(pageId);
+                }
             }
         }
 

@@ -267,6 +267,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /** Optional stats logger for recording per-segment size distribution. */
     private volatile OpStatsLogger segmentSizeStats;
 
+    /** Global shared page cache for all segments of this store. */
+    private final SharedSegmentPageCache segmentPageCache;
+
     // -------------------------------------------------------------------------
     // In-memory state -- LIVE inserts (new since last checkpoint)
     // -------------------------------------------------------------------------
@@ -593,6 +596,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.maxVectorMemoryBytes = maxVectorMemoryBytes;
         this.memoryBudget = memoryBudget;
         this.maxLiveBytesPerCheckpoint = maxLiveBytesPerCheckpoint > 0 ? maxLiveBytesPerCheckpoint : 10L * 1024 * 1024 * 1024;
+
+        // Initialize global shared page cache for lazy-loaded segments
+        long segmentPageCacheBytes = Long.getLong("herddb.vectorindex.segmentPageCacheMaxBytes",
+                SharedSegmentPageCache.DEFAULT_MAX_BYTES);
+        this.segmentPageCache = new SharedSegmentPageCache(segmentPageCacheBytes);
     }
 
     /**
@@ -682,6 +690,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.maxVectorMemoryBytes = maxVectorMemoryBytes;
         this.memoryBudget = memoryBudget;
         this.maxLiveBytesPerCheckpoint = maxLiveBytesPerCheckpoint > 0 ? maxLiveBytesPerCheckpoint : 10L * 1024 * 1024 * 1024;
+
+        // Initialize global shared page cache for lazy-loaded segments
+        long segmentPageCacheBytes = Long.getLong("herddb.vectorindex.segmentPageCacheMaxBytes",
+                SharedSegmentPageCache.DEFAULT_MAX_BYTES);
+        this.segmentPageCache = new SharedSegmentPageCache(segmentPageCacheBytes);
     }
 
     // -------------------------------------------------------------------------
@@ -747,6 +760,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
         final int segmentId;
         final List<Long> graphPageIds;
         final List<Long> mapPageIds;
+        final List<Integer> graphPageSizes;
+        final List<Integer> mapPageSizes;
         final long estimatedSizeBytes;
         // Multipart mode (non-null when the storage manager supports multipart writes)
         final String graphFilePath;
@@ -756,10 +771,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         /** Page-based constructor. */
         SegmentWriteResult(int segmentId, List<Long> graphPageIds, List<Long> mapPageIds,
+                           List<Integer> graphPageSizes, List<Integer> mapPageSizes,
                            long estimatedSizeBytes) {
             this.segmentId = segmentId;
             this.graphPageIds = graphPageIds;
             this.mapPageIds = mapPageIds;
+            this.graphPageSizes = graphPageSizes;
+            this.mapPageSizes = mapPageSizes;
             this.estimatedSizeBytes = estimatedSizeBytes;
             this.graphFilePath = null;
             this.graphFileSize = 0;
@@ -773,6 +791,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
             this.segmentId = segmentId;
             this.graphPageIds = Collections.emptyList();
             this.mapPageIds = Collections.emptyList();
+            this.graphPageSizes = Collections.emptyList();
+            this.mapPageSizes = Collections.emptyList();
             this.estimatedSizeBytes = estimatedSizeBytes;
             this.graphFilePath = graphFilePath;
             this.graphFileSize = graphFileSize;
@@ -782,6 +802,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         boolean isMultipart() {
             return graphFilePath != null;
+        }
+    }
+
+    /** Holds the result of writing chunks (pageIds + their payload sizes). */
+    private static class ChunkWriteResult {
+        final List<Long> pageIds;
+        final List<Integer> payloadSizes;
+
+        ChunkWriteResult(List<Long> pageIds, List<Integer> payloadSizes) {
+            this.pageIds = pageIds;
+            this.payloadSizes = payloadSizes;
         }
     }
 
@@ -1022,6 +1053,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
             seg.close();
         }
         segments = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        // Clear the global shared page cache
+        if (segmentPageCache != null) {
+            segmentPageCache.clear();
+        }
 
         LOGGER.log(Level.INFO, "PersistentVectorStore {0} closed", indexName);
     }
@@ -1525,25 +1561,28 @@ public class PersistentVectorStore extends AbstractVectorStore {
         newShard.builder.cleanup();
         this.liveShards = new ArrayList<>(Collections.singletonList(newShard));
 
-        List<Long> graphPageIds;
+        ChunkWriteResult graphResult;
         Path graphTmpFile = Files.createTempFile(tmpDirectory, "herddb-vector-graph-", ".tmp");
         try {
             try (java.io.DataOutputStream graphDos = new java.io.DataOutputStream(
                     new BufferedOutputStream(new FileOutputStream(graphTmpFile.toFile()), CHUNK_SIZE))) {
                 ((OnHeapGraphIndex) newShard.builder.getGraph()).save(graphDos);
             }
-            graphPageIds = writeChunks(graphTmpFile, TYPE_VECTOR_GRAPHCHUNK);
+            graphResult = writeChunks(graphTmpFile, TYPE_VECTOR_GRAPHCHUNK);
         } finally {
             Files.deleteIfExists(graphTmpFile);
         }
 
-        List<Long> mapPageIds;
+        ChunkWriteResult mapResult;
         Path mapTmpFile = serializeMapDataToFile(vectorStorage, newShard.nodeToPk);
         try {
-            mapPageIds = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
+            mapResult = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
         } finally {
             Files.deleteIfExists(mapTmpFile);
         }
+
+        List<Long> graphPageIds = graphResult.pageIds;
+        List<Long> mapPageIds = mapResult.pageIds;
 
         int totalNodes = newShard.nodeToPk.size();
         persistIndexStatusSimple(graphPageIds, mapPageIds, totalNodes, false, sequenceNumber);
@@ -1706,6 +1745,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     seg.estimatedSizeBytes = swr.estimatedSizeBytes;
                     seg.graphPageIds = swr.graphPageIds;
                     seg.mapPageIds = swr.mapPageIds;
+                    seg.graphPageSizes = swr.graphPageSizes;
+                    seg.mapPageSizes = swr.mapPageSizes;
                     seg.graphFilePath = swr.graphFilePath;
                     seg.graphFileSize = swr.graphFileSize;
                     seg.mapFilePath = swr.mapFilePath;
@@ -2011,24 +2052,27 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
                 poolBuilder.cleanup();
 
-                List<Long> graphPageIds;
+                ChunkWriteResult graphResult;
                 Path graphTmpFile = Files.createTempFile(tmpDirectory, "herddb-vector-graph-", ".tmp");
                 try {
                     try (java.io.DataOutputStream graphDos = new java.io.DataOutputStream(
                             new BufferedOutputStream(new FileOutputStream(graphTmpFile.toFile()), CHUNK_SIZE))) {
                         ((OnHeapGraphIndex) poolBuilder.getGraph()).save(graphDos);
                     }
-                    graphPageIds = writeChunks(graphTmpFile, TYPE_VECTOR_GRAPHCHUNK);
+                    graphResult = writeChunks(graphTmpFile, TYPE_VECTOR_GRAPHCHUNK);
                 } finally {
                     Files.deleteIfExists(graphTmpFile);
                 }
-                List<Long> mapPageIds;
+                ChunkWriteResult mapResult;
                 Path mapTmpFile = serializeMapDataToFile(poolStorage, poolNodeToPk);
                 try {
-                    mapPageIds = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
+                    mapResult = writeChunks(mapTmpFile, TYPE_VECTOR_MAPCHUNK);
                 } finally {
                     Files.deleteIfExists(mapTmpFile);
                 }
+
+                List<Long> graphPageIds = graphResult.pageIds;
+                List<Long> mapPageIds = mapResult.pageIds;
                 try {
                     poolBuilder.close();
                 } catch (IOException e) {
@@ -2310,11 +2354,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 } else {
                     // Fallback to page-based write if multipart not supported
                     ConcurrentHashMap<Integer, Bytes> ordinalToPk = buildOrdinalToPk(shard);
-                    List<Long> graphPages = writeChunks(tempFile, TYPE_VECTOR_GRAPHCHUNK);
-                    List<Long> mapPages = writeFusedPQMapData(shardView, ordinalToPk);
+                    ChunkWriteResult graphResult = writeChunks(tempFile, TYPE_VECTOR_GRAPHCHUNK);
+                    ChunkWriteResult mapResult = writeFusedPQMapData(shardView, ordinalToPk);
                     compactionNodesDone.addAndGet(shardSize);
-                    return new SegmentWriteResult(segmentId, graphPages, mapPages,
-                            (long) (graphPages.size() + mapPages.size()) * CHUNK_SIZE);
+                    return new SegmentWriteResult(segmentId, graphResult.pageIds, mapResult.pageIds,
+                            graphResult.payloadSizes, mapResult.payloadSizes,
+                            (long) (graphResult.pageIds.size() + mapResult.pageIds.size()) * CHUNK_SIZE);
                 }
             } finally {
                 // Always delete temp file - it's been uploaded/written to persistent storage
@@ -2642,16 +2687,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 try {
                     int numGraphChunks = dis.readInt();
                     long[] graphChunkPageIds = new long[numGraphChunks];
+                    int[] graphChunkPageSizes = new int[numGraphChunks];
                     for (int i = 0; i < numGraphChunks; i++) {
                         graphChunkPageIds[i] = dis.readLong();
+                        graphChunkPageSizes[i] = dis.readInt();
                     }
                     int numMapChunks = dis.readInt();
                     long[] mapChunkPageIds = new long[numMapChunks];
+                    int[] mapChunkPageSizes = new int[numMapChunks];
                     for (int i = 0; i < numMapChunks; i++) {
                         mapChunkPageIds[i] = dis.readLong();
+                        mapChunkPageSizes[i] = dis.readInt();
                     }
                     seg.graphPageIds = toLongList(graphChunkPageIds);
                     seg.mapPageIds = toLongList(mapChunkPageIds);
+                    seg.graphPageSizes = toIntList(graphChunkPageSizes);
+                    seg.mapPageSizes = toIntList(mapChunkPageSizes);
                     Path mapFile = readChunksToTempFile(mapChunkPageIds, TYPE_VECTOR_MAPCHUNK);
                     loadFusedPQSegment(seg, mapFile, dim, savedNextNodeId);
                 } catch (IOException e) {
@@ -2769,13 +2820,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         } else {
             long[] graphPageIds = new long[seg.graphPageIds.size()];
+            int[] graphPageSizes = new int[seg.graphPageSizes.size()];
             for (int i = 0; i < graphPageIds.length; i++) {
                 graphPageIds[i] = seg.graphPageIds.get(i);
+                graphPageSizes[i] = seg.graphPageSizes.get(i);
             }
             readerSupplier = new PageStoreReader.Supplier(
                     dataStorageManager, tableSpaceUUID, indexUUID,
-                    graphPageIds, TYPE_VECTOR_GRAPHCHUNK,
-                    PageStoreReader.DEFAULT_LRU_PAGES);
+                    graphPageIds, graphPageSizes, TYPE_VECTOR_GRAPHCHUNK,
+                    PageStoreReader.DEFAULT_LRU_PAGES, segmentPageCache);
         }
         seg.onDiskGraph = OnDiskGraphIndex.load(readerSupplier);
         seg.onDiskReaderSupplier = readerSupplier;
@@ -2856,17 +2909,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         // Fallback: page-based writes
-        List<Long> graphPageIds = writeFusedPQGraph(partVectors, partNodeToPk, snapshotDimension);
-        List<Long> mapPageIds = writeFusedPQMapData(
+        ChunkWriteResult graphResult = writeFusedPQGraph(partVectors, partNodeToPk, snapshotDimension);
+        ChunkWriteResult mapResult = writeFusedPQMapData(
                 new VectorStorageRandomAccessVectorValues(partStorage, snapshotDimension), partNodeToPk);
-        long estimatedSize = (long) (graphPageIds.size() + mapPageIds.size()) * CHUNK_SIZE;
-        return new SegmentWriteResult(s.segmentId, graphPageIds, mapPageIds, estimatedSize);
+        long estimatedSize = (long) (graphResult.pageIds.size() + mapResult.pageIds.size()) * CHUNK_SIZE;
+        return new SegmentWriteResult(s.segmentId, graphResult.pageIds, mapResult.pageIds,
+                graphResult.payloadSizes, mapResult.payloadSizes, estimatedSize);
     }
 
     /**
-     * Writes the merged graph as FusedPQ on-disk format.
+     * Writes the merged graph as FusedPQ on-disk format. Returns both page IDs and their payload sizes.
      */
-    private List<Long> writeFusedPQGraph(ConcurrentHashMap<Integer, VectorFloat<?>> allVectors,
+    private ChunkWriteResult writeFusedPQGraph(ConcurrentHashMap<Integer, VectorFloat<?>> allVectors,
                                           ConcurrentHashMap<Integer, Bytes> allNodeToPk,
                                           int dim) throws IOException, DataStorageManagerException {
         if (allNodeToPk.isEmpty()) {
@@ -2955,12 +3009,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         ordinal -> new InlineVectors.State(allMravv.getVector(ordinal)));
                 writer.write(suppliers);
             }
-            List<Long> pages = writeChunks(tempFile, TYPE_VECTOR_GRAPHCHUNK);
+            ChunkWriteResult result = writeChunks(tempFile, TYPE_VECTOR_GRAPHCHUNK);
             long writeElapsedMs = System.currentTimeMillis() - writeStartMs;
             LOGGER.log(Level.INFO,
                     "writeFusedPQGraph {0}: disk write completed in {1} ms ({2} pages)",
-                    new Object[]{indexName, writeElapsedMs, pages.size()});
-            return pages;
+                    new Object[]{indexName, writeElapsedMs, result.pageIds.size()});
+            return result;
         } finally {
             Files.deleteIfExists(tempFile);
             try {
@@ -2972,9 +3026,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
-     * Writes map data for FusedPQ format.
+     * Writes map data for FusedPQ format. Returns both page IDs and their payload sizes.
      */
-    private List<Long> writeFusedPQMapData(RandomAccessVectorValues allVectors,
+    private ChunkWriteResult writeFusedPQMapData(RandomAccessVectorValues allVectors,
                                             ConcurrentHashMap<Integer, Bytes> allNodeToPk)
             throws IOException, DataStorageManagerException {
         List<Integer> sortedNodeIds = new ArrayList<>(allNodeToPk.keySet());
@@ -3234,12 +3288,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Streams a file into CHUNK_SIZE pieces and writes each as an index page.
+     * Returns both page IDs and the payload size for each page (used for building prefix-sum table).
      * <p>Every allocated pageId is recorded in {@link #provisionalPageIds} (if non-null)
      * <em>before</em> the corresponding {@code writeIndexPage} call, so that a failure
      * mid-write still leaves a rollback record for the caller to reclaim the page.
      */
-    private List<Long> writeChunks(Path file, int chunkType) throws DataStorageManagerException, IOException {
+    private ChunkWriteResult writeChunks(Path file, int chunkType) throws DataStorageManagerException, IOException {
         List<Long> pageIds = new ArrayList<>();
+        List<Integer> payloadSizes = new ArrayList<>();
         long fileSize = Files.size(file);
         if (fileSize == 0) {
             long pageId = newPageId.getAndIncrement();
@@ -3249,7 +3305,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 out.writeVInt(0);
             });
             pageIds.add(pageId);
-            return pageIds;
+            payloadSizes.add(0);
+            return new ChunkWriteResult(pageIds, payloadSizes);
         }
         try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(file.toFile()), CHUNK_SIZE)) {
             byte[] buf = new byte[CHUNK_SIZE];
@@ -3264,9 +3321,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     out.write(buf, 0, len);
                 });
                 pageIds.add(pageId);
+                payloadSizes.add(len);
             }
         }
-        return pageIds;
+        return new ChunkWriteResult(pageIds, payloadSizes);
     }
 
     /**
@@ -3285,9 +3343,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Splits data into CHUNK_SIZE pieces and writes each as an index page.
+     * Returns both page IDs and the payload size for each page.
      */
-    private List<Long> writeChunks(byte[] data, int chunkType) throws DataStorageManagerException {
+    private ChunkWriteResult writeChunks(byte[] data, int chunkType) throws DataStorageManagerException {
         List<Long> pageIds = new ArrayList<>();
+        List<Integer> payloadSizes = new ArrayList<>();
         if (data.length == 0) {
             long pageId = newPageId.getAndIncrement();
             trackProvisionalPageId(pageId);
@@ -3296,7 +3356,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 out.writeVInt(0);
             });
             pageIds.add(pageId);
-            return pageIds;
+            payloadSizes.add(0);
+            return new ChunkWriteResult(pageIds, payloadSizes);
         }
         for (int offset = 0; offset < data.length; offset += CHUNK_SIZE) {
             final int off = offset;
@@ -3309,8 +3370,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 out.write(data, off, len);
             });
             pageIds.add(pageId);
+            payloadSizes.add(len);
         }
-        return pageIds;
+        return new ChunkWriteResult(pageIds, payloadSizes);
     }
 
     // -------------------------------------------------------------------------
@@ -3382,6 +3444,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 writeSegmentMeta(dos, activePages,
                         seg.segmentId, seg.estimatedSizeBytes,
                         seg.graphPageIds, seg.mapPageIds,
+                        seg.graphPageSizes, seg.mapPageSizes,
                         seg.graphFilePath, seg.graphFileSize,
                         seg.mapFilePath, seg.mapFileSize);
             }
@@ -3389,6 +3452,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 writeSegmentMeta(dos, activePages,
                         seg.segmentId, seg.estimatedSizeBytes,
                         seg.graphPageIds, seg.mapPageIds,
+                        seg.graphPageSizes, seg.mapPageSizes,
                         seg.graphFilePath, seg.graphFileSize,
                         seg.mapFilePath, seg.mapFileSize);
             }
@@ -3396,6 +3460,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 writeSegmentMeta(dos, activePages,
                         swr.segmentId, swr.estimatedSizeBytes,
                         swr.graphPageIds, swr.mapPageIds,
+                        swr.graphPageSizes, swr.mapPageSizes,
                         swr.graphFilePath, swr.graphFileSize,
                         swr.mapFilePath, swr.mapFileSize);
             }
@@ -3414,6 +3479,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             java.io.DataOutputStream dos, Set<Long> activePages,
             int segmentId, long estimatedSizeBytes,
             List<Long> graphPageIds, List<Long> mapPageIds,
+            List<Integer> graphPageSizes, List<Integer> mapPageSizes,
             String graphFilePath, long graphFileSize,
             String mapFilePath, long mapFileSize) throws IOException {
         dos.writeInt(segmentId);
@@ -3427,14 +3493,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
             dos.writeLong(mapFileSize);
         } else {
             dos.writeInt(graphPageIds.size());
-            for (long id : graphPageIds) {
-                dos.writeLong(id);
-                activePages.add(id);
+            for (int i = 0; i < graphPageIds.size(); i++) {
+                dos.writeLong(graphPageIds.get(i));
+                dos.writeInt(graphPageSizes.get(i));
+                activePages.add(graphPageIds.get(i));
             }
             dos.writeInt(mapPageIds.size());
-            for (long id : mapPageIds) {
-                dos.writeLong(id);
-                activePages.add(id);
+            for (int i = 0; i < mapPageIds.size(); i++) {
+                dos.writeLong(mapPageIds.get(i));
+                dos.writeInt(mapPageSizes.get(i));
+                activePages.add(mapPageIds.get(i));
             }
         }
     }
@@ -3759,6 +3827,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private static List<Long> toLongList(long[] arr) {
         List<Long> list = new ArrayList<>(arr.length);
         for (long v : arr) {
+            list.add(v);
+        }
+        return list;
+    }
+
+    private static List<Integer> toIntList(int[] arr) {
+        List<Integer> list = new ArrayList<>(arr.length);
+        for (int v : arr) {
             list.add(v);
         }
         return list;
