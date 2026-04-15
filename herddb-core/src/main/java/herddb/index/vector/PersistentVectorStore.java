@@ -1758,16 +1758,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
 
             if (newSegmentResults != null) {
-                for (VectorSegment seg : mergeableSegments) {
-                    seg.close();
-                    dropSegmentBLinkStorage(seg);
-                }
-
                 List<VectorSegment> newSegments = new java.util.concurrent.CopyOnWriteArrayList<>();
+                // Preserve existing sealed segments
                 for (VectorSegment sealed : sealedSegments) {
                     sealed.dirty = false;
                     newSegments.add(sealed);
                 }
+                // Preserve existing mergeable segments (old compaction targets)
+                for (VectorSegment mergeable : mergeableSegments) {
+                    mergeable.dirty = false;
+                    newSegments.add(mergeable);
+                }
+                // Add newly written segments from this checkpoint
                 newSegments.addAll(preloadedSegments);
 
                 Set<Bytes> pending = this.pendingCheckpointDeletes;
@@ -1854,6 +1856,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
             List<VectorSegment> mergeableSegments,
             LogSequenceNumber sequenceNumber)
             throws IOException, DataStorageManagerException {
+
+        long phaseBStartMs = System.currentTimeMillis();
 
         // Cleanup all shard builders first (finalizes HNSW diversity/refine)
         for (LiveGraphShard shard : snapshotShards) {
@@ -1967,7 +1971,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         // Log per-shard write summary
-        long phaseBStartMs = System.currentTimeMillis();
         long phaseBElapsedMs = System.currentTimeMillis() - phaseBStartMs;
         lastCheckpointPhaseBDurationMs.set(phaseBElapsedMs);
         lastCheckpointVectorsProcessed.set(totalShardVectors);
@@ -1989,7 +1992,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // Order the results by segmentId so that the persisted IndexStatus and
         // the in-memory segment list are both deterministic.
         newSegmentResults.sort(java.util.Comparator.comparingInt(r -> r.segmentId));
-        persistIndexStatusMultiSegment(sealedSegments, newSegmentResults, sequenceNumber);
+        persistIndexStatusMultiSegment(sealedSegments, mergeableSegments, newSegmentResults, sequenceNumber);
 
         return newSegmentResults;
     }
@@ -2147,8 +2150,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
             // Compute PQ over just this shard's vectors (50K vs 900K pooled = 18× fewer elements)
             int pqSubspaces = Math.max(1, snapshotDimension / 4);
+            boolean useFusedPQForShard = shardSize >= MIN_VECTORS_FOR_FUSED_PQ;
+            int pqClusters = useFusedPQForShard ? 256 : Math.min(256, shardSize);
             ProductQuantization pq = ProductQuantization.compute(
-                    shardView, pqSubspaces, 256, true);
+                    shardView, pqSubspaces, pqClusters, true);
             PQVectors pqv = pq.encodeAll(shardView, PhysicalCoreExecutor.pool());
 
             // Write graph + features to temp file, streaming via suppliers
@@ -2156,16 +2161,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     tmpDirectory, "herddb-vector-shard-", ".idx");
             boolean success = false;
             try {
-                try (OnDiskGraphIndexWriter writer = new OnDiskGraphIndexWriter.Builder(
-                        shardGraph, tempFile)
-                        .with(new FusedPQ(shardGraph.maxDegree(), pq))
+                OnDiskGraphIndexWriter.Builder builder = new OnDiskGraphIndexWriter.Builder(
+                        shardGraph, tempFile);
+                if (useFusedPQForShard) {
+                    builder.with(new FusedPQ(shardGraph.maxDegree(), pq));
+                }
+                try (OnDiskGraphIndexWriter writer = builder
                         .with(new InlineVectors(snapshotDimension))
                         .build()) {
                     ImmutableGraphIndex.View view = shardGraph.getView();
                     EnumMap<FeatureId, IntFunction<io.github.jbellis.jvector.graph.disk.feature.Feature.State>> suppliers =
                             new EnumMap<>(FeatureId.class);
-                    suppliers.put(FeatureId.FUSED_PQ,
-                            ordinal -> new FusedPQ.State(view, pqv, ordinal));
+                    if (useFusedPQForShard) {
+                        suppliers.put(FeatureId.FUSED_PQ,
+                                ordinal -> new FusedPQ.State(view, pqv, ordinal));
+                    }
                     suppliers.put(FeatureId.INLINE_VECTORS,
                             ordinal -> new InlineVectors.State(shardView.getVector(ordinal)));
                     writer.write(suppliers);
@@ -3034,6 +3044,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     Bytes pk = allNodeToPk.get(oldId);
                     byte[] pkBytes = pk.to_array();
                     VectorFloat<?> vec = allVectors.getVector(oldId);
+                    if (vec == null) {
+                        throw new IOException("writeFusedPQMapDataToTempFile: null vector at ordinal " + oldId);
+                    }
                     writeInt(bos, newOrdinal);
                     writeInt(bos, pkBytes.length);
                     bos.write(pkBytes);
@@ -3259,10 +3272,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     private void persistIndexStatusMultiSegment(
-            List<VectorSegment> sealedSegments, List<SegmentWriteResult> newSegmentResults,
+            List<VectorSegment> sealedSegments, List<VectorSegment> mergeableSegments,
+            List<SegmentWriteResult> newSegmentResults,
             LogSequenceNumber sequenceNumber) throws DataStorageManagerException {
 
-        int totalSegments = sealedSegments.size() + newSegmentResults.size();
+        int totalSegments = sealedSegments.size() + mergeableSegments.size() + newSegmentResults.size();
         Set<Long> activePages = new HashSet<>();
 
         VisibleByteArrayOutputStream baos = new VisibleByteArrayOutputStream(256);
@@ -3279,6 +3293,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
             dos.writeInt(totalSegments);
 
             for (VectorSegment seg : sealedSegments) {
+                writeSegmentMeta(dos, activePages,
+                        seg.segmentId, seg.estimatedSizeBytes,
+                        seg.graphPageIds, seg.mapPageIds,
+                        seg.graphFilePath, seg.graphFileSize,
+                        seg.mapFilePath, seg.mapFileSize);
+            }
+            for (VectorSegment seg : mergeableSegments) {
                 writeSegmentMeta(dos, activePages,
                         seg.segmentId, seg.estimatedSizeBytes,
                         seg.graphPageIds, seg.mapPageIds,
