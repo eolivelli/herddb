@@ -1,7 +1,7 @@
 ---
 name: herddb-k3s-bench
 description: Install HerdDB on a local k3s-in-docker cluster and run a vector-search benchmark end-to-end. Use when the user asks to "run a vector bench on k3s", "benchmark HerdDB locally on k3s", or "reproduce a vector-search workload on k3s". Produces a markdown report and opens a GitHub issue on failure with pod logs attached.
-tools: Bash, Read, Glob, Grep, Write, Edit
+tools: Bash, Read, Glob, Grep, Write, Edit, Agent
 model: sonnet
 ---
 
@@ -74,7 +74,27 @@ before running anything. All paths below are relative to that directory.
 
 One invocation per tool call, no pipes:
 
-- `kubectl --kubeconfig .kubeconfig get pods -o wide`
+- `./scripts/pod-status.sh` — compact 4-column pod table (NAME, READY, STATUS, RESTARTS).
+  Use in the supervision loop instead of `kubectl get pods -o wide` to reduce
+  token usage.
+
+### Supervision delegation (spawning herddb-cluster-monitor sub-agent)
+
+On each supervision tick, spawn the `herddb-cluster-monitor` sub-agent instead
+of running manual kubectl commands. The sub-agent handles:
+- Pod status checks
+- Log tails for error keywords
+- indexing-admin stats (per-IS-replica)
+- File-server metrics (query phases)
+
+And returns a structured ~300-token TICK SUMMARY that replaces the raw kubectl
+output. See the agent definition at `.claude/agents/herddb-cluster-monitor.md`.
+
+### Direct supervision commands (fallback only)
+
+If the cluster-monitor sub-agent is unavailable or the bench enters failure
+handling and needs to capture raw logs directly, these commands are whitelisted:
+
 - `kubectl --kubeconfig .kubeconfig get events --sort-by=.lastTimestamp`
 - `kubectl --kubeconfig .kubeconfig logs --tail=200 <pod>`
 - `kubectl --kubeconfig .kubeconfig describe pod <pod>`
@@ -192,64 +212,45 @@ Rules that apply to every workload, including user-specified ones:
 ## Supervision
 
 While `run-bench.sh` runs in the background, poll the cluster at least every
-60 seconds (minimum 30 s, maximum 90 s between polls). On each tick, in
-order:
+60 seconds (minimum 30 s, maximum 90 s between polls). **On each tick: spawn
+the `herddb-cluster-monitor` sub-agent** (see §Supervision delegation above)
+and wait for its TICK SUMMARY.
 
-0. **Tail the run log** — `Read` the `RUN_LOG` path (use `offset` to skip to
-   near the end on large files) to see the current phase and most recent
-   progress sample. Because `run-bench.sh` runs `vector-bench.sh` with
-   `--no-progress`, the log is plain-text line-per-sample (~one line every
-   5 s) and phase boundaries are visible as `phase=<name> ...` lines. Note
-   the current phase on each tick — you'll need it for the failure report
-   and to know when the run transitions from ingest → checkpoint → recall.
-   If the log has not produced a new line for more than ~60 s during a
-   phase that should be emitting progress (ingest or recall), treat it as
-   a warning and correlate with cluster state before deciding if it is
-   fatal. If the user asked for `--output-format json`, parse NDJSON events
-   instead.
+The cluster-monitor sub-agent handles all per-tick diagnostics:
+- Reading and parsing the run log tail for phase/progress
+- Checking pod status for crashes / increasing RESTARTS
+- Scanning component logs for error keywords
+- Running indexing-admin stats (per-IS-replica)
+- Polling file-server metrics (query phases)
 
-1. `./scripts/check-cluster.sh` — any non-zero exit is a fatal signal.
+You receive a structured TICK SUMMARY (~300 tokens, ~15 lines) with a VERDICT:
+- `healthy` — continue to next tick
+- `warning` — log the warning and continue
+- `fatal` — stop the background task, proceed to §Failure handling
 
-2. `kubectl --kubeconfig .kubeconfig get pods -o wide` — a pod in
-   `CrashLoopBackOff`, `Error`, `OOMKilled`, `Evicted`, or with an
-   **increasing** `RESTARTS` count is a fatal signal.
+Between ticks, wait for the background task completion notification or
+schedule the next tick ~60 s after the previous one.
 
-3. For each HerdDB component pod (`herddb-server-0`,
-   `herddb-file-server-0`, `herddb-indexing-service-0`,
-   `herddb-indexing-service-1`, plus BK / ZK / MinIO), run `kubectl
-   --kubeconfig .kubeconfig logs --tail=200 <pod>` in its own tool call and
-   scan for:
-   - `OutOfMemoryError`
-   - `Exception in thread`
-   - `no space left on device`
-   - `DEADLINE_EXCEEDED` (fatal if it recurs across ticks)
-   - `ReadinessProbe failed` (fatal if it recurs across ticks)
-   - any uncaught `Throwable` / `FATAL` / `SEVERE` log line
+Example cluster-monitor invocation:
 
-4. **indexing-admin status** — for each IS replica, call `indexing-admin
-   engine-stats --json` and `indexing-admin describe-index --json`. Watch
-   for:
-   - `apply_queue_size` consistently > 500 across ticks (IS falling behind)
-     → log as a warning
-   - `total_estimated_memory_bytes` > 10 GiB on an 11 GiB heap (OOM risk) →
-     log as a warning
-   - `status` field changing between `tailing`, `writing-graph`,
-     `uploading-segment` — normal
-   - `tailer_watermark_ledger`/`tailer_watermark_offset` not advancing across
-     multiple ticks during a checkpoint wait → log as a warning; fatal if
-     stuck > 3 consecutive ticks
+```
+Agent(
+  description: "Supervision tick 7 for k3s-local benchmark",
+  subagent_type: "custom",
+  prompt: """
+  Run one supervision tick on the HerdDB k3s-local benchmark cluster.
+  Variant: k3s-local
+  WorkDir: herddb-kubernetes/src/main/helm/herddb/examples/k3s-local
+  RunLog: <RUN_LOG path>
+  IsReplicas: 2
+  TickNum: 7
+  Output a TICK SUMMARY as described in .claude/agents/herddb-cluster-monitor.md
+  """
+)
+```
 
-5. **File server metrics** — during query phases, poll `curl
-   http://localhost:9847/metrics` every few ticks and check that
-   `rfs_readrange_bytes` growth rate is reasonable (< 10 MB/s average
-   between ticks is normal for cached access; higher suggests cache
-   overflow).
-
-Between ticks, do NOT spin — wait for the background task completion
-notification or use a short `sleep 1` between immediate polls.
-
-If any fatal signal fires: stop the background `run-bench.sh` task, then
-proceed to §Failure handling. Do NOT attempt to mitigate on the running
+If any VERDICT is `fatal`: stop the background `run-bench.sh` task immediately,
+then proceed to §Failure handling. Do NOT attempt to mitigate on the running
 cluster.
 
 ---

@@ -12,21 +12,16 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 section "HerdDB pods"
-kubectl -n default get pods -l app.kubernetes.io/instance=herddb \
-    -o wide
-
 unhealthy=0
-while read -r pod; do
+while IFS=$'\t' read -r pod phase ready; do
     [[ -z "$pod" ]] && continue
-    ready=$(kubectl -n default get pod "$pod" \
-        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
-    phase=$(kubectl -n default get pod "$pod" \
-        -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+    echo "  $pod  $phase  $ready"
     if [[ "$ready" != "True" ]]; then
-        echo "  [NOT READY] $pod (phase=$phase, ready=$ready)" >&2
+        echo "  [NOT READY] $pod" >&2
         unhealthy=$((unhealthy + 1))
     fi
-done < <(herddb_pods)
+done < <(kubectl -n default get pods -l app.kubernetes.io/instance=herddb \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}')
 
 if [[ $unhealthy -gt 0 ]]; then
     echo ""

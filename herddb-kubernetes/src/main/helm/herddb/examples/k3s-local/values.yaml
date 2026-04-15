@@ -132,10 +132,11 @@ bookkeeper:
 indexingService:
   enabled: true
   storageMode: remote
-  replicaCount: 2
-  # Heap raised to 3 g for extra GC headroom during large-dataset compaction
-  # coordination (was 2 g).
-  javaOpts: "-Xms11g -Xmx11g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
+  replicaCount: 1
+  # Heap set to 5 g (user request for sift10m iteration 2): reduced from 11 g
+  # to see if the indexing service can complete sift10m with a smaller heap.
+  # Container memory = 6 GiB (heap 5 g + ~1 GiB JVM overhead).
+  javaOpts: "-Xms5g -Xmx5g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
   storage:
     data:
       size: 5Gi
@@ -143,10 +144,10 @@ indexingService:
       size: 2Gi
   resources:
     requests:
-      memory: "12Gi"
+      memory: "6Gi"
       cpu: "4"
     limits:
-      memory: "12Gi"
+      memory: "6Gi"
       cpu: "4"
 
 tools:
@@ -154,16 +155,16 @@ tools:
   storage:
     datasets:
       size: 10Gi
-  # Heap raised to 2 g: sift1m base set (512 MB) plus JVM overhead exceeds
-  # the old 512 Mi container limit, causing OOMKill during ingest.
-  javaOpts: "-Xms512m -Xmx1536m -Djava.net.preferIPv4Stack=true"
+  # Heap raised to 6 g: sift10m base set (10M × 128-dim × 4 B = 5.12 GB)
+  # must fit in JVM heap during ingest. Container limit = heap + ~1 GiB overhead.
+  javaOpts: "-Xms512m -Xmx6g -Djava.net.preferIPv4Stack=true"
   resources:
     requests:
-      memory: "2Gi"
-      cpu: "0.25"
-    limits:
-      memory: "2Gi"
+      memory: "7Gi"
       cpu: "0.5"
+    limits:
+      memory: "7Gi"
+      cpu: "1"
 
 prometheus:
   # Disabled by default to save ~512 Mi RAM during vector benchmarks.

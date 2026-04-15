@@ -1,7 +1,7 @@
 ---
 name: herddb-gke-bench
 description: Install HerdDB on an existing GKE cluster and run a vector-search benchmark end-to-end using Google Cloud Storage. Use when the user asks to "run a vector bench on GKE", "benchmark HerdDB on GKE", or "reproduce a vector-search workload against a GKE cluster". Produces a markdown report and opens a GitHub issue on failure with pod logs attached.
-tools: Bash, Read, Glob, Grep, Write, Edit
+tools: Bash, Read, Glob, Grep, Write, Edit, Agent
 model: sonnet
 ---
 
@@ -81,11 +81,24 @@ directory.
   `PROFILES_DIR=<path>` on the last line. Use this on explicit user
   request or when a query phase is unexpectedly slow.
 
-### Read-only supervision commands (whitelisted ONLY for the supervision loop)
+### Supervision delegation (spawning herddb-cluster-monitor sub-agent)
 
-One invocation per tool call, no pipes:
+On each supervision tick, spawn the `herddb-cluster-monitor` sub-agent instead
+of running manual kubectl commands. The sub-agent handles:
+- Pod status checks
+- Log tails for error keywords
+- indexing-admin stats (per-IS-replica)
+- File-server metrics (query phases)
 
-- `kubectl get pods -o wide`
+And returns a structured ~300-token TICK SUMMARY that replaces the raw kubectl
+output. See the agent definition at `.claude/agents/herddb-cluster-monitor.md`.
+
+### Read-only supervision commands (fallback only)
+
+If the cluster-monitor sub-agent is unavailable or the bench enters failure
+handling and needs to capture raw logs directly:
+
+- `./scripts/pod-status.sh` — compact 4-column pod table (NAME, READY, STATUS, RESTARTS)
 - `kubectl get events --sort-by=.lastTimestamp`
 - `kubectl logs --tail=200 <pod>`
 - `kubectl describe pod <pod>`
@@ -224,51 +237,45 @@ Rules that apply to every workload, including user-specified ones:
 
 While `run-bench.sh` runs in the background, poll the cluster at
 least every 60 seconds (minimum 30 s, maximum 90 s between polls).
-On each tick, in order:
+**On each tick: spawn the `herddb-cluster-monitor` sub-agent** (see
+§Supervision delegation above) and wait for its TICK SUMMARY.
 
-0. **Tail the run log** — `Read` the `RUN_LOG` path (use `offset` to
-   skip to near the end on large files) to see the current phase and
-   most recent progress sample. Note the current phase on each tick
-   — you'll need it for the failure report. If the log has not
-   produced a new line for more than ~60 s during a phase that should
-   be emitting progress (ingest or recall), treat it as a warning and
-   correlate with cluster state.
+The cluster-monitor sub-agent handles all per-tick diagnostics:
+- Reading and parsing the run log tail for phase/progress
+- Checking pod status for crashes / increasing RESTARTS
+- Scanning component logs for error keywords
+- Running indexing-admin stats (per-IS-replica)
+- Polling file-server metrics (query phases)
 
-1. `./scripts/check-cluster.sh` — any non-zero exit is a fatal
-   signal.
+You receive a structured TICK SUMMARY (~300 tokens, ~15 lines) with a VERDICT:
+- `healthy` — continue to next tick
+- `warning` — log the warning and continue
+- `fatal` — stop the background task, proceed to §Failure handling
 
-2. `kubectl get pods -o wide` — a pod in `CrashLoopBackOff`, `Error`,
-   `OOMKilled`, `Evicted`, or with an **increasing** `RESTARTS` count
-   is a fatal signal.
+Between ticks, wait for the background task completion notification or
+schedule the next tick ~60 s after the previous one.
 
-3. For each HerdDB component pod (`herddb-server-0`,
-   `herddb-file-server-0`, `herddb-indexing-service-0`,
-   `herddb-indexing-service-1`, plus BK / ZK), run
-   `kubectl logs --tail=200 <pod>` in its own tool call and scan for:
-   - `OutOfMemoryError`
-   - `Exception in thread`
-   - `no space left on device`
-   - `DEADLINE_EXCEEDED` (fatal if it recurs across ticks)
-   - `ReadinessProbe failed` (fatal if it recurs across ticks)
-   - any uncaught `Throwable` / `FATAL` / `SEVERE` log line
+Example cluster-monitor invocation:
 
-4. **indexing-admin status** — for each IS replica, call
-   `indexing-admin engine-stats --json` and
-   `indexing-admin describe-index --json`. Watch for:
-   - `apply_queue_size` consistently > 500 across ticks → warning
-   - `total_estimated_memory_bytes` near the heap limit → warning
-   - `tailer_watermark_*` not advancing across ticks during a
-     checkpoint wait → warning; fatal if stuck > 3 consecutive ticks
+```
+Agent(
+  description: "Supervision tick 7 for gke benchmark",
+  subagent_type: "custom",
+  prompt: """
+  Run one supervision tick on the HerdDB GKE benchmark cluster.
+  Variant: gke
+  WorkDir: herddb-kubernetes/src/main/helm/herddb/examples/gke
+  RunLog: <RUN_LOG path>
+  IsReplicas: 2
+  TickNum: 7
+  Output a TICK SUMMARY as described in .claude/agents/herddb-cluster-monitor.md
+  """
+)
+```
 
-5. **File server metrics** — during query phases, poll
-   `curl http://localhost:9847/metrics` every few ticks and check
-   that `rfs_readrange_bytes` growth rate is reasonable (< 10 MB/s
-   average between ticks is normal for cached access; higher
-   suggests cache overflow).
-
-If any fatal signal fires: stop the background `run-bench.sh` task,
-then proceed to §Failure handling. Do NOT attempt to mitigate on
-the running cluster.
+If any VERDICT is `fatal`: stop the background `run-bench.sh` task
+immediately, then proceed to §Failure handling. Do NOT attempt to mitigate
+on the running cluster.
 
 ---
 
