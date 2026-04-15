@@ -262,6 +262,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final long compactionIntervalMs;
     private final long maxVectorMemoryBytes;
     private final VectorMemoryBudget memoryBudget;
+    private final long maxLiveBytesPerCheckpoint;
 
     /** Optional stats logger for recording per-segment size distribution. */
     private volatile OpStatsLogger segmentSizeStats;
@@ -293,6 +294,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /** Frozen shards from Phase A. */
     private volatile List<LiveGraphShard> frozenShards;
+
+    /**
+     * Live shards deferred from Phase A because the byte cap was reached;
+     * prepended to {@link #liveShards} at Phase C or restored on Phase B failure.
+     */
+    private volatile List<LiveGraphShard> deferredShards;
 
     /** PKs deleted during Phase B. */
     private volatile Set<Bytes> pendingCheckpointDeletes;
@@ -497,10 +504,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  int m, int beamWidth, float neighborOverflow, float alpha,
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
                                  long compactionIntervalMs) {
-        this(indexName, tableName, tableSpaceUUID, vectorColumnName, tmpDirectory,
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName,
+                indexName + "_" + tableName + "_" + System.nanoTime(), tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                VectorSimilarityFunction.COSINE, Long.MAX_VALUE);
+                VectorSimilarityFunction.COSINE, Long.MAX_VALUE, null, 0);
     }
 
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
@@ -511,10 +519,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
                                  long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction) {
-        this(indexName, tableName, tableSpaceUUID, vectorColumnName, tmpDirectory,
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName,
+                indexName + "_" + tableName + "_" + System.nanoTime(), tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, Long.MAX_VALUE);
+                similarityFunction, Long.MAX_VALUE, null, 0);
     }
 
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
@@ -526,10 +535,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes) {
-        this(indexName, tableName, tableSpaceUUID, vectorColumnName, tmpDirectory,
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName,
+                indexName + "_" + tableName + "_" + System.nanoTime(), tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, maxVectorMemoryBytes, null);
+                similarityFunction, maxVectorMemoryBytes, null, 0);
     }
 
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
@@ -541,7 +551,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes,
-                                 VectorMemoryBudget memoryBudget) {
+                                 VectorMemoryBudget memoryBudget,
+                                 long maxLiveBytesPerCheckpoint) {
         super(vectorColumnName);
         this.indexName = indexName;
         this.tableName = tableName;
@@ -561,6 +572,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.compactionIntervalMs = compactionIntervalMs;
         this.maxVectorMemoryBytes = maxVectorMemoryBytes;
         this.memoryBudget = memoryBudget;
+        this.maxLiveBytesPerCheckpoint = maxLiveBytesPerCheckpoint > 0 ? maxLiveBytesPerCheckpoint : 10L * 1024 * 1024 * 1024;
     }
 
     /**
@@ -577,7 +589,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                VectorSimilarityFunction.COSINE, Long.MAX_VALUE);
+                VectorSimilarityFunction.COSINE, Long.MAX_VALUE, null, 0);
     }
 
     /**
@@ -594,7 +606,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, Long.MAX_VALUE);
+                similarityFunction, Long.MAX_VALUE, null, 0);
     }
 
     /**
@@ -612,12 +624,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, maxVectorMemoryBytes, null);
+                similarityFunction, maxVectorMemoryBytes, null, 0);
     }
 
     /**
      * Constructor that accepts an explicit indexUUID, similarity function, memory limit,
-     * and global memory budget.
+     * global memory budget, and live-shard snapshot byte cap.
      */
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
                                  String vectorColumnName, String indexUUID, Path tmpDirectory,
@@ -628,7 +640,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  long compactionIntervalMs,
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes,
-                                 VectorMemoryBudget memoryBudget) {
+                                 VectorMemoryBudget memoryBudget,
+                                 long maxLiveBytesPerCheckpoint) {
         super(vectorColumnName);
         this.indexName = indexName;
         this.tableName = tableName;
@@ -648,6 +661,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.compactionIntervalMs = compactionIntervalMs;
         this.maxVectorMemoryBytes = maxVectorMemoryBytes;
         this.memoryBudget = memoryBudget;
+        this.maxLiveBytesPerCheckpoint = maxLiveBytesPerCheckpoint > 0 ? maxLiveBytesPerCheckpoint : 10L * 1024 * 1024 * 1024;
     }
 
     // -------------------------------------------------------------------------
@@ -974,6 +988,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
             }
             this.frozenShards = null;
+            this.deferredShards = null;
         }
         this.pendingCheckpointDeletes = null;
         this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
@@ -1164,6 +1179,31 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         }
 
+        // Search deferred shards (live shards held back by the shard cap during Phase B)
+        List<LiveGraphShard> deferred = deferredShards;
+        if (deferred != null) {
+            Set<Bytes> pending = pendingCheckpointDeletes;
+            for (LiveGraphShard shard : deferred) {
+                if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
+                    int k = Math.min(perSourceK, shard.nodeToPk.size());
+                    try {
+                        ImmutableGraphIndex graph = shard.builder.getGraph();
+                        SearchResult result = GraphSearcher.search(
+                                qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
+                        for (SearchResult.NodeScore ns : result.getNodes()) {
+                            Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
+                            if (pk != null && (pending == null || !pending.contains(pk))) {
+                                results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+                            }
+                        }
+                    } catch (Exception e) {
+                        LOGGER.log(Level.WARNING,
+                                "error searching deferred shard for " + indexName, e);
+                    }
+                }
+            }
+        }
+
         // Merge and sort by score descending, take top-K
         results.sort((a, b) -> Float.compare(b.getValue(), a.getValue()));
         return results.size() <= topK ? results : results.subList(0, topK);
@@ -1185,7 +1225,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 frozenCount += shard.nodeToPk.size();
             }
         }
-        return totalLiveSize() + frozenCount + (int) onDiskNodeToPkSize();
+        int deferredCount = 0;
+        List<LiveGraphShard> deferred = deferredShards;
+        if (deferred != null) {
+            for (LiveGraphShard shard : deferred) {
+                deferredCount += shard.nodeToPk.size();
+            }
+        }
+        return totalLiveSize() + frozenCount + deferredCount + (int) onDiskNodeToPkSize();
     }
 
     /**
@@ -1209,6 +1256,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         List<LiveGraphShard> frozen = frozenShards;
         if (frozen != null) {
             for (LiveGraphShard shard : frozen) {
+                total += shardMemoryBytes(shard);
+            }
+        }
+        List<LiveGraphShard> deferred = deferredShards;
+        if (deferred != null) {
+            for (LiveGraphShard shard : deferred) {
                 total += shardMemoryBytes(shard);
             }
         }
@@ -1505,7 +1558,40 @@ public class PersistentVectorStore extends AbstractVectorStore {
         stateLock.writeLock().lock();
         try {
             snapshotDimension = dimension;
-            snapshotShards = this.liveShards;
+
+            // Phase A: byte-cap split — if snapshot would exceed the budget,
+            // take only the oldest shards that fit and defer the rest.
+            List<LiveGraphShard> allShards = this.liveShards;
+            long byteCap = maxLiveBytesPerCheckpoint;
+            long bytesPerVec = (byteCap > 0 && snapshotDimension > 0)
+                    ? estimatedBytesPerVector(snapshotDimension, m, neighborOverflow) : 0L;
+            int capIndex = allShards.size();   // default: take all
+            if (bytesPerVec > 0) {
+                long accumulated = 0;
+                for (int i = 0; i < allShards.size(); i++) {
+                    long shardVecs = allShards.get(i).nodeToPk.size();
+                    // Always include at least one shard to guarantee progress.
+                    if (i > 0 && (accumulated + shardVecs) * bytesPerVec > byteCap) {
+                        capIndex = i;
+                        break;
+                    }
+                    accumulated += shardVecs;
+                }
+            }
+            if (capIndex < allShards.size()) {
+                snapshotShards = new ArrayList<>(allShards.subList(0, capIndex));
+                this.deferredShards = new ArrayList<>(allShards.subList(capIndex, allShards.size()));
+                long snapshotVectors = snapshotShards.stream().mapToInt(s -> s.nodeToPk.size()).sum();
+                LOGGER.log(Level.WARNING,
+                        "checkpoint {0} Phase A: byte cap {1} reached; snapshotting {2} shards "
+                                + "({3} vectors, ~{4} MB), deferring {5} shards to next cycle",
+                        new Object[]{indexName, byteCap, capIndex, snapshotVectors,
+                                snapshotVectors * bytesPerVec / (1024 * 1024),
+                                allShards.size() - capIndex});
+            } else {
+                snapshotShards = allShards;
+                this.deferredShards = null;
+            }
 
             sealedSegments = new ArrayList<>();
             mergeableSegments = new ArrayList<>();
@@ -1529,10 +1615,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
             for (LiveGraphShard shard : snapshotShards) {
                 totalSnapshotSize += shard.nodeToPk.size();
             }
+            // Include deferred shards in the frozen count so Phase B back-pressure
+            // is appropriately tight.
+            int deferredSize = 0;
+            List<LiveGraphShard> def = this.deferredShards;
+            if (def != null) {
+                for (LiveGraphShard s : def) {
+                    deferredSize += s.nodeToPk.size();
+                }
+            }
             long effectiveBudget = maxVectorMemoryBytes != Long.MAX_VALUE ? maxVectorMemoryBytes
                     : (memoryBudget != null ? memoryBudget.maxMemoryBytes() : Long.MAX_VALUE);
             this.liveVectorCapDuringCheckpoint = computeLiveVectorCapDuringCheckpoint(
-                    totalSnapshotSize, snapshotDimension, m, neighborOverflow,
+                    totalSnapshotSize + deferredSize, snapshotDimension, m, neighborOverflow,
                     effectiveBudget, computeEffectiveMaxLiveGraphSize());
 
             initEmptyLiveShards(snapshotDimension, beamWidth, neighborOverflow, alpha);
@@ -1703,7 +1798,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // Shrink the backing array if most slots were freed
             vectorStorage.compact(nextNodeId.get());
 
+            // Rejoin deferred shards before clearing so the next checkpoint cycle processes them.
+            List<LiveGraphShard> deferred = this.deferredShards;
+            if (deferred != null && !deferred.isEmpty()) {
+                List<LiveGraphShard> merged = new ArrayList<>(deferred);
+                merged.addAll(this.liveShards);
+                this.liveShards = merged;
+            }
+
             this.frozenShards = null;
+            this.deferredShards = null;
             this.pendingCheckpointDeletes = null;
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
             dirty.set(totalLiveSize() > 0);
@@ -2194,7 +2298,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
 
             this.liveShards = new ArrayList<>(snapshotShards);
+            // Restore deferred shards so they rejoin the live set intact.
+            // The existing merge of Phase B new vectors into lastSnapshot is unaffected —
+            // initEmptyLiveShards put only a fresh empty shard in this.liveShards during Phase A.
+            List<LiveGraphShard> deferred = this.deferredShards;
+            if (deferred != null) {
+                this.liveShards.addAll(deferred);
+            }
             this.frozenShards = null;
+            this.deferredShards = null;
             this.pendingCheckpointDeletes = null;
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
             dirty.set(true);
