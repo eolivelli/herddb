@@ -23,8 +23,6 @@ package herddb.remote;
 import static org.junit.Assert.assertTrue;
 
 import java.net.URL;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.Properties;
 import java.util.Scanner;
 import org.junit.After;
