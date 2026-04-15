@@ -2128,10 +2128,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
             int snapshotDimension) throws IOException, DataStorageManagerException {
 
         int shardSize = shard.nodeToPk.size();
-        if (shardSize < MIN_VECTORS_FOR_FUSED_PQ) {
-            // Shard too small for FusedPQ; skip it (shouldn't happen with maxLiveGraphSize=50K)
+        if (shardSize == 0) {
+            // Empty shard, skip it
             return null;
         }
+
+        // Update compaction metrics for this shard
+        compactionNodesTotal.addAndGet(shardSize);
 
         writingGraphActive.incrementAndGet();
         try {
@@ -2200,6 +2203,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         } finally {
                             uploadingActive.decrementAndGet();
                         }
+                        compactionNodesDone.addAndGet(shardSize);
                         return new SegmentWriteResult(segmentId,
                                 graphFilePath, graphSize,
                                 mapFilePath, mapSize,
@@ -2212,12 +2216,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     ConcurrentHashMap<Integer, Bytes> ordinalToPk = buildOrdinalToPk(shard);
                     List<Long> graphPages = writeChunks(tempFile, TYPE_VECTOR_GRAPHCHUNK);
                     List<Long> mapPages = writeFusedPQMapData(shardView, ordinalToPk);
+                    compactionNodesDone.addAndGet(shardSize);
                     return new SegmentWriteResult(segmentId, graphPages, mapPages,
                             (long) (graphPages.size() + mapPages.size()) * CHUNK_SIZE);
                 }
             } finally {
-                if (!success) {
+                // Always delete temp file - it's been uploaded/written to persistent storage
+                try {
                     Files.deleteIfExists(tempFile);
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "error deleting temp file for " + indexName, e);
                 }
                 try {
                     if (shard.builder != null) {
