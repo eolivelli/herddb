@@ -120,7 +120,7 @@ public class VectorIndexManagerSearchStreamTest {
             StubService service, int targetK, float factor, int minInitial, int maxExpansions) {
         return VectorIndexManager.newSearchIteratorForTest(service,
                 "tblspace1", "t1", "vidx", QUERY,
-                targetK, factor, minInitial, maxExpansions);
+                targetK, factor, minInitial, maxExpansions, null, null);
     }
 
     @Test
