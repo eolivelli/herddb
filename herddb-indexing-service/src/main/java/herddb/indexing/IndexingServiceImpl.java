@@ -115,7 +115,7 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
             SearchResponse response = responseBuilder.build();
             long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
             searchLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-            searchBytes.add(response.getSerializedSize());
+            searchBytes.inc();
             responseObserver.onNext(response);
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
