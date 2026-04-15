@@ -260,8 +260,11 @@ public class LocalObjectStorage implements ObjectStorage {
                     if (diskReadLatency != null) {
                         diskReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
                     }
+                    if (diskReadRequests != null) {
+                        diskReadRequests.inc();
+                    }
                     if (diskReadBytes != null) {
-                        diskReadBytes.add((long) content.length);
+                        diskReadBytes.inc();
                     }
                     result.complete(ReadResult.found(content));
                 }
