@@ -22,9 +22,15 @@ package herddb.remote;
 
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
+import herddb.utils.MathUtils;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
+import org.apache.bookkeeper.stats.Counter;
+import org.apache.bookkeeper.stats.OpStatsLogger;
+import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
  * A {@link RandomAccessReader} that reads from a remote multipart file via
@@ -54,6 +60,12 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
     private final long totalSize;
     private final int writeBlockSize;
     private final int bufferSize;
+    @Nullable
+    private final OpStatsLogger clientReadLatency;
+    @Nullable
+    private final Counter clientReadBytes;
+    @Nullable
+    private final Counter clientReadRequests;
 
     private long position;
     private byte[] blockBuffer;
@@ -68,9 +80,11 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
      *                       a buffer window never crosses a chunk boundary
      * @param bufferSize     the read-side buffer window; capped to
      *                       {@code writeBlockSize} if larger
+     * @param statsLogger    optional stats logger for client-side metrics (nullable)
      */
     public RemoteRandomAccessReader(RemoteFileServiceClient client, String path,
-                                    long totalSize, int writeBlockSize, int bufferSize) {
+                                    long totalSize, int writeBlockSize, int bufferSize,
+                                    @Nullable StatsLogger statsLogger) {
         if (writeBlockSize <= 0) {
             throw new IllegalArgumentException("writeBlockSize must be > 0, got " + writeBlockSize);
         }
@@ -88,16 +102,37 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         this.totalSize = totalSize;
         this.writeBlockSize = writeBlockSize;
         this.bufferSize = effective;
+
+        if (statsLogger != null) {
+            StatsLogger clientScope = statsLogger.scope("rfs").scope("client");
+            this.clientReadLatency = clientScope.getOpStatsLogger("read_latency");
+            this.clientReadBytes = clientScope.getCounter("read_bytes");
+            this.clientReadRequests = clientScope.getCounter("read_requests");
+        } else {
+            this.clientReadLatency = null;
+            this.clientReadBytes = null;
+            this.clientReadRequests = null;
+        }
     }
 
     /**
      * Convenience constructor for the case where the caller has no distinct
      * read-buffer size. Equivalent to
-     * {@code RemoteRandomAccessReader(client, path, totalSize, blockSize, blockSize)}.
+     * {@code RemoteRandomAccessReader(client, path, totalSize, blockSize, blockSize, statsLogger)}.
+     */
+    public RemoteRandomAccessReader(RemoteFileServiceClient client, String path,
+                                    long totalSize, int blockSize,
+                                    @Nullable StatsLogger statsLogger) {
+        this(client, path, totalSize, blockSize, blockSize, statsLogger);
+    }
+
+    /**
+     * Convenience constructor without stats logging (backward compatibility).
+     * Equivalent to {@code RemoteRandomAccessReader(client, path, totalSize, blockSize, blockSize, null)}.
      */
     public RemoteRandomAccessReader(RemoteFileServiceClient client, String path,
                                     long totalSize, int blockSize) {
-        this(client, path, totalSize, blockSize, blockSize);
+        this(client, path, totalSize, blockSize, blockSize, null);
     }
 
     @Override
@@ -204,9 +239,23 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
             throw new IOException("Read past end of file: position=" + position
                     + " totalSize=" + totalSize);
         }
+        if (clientReadRequests != null) {
+            clientReadRequests.inc();
+        }
+        long startNanos = System.nanoTime();
         byte[] data = client.readFileRange(path, bufferOffset, requestLength, writeBlockSize);
+        long elapsedNanos = System.nanoTime() - startNanos;
         if (data == null) {
+            if (clientReadLatency != null) {
+                clientReadLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+            }
             throw new IOException("Block not found: path=" + path + " bufferIndex=" + bufferIndex);
+        }
+        if (clientReadLatency != null) {
+            clientReadLatency.registerSuccessfulEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+        }
+        if (clientReadBytes != null) {
+            clientReadBytes.add(data.length);
         }
         blockBuffer = data;
         bufferedBlockIndex = bufferIndex;
@@ -223,14 +272,18 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         private final long totalSize;
         private final int writeBlockSize;
         private final int bufferSize;
+        @Nullable
+        private final StatsLogger statsLogger;
 
         public Supplier(RemoteFileServiceClient client, String path,
-                        long totalSize, int writeBlockSize, int bufferSize) {
+                        long totalSize, int writeBlockSize, int bufferSize,
+                        @Nullable StatsLogger statsLogger) {
             this.client = client;
             this.path = path;
             this.totalSize = totalSize;
             this.writeBlockSize = writeBlockSize;
             this.bufferSize = bufferSize;
+            this.statsLogger = statsLogger;
         }
 
         /**
@@ -238,13 +291,22 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
          * size and the read-buffer size.
          */
         public Supplier(RemoteFileServiceClient client, String path,
+                        long totalSize, int blockSize,
+                        @Nullable StatsLogger statsLogger) {
+            this(client, path, totalSize, blockSize, blockSize, statsLogger);
+        }
+
+        /**
+         * Convenience constructor without stats logging (backward compatibility).
+         */
+        public Supplier(RemoteFileServiceClient client, String path,
                         long totalSize, int blockSize) {
-            this(client, path, totalSize, blockSize, blockSize);
+            this(client, path, totalSize, blockSize, blockSize, null);
         }
 
         @Override
         public RandomAccessReader get() throws IOException {
-            return new RemoteRandomAccessReader(client, path, totalSize, writeBlockSize, bufferSize);
+            return new RemoteRandomAccessReader(client, path, totalSize, writeBlockSize, bufferSize, statsLogger);
         }
 
         @Override

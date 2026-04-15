@@ -2227,7 +2227,8 @@ public class TableSpaceManager {
                 indexManager = new VectorIndexManager(index, tableManager, log,
                         dataStorageManager, tableSpaceUUID, transaction,
                         writeLockTimeout, readLockTimeout,
-                        dbmanager::getRemoteVectorIndexService);
+                        dbmanager::getRemoteVectorIndexService,
+                        tablespaceStasLogger);
                 break;
             default:
                 throw new DataStorageManagerException("invalid NON-UNIQUE index type " + index.type);

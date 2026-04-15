@@ -32,6 +32,10 @@ import herddb.model.TableContext;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
+import herddb.utils.MathUtils;
+import org.apache.bookkeeper.stats.Counter;
+import org.apache.bookkeeper.stats.OpStatsLogger;
+import org.apache.bookkeeper.stats.StatsLogger;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -78,6 +82,9 @@ public class VectorIndexManager extends AbstractIndexManager {
      * {@code VectorIndexManager}.
      */
     private final Supplier<RemoteVectorIndexService> remoteServiceSupplier;
+    private final Counter queryRequests;
+    private final Counter queryErrors;
+    private final OpStatsLogger queryLatency;
 
     public VectorIndexManager(Index index,
                                AbstractTableManager tableManager,
@@ -87,13 +94,18 @@ public class VectorIndexManager extends AbstractIndexManager {
                                long transaction,
                                int writeLockTimeout,
                                int readLockTimeout,
-                               Supplier<RemoteVectorIndexService> remoteServiceSupplier) {
+                               Supplier<RemoteVectorIndexService> remoteServiceSupplier,
+                               StatsLogger statsLogger) {
         super(index, tableManager, dataStorageManager, tableSpaceUUID, log,
                 transaction, writeLockTimeout, readLockTimeout);
         if (remoteServiceSupplier == null) {
             throw new IllegalArgumentException("remoteServiceSupplier is required");
         }
         this.remoteServiceSupplier = remoteServiceSupplier;
+        StatsLogger vectorScope = statsLogger.scope("vector");
+        this.queryRequests = vectorScope.getCounter("query_requests");
+        this.queryErrors = vectorScope.getCounter("query_errors");
+        this.queryLatency = vectorScope.getOpStatsLogger("query_latency");
     }
 
     private RemoteVectorIndexService remoteService() {
@@ -196,15 +208,21 @@ public class VectorIndexManager extends AbstractIndexManager {
         LOGGER.log(Level.INFO, "search index {0} on table {1} tablespace {2}, topK={3}, vectorDim={4}",
                 new Object[]{index.name, index.table, tableSpaceUUID, topK, queryVector.length});
         long start = System.nanoTime();
+        queryRequests.inc();
         try {
             List<Map.Entry<Bytes, Float>> results =
                     remoteService().search(tableSpaceUUID, index.table, index.name, queryVector, topK);
-            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            long elapsedNanos = System.nanoTime() - start;
+            queryLatency.registerSuccessfulEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
             LOGGER.log(Level.INFO, "search index {0} on table {1} completed in {2} ms, {3} results",
                     new Object[]{index.name, index.table, elapsedMs, results.size()});
             return results;
         } catch (Exception e) {
-            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            long elapsedNanos = System.nanoTime() - start;
+            queryLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+            queryErrors.inc();
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
             LOGGER.log(Level.SEVERE, "search index {0} on table {1} failed after {2} ms: {3}",
                     new Object[]{index.name, index.table, elapsedMs, e.getMessage()});
             throw new StatementExecutionException("remote vector index search failed: " + e.getMessage(), e);
@@ -242,8 +260,10 @@ public class VectorIndexManager extends AbstractIndexManager {
         if (initialBudget <= 0) {
             initialBudget = 1;
         }
+        queryRequests.inc();
         return new ExpandingSearchIterator(remoteService(), tableSpaceUUID,
-                index.table, index.name, queryVector, initialBudget, maxExpansions);
+                index.table, index.name, queryVector, initialBudget, maxExpansions,
+                queryLatency, queryErrors);
     }
 
     /**
@@ -256,7 +276,8 @@ public class VectorIndexManager extends AbstractIndexManager {
     public static SearchIterator newSearchIteratorForTest(RemoteVectorIndexService service,
                                                     String tablespace, String table, String indexName,
                                                     float[] queryVector, int targetK,
-                                                    float factor, int minInitial, int maxExpansions) {
+                                                    float factor, int minInitial, int maxExpansions,
+                                                    OpStatsLogger queryLatency, Counter queryErrors) {
         if (targetK <= 0) {
             throw new IllegalArgumentException("targetK must be positive, got " + targetK);
         }
@@ -271,7 +292,7 @@ public class VectorIndexManager extends AbstractIndexManager {
             initialBudget = 1;
         }
         return new ExpandingSearchIterator(service, tablespace, table, indexName,
-                queryVector, initialBudget, maxExpansions);
+                queryVector, initialBudget, maxExpansions, queryLatency, queryErrors);
     }
 
     /**
@@ -299,16 +320,20 @@ public class VectorIndexManager extends AbstractIndexManager {
         private final Set<Bytes> seen = new HashSet<>();
         private final Deque<Map.Entry<Bytes, Float>> buffer = new ArrayDeque<>();
         private final long startNanos = System.nanoTime();
+        private final OpStatsLogger queryLatency;
+        private final Counter queryErrors;
 
         private int budget;
         private int expansionsUsed;
         private boolean exhausted;
         private boolean closed;
         private int emittedTotal;
+        private boolean firstBatchProcessed;
 
         ExpandingSearchIterator(RemoteVectorIndexService service,
                                  String tablespace, String table, String indexName,
-                                 float[] queryVector, int initialBudget, int maxExpansions) {
+                                 float[] queryVector, int initialBudget, int maxExpansions,
+                                 OpStatsLogger queryLatency, Counter queryErrors) {
             this.service = service;
             this.tablespace = tablespace;
             this.table = table;
@@ -316,6 +341,8 @@ public class VectorIndexManager extends AbstractIndexManager {
             this.queryVector = queryVector;
             this.budget = initialBudget;
             this.maxExpansions = maxExpansions;
+            this.queryLatency = queryLatency;
+            this.queryErrors = queryErrors;
         }
 
         @Override
@@ -348,14 +375,25 @@ public class VectorIndexManager extends AbstractIndexManager {
             try {
                 results = service.search(tablespace, table, indexName, queryVector, requested);
             } catch (RuntimeException e) {
-                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - rpcStart);
+                long elapsedNanos = System.nanoTime() - rpcStart;
+                if (!firstBatchProcessed) {
+                    queryLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+                    firstBatchProcessed = true;
+                }
+                queryErrors.inc();
+                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
                 LOGGER.log(Level.SEVERE,
                         "searchStream expansion {0} failed for index {1} after {2} ms: {3}",
                         new Object[]{expansionsUsed, indexName, elapsedMs, e.getMessage()});
                 throw new StatementExecutionException(
                         "remote vector index search failed: " + e.getMessage(), e);
             }
-            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - rpcStart);
+            long elapsedNanos = System.nanoTime() - rpcStart;
+            if (!firstBatchProcessed) {
+                queryLatency.registerSuccessfulEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+                firstBatchProcessed = true;
+            }
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
             int returned = results.size();
             int newlyAdded = 0;
             List<Map.Entry<Bytes, Float>> newEntries = new ArrayList<>();
