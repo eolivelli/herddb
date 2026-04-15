@@ -25,8 +25,13 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+import org.apache.bookkeeper.stats.Counter;
+import org.apache.bookkeeper.stats.OpStatsLogger;
+import org.apache.bookkeeper.stats.StatsLogger;
 import software.amazon.awssdk.core.async.AsyncRequestBody;
 import software.amazon.awssdk.core.async.AsyncResponseTransformer;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
@@ -54,11 +59,35 @@ public class S3ObjectStorage implements ObjectStorage {
     private final S3AsyncClient client;
     private final String bucket;
     private final String keyPrefix;
+    @Nullable
+    private final OpStatsLogger s3ReadLatency;
+    @Nullable
+    private final Counter s3ReadBytes;
+    @Nullable
+    private final Counter s3ReadRequests;
 
-    public S3ObjectStorage(S3AsyncClient client, String bucket, String prefix) {
+    public S3ObjectStorage(S3AsyncClient client, String bucket, String prefix,
+                          @Nullable StatsLogger statsLogger) {
         this.client = client;
         this.bucket = bucket;
         this.keyPrefix = prefix == null ? "" : prefix;
+        if (statsLogger != null) {
+            StatsLogger s3Scope = statsLogger.scope("rfs").scope("s3");
+            this.s3ReadLatency = s3Scope.getOpStatsLogger("read_latency");
+            this.s3ReadBytes = s3Scope.getCounter("read_bytes");
+            this.s3ReadRequests = s3Scope.getCounter("read_requests");
+        } else {
+            this.s3ReadLatency = null;
+            this.s3ReadBytes = null;
+            this.s3ReadRequests = null;
+        }
+    }
+
+    /**
+     * Backward-compatible constructor without metrics logging.
+     */
+    public S3ObjectStorage(S3AsyncClient client, String bucket, String prefix) {
+        this(client, bucket, prefix, null);
     }
 
     private String toKey(String path) {
