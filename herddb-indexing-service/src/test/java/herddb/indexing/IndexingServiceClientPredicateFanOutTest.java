@@ -161,7 +161,7 @@ public class IndexingServiceClientPredicateFanOutTest {
         try (VectorIndexManager.SearchIterator it =
                      VectorIndexManager.newSearchIteratorForTest(client,
                              "herd", "t1", "vidx", new float[]{1, 0, 0},
-                             10, 1.5f, 16, 6)) {
+                             10, 1.5f, 16, 6, null, null)) {
             while (it.hasNext() && matched < 10) {
                 Map.Entry<Bytes, Float> e = it.next();
                 assertTrue("no duplicates", distinct.add(e.getKey()));
@@ -256,7 +256,7 @@ public class IndexingServiceClientPredicateFanOutTest {
         try (VectorIndexManager.SearchIterator it =
                      VectorIndexManager.newSearchIteratorForTest(client,
                              "herd", "t1", "vidx", new float[]{1, 0, 0},
-                             10, 1.5f, 16, 6)) {
+                             10, 1.5f, 16, 6, null, null)) {
             while (it.hasNext() && drained < 50) {
                 it.next();
                 drained++;
