@@ -145,20 +145,49 @@ public class S3ObjectStorage implements ObjectStorage {
         int offsetInBlock = (int) (offset % blockSize);
         // Each block is a separate S3 object starting at byte 0.
         // Download the whole block object and return the requested slice.
+        if (s3ReadRequests != null) {
+            s3ReadRequests.inc();
+        }
+        final long startNanos = System.nanoTime();
         return read(path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex)
                 .thenApply(result -> {
                     if (result.status() == ReadResult.Status.NOT_FOUND) {
+                        if (s3ReadLatency != null) {
+                            s3ReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                        }
                         return ReadResult.notFound();
                     }
                     byte[] blockBytes = result.content();
                     int from = offsetInBlock;
                     int to = Math.min(from + length, blockBytes.length);
                     if (from >= blockBytes.length) {
+                        if (s3ReadLatency != null) {
+                            s3ReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                        }
                         return ReadResult.notFound();
                     }
                     byte[] slice = new byte[to - from];
                     System.arraycopy(blockBytes, from, slice, 0, slice.length);
+                    if (s3ReadLatency != null) {
+                        s3ReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                    }
+                    if (s3ReadBytes != null) {
+                        s3ReadBytes.add(slice.length);
+                    }
                     return ReadResult.found(slice);
+                })
+                .exceptionally(t -> {
+                    if (s3ReadLatency != null) {
+                        s3ReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                    }
+                    Throwable cause = (t instanceof CompletionException) ? t.getCause() : t;
+                    if (cause instanceof NoSuchKeyException) {
+                        return ReadResult.notFound();
+                    }
+                    if (cause instanceof RuntimeException) {
+                        throw (RuntimeException) cause;
+                    }
+                    throw new RuntimeException(cause);
                 });
     }
 
