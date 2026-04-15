@@ -39,10 +39,13 @@ import herddb.storage.FullTableScanConsumer;
 import herddb.storage.IndexStatus;
 import herddb.storage.TableStatus;
 import herddb.utils.ByteArrayCursor;
+import herddb.utils.ByteBufUtils;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataOutputStream;
-import herddb.utils.VisibleByteArrayOutputStream;
 import herddb.utils.XXHash64Utils;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufOutputStream;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -333,54 +336,66 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     // Page serialization (matches FileDataStorageManager format)
     // -------------------------------------------------------------------------
 
-    private static VisibleByteArrayOutputStream serializeDataPage(Collection<Record> records) throws IOException {
-        VisibleByteArrayOutputStream oo = new VisibleByteArrayOutputStream(4096);
-        try (ExtendedDataOutputStream out = new ExtendedDataOutputStream(oo)) {
-            out.writeVLong(1); // version
-            out.writeVLong(0); // flags
-            out.writeInt(records.size());
-            for (Record record : records) {
-                out.writeArray(record.key);
-                out.writeArray(record.value);
+    private static ByteBuf serializeDataPage(Collection<Record> records) throws IOException {
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(4096);
+        try {
+            ByteBufOutputStream bufOut = new ByteBufOutputStream(buf);
+            XXHash64Utils.HashingOutputStream hashOut = new XXHash64Utils.HashingOutputStream(bufOut);
+            try (ExtendedDataOutputStream out = new ExtendedDataOutputStream(hashOut)) {
+                out.writeVLong(1); // version
+                out.writeVLong(0); // flags
+                out.writeInt(records.size());
+                for (Record record : records) {
+                    out.writeArray(record.key);
+                    out.writeArray(record.value);
+                }
+                out.flush();
+                long hash = hashOut.hash(); // hash of data bytes only, before footer
+                out.writeLong(hash); // footer
+                out.flush();
             }
-            out.flush();
-            long hash = XXHash64Utils.hash(oo.getBuffer(), 0, oo.size());
-            out.writeLong(hash);
-            out.flush();
+        } catch (IOException e) {
+            buf.release();
+            throw e;
         }
-        return oo;
+        return buf;
     }
 
-    private static List<Record> deserializeDataPage(byte[] data) throws IOException, DataStorageManagerException {
-        try (ByteArrayCursor dataIn = ByteArrayCursor.wrap(data)) {
-            long version = dataIn.readVLong();
-            long flags = dataIn.readVLong();
-            if (version != 1 || flags != 0) {
-                throw new DataStorageManagerException("corrupted remote data page");
-            }
-            int numRecords = dataIn.readInt();
-            List<Record> result = new ArrayList<>(numRecords);
-            for (int i = 0; i < numRecords; i++) {
-                Bytes key = dataIn.readBytesNoCopy();
-                Bytes value = dataIn.readBytesNoCopy();
-                result.add(new Record(key, value));
-            }
-            return result;
+    private static List<Record> deserializeDataPage(ByteBuf data) throws IOException, DataStorageManagerException {
+        long version = ByteBufUtils.readVLong(data);
+        long flags = ByteBufUtils.readVLong(data);
+        if (version != 1 || flags != 0) {
+            throw new DataStorageManagerException("corrupted remote data page");
         }
+        int numRecords = data.readInt();
+        List<Record> result = new ArrayList<>(numRecords);
+        for (int i = 0; i < numRecords; i++) {
+            Bytes key = Bytes.from_array(ByteBufUtils.readArray(data)); // copies from pooled buf
+            Bytes value = Bytes.from_array(ByteBufUtils.readArray(data));
+            result.add(new Record(key, value));
+        }
+        return result;
     }
 
-    private static VisibleByteArrayOutputStream serializeIndexPage(DataWriter writer) throws IOException {
-        VisibleByteArrayOutputStream oo = new VisibleByteArrayOutputStream(4096);
-        try (ExtendedDataOutputStream out = new ExtendedDataOutputStream(oo)) {
-            out.writeVLong(1); // version
-            out.writeVLong(0); // flags
-            writer.write(out);
-            out.flush();
-            long hash = XXHash64Utils.hash(oo.getBuffer(), 0, oo.size());
-            out.writeLong(hash);
-            out.flush();
+    private static ByteBuf serializeIndexPage(DataWriter writer) throws IOException {
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(4096);
+        try {
+            ByteBufOutputStream bufOut = new ByteBufOutputStream(buf);
+            XXHash64Utils.HashingOutputStream hashOut = new XXHash64Utils.HashingOutputStream(bufOut);
+            try (ExtendedDataOutputStream out = new ExtendedDataOutputStream(hashOut)) {
+                out.writeVLong(1); // version
+                out.writeVLong(0); // flags
+                writer.write(out);
+                out.flush();
+                long hash = hashOut.hash(); // hash of data bytes only, before footer
+                out.writeLong(hash); // footer
+                out.flush();
+            }
+        } catch (IOException e) {
+            buf.release();
+            throw e;
         }
-        return oo;
+        return buf;
     }
 
     private static <X> X deserializeIndexPage(byte[] data, DataReader<X> reader)
@@ -403,7 +418,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     public List<Record> readPage(String tableSpace, String uuid, Long pageId)
             throws DataStorageManagerException {
         String path = remoteDataPagePath(tableSpace, uuid, pageId);
-        byte[] data = client.readFile(path);
+        ByteBuf data = client.readFileAsByteBuf(path);
         if (data == null) {
             throw new DataPageDoesNotExistException(
                     "No such remote page: " + tableSpace + "_" + uuid + "." + pageId);
@@ -412,6 +427,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             return deserializeDataPage(data);
         } catch (IOException e) {
             throw new DataStorageManagerException("Error reading remote data page: " + path, e);
+        } finally {
+            data.release();
         }
     }
 
@@ -420,8 +437,12 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             Collection<Record> newPage) throws DataStorageManagerException {
         String path = remoteDataPagePath(tableSpace, uuid, pageId);
         try {
-            VisibleByteArrayOutputStream oo = serializeDataPage(newPage);
-            client.writeFile(path, oo.getBuffer(), 0, oo.size());
+            ByteBuf buf = serializeDataPage(newPage);
+            try {
+                client.writeFile(path, buf);
+            } finally {
+                buf.release();
+            }
         } catch (IOException e) {
             throw new DataStorageManagerException("Error writing remote data page: " + path, e);
         }
@@ -447,8 +468,12 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     public void writeIndexPage(String tableSpace, String uuid, long pageId, DataWriter writer) {
         String path = remoteIndexPagePath(tableSpace, uuid, pageId);
         try {
-            VisibleByteArrayOutputStream oo = serializeIndexPage(writer);
-            client.writeFile(path, oo.getBuffer(), 0, oo.size());
+            ByteBuf buf = serializeIndexPage(writer);
+            try {
+                client.writeFile(path, buf);
+            } finally {
+                buf.release();
+            }
         } catch (IOException e) {
             throw new RuntimeException("Error writing remote index page: " + path, e);
         }
