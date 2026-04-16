@@ -23,6 +23,8 @@ package herddb.remote.storage;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -137,10 +139,24 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
                     pending.completeExceptionally(err);
                     return;
                 }
-                if (result.status() == ReadResult.Status.FOUND && result.content() != null) {
-                    cache.put(key, result.content());
+                try {
+                    byte[] content = result.content();  // Extract bytes from pooled ByteBuf
+                    if (result.status() == ReadResult.Status.FOUND && content != null) {
+                        cache.put(key, content);
+                    }
+                    // Create a new ReadResult wrapping extracted bytes
+                    ReadResult toReturn;
+                    if (result.status() == ReadResult.Status.FOUND) {
+                        ByteBuf newBuf = PooledByteBufAllocator.DEFAULT.directBuffer(content.length);
+                        newBuf.writeBytes(content);
+                        toReturn = ReadResult.found(newBuf);
+                    } else {
+                        toReturn = ReadResult.notFound();
+                    }
+                    pending.complete(toReturn);
+                } finally {
+                    result.release();  // Release the original pooled ByteBuf
                 }
-                pending.complete(result);
             } finally {
                 inFlight.remove(key, pending);
             }
@@ -217,9 +233,9 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
         }
         int to = Math.min(offsetInBlock + length, block.length);
         int sliceLen = to - offsetInBlock;
-        byte[] out = new byte[sliceLen];
-        System.arraycopy(block, offsetInBlock, out, 0, sliceLen);
-        return ReadResult.found(out);
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(sliceLen);
+        buf.writeBytes(block, offsetInBlock, sliceLen);
+        return ReadResult.found(buf);
     }
 
     /** Package-private: force Caffeine maintenance. Used by tests. */

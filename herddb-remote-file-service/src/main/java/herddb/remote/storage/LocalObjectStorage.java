@@ -22,11 +22,14 @@ package herddb.remote.storage;
 
 import com.github.benmanes.caffeine.cache.AsyncLoadingCache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousFileChannel;
 import java.nio.channels.CompletionHandler;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -165,28 +168,29 @@ public class LocalObjectStorage implements ObjectStorage {
     @Override
     public CompletableFuture<ReadResult> read(String path) {
         Path target = resolvePath(path);
-
-        if (!Files.exists(target)) {
-            return CompletableFuture.completedFuture(ReadResult.notFound());
-        }
-
         CompletableFuture<ReadResult> result = new CompletableFuture<>();
-        try {
-            long fileSize = Files.size(target);
-            AsynchronousFileChannel channel = AsynchronousFileChannel.open(target, StandardOpenOption.READ);
-            ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
 
-            channel.read(buffer, 0, null, new CompletionHandler<Integer, Void>() {
+        try {
+            // Open channel directly; NoSuchFileException is caught below and treated as not-found.
+            // This avoids blocking syscalls for Files.exists() and Files.size().
+            AsynchronousFileChannel channel = AsynchronousFileChannel.open(target, StandardOpenOption.READ);
+
+            // Get file size from the open channel (cheaper than separate stat syscall)
+            long fileSize = channel.size();
+            // Allocate direct pooled ByteBuf for zero-copy efficient I/O
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer((int) fileSize);
+            ByteBuffer nioBuffer = byteBuf.nioBuffer(0, (int) fileSize);
+
+            channel.read(nioBuffer, 0, null, new CompletionHandler<Integer, Void>() {
                 @Override
                 public void completed(Integer bytesRead, Void attachment) {
                     try {
                         channel.close();
                     } catch (IOException ignored) {
                     }
-                    buffer.flip();
-                    byte[] content = new byte[buffer.remaining()];
-                    buffer.get(content);
-                    result.complete(ReadResult.found(content));
+                    // Set reader index for the ByteBuf based on bytes read
+                    byteBuf.writerIndex(bytesRead);
+                    result.complete(ReadResult.found(byteBuf));
                 }
 
                 @Override
@@ -195,9 +199,14 @@ public class LocalObjectStorage implements ObjectStorage {
                         channel.close();
                     } catch (IOException ignored) {
                     }
+                    // Release pooled buffer on failure
+                    byteBuf.release();
                     result.completeExceptionally(exc);
                 }
             });
+        } catch (NoSuchFileException e) {
+            // File does not exist; return not-found result
+            result.complete(ReadResult.notFound());
         } catch (Throwable t) {
             result.completeExceptionally(t);
         }
@@ -227,36 +236,42 @@ public class LocalObjectStorage implements ObjectStorage {
         int offsetInBlock = (int) (offset % blockSize);
         String blockPath = path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex;
         Path target = resolvePath(blockPath);
-        if (!Files.exists(target)) {
-            return CompletableFuture.completedFuture(ReadResult.notFound());
-        }
         if (diskReadRequests != null) {
             diskReadRequests.inc();
         }
         CompletableFuture<ReadResult> result = new CompletableFuture<>();
         final long startNanos = System.nanoTime();
         try {
-            long fileSize = Files.size(target);
+            // Open channel directly; NoSuchFileException is caught below and treated as not-found.
+            // This avoids blocking syscalls for Files.exists() and Files.size().
+            AsynchronousFileChannel channel = AsynchronousFileChannel.open(target, StandardOpenOption.READ);
+
+            // Get file size from the open channel (cheaper than separate stat syscall)
+            long fileSize = channel.size();
             int available = (int) (fileSize - offsetInBlock);
             if (available <= 0) {
+                try {
+                    channel.close();
+                } catch (IOException ignored) {
+                }
                 if (diskReadLatency != null) {
                     diskReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
                 }
                 return CompletableFuture.completedFuture(ReadResult.notFound());
             }
             int toRead = Math.min(length, available);
-            AsynchronousFileChannel channel = AsynchronousFileChannel.open(target, StandardOpenOption.READ);
-            ByteBuffer buffer = ByteBuffer.allocate(toRead);
-            channel.read(buffer, offsetInBlock, null, new CompletionHandler<Integer, Void>() {
+            // Allocate direct pooled ByteBuf for zero-copy efficient I/O
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(toRead);
+            ByteBuffer nioBuffer = byteBuf.nioBuffer(0, toRead);
+            channel.read(nioBuffer, offsetInBlock, null, new CompletionHandler<Integer, Void>() {
                 @Override
                 public void completed(Integer bytesRead, Void attachment) {
                     try {
                         channel.close();
                     } catch (IOException ignored) {
                     }
-                    buffer.flip();
-                    byte[] content = new byte[buffer.remaining()];
-                    buffer.get(content);
+                    // Set writer index for the ByteBuf based on bytes read
+                    byteBuf.writerIndex(bytesRead);
                     if (diskReadLatency != null) {
                         diskReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
                     }
@@ -266,7 +281,7 @@ public class LocalObjectStorage implements ObjectStorage {
                     if (diskReadBytes != null) {
                         diskReadBytes.inc();
                     }
-                    result.complete(ReadResult.found(content));
+                    result.complete(ReadResult.found(byteBuf));
                 }
                 @Override
                 public void failed(Throwable exc, Void attachment) {
@@ -274,12 +289,20 @@ public class LocalObjectStorage implements ObjectStorage {
                         channel.close();
                     } catch (IOException ignored) {
                     }
+                    // Release pooled buffer on failure
+                    byteBuf.release();
                     if (diskReadLatency != null) {
                         diskReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
                     }
                     result.completeExceptionally(exc);
                 }
             });
+        } catch (NoSuchFileException e) {
+            // File does not exist; return not-found result
+            if (diskReadLatency != null) {
+                diskReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+            }
+            result.complete(ReadResult.notFound());
         } catch (Throwable t) {
             if (diskReadLatency != null) {
                 diskReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);

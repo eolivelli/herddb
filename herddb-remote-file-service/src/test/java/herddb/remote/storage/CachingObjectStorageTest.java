@@ -24,6 +24,7 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -74,8 +75,13 @@ public class CachingObjectStorageTest {
         public CompletableFuture<ReadResult> read(String path) {
             readCalls.incrementAndGet();
             byte[] bytes = data.get(path);
-            return CompletableFuture.completedFuture(
-                    bytes != null ? ReadResult.found(Arrays.copyOf(bytes, bytes.length)) : ReadResult.notFound());
+            if (bytes == null) {
+                return CompletableFuture.completedFuture(ReadResult.notFound());
+            }
+            byte[] copy = Arrays.copyOf(bytes, bytes.length);
+            io.netty.buffer.ByteBuf buf = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(copy.length);
+            buf.writeBytes(copy);
+            return CompletableFuture.completedFuture(ReadResult.found(buf));
         }
 
         @Override
@@ -121,8 +127,10 @@ public class CachingObjectStorageTest {
                 return CompletableFuture.completedFuture(ReadResult.notFound());
             }
             int end = Math.min(offsetInBlock + length, block.length);
-            byte[] result = Arrays.copyOfRange(block, offsetInBlock, end);
-            return CompletableFuture.completedFuture(ReadResult.found(result));
+            byte[] sliceBytes = Arrays.copyOfRange(block, offsetInBlock, end);
+            io.netty.buffer.ByteBuf buf = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(sliceBytes.length);
+            buf.writeBytes(sliceBytes);
+            return CompletableFuture.completedFuture(ReadResult.found(buf));
         }
 
         @Override
@@ -337,8 +345,13 @@ public class CachingObjectStorageTest {
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
-                    return bytes != null ? ReadResult.found(Arrays.copyOf(bytes, bytes.length))
-                            : ReadResult.notFound();
+                    if (bytes == null) {
+                        return ReadResult.notFound();
+                    }
+                    byte[] copy = Arrays.copyOf(bytes, bytes.length);
+                    io.netty.buffer.ByteBuf buf = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(copy.length);
+                    buf.writeBytes(copy);
+                    return ReadResult.found(buf);
                 }, executor);
             }
         };
@@ -383,5 +396,262 @@ public class CachingObjectStorageTest {
         for (int i = 0; i < 8; i++) {
             CompletableFuture.runAsync(() -> { }, executor).get();
         }
+    }
+
+    @Test
+    public void testConcurrentWritesDeduplicate() throws Exception {
+        // Multiple concurrent writes to the same path should deduplicate via inFlightWrites
+        FakeObjectStorage inner = new FakeObjectStorage();
+        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+
+        byte[] data = "test".getBytes();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            futures.add(caching.write("concurrent/file.page", data));
+        }
+
+        for (CompletableFuture<Void> f : futures) {
+            f.get(); // All should complete successfully
+        }
+
+        // Verify data is cached
+        ReadResult result = caching.read("concurrent/file.page").get();
+        assertEquals(ReadResult.Status.FOUND, result.status());
+        assertArrayEquals(data, result.content());
+    }
+
+    @Test
+    public void testAsyncReadFromCacheHandlesNoSuchFile() throws Exception {
+        // If a file is evicted after the cache membership check but before async open,
+        // the read should treat it as a cache miss and fall through to inner.read
+        FakeObjectStorage inner = new FakeObjectStorage();
+        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+
+        byte[] data = "race".getBytes();
+        caching.write("race/1.page", data).get();
+
+        // Manually delete the cache file after it's written but before we read
+        Path file = caching.cacheFilePath("race/1.page");
+        Files.deleteIfExists(file);
+
+        // Inner should have the data
+        inner.data.put("race/1.page", data);
+
+        // Read should recover from the eviction and fall through to inner.read
+        ReadResult result = caching.read("race/1.page").get();
+        assertEquals(ReadResult.Status.FOUND, result.status());
+        assertArrayEquals(data, result.content());
+    }
+
+    @Test
+    public void testAsyncReadSliceFromCacheHandlesNoSuchFile() throws Exception {
+        // Similar to above but for readRange
+        FakeObjectStorage inner = new FakeObjectStorage();
+        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+
+        byte[] block = new byte[4096];
+        for (int i = 0; i < block.length; i++) {
+            block[i] = (byte) (i & 0xFF);
+        }
+        caching.writeBlock("big.page", 0, block).get();
+
+        // Manually delete the cache file
+        Path file = caching.cacheFilePath("big.page.multipart/0");
+        Files.deleteIfExists(file);
+
+        // Inner should have the block
+        inner.data.put("big.page.multipart/0", block);
+
+        // readRange should recover and fall through to inner
+        ReadResult result = caching.readRange("big.page", 1000, 16, 4096).get();
+        assertEquals(ReadResult.Status.FOUND, result.status());
+        assertEquals(16, result.content().length);
+    }
+
+    @Test
+    public void testAsyncWriteCacheFileToMultipleBlocks() throws Exception {
+        // Verify that async write properly handles multiple blocks
+        FakeObjectStorage inner = new FakeObjectStorage();
+        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+
+        byte[] block0 = new byte[1024];
+        byte[] block1 = new byte[2048];
+        for (int i = 0; i < block0.length; i++) {
+            block0[i] = (byte) i;
+        }
+        for (int i = 0; i < block1.length; i++) {
+            block1[i] = (byte) (i & 0xFF);
+        }
+
+        caching.writeBlock("multi.page", 0, block0).get();
+        caching.writeBlock("multi.page", 1, block1).get();
+
+        // Verify cache files were written
+        Path file0 = caching.cacheFilePath("multi.page.multipart/0");
+        Path file1 = caching.cacheFilePath("multi.page.multipart/1");
+        assertTrue("block 0 cache file should exist", Files.exists(file0));
+        assertTrue("block 1 cache file should exist", Files.exists(file1));
+
+        // Verify reads work
+        ReadResult r0 = caching.readRange("multi.page", 0, 100, 1024).get();
+        assertEquals(ReadResult.Status.FOUND, r0.status());
+        assertEquals(100, r0.content().length);
+    }
+
+    @Test
+    public void testConcurrentReadsMissesDeduplicateInnerCallsAsync() throws Exception {
+        // Verify that concurrent cache misses still deduplicate inner.read calls
+        // with the new async path
+        final int n = 16;
+        FakeObjectStorage inner = new FakeObjectStorage() {
+            @Override
+            public CompletableFuture<ReadResult> read(String path) {
+                readCalls.incrementAndGet();
+                byte[] bytes = data.get(path);
+                return CompletableFuture.supplyAsync(() -> {
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    if (bytes == null) {
+                        return ReadResult.notFound();
+                    }
+                    byte[] copy = Arrays.copyOf(bytes, bytes.length);
+                    io.netty.buffer.ByteBuf buf = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(copy.length);
+                    buf.writeBytes(copy);
+                    return ReadResult.found(buf);
+                }, executor);
+            }
+        };
+        inner.data.put("hotdata.page", "hot".getBytes());
+        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+
+        List<CompletableFuture<ReadResult>> futures = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            futures.add(caching.read("hotdata.page"));
+        }
+        for (CompletableFuture<ReadResult> f : futures) {
+            ReadResult res = f.get();
+            assertEquals(ReadResult.Status.FOUND, res.status());
+        }
+        assertEquals("concurrent misses must collapse to a single inner read",
+                1, inner.readCalls.get());
+    }
+
+    @Test
+    public void testEvictionDuringAsyncWriteDoesNotCorruptCache() throws Exception {
+        FakeObjectStorage inner = new FakeObjectStorage();
+        Path cacheDir = folder.newFolder("cache_evict").toPath();
+        // Budget = 250 bytes; writing three 100-byte blobs forces evictions.
+        // This matches the existing testEvictionDeletesOldestFileWhenBudgetExceeded
+        CachingObjectStorage caching = new CachingObjectStorage(inner, cacheDir, executor, 250);
+
+        byte[] blob = new byte[100];
+        caching.write("blobs/a", blob).get();
+        caching.write("blobs/b", blob).get();
+        caching.write("blobs/c", blob).get();
+
+        caching.cleanUp();
+        flushExecutor();
+
+        // Oldest blob should be evicted
+        Path fileA = caching.cacheFilePath("blobs/a");
+        assertFalse("oldest entry should have been evicted", Files.exists(fileA));
+
+        // Newer ones should remain
+        Path fileB = caching.cacheFilePath("blobs/b");
+        Path fileC = caching.cacheFilePath("blobs/c");
+        assertTrue("b should remain", Files.exists(fileB));
+        assertTrue("c should remain", Files.exists(fileC));
+
+        // Verify reads still work (newer entries remain accessible)
+        assertEquals(ReadResult.Status.FOUND, caching.read("blobs/b").get().status());
+        assertEquals(ReadResult.Status.FOUND, caching.read("blobs/c").get().status());
+    }
+
+    @Test
+    public void testConcurrentWriteAndReadOfSameFile() throws Exception {
+        FakeObjectStorage inner = new FakeObjectStorage();
+        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+
+        byte[] data = "concurrent access".getBytes();
+
+        // Start multiple concurrent operations
+        List<CompletableFuture<?>> futures = new ArrayList<>();
+
+        // Concurrent writes
+        for (int i = 0; i < 2; i++) {
+            futures.add(caching.write("concurrent/file.page", data));
+        }
+
+        // Concurrent reads (some may hit cache miss, some may hit cache)
+        for (int i = 0; i < 4; i++) {
+            futures.add(caching.read("concurrent/file.page"));
+        }
+
+        // Wait for all to complete
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
+
+        // Verify final state is correct
+        ReadResult result = caching.read("concurrent/file.page").get();
+        assertEquals(ReadResult.Status.FOUND, result.status());
+        assertArrayEquals(data, result.content());
+    }
+
+    @Test
+    public void testReadRangeWithCacheHitAndMiss() throws Exception {
+        FakeObjectStorage inner = new FakeObjectStorage();
+        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+
+        byte[] block0 = new byte[4096];
+        byte[] block1 = new byte[4096];
+        for (int i = 0; i < block0.length; i++) {
+            block0[i] = (byte) (i & 0xFF);
+        }
+        for (int i = 0; i < block1.length; i++) {
+            block1[i] = (byte) ((i + 100) & 0xFF);
+        }
+
+        // Write block 0 to cache
+        caching.writeBlock("big.page", 0, block0).get();
+        // Block 1 is only in inner
+        inner.data.put("big.page.multipart/1", block1);
+
+        // Read from cached block 0 (should not call inner)
+        int innerReadsBefore = inner.readCalls.get();
+        ReadResult r0 = caching.readRange("big.page", 1000, 16, 4096).get();
+        assertEquals(ReadResult.Status.FOUND, r0.status());
+        assertEquals(innerReadsBefore, inner.readCalls.get()); // No new inner calls
+
+        // Read from uncached block 1 (should call inner)
+        ReadResult r1 = caching.readRange("big.page", 5000, 16, 4096).get();
+        assertEquals(ReadResult.Status.FOUND, r1.status());
+        assertTrue("should have called inner for uncached block", inner.readCalls.get() > innerReadsBefore);
+    }
+
+    @Test
+    public void testAsyncWriteFailureDoesNotCacheData() throws Exception {
+        // Create a failing inner storage
+        FakeObjectStorage inner = new FakeObjectStorage() {
+            @Override
+            public CompletableFuture<Void> write(String path, byte[] content) {
+                CompletableFuture<Void> failed = new CompletableFuture<>();
+                failed.completeExceptionally(new IOException("write failed"));
+                return failed;
+            }
+        };
+        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+
+        byte[] data = "should fail".getBytes();
+        try {
+            caching.write("fail/file.page", data).get();
+        } catch (Exception e) {
+            // Expected
+        }
+
+        // Data should not be cached
+        Path cacheFile = caching.cacheFilePath("fail/file.page");
+        assertFalse("cache file should not exist after failed write", Files.exists(cacheFile));
     }
 }

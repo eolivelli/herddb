@@ -26,6 +26,8 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -318,7 +320,10 @@ public class InMemoryBlockCacheObjectStorageTest {
                     out.complete(ReadResult.notFound());
                     return;
                 }
-                out.complete(ReadResult.found(Arrays.copyOfRange(block, offsetInBlock, end)));
+                byte[] sliceBytes = Arrays.copyOfRange(block, offsetInBlock, end);
+                ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(sliceBytes.length);
+                buf.writeBytes(sliceBytes);
+                out.complete(ReadResult.found(buf));
             };
             if (g != null) {
                 new Thread(() -> {
