@@ -292,23 +292,29 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
                         LOGGER.log(Level.SEVERE, "readFileRange failed for path " + request.getPath(), t);
                         responseObserver.onError(
                                 Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
-                    } else if (result.status() == ReadResult.Status.NOT_FOUND) {
-                        readRangeNotFound.inc();
-                        readRangeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        responseObserver.onNext(ReadFileRangeResponse.newBuilder().setFound(false).build());
-                        responseObserver.onCompleted();
                     } else {
-                        byte[] content = result.content();
-                        readRangeBytes.addCount(content.length);
-                        readRangeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.FINE, "readFileRange path={0} offset={1} size={2} time={3}ms",
-                                new Object[]{request.getPath(), request.getOffset(),
-                                        content.length, elapsedMs(start)});
-                        responseObserver.onNext(ReadFileRangeResponse.newBuilder()
-                                .setFound(true)
-                                .setContent(UnsafeByteOperations.unsafeWrap(content))
-                                .build());
-                        responseObserver.onCompleted();
+                        try {
+                            if (result.status() == ReadResult.Status.NOT_FOUND) {
+                                readRangeNotFound.inc();
+                                readRangeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                                responseObserver.onNext(ReadFileRangeResponse.newBuilder().setFound(false).build());
+                                responseObserver.onCompleted();
+                            } else {
+                                byte[] content = result.content();
+                                readRangeBytes.addCount(content.length);
+                                readRangeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                                LOGGER.log(Level.FINE, "readFileRange path={0} offset={1} size={2} time={3}ms",
+                                        new Object[]{request.getPath(), request.getOffset(),
+                                                content.length, elapsedMs(start)});
+                                responseObserver.onNext(ReadFileRangeResponse.newBuilder()
+                                        .setFound(true)
+                                        .setContent(UnsafeByteOperations.unsafeWrap(content))
+                                        .build());
+                                responseObserver.onCompleted();
+                            }
+                        } finally {
+                            result.release();
+                        }
                     }
                 });
     }
