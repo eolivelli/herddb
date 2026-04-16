@@ -261,7 +261,7 @@ public class CachingObjectStorage implements ObjectStorage {
                     } catch (IOException ignored) {
                     }
                     byteBuf.writerIndex(bytesRead);
-                    result.complete(ReadResult.foundWithByteBuf(byteBuf));
+                    result.complete(ReadResult.found(byteBuf));
                 }
 
                 @Override
@@ -372,7 +372,7 @@ public class CachingObjectStorage implements ObjectStorage {
                     } catch (IOException ignored) {
                     }
                     byteBuf.writerIndex(bytesRead);
-                    result.complete(ReadResult.foundWithByteBuf(byteBuf));
+                    result.complete(ReadResult.found(byteBuf));
                 }
 
                 @Override
@@ -402,14 +402,16 @@ public class CachingObjectStorage implements ObjectStorage {
         if (full.status() == ReadResult.Status.NOT_FOUND) {
             return ReadResult.notFound();
         }
-        byte[] blockBytes = full.content();
-        if (offsetInBlock >= blockBytes.length) {
+        ByteBuf blockBuf = full.byteBuf();
+        int blockLength = blockBuf.readableBytes();
+        if (offsetInBlock >= blockLength) {
             return ReadResult.notFound();
         }
-        int to = Math.min(offsetInBlock + length, blockBytes.length);
-        byte[] slice = new byte[to - offsetInBlock];
-        System.arraycopy(blockBytes, offsetInBlock, slice, 0, slice.length);
-        return ReadResult.found(slice);
+        int to = Math.min(offsetInBlock + length, blockLength);
+        int sliceLength = to - offsetInBlock;
+        ByteBuf sliceBuf = PooledByteBufAllocator.DEFAULT.directBuffer(sliceLength);
+        sliceBuf.writeBytes(blockBuf, blockBuf.readerIndex() + offsetInBlock, sliceLength);
+        return ReadResult.found(sliceBuf);
     }
 
     @Override

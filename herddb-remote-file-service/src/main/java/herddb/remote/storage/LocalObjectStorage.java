@@ -190,7 +190,7 @@ public class LocalObjectStorage implements ObjectStorage {
                     }
                     // Set reader index for the ByteBuf based on bytes read
                     byteBuf.writerIndex(bytesRead);
-                    result.complete(ReadResult.foundWithByteBuf(byteBuf));
+                    result.complete(ReadResult.found(byteBuf));
                 }
 
                 @Override
@@ -281,7 +281,7 @@ public class LocalObjectStorage implements ObjectStorage {
                     if (diskReadBytes != null) {
                         diskReadBytes.inc();
                     }
-                    result.complete(ReadResult.foundWithByteBuf(byteBuf));
+                    result.complete(ReadResult.found(byteBuf));
                 }
                 @Override
                 public void failed(Throwable exc, Void attachment) {

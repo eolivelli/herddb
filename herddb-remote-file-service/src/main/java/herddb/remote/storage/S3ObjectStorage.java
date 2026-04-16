@@ -20,6 +20,8 @@
 
 package herddb.remote.storage;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -115,7 +117,12 @@ public class S3ObjectStorage implements ObjectStorage {
                 .key(toKey(path))
                 .build();
         return client.getObject(request, AsyncResponseTransformer.toBytes())
-                .thenApply(response -> ReadResult.found(response.asByteArray()))
+                .thenApply(response -> {
+                    byte[] data = response.asByteArray();
+                    ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(data.length);
+                    buf.writeBytes(data);
+                    return ReadResult.found(buf);
+                })
                 .exceptionally(t -> {
                     Throwable cause = (t instanceof CompletionException) ? t.getCause() : t;
                     if (cause instanceof NoSuchKeyException) {
@@ -151,33 +158,39 @@ public class S3ObjectStorage implements ObjectStorage {
         final long startNanos = System.nanoTime();
         return read(path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex)
                 .thenApply(result -> {
-                    if (result.status() == ReadResult.Status.NOT_FOUND) {
-                        if (s3ReadLatency != null) {
-                            s3ReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                    try {
+                        if (result.status() == ReadResult.Status.NOT_FOUND) {
+                            if (s3ReadLatency != null) {
+                                s3ReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                            }
+                            return ReadResult.notFound();
                         }
-                        return ReadResult.notFound();
-                    }
-                    byte[] blockBytes = result.content();
-                    int from = offsetInBlock;
-                    int to = Math.min(from + length, blockBytes.length);
-                    if (from >= blockBytes.length) {
-                        if (s3ReadLatency != null) {
-                            s3ReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                        ByteBuf blockBuf = result.byteBuf();
+                        int blockLength = blockBuf.readableBytes();
+                        int from = offsetInBlock;
+                        int to = Math.min(from + length, blockLength);
+                        if (from >= blockLength) {
+                            if (s3ReadLatency != null) {
+                                s3ReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                            }
+                            return ReadResult.notFound();
                         }
-                        return ReadResult.notFound();
+                        // Create pooled slice without copying
+                        ByteBuf sliceBuf = PooledByteBufAllocator.DEFAULT.directBuffer(to - from);
+                        sliceBuf.writeBytes(blockBuf, blockBuf.readerIndex() + from, to - from);
+                        if (s3ReadLatency != null) {
+                            s3ReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+                        }
+                        if (s3ReadRequests != null) {
+                            s3ReadRequests.inc();
+                        }
+                        if (s3ReadBytes != null) {
+                            s3ReadBytes.inc();
+                        }
+                        return ReadResult.found(sliceBuf);
+                    } finally {
+                        result.release();
                     }
-                    byte[] slice = new byte[to - from];
-                    System.arraycopy(blockBytes, from, slice, 0, slice.length);
-                    if (s3ReadLatency != null) {
-                        s3ReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
-                    }
-                    if (s3ReadRequests != null) {
-                        s3ReadRequests.inc();
-                    }
-                    if (s3ReadBytes != null) {
-                        s3ReadBytes.inc();
-                    }
-                    return ReadResult.found(slice);
                 })
                 .exceptionally(t -> {
                     if (s3ReadLatency != null) {

@@ -23,6 +23,8 @@ package herddb.remote.storage;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -217,9 +219,9 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
         }
         int to = Math.min(offsetInBlock + length, block.length);
         int sliceLen = to - offsetInBlock;
-        byte[] out = new byte[sliceLen];
-        System.arraycopy(block, offsetInBlock, out, 0, sliceLen);
-        return ReadResult.found(out);
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(sliceLen);
+        buf.writeBytes(block, offsetInBlock, sliceLen);
+        return ReadResult.found(buf);
     }
 
     /** Package-private: force Caffeine maintenance. Used by tests. */

@@ -75,8 +75,13 @@ public class CachingObjectStorageTest {
         public CompletableFuture<ReadResult> read(String path) {
             readCalls.incrementAndGet();
             byte[] bytes = data.get(path);
-            return CompletableFuture.completedFuture(
-                    bytes != null ? ReadResult.found(Arrays.copyOf(bytes, bytes.length)) : ReadResult.notFound());
+            if (bytes == null) {
+                return CompletableFuture.completedFuture(ReadResult.notFound());
+            }
+            byte[] copy = Arrays.copyOf(bytes, bytes.length);
+            io.netty.buffer.ByteBuf buf = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(copy.length);
+            buf.writeBytes(copy);
+            return CompletableFuture.completedFuture(ReadResult.found(buf));
         }
 
         @Override
@@ -122,8 +127,10 @@ public class CachingObjectStorageTest {
                 return CompletableFuture.completedFuture(ReadResult.notFound());
             }
             int end = Math.min(offsetInBlock + length, block.length);
-            byte[] result = Arrays.copyOfRange(block, offsetInBlock, end);
-            return CompletableFuture.completedFuture(ReadResult.found(result));
+            byte[] sliceBytes = Arrays.copyOfRange(block, offsetInBlock, end);
+            io.netty.buffer.ByteBuf buf = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(sliceBytes.length);
+            buf.writeBytes(sliceBytes);
+            return CompletableFuture.completedFuture(ReadResult.found(buf));
         }
 
         @Override
@@ -338,8 +345,13 @@ public class CachingObjectStorageTest {
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
-                    return bytes != null ? ReadResult.found(Arrays.copyOf(bytes, bytes.length))
-                            : ReadResult.notFound();
+                    if (bytes == null) {
+                        return ReadResult.notFound();
+                    }
+                    byte[] copy = Arrays.copyOf(bytes, bytes.length);
+                    io.netty.buffer.ByteBuf buf = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(copy.length);
+                    buf.writeBytes(copy);
+                    return ReadResult.found(buf);
                 }, executor);
             }
         };
@@ -502,8 +514,13 @@ public class CachingObjectStorageTest {
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
-                    return bytes != null ? ReadResult.found(Arrays.copyOf(bytes, bytes.length))
-                            : ReadResult.notFound();
+                    if (bytes == null) {
+                        return ReadResult.notFound();
+                    }
+                    byte[] copy = Arrays.copyOf(bytes, bytes.length);
+                    io.netty.buffer.ByteBuf buf = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(copy.length);
+                    buf.writeBytes(copy);
+                    return ReadResult.found(buf);
                 }, executor);
             }
         };

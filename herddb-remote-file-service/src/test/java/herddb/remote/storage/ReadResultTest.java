@@ -23,6 +23,8 @@ package herddb.remote.storage;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import org.junit.Test;
 
 public class ReadResultTest {
@@ -30,9 +32,15 @@ public class ReadResultTest {
     @Test
     public void testFound() {
         byte[] data = {1, 2, 3};
-        ReadResult result = ReadResult.found(data);
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertArrayEquals(data, result.content());
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(data.length);
+        buf.writeBytes(data);
+        ReadResult result = ReadResult.found(buf);
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(data, result.content());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -40,5 +48,6 @@ public class ReadResultTest {
         ReadResult result = ReadResult.notFound();
         assertEquals(ReadResult.Status.NOT_FOUND, result.status());
         assertNull(result.content());
+        result.release(); // Safe to call on notFound
     }
 }

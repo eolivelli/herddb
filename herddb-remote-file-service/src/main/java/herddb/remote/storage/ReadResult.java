@@ -26,8 +26,8 @@ import javax.annotation.Nullable;
 /**
  * Result of a {@link ObjectStorage#read(String)} operation.
  *
- * Supports both heap byte[] and Netty direct pooled ByteBuf for zero-copy I/O efficiency.
- * When using ByteBuf, the caller MUST release it after use via {@link #release()}.
+ * Backed by Netty direct pooled ByteBuf for zero-copy I/O efficiency.
+ * Caller MUST call {@link #release()} when done to return buffer to the pool.
  *
  * @author enrico.olivelli
  */
@@ -38,29 +38,15 @@ public final class ReadResult {
         NOT_FOUND
     }
 
-    private static final ReadResult NOT_FOUND_INSTANCE = new ReadResult(Status.NOT_FOUND, null, null);
+    private static final ReadResult NOT_FOUND_INSTANCE = new ReadResult(Status.NOT_FOUND, null);
 
     private final Status status;
     @Nullable
-    private final byte[] content;
-    @Nullable
     private final ByteBuf byteBuf;
 
-    private ReadResult(Status status, @Nullable byte[] content, @Nullable ByteBuf byteBuf) {
+    private ReadResult(Status status, @Nullable ByteBuf byteBuf) {
         this.status = status;
-        this.content = content;
         this.byteBuf = byteBuf;
-        // Ensure only one is set
-        if (content != null && byteBuf != null) {
-            throw new IllegalArgumentException("Cannot have both content and byteBuf");
-        }
-    }
-
-    /**
-     * Create a found result with heap byte array (backward compatible).
-     */
-    public static ReadResult found(byte[] content) {
-        return new ReadResult(Status.FOUND, content, null);
     }
 
     /**
@@ -68,14 +54,22 @@ public final class ReadResult {
      * <p>
      * IMPORTANT: Caller MUST call {@link #release()} when done to return the buffer to the pool.
      * The ByteBuf's refcount starts at 1.
+     *
+     * @param byteBuf non-null ByteBuf with content
+     * @return ReadResult holding the ByteBuf (ownership transferred to result)
      */
-    public static ReadResult foundWithByteBuf(ByteBuf byteBuf) {
+    public static ReadResult found(ByteBuf byteBuf) {
         if (byteBuf == null) {
             throw new IllegalArgumentException("byteBuf cannot be null");
         }
-        return new ReadResult(Status.FOUND, null, byteBuf);
+        return new ReadResult(Status.FOUND, byteBuf);
     }
 
+    /**
+     * Create a not-found result.
+     *
+     * @return singleton NOT_FOUND result
+     */
     public static ReadResult notFound() {
         return NOT_FOUND_INSTANCE;
     }
@@ -85,61 +79,56 @@ public final class ReadResult {
     }
 
     /**
-     * Get content as byte array. If backed by ByteBuf, makes a copy.
-     * @return content bytes, or null if NOT_FOUND
-     */
-    @Nullable
-    public byte[] content() {
-        if (content != null) {
-            return content;
-        }
-        if (byteBuf != null) {
-            byte[] copy = new byte[byteBuf.readableBytes()];
-            byteBuf.getBytes(byteBuf.readerIndex(), copy);
-            return copy;
-        }
-        return null;
-    }
-
-    /**
-     * Get content as Netty ByteBuf. If backed by byte array, wraps it.
+     * Get content as Netty ByteBuf with direct pooled memory.
      * <p>
-     * IMPORTANT: If this returns a pooled ByteBuf (from {@link #foundWithByteBuf}),
-     * caller MUST call {@link #release()} when done. Wrapping a byte[] does not
-     * require release.
+     * IMPORTANT: Caller MUST call {@link #release()} on the result when done
+     * to return the pooled buffer to Netty's allocator.
      *
      * @return ByteBuf with content, or null if NOT_FOUND
      */
     @Nullable
     public ByteBuf byteBuf() {
-        if (byteBuf != null) {
-            return byteBuf;
-        }
-        if (content != null) {
-            return io.netty.buffer.Unpooled.wrappedBuffer(content);
-        }
-        return null;
+        return byteBuf;
     }
 
     /**
-     * Release the underlying ByteBuf if this result was created with
-     * {@link #foundWithByteBuf(ByteBuf)}.
+     * Get content as byte array copy (convenience method).
+     * <p>
+     * This makes a heap copy from the pooled direct ByteBuf.
+     * Prefer using {@link #byteBuf()} directly for better performance.
      *
-     * Safe to call multiple times (refcount-aware). Only decrements if backing
-     * a pooled ByteBuf. If backing a heap byte[], this is a no-op.
+     * @return copy of content bytes, or null if NOT_FOUND
+     */
+    @Nullable
+    public byte[] content() {
+        if (byteBuf == null) {
+            return null;
+        }
+        byte[] copy = new byte[byteBuf.readableBytes()];
+        byteBuf.getBytes(byteBuf.readerIndex(), copy);
+        return copy;
+    }
+
+    /**
+     * Release the pooled ByteBuf, returning it to Netty's allocator.
+     * <p>
+     * Safe to call multiple times (refcount-aware via ByteBuf.release()).
+     * If NOT_FOUND, this is a no-op (no buffer to release).
+     * <p>
+     * IMPORTANT: Must be called in a finally block to ensure proper cleanup.
+     * Example:
+     * <pre>
+     * ReadResult result = storage.read(path).get();
+     * try {
+     *     process(result.byteBuf());
+     * } finally {
+     *     result.release();  // Always release
+     * }
+     * </pre>
      */
     public void release() {
         if (byteBuf != null) {
             byteBuf.release();
         }
-        // Heap byte[] doesn't need release
-    }
-
-    /**
-     * Check if this result is backed by a pooled ByteBuf.
-     * @return true if created with {@link #foundWithByteBuf(ByteBuf)}
-     */
-    public boolean isByteBufBacked() {
-        return byteBuf != null;
     }
 }
