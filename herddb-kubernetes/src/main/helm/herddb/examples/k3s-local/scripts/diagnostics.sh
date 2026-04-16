@@ -135,7 +135,26 @@ if [[ -z "$JVM_PID" ]]; then
 fi
 echo "  JVM PID: $JVM_PID"
 
-# ── 2. Trigger the heap dump inside the pod ──────────────────────────────────
+# ── 2. Collect JVM command-line and VM info ───────────────────────────────────
+echo "  Collecting JVM command-line and VM info..."
+JVM_INFO_FILE="$REPORTS_DIR/jvminfo-${POD}-$(timestamp).txt"
+{
+    echo "=== jcmd VM.command_line ==="
+    kubectl -n default exec "$POD" -- jcmd "$JVM_PID" VM.command_line 2>&1 || true
+    echo ""
+    echo "=== jcmd VM.version ==="
+    kubectl -n default exec "$POD" -- jcmd "$JVM_PID" VM.version 2>&1 || true
+    echo ""
+    echo "=== jcmd VM.flags ==="
+    kubectl -n default exec "$POD" -- jcmd "$JVM_PID" VM.flags 2>&1 || true
+    echo ""
+    echo "=== jcmd VM.info ==="
+    kubectl -n default exec "$POD" -- jcmd "$JVM_PID" VM.info 2>&1 || true
+} > "$JVM_INFO_FILE"
+echo "  JVM info written to $JVM_INFO_FILE"
+echo "JVM_INFO=$JVM_INFO_FILE"
+
+# ── 3. Trigger the heap dump inside the pod ──────────────────────────────────
 REMOTE_DUMP="/tmp/heapdump-$(date +%Y%m%d-%H%M%S).hprof"
 echo "  Writing heap dump to $POD:$REMOTE_DUMP ..."
 kubectl -n default exec "$POD" -- jcmd "$JVM_PID" GC.heap_dump "$REMOTE_DUMP"

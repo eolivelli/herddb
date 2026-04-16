@@ -362,10 +362,16 @@ public class VectorBench {
             double elapsed = (System.nanoTime() - queryStart) / 1e9;
             long queriesDone = queryMetrics.getCount();
             double qps = elapsed > 0 ? queriesDone / elapsed : 0.0;
+            MetricsCollector.Stats intermediateStats = queryMetrics.computeStats();
             LinkedHashMap<String, Object> fields = new LinkedHashMap<>();
             fields.put("queries_done", queriesDone);
             fields.put("total", (long) actualQueries);
             fields.put("qps", qps);
+            fields.put("latency_mean_ms", round2(intermediateStats.meanNanos() / 1e6));
+            fields.put("latency_p50_ms", round2(intermediateStats.p50Nanos() / 1e6));
+            fields.put("latency_p95_ms", round2(intermediateStats.p95Nanos() / 1e6));
+            fields.put("latency_p99_ms", round2(intermediateStats.p99Nanos() / 1e6));
+            fields.put("latency_max_ms", round2(intermediateStats.maxNanos() / 1e6));
             out.progress("query", elapsed, queryStatus.get(), fields);
         }
         double querySecs = (System.nanoTime() - queryStart) / 1e9;
