@@ -301,7 +301,14 @@ public class CachingObjectStorage implements ObjectStorage {
         inner.read(path).thenCompose(result -> {
             if (result.status() == ReadResult.Status.FOUND) {
                 // Write to cache asynchronously before returning the result
-                return admitToDisk(path, result.content()).thenApply(v -> result);
+                byte[] content = result.content();  // Make copy before releasing
+                result.release();  // Release the pooled ByteBuf
+                return admitToDisk(path, content).thenApply(v -> {
+                    // Need to return a new ReadResult with the content
+                    ByteBuf newBuf = PooledByteBufAllocator.DEFAULT.directBuffer(content.length);
+                    newBuf.writeBytes(content);
+                    return ReadResult.found(newBuf);
+                });
             }
             return CompletableFuture.completedFuture(result);
         }).whenComplete((result, err) -> {
@@ -400,18 +407,23 @@ public class CachingObjectStorage implements ObjectStorage {
 
     private static ReadResult sliceFromFull(ReadResult full, int offsetInBlock, int length) {
         if (full.status() == ReadResult.Status.NOT_FOUND) {
+            full.release();
             return ReadResult.notFound();
         }
-        ByteBuf blockBuf = full.byteBuf();
-        int blockLength = blockBuf.readableBytes();
-        if (offsetInBlock >= blockLength) {
-            return ReadResult.notFound();
+        try {
+            ByteBuf blockBuf = full.byteBuf();
+            int blockLength = blockBuf.readableBytes();
+            if (offsetInBlock >= blockLength) {
+                return ReadResult.notFound();
+            }
+            int to = Math.min(offsetInBlock + length, blockLength);
+            int sliceLength = to - offsetInBlock;
+            ByteBuf sliceBuf = PooledByteBufAllocator.DEFAULT.directBuffer(sliceLength);
+            sliceBuf.writeBytes(blockBuf, blockBuf.readerIndex() + offsetInBlock, sliceLength);
+            return ReadResult.found(sliceBuf);
+        } finally {
+            full.release();
         }
-        int to = Math.min(offsetInBlock + length, blockLength);
-        int sliceLength = to - offsetInBlock;
-        ByteBuf sliceBuf = PooledByteBufAllocator.DEFAULT.directBuffer(sliceLength);
-        sliceBuf.writeBytes(blockBuf, blockBuf.readerIndex() + offsetInBlock, sliceLength);
-        return ReadResult.found(sliceBuf);
     }
 
     @Override

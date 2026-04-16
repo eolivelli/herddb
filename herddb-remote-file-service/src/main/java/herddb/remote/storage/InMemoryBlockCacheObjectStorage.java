@@ -139,10 +139,24 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
                     pending.completeExceptionally(err);
                     return;
                 }
-                if (result.status() == ReadResult.Status.FOUND && result.content() != null) {
-                    cache.put(key, result.content());
+                try {
+                    byte[] content = result.content();  // Extract bytes from pooled ByteBuf
+                    if (result.status() == ReadResult.Status.FOUND && content != null) {
+                        cache.put(key, content);
+                    }
+                    // Create a new ReadResult wrapping extracted bytes
+                    ReadResult toReturn;
+                    if (result.status() == ReadResult.Status.FOUND) {
+                        ByteBuf newBuf = PooledByteBufAllocator.DEFAULT.directBuffer(content.length);
+                        newBuf.writeBytes(content);
+                        toReturn = ReadResult.found(newBuf);
+                    } else {
+                        toReturn = ReadResult.notFound();
+                    }
+                    pending.complete(toReturn);
+                } finally {
+                    result.release();  // Release the original pooled ByteBuf
                 }
-                pending.complete(result);
             } finally {
                 inFlight.remove(key, pending);
             }
