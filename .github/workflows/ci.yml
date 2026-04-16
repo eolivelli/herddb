@@ -49,7 +49,7 @@ jobs:
       - name: 'Build jvector'
         run: mvn -B install -DskipTests -Drat.skip=true --file jvector/pom.xml && rm -rf jvector
       - name: 'Build with Maven (with checkstyle, rat, spotbugs)'
-        run: mvn -B checkstyle:check apache-rat:check install -DskipTests spotbugs:check -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins
+        run: mvn -B checkstyle:check apache-rat:check install -DskipTests spotbugs:check -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pci
       - name: 'Upload build artifacts'
         uses: actions/upload-artifact@v4
         with:
@@ -84,7 +84,7 @@ jobs:
           name: maven-build-artifacts
           path: ~/.m2/repository
       - name: 'Test herddb-core (non-cluster)'
-        run: mvn -B verify -DforkCount=2 -Dtest.excludedGroups=herddb.core.ClusterTest -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -pl herddb-core -Pjenkins
+        run: mvn -B verify -DforkCount=2 -Dtest.excludedGroups=herddb.core.ClusterTest -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -pl herddb-core -Pci
       - name: 'Upload surefire reports'
         if: failure()
         uses: actions/upload-artifact@v4
@@ -119,7 +119,7 @@ jobs:
           name: maven-build-artifacts
           path: ~/.m2/repository
       - name: 'Test herddb-core (cluster)'
-        run: mvn -B verify -DforkCount=2 -Dtest.groups=herddb.core.ClusterTest -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -pl herddb-core -Pjenkins
+        run: mvn -B verify -DforkCount=2 -Dtest.groups=herddb.core.ClusterTest -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -pl herddb-core -Pci
       - name: 'Upload surefire reports'
         if: failure()
         uses: actions/upload-artifact@v4
@@ -154,7 +154,7 @@ jobs:
           name: maven-build-artifacts
           path: ~/.m2/repository
       - name: 'Test other modules'
-        run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins -pl !herddb-core,!herddb-remote-file-service,!herddb-indexing-service
+        run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pci -pl !herddb-core,!herddb-remote-file-service,!herddb-indexing-service
       - name: 'Upload surefire reports'
         if: failure()
         uses: actions/upload-artifact@v4
@@ -189,7 +189,7 @@ jobs:
           name: maven-build-artifacts
           path: ~/.m2/repository
       - name: 'Test herddb-remote-file-service'
-        run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins -pl herddb-remote-file-service
+        run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pci -pl herddb-remote-file-service
       - name: 'Upload surefire reports'
         if: failure()
         uses: actions/upload-artifact@v4
@@ -224,7 +224,7 @@ jobs:
           name: maven-build-artifacts
           path: ~/.m2/repository
       - name: 'Test herddb-indexing-service'
-        run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pjenkins -pl herddb-indexing-service
+        run: mvn -B verify -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pci -pl herddb-indexing-service
       - name: 'Upload surefire reports'
         if: failure()
         uses: actions/upload-artifact@v4

@@ -881,7 +881,7 @@
             </build>
         </profile>
         <profile>
-            <id>jenkins</id>
+            <id>ci</id>
             <activation>
                 <activeByDefault>false</activeByDefault>
             </activation>
