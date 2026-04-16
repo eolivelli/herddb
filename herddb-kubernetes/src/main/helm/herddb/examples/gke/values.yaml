@@ -113,7 +113,7 @@ indexingService:
   enabled: true
   storageMode: remote
   replicaCount: 2
-  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=512m -Dio.netty.allocator.numDirectArenas=16"
   storage:
     data:
       size: 20Gi

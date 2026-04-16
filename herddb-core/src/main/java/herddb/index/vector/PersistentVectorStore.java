@@ -1496,8 +1496,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private void doCheckpointSimpleUnderLock(LogSequenceNumber sequenceNumber)
             throws IOException, DataStorageManagerException {
         // Collect all vectors from all live shards + on-disk segments
-        ConcurrentHashMap<Integer, VectorFloat<?>> allVectors = new ConcurrentHashMap<>();
-        ConcurrentHashMap<Integer, Bytes> allNodeToPk = new ConcurrentHashMap<>();
+        int estimatedSize = liveShards.stream().mapToInt(s -> s.nodeToPk.size()).sum() + segments.size() * 10000;
+        ConcurrentHashMap<Integer, VectorFloat<?>> allVectors = new ConcurrentHashMap<>(estimatedSize);
+        ConcurrentHashMap<Integer, Bytes> allNodeToPk = new ConcurrentHashMap<>(estimatedSize);
         int seqId = 0;
         for (LiveGraphShard shard : liveShards) {
             for (Map.Entry<Integer, Bytes> e : shard.nodeToPk.entrySet()) {
@@ -3039,7 +3040,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             throws IOException, DataStorageManagerException {
         List<Integer> sortedNodeIds = new ArrayList<>(allNodeToPk.keySet());
         java.util.Collections.sort(sortedNodeIds);
-        Map<Integer, Integer> oldToNew = new java.util.HashMap<>();
+        Map<Integer, Integer> oldToNew = new java.util.HashMap<>(sortedNodeIds.size() * 2);  // avoid rehashing (issue #122)
         for (int i = 0; i < sortedNodeIds.size(); i++) {
             oldToNew.put(sortedNodeIds.get(i), i);
         }
@@ -3174,7 +3175,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             ConcurrentHashMap<Integer, Bytes> allNodeToPk) throws IOException {
         List<Integer> sortedNodeIds = new ArrayList<>(allNodeToPk.keySet());
         java.util.Collections.sort(sortedNodeIds);
-        Map<Integer, Integer> oldToNew = new java.util.HashMap<>();
+        Map<Integer, Integer> oldToNew = new java.util.HashMap<>(sortedNodeIds.size() * 2);  // avoid rehashing (issue #122)
         for (int i = 0; i < sortedNodeIds.size(); i++) {
             oldToNew.put(sortedNodeIds.get(i), i);
         }
@@ -3759,8 +3760,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * Use this when the global nodeId space has already been remapped (e.g., simple checkpoint rebuild).
      */
     private LiveGraphShard createEmptyLiveShard(int dim, int bw, float no, float a, int startNodeId) {
-        ConcurrentHashMap<Bytes, Integer> p2n = new ConcurrentHashMap<>();
-        ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>();
+        int cap = computeEffectiveMaxLiveGraphSize();  // preallocate to avoid rehashing during inserts (issue #122)
+        ConcurrentHashMap<Bytes, Integer> p2n = new ConcurrentHashMap<>(cap);
+        ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>(cap);
         VectorStorageRandomAccessVectorValues ravv =
                 new VectorStorageRandomAccessVectorValues(vectorStorage, dim, -1, startNodeId);
         BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(ravv, similarityFunction);
