@@ -39,6 +39,7 @@ import herddb.storage.FullTableScanConsumer;
 import herddb.storage.IndexStatus;
 import herddb.storage.TableStatus;
 import herddb.utils.ByteArrayCursor;
+import herddb.utils.ByteBufCursor;
 import herddb.utils.ByteBufUtils;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataOutputStream;
@@ -400,7 +401,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     private static <X> X deserializeIndexPage(byte[] data, DataReader<X> reader)
             throws IOException, DataStorageManagerException {
-        try (ByteArrayCursor dataIn = ByteArrayCursor.wrap(data)) {
+        io.netty.buffer.ByteBuf buf = io.netty.buffer.Unpooled.wrappedBuffer(data);
+        try (ByteBufCursor dataIn = ByteBufCursor.wrap(buf)) {
             long version = dataIn.readVLong();
             long flags = dataIn.readVLong();
             if (version != 1 || flags != 0) {

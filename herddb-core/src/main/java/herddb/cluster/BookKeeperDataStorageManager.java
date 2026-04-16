@@ -41,6 +41,7 @@ import herddb.storage.FullTableScanConsumer;
 import herddb.storage.IndexStatus;
 import herddb.storage.TableStatus;
 import herddb.utils.ByteArrayCursor;
+import herddb.utils.ByteBufCursor;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataInputStream;
 import herddb.utils.ExtendedDataOutputStream;
@@ -506,7 +507,8 @@ public class BookKeeperDataStorageManager extends DataStorageManager {
     }
 
     private static <X> X readIndexPage(byte[] dataPage, DataReader<X> reader) throws IOException, DataStorageManagerException {
-        try (ByteArrayCursor dataIn = ByteArrayCursor.wrap(dataPage)) {
+        io.netty.buffer.ByteBuf buf = io.netty.buffer.Unpooled.wrappedBuffer(dataPage);
+        try (ByteBufCursor dataIn = ByteBufCursor.wrap(buf)) {
             long version = dataIn.readVLong(); // version
             long flags = dataIn.readVLong(); // flags for future implementations
             if (version != 1 || flags != 0) {

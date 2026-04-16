@@ -37,6 +37,7 @@ import herddb.storage.FullTableScanConsumer;
 import herddb.storage.IndexStatus;
 import herddb.storage.TableStatus;
 import herddb.utils.ByteArrayCursor;
+import herddb.utils.ByteBufCursor;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataInputStream;
 import herddb.utils.ExtendedDataOutputStream;
@@ -129,7 +130,7 @@ public class MemoryDataStorageManager extends DataStorageManager {
         if (page == null) {
             throw new DataStorageManagerException("No such page: " + tableSpace + "." + indexName + " page " + pageId);
         }
-        try (ByteArrayCursor ein = page.newCursor()) {
+        try (ByteBufCursor ein = page.newByteBufCursor()) {
             return reader.read(ein);
         } catch (IOException e) {
             throw new DataStorageManagerException(e);

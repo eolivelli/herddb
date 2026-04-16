@@ -458,6 +458,10 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         return ByteArrayCursor.wrap(buffer, offset, length);
     }
 
+    public ByteBufCursor newByteBufCursor() {
+        return ByteBufCursor.wrap(buffer, offset, length);
+    }
+
     /**
      * Returns the next {@code Bytes} instance.
      * <p>
