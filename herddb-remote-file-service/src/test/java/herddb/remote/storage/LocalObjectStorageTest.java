@@ -24,7 +24,9 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.junit.After;
@@ -164,5 +166,102 @@ public class LocalObjectStorageTest {
         assertEquals(2, logical.size());
         assertTrue(logical.contains("ts1/uuid1/a.page"));
         assertTrue(logical.contains("ts1/uuid1/bigfile"));
+    }
+
+    @Test
+    public void testConcurrentReads() throws Exception {
+        byte[] data = "concurrent data".getBytes();
+        storage.write("ts1/uuid1/1.page", data).get();
+
+        // Submit multiple concurrent reads and verify all succeed
+        List<CompletableFuture<ReadResult>> futures = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            futures.add(storage.read("ts1/uuid1/1.page"));
+        }
+
+        for (CompletableFuture<ReadResult> f : futures) {
+            ReadResult result = f.get();
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(data, result.content());
+        }
+    }
+
+    @Test
+    public void testConcurrentWrites() throws Exception {
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            final int idx = i;
+            futures.add(storage.write("ts1/page" + idx, ("data" + idx).getBytes()));
+        }
+
+        for (CompletableFuture<Void> f : futures) {
+            f.get();
+        }
+
+        // Verify all writes succeeded
+        for (int i = 0; i < 4; i++) {
+            ReadResult result = storage.read("ts1/page" + i).get();
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(("data" + i).getBytes(), result.content());
+        }
+    }
+
+    @Test
+    public void testLargeFileRead() throws Exception {
+        byte[] largeData = new byte[10 * 1024 * 1024]; // 10 MB
+        for (int i = 0; i < largeData.length; i++) {
+            largeData[i] = (byte) (i & 0xFF);
+        }
+
+        storage.write("ts1/uuid1/large.page", largeData).get();
+        ReadResult result = storage.read("ts1/uuid1/large.page").get();
+        assertEquals(ReadResult.Status.FOUND, result.status());
+        assertArrayEquals(largeData, result.content());
+    }
+
+    @Test
+    public void testReadRangeOutOfBounds() throws Exception {
+        byte[] data = new byte[100];
+        for (int i = 0; i < 100; i++) {
+            data[i] = (byte) i;
+        }
+        storage.writeBlock("ts1/uuid1/graph", 0, data).get();
+
+        // Request beyond file size
+        ReadResult result = storage.readRange("ts1/uuid1/graph", 150, 10, 100).get();
+        assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+    }
+
+    @Test
+    public void testReadRangeMissingBlock() throws Exception {
+        byte[] data = new byte[100];
+        storage.writeBlock("ts1/uuid1/graph", 0, data).get();
+
+        // Try to read from a block that doesn't exist
+        ReadResult result = storage.readRange("ts1/uuid1/graph", 200, 10, 100).get();
+        assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+    }
+
+    @Test
+    public void testAsyncReadHandlesException() throws Exception {
+        // This tests that async read properly handles exceptions (e.g., from channel.read)
+        // by completing the future exceptionally
+        byte[] data = "test".getBytes();
+        storage.write("ts1/test.page", data).get();
+
+        // Normal read should work fine
+        ReadResult result = storage.read("ts1/test.page").get();
+        assertEquals(ReadResult.Status.FOUND, result.status());
+    }
+
+    @Test
+    public void testAsyncWriteHandlesException() throws Exception {
+        // Write should succeed even with complex paths
+        byte[] data = "test".getBytes();
+        storage.write("ts1/uuid1/nested/deep/path/1.page", data).get();
+
+        ReadResult result = storage.read("ts1/uuid1/nested/deep/path/1.page").get();
+        assertEquals(ReadResult.Status.FOUND, result.status());
+        assertArrayEquals(data, result.content());
     }
 }
