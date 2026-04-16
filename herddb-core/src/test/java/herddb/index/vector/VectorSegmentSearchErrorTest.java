@@ -19,25 +19,44 @@
 
 package herddb.index.vector;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import herddb.utils.Bytes;
+import io.github.jbellis.jvector.graph.GraphIndexBuilder;
+import io.github.jbellis.jvector.graph.OnHeapGraphIndex;
+import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
+import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexWriter;
+import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
+import io.github.jbellis.jvector.graph.disk.feature.InlineVectors;
+import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.IntFunction;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 /**
  * Tests that VectorSegment.search propagates errors instead of silently
- * swallowing them.
+ * swallowing them. Also tests both the FusedPQ and non-FusedPQ search paths
+ * to ensure they produce correct results.
  */
 public class VectorSegmentSearchErrorTest {
 
     private static final VectorTypeSupport VTS = VectorizationProvider.getInstance().getVectorTypeSupport();
+
+    @Rule
+    public TemporaryFolder tmpFolder = new TemporaryFolder();
 
     /**
      * When the on-disk graph is set but the GraphSearcher cannot be created
@@ -171,5 +190,129 @@ public class VectorSegmentSearchErrorTest {
         VectorFloat<?> qv = VTS.createFloatVector(new float[]{1.0f});
         seg.search(qv, 10, VectorSimilarityFunction.COSINE, results);
         assertTrue(results.isEmpty());
+    }
+
+    /**
+     * Tests search with FusedPQ feature absent (exact-scoring fallback path).
+     * Builds a small on-disk graph with ~10 vectors, writes it with only InlineVectors (no FusedPQ),
+     * then searches and verifies the nearest neighbor is ranked first.
+     * This is the edge case from issue #116.
+     */
+    @Test
+    public void testSearchWithNoFusedPQSegment() throws Exception {
+        Path tmpDir = tmpFolder.newFolder().toPath();
+        int dim = 8;
+        int numVectors = 10;  // Small, will not get FusedPQ in production
+        float[][] vectors = new float[numVectors][dim];
+        for (int i = 0; i < numVectors; i++) {
+            for (int j = 0; j < dim; j++) {
+                vectors[i][j] = (float) (i * 0.1 + j * 0.01);
+            }
+        }
+
+        // Build in-memory graph
+        VectorStorageRandomAccessVectorValues ravv = new VectorStorageRandomAccessVectorValues(
+                buildVectorStorage(vectors), dim);
+        BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(ravv, VectorSimilarityFunction.COSINE);
+        GraphIndexBuilder builder = new GraphIndexBuilder(
+                bsp, dim, 16, 100, 1.2f, 1.4f, false, false);
+        for (int i = 0; i < numVectors; i++) {
+            builder.addGraphNode(i, ravv.getVector(i));
+        }
+        builder.cleanup();
+        OnHeapGraphIndex graph = (OnHeapGraphIndex) builder.getGraph();
+
+        // Write with only InlineVectors (no FusedPQ) — simulates tail shard < MIN_VECTORS_FOR_FUSED_PQ
+        Path graphFile = tmpDir.resolve("graph_no_fusedpq.idx");
+        try (OnDiskGraphIndexWriter writer = new OnDiskGraphIndexWriter.Builder(graph, graphFile)
+                .with(new InlineVectors(dim))
+                .build()) {
+            EnumMap<FeatureId, IntFunction<io.github.jbellis.jvector.graph.disk.feature.Feature.State>> suppliers =
+                    new EnumMap<>(FeatureId.class);
+            suppliers.put(FeatureId.INLINE_VECTORS,
+                    ordinal -> new InlineVectors.State(ravv.getVector(ordinal)));
+            writer.write(suppliers);
+        }
+
+        // Load and verify FusedPQ is absent
+        SegmentedMappedReader.Supplier supplier = new SegmentedMappedReader.Supplier(graphFile);
+        OnDiskGraphIndex odg = OnDiskGraphIndex.load(supplier);
+        assertFalse("Graph should NOT have FusedPQ feature", odg.getFeatureSet().contains(FeatureId.FUSED_PQ));
+        assertTrue("Graph should have InlineVectors feature", odg.getFeatureSet().contains(FeatureId.INLINE_VECTORS));
+
+        // Set up VectorSegment
+        VectorSegment seg = new VectorSegment(1);
+        seg.onDiskGraph = odg;
+        seg.onDiskReaderSupplier = supplier;
+        seg.liveCount.set(numVectors);
+        setupSegmentPkData(seg, numVectors);
+
+        // Search for vector closest to vectors[0] — should NOT throw UnsupportedOperationException
+        List<Map.Entry<Bytes, Float>> results = new ArrayList<>();
+        VectorFloat<?> query = VTS.createFloatVector(vectors[0]);
+        seg.search(query, 3, VectorSimilarityFunction.COSINE, results);
+
+        assertFalse("Search should return results even without FusedPQ", results.isEmpty());
+        assertEquals("Should return top-3 results (or fewer if graph is small)", 3, results.size());
+        // The first (best matching) result should be vectors[0] itself (ordinal 0)
+        int topOrdinal = ordinalFromPk(results.get(0).getKey());
+        assertEquals("Top result should be ordinal 0 (the query vector itself)", 0, topOrdinal);
+    }
+
+    // Helper: build a VectorStorage from a 2D float array
+    private VectorStorage buildVectorStorage(float[][] vectors) {
+        VectorStorage storage = new VectorStorage(vectors.length);
+        for (int i = 0; i < vectors.length; i++) {
+            storage.set(i, VTS.createFloatVector(vectors[i]));
+        }
+        return storage;
+    }
+
+    // Helper: populate VectorSegment's PK data (ordinal -> PK mapping)
+    private void setupSegmentPkData(VectorSegment seg, int numVectors) {
+        ConcurrentHashMap<Integer, Bytes> ordinalToPk = new ConcurrentHashMap<>();
+        for (int i = 0; i < numVectors; i++) {
+            ordinalToPk.put(i, toPkBytes(i));
+        }
+        int maxOrdinal = numVectors - 1;
+        int cacheSize = maxOrdinal + 1;
+        int[] offsets = new int[cacheSize];
+        int[] lengths = new int[cacheSize];
+        java.util.Arrays.fill(offsets, -1);
+        java.io.ByteArrayOutputStream pkBuf = new java.io.ByteArrayOutputStream();
+        int pos = 0;
+        for (int i = 0; i < numVectors; i++) {
+            Bytes pk = toPkBytes(i);
+            offsets[i] = pos;
+            lengths[i] = pk.getLength();
+            try {
+                pkBuf.write(pk.to_array());
+            } catch (java.io.IOException e) {
+                throw new RuntimeException(e);
+            }
+            pos += pk.getLength();
+        }
+        seg.pkData = pkBuf.toByteArray();
+        seg.pkOffsets = offsets;
+        seg.pkLengths = lengths;
+    }
+
+    // Helper: convert ordinal to Bytes PK
+    private Bytes toPkBytes(int ordinal) {
+        byte[] b = new byte[4];
+        b[0] = (byte) (ordinal >>> 24);
+        b[1] = (byte) (ordinal >>> 16);
+        b[2] = (byte) (ordinal >>> 8);
+        b[3] = (byte) ordinal;
+        return Bytes.from_array(b);
+    }
+
+    // Helper: extract ordinal from Bytes PK
+    private int ordinalFromPk(Bytes pk) {
+        if (pk.getLength() != 4) {
+            throw new IllegalArgumentException("PK length must be 4");
+        }
+        byte[] b = pk.to_array();
+        return ((b[0] & 0xFF) << 24) | ((b[1] & 0xFF) << 16) | ((b[2] & 0xFF) << 8) | (b[3] & 0xFF);
     }
 }

@@ -25,6 +25,7 @@ import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.graph.GraphSearcher;
 import io.github.jbellis.jvector.graph.SearchResult;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
+import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.similarity.DefaultSearchScoreProvider;
 import io.github.jbellis.jvector.util.Bits;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
@@ -152,12 +153,21 @@ class VectorSegment implements Closeable {
                 searcherCache.set(searcher);
             }
             OnDiskGraphIndex.View view = (OnDiskGraphIndex.View) searcher.getView();
-            io.github.jbellis.jvector.graph.similarity.ScoreFunction.ApproximateScoreFunction approxSF =
-                    view.approximateScoreFunctionFor(qv, similarityFunction);
             io.github.jbellis.jvector.graph.similarity.ScoreFunction.ExactScoreFunction reranker =
                     view.rerankerFor(qv, similarityFunction);
-            DefaultSearchScoreProvider ssp = new DefaultSearchScoreProvider(approxSF, reranker);
-            int rerankK = Math.min(k * OVERQUERY_FACTOR, activeCount);
+            DefaultSearchScoreProvider ssp;
+            int rerankK;
+            if (odg.getFeatureSet().contains(FeatureId.FUSED_PQ)) {
+                io.github.jbellis.jvector.graph.similarity.ScoreFunction.ApproximateScoreFunction approxSF =
+                        view.approximateScoreFunctionFor(qv, similarityFunction);
+                ssp = new DefaultSearchScoreProvider(approxSF, reranker);
+                rerankK = Math.min(k * OVERQUERY_FACTOR, activeCount);
+            } else {
+                // Segment written without FusedPQ (tail shard < MIN_VECTORS_FOR_FUSED_PQ).
+                // InlineVectors are always present; use exact scoring for the beam search.
+                ssp = new DefaultSearchScoreProvider(reranker);
+                rerankK = k;
+            }
             SearchResult sr = searcher.search(ssp, k, rerankK, 0.0f, 0.0f, acceptBits);
             int matched = 0;
             for (SearchResult.NodeScore ns : sr.getNodes()) {
