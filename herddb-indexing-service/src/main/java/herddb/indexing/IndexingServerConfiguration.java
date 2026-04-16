@@ -177,7 +177,7 @@ public final class IndexingServerConfiguration {
      */
     public static final String PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS =
             "remote.file.bootstrap.wait.ms";
-    public static final long PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS_DEFAULT = 30_000L;
+    public static final long PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS_DEFAULT = 1_800_000L; // 30 minutes
 
     // Instance identity and clustering
     public static final String PROPERTY_INSTANCE_ID = "indexing.instance.id";
@@ -212,6 +212,16 @@ public final class IndexingServerConfiguration {
 
     public static final String PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS = "indexing.tablespace.wait.poll.interval.ms";
     public static final int PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS_DEFAULT = 2_000;
+
+    /**
+     * Maximum time (in milliseconds) to block during engine start() waiting for the tablespace
+     * to be available in the metadata storage manager. On a cold k3s boot, the metadata
+     * (which may be replicated from ZooKeeper or another source) can take time to become
+     * available. Without a timeout, the loop would block indefinitely.
+     * With an explicit timeout, the pod can be restarted or the issue investigated.
+     */
+    public static final String PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS = "indexing.tablespace.wait.timeout.ms";
+    public static final long PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS_DEFAULT = 1_800_000L; // 30 minutes
 
     // Server mode — same key as ServerConfiguration so config can be copy/pasted
     public static final String PROPERTY_MODE = "server.mode";

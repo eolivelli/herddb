@@ -326,20 +326,46 @@ public class RemoteFileServer implements AutoCloseable {
 
         S3AsyncClient s3Client = clientBuilder.build();
 
-        // Fail fast: verify bucket exists
-        try {
-            s3Client.headBucket(HeadBucketRequest.builder().bucket(bucket).build()).get();
-        } catch (ExecutionException e) {
-            s3Client.close();
-            Throwable cause = e.getCause();
-            if (cause instanceof NoSuchBucketException) {
-                throw new IOException("S3 bucket does not exist: " + bucket);
+        // Wait for bucket to become available, with configurable timeout
+        long bucketWaitTimeoutMs = Long.parseLong(
+                config.getProperty("s3.bucket.wait.timeout.ms", "1800000")); // 30 minutes default
+        long bucketPollIntervalMs = 5_000; // 5 seconds between retries
+        long deadline = System.currentTimeMillis() + bucketWaitTimeoutMs;
+        LOGGER.log(Level.INFO,
+                "Waiting up to {0}ms for S3 bucket ''{1}'' to become available...",
+                new Object[]{bucketWaitTimeoutMs, bucket});
+        while (true) {
+            try {
+                s3Client.headBucket(HeadBucketRequest.builder().bucket(bucket).build()).get();
+                LOGGER.log(Level.INFO, "S3 bucket ''{0}'' is available", bucket);
+                break;
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof NoSuchBucketException) {
+                    if (System.currentTimeMillis() > deadline) {
+                        s3Client.close();
+                        throw new IOException("Timed out after " + bucketWaitTimeoutMs
+                                + "ms waiting for S3 bucket to exist: " + bucket);
+                    }
+                    LOGGER.log(Level.INFO, "S3 bucket ''{0}'' not yet available, retrying in {1}ms...",
+                            new Object[]{bucket, bucketPollIntervalMs});
+                    try {
+                        Thread.sleep(bucketPollIntervalMs);
+                    } catch (InterruptedException ie) {
+                        s3Client.close();
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted while verifying S3 bucket", ie);
+                    }
+                } else {
+                    // Non-bucket errors (permissions, network, etc.) fail immediately
+                    s3Client.close();
+                    throw new IOException("Failed to verify S3 bucket: " + bucket, cause);
+                }
+            } catch (InterruptedException e) {
+                s3Client.close();
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while verifying S3 bucket", e);
             }
-            throw new IOException("Failed to verify S3 bucket: " + bucket, cause);
-        } catch (InterruptedException e) {
-            s3Client.close();
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while verifying S3 bucket", e);
         }
 
         String cacheDir = config.getProperty("cache.dir",

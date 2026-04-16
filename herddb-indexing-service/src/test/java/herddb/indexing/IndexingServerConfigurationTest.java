@@ -97,6 +97,12 @@ public class IndexingServerConfigurationTest {
         assertEquals("file", config.getString(
                 IndexingServerConfiguration.PROPERTY_STORAGE_TYPE,
                 IndexingServerConfiguration.PROPERTY_STORAGE_TYPE_DEFAULT));
+        assertEquals(1_800_000L, config.getLong(
+                IndexingServerConfiguration.PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS,
+                IndexingServerConfiguration.PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS_DEFAULT));
+        assertEquals(1_800_000L, config.getLong(
+                IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS,
+                IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS_DEFAULT));
     }
 
     @Test

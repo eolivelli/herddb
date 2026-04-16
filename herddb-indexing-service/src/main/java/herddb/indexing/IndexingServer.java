@@ -394,6 +394,9 @@ public class IndexingServer implements AutoCloseable {
         long bootstrapWaitMs = config.getLong(
                 IndexingServerConfiguration.PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS,
                 IndexingServerConfiguration.PROPERTY_REMOTE_FILE_BOOTSTRAP_WAIT_MS_DEFAULT);
+        LOGGER.log(Level.INFO,
+                "Waiting up to {0}ms for remote file servers to be discovered via ZK for tableSpace {1}...",
+                new Object[]{bootstrapWaitMs, tableSpaceUUID});
         try {
             boolean ready = client.awaitServersReady(bootstrapWaitMs);
             if (!ready) {
