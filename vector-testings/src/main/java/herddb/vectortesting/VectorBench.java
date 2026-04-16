@@ -218,7 +218,7 @@ public class VectorBench {
                     double elapsed = (System.nanoTime() - ingestStart) / 1e9;
                     long usedMb = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
                     long maxMb = rt.maxMemory() / (1024 * 1024);
-                    long rowsIngested = ingestMetrics.getCount();
+                    long rowsIngested = rowId.get() - config.resumeFrom;
                     double opsPerSec = elapsed > 0 ? rowsIngested / elapsed : 0.0;
                     long remaining = Math.max(0L, totalRowsTarget - (config.resumeFrom + rowsIngested));
                     double etaSecs = opsPerSec > 0 ? remaining / opsPerSec : 0.0;
@@ -262,7 +262,7 @@ public class VectorBench {
             out.phaseDone("ingest", ingestSecs);
 
             ingestionWallSecs = ingestSecs;
-            ingestionRows = ingestMetrics.getCount();
+            ingestionRows = rowId.get() - config.resumeFrom;
             ingestionThroughput = ingestionRows / ingestSecs;
             ingestionLatency = ingestMetrics.computeStats();
 
@@ -277,7 +277,7 @@ public class VectorBench {
 
             // Verify row count matches ingested records
             if (!config.skipVerify) {
-                long expectedRows = config.resumeFrom + ingestMetrics.getCount();
+                long expectedRows = rowId.get();
                 long[] actualCount = {0};
                 runWithProgress(out, "verification", "=== VERIFICATION (COUNT) ===", () -> {
                     try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);

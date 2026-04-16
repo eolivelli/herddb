@@ -178,8 +178,10 @@ Rules that apply to every workload, including user-specified ones:
 
 - **Ingest defaults to `--ingest-max-ops 20000 --ingest-threads 8 --batch-size 10000`**
   unless the user explicitly overrides them. These values were validated on
-  bigann 10M (k3s-local): 13,870 ops/s sustained, p99=0.43 ms, batch latency
-  max=73 ms. If the user's command omits any of these flags, add them and tell
+  bigann 10M (k3s-local): 13,870 ops/s sustained. Latency percentiles
+  now reflect batch+commit duration (one sample per commit of --batch-size rows),
+  not per-row latency. The previous per-row p99=0.43 ms baseline no longer applies.
+  If the user's command omits any of these flags, add them and tell
   the user you added them.
 - **Recall / query phases must only run AFTER a successful
   checkpoint.** If the user's command includes a recall phase but no

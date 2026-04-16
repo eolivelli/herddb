@@ -74,9 +74,8 @@ public class IngestionWorker implements Runnable {
                 int batchCount = 0;
                 long lastCommitTime = System.currentTimeMillis();
                 final long maxCommitIntervalMs = 30_000; // 30 seconds
-                long totalCommitTimeNanos = 0;
-                long commitCount = 0;
-                long lastCommitDurationNanos = 0;
+                long batchStartNanos = 0;
+                long rowsIngested = 0;
                 while (true) {
                     float[] vec = queue.poll(100, TimeUnit.MILLISECONDS);
                     if (vec == null) {
@@ -90,7 +89,9 @@ public class IngestionWorker implements Runnable {
                         break; // poison pill
                     }
                     long id = rowId.getAndIncrement();
-                    long start = System.nanoTime();
+                    if (batchCount == 0) {
+                        batchStartNanos = System.nanoTime();
+                    }
                     ps.setLong(1, id);
                     ps.setObject(2, vec);
                     ps.executeUpdate();
@@ -98,22 +99,16 @@ public class IngestionWorker implements Runnable {
 
                     long now = System.currentTimeMillis();
                     if (batchCount >= config.batchSize || (batchCount > 0 && now - lastCommitTime >= maxCommitIntervalMs)) {
-                        long commitStart = System.nanoTime();
                         conn.commit();
-                        lastCommitDurationNanos = System.nanoTime() - commitStart;
-                        totalCommitTimeNanos += lastCommitDurationNanos;
-                        commitCount++;
+                        metrics.record(System.nanoTime() - batchStartNanos);
+                        rowsIngested += batchCount;
                         batchCount = 0;
                         lastCommitTime = now;
                     }
 
-                    long elapsed = System.nanoTime() - start;
-                    metrics.record(elapsed);
-
                     // Throttle if max ops/s is configured
                     if (config.ingestMaxOpsPerSecond > 0) {
-                        long total = metrics.getCount();
-                        double expectedElapsedSecs = (double) total / config.ingestMaxOpsPerSecond;
+                        double expectedElapsedSecs = (double) rowsIngested / config.ingestMaxOpsPerSecond;
                         double actualElapsedSecs = (System.nanoTime() - ingestStartNanos) / 1e9;
                         double sleepSecs = expectedElapsedSecs - actualElapsedSecs;
                         if (sleepSecs > 0.001) {
@@ -121,34 +116,27 @@ public class IngestionWorker implements Runnable {
                         }
                     }
 
-                    long total = metrics.getCount();
-                    if (total % 10_000 == 0) {
+                    if (rowsIngested % 10_000 == 0 && rowsIngested > 0) {
                         MetricsCollector.Stats s = metrics.computeStats();
-                        double avgCommitMs = commitCount > 0 ? (totalCommitTimeNanos / commitCount) / 1_000_000.0 : 0;
-                        double lastCommitMs = lastCommitDurationNanos / 1_000_000.0;
                         double elapsedSecs = (System.nanoTime() - ingestStartNanos) / 1e9;
-                        double rowsPerSec = total / elapsedSecs;
-                        long remaining = config.numRows - total;
+                        double rowsPerSec = rowsIngested / elapsedSecs;
+                        long remaining = config.numRows - rowsIngested;
                         double etaSecs = rowsPerSec > 0 ? remaining / rowsPerSec : 0;
                         String etaStr = formatEta(etaSecs);
-                        statusLine.set(String.format("Ingested %d/%d rows | %.0f ops/s | mean: %.2f ms | p50: %.2f ms | p99: %.2f ms | commit avg: %.1f ms last: %.1f ms | ETA: %s",
-                                total,
+                        statusLine.set(String.format("Ingested %d/%d rows | %.0f ops/s | batch mean: %.2f ms | batch p50: %.2f ms | batch p99: %.2f ms | ETA: %s",
+                                rowsIngested,
                                 config.numRows,
                                 rowsPerSec,
                                 s.meanNanos() / 1_000_000.0,
                                 s.p50Nanos() / 1_000_000.0,
                                 s.p99Nanos() / 1_000_000.0,
-                                avgCommitMs,
-                                lastCommitMs,
                                 etaStr));
                     }
                 }
                 if (batchCount > 0) {
-                    long commitStart = System.nanoTime();
                     conn.commit();
-                    lastCommitDurationNanos = System.nanoTime() - commitStart;
-                    totalCommitTimeNanos += lastCommitDurationNanos;
-                    commitCount++;
+                    metrics.record(System.nanoTime() - batchStartNanos);
+                    rowsIngested += batchCount;
                 }
             } catch (Exception e) {
                 System.err.println("Ingestion error: " + e.getMessage());
