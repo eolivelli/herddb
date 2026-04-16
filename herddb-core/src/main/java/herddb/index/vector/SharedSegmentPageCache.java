@@ -53,10 +53,7 @@ public class SharedSegmentPageCache {
         } else {
             this.cache = Caffeine.newBuilder()
                     .maximumWeight(maxBytes)
-                    .weigher((Long pageId, byte[] data) -> {
-                        long len = data == null ? 0L : data.length;
-                        return len > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) len;
-                    })
+                    .weigher((Long pageId, byte[] data) -> data == null ? 0 : data.length)
                     .recordStats()
                     .build();
         }
