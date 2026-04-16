@@ -201,30 +201,37 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
         attachCallback(storage.read(request.getPath()), readExecutor,
                 (result, t) -> {
                     long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
-                    if (t != null) {
-                        readErrors.inc();
-                        readLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.SEVERE, "readFile failed for path " + request.getPath(), t);
-                        responseObserver.onError(
-                                Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
-                    } else if (result.status() == ReadResult.Status.NOT_FOUND) {
-                        readNotFound.inc();
-                        readLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.INFO, "readFile path={0} found=false time={1}ms",
-                                new Object[]{request.getPath(), elapsedMs(start)});
-                        responseObserver.onNext(ReadFileResponse.newBuilder().setFound(false).build());
-                        responseObserver.onCompleted();
-                    } else {
-                        byte[] content = result.content();
-                        readBytes.addCount(content.length);
-                        readLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.FINE, "readFile path={0} size={1} time={2}ms",
-                                new Object[]{request.getPath(), content.length, elapsedMs(start)});
-                        responseObserver.onNext(ReadFileResponse.newBuilder()
-                                .setFound(true)
-                                .setContent(UnsafeByteOperations.unsafeWrap(content))
-                                .build());
-                        responseObserver.onCompleted();
+                    try {
+                        if (t != null) {
+                            readErrors.inc();
+                            readLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                            LOGGER.log(Level.SEVERE, "readFile failed for path " + request.getPath(), t);
+                            responseObserver.onError(
+                                    Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
+                        } else if (result.status() == ReadResult.Status.NOT_FOUND) {
+                            readNotFound.inc();
+                            readLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                            LOGGER.log(Level.INFO, "readFile path={0} found=false time={1}ms",
+                                    new Object[]{request.getPath(), elapsedMs(start)});
+                            responseObserver.onNext(ReadFileResponse.newBuilder().setFound(false).build());
+                            responseObserver.onCompleted();
+                        } else {
+                            byte[] content = result.content();
+                            readBytes.addCount(content.length);
+                            readLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                            LOGGER.log(Level.FINE, "readFile path={0} size={1} time={2}ms",
+                                    new Object[]{request.getPath(), content.length, elapsedMs(start)});
+                            responseObserver.onNext(ReadFileResponse.newBuilder()
+                                    .setFound(true)
+                                    .setContent(UnsafeByteOperations.unsafeWrap(content))
+                                    .build());
+                            responseObserver.onCompleted();
+                        }
+                    } finally {
+                        // Release pooled ByteBuf if result was backed by one
+                        if (result != null) {
+                            result.release();
+                        }
                     }
                 });
     }

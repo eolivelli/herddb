@@ -24,6 +24,8 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.RemovalListener;
 import com.google.common.util.concurrent.Striped;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousFileChannel;
@@ -232,6 +234,9 @@ public class CachingObjectStorage implements ObjectStorage {
      * on miss (including {@link NoSuchFileException} from a concurrent eviction).
      * Uses an optimistic lock-free approach: open the file directly; if it doesn't exist
      * or is being evicted, fall through to the inner storage.
+     *
+     * Uses Netty pooled direct ByteBuf for zero-copy I/O. Caller MUST call
+     * {@link ReadResult#release()} when done to return the buffer to the pool.
      */
     private CompletableFuture<ReadResult> tryReadFromDiskAsync(String path) {
         if (diskLru.getIfPresent(path) == null) {
@@ -244,18 +249,19 @@ public class CachingObjectStorage implements ObjectStorage {
             // Open file directly; catch NoSuchFileException for eviction races
             AsynchronousFileChannel channel = AsynchronousFileChannel.open(filePath, StandardOpenOption.READ);
             long fileSize = channel.size();
-            // Allocate byte array directly and wrap in ByteBuffer to avoid copy
-            byte[] content = new byte[(int) fileSize];
-            ByteBuffer buffer = ByteBuffer.wrap(content);
+            // Allocate direct pooled ByteBuf for zero-copy efficient I/O
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer((int) fileSize);
+            ByteBuffer nioBuffer = byteBuf.nioBuffer(0, (int) fileSize);
 
-            channel.read(buffer, 0, null, new CompletionHandler<Integer, Void>() {
+            channel.read(nioBuffer, 0, null, new CompletionHandler<Integer, Void>() {
                 @Override
                 public void completed(Integer bytesRead, Void attachment) {
                     try {
                         channel.close();
                     } catch (IOException ignored) {
                     }
-                    result.complete(ReadResult.found(content));
+                    byteBuf.writerIndex(bytesRead);
+                    result.complete(ReadResult.foundWithByteBuf(byteBuf));
                 }
 
                 @Override
@@ -264,6 +270,8 @@ public class CachingObjectStorage implements ObjectStorage {
                         channel.close();
                     } catch (IOException ignored) {
                     }
+                    // Release pooled buffer on failure
+                    byteBuf.release();
                     // Treat as cache miss; fall through to inner storage
                     result.complete(null);
                 }
@@ -330,6 +338,9 @@ public class CachingObjectStorage implements ObjectStorage {
      * on miss (including {@link NoSuchFileException} from a concurrent eviction).
      * Uses an optimistic lock-free approach: open the file directly; if it doesn't exist,
      * fall through to the inner storage.
+     *
+     * Uses Netty pooled direct ByteBuf for zero-copy I/O. Caller MUST call
+     * {@link ReadResult#release()} when done to return the buffer to the pool.
      */
     private CompletableFuture<ReadResult> tryReadSliceFromDiskAsync(String blockPath, int offsetInBlock, int length) {
         Long size = diskLru.getIfPresent(blockPath);
@@ -349,18 +360,19 @@ public class CachingObjectStorage implements ObjectStorage {
             Path filePath = cacheFilePath(blockPath);
             // Open file directly; catch NoSuchFileException for eviction races
             AsynchronousFileChannel channel = AsynchronousFileChannel.open(filePath, StandardOpenOption.READ);
-            // Allocate byte array directly and wrap in ByteBuffer to avoid copy
-            byte[] content = new byte[readable];
-            ByteBuffer buffer = ByteBuffer.wrap(content);
+            // Allocate direct pooled ByteBuf for zero-copy efficient I/O
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(readable);
+            ByteBuffer nioBuffer = byteBuf.nioBuffer(0, readable);
 
-            channel.read(buffer, offsetInBlock, null, new CompletionHandler<Integer, Void>() {
+            channel.read(nioBuffer, offsetInBlock, null, new CompletionHandler<Integer, Void>() {
                 @Override
                 public void completed(Integer bytesRead, Void attachment) {
                     try {
                         channel.close();
                     } catch (IOException ignored) {
                     }
-                    result.complete(ReadResult.found(content));
+                    byteBuf.writerIndex(bytesRead);
+                    result.complete(ReadResult.foundWithByteBuf(byteBuf));
                 }
 
                 @Override
@@ -369,6 +381,8 @@ public class CachingObjectStorage implements ObjectStorage {
                         channel.close();
                     } catch (IOException ignored) {
                     }
+                    // Release pooled buffer on failure
+                    byteBuf.release();
                     // Treat as cache miss; fall through to inner storage
                     result.complete(null);
                 }

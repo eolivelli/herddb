@@ -22,6 +22,8 @@ package herddb.remote.storage;
 
 import com.github.benmanes.caffeine.cache.AsyncLoadingCache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousFileChannel;
@@ -175,18 +177,20 @@ public class LocalObjectStorage implements ObjectStorage {
 
             // Get file size from the open channel (cheaper than separate stat syscall)
             long fileSize = channel.size();
-            // Allocate byte array directly and wrap in ByteBuffer to avoid copy
-            byte[] content = new byte[(int) fileSize];
-            ByteBuffer buffer = ByteBuffer.wrap(content);
+            // Allocate direct pooled ByteBuf for zero-copy efficient I/O
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer((int) fileSize);
+            ByteBuffer nioBuffer = byteBuf.nioBuffer(0, (int) fileSize);
 
-            channel.read(buffer, 0, null, new CompletionHandler<Integer, Void>() {
+            channel.read(nioBuffer, 0, null, new CompletionHandler<Integer, Void>() {
                 @Override
                 public void completed(Integer bytesRead, Void attachment) {
                     try {
                         channel.close();
                     } catch (IOException ignored) {
                     }
-                    result.complete(ReadResult.found(content));
+                    // Set reader index for the ByteBuf based on bytes read
+                    byteBuf.writerIndex(bytesRead);
+                    result.complete(ReadResult.foundWithByteBuf(byteBuf));
                 }
 
                 @Override
@@ -195,6 +199,8 @@ public class LocalObjectStorage implements ObjectStorage {
                         channel.close();
                     } catch (IOException ignored) {
                     }
+                    // Release pooled buffer on failure
+                    byteBuf.release();
                     result.completeExceptionally(exc);
                 }
             });
@@ -254,16 +260,18 @@ public class LocalObjectStorage implements ObjectStorage {
                 return CompletableFuture.completedFuture(ReadResult.notFound());
             }
             int toRead = Math.min(length, available);
-            // Allocate byte array directly and wrap in ByteBuffer to avoid copy
-            byte[] content = new byte[toRead];
-            ByteBuffer buffer = ByteBuffer.wrap(content);
-            channel.read(buffer, offsetInBlock, null, new CompletionHandler<Integer, Void>() {
+            // Allocate direct pooled ByteBuf for zero-copy efficient I/O
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(toRead);
+            ByteBuffer nioBuffer = byteBuf.nioBuffer(0, toRead);
+            channel.read(nioBuffer, offsetInBlock, null, new CompletionHandler<Integer, Void>() {
                 @Override
                 public void completed(Integer bytesRead, Void attachment) {
                     try {
                         channel.close();
                     } catch (IOException ignored) {
                     }
+                    // Set writer index for the ByteBuf based on bytes read
+                    byteBuf.writerIndex(bytesRead);
                     if (diskReadLatency != null) {
                         diskReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
                     }
@@ -273,7 +281,7 @@ public class LocalObjectStorage implements ObjectStorage {
                     if (diskReadBytes != null) {
                         diskReadBytes.inc();
                     }
-                    result.complete(ReadResult.found(content));
+                    result.complete(ReadResult.foundWithByteBuf(byteBuf));
                 }
                 @Override
                 public void failed(Throwable exc, Void attachment) {
@@ -281,6 +289,8 @@ public class LocalObjectStorage implements ObjectStorage {
                         channel.close();
                     } catch (IOException ignored) {
                     }
+                    // Release pooled buffer on failure
+                    byteBuf.release();
                     if (diskReadLatency != null) {
                         diskReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
                     }
