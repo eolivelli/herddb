@@ -531,7 +531,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 indexName + "_" + tableName + "_" + System.nanoTime(), tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                VectorSimilarityFunction.COSINE, Long.MAX_VALUE, null, 0);
+                VectorSimilarityFunction.COSINE, Long.MAX_VALUE, null, 0, 0);
     }
 
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
@@ -546,7 +546,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 indexName + "_" + tableName + "_" + System.nanoTime(), tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, Long.MAX_VALUE, null, 0);
+                similarityFunction, Long.MAX_VALUE, null, 0, 0);
     }
 
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
@@ -562,7 +562,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 indexName + "_" + tableName + "_" + System.nanoTime(), tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, maxVectorMemoryBytes, null, 0);
+                similarityFunction, maxVectorMemoryBytes, null, 0, 0);
     }
 
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
@@ -576,31 +576,36 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  long maxVectorMemoryBytes,
                                  VectorMemoryBudget memoryBudget,
                                  long maxLiveBytesPerCheckpoint) {
-        super(vectorColumnName);
-        this.indexName = indexName;
-        this.tableName = tableName;
-        this.tableSpaceUUID = tableSpaceUUID;
-        this.indexUUID = indexName + "_" + tableName + "_" + System.nanoTime();
-        this.tmpDirectory = tmpDirectory;
-        this.dataStorageManager = dataStorageManager;
-        this.memoryManager = memoryManager;
-        this.m = m;
-        this.beamWidth = beamWidth;
-        this.neighborOverflow = neighborOverflow;
-        this.alpha = alpha;
-        this.fusedPQ = fusedPQ;
-        this.similarityFunction = similarityFunction;
-        this.maxSegmentSize = maxSegmentSize;
-        this.maxLiveGraphSize = maxLiveGraphSize;
-        this.compactionIntervalMs = compactionIntervalMs;
-        this.maxVectorMemoryBytes = maxVectorMemoryBytes;
-        this.memoryBudget = memoryBudget;
-        this.maxLiveBytesPerCheckpoint = maxLiveBytesPerCheckpoint > 0 ? maxLiveBytesPerCheckpoint : 10L * 1024 * 1024 * 1024;
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName,
+                indexName + "_" + tableName + "_" + System.nanoTime(),
+                tmpDirectory, dataStorageManager, memoryManager, m, beamWidth,
+                neighborOverflow, alpha, fusedPQ, maxSegmentSize, maxLiveGraphSize,
+                compactionIntervalMs, similarityFunction, maxVectorMemoryBytes,
+                memoryBudget, maxLiveBytesPerCheckpoint, 0);
+    }
 
-        // Initialize global shared page cache for lazy-loaded segments
-        long segmentPageCacheBytes = Long.getLong("herddb.vectorindex.segmentPageCacheMaxBytes",
-                SharedSegmentPageCache.DEFAULT_MAX_BYTES);
-        this.segmentPageCache = new SharedSegmentPageCache(segmentPageCacheBytes);
+    /**
+     * Constructor that accepts all parameters including segment page cache max bytes,
+     * for use by the IndexingServiceEngine factory.
+     */
+    public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
+                                 String vectorColumnName, Path tmpDirectory,
+                                 DataStorageManager dataStorageManager,
+                                 MemoryManager memoryManager,
+                                 int m, int beamWidth, float neighborOverflow, float alpha,
+                                 boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
+                                 long compactionIntervalMs,
+                                 VectorSimilarityFunction similarityFunction,
+                                 long maxVectorMemoryBytes,
+                                 VectorMemoryBudget memoryBudget,
+                                 long maxLiveBytesPerCheckpoint,
+                                 long segmentPageCacheMaxBytes) {
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName,
+                indexName + "_" + tableName + "_" + System.nanoTime(),
+                tmpDirectory, dataStorageManager, memoryManager, m, beamWidth,
+                neighborOverflow, alpha, fusedPQ, maxSegmentSize, maxLiveGraphSize,
+                compactionIntervalMs, similarityFunction, maxVectorMemoryBytes,
+                memoryBudget, maxLiveBytesPerCheckpoint, segmentPageCacheMaxBytes);
     }
 
     /**
@@ -617,7 +622,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                VectorSimilarityFunction.COSINE, Long.MAX_VALUE, null, 0);
+                VectorSimilarityFunction.COSINE, Long.MAX_VALUE, null, 0, 0);
     }
 
     /**
@@ -634,7 +639,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, Long.MAX_VALUE, null, 0);
+                similarityFunction, Long.MAX_VALUE, null, 0, 0);
     }
 
     /**
@@ -652,12 +657,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
                 dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
                 fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
-                similarityFunction, maxVectorMemoryBytes, null, 0);
+                similarityFunction, maxVectorMemoryBytes, null, 0, 0);
     }
 
     /**
      * Constructor that accepts an explicit indexUUID, similarity function, memory limit,
-     * global memory budget, and live-shard snapshot byte cap.
+     * global memory budget, live-shard snapshot byte cap, and segment page cache max bytes.
      */
     public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
                                  String vectorColumnName, String indexUUID, Path tmpDirectory,
@@ -669,7 +674,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  VectorSimilarityFunction similarityFunction,
                                  long maxVectorMemoryBytes,
                                  VectorMemoryBudget memoryBudget,
-                                 long maxLiveBytesPerCheckpoint) {
+                                 long maxLiveBytesPerCheckpoint,
+                                 long segmentPageCacheMaxBytes) {
         super(vectorColumnName);
         this.indexName = indexName;
         this.tableName = tableName;
@@ -692,9 +698,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.maxLiveBytesPerCheckpoint = maxLiveBytesPerCheckpoint > 0 ? maxLiveBytesPerCheckpoint : 10L * 1024 * 1024 * 1024;
 
         // Initialize global shared page cache for lazy-loaded segments
-        long segmentPageCacheBytes = Long.getLong("herddb.vectorindex.segmentPageCacheMaxBytes",
-                SharedSegmentPageCache.DEFAULT_MAX_BYTES);
-        this.segmentPageCache = new SharedSegmentPageCache(segmentPageCacheBytes);
+        // If segmentPageCacheMaxBytes is 0, use the default (1/4 of JVM heap)
+        long cacheBytes = segmentPageCacheMaxBytes > 0 ? segmentPageCacheMaxBytes : SharedSegmentPageCache.DEFAULT_MAX_BYTES;
+        this.segmentPageCache = new SharedSegmentPageCache(cacheBytes);
     }
 
     // -------------------------------------------------------------------------

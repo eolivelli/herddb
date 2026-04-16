@@ -326,9 +326,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT);
             LOGGER.log(Level.INFO, "vector index maxLiveBytesPerCheckpoint: {0} bytes",
                     maxLiveBytesPerCheckpoint);
+            final long segmentPageCacheMaxBytes = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES_DEFAULT);
+            long effectiveCacheBytes = segmentPageCacheMaxBytes > 0 ? segmentPageCacheMaxBytes
+                    : herddb.index.vector.SharedSegmentPageCache.DEFAULT_MAX_BYTES;
+            LOGGER.log(Level.INFO, "vector index segmentPageCacheMaxBytes: {0} bytes (config: {1})",
+                    new Object[]{effectiveCacheBytes, segmentPageCacheMaxBytes});
 
             final long vectorMemLimit = maxVectorMemoryBytes;
             final VectorMemoryBudget budget = this;
+            final long finalSegmentPageCacheMaxBytes = segmentPageCacheMaxBytes;
             vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir, indexProperties) -> {
                 var similarityFunction = PersistentVectorStore.parseSimilarityFunction(
                         indexProperties != null ? indexProperties.get(VectorIndexManager.PROP_SIMILARITY) : null);
@@ -338,7 +346,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         m, beamWidth, neighborOverflow, alpha,
                         fusedPQ, maxSegmentSize, maxLiveGraphSize,
                         compactionInterval,
-                        similarityFunction, vectorMemLimit, budget, maxLiveBytesPerCheckpoint);
+                        similarityFunction, vectorMemLimit, budget, maxLiveBytesPerCheckpoint,
+                        finalSegmentPageCacheMaxBytes);
                 try {
                     store.start();
                 } catch (Exception e) {

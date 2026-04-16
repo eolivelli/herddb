@@ -117,6 +117,10 @@ public final class IndexingServerConfiguration {
     public static final long PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT =
             10L * 1024 * 1024 * 1024; // 10 GiB
 
+    public static final String PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES =
+            "indexing.vector.segmentPageCacheMaxBytes";
+    public static final long PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES_DEFAULT = 0; // 0 = compute as 1/4 of heap
+
     // Compaction
     public static final String PROPERTY_COMPACTION_INTERVAL = "indexing.compaction.interval";
     public static final long PROPERTY_COMPACTION_INTERVAL_DEFAULT = 60000L;
