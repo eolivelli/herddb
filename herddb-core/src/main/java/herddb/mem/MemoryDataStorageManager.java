@@ -36,7 +36,6 @@ import herddb.storage.DataStorageManagerException;
 import herddb.storage.FullTableScanConsumer;
 import herddb.storage.IndexStatus;
 import herddb.storage.TableStatus;
-import herddb.utils.ByteArrayCursor;
 import herddb.utils.ByteBufCursor;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataInputStream;

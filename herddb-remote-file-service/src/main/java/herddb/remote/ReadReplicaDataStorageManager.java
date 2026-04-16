@@ -140,8 +140,7 @@ public class ReadReplicaDataStorageManager extends DataStorageManager {
 
     private static <X> X deserializeIndexPage(byte[] data, DataReader<X> reader)
             throws IOException, DataStorageManagerException {
-        io.netty.buffer.ByteBuf buf = io.netty.buffer.Unpooled.wrappedBuffer(data);
-        try (ByteBufCursor dataIn = ByteBufCursor.wrap(buf)) {
+        try (ByteBufCursor dataIn = ByteBufCursor.wrap(data)) {
             long version = dataIn.readVLong();
             long flags = dataIn.readVLong();
             if (version != 1 || flags != 0) {

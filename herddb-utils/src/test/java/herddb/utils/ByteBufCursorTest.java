@@ -27,7 +27,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
-import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -444,9 +443,9 @@ public class ByteBufCursorTest {
 
         Object cursor = factory.wrap(data);
         try {
-            assert factory.readBoolean(cursor) == true;
-            assert factory.readBoolean(cursor) == false;
-            assert factory.readBoolean(cursor) == true;
+            assert factory.readBoolean(cursor);
+            assert !factory.readBoolean(cursor);
+            assert factory.readBoolean(cursor);
             assert factory.isEof(cursor);
         } finally {
             factory.close(cursor);

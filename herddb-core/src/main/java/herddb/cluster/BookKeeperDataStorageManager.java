@@ -507,8 +507,7 @@ public class BookKeeperDataStorageManager extends DataStorageManager {
     }
 
     private static <X> X readIndexPage(byte[] dataPage, DataReader<X> reader) throws IOException, DataStorageManagerException {
-        io.netty.buffer.ByteBuf buf = io.netty.buffer.Unpooled.wrappedBuffer(dataPage);
-        try (ByteBufCursor dataIn = ByteBufCursor.wrap(buf)) {
+        try (ByteBufCursor dataIn = ByteBufCursor.wrap(dataPage)) {
             long version = dataIn.readVLong(); // version
             long flags = dataIn.readVLong(); // flags for future implementations
             if (version != 1 || flags != 0) {

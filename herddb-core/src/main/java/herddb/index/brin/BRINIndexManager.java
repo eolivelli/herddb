@@ -44,7 +44,6 @@ import herddb.sql.SQLRecordKeyFunction;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
-import herddb.utils.ByteArrayCursor;
 import herddb.utils.ByteBufCursor;
 import herddb.utils.Bytes;
 import herddb.utils.DataAccessor;
