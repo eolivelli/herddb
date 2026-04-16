@@ -31,6 +31,9 @@ import java.util.List;
  */
 public class ByteBufUtils {
 
+    private static final byte[] EMPTY_BYTE_ARRAY = new byte[0];
+    private static final float[] EMPTY_FLOAT_ARRAY = new float[0];
+
     public static void writeArray(ByteBuf buffer, byte[] array) {
         writeVInt(buffer, array.length);
         buffer.writeBytes(array);
@@ -70,6 +73,11 @@ public class ByteBufUtils {
 
     public static byte[] readArray(ByteBuf buffer) {
         final int len = readVInt(buffer);
+        if (len == 0) {
+            return EMPTY_BYTE_ARRAY;
+        } else if (len == -1) {
+            return null;
+        }
         final byte[] array = new byte[len];
         buffer.readBytes(array);
         return array;
@@ -77,6 +85,11 @@ public class ByteBufUtils {
 
     public static float[] readFloatArray(ByteBuf buffer) {
         final int len = readVInt(buffer);
+        if (len == 0) {
+            return EMPTY_FLOAT_ARRAY;
+        } else if (len == -1) {
+            return null;
+        }
         final float[] array = new float[len];
         for (int i = 0; i < len; i++) {
             array[i] = buffer.readFloat();
