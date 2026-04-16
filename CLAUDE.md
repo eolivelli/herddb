@@ -7,7 +7,7 @@ open a pull request so that CI runs and changes can be reviewed before merging.
 ## Before Sending a PR
 Run the code validation checks locally before opening a pull request:
 ```
-mvn -B checkstyle:check apache-rat:check spotbugs:check install -DskipTests -Pjenkins
+mvn -B checkstyle:check apache-rat:check spotbugs:check install -DskipTests -Pci
 ```
 This matches what `.github/workflows/pr-validation.yml` runs in CI (checkstyle, Apache RAT license headers, SpotBugs).
 
