@@ -19,10 +19,13 @@
  */
 package herddb.vectortesting;
 
+import herddb.jdbc.PreparedStatementAsync;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -65,6 +68,45 @@ public class IngestionWorker implements Runnable {
         return String.format("%ds", sec);
     }
 
+    /**
+     * Flush accumulated batch using executeBatchAsync and commit.
+     * Records batch+commit latency to metrics.
+     *
+     * @param ps prepared statement with accumulated batch
+     * @param conn connection for commit
+     * @param batchStartNanos nanosecond timestamp when batch started
+     * @return latency in nanoseconds (batch + commit)
+     * @throws SQLException if batch execution or commit fails
+     * @throws ExecutionException if async batch execution fails
+     * @throws InterruptedException if async batch execution is interrupted
+     */
+    private long flushBatch(PreparedStatement ps, Connection conn, long batchStartNanos)
+            throws SQLException, ExecutionException, InterruptedException {
+        // Execute accumulated batch asynchronously
+        ps.unwrap(PreparedStatementAsync.class).executeBatchAsync().get();
+        // Commit the transaction
+        conn.commit();
+        // Calculate and return latency
+        return System.nanoTime() - batchStartNanos;
+    }
+
+    /**
+     * Package-private method for testing flushBatch behavior.
+     * Delegates to the private flushBatch method.
+     *
+     * @param ps prepared statement with accumulated batch
+     * @param conn connection for commit
+     * @param batchStartNanos nanosecond timestamp when batch started
+     * @return latency in nanoseconds (batch + commit)
+     * @throws SQLException if batch execution or commit fails
+     * @throws ExecutionException if async batch execution fails
+     * @throws InterruptedException if async batch execution is interrupted
+     */
+    long testFlushBatch(PreparedStatement ps, Connection conn, long batchStartNanos)
+            throws SQLException, ExecutionException, InterruptedException {
+        return flushBatch(ps, conn, batchStartNanos);
+    }
+
     @Override
     public void run() {
         String sql = "INSERT INTO " + config.tableName + "(id, vec) VALUES(?, ?)";
@@ -94,13 +136,13 @@ public class IngestionWorker implements Runnable {
                     }
                     ps.setLong(1, id);
                     ps.setObject(2, vec);
-                    ps.executeUpdate();
+                    ps.addBatch();
                     batchCount++;
 
                     long now = System.currentTimeMillis();
                     if (batchCount >= config.batchSize || (batchCount > 0 && now - lastCommitTime >= maxCommitIntervalMs)) {
-                        conn.commit();
-                        metrics.record(System.nanoTime() - batchStartNanos);
+                        long latencyNanos = flushBatch(ps, conn, batchStartNanos);
+                        metrics.record(latencyNanos);
                         rowsIngested += batchCount;
                         batchCount = 0;
                         lastCommitTime = now;
@@ -134,14 +176,19 @@ public class IngestionWorker implements Runnable {
                     }
                 }
                 if (batchCount > 0) {
-                    conn.commit();
-                    metrics.record(System.nanoTime() - batchStartNanos);
+                    long latencyNanos = flushBatch(ps, conn, batchStartNanos);
+                    metrics.record(latencyNanos);
                     rowsIngested += batchCount;
                 }
-            } catch (Exception e) {
+            } catch (SQLException | ExecutionException | InterruptedException e) {
                 System.err.println("Ingestion error: " + e.getMessage());
                 e.printStackTrace();
-                conn.rollback();
+                try {
+                    conn.rollback();
+                } catch (SQLException rollbackError) {
+                    System.err.println("Rollback failed: " + rollbackError.getMessage());
+                    rollbackError.printStackTrace();
+                }
             }
         } catch (Exception e) {
             System.err.println("Connection error: " + e.getMessage());
