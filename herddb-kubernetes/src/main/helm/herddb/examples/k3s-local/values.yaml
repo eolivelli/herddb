@@ -44,7 +44,12 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  javaOpts: "-Xms12g -Xmx12g -Djava.net.preferIPv4Stack=true"
+  # Heap raised to 20 g for bigann 100M-vector workload.
+  # bigann produces ~52,570 dirty pages (~52.5 GiB checkpoint buffer allocations);
+  # 10 g caused GC-pause connection drop on sift10m (5,257 pages), 12 g survived
+  # sift10m. 20 g gives headroom for the 10× larger bigann checkpoint.
+  # 20 g heap + 1 GiB JVM overhead → 21 GiB container memory.
+  javaOpts: "-Xms20g -Xmx20g -Djava.net.preferIPv4Stack=true"
   storage:
     data:
       size: 5Gi
@@ -54,10 +59,10 @@ server:
     indexing.service.timeout: "300"
   resources:
     requests:
-      memory: "13Gi"
+      memory: "21Gi"
       cpu: "2"
     limits:
-      memory: "13Gi"
+      memory: "21Gi"
       cpu: "2"
 
 fileServer:
@@ -134,10 +139,12 @@ indexingService:
   enabled: true
   storageMode: remote
   replicaCount: 1
-  # Heap set to 5 g (user request for sift10m iteration 2): reduced from 11 g
-  # to see if the indexing service can complete sift10m with a smaller heap.
-  # Container memory = 6 GiB (heap 5 g + ~1 GiB JVM overhead).
-  javaOpts: "-Xms5g -Xmx5g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
+  # Heap raised to 9 g: sift10m builds 221 FusedPQ segments (~17 GB total graph
+  # data); with 5 g the IS had to evict/reload segments on every query causing
+  # ~25s/query. 9 g allows more segments resident in memory simultaneously,
+  # which should significantly reduce query latency.
+  # 9 g heap + 1 GiB JVM overhead → 10 GiB container memory.
+  javaOpts: "-Xms9g -Xmx9g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
   storage:
     data:
       size: 5Gi
@@ -145,10 +152,10 @@ indexingService:
       size: 2Gi
   resources:
     requests:
-      memory: "6Gi"
+      memory: "10Gi"
       cpu: "4"
     limits:
-      memory: "6Gi"
+      memory: "10Gi"
       cpu: "4"
 
 tools:
