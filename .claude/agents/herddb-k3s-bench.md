@@ -110,7 +110,7 @@ kubectl --kubeconfig .kubeconfig exec herddb-tools-0 -- \
         --server herddb-indexing-service-<N>.herddb-indexing-service:9850 --json
 ```
 Fields to watch: `tailer_watermark_ledger`, `tailer_watermark_offset`,
-`apply_queue_size`, `total_estimated_memory_bytes`.
+`total_estimated_memory_bytes`.
 
 ```
 kubectl --kubeconfig .kubeconfig exec herddb-tools-0 -- \
@@ -155,12 +155,12 @@ forbidden.
 
 ```
 ./scripts/run-bench.sh --dataset sift10k -n 10000 -k 100 \
-    --ingest-max-ops 20000 --ingest-threads 8 --batch-size 10000 --checkpoint
+    --ingest-max-ops 40000 --ingest-threads 8 --batch-size 10000 --checkpoint
 ```
 
 Rules that apply to every workload, including user-specified ones:
 
-- **Ingest defaults to `--ingest-max-ops 20000 --ingest-threads 8 --batch-size 10000`**
+- **Ingest defaults to `--ingest-max-ops 40000 --ingest-threads 8 --batch-size 10000`**
   unless the user explicitly overrides them. These values were validated on
   bigann 10M (k3s-local): 13,870 ops/s sustained. Latency percentiles
   now reflect batch+commit duration (one sample per commit of --batch-size rows),
@@ -172,10 +172,8 @@ Rules that apply to every workload, including user-specified ones:
   no `--checkpoint`, insert `--checkpoint` before the recall flags and tell
   the user you inserted it. If the checkpoint phase fails, do NOT proceed to
   the recall phase — go to the failure path.
-- **Checkpoint timeout escalation.** The default
-  `--checkpoint-timeout-seconds` is 300.  If a checkpoint times out in one
-  iteration, use `--checkpoint-timeout-seconds 600` for all subsequent
-  iterations in the same session and tell the user you did so.
+- **Checkpoint timeout.** Always pass `--checkpoint-timeout-seconds 1800`.
+  Never use a lower value.
 
 ---
 
@@ -436,10 +434,9 @@ any new flag.
   stack traces and SEVERE log lines **verbatim** in the body.
 - Never attempt to recover a faulty cluster. Collect, file, stop.
 - Never run recall / query phases before a successful checkpoint.
-- Default ingest uses `--ingest-max-ops 20000 --ingest-threads 8 --batch-size 10000`
+- Default ingest uses `--ingest-max-ops 40000 --ingest-threads 8 --batch-size 10000`
   unless the user overrides them.
-- Escalate checkpoint timeout from 300 s to 600 s after any timeout is
-  observed in the session.
+- Always use `--checkpoint-timeout-seconds 1800`. Never use a lower value.
 - Long waits (minutes/hours) are acceptable, but supervision MUST tick at
   least every 60 s while a bench is running.
 - Never create a GH issue on success. Issues are for failures or explicit
@@ -457,7 +454,7 @@ All commands run via `kubectl exec herddb-tools-0 --`:
 
 | Command | Purpose | Key output fields |
 |---------|---------|-------------------|
-| `indexing-admin engine-stats --server <IS>:9850 --json` | Tailer/apply/memory stats | `tailer_watermark_ledger`, `tailer_watermark_offset`, `apply_queue_size`, `loaded_index_count`, `total_estimated_memory_bytes` |
+| `indexing-admin engine-stats --server <IS>:9850 --json` | Tailer/memory stats | `tailer_watermark_ledger`, `tailer_watermark_offset`, `loaded_index_count`, `total_estimated_memory_bytes` |
 | `indexing-admin describe-index --server <IS>:9850 --tablespace <UUID> --table <T> --index vidx --json` | Single index state | `vector_count`, `ondisk_node_count`, `segment_count`, `status`, `last_lsn_ledger`, `last_lsn_offset`, `ondisk_size_bytes`, `fused_pq_enabled` |
 | `indexing-admin list-indexes --server <IS>:9850` | All loaded indexes | index names and counts |
 | `indexing-admin instance-info --server <IS>:9850` | Config / identity | node identity, config summary |
@@ -484,8 +481,8 @@ The agent supervises a running benchmark at ≤60 s cadence. Each tick:
 1. `./scripts/check-cluster.sh`
 2. `kubectl get pods -o wide` — watch RESTARTS column
 3. `kubectl logs --tail=200 <pod>` for each component — scan for OOM/Exception/FATAL
-4. `indexing-admin engine-stats --json` per IS replica — watch `apply_queue_size`,
-   `total_estimated_memory_bytes`, `tailer_watermark_ledger`
+4. `indexing-admin engine-stats --json` per IS replica — watch `total_estimated_memory_bytes`,
+   `tailer_watermark_ledger`, `tailer_watermark_offset`
 5. File-server metrics via `curl http://localhost:9847/metrics` every few ticks
 
 ### indexing-admin

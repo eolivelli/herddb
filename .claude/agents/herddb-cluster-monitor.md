@@ -74,7 +74,6 @@ kubectl exec herddb-tools-0 -- indexing-admin engine-stats \
 
 For each replica 0 to IS_REPLICAS-1, extract and report:
 - `tailer_watermark_ledger` / `tailer_watermark_offset`
-- `apply_queue_size`
 - `total_estimated_memory_bytes`
 - Parse memory in GiB (divide by 1e9)
 
@@ -98,8 +97,8 @@ TICK <num> SUMMARY
 Variant: k3s-local
 Phase: ingest  Progress: op=5123/10000 (51%)
 PodStatus: 8 pods Running/Ready
-IS-0: watermark L=5 O=5123, apply_queue=12, mem=2.1 GiB — OK
-IS-1: watermark L=5 O=5122, apply_queue=15, mem=2.0 GiB — OK
+IS-0: watermark L=5 O=5123, mem=2.1 GiB — OK
+IS-1: watermark L=5 O=5122, mem=2.0 GiB — OK
 LogErrors: none detected
 Verdict: healthy
 ```
@@ -111,8 +110,8 @@ TICK <num> SUMMARY
 Variant: gke
 Phase: checkpoint  Progress: n/a
 PodStatus: 8 pods, herddb-indexing-service-1 has 2 restarts
-IS-0: watermark L=5 O=2000, apply_queue=1200, mem=2.5 GiB — WARNING (queue high)
-IS-1: watermark L=5 O=2000, apply_queue=1350, mem=2.6 GiB — WARNING (queue high)
+IS-0: watermark L=5 O=2000, mem=2.5 GiB — OK
+IS-1: watermark L=5 O=2000, mem=2.6 GiB — OK
 LogErrors: herddb-file-server-0 SEVERE: "ReadinessProbe failed"
 Verdict: warning
 ```
