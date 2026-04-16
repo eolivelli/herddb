@@ -170,12 +170,12 @@ invariants.
 
 ```
 ./scripts/run-bench.sh --dataset sift10k -n 10000 -k 100 \
-    --ingest-max-ops 10000 --ingest-threads 8 --batch-size 10000 --checkpoint
+    --ingest-max-ops 20000 --ingest-threads 8 --batch-size 10000 --checkpoint
 ```
 
 Rules that apply to every workload, including user-specified ones:
 
-- **Ingest defaults to `--ingest-max-ops 10000 --ingest-threads 8 --batch-size 10000`**
+- **Ingest defaults to `--ingest-max-ops 20000 --ingest-threads 8 --batch-size 10000`**
   unless the user explicitly overrides them. These values were validated on
   bigann 10M (k3s-local): 13,870 ops/s sustained, p99=0.43 ms, batch latency
   max=73 ms. If the user's command omits any of these flags, add them and tell
@@ -458,7 +458,7 @@ preserve existing `section` / `timestamp` helpers, and add `--help`
   traces and SEVERE log lines **verbatim**.
 - Never attempt to recover a faulty cluster. Collect, file, stop.
 - Never run recall / query phases before a successful checkpoint.
-- Default ingest uses `--ingest-max-ops 10000 --ingest-threads 8 --batch-size 10000`
+- Default ingest uses `--ingest-max-ops 20000 --ingest-threads 8 --batch-size 10000`
   unless the user overrides them.
 - Escalate checkpoint timeout from 300 s to 600 s after any timeout
   is observed in the session.
