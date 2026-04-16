@@ -28,6 +28,7 @@ import static org.junit.Assert.fail;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.util.ResourceLeakDetector;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -41,6 +42,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 public class InMemoryBlockCacheObjectStorageTest {
@@ -48,6 +50,11 @@ public class InMemoryBlockCacheObjectStorageTest {
     private static final int BLOCK_SIZE = 1024;
 
     private ExecutorService executor;
+
+    @BeforeClass
+    public static void enableLeakDetection() {
+        ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.PARANOID);
+    }
 
     @Before
     public void setUp() {
@@ -77,12 +84,20 @@ public class InMemoryBlockCacheObjectStorageTest {
                 new InMemoryBlockCacheObjectStorage(inner, 4 * 1024 * 1024)) {
 
             ReadResult r1 = cache.readRange("path/a", 0, 256, BLOCK_SIZE).get();
-            assertEquals(ReadResult.Status.FOUND, r1.status());
-            assertArrayEquals(Arrays.copyOfRange(block0, 0, 256), r1.content());
+            try {
+                assertEquals(ReadResult.Status.FOUND, r1.status());
+                assertArrayEquals(Arrays.copyOfRange(block0, 0, 256), r1.content());
+            } finally {
+                r1.release();
+            }
 
             ReadResult r2 = cache.readRange("path/a", 256, 256, BLOCK_SIZE).get();
-            assertEquals(ReadResult.Status.FOUND, r2.status());
-            assertArrayEquals(Arrays.copyOfRange(block0, 256, 512), r2.content());
+            try {
+                assertEquals(ReadResult.Status.FOUND, r2.status());
+                assertArrayEquals(Arrays.copyOfRange(block0, 256, 512), r2.content());
+            } finally {
+                r2.release();
+            }
 
             // Only the first range caused a readRange on inner (to fetch the whole block).
             assertEquals(1, inner.readRangeCalls.get());
@@ -114,13 +129,18 @@ public class InMemoryBlockCacheObjectStorageTest {
 
             ReadResult r1 = f1.get(5, TimeUnit.SECONDS);
             ReadResult r2 = f2.get(5, TimeUnit.SECONDS);
-            assertEquals(ReadResult.Status.FOUND, r1.status());
-            assertEquals(ReadResult.Status.FOUND, r2.status());
-            assertArrayEquals(Arrays.copyOfRange(block0, 0, 512), r1.content());
-            assertArrayEquals(Arrays.copyOfRange(block0, 0, 512), r2.content());
+            try {
+                assertEquals(ReadResult.Status.FOUND, r1.status());
+                assertEquals(ReadResult.Status.FOUND, r2.status());
+                assertArrayEquals(Arrays.copyOfRange(block0, 0, 512), r1.content());
+                assertArrayEquals(Arrays.copyOfRange(block0, 0, 512), r2.content());
 
-            // Only one inner readRange, thanks to in-flight dedup.
-            assertEquals(1, inner.readRangeCalls.get());
+                // Only one inner readRange, thanks to in-flight dedup.
+                assertEquals(1, inner.readRangeCalls.get());
+            } finally {
+                r1.release();
+                r2.release();
+            }
         }
     }
 
@@ -132,15 +152,23 @@ public class InMemoryBlockCacheObjectStorageTest {
 
         try (InMemoryBlockCacheObjectStorage cache =
                 new InMemoryBlockCacheObjectStorage(inner, 4 * 1024 * 1024)) {
-            cache.readRange("path/c", 0, 16, BLOCK_SIZE).get();
-            assertEquals(1, inner.readRangeCalls.get());
+            ReadResult r0 = cache.readRange("path/c", 0, 16, BLOCK_SIZE).get();
+            try {
+                assertEquals(1, inner.readRangeCalls.get());
+            } finally {
+                r0.release();
+            }
 
             byte[] updated = makeBlock(99, BLOCK_SIZE);
             cache.writeBlock("path/c", 0, updated).get();
 
             ReadResult r = cache.readRange("path/c", 0, 16, BLOCK_SIZE).get();
-            assertArrayEquals(Arrays.copyOfRange(updated, 0, 16), r.content());
-            assertEquals(2, inner.readRangeCalls.get());
+            try {
+                assertArrayEquals(Arrays.copyOfRange(updated, 0, 16), r.content());
+                assertEquals(2, inner.readRangeCalls.get());
+            } finally {
+                r.release();
+            }
         }
     }
 
@@ -152,14 +180,18 @@ public class InMemoryBlockCacheObjectStorageTest {
 
         try (InMemoryBlockCacheObjectStorage cache =
                 new InMemoryBlockCacheObjectStorage(inner, 4 * 1024 * 1024)) {
-            cache.readRange("path/d", 0, 16, BLOCK_SIZE).get();
-            cache.readRange("path/d", BLOCK_SIZE, 16, BLOCK_SIZE).get();
+            ReadResult r1 = cache.readRange("path/d", 0, 16, BLOCK_SIZE).get();
+            r1.release();
+            ReadResult r2 = cache.readRange("path/d", BLOCK_SIZE, 16, BLOCK_SIZE).get();
+            r2.release();
             assertEquals(2, inner.readRangeCalls.get());
 
             cache.write("path/d", new byte[]{1, 2, 3}).get();
 
-            cache.readRange("path/d", 0, 16, BLOCK_SIZE).get();
-            cache.readRange("path/d", BLOCK_SIZE, 16, BLOCK_SIZE).get();
+            ReadResult r3 = cache.readRange("path/d", 0, 16, BLOCK_SIZE).get();
+            r3.release();
+            ReadResult r4 = cache.readRange("path/d", BLOCK_SIZE, 16, BLOCK_SIZE).get();
+            r4.release();
             assertEquals("both blocks must be re-fetched after write", 4, inner.readRangeCalls.get());
         }
     }
@@ -173,15 +205,19 @@ public class InMemoryBlockCacheObjectStorageTest {
 
         try (InMemoryBlockCacheObjectStorage cache =
                 new InMemoryBlockCacheObjectStorage(inner, 4 * 1024 * 1024)) {
-            cache.readRange("path/e", 0, 16, BLOCK_SIZE).get();
-            cache.readRange("path/e", BLOCK_SIZE, 16, BLOCK_SIZE).get();
-            cache.readRange("path/other", 0, 16, BLOCK_SIZE).get();
+            ReadResult r1 = cache.readRange("path/e", 0, 16, BLOCK_SIZE).get();
+            r1.release();
+            ReadResult r2 = cache.readRange("path/e", BLOCK_SIZE, 16, BLOCK_SIZE).get();
+            r2.release();
+            ReadResult r3 = cache.readRange("path/other", 0, 16, BLOCK_SIZE).get();
+            r3.release();
 
             cache.deleteLogical("path/e").get();
 
             // Unrelated path stays cached.
             int before = inner.readRangeCalls.get();
-            cache.readRange("path/other", 0, 16, BLOCK_SIZE).get();
+            ReadResult r4 = cache.readRange("path/other", 0, 16, BLOCK_SIZE).get();
+            r4.release();
             assertEquals(before, inner.readRangeCalls.get());
         }
     }
@@ -195,16 +231,20 @@ public class InMemoryBlockCacheObjectStorageTest {
 
         try (InMemoryBlockCacheObjectStorage cache =
                 new InMemoryBlockCacheObjectStorage(inner, 4 * 1024 * 1024)) {
-            cache.readRange("pfx/a", 0, 16, BLOCK_SIZE).get();
-            cache.readRange("pfx/b", 0, 16, BLOCK_SIZE).get();
-            cache.readRange("other/c", 0, 16, BLOCK_SIZE).get();
+            ReadResult r1 = cache.readRange("pfx/a", 0, 16, BLOCK_SIZE).get();
+            r1.release();
+            ReadResult r2 = cache.readRange("pfx/b", 0, 16, BLOCK_SIZE).get();
+            r2.release();
+            ReadResult r3 = cache.readRange("other/c", 0, 16, BLOCK_SIZE).get();
+            r3.release();
             int before = inner.readRangeCalls.get();
 
             int deleted = cache.deleteByPrefix("pfx/").get();
             assertEquals(2, deleted);
 
             // Unrelated path served from cache.
-            cache.readRange("other/c", 0, 16, BLOCK_SIZE).get();
+            ReadResult r4 = cache.readRange("other/c", 0, 16, BLOCK_SIZE).get();
+            r4.release();
             assertEquals(before, inner.readRangeCalls.get());
         }
     }
@@ -219,9 +259,12 @@ public class InMemoryBlockCacheObjectStorageTest {
 
         try (InMemoryBlockCacheObjectStorage cache =
                 new InMemoryBlockCacheObjectStorage(inner, 2 * BLOCK_SIZE)) {
-            cache.readRange("w/a", 0, 16, BLOCK_SIZE).get();
-            cache.readRange("w/b", 0, 16, BLOCK_SIZE).get();
-            cache.readRange("w/c", 0, 16, BLOCK_SIZE).get();
+            ReadResult r1 = cache.readRange("w/a", 0, 16, BLOCK_SIZE).get();
+            r1.release();
+            ReadResult r2 = cache.readRange("w/b", 0, 16, BLOCK_SIZE).get();
+            r2.release();
+            ReadResult r3 = cache.readRange("w/c", 0, 16, BLOCK_SIZE).get();
+            r3.release();
             cache.cleanUp();
 
             assertTrue("cache must not exceed its weight bound",
@@ -240,13 +283,21 @@ public class InMemoryBlockCacheObjectStorageTest {
                 new InMemoryBlockCacheObjectStorage(inner, 4 * 1024 * 1024)) {
             // Requesting 256 bytes from offset 40: expect 256 bytes of the partial block.
             ReadResult r = cache.readRange("path/last", 40, 256, BLOCK_SIZE).get();
-            assertEquals(ReadResult.Status.FOUND, r.status());
-            assertArrayEquals(Arrays.copyOfRange(partial, 40, 40 + 256), r.content());
+            try {
+                assertEquals(ReadResult.Status.FOUND, r.status());
+                assertArrayEquals(Arrays.copyOfRange(partial, 40, 40 + 256), r.content());
+            } finally {
+                r.release();
+            }
 
             // Request past the end of the stored bytes: should return the available tail.
             ReadResult r2 = cache.readRange("path/last", 200, 256, BLOCK_SIZE).get();
-            assertEquals(ReadResult.Status.FOUND, r2.status());
-            assertArrayEquals(Arrays.copyOfRange(partial, 200, 300), r2.content());
+            try {
+                assertEquals(ReadResult.Status.FOUND, r2.status());
+                assertArrayEquals(Arrays.copyOfRange(partial, 200, 300), r2.content());
+            } finally {
+                r2.release();
+            }
         }
     }
 
@@ -256,7 +307,11 @@ public class InMemoryBlockCacheObjectStorageTest {
         try (InMemoryBlockCacheObjectStorage cache =
                 new InMemoryBlockCacheObjectStorage(inner, 4 * 1024 * 1024)) {
             ReadResult r = cache.readRange("missing", 0, 16, BLOCK_SIZE).get();
-            assertEquals(ReadResult.Status.NOT_FOUND, r.status());
+            try {
+                assertEquals(ReadResult.Status.NOT_FOUND, r.status());
+            } finally {
+                r.release();
+            }
         }
     }
 

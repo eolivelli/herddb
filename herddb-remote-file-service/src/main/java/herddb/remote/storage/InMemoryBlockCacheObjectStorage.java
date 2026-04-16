@@ -25,6 +25,7 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.buffer.Unpooled;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -147,9 +148,7 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
                     // Create a new ReadResult wrapping extracted bytes
                     ReadResult toReturn;
                     if (result.status() == ReadResult.Status.FOUND) {
-                        ByteBuf newBuf = PooledByteBufAllocator.DEFAULT.directBuffer(content.length);
-                        newBuf.writeBytes(content);
-                        toReturn = ReadResult.found(newBuf);
+                        toReturn = ReadResult.found(Unpooled.wrappedBuffer(content));
                     } else {
                         toReturn = ReadResult.notFound();
                     }
