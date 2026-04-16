@@ -49,7 +49,10 @@ server:
   # 10 g caused GC-pause connection drop on sift10m (5,257 pages), 12 g survived
   # sift10m. 20 g gives headroom for the 10× larger bigann checkpoint.
   # 20 g heap + 1 GiB JVM overhead → 21 GiB container memory.
-  javaOpts: "-Xms20g -Xmx20g -Djava.net.preferIPv4Stack=true"
+  # -Dio.netty.maxDirectMemory=0 tells Netty to respect -XX:MaxDirectMemorySize
+  # (defaults to -Xmx) rather than doubling it, preventing RSS from exceeding
+  # the container limit under heavy gRPC traffic.
+  javaOpts: "-Xms20g -Xmx20g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0"
   storage:
     data:
       size: 5Gi
@@ -68,7 +71,17 @@ server:
 fileServer:
   replicaCount: 1
   storageMode: s3
-  javaOpts: "-Xms4g -Xmx4g -Djava.net.preferIPv4Stack=true"
+  # Heap reduced to 2 g: the file server's hot path is disk-cache I/O and gRPC
+  # streaming; it does not need a large heap. A smaller heap leaves more RSS
+  # budget for Netty direct buffers.
+  # -Dio.netty.maxDirectMemory=0 tells Netty to respect the JVM MaxDirectMemorySize
+  # (defaults to -Xmx = 2 g) instead of sizing direct memory independently.
+  # With -Xmx2g: heap (2 g) + direct (≤ 2 g) + JVM overhead ≈ 5 g → 6 GiB
+  # container limit gives ~1 GiB headroom.
+  # Previously -Xmx4g with no MaxDirectMemorySize cap caused OOMKill when the IS
+  # loaded 100+ HNSW segments concurrently (heap 4 g + direct up to 4 g > 5 GiB
+  # limit; see issue #126).
+  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0"
   # S3 endpoint, bucket, and credentials are auto-wired from the
   # minio section below.
   s3:
@@ -86,10 +99,10 @@ fileServer:
     size: 200Gi
   resources:
     requests:
-      memory: "5Gi"
+      memory: "6Gi"
       cpu: "0.5"
     limits:
-      memory: "5Gi"
+      memory: "6Gi"
       cpu: "1"
 
 minio:
