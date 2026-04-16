@@ -244,7 +244,9 @@ public class CachingObjectStorage implements ObjectStorage {
             // Open file directly; catch NoSuchFileException for eviction races
             AsynchronousFileChannel channel = AsynchronousFileChannel.open(filePath, StandardOpenOption.READ);
             long fileSize = channel.size();
-            ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
+            // Allocate byte array directly and wrap in ByteBuffer to avoid copy
+            byte[] content = new byte[(int) fileSize];
+            ByteBuffer buffer = ByteBuffer.wrap(content);
 
             channel.read(buffer, 0, null, new CompletionHandler<Integer, Void>() {
                 @Override
@@ -253,9 +255,6 @@ public class CachingObjectStorage implements ObjectStorage {
                         channel.close();
                     } catch (IOException ignored) {
                     }
-                    buffer.flip();
-                    byte[] content = new byte[buffer.remaining()];
-                    buffer.get(content);
                     result.complete(ReadResult.found(content));
                 }
 
@@ -350,7 +349,9 @@ public class CachingObjectStorage implements ObjectStorage {
             Path filePath = cacheFilePath(blockPath);
             // Open file directly; catch NoSuchFileException for eviction races
             AsynchronousFileChannel channel = AsynchronousFileChannel.open(filePath, StandardOpenOption.READ);
-            ByteBuffer buffer = ByteBuffer.allocate(readable);
+            // Allocate byte array directly and wrap in ByteBuffer to avoid copy
+            byte[] content = new byte[readable];
+            ByteBuffer buffer = ByteBuffer.wrap(content);
 
             channel.read(buffer, offsetInBlock, null, new CompletionHandler<Integer, Void>() {
                 @Override
@@ -359,9 +360,6 @@ public class CachingObjectStorage implements ObjectStorage {
                         channel.close();
                     } catch (IOException ignored) {
                     }
-                    buffer.flip();
-                    byte[] content = new byte[buffer.remaining()];
-                    buffer.get(content);
                     result.complete(ReadResult.found(content));
                 }
 

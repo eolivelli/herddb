@@ -175,7 +175,9 @@ public class LocalObjectStorage implements ObjectStorage {
 
             // Get file size from the open channel (cheaper than separate stat syscall)
             long fileSize = channel.size();
-            ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
+            // Allocate byte array directly and wrap in ByteBuffer to avoid copy
+            byte[] content = new byte[(int) fileSize];
+            ByteBuffer buffer = ByteBuffer.wrap(content);
 
             channel.read(buffer, 0, null, new CompletionHandler<Integer, Void>() {
                 @Override
@@ -184,9 +186,6 @@ public class LocalObjectStorage implements ObjectStorage {
                         channel.close();
                     } catch (IOException ignored) {
                     }
-                    buffer.flip();
-                    byte[] content = new byte[buffer.remaining()];
-                    buffer.get(content);
                     result.complete(ReadResult.found(content));
                 }
 
@@ -255,7 +254,9 @@ public class LocalObjectStorage implements ObjectStorage {
                 return CompletableFuture.completedFuture(ReadResult.notFound());
             }
             int toRead = Math.min(length, available);
-            ByteBuffer buffer = ByteBuffer.allocate(toRead);
+            // Allocate byte array directly and wrap in ByteBuffer to avoid copy
+            byte[] content = new byte[toRead];
+            ByteBuffer buffer = ByteBuffer.wrap(content);
             channel.read(buffer, offsetInBlock, null, new CompletionHandler<Integer, Void>() {
                 @Override
                 public void completed(Integer bytesRead, Void attachment) {
@@ -263,9 +264,6 @@ public class LocalObjectStorage implements ObjectStorage {
                         channel.close();
                     } catch (IOException ignored) {
                     }
-                    buffer.flip();
-                    byte[] content = new byte[buffer.remaining()];
-                    buffer.get(content);
                     if (diskReadLatency != null) {
                         diskReadLatency.registerSuccessfulEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
                     }
