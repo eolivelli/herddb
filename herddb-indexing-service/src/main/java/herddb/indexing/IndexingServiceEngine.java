@@ -423,11 +423,21 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 IndexingServerConfiguration.PROPERTY_TABLESPACE_NAME_DEFAULT);
         long pollIntervalMs = config.getLong(IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS,
                 IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS_DEFAULT);
+        long tablespaceWaitTimeoutMs = config.getLong(
+                IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS,
+                IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS_DEFAULT);
+        long deadline = System.currentTimeMillis() + tablespaceWaitTimeoutMs;
+        LOGGER.log(Level.INFO, "Waiting up to {0}ms for tablespace ''{1}'' to become available...",
+                new Object[]{tablespaceWaitTimeoutMs, tablespaceName});
         TableSpace tableSpace = null;
         while (true) {
             tableSpace = metadataStorageManager.describeTableSpace(tablespaceName);
             if (tableSpace != null) {
                 break;
+            }
+            if (System.currentTimeMillis() > deadline) {
+                throw new RuntimeException("Timed out after " + tablespaceWaitTimeoutMs + "ms waiting for tablespace '"
+                        + tablespaceName + "' to become available");
             }
             LOGGER.log(Level.INFO, "Tablespace ''{0}'' not yet available, retrying in {1}ms...",
                     new Object[]{tablespaceName, pollIntervalMs});

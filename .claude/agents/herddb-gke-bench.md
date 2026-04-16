@@ -175,6 +175,7 @@ invariants.
 
 Rules that apply to every workload, including user-specified ones:
 
+
 - **Ingest defaults to `--ingest-max-ops 20000 --ingest-threads 8 --batch-size 10000`**
   unless the user explicitly overrides them. These values were validated on
   bigann 10M (k3s-local): 13,870 ops/s sustained, p99=0.43 ms, batch latency
