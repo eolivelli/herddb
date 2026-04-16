@@ -72,15 +72,18 @@ fileServer:
   # S3 endpoint, bucket, and credentials are auto-wired from the
   # minio section below.
   s3:
-    # Local disk cache set to the full PVC (30 GiB = 32212254720 bytes).
+    # Local disk cache raised to 200 GiB (214748364800 bytes) for bigann 10M
+    # benchmarks. The bigann 10M index (M=16, FusedPQ) produces ~218 segments
+    # totalling ~196 GiB of file-server reads — the previous 30 GiB cache was
+    # exhausted early in the query phase, causing p999 read latencies of 15.5s
+    # as reads fell through to MinIO (see issue #118).
     # NOTE: this key must be under fileServer.s3 — the template reads
     # .Values.fileServer.s3.cacheMaxBytes (not .Values.fileServer.cacheMaxBytes).
-    cacheMaxBytes: 32212254720
+    cacheMaxBytes: 214748364800
   storage:
-    # 30 GiB: large enough to cache the full gist1m index (M=32 ≈ 4.8 GB)
-    # plus data pages (~3.7 GB) with ~3.5× headroom so warm queries never
-    # fall back to MinIO.
-    size: 30Gi
+    # 200 GiB: sized to hold the full bigann 10M segment data in the local
+    # disk cache without any MinIO fallback on warm queries.
+    size: 200Gi
   resources:
     requests:
       memory: "5Gi"
@@ -92,9 +95,10 @@ fileServer:
 minio:
   enabled: true
   storage:
-    # 20 GiB: holds gist1m data (~8.5 GB) plus multiple benchmark runs
-    # without running out of object-storage space.
-    size: 20Gi
+    # 200 GiB: sized for bigann 10M HNSW segments (~196 GiB observed during
+    # the 2026-04-16 benchmark run). Previous 20 GiB was sufficient for smaller
+    # datasets (gist1m, sift1m, sift10k) but bigann 10M fills it entirely.
+    size: 200Gi
   resources:
     requests:
       memory: "256Mi"
