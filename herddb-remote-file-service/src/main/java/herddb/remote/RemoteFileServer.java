@@ -59,6 +59,7 @@ import org.eclipse.jetty.servlet.ServletHolder;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.S3AsyncClientBuilder;
 import software.amazon.awssdk.services.s3.S3Configuration;
@@ -318,7 +319,9 @@ public class RemoteFileServer implements AutoCloseable {
                 .region(Region.of(region))
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create(accessKey, secretKey)))
-                .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build());
+                .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build())
+                // Use AWS CRT async HTTP client for better stability and non-blocking shutdown
+                .httpClientBuilder(AwsCrtAsyncHttpClient.builder());
 
         if (endpoint != null && !endpoint.isEmpty()) {
             clientBuilder.endpointOverride(URI.create(endpoint));

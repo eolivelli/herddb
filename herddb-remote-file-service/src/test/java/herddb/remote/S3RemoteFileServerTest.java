@@ -41,6 +41,7 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.S3Configuration;
@@ -96,6 +97,8 @@ public class S3RemoteFileServerTest {
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create(MINIO_USER, MINIO_PASS)))
                 .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build())
+                // Use AWS CRT async HTTP client for better stability and non-blocking shutdown
+                .httpClientBuilder(AwsCrtAsyncHttpClient.builder())
                 .build();
     }
 
@@ -177,6 +180,8 @@ public class S3RemoteFileServerTest {
         Path dataDir = folder.newFolder("data3").toPath();
         Properties config = buildConfig(dataDir);
         config.setProperty("s3.bucket", "nonexistent-bucket-" + UUID.randomUUID());
+        // Set a short timeout for testing nonexistent bucket
+        config.setProperty("s3.bucket.wait.timeout.ms", "500");
 
         RemoteFileServer server = new RemoteFileServer("0.0.0.0", 0, dataDir, 4, config);
         server.start(); // should throw IOException
