@@ -48,5 +48,11 @@ else
     echo "==> k3s container '$CONTAINER_NAME' not found."
 fi
 
+# ── 3. Prune unused Docker volumes ──────────────────────────────────
+# k3s stores containerd image layers and PVC data in anonymous Docker
+# volumes; pruning them reclaims disk space after each benchmark run.
+echo "==> Pruning unused Docker volumes..."
+docker volume prune -f
+
 echo ""
 echo "==> Teardown complete."

@@ -155,16 +155,16 @@ forbidden.
 
 ```
 ./scripts/run-bench.sh --dataset sift10k -n 10000 -k 100 \
-    --ingest-max-ops 1000 --checkpoint
+    --ingest-max-ops 20000 --ingest-threads 8 --batch-size 10000 --checkpoint
 ```
 
 Rules that apply to every workload, including user-specified ones:
 
-- **Ingest is always throttled to `--ingest-max-ops 1000`** unless the user
-  explicitly overrides it. We are never in a hurry; a stable 1000 op/s load
-  avoids saturating MinIO / BookKeeper on a laptop and keeps results
-  comparable across runs. If the user's command omits the flag, add it and
-  tell the user you added it.
+- **Ingest defaults to `--ingest-max-ops 20000 --ingest-threads 8 --batch-size 10000`**
+  unless the user explicitly overrides them. These values were validated on
+  bigann 10M (k3s-local): 13,870 ops/s sustained, p99=0.43 ms, max=73 ms.
+  If the user's command omits any of these flags, add them and tell the user
+  you added them.
 - **Recall / query phases (`-k`, recall tests) must only run AFTER a
   successful checkpoint.** If the user's command includes a recall phase but
   no `--checkpoint`, insert `--checkpoint` before the recall flags and tell
@@ -434,8 +434,8 @@ any new flag.
   stack traces and SEVERE log lines **verbatim** in the body.
 - Never attempt to recover a faulty cluster. Collect, file, stop.
 - Never run recall / query phases before a successful checkpoint.
-- Default ingest is throttled to `--ingest-max-ops 1000` unless the user
-  overrides it.
+- Default ingest uses `--ingest-max-ops 20000 --ingest-threads 8 --batch-size 10000`
+  unless the user overrides them.
 - Escalate checkpoint timeout from 300 s to 600 s after any timeout is
   observed in the session.
 - Long waits (minutes/hours) are acceptable, but supervision MUST tick at
