@@ -1217,44 +1217,53 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         }
 
-        // Search frozen shards (during Phase B of checkpoint)
-        List<LiveGraphShard> frozen = frozenShards;
-        if (frozen != null) {
-            Set<Bytes> pending = pendingCheckpointDeletes;
-            for (LiveGraphShard shard : frozen) {
-                if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
-                    int k = Math.min(perSourceK, shard.nodeToPk.size());
-                    ImmutableGraphIndex graph = shard.builder.getGraph();
-                    SearchResult result = GraphSearcher.search(
-                            qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
-                    for (SearchResult.NodeScore ns : result.getNodes()) {
-                        Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
-                        if (pk != null && (pending == null || !pending.contains(pk))) {
-                            results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+        // Search frozen shards (during Phase B of checkpoint) and deferred shards.
+        // Both are cleaned up by Phase C under the write lock, so we must hold the read lock
+        // to prevent concurrent vectorStorage.remove() (called in Phase C) from clearing vectors
+        // while GraphSearcher accesses them via shard.mravv. Without this lock, there is a race
+        // where vectorStorage.remove() nulls a vector slot while jvector's scorer is calling
+        // getVector() on it, leading to NullPointerException (issue #129).
+        stateLock.readLock().lock();
+        try {
+            List<LiveGraphShard> frozen = frozenShards;
+            if (frozen != null) {
+                Set<Bytes> pending = pendingCheckpointDeletes;
+                for (LiveGraphShard shard : frozen) {
+                    if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
+                        int k = Math.min(perSourceK, shard.nodeToPk.size());
+                        ImmutableGraphIndex graph = shard.builder.getGraph();
+                        SearchResult result = GraphSearcher.search(
+                                qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
+                        for (SearchResult.NodeScore ns : result.getNodes()) {
+                            Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
+                            if (pk != null && (pending == null || !pending.contains(pk))) {
+                                results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Search deferred shards (live shards held back by the shard cap during Phase B)
-        List<LiveGraphShard> deferred = deferredShards;
-        if (deferred != null) {
-            Set<Bytes> pending = pendingCheckpointDeletes;
-            for (LiveGraphShard shard : deferred) {
-                if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
-                    int k = Math.min(perSourceK, shard.nodeToPk.size());
-                    ImmutableGraphIndex graph = shard.builder.getGraph();
-                    SearchResult result = GraphSearcher.search(
-                            qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
-                    for (SearchResult.NodeScore ns : result.getNodes()) {
-                        Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
-                        if (pk != null && (pending == null || !pending.contains(pk))) {
-                            results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+            List<LiveGraphShard> deferred = deferredShards;
+            if (deferred != null) {
+                Set<Bytes> pending = pendingCheckpointDeletes;
+                for (LiveGraphShard shard : deferred) {
+                    if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
+                        int k = Math.min(perSourceK, shard.nodeToPk.size());
+                        ImmutableGraphIndex graph = shard.builder.getGraph();
+                        SearchResult result = GraphSearcher.search(
+                                qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
+                        for (SearchResult.NodeScore ns : result.getNodes()) {
+                            Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
+                            if (pk != null && (pending == null || !pending.contains(pk))) {
+                                results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+                            }
                         }
                     }
                 }
             }
+        } finally {
+            stateLock.readLock().unlock();
         }
 
         // Merge and sort by score descending, take top-K

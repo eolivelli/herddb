@@ -35,6 +35,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.After;
 import org.junit.Before;
@@ -341,6 +342,84 @@ public class PersistentVectorStoreConcurrentCheckpointTest {
             assertEquals("a real Phase B should have run after the bound",
                     afterBootstrap + 1, store.getTotalFusedPQCheckpointCount());
             assertEquals(400, store.size());
+        }
+    }
+
+    /**
+     * Verifies that concurrent search and checkpoint do not corrupt the
+     * vector store state. This is a regression test for issue #129, which
+     * manifested as NullPointerException in GraphSearcher when Phase C
+     * cleared vectorStorage while searches were accessing frozen shards.
+     */
+    @Test
+    public void testConcurrentSearchAndCheckpoint() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("concurrent-search-cp-simple").toPath();
+        int dim = 128;
+        Random rng = new Random(42);
+
+        try (PersistentVectorStore store = createStore(tmpDir)) {
+            store.start();
+
+            // Insert and checkpoint multiple times concurrently with searches
+            // This exercises the race condition where Phase C clears vectorStorage
+            // while searches might be accessing frozen shards.
+            for (int cycle = 0; cycle < 3; cycle++) {
+                // Insert a batch of vectors
+                int batchSize = 256;
+                for (int i = 0; i < batchSize; i++) {
+                    store.addVector(Bytes.from_int(cycle * 1000 + i), randomVector(rng, dim));
+                }
+
+                // Launch search threads that will run concurrently
+                // with checkpoint Phase C (which clears vectorStorage).
+                int numSearchThreads = 3;
+                CountDownLatch searchStart = new CountDownLatch(numSearchThreads);
+                CountDownLatch searchDone = new CountDownLatch(numSearchThreads);
+                AtomicInteger searchCount = new AtomicInteger(0);
+                AtomicReference<Throwable> searchError = new AtomicReference<>();
+
+                for (int t = 0; t < numSearchThreads; t++) {
+                    new Thread(() -> {
+                        try {
+                            searchStart.countDown();
+                            searchStart.await();
+                            float[] query = randomVector(rng, dim);
+                            for (int iter = 0; iter < 5; iter++) {
+                                store.search(query, 5);
+                                searchCount.incrementAndGet();
+                            }
+                        } catch (Throwable t1) {
+                            searchError.compareAndSet(null, t1);
+                        } finally {
+                            searchDone.countDown();
+                        }
+                    }).start();
+                }
+
+                // Run checkpoint while searches are happening
+                searchStart.await();
+                store.checkpoint();
+
+                // Wait for searches to complete
+                assertTrue("searches should complete within 120s",
+                        searchDone.await(120, TimeUnit.SECONDS));
+                if (searchError.get() != null) {
+                    throw new AssertionError("search thread encountered exception",
+                            searchError.get());
+                }
+                assertTrue("search threads should have executed some queries",
+                        searchCount.get() > 0);
+            }
+
+            // Verify data integrity
+            int expectedVectors = 3 * 256;
+            assertEquals("all vectors should be present after concurrent ops",
+                    expectedVectors, store.size());
+
+            // Verify searches still work
+            float[] query = randomVector(rng, dim);
+            var results = store.search(query, 10);
+            assertFalse("final search should return results", results.isEmpty());
         }
     }
 }
