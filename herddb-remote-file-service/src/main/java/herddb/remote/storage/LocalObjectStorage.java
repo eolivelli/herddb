@@ -27,6 +27,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousFileChannel;
 import java.nio.channels.CompletionHandler;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -165,15 +166,15 @@ public class LocalObjectStorage implements ObjectStorage {
     @Override
     public CompletableFuture<ReadResult> read(String path) {
         Path target = resolvePath(path);
-
-        if (!Files.exists(target)) {
-            return CompletableFuture.completedFuture(ReadResult.notFound());
-        }
-
         CompletableFuture<ReadResult> result = new CompletableFuture<>();
+
         try {
-            long fileSize = Files.size(target);
+            // Open channel directly; NoSuchFileException is caught below and treated as not-found.
+            // This avoids blocking syscalls for Files.exists() and Files.size().
             AsynchronousFileChannel channel = AsynchronousFileChannel.open(target, StandardOpenOption.READ);
+
+            // Get file size from the open channel (cheaper than separate stat syscall)
+            long fileSize = channel.size();
             ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
 
             channel.read(buffer, 0, null, new CompletionHandler<Integer, Void>() {
@@ -198,6 +199,9 @@ public class LocalObjectStorage implements ObjectStorage {
                     result.completeExceptionally(exc);
                 }
             });
+        } catch (NoSuchFileException e) {
+            // File does not exist; return not-found result
+            result.complete(ReadResult.notFound());
         } catch (Throwable t) {
             result.completeExceptionally(t);
         }
@@ -227,25 +231,30 @@ public class LocalObjectStorage implements ObjectStorage {
         int offsetInBlock = (int) (offset % blockSize);
         String blockPath = path + ObjectStorage.MULTIPART_SUFFIX + "/" + blockIndex;
         Path target = resolvePath(blockPath);
-        if (!Files.exists(target)) {
-            return CompletableFuture.completedFuture(ReadResult.notFound());
-        }
         if (diskReadRequests != null) {
             diskReadRequests.inc();
         }
         CompletableFuture<ReadResult> result = new CompletableFuture<>();
         final long startNanos = System.nanoTime();
         try {
-            long fileSize = Files.size(target);
+            // Open channel directly; NoSuchFileException is caught below and treated as not-found.
+            // This avoids blocking syscalls for Files.exists() and Files.size().
+            AsynchronousFileChannel channel = AsynchronousFileChannel.open(target, StandardOpenOption.READ);
+
+            // Get file size from the open channel (cheaper than separate stat syscall)
+            long fileSize = channel.size();
             int available = (int) (fileSize - offsetInBlock);
             if (available <= 0) {
+                try {
+                    channel.close();
+                } catch (IOException ignored) {
+                }
                 if (diskReadLatency != null) {
                     diskReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
                 }
                 return CompletableFuture.completedFuture(ReadResult.notFound());
             }
             int toRead = Math.min(length, available);
-            AsynchronousFileChannel channel = AsynchronousFileChannel.open(target, StandardOpenOption.READ);
             ByteBuffer buffer = ByteBuffer.allocate(toRead);
             channel.read(buffer, offsetInBlock, null, new CompletionHandler<Integer, Void>() {
                 @Override
@@ -280,6 +289,12 @@ public class LocalObjectStorage implements ObjectStorage {
                     result.completeExceptionally(exc);
                 }
             });
+        } catch (NoSuchFileException e) {
+            // File does not exist; return not-found result
+            if (diskReadLatency != null) {
+                diskReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+            }
+            result.complete(ReadResult.notFound());
         } catch (Throwable t) {
             if (diskReadLatency != null) {
                 diskReadLatency.registerFailedEvent(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
