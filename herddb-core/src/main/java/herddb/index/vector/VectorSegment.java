@@ -92,6 +92,10 @@ class VectorSegment implements Closeable {
     List<Long> graphPageIds = java.util.Collections.emptyList();
     /** Page IDs for the map chunks (needed to re-persist sealed segments, page-based mode). */
     List<Long> mapPageIds = java.util.Collections.emptyList();
+    /** Payload sizes (in bytes) for each graph page, from segment metadata. */
+    List<Integer> graphPageSizes = java.util.Collections.emptyList();
+    /** Payload sizes (in bytes) for each map page, from segment metadata. */
+    List<Integer> mapPageSizes = java.util.Collections.emptyList();
 
     /** Logical path of the graph multipart file (non-null only in multipart mode). */
     String graphFilePath;

@@ -26,7 +26,6 @@ import static org.junit.Assert.fail;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -71,6 +70,21 @@ public class PageStoreReaderTest {
         return ids;
     }
 
+    /**
+     * Calculates page sizes for fixed-size pages (each page is {@code pageSize}
+     * bytes except the last one may be smaller).
+     */
+    private int[] calculatePageSizes(int pageCount, int pageSize, long totalLength) {
+        int[] sizes = new int[pageCount];
+        long bytesLeft = totalLength;
+        for (int i = 0; i < pageCount; i++) {
+            int len = (int) Math.min(pageSize, bytesLeft);
+            sizes[i] = len;
+            bytesLeft -= len;
+        }
+        return sizes;
+    }
+
     @Test
     public void roundTripMatchesByteStream() throws Exception {
         // Write a 7-page stream, each page 1024 bytes except the tail = 300.
@@ -80,7 +94,7 @@ public class PageStoreReaderTest {
         long[] ids = writeFixedSizePages(dsm, 7, pageSize, total);
 
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 3)) {
+                dsm, TS, IDX, ids, calculatePageSizes(7, pageSize, total), CHUNK_TYPE, 3, null)) {
             try (RandomAccessReader r = sup.get()) {
                 assertEquals(total, r.length());
                 // Read all bytes from position 0 and verify the deterministic
@@ -103,7 +117,7 @@ public class PageStoreReaderTest {
         long[] ids = writeFixedSizePages(dsm, 11, pageSize, total);
 
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 2)) {
+                dsm, TS, IDX, ids, calculatePageSizes(11, pageSize, total), CHUNK_TYPE, 2, null)) {
             try (RandomAccessReader r = sup.get()) {
                 // Probe crossing page boundaries; last position must leave at
                 // least 4 bytes (readInt consumes 4) before EOF.
@@ -123,7 +137,7 @@ public class PageStoreReaderTest {
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         long[] ids = writeFixedSizePages(dsm, 1, 8, 8);
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 1)) {
+                dsm, TS, IDX, ids, calculatePageSizes(1, 8, 8), CHUNK_TYPE, 1, null)) {
             try (RandomAccessReader r = sup.get()) {
                 r.seek(7);
                 try {
@@ -138,17 +152,16 @@ public class PageStoreReaderTest {
     @Test
     public void lruEvictsOldestPages() throws Exception {
         // 6 pages, cache of 2 → touching all 6 in order forces at least 4 misses
-        // in addition to the initial priming pass that filled the cache.
+        // due to LRU eviction.
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         int pageSize = 64;
         long total = 6L * pageSize;
         long[] ids = writeFixedSizePages(dsm, 6, pageSize, total);
 
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 2)) {
-            // At construction, 6 pages were read to learn sizes; LRU now holds
-            // the last 2.
-            assertEquals(2, sup.getCachedPages());
+                dsm, TS, IDX, ids, calculatePageSizes(6, pageSize, total), CHUNK_TYPE, 2, null)) {
+            // With lazy loading, no pages cached at construction
+            assertEquals("no cache at construction", 0, sup.getCachedPages());
             long missesBefore = sup.getCacheMisses();
             try (RandomAccessReader r = sup.get()) {
                 for (int pageIdx = 0; pageIdx < 6; pageIdx++) {
@@ -166,24 +179,29 @@ public class PageStoreReaderTest {
 
     @Test
     public void wrongChunkTypeFails() throws Exception {
-        // Pages stored with type 99, reader expects CHUNK_TYPE = 12 → should
-        // throw when constructing the PageSource (priming pass).
+        // Pages stored with type 99, reader expects CHUNK_TYPE = 12.
+        // With lazy loading, the type check happens when a page is actually read.
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         dsm.writeIndexPage(TS, IDX, 42L, out -> {
             out.writeVInt(99);
             out.writeVInt(4);
             out.write(new byte[]{1, 2, 3, 4}, 0, 4);
         });
-        try {
-            new PageStoreReader.Supplier(dsm, TS, IDX,
-                    new long[]{42L}, CHUNK_TYPE, 2);
-            fail("expected failure on wrong chunk type");
-        } catch (IOException | DataStorageManagerException expected) {
-            assertTrue("message should surface the type mismatch, got: "
-                            + expected.getMessage() + " cause: " + expected.getCause(),
-                    expected.getMessage().contains("expected type")
-                            || (expected.getCause() != null
-                                && expected.getCause().getMessage().contains("expected type")));
+        // Supplier construction succeeds with lazy loading (no page reads yet)
+        PageStoreReader.Supplier sup = new PageStoreReader.Supplier(dsm, TS, IDX,
+                new long[]{42L}, new int[]{4}, CHUNK_TYPE, 2, null);
+        // Type mismatch is detected when the page is actually accessed
+        try (RandomAccessReader r = sup.get()) {
+            try {
+                r.readInt(); // This triggers the page load which should fail on type check
+                fail("expected failure on wrong chunk type");
+            } catch (RuntimeException expected) {
+                // The IOException with "expected type" is wrapped as the cause
+                String fullMessage = expected.toString() + " cause: "
+                        + (expected.getCause() != null ? expected.getCause().toString() : "null");
+                assertTrue("message should surface the type mismatch, got: " + fullMessage,
+                        fullMessage.contains("expected type"));
+            }
         }
     }
 
@@ -192,8 +210,14 @@ public class PageStoreReaderTest {
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         long[] ids = writeFixedSizePages(dsm, 3, 64, 3 * 64L);
         PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 3);
-        assertTrue(sup.getCachedPages() > 0);
+                dsm, TS, IDX, ids, calculatePageSizes(3, 64, 3 * 64L), CHUNK_TYPE, 3, null);
+        // With lazy loading, no pages are cached at construction
+        assertEquals("no pages cached at construction with lazy loading", 0, sup.getCachedPages());
+        // Access a page to populate the cache
+        try (RandomAccessReader r = sup.get()) {
+            r.readInt();
+        }
+        assertTrue("cache should have pages after access", sup.getCachedPages() > 0);
         sup.close();
         assertEquals("close must drop cached pages", 0, sup.getCachedPages());
     }
@@ -210,7 +234,7 @@ public class PageStoreReaderTest {
 
         // Very small cache so reading a different page evicts.
         PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 1);
+                dsm, TS, IDX, ids, calculatePageSizes(4, pageSize, 4L * pageSize), CHUNK_TYPE, 1, null);
         // Remove page 0 from the backing store.
         dsm.deleteIndexPage(TS, IDX, ids[0]);
         try (RandomAccessReader r = sup.get()) {
@@ -235,7 +259,7 @@ public class PageStoreReaderTest {
         int pageSize = 64;
         long[] ids = writeFixedSizePages(dsm, 4, pageSize, 4L * pageSize);
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 4)) {
+                dsm, TS, IDX, ids, calculatePageSizes(4, pageSize, 4L * pageSize), CHUNK_TYPE, 4, null)) {
             long hitsBefore = sup.getCacheHits();
             RandomAccessReader a = sup.get();
             RandomAccessReader b = sup.get();
@@ -253,9 +277,8 @@ public class PageStoreReaderTest {
 
     @Test
     public void counterOfReadPayloadInvocations() throws Exception {
-        // Defensive: the priming-pass invokes readIndexPage exactly once per
-        // page. We simulate that by counting dsm.readIndexPage calls via a
-        // subclass.
+        // Defensive: with lazy loading, pages are read on-demand when accessed.
+        // Count dsm.readIndexPage calls via a subclass.
         AtomicInteger reads = new AtomicInteger(0);
         MemoryDataStorageManager dsm = new MemoryDataStorageManager() {
             @Override
@@ -268,11 +291,10 @@ public class PageStoreReaderTest {
         long[] ids = writeFixedSizePages(dsm, 5, 128, 5L * 128);
         int before = reads.get();
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 5)) {
-            assertEquals("priming pass must read each page exactly once",
-                    5, reads.get() - before);
-            // Second pass, reading all pages, should be ALL hits (no extra
-            // readIndexPage calls).
+                dsm, TS, IDX, ids, calculatePageSizes(5, 128, 5L * 128), CHUNK_TYPE, 5, null)) {
+            assertEquals("no reads at construction with lazy loading",
+                    0, reads.get() - before);
+            // First pass: reading all pages triggers lazy loads on demand
             int after = reads.get();
             try (RandomAccessReader r = sup.get()) {
                 for (int p = 0; p < 5; p++) {
@@ -280,7 +302,18 @@ public class PageStoreReaderTest {
                     r.readInt();
                 }
             }
-            assertEquals("all hits, no new reads", after, reads.get());
+            int firstPass = reads.get() - after;
+            assertTrue("first pass should read pages on demand", firstPass > 0);
+            // Second pass, reading all pages again, should be ALL hits (no extra readIndexPage calls).
+            int after2 = reads.get();
+            try (RandomAccessReader r = sup.get()) {
+                for (int p = 0; p < 5; p++) {
+                    r.seek((long) p * 128);
+                    r.readInt();
+                }
+            }
+            assertEquals("all second pass reads should hit the cache",
+                    0, reads.get() - after2);
         }
     }
 
@@ -291,7 +324,7 @@ public class PageStoreReaderTest {
         int pageSize = 32;
         long[] ids = writeFixedSizePages(dsm, 3, pageSize, 3L * pageSize);
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 3)) {
+                dsm, TS, IDX, ids, calculatePageSizes(3, pageSize, 3L * pageSize), CHUNK_TYPE, 3, null)) {
             try (RandomAccessReader r = sup.get()) {
                 // Read full buffer and check alignment
                 byte[] buf = new byte[3 * pageSize];
@@ -314,7 +347,7 @@ public class PageStoreReaderTest {
         long total = 2L * pageSize + 7;
         long[] ids = writeFixedSizePages(dsm, 3, pageSize, total);
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 3)) {
+                dsm, TS, IDX, ids, calculatePageSizes(3, pageSize, total), CHUNK_TYPE, 3, null)) {
             assertEquals(total, sup.getTotalLength());
         }
     }
@@ -325,7 +358,7 @@ public class PageStoreReaderTest {
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         long[] ids = writeFixedSizePages(dsm, 1, 16, 16);
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 1)) {
+                dsm, TS, IDX, ids, calculatePageSizes(1, 16, 16), CHUNK_TYPE, 1, null)) {
             try (RandomAccessReader r = sup.get()) {
                 r.seek(0);
                 byte[] buf = new byte[16];
@@ -345,13 +378,15 @@ public class PageStoreReaderTest {
         int pageSize = 32;
         long[] ids = writeFixedSizePages(dsm, pageCount, pageSize, pageCount * (long) pageSize);
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 4)) {
-            assertEquals("cache must saturate at its bound", 4, sup.getCachedPages());
+                dsm, TS, IDX, ids, calculatePageSizes(pageCount, pageSize, pageCount * (long) pageSize), CHUNK_TYPE, 4, null)) {
+            // With lazy loading, no cache at construction
+            assertEquals("no cache at construction", 0, sup.getCachedPages());
             try (RandomAccessReader r = sup.get()) {
                 byte[] buf = new byte[pageCount * pageSize];
                 r.seek(0);
                 r.readFully(buf);
             }
+            // After streaming through all 40 pages with cache of 4, LRU should still be bounded
             assertEquals("cache still bounded after streaming", 4, sup.getCachedPages());
         }
     }
@@ -362,7 +397,7 @@ public class PageStoreReaderTest {
         int pageSize = 8;
         long[] ids = writeFixedSizePages(dsm, 4, pageSize, 4L * pageSize);
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 4)) {
+                dsm, TS, IDX, ids, calculatePageSizes(4, pageSize, 4L * pageSize), CHUNK_TYPE, 4, null)) {
             try (RandomAccessReader r = sup.get()) {
                 // Read a 12-byte buffer starting at position 4: spans pages 0 and 1.
                 byte[] buf = new byte[12];
@@ -379,7 +414,7 @@ public class PageStoreReaderTest {
     public void emptyPageListIsUnsupported() {
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         try {
-            new PageStoreReader.Supplier(dsm, TS, IDX, new long[0], CHUNK_TYPE, 2);
+            new PageStoreReader.Supplier(dsm, TS, IDX, new long[0], new int[0], CHUNK_TYPE, 2, null);
             // Empty list is valid construction; totalLength = 0.
         } catch (Exception unexpected) {
             fail("empty page list should be allowed: " + unexpected);
@@ -395,7 +430,7 @@ public class PageStoreReaderTest {
         long total = 16L * pageSize;
         long[] ids = writeFixedSizePages(dsm, 16, pageSize, total);
         try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
-                dsm, TS, IDX, ids, CHUNK_TYPE, 4)) {
+                dsm, TS, IDX, ids, calculatePageSizes(16, pageSize, total), CHUNK_TYPE, 4, null)) {
             List<Thread> threads = new ArrayList<>();
             List<Throwable> errors = new ArrayList<>();
             for (int t = 0; t < 4; t++) {
