@@ -115,6 +115,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     private ManagedChannel buildChannel(String server) {
         ManagedChannelBuilder<?> b = ManagedChannelBuilder.forTarget(server)
                 .usePlaintext()
+                .disableRetry()  // eliminate UncommittedRetriableStreamsRegistry lock contention (issue #122)
                 .keepAliveTime(300, TimeUnit.SECONDS)
                 .keepAliveTimeout(20, TimeUnit.SECONDS);
         if (clientInterceptor != null) {

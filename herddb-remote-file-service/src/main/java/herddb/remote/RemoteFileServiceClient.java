@@ -171,6 +171,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         int port = Integer.parseInt(parts[1]);
         ManagedChannelBuilder<?> b = ManagedChannelBuilder.forAddress(host, port)
                 .usePlaintext()
+                .disableRetry()  // eliminate UncommittedRetriableStreamsRegistry lock contention (issue #122)
                 .keepAliveTime(300, TimeUnit.SECONDS)
                 .keepAliveTimeout(20, TimeUnit.SECONDS)
                 .keepAliveWithoutCalls(false)

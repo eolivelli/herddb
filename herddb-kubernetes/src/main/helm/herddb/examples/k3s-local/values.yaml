@@ -148,7 +148,10 @@ indexingService:
   # ~25s/query. 9 g allows more segments resident in memory simultaneously,
   # which should significantly reduce query latency.
   # 9 g heap + 1 GiB JVM overhead → 10 GiB container memory.
-  javaOpts: "-Xms9g -Xmx9g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector"
+  # Netty memory tuning: io.netty.maxDirectMemory=0 respects -XX:MaxDirectMemorySize cap
+  # instead of defaulting to heap size; 512m cap is sufficient for gRPC messages.
+  # numDirectArenas=16 spreads Netty allocations to reduce lock contention (issue #122).
+  javaOpts: "-Xms9g -Xmx9g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=512m -Dio.netty.allocator.numDirectArenas=16"
   storage:
     data:
       size: 5Gi
