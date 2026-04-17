@@ -700,7 +700,34 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // Initialize global shared page cache for lazy-loaded segments
         // If segmentPageCacheMaxBytes is 0, use the default (1/4 of JVM heap)
         long cacheBytes = segmentPageCacheMaxBytes > 0 ? segmentPageCacheMaxBytes : SharedSegmentPageCache.DEFAULT_MAX_BYTES;
-        this.segmentPageCache = new SharedSegmentPageCache(cacheBytes);
+        this.segmentPageCache = new SharedSegmentPageCache(cacheBytes, this::loadGraphChunkPage);
+    }
+
+    /**
+     * {@link SharedSegmentPageCache.PageLoader} implementation used for all
+     * {@link #TYPE_VECTOR_GRAPHCHUNK} pages written by this store's segments.
+     * The cache guarantees single-flight loading across concurrent segment
+     * readers that miss on the same {@code pageId}.
+     */
+    private byte[] loadGraphChunkPage(SharedSegmentPageCache.PageKey key)
+            throws DataStorageManagerException {
+        // DSM.readIndexPage() wraps any IOException from the reader lambda
+        // into DataStorageManagerException (see e.g. MemoryDataStorageManager /
+        // FileDataStorageManager), so we only need the one checked throws here.
+        return dataStorageManager.readIndexPage(
+                key.tableSpaceUUID(), key.indexUUID(), key.pageId(),
+                in -> {
+                    int type = in.readVInt();
+                    if (type != TYPE_VECTOR_GRAPHCHUNK) {
+                        throw new java.io.IOException(
+                                "page " + key.pageId() + ": expected type "
+                                        + TYPE_VECTOR_GRAPHCHUNK + " but got " + type);
+                    }
+                    int len = in.readVInt();
+                    byte[] data = new byte[len];
+                    in.readArray(len, data);
+                    return data;
+                });
     }
 
     // -------------------------------------------------------------------------
@@ -4055,6 +4082,101 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public void setSegmentSizeStats(OpStatsLogger segmentSizeStats) {
         this.segmentSizeStats = segmentSizeStats;
+    }
+
+    // -------------------------------------------------------------------------
+    // Cache stats accessors — used by IndexingServiceEngine to register
+    // per-index gauges for the shared segment page cache and the aggregated
+    // per-segment page-reader caches.
+    // -------------------------------------------------------------------------
+
+    public long getSegmentPageCacheHitCount() {
+        return segmentPageCache == null ? 0L : segmentPageCache.hitCount();
+    }
+
+    public long getSegmentPageCacheMissCount() {
+        return segmentPageCache == null ? 0L : segmentPageCache.missCount();
+    }
+
+    public long getSegmentPageCacheEvictionCount() {
+        return segmentPageCache == null ? 0L : segmentPageCache.evictionCount();
+    }
+
+    public long getSegmentPageCacheLoadSuccessCount() {
+        return segmentPageCache == null ? 0L : segmentPageCache.loadSuccessCount();
+    }
+
+    public long getSegmentPageCacheLoadFailureCount() {
+        return segmentPageCache == null ? 0L : segmentPageCache.loadFailureCount();
+    }
+
+    public long getSegmentPageCacheLoadTimeNanos() {
+        return segmentPageCache == null ? 0L : segmentPageCache.totalLoadTimeNanos();
+    }
+
+    public long getSegmentPageCacheEntries() {
+        return segmentPageCache == null ? 0L : segmentPageCache.estimatedSize();
+    }
+
+    public long getSegmentPageCacheSizeBytes() {
+        return segmentPageCache == null ? 0L : segmentPageCache.weightedSize();
+    }
+
+    public long getSegmentPageCacheMaxBytes() {
+        return segmentPageCache == null ? 0L : segmentPageCache.maxBytes();
+    }
+
+    /**
+     * Aggregates per-segment {@link PageStoreReader.Supplier} Caffeine stats across all
+     * currently-loaded segments that use page-based readers (the remote multipart path
+     * contributes zero). Each call walks the segment list once; values are totals since
+     * the segments were loaded.
+     */
+    private long aggregatePageReaderStats(
+            java.util.function.ToLongFunction<com.github.benmanes.caffeine.cache.stats.CacheStats> extract) {
+        long total = 0L;
+        for (VectorSegment seg : segments) {
+            io.github.jbellis.jvector.disk.ReaderSupplier rs = seg.onDiskReaderSupplier;
+            if (rs instanceof PageStoreReader.Supplier) {
+                total += extract.applyAsLong(((PageStoreReader.Supplier) rs).snapshot());
+            }
+        }
+        return total;
+    }
+
+    public long getPageReaderCacheHitCount() {
+        return aggregatePageReaderStats(com.github.benmanes.caffeine.cache.stats.CacheStats::hitCount);
+    }
+
+    public long getPageReaderCacheMissCount() {
+        return aggregatePageReaderStats(com.github.benmanes.caffeine.cache.stats.CacheStats::missCount);
+    }
+
+    public long getPageReaderCacheEvictionCount() {
+        return aggregatePageReaderStats(com.github.benmanes.caffeine.cache.stats.CacheStats::evictionCount);
+    }
+
+    public long getPageReaderCacheLoadSuccessCount() {
+        return aggregatePageReaderStats(com.github.benmanes.caffeine.cache.stats.CacheStats::loadSuccessCount);
+    }
+
+    public long getPageReaderCacheLoadFailureCount() {
+        return aggregatePageReaderStats(com.github.benmanes.caffeine.cache.stats.CacheStats::loadFailureCount);
+    }
+
+    public long getPageReaderCacheLoadTimeNanos() {
+        return aggregatePageReaderStats(com.github.benmanes.caffeine.cache.stats.CacheStats::totalLoadTime);
+    }
+
+    public long getPageReaderCacheEntries() {
+        long total = 0L;
+        for (VectorSegment seg : segments) {
+            io.github.jbellis.jvector.disk.ReaderSupplier rs = seg.onDiskReaderSupplier;
+            if (rs instanceof PageStoreReader.Supplier) {
+                total += ((PageStoreReader.Supplier) rs).getCachedPages();
+            }
+        }
+        return total;
     }
 
     private void recordSegmentSizeDistribution() {

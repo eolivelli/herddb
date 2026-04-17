@@ -19,33 +19,35 @@
 
 package herddb.index.vector;
 
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.CompletionException;
 
 /**
  * A {@link RandomAccessReader} that reads a logical byte stream assembled from
  * index pages stored in a {@link DataStorageManager}. This is the non-mmap
  * alternative to {@link SegmentedMappedReader} — the graph data is <em>not</em>
  * kept as a resident temp file on disk, and the memory footprint is explicitly
- * bounded by a small LRU page cache.
+ * bounded by a small Caffeine LRU page cache.
  *
  * <p>Rationale: mmapped regions are not counted against the process heap, so
  * holding an mmap reader per loaded vector-store segment can silently explode
  * resident memory at scale. This reader uses on-demand page fetches plus a
- * bounded LRU of decoded page bytes, so the cost is both observable and
- * configurable.
+ * bounded Caffeine LRU of decoded page bytes, so the cost is both observable
+ * and configurable.
  *
  * <p>Thread-safety: each {@code PageStoreReader} instance has its own mutable
  * position and is <em>not</em> safe for concurrent use. Multiple readers
- * obtained from the same {@link Supplier} share a single cache that is
- * internally synchronised.
+ * obtained from the same {@link Supplier} share a single {@link LoadingCache}
+ * that is lock-free on the read path and deduplicates concurrent misses on
+ * the same page.
  */
 final class PageStoreReader implements RandomAccessReader {
 
@@ -187,8 +189,8 @@ final class PageStoreReader implements RandomAccessReader {
 
     /**
      * Shared state used by all readers for one logical file. Holds the
-     * page-id list, the prefix-sum table of page sizes, and a bounded LRU
-     * cache of decoded page bytes.
+     * page-id list, the prefix-sum table of page sizes, and a bounded Caffeine
+     * {@link LoadingCache} of decoded page bytes.
      */
     static final class PageSource {
 
@@ -202,12 +204,8 @@ final class PageStoreReader implements RandomAccessReader {
         final long[] prefixSum;
         final long totalLength;
         private final int maxCachedPages;
-        private final LinkedHashMap<Integer, byte[]> cache;
+        private final LoadingCache<Integer, byte[]> cache;
         private final SharedSegmentPageCache sharedCache;
-        /** Observability: number of page loads that hit the cache. */
-        final AtomicLong cacheHits = new AtomicLong(0);
-        /** Observability: number of page loads that missed and read from the page store. */
-        final AtomicLong cacheMisses = new AtomicLong(0);
 
         /**
          * Builds the PageSource with lazy loading. Page sizes must be provided up-front
@@ -218,7 +216,8 @@ final class PageStoreReader implements RandomAccessReader {
          * @param pageSizes payload size (in bytes) for each page, pre-computed at write time
          * @param expectedChunkType type tag to validate when reading pages
          * @param maxCachedPages per-segment LRU page cache size
-         * @param sharedCache optional global page cache; if non-null, pages are stored here first
+         * @param sharedCache optional global page cache; if non-null, pages are
+         *        fetched through it so concurrent segment readers dedup DSM reads
          */
         PageSource(DataStorageManager dsm, String tableSpace, String indexName,
                    long[] pageIds, int[] pageSizes, int expectedChunkType, int maxCachedPages,
@@ -232,12 +231,10 @@ final class PageStoreReader implements RandomAccessReader {
             this.sharedCache = sharedCache;
             this.prefixSum = new long[pageIds.length + 1];
             this.maxCachedPages = Math.max(1, maxCachedPages);
-            this.cache = new LinkedHashMap<Integer, byte[]>(maxCachedPages + 1, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<Integer, byte[]> eldest) {
-                    return size() > PageSource.this.maxCachedPages;
-                }
-            };
+            this.cache = Caffeine.newBuilder()
+                    .maximumSize(this.maxCachedPages)
+                    .recordStats()
+                    .build(this::loadPageViaStorage);
 
             // Build prefix-sum table from pre-computed page sizes (no I/O).
             // Pages are fetched lazily in loadPage() only when accessed during search.
@@ -275,48 +272,38 @@ final class PageStoreReader implements RandomAccessReader {
         }
 
         byte[] loadPage(int pageIndex) {
-            long pageId = pageIds[pageIndex];
-
-            // Check per-segment LRU first
-            byte[] page;
-            synchronized (cache) {
-                page = cache.get(pageIndex);
-                if (page != null) {
-                    cacheHits.incrementAndGet();
-                    return page;
-                }
-            }
-
-            // Check shared global cache (if enabled)
-            if (sharedCache != null) {
-                page = sharedCache.get(pageId);
-                if (page != null) {
-                    // Store in per-segment LRU too for locality
-                    synchronized (cache) {
-                        cache.put(pageIndex, page);
-                        cacheHits.incrementAndGet();
-                    }
-                    return page;
-                }
-            }
-
-            // Cache miss: fetch from storage
             try {
-                page = readPayload(pageId, expectedChunkType);
-            } catch (IOException | DataStorageManagerException e) {
-                throw new RuntimeException(
+                return cache.get(pageIndex);
+            } catch (CompletionException ce) {
+                Throwable cause = ce.getCause() != null ? ce.getCause() : ce;
+                if (cause instanceof RuntimeException) {
+                    throw (RuntimeException) cause;
+                }
+                if (cause instanceof Error) {
+                    throw (Error) cause;
+                }
+                throw new RuntimeException("failed to load page index " + pageIndex
+                        + " for index " + indexName, cause);
+            }
+        }
+
+        /**
+         * Caffeine CacheLoader body. Either delegates to the shared cache (which has
+         * its own LoadingCache and dedups across segments) or falls back to a direct
+         * DSM read.
+         */
+        private byte[] loadPageViaStorage(Integer pageIndex) throws DataStorageManagerException {
+            long pageId = pageIds[pageIndex];
+            if (sharedCache != null && sharedCache.isActive()) {
+                return sharedCache.load(
+                        new SharedSegmentPageCache.PageKey(tableSpace, indexName, pageId));
+            }
+            try {
+                return readPayload(pageId, expectedChunkType);
+            } catch (IOException e) {
+                throw new DataStorageManagerException(
                         "failed to read page " + pageId + " for index " + indexName, e);
             }
-
-            // Store in both caches
-            synchronized (cache) {
-                cache.put(pageIndex, page);
-                cacheMisses.incrementAndGet();
-            }
-            if (sharedCache != null) {
-                sharedCache.put(pageId, page);
-            }
-            return page;
         }
 
         private byte[] readPayload(long pageId, int expectedType)
@@ -337,15 +324,24 @@ final class PageStoreReader implements RandomAccessReader {
         }
 
         int cachedPages() {
-            synchronized (cache) {
-                return cache.size();
-            }
+            // Caffeine counts may lag on pending writes; force cleanup for tests.
+            cache.cleanUp();
+            return (int) cache.estimatedSize();
+        }
+
+        CacheStats stats() {
+            return cache.stats();
+        }
+
+        void clearCache() {
+            cache.invalidateAll();
+            cache.cleanUp();
         }
     }
 
     /**
      * A {@link ReaderSupplier} backed by a single shared {@link PageSource}.
-     * All returned readers share the LRU page cache but each has its own
+     * All returned readers share the Caffeine cache but each has its own
      * {@code position}, so concurrent search traffic on one segment does not
      * multiply the cached footprint.
      */
@@ -369,25 +365,40 @@ final class PageStoreReader implements RandomAccessReader {
         @Override
         public void close() {
             // Drop cached pages to free memory promptly
-            synchronized (source.cache) {
-                source.cache.clear();
-            }
-            // Also invalidate entries from shared cache
+            source.clearCache();
+            // Also invalidate entries from shared cache, so a subsequent segment
+            // load does not reuse stale bytes after an index has been dropped.
             if (source.sharedCache != null) {
                 for (long pageId : source.pageIds) {
-                    source.sharedCache.invalidate(pageId);
+                    source.sharedCache.invalidate(new SharedSegmentPageCache.PageKey(
+                            source.tableSpace, source.indexName, pageId));
                 }
             }
         }
 
         /** Visible for tests. */
         long getCacheHits() {
-            return source.cacheHits.get();
+            return source.stats().hitCount();
         }
 
         /** Visible for tests. */
         long getCacheMisses() {
-            return source.cacheMisses.get();
+            return source.stats().missCount();
+        }
+
+        /** Visible for tests. */
+        long getCacheLoadSuccess() {
+            return source.stats().loadSuccessCount();
+        }
+
+        /** Visible for tests. */
+        long getCacheLoadFailure() {
+            return source.stats().loadFailureCount();
+        }
+
+        /** Visible for tests. */
+        long getCacheLoadTimeNanos() {
+            return source.stats().totalLoadTime();
         }
 
         /** Visible for tests. */
@@ -398,6 +409,11 @@ final class PageStoreReader implements RandomAccessReader {
         /** Visible for tests. */
         long getTotalLength() {
             return source.totalLength;
+        }
+
+        /** Snapshot of Caffeine stats for metrics publishing. */
+        CacheStats snapshot() {
+            return source.stats();
         }
     }
 }
