@@ -62,6 +62,7 @@ import java.io.IOError;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.channels.FileChannel;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -1025,13 +1026,17 @@ public class FileDataStorageManager extends DataStorageManager {
     // Multipart large-file support (FusedPQ graphs, map data, etc.)
     // -------------------------------------------------------------------------
 
-    /** Default block size for multipart files on local filesystem (4 MiB). */
+    /**
+     * Default block size for multipart files on local filesystem (256 MiB).
+     * Big blocks keep the per-block fsync / rename overhead low and
+     * limit directory-entry churn for large vector-index artefacts.
+     */
     public static final int DEFAULT_MULTIPART_BLOCK_SIZE =
-            SystemProperties.getIntSystemProperty("herddb.file.multipart.blocksize", 4 * 1024 * 1024);
+            SystemProperties.getIntSystemProperty("herddb.file.multipart.blocksize", 256 * 1024 * 1024);
 
     private int multipartBlockSize = DEFAULT_MULTIPART_BLOCK_SIZE;
 
-    /** Visible for tests only — lets a test exercise multi-block behaviour without writing megabytes. */
+    /** Visible for tests only — lets a test exercise multi-block behaviour without writing hundreds of MB. */
     void setMultipartBlockSizeForTests(int blockSize) {
         if (blockSize <= 0) {
             throw new IllegalArgumentException("blockSize must be > 0");
@@ -1059,45 +1064,44 @@ public class FileDataStorageManager extends DataStorageManager {
         }
         Files.createDirectories(dir);
 
-        long totalBytes = 0L;
         int blockSize = multipartBlockSize;
-        byte[] buf = new byte[blockSize];
+        long totalBytes = 0L;
         int blockIndex = 0;
-        try (InputStream in = Files.newInputStream(tempFile, StandardOpenOption.READ)) {
-            while (true) {
-                int filled = 0;
-                while (filled < buf.length) {
-                    int n = in.read(buf, filled, buf.length - filled);
-                    if (n < 0) {
-                        break;
-                    }
-                    filled += n;
-                }
-                if (filled == 0) {
-                    break;
-                }
+        try (FileChannel src = FileChannel.open(tempFile, StandardOpenOption.READ)) {
+            long remaining = src.size();
+            long srcPosition = 0L;
+            while (srcPosition < remaining) {
+                long blockLen = Math.min((long) blockSize, remaining - srcPosition);
                 Path blockFile = dir.resolve(blockFileName(blockIndex));
                 Path blockTmp = dir.resolve(blockFileName(blockIndex) + ".tmp");
-                try (ManagedFile file = ManagedFile.open(blockTmp, requirefsync,
-                        StandardOpenOption.WRITE, StandardOpenOption.CREATE,
-                        StandardOpenOption.TRUNCATE_EXISTING);
-                     OutputStream out = file.getOutputStream()) {
-                    out.write(buf, 0, filled);
-                    out.flush();
+                try (FileChannel dst = FileChannel.open(blockTmp,
+                        StandardOpenOption.WRITE,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING)) {
+                    // transferTo is allowed to move fewer bytes than requested on a
+                    // single call, so loop until the full block has been copied.
+                    long written = 0L;
+                    while (written < blockLen) {
+                        long n = src.transferTo(srcPosition + written, blockLen - written, dst);
+                        if (n <= 0) {
+                            throw new IOException(
+                                    "transferTo stalled at offset " + (srcPosition + written)
+                                            + " while writing " + blockFile);
+                        }
+                        written += n;
+                    }
                     if (requirefsync) {
-                        file.sync();
+                        dst.force(false);
                     }
                 }
                 Files.move(blockTmp, blockFile,
                         StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-                if (progress != null && filled > 0) {
-                    progress.accept(filled);
+                if (progress != null && blockLen > 0) {
+                    progress.accept(blockLen);
                 }
-                totalBytes += filled;
+                srcPosition += blockLen;
+                totalBytes += blockLen;
                 blockIndex++;
-                if (filled < buf.length) {
-                    break;
-                }
             }
         }
         // Per-block fsync above already forces block bytes to disk; directory fsync is a
@@ -1128,8 +1132,10 @@ public class FileDataStorageManager extends DataStorageManager {
                 if (firstBlockSize > 0 && firstBlockSize <= Integer.MAX_VALUE) {
                     blockSize = (int) firstBlockSize;
                 }
-            } catch (IOException ignored) {
-                // fall back to the configured block size
+            } catch (IOException err) {
+                LOGGER.log(Level.WARNING,
+                        "Failed to probe block size for " + firstBlock
+                                + ", falling back to configured default " + blockSize, err);
             }
         }
         return new BlockDirReaderSupplier(dir, fileSize, blockSize);
