@@ -539,7 +539,7 @@ Persists log entries to Apache BookKeeper ledgers in a distributed cluster.
 | Aspect | Behaviour |
 |--------|-----------|
 | `getLastSequenceNumber()` | Returns `(currentLedgerId, currentEntryId)` from the active BK ledger |
-| `dropOldLedgers(lsn)` | Calls `BookKeeper.deleteLedger()` for ledgers with `ledgerId < lsn.ledgerId` |
+| `dropOldLedgers(lsn)` | Calls `BookKeeper.deleteLedger()` for ledgers with `ledgerId < lsn.ledgerId` **and** older than the wall-clock retention period (`server.bookkeeper.ledgers.retention.period`). Both conditions must hold: the LSN floor guarantees replay from the last checkpoint is always possible, the retention gives external tailers a minimum time budget to catch up. |
 | Ledger rotation | A new BK ledger is created on fencing (leadership change) or explicit rotation |
 | Recovery | Reads all ledger entries from the stored first-ledger ID through the last written entry |
 | Checkpoint role | Enables deletion of old BK ledgers, freeing storage quota in the BK cluster |

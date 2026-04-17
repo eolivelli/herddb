@@ -559,6 +559,150 @@ public class BookKeeperCommitLogTest {
         return result;
     }
 
+    /**
+     * Regression test for issue #146.
+     *
+     * <p>{@code dropOldLedgers} must never delete ledgers whose id is at or
+     * after the last successful checkpoint LSN, no matter how aggressive
+     * wall-clock retention is. Before the fix, the method ignored
+     * {@code lastCheckPointSequenceNumber} entirely and deleted every ledger
+     * past time-based retention, leaving the server (and any tailer) unable
+     * to recover.
+     */
+    @Test
+    public void testDropOldLedgersHonorsCheckpointLsn() throws Exception {
+        final String tableSpaceUUID = UUID.randomUUID().toString();
+        final String name = TableSpace.DEFAULT;
+        final String nodeid = "nodeid";
+        ServerConfiguration serverConfiguration = newServerConfigurationWithAutoPort();
+        try (ZookeeperMetadataStorageManager man = new ZookeeperMetadataStorageManager(testEnv.getAddress(),
+                testEnv.getTimeout(), testEnv.getPath());
+                BookkeeperCommitLogManager logManager = new BookkeeperCommitLogManager(man, serverConfiguration, NullStatsLogger.INSTANCE)) {
+            // tiny retention so every ledger we backdate is considered "old"
+            logManager.setLedgersRetentionPeriod(1);
+            man.start();
+            logManager.start();
+
+            LogSequenceNumber checkpointLsn;
+            try (BookkeeperCommitLog writer = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
+                writer.startWriting(1);
+                // Produce several ledgers. The BK writer auto-rolls on each sync
+                // write in this test setup (small ledger handle), so a handful
+                // of log calls plus explicit rolls is enough to guarantee at
+                // least 4 distinct ledgers.
+                writer.log(LogEntryFactory.beginTransaction(1), true).getLogSequenceNumber();
+                writer.rollNewLedger();
+                writer.log(LogEntryFactory.beginTransaction(2), true).getLogSequenceNumber();
+                writer.rollNewLedger();
+                writer.log(LogEntryFactory.beginTransaction(3), true).getLogSequenceNumber();
+                writer.rollNewLedger();
+                writer.log(LogEntryFactory.beginTransaction(4), true).getLogSequenceNumber();
+
+                List<Long> ledgerIds = new ArrayList<>(writer.getActualLedgersList().getActiveLedgers());
+                assertTrue("expected at least four ledgers to exist, got " + ledgerIds,
+                        ledgerIds.size() >= 4);
+                // Pick a checkpoint ledger somewhere in the middle, so some
+                // ledgers are below the checkpoint (safe to drop) and some are
+                // at-or-after (must be kept).
+                long checkpointLedger = ledgerIds.get(ledgerIds.size() / 2);
+                checkpointLsn = new LogSequenceNumber(checkpointLedger, 0);
+                List<Long> below = new ArrayList<>();
+                List<Long> atOrAfter = new ArrayList<>();
+                for (Long id : ledgerIds) {
+                    if (id < checkpointLedger) {
+                        below.add(id);
+                    } else {
+                        atOrAfter.add(id);
+                    }
+                }
+                assertFalse("need at least one ledger below the checkpoint LSN", below.isEmpty());
+                assertFalse("need at least one ledger at or after the checkpoint LSN", atOrAfter.isEmpty());
+
+                // Backdate all timestamps so every ledger looks old enough to
+                // expire. Without this, freshly-created ledgers have current
+                // timestamps and the time filter keeps them regardless of LSN.
+                LedgersInfo info = writer.getActualLedgersList();
+                List<Long> backdated = new ArrayList<>();
+                for (int i = 0; i < ledgerIds.size(); i++) {
+                    backdated.add(0L);
+                }
+                info.setLedgersTimestamps(backdated);
+                man.saveActualLedgersList(tableSpaceUUID, info);
+
+                writer.dropOldLedgers(checkpointLsn);
+
+                List<Long> remaining = writer.getActualLedgersList().getActiveLedgers();
+                for (Long id : below) {
+                    assertFalse("ledger " + id + " (below checkpoint " + checkpointLedger
+                                    + ") must be dropped, remaining=" + remaining,
+                            remaining.contains(id));
+                }
+                for (Long id : atOrAfter) {
+                    assertTrue("ledger " + id + " (at or after checkpoint " + checkpointLedger
+                                    + ") must be kept, remaining=" + remaining,
+                            remaining.contains(id));
+                }
+
+                // ZK view must match what the writer sees.
+                List<Long> fromZk = man.getActualLedgersList(tableSpaceUUID).getActiveLedgers();
+                assertEquals(remaining, fromZk);
+            }
+
+            // Recovery from the checkpoint LSN must succeed using the ledgers
+            // that were kept (i.e. the core correctness property this bug
+            // broke: replay from the last checkpoint).
+            try (BookkeeperCommitLog reader = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
+                reader.recovery(checkpointLsn, (lsn, entry) -> { }, false);
+            }
+        }
+    }
+
+    /**
+     * Without any successful checkpoint yet ({@code START_OF_TIME}), the entire
+     * log is still needed for recovery; {@code dropOldLedgers} must keep all
+     * active ledgers regardless of retention. Regression test for issue #146.
+     */
+    @Test
+    public void testDropOldLedgersKeepsAllWhenNoCheckpoint() throws Exception {
+        final String tableSpaceUUID = UUID.randomUUID().toString();
+        final String name = TableSpace.DEFAULT;
+        final String nodeid = "nodeid";
+        ServerConfiguration serverConfiguration = newServerConfigurationWithAutoPort();
+        try (ZookeeperMetadataStorageManager man = new ZookeeperMetadataStorageManager(testEnv.getAddress(),
+                testEnv.getTimeout(), testEnv.getPath());
+                BookkeeperCommitLogManager logManager = new BookkeeperCommitLogManager(man, serverConfiguration, NullStatsLogger.INSTANCE)) {
+            logManager.setLedgersRetentionPeriod(1);
+            man.start();
+            logManager.start();
+
+            try (BookkeeperCommitLog writer = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
+                writer.startWriting(1);
+                writer.log(LogEntryFactory.beginTransaction(1), true).getLogSequenceNumber();
+                writer.rollNewLedger();
+                writer.log(LogEntryFactory.beginTransaction(2), true).getLogSequenceNumber();
+                writer.rollNewLedger();
+                writer.log(LogEntryFactory.beginTransaction(3), true).getLogSequenceNumber();
+
+                List<Long> before = new ArrayList<>(writer.getActualLedgersList().getActiveLedgers());
+                assertTrue("expected at least three ledgers, got " + before, before.size() >= 3);
+
+                LedgersInfo info = writer.getActualLedgersList();
+                List<Long> backdated = new ArrayList<>();
+                for (int i = 0; i < before.size(); i++) {
+                    backdated.add(0L);
+                }
+                info.setLedgersTimestamps(backdated);
+                man.saveActualLedgersList(tableSpaceUUID, info);
+
+                writer.dropOldLedgers(LogSequenceNumber.START_OF_TIME);
+
+                List<Long> after = writer.getActualLedgersList().getActiveLedgers();
+                assertEquals("no ledgers may be dropped before any checkpoint has happened",
+                        before, after);
+            }
+        }
+    }
+
     @Test
     public void testFollowEmptyLedgerBookieDown() throws Exception {
         BookieId secondBookie = testEnv.startNewBookie();
