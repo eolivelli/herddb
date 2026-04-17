@@ -77,6 +77,11 @@ spec:
             - name: server-config
               mountPath: /opt/herddb/conf/server.properties
               subPath: server.properties
+            {{- if .Values.server.loggingProperties }}
+            - name: server-config
+              mountPath: /opt/herddb/conf/logging.properties
+              subPath: logging.properties
+            {{- end }}
             - name: data
               mountPath: /opt/herddb/data
             - name: commitlog

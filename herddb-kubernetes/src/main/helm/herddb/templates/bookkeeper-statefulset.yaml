@@ -76,6 +76,11 @@ spec:
             - name: bookkeeper-config
               mountPath: /opt/herddb/conf/bookie.properties
               subPath: bookie.properties
+            {{- if .Values.bookkeeper.loggingProperties }}
+            - name: bookkeeper-config
+              mountPath: /opt/herddb/conf/logging.properties
+              subPath: logging.properties
+            {{- end }}
             - name: journal
               mountPath: /opt/herddb/bookie-data/journal
             - name: ledger

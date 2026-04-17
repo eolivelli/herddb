@@ -12,4 +12,8 @@ data:
     dataDir=/opt/herddb/zk-data
     clientPort={{ .Values.zookeeper.clientPort }}
     http.port={{ .Values.zookeeper.metricsPort }}
+{{- if .Values.zookeeper.loggingProperties }}
+  logging.properties: |
+{{ .Values.zookeeper.loggingProperties | indent 4 }}
+{{- end }}
 {{- end }}

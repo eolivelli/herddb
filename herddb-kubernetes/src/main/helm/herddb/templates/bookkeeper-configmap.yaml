@@ -19,4 +19,8 @@ data:
 {{- range $k, $v := .Values.bookkeeper.extraConfig }}
     {{ $k }}={{ $v }}
 {{- end }}
+{{- if .Values.bookkeeper.loggingProperties }}
+  logging.properties: |
+{{ .Values.bookkeeper.loggingProperties | indent 4 }}
+{{- end }}
 {{- end }}

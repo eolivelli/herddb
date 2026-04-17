@@ -51,4 +51,8 @@ data:
     {{- range $k, $v := .Values.fileServer.extraConfig }}
     {{ $k }}={{ $v }}
     {{- end }}
+{{- if .Values.fileServer.loggingProperties }}
+  logging.properties: |
+{{ .Values.fileServer.loggingProperties | indent 4 }}
+{{- end }}
 {{- end }}
