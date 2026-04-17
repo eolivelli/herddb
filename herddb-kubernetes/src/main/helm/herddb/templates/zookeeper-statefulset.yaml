@@ -61,6 +61,11 @@ spec:
             - name: zookeeper-config
               mountPath: /opt/herddb/conf/zoo.cfg
               subPath: zoo.cfg
+            {{- if .Values.zookeeper.loggingProperties }}
+            - name: zookeeper-config
+              mountPath: /opt/herddb/conf/logging.properties
+              subPath: logging.properties
+            {{- end }}
             - name: data
               mountPath: /opt/herddb/zk-data
       volumes:

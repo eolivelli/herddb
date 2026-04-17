@@ -31,3 +31,7 @@ data:
     {{- range $k, $v := .Values.server.extraConfig }}
     {{ $k }}={{ $v }}
     {{- end }}
+{{- if .Values.server.loggingProperties }}
+  logging.properties: |
+{{ .Values.server.loggingProperties | indent 4 }}
+{{- end }}

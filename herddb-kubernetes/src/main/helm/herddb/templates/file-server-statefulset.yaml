@@ -42,6 +42,9 @@ spec:
               cp /opt/herddb/conf-ro/fileserver.properties /opt/herddb/conf/fileserver.properties
               echo "s3.access.key=${S3_ACCESS_KEY}" >> /opt/herddb/conf/fileserver.properties
               echo "s3.secret.key=${S3_SECRET_KEY}" >> /opt/herddb/conf/fileserver.properties
+              {{- if .Values.fileServer.loggingProperties }}
+              cp /opt/herddb/conf-ro/logging.properties /opt/herddb/conf/logging.properties
+              {{- end }}
               {{- end }}
               exec /opt/herddb/bin/service file-server console \
                 /opt/herddb/conf/fileserver.properties \
@@ -55,6 +58,9 @@ spec:
               cp /opt/herddb/conf-ro/fileserver.properties /opt/herddb/conf/fileserver.properties
               echo "s3.access.key=${S3_ACCESS_KEY}" >> /opt/herddb/conf/fileserver.properties
               echo "s3.secret.key=${S3_SECRET_KEY}" >> /opt/herddb/conf/fileserver.properties
+              {{- if .Values.fileServer.loggingProperties }}
+              cp /opt/herddb/conf-ro/logging.properties /opt/herddb/conf/logging.properties
+              {{- end }}
               exec /opt/herddb/bin/service file-server console \
                 /opt/herddb/conf/fileserver.properties \
                 --port={{ .Values.fileServer.port }} \

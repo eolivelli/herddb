@@ -27,6 +27,12 @@ server:
   httpPort: 9845
   # JVM options (overrides default JAVA_OPTS from setenv.sh)
   javaOpts: ""
+  # Optional: override /opt/herddb/conf/logging.properties inside the pod.
+  # Empty string = use the logging.properties bundled in the Docker image.
+  # Paste the full file content as a multiline YAML string to override without
+  # rebuilding the image. The ConfigMap checksum annotation ensures a rolling
+  # restart when this value changes.
+  loggingProperties: ""
   # Extra key=value entries appended to server.properties
   extraConfig: {}
   storage:
@@ -50,6 +56,10 @@ fileServer:
   port: 9846
   httpPort: 9847
   javaOpts: ""
+  # Optional: override /opt/herddb/conf/logging.properties inside the pod.
+  # Empty string = use the logging.properties bundled in the Docker image
+  # (or JUL built-in defaults when the whole conf dir is ConfigMap-mounted).
+  loggingProperties: ""
   # Storage backend: "local" (default) or "s3"
   storageMode: local
   # S3 / MinIO configuration (used when storageMode=s3)
@@ -111,6 +121,9 @@ zookeeper:
   clientPort: 2181
   metricsPort: 7070
   javaOpts: ""
+  # Optional: override /opt/herddb/conf/logging.properties inside the pod.
+  # Empty string = use the logging.properties bundled in the Docker image.
+  loggingProperties: ""
   storage:
     size: 2Gi
     storageClass: ""
@@ -129,6 +142,9 @@ bookkeeper:
   bookiePort: 3181
   httpPort: 8000
   javaOpts: ""
+  # Optional: override /opt/herddb/conf/logging.properties inside the pod.
+  # Empty string = use the logging.properties bundled in the Docker image.
+  loggingProperties: ""
   storage:
     journal:
       size: 2Gi
@@ -155,6 +171,10 @@ indexingService:
   # Storage mode: "file" (local), "memory" (testing), or "remote" (remote file server via ZK)
   storageMode: file
   javaOpts: ""
+  # Optional: override /opt/herddb/conf/logging.properties inside the pod.
+  # Empty string = use the logging.properties bundled in the Docker image
+  # (or JUL built-in defaults when the whole conf dir is ConfigMap-mounted).
+  loggingProperties: ""
   storage:
     data:
       size: 10Gi

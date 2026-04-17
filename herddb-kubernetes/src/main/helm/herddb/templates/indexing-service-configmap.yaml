@@ -22,4 +22,8 @@ data:
     indexing.log.type=bookkeeper
     server.bookkeeper.ledgers.path=/ledgers
     {{- end }}
+{{- if .Values.indexingService.loggingProperties }}
+  logging.properties: |
+{{ .Values.indexingService.loggingProperties | indent 4 }}
+{{- end }}
 {{- end }}
