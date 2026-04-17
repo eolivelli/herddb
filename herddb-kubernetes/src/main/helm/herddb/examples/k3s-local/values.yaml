@@ -52,7 +52,7 @@ server:
   # -Dio.netty.maxDirectMemory=0 tells Netty to respect -XX:MaxDirectMemorySize
   # (defaults to -Xmx) rather than doubling it, preventing RSS from exceeding
   # the container limit under heavy gRPC traffic.
-  javaOpts: "-Xms20g -Xmx20g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0"
+  javaOpts: "-Xms20g -Xmx20g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
   storage:
     data:
       size: 5Gi
@@ -60,12 +60,26 @@ server:
       size: 2Gi
   extraConfig:
     indexing.service.timeout: "300"
+    # --- BookKeeper commit-log tuning (experiment for issues #141 / #145) ---
+    # Default max ledger size is 1 GiB (BookkeeperCommitLog.maxLedgerSizeBytes,
+    # defaulted from ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_MAX_SIZE).
+    # At bigann's ~200 B/entry that is ~5–7 M INSERTs per ledger, so by the
+    # time the scheduled checkpoint fires (~15 min) the cluster has a handful
+    # of fat ledgers pinned on the single bookie. Force more frequent
+    # rollovers so each ledger is smaller and can be dropped sooner.
+    server.bookkeeper.ledgers.max.size: "134217728"            # 128 MiB
+    # Default retention is 2 days (1000*60*60*24*2 ms). On a 30-min bench
+    # that's "never" — closed ledgers pile up on the bookie's ledgers PVC
+    # and keep per-ledger state alive in the bookie's memtable/file-handle
+    # caches. 5 min is enough to let a checkpoint durably capture the LSN
+    # before cleanup and lets dropOldLedgers actually prune between checkpoints.
+    server.bookkeeper.ledgers.retention.period: "300000"       # 5 min (ms)
   resources:
     requests:
-      memory: "21Gi"
+      memory: "23Gi"
       cpu: "2"
     limits:
-      memory: "21Gi"
+      memory: "23Gi"
       cpu: "2"
 
 fileServer:
@@ -81,7 +95,7 @@ fileServer:
   # Previously -Xmx4g with no MaxDirectMemorySize cap caused OOMKill when the IS
   # loaded 100+ HNSW segments concurrently (heap 4 g + direct up to 4 g > 5 GiB
   # limit; see issue #126).
-  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0"
+  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=3g"
   # S3 endpoint, bucket, and credentials are auto-wired from the
   # minio section below.
   s3:
@@ -122,7 +136,7 @@ minio:
 
 zookeeper:
   enabled: true
-  javaOpts: "-Xms512m -Xmx512m -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms512m -Xmx512m -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=512m"
   storage:
     size: 2Gi
   resources:
@@ -136,20 +150,27 @@ zookeeper:
 bookkeeper:
   enabled: true
   replicaCount: 1
-  javaOpts: "-Xms512m -Xmx512m -Djava.net.preferIPv4Stack=true"
-  extraConfig:
-    journalWriteData: "false"
+  # Heap raised to 2 g (from 512 m): 38 k ops/s from 8 ingest threads caused
+  # frequent GC pauses on 512 m heap, making the bookie temporarily unavailable.
+  # 2 g + 1 GiB JVM overhead → 3 GiB container memory.
+  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
+  # Journal PVC raised to 100 Gi (from 1 Gi) for long-running bigann ingests:
+  # the 2026-04-17 bigann 100M run saw the ledger PVC hit 16 GB by 27% progress,
+  # so the journal also needs significant headroom for in-flight writes and
+  # journal rotation during sustained ingest. journalWriteData was previously
+  # set to "false" to reduce journal I/O; removed here so the bookie journals
+  # payload data (safer durability, and we have plenty of PVC headroom).
   storage:
     journal:
-      size: 1Gi
+      size: 100Gi
     ledger:
       size: 10Gi
   resources:
     requests:
-      memory: "1Gi"
+      memory: "3Gi"
       cpu: "0.25"
     limits:
-      memory: "1Gi"
+      memory: "3Gi"
       cpu: "0.5"
 
 indexingService:
@@ -164,7 +185,7 @@ indexingService:
   # Netty memory tuning: io.netty.maxDirectMemory=0 respects -XX:MaxDirectMemorySize cap
   # instead of defaulting to heap size; 512m cap is sufficient for gRPC messages.
   # numDirectArenas=16 spreads Netty allocations to reduce lock contention (issue #122).
-  javaOpts: "-Xms9g -Xmx9g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=512m -Dio.netty.allocator.numDirectArenas=16"
+  javaOpts: "-Xms9g -Xmx9g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=2g -Dio.netty.allocator.numDirectArenas=16"
   storage:
     data:
       size: 5Gi
@@ -185,7 +206,7 @@ tools:
       size: 10Gi
   # Heap raised to 6 g: sift10m base set (10M × 128-dim × 4 B = 5.12 GB)
   # must fit in JVM heap during ingest. Container limit = heap + ~1 GiB overhead.
-  javaOpts: "-Xms512m -Xmx6g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms512m -Xmx6g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
   resources:
     requests:
       memory: "7Gi"

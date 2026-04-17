@@ -32,23 +32,37 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  javaOpts: "-Xms16g -Xmx16g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms20g -Xmx20g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
   storage:
     data:
       size: 10Gi
     commitlog:
       size: 5Gi
+  extraConfig:
+    # --- BookKeeper commit-log tuning (experiment for issues #141 / #145) ---
+    # Default max ledger size is 1 GiB (ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_MAX_SIZE).
+    # At bigann's ~200 B/entry that is ~5–7 M INSERTs per ledger, so by the
+    # time the scheduled checkpoint fires (~15 min) the cluster has a handful
+    # of fat ledgers pinned on the single bookie. Force more frequent
+    # rollovers so each ledger is smaller and can be dropped sooner.
+    server.bookkeeper.ledgers.max.size: "134217728"            # 128 MiB
+    # Default retention is 2 days (1000*60*60*24*2 ms). On a typical bench
+    # run that's "never" — closed ledgers pile up on the bookie's ledgers PVC
+    # and keep per-ledger state alive in the bookie's memtable/file-handle
+    # caches. 5 min is enough to let a checkpoint durably capture the LSN
+    # before cleanup and lets dropOldLedgers actually prune between checkpoints.
+    server.bookkeeper.ledgers.retention.period: "300000"       # 5 min (ms)
   resources:
     requests:
-      memory: "20Gi"
+      memory: "23Gi"
       cpu: "8"
     limits:
-      memory: "20Gi"
+      memory: "23Gi"
       cpu: "8"
 
 fileServer:
   replicaCount: 2
-  javaOpts: "-Xms12g -Xmx12g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms12g -Xmx12g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=3g"
   storageMode: s3
   s3:
     endpoint: "https://storage.googleapis.com"
@@ -79,7 +93,7 @@ minio:
 
 zookeeper:
   enabled: true
-  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true"
+  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=512m"
   storage:
     size: 10Gi
   resources:
@@ -93,12 +107,14 @@ zookeeper:
 bookkeeper:
   enabled: true
   replicaCount: 1
-  javaOpts: "-Xms6g -Xmx6g -Djava.net.preferIPv4Stack=true"
-  extraConfig:
-    journalWriteData: "false"
+  javaOpts: "-Xms6g -Xmx6g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
+  # Journal PVC raised to 100 Gi (from 1 Gi) for long-running bigann ingests.
+  # journalWriteData was previously set to "false" to reduce journal I/O;
+  # removed here so the bookie journals payload data (safer durability, and
+  # we now have plenty of PVC headroom).
   storage:
     journal:
-      size: 1Gi
+      size: 100Gi
     ledger:
       size: 500Gi
   resources:
@@ -113,7 +129,7 @@ indexingService:
   enabled: true
   storageMode: remote
   replicaCount: 2
-  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=512m -Dio.netty.allocator.numDirectArenas=16"
+  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=2g -Dio.netty.allocator.numDirectArenas=16"
   storage:
     data:
       size: 20Gi
