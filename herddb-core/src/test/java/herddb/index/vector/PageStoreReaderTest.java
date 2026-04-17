@@ -633,6 +633,8 @@ public class PageStoreReaderTest {
             r.readInt();
         }
         int afterFirst = loaderCalls.get();
+        // Caffeine size accounting is async; drain maintenance before asserting.
+        shared.cleanUp();
         assertTrue("shared cache has a page for this segment",
                 shared.size() > 0);
         sup.close();

@@ -317,8 +317,10 @@ public class SharedSegmentPageCacheTest {
         cache.load(new PageKey(TS, IDX, 1));
         cache.load(new PageKey(TS, IDX, 2));
         cache.load(new PageKey(TS, IDX, 3));
+        cache.cleanUp();
         assertTrue(cache.size() > 0);
         cache.clear();
+        cache.cleanUp();
         assertEquals("clear leaves the cache empty", 0, cache.size());
     }
 
@@ -441,6 +443,10 @@ public class SharedSegmentPageCacheTest {
         assertEquals(2L, cache.loadSuccessCount());
         assertTrue("totalLoadTimeNanos should record some time",
                 cache.totalLoadTimeNanos() >= 0);
+        // Caffeine's weight/size accounting goes through an async write buffer;
+        // drain it before asserting on converged state, otherwise the test is
+        // flaky under CI scheduling.
+        cache.cleanUp();
         assertTrue("weightedSize tracks cached bytes", cache.weightedSize() > 0);
         assertTrue(cache.estimatedSize() > 0);
     }
