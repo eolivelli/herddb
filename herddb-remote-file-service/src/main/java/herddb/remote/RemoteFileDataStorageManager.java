@@ -507,13 +507,6 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     @Override
     public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
-                                          Path tempFile)
-            throws IOException, DataStorageManagerException {
-        return writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile, null);
-    }
-
-    @Override
-    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
                                           Path tempFile, LongConsumer progress)
             throws IOException, DataStorageManagerException {
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);

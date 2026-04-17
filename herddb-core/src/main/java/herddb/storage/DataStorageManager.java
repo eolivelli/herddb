@@ -148,50 +148,50 @@ public abstract class DataStorageManager implements AutoCloseable {
     }
 
     /**
-     * Writes a large file as a multipart file distributed across remote storage.
+     * Writes a large file as a multipart file distributed across the storage backend.
      * Splits the content of {@code tempFile} into fixed-size blocks and stores them
-     * at {@code {tableSpace}/{uuid}/multipart/{fileType}.multipart/{blockIndex}}.
+     * under {@code {tableSpace}/{uuid}/multipart/{fileType}/...}. Used by the vector
+     * index to persist FusedPQ graphs and map data without page-by-page framing.
      *
-     * @return the logical path of the written multipart file, or {@code null} if multipart
-     *         writes are not supported by this storage manager (falls back to page-based writes)
+     * <p>{@code progress} is invoked with the number of bytes written since the
+     * last invocation (a delta, not a running total). May be {@code null} if the
+     * caller is not interested in progress reporting.
+     *
+     * @return a backend-specific logical path identifying the written file. The
+     *         returned string is opaque to callers — it is only used to look up
+     *         the same file via {@link #multipartIndexReaderSupplier} and
+     *         {@link #deleteMultipartIndexFile}.
      */
-    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
-                                          Path tempFile)
-            throws IOException, DataStorageManagerException {
-        return null; // default: not supported; caller falls back to page-based writes
-    }
-
-    /**
-     * Overload that reports upload progress to the caller via {@code progress}.
-     * The callback is invoked with the number of bytes written since the last
-     * invocation (a delta, not a running total). Default implementation ignores
-     * {@code progress} and delegates to the non-progress overload.
-     */
-    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
-                                          Path tempFile, LongConsumer progress)
-            throws IOException, DataStorageManagerException {
-        return writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile);
-    }
+    public abstract String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                                   Path tempFile, LongConsumer progress)
+            throws IOException, DataStorageManagerException;
 
     /**
      * Returns a {@link io.github.jbellis.jvector.disk.ReaderSupplier} for a multipart index file
      * previously written with {@link #writeMultipartIndexFile}.
-     *
-     * @return a ReaderSupplier, or {@code null} if multipart reads are not supported
      */
-    public io.github.jbellis.jvector.disk.ReaderSupplier multipartIndexReaderSupplier(
+    public abstract io.github.jbellis.jvector.disk.ReaderSupplier multipartIndexReaderSupplier(
             String tableSpace, String uuid, String fileType, long fileSize)
-            throws DataStorageManagerException {
-        return null; // default: not supported
-    }
+            throws DataStorageManagerException;
 
     /**
-     * Deletes a multipart index file and all its blocks.
-     * Default implementation is a no-op.
+     * Deletes a multipart index file and all its blocks. Idempotent — must not
+     * throw if the file does not exist.
      */
-    public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
-            throws DataStorageManagerException {
-        // default: no-op
+    public abstract void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
+            throws DataStorageManagerException;
+
+    /**
+     * Reports whether this storage manager can host vector indexes
+     * ({@code PersistentVectorStore}). Vector indexes persist large graph and
+     * map artefacts via the multipart API above; backends that cannot
+     * implement it (notably {@link herddb.cluster.BookKeeperDataStorageManager})
+     * must override this to {@code false} so callers can fail fast with a
+     * clear error rather than a cryptic {@code UnsupportedOperationException}
+     * during checkpoint.
+     */
+    public boolean supportsVectorIndexes() {
+        return true;
     }
 
     /**

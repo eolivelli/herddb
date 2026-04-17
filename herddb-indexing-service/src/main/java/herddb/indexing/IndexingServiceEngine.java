@@ -329,10 +329,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final long segmentPageCacheMaxBytes = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES,
                     IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES_DEFAULT);
-            long effectiveCacheBytes = segmentPageCacheMaxBytes > 0 ? segmentPageCacheMaxBytes
-                    : herddb.index.vector.SharedSegmentPageCache.DEFAULT_MAX_BYTES;
-            LOGGER.log(Level.INFO, "vector index segmentPageCacheMaxBytes: {0} bytes (config: {1})",
-                    new Object[]{effectiveCacheBytes, segmentPageCacheMaxBytes});
+            // segmentPageCacheMaxBytes is accepted for config compatibility but
+            // has no effect after the page-based cache was removed. A follow-up
+            // change will reintroduce a multipart-aware cache and log its size.
+            LOGGER.log(Level.INFO, "vector index segmentPageCacheMaxBytes: {0} (unused pending multipart cache)",
+                    segmentPageCacheMaxBytes);
 
             final long vectorMemLimit = maxVectorMemoryBytes;
             final VectorMemoryBudget budget = this;
@@ -1384,16 +1385,6 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     return pvs.getTotalFusedPQCheckpointCount();
                 }
             });
-            indexStats.registerGauge("checkpoint_simple_count", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getTotalSimpleCheckpointCount();
-                }
-            });
             indexStats.registerGauge("checkpoint_duration_ms", new Gauge<Long>() {
                 @Override
                 public Long getDefaultValue() {
@@ -1664,173 +1655,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             });
             pvs.setSegmentSizeStats(indexStats.getOpStatsLogger("segment_size_bytes"));
 
-            // ---------------------------------------------------------------
-            // Segment page cache (shared Caffeine LoadingCache, byte-weighted)
-            // ---------------------------------------------------------------
-            indexStats.registerGauge("segment_cache_hits", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getSegmentPageCacheHitCount();
-                }
-            });
-            indexStats.registerGauge("segment_cache_misses", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getSegmentPageCacheMissCount();
-                }
-            });
-            indexStats.registerGauge("segment_cache_evictions", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getSegmentPageCacheEvictionCount();
-                }
-            });
-            indexStats.registerGauge("segment_cache_load_success", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getSegmentPageCacheLoadSuccessCount();
-                }
-            });
-            indexStats.registerGauge("segment_cache_load_failure", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getSegmentPageCacheLoadFailureCount();
-                }
-            });
-            indexStats.registerGauge("segment_cache_load_time_nanos_total", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getSegmentPageCacheLoadTimeNanos();
-                }
-            });
-            indexStats.registerGauge("segment_cache_entries", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getSegmentPageCacheEntries();
-                }
-            });
-            indexStats.registerGauge("segment_cache_size_bytes", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getSegmentPageCacheSizeBytes();
-                }
-            });
-            indexStats.registerGauge("segment_cache_max_bytes", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getSegmentPageCacheMaxBytes();
-                }
-            });
-
-            // ---------------------------------------------------------------
-            // Per-segment PageStoreReader caches (aggregated across segments)
-            // ---------------------------------------------------------------
-            indexStats.registerGauge("page_reader_cache_hits", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getPageReaderCacheHitCount();
-                }
-            });
-            indexStats.registerGauge("page_reader_cache_misses", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getPageReaderCacheMissCount();
-                }
-            });
-            indexStats.registerGauge("page_reader_cache_evictions", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getPageReaderCacheEvictionCount();
-                }
-            });
-            indexStats.registerGauge("page_reader_cache_load_success", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getPageReaderCacheLoadSuccessCount();
-                }
-            });
-            indexStats.registerGauge("page_reader_cache_load_failure", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getPageReaderCacheLoadFailureCount();
-                }
-            });
-            indexStats.registerGauge("page_reader_cache_load_time_nanos_total", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getPageReaderCacheLoadTimeNanos();
-                }
-            });
-            indexStats.registerGauge("page_reader_cache_entries", new Gauge<Long>() {
-                @Override
-                public Long getDefaultValue() {
-                    return 0L;
-                }
-                @Override
-                public Long getSample() {
-                    return pvs.getPageReaderCacheEntries();
-                }
-            });
+            // Segment graph-page cache gauges were removed when the page-based
+            // persistence path was deleted. A multipart-aware cache will be
+            // re-introduced as a follow-up, at which point its gauges will be
+            // registered here.
         }
     }
 

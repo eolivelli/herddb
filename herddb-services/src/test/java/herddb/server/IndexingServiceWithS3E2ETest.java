@@ -81,8 +81,8 @@ import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
  *       live shards.</li>
  *   <li>Restart of the indexing service <em>after</em> its vector-store
  *       checkpoint — the store must reload multi-segment FusedPQ state
- *       from S3 via {@code PageStoreReader} and stream graph pages on
- *       demand.</li>
+ *       from S3 via the multipart reader supplier and stream graph bytes
+ *       on demand.</li>
  * </ol>
  */
 public class IndexingServiceWithS3E2ETest {
@@ -380,7 +380,7 @@ public class IndexingServiceWithS3E2ETest {
             t.server.getManager().checkpoint();
 
             // Query is still served: data lives on-disk (in S3) for the
-            // vector store, served through PageStoreReader.
+            // vector store, served via the multipart reader.
             assertEquals(3, annTop1(con, new float[]{0, 0, 1, 0}));
             assertEquals(4, annTop1(con, new float[]{0, 0, 0, 1}));
         }
