@@ -39,6 +39,7 @@ import herddb.storage.FullTableScanConsumer;
 import herddb.storage.IndexStatus;
 import herddb.storage.TableStatus;
 import herddb.utils.ByteArrayCursor;
+import herddb.utils.ByteBufCursor;
 import herddb.utils.Bytes;
 import herddb.utils.CleanDirectoryFileVisitor;
 import herddb.utils.DeleteFileVisitor;
@@ -397,7 +398,7 @@ public class FileDataStorageManager extends DataStorageManager {
         if (read != size) {
             throw new IOException("short read, read " + read + " instead of " + size + " bytes from " + pageFile);
         }
-        try (ByteArrayCursor dataIn = ByteArrayCursor.wrap(dataPage)) {
+        try (ByteBufCursor dataIn = ByteBufCursor.wrap(dataPage)) {
             /*
              * When writing with O_DIRECT this stream will be zero padded at the end. It isn't a problem: reader
              * must already handle his stop condition without reading file till the end because it contains an

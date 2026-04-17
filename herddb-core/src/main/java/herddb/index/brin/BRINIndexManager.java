@@ -44,7 +44,7 @@ import herddb.sql.SQLRecordKeyFunction;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
-import herddb.utils.ByteArrayCursor;
+import herddb.utils.ByteBufCursor;
 import herddb.utils.Bytes;
 import herddb.utils.DataAccessor;
 import herddb.utils.ExtendedDataOutputStream;
@@ -160,7 +160,7 @@ public class BRINIndexManager extends AbstractIndexManager {
             }
         }
 
-        static PageContents deserialize(ByteArrayCursor in) throws IOException {
+        static PageContents deserialize(ByteBufCursor in) throws IOException {
             long version = in.readVLong(); // version
             long flags = in.readVLong(); // flags for future implementations
 
@@ -223,7 +223,7 @@ public class BRINIndexManager extends AbstractIndexManager {
         }
 
         static PageContents deserialize(byte[] pagedata) throws IOException {
-            try (ByteArrayCursor ein = ByteArrayCursor.wrap(pagedata)) {
+            try (ByteBufCursor ein = ByteBufCursor.wrap(pagedata)) {
                 return deserialize(ein);
             }
         }

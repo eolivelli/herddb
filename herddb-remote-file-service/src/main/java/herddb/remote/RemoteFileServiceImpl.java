@@ -216,14 +216,15 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
                             responseObserver.onNext(ReadFileResponse.newBuilder().setFound(false).build());
                             responseObserver.onCompleted();
                         } else {
-                            byte[] content = result.content();
-                            readBytes.addCount(content.length);
+                            io.netty.buffer.ByteBuf byteBuf = result.byteBuf();
+                            int contentLength = byteBuf.readableBytes();
+                            readBytes.addCount(contentLength);
                             readLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
                             LOGGER.log(Level.FINE, "readFile path={0} size={1} time={2}ms",
-                                    new Object[]{request.getPath(), content.length, elapsedMs(start)});
+                                    new Object[]{request.getPath(), contentLength, elapsedMs(start)});
                             responseObserver.onNext(ReadFileResponse.newBuilder()
                                     .setFound(true)
-                                    .setContent(UnsafeByteOperations.unsafeWrap(content))
+                                    .setContent(UnsafeByteOperations.unsafeWrap(byteBuf.nioBuffer()))
                                     .build());
                             responseObserver.onCompleted();
                         }
@@ -300,15 +301,16 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
                                 responseObserver.onNext(ReadFileRangeResponse.newBuilder().setFound(false).build());
                                 responseObserver.onCompleted();
                             } else {
-                                byte[] content = result.content();
-                                readRangeBytes.addCount(content.length);
+                                io.netty.buffer.ByteBuf byteBuf = result.byteBuf();
+                                int contentLength = byteBuf.readableBytes();
+                                readRangeBytes.addCount(contentLength);
                                 readRangeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
                                 LOGGER.log(Level.FINE, "readFileRange path={0} offset={1} size={2} time={3}ms",
                                         new Object[]{request.getPath(), request.getOffset(),
-                                                content.length, elapsedMs(start)});
+                                                contentLength, elapsedMs(start)});
                                 responseObserver.onNext(ReadFileRangeResponse.newBuilder()
                                         .setFound(true)
-                                        .setContent(UnsafeByteOperations.unsafeWrap(content))
+                                        .setContent(UnsafeByteOperations.unsafeWrap(byteBuf.nioBuffer()))
                                         .build());
                                 responseObserver.onCompleted();
                             }

@@ -29,7 +29,7 @@ import herddb.model.Index;
 import herddb.model.Record;
 import herddb.model.Table;
 import herddb.model.Transaction;
-import herddb.utils.ByteArrayCursor;
+import herddb.utils.ByteBufCursor;
 import herddb.utils.ExtendedDataOutputStream;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -77,7 +77,7 @@ public abstract class DataStorageManager implements AutoCloseable {
     @FunctionalInterface
     public interface DataReader<X> {
 
-        X read(ByteArrayCursor in) throws IOException;
+        X read(ByteBufCursor in) throws IOException;
     }
 
     public abstract <X> X readIndexPage(String tableSpace, String uuid, Long pageId, DataReader<X> reader)
