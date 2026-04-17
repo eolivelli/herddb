@@ -57,6 +57,8 @@ public class BookKeeperMainWrapperTest {
             config.put("ledgerDirNames", folder.newFolder("bk-ledgers").getAbsolutePath());
             config.put("journalDirName", folder.newFolder("bk-journal").getAbsolutePath());
             config.put("httpServerPort", String.valueOf(httpPort));
+            // Required for CI / dev hosts whose advertised hostname resolves to a loopback address.
+            config.put("allowLoopback", "true");
 
             BookKeeperMainWrapper wrapper = new BookKeeperMainWrapper(config);
             Thread runner = new Thread(() -> {
@@ -70,11 +72,15 @@ public class BookKeeperMainWrapperTest {
             runner.start();
 
             try {
-                // Wait for metrics HTTP endpoint to become available
+                // Wait for metrics HTTP endpoint to become available AND for the bookie's
+                // internal stats provider to have registered its metrics. Both must be
+                // present: JVM metrics come from PrometheusMetricsProvider.start(), and
+                // bookkeeper_server_* counters come from the embedded bookie once its
+                // stats provider is wired via EmbeddedServer.builder(...).statsProvider(...).
+                URL metricsUrl = new URL("http://localhost:" + httpPort + "/metrics");
                 String metricsBody = null;
-                for (int i = 0; i < 60; i++) {
+                for (int i = 0; i < 120; i++) {
                     try {
-                        URL metricsUrl = new URL("http://localhost:" + httpPort + "/metrics");
                         HttpURLConnection conn = (HttpURLConnection) metricsUrl.openConnection();
                         conn.setRequestMethod("GET");
                         conn.setConnectTimeout(1000);
@@ -88,18 +94,29 @@ public class BookKeeperMainWrapperTest {
                                     body.append(line).append("\n");
                                 }
                             }
-                            metricsBody = body.toString();
-                            break;
+                            String snapshot = body.toString();
+                            if (snapshot.contains("jvm_") && snapshot.contains("bookkeeper_server_")) {
+                                metricsBody = snapshot;
+                                break;
+                            }
                         }
-                    } catch (Exception e) {
-                        Thread.sleep(500);
+                    } catch (Exception ignored) {
+                        // endpoint not ready yet
                     }
+                    Thread.sleep(500);
                 }
 
-                assertTrue("Metrics endpoint did not become available in time", metricsBody != null);
+                assertTrue("Metrics endpoint did not expose the expected counters in time",
+                        metricsBody != null);
                 // JVM metrics should be present
                 assertTrue("Metrics should contain JVM info, got: " + metricsBody,
                         metricsBody.contains("jvm_"));
+                // BookKeeper server metrics should be present — regression guard for #142:
+                // if the embedded bookie's stats provider is not passed to the Jetty-served
+                // PrometheusMetricsProvider, BK counters accumulate in a hidden provider
+                // and only jvm_ metrics appear here.
+                assertTrue("Metrics should contain bookkeeper_server_* counters, got: " + metricsBody,
+                        metricsBody.contains("bookkeeper_server_"));
             } finally {
                 wrapper.close();
             }
