@@ -160,6 +160,33 @@ bookkeeper:
   # frequent GC pauses on 512 m heap, making the bookie temporarily unavailable.
   # 2 g + 1 GiB JVM overhead → 3 GiB container memory.
   javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
+  # Enable FINE logging for BK write processors so OperationRejectedException
+  # (bookie backpressure) becomes visible. FINE is set only here in the k3s-local
+  # values override, not in the baked-in logging.properties in the image.
+  loggingProperties: |
+    handlers=java.util.logging.ConsoleHandler
+
+    # Default global logging level
+    .level= INFO
+
+    # BookKeeper bookie — raised from SEVERE so WARN-level messages are visible:
+    # non-writable channels, fenced-ledger warnings, bookie state transitions.
+    org.apache.bookkeeper.level=WARNING
+
+    # Enable FINE (= SLF4J DEBUG) only for the two write-processor classes so that
+    # OperationRejectedException (backpressure) becomes visible when the bookie
+    # storage cannot keep up with the write rate.
+    # One log line per rejected addEntry — potentially verbose under sustained
+    # back-pressure, but that is the signal needed to diagnose silent write failures.
+    org.apache.bookkeeper.proto.WriteEntryProcessorV3.level=FINE
+    org.apache.bookkeeper.proto.WriteEntryProcessor.level=FINE
+
+    ############################################################
+    # Handler specific properties.
+    ############################################################
+    # Raised to FINE so the write-processor DEBUG lines above reach the console.
+    java.util.logging.ConsoleHandler.level = FINE
+    java.util.logging.ConsoleHandler.formatter = java.util.logging.SimpleFormatter
   # Journal PVC raised to 100 Gi (from 1 Gi) for long-running bigann ingests:
   # the 2026-04-17 bigann 100M run saw the ledger PVC hit 16 GB by 27% progress,
   # so the journal also needs significant headroom for in-flight writes and
