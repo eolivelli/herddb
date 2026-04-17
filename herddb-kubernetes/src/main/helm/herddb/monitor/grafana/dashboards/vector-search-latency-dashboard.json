@@ -1612,6 +1612,73 @@
       "showTitle": true,
       "title": "File Server S3 Reads",
       "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 400,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 2,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "sum by (instance)(rate({__name__=~\".+_segment_cache_hits\",job=\"indexing-service\",instance=~\"$instance\"}[1m])) / clamp_min(sum by (instance)(rate({__name__=~\".+_segment_cache_hits\",job=\"indexing-service\",instance=~\"$instance\"}[1m])) + sum by (instance)(rate({__name__=~\".+_segment_cache_misses\",job=\"indexing-service\",instance=~\"$instance\"}[1m])), 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "segment-cache hit ratio [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Aggregated Segment-Cache Hit Ratio (1m)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "percentunit", "logBase": 1, "max": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 401,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "stack": false,
+          "targets": [
+            {
+              "expr": "sum by (instance)(rate({__name__=~\".+_segment_cache_misses\",job=\"indexing-service\",instance=~\"$instance\"}[1m]))",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "segment miss/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(rfs_client_read_requests{instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "rfs client read/s [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "title": "Segment Miss vs File-Server Client Read Rate",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Vector Cache Correlation",
+      "titleSize": "h6"
     }
   ],
   "schemaVersion": 14,

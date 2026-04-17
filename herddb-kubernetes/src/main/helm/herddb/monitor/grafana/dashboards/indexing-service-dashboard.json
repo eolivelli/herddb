@@ -1244,6 +1244,284 @@
       "height": 250,
       "panels": [
         {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 300,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_hits\",job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "hits/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_misses\",job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "misses/s [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "title": "Segment Cache Hits / Misses (1m)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 301,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 2,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_hits\",job=\"indexing-service\",instance=~\"$instance\"}[1m]) / clamp_min(rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_hits\",job=\"indexing-service\",instance=~\"$instance\"}[1m]) + rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_misses\",job=\"indexing-service\",instance=~\"$instance\"}[1m]), 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "hit ratio [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Segment Cache Hit Ratio (1m)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "percentunit", "logBase": 1, "max": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 302,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_size_bytes\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "used [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_max_bytes\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "max [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "title": "Segment Cache Bytes (used vs max)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "bytes", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 303,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_evictions\",job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "evictions/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_entries\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "entries [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "title": "Segment Cache Evictions (1m) & Entries",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 304,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_load_time_nanos_total\",job=\"indexing-service\",instance=~\"$instance\"}[1m]) / clamp_min(rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_load_success\",job=\"indexing-service\",instance=~\"$instance\"}[1m]) + rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_cache_load_failure\",job=\"indexing-service\",instance=~\"$instance\"}[1m]), 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "avg load ns [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Segment Cache — Average Page Load Latency",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ns", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Vector Segment Cache",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 310,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_page_reader_cache_hits\",job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "hits/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_page_reader_cache_misses\",job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "misses/s [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "title": "Page Reader Cache Hits / Misses (1m)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 311,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 2,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_page_reader_cache_hits\",job=\"indexing-service\",instance=~\"$instance\"}[1m]) / clamp_min(rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_page_reader_cache_hits\",job=\"indexing-service\",instance=~\"$instance\"}[1m]) + rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_page_reader_cache_misses\",job=\"indexing-service\",instance=~\"$instance\"}[1m]), 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "hit ratio [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Page Reader Cache Hit Ratio (1m)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "percentunit", "logBase": 1, "max": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 312,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_page_reader_cache_evictions\",job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "evictions/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_page_reader_cache_entries\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "entries [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "title": "Page Reader Cache Evictions (1m) & Entries",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 313,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_page_reader_cache_load_time_nanos_total\",job=\"indexing-service\",instance=~\"$instance\"}[1m]) / clamp_min(rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_page_reader_cache_load_success\",job=\"indexing-service\",instance=~\"$instance\"}[1m]) + rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_page_reader_cache_load_failure\",job=\"indexing-service\",instance=~\"$instance\"}[1m]), 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "avg load ns [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Page Reader Cache — Average Page Load Latency",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ns", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Vector Page Reader Cache",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
           "aliasColors": {},
           "bars": false,
           "dashLength": 10,

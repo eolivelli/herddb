@@ -28,6 +28,10 @@ import herddb.storage.DataStorageManagerException;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
 
@@ -173,6 +177,8 @@ public class PageStoreReaderTest {
             assertTrue("some pages must have missed, got "
                             + (missesAfter - missesBefore),
                     missesAfter - missesBefore >= 4);
+            // Caffeine eviction is async; drain it before asserting a strict count.
+            sup.drainCacheMaintenance();
             assertEquals("LRU must still be bounded", 2, sup.getCachedPages());
         }
     }
@@ -386,7 +392,9 @@ public class PageStoreReaderTest {
                 r.seek(0);
                 r.readFully(buf);
             }
-            // After streaming through all 40 pages with cache of 4, LRU should still be bounded
+            // After streaming through all 40 pages with cache of 4, LRU should still be bounded.
+            // Caffeine eviction is async — drain before asserting a strict count.
+            sup.drainCacheMaintenance();
             assertEquals("cache still bounded after streaming", 4, sup.getCachedPages());
         }
     }
@@ -419,6 +427,222 @@ public class PageStoreReaderTest {
         } catch (Exception unexpected) {
             fail("empty page list should be allowed: " + unexpected);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // LoadingCache-specific tests (new behaviour after migration)
+    // -----------------------------------------------------------------
+
+    @Test
+    public void concurrentMissesOnSamePageDeduplicate() throws Exception {
+        // With the old LinkedHashMap LRU, two threads missing the same page
+        // would each issue a readIndexPage call. Caffeine's LoadingCache
+        // dedups these: the loader runs exactly once per concurrent miss.
+        final int threadCount = 16;
+        AtomicInteger reads = new AtomicInteger(0);
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager() {
+            @Override
+            public <X> X readIndexPage(String tableSpace, String uuid, Long pageId,
+                                       DataReader<X> reader) throws DataStorageManagerException {
+                reads.incrementAndGet();
+                try {
+                    Thread.sleep(10); // hold the load briefly so threads collide
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+                return super.readIndexPage(tableSpace, uuid, pageId, reader);
+            }
+        };
+        int pageSize = 64;
+        long[] ids = writeFixedSizePages(dsm, 4, pageSize, 4L * pageSize);
+        try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
+                dsm, TS, IDX, ids, calculatePageSizes(4, pageSize, 4L * pageSize),
+                CHUNK_TYPE, 4, null)) {
+            int before = reads.get();
+            CountDownLatch start = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(threadCount);
+            ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+            try {
+                List<Throwable> errs = new ArrayList<>();
+                for (int i = 0; i < threadCount; i++) {
+                    pool.submit(() -> {
+                        try (RandomAccessReader r = sup.get()) {
+                            start.await();
+                            r.seek(0); // all threads hit page 0
+                            r.readInt();
+                        } catch (Throwable t) {
+                            synchronized (errs) {
+                                errs.add(t);
+                            }
+                        } finally {
+                            done.countDown();
+                        }
+                    });
+                }
+                start.countDown();
+                assertTrue("threads finished", done.await(10, TimeUnit.SECONDS));
+                if (!errs.isEmpty()) {
+                    throw new AssertionError("concurrent reads failed: " + errs.get(0),
+                            errs.get(0));
+                }
+            } finally {
+                pool.shutdownNow();
+            }
+            int after = reads.get();
+            assertEquals("dedup must limit the loader to one invocation for page 0",
+                    1, after - before);
+        }
+    }
+
+    @Test
+    public void statsAccessorsTrackLoadsAndHits() throws Exception {
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        int pageSize = 64;
+        long[] ids = writeFixedSizePages(dsm, 3, pageSize, 3L * pageSize);
+        try (PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
+                dsm, TS, IDX, ids, calculatePageSizes(3, pageSize, 3L * pageSize),
+                CHUNK_TYPE, 4, null)) {
+            assertEquals("fresh supplier has zero load-success count",
+                    0, sup.getCacheLoadSuccess());
+            assertEquals(0, sup.getCacheLoadFailure());
+            try (RandomAccessReader r = sup.get()) {
+                r.seek(0);
+                r.readInt();
+                r.seek(pageSize);
+                r.readInt();
+                r.seek(2L * pageSize);
+                r.readInt();
+            }
+            assertEquals("three pages loaded exactly once each",
+                    3, sup.getCacheLoadSuccess());
+            assertTrue("some load time recorded",
+                    sup.getCacheLoadTimeNanos() >= 0);
+        }
+    }
+
+    @Test
+    public void failedLoadsIncrementLoadFailureStat() throws Exception {
+        // Deleting a page after construction triggers a failed load;
+        // Caffeine's recordStats() must count it under loadFailure, not success.
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        int pageSize = 32;
+        long[] ids = writeFixedSizePages(dsm, 2, pageSize, 2L * pageSize);
+        PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
+                dsm, TS, IDX, ids, calculatePageSizes(2, pageSize, 2L * pageSize),
+                CHUNK_TYPE, 1, null);
+        dsm.deleteIndexPage(TS, IDX, ids[0]);
+        try (RandomAccessReader r = sup.get()) {
+            r.seek(pageSize); // page 1 first (succeeds)
+            r.readInt();
+            r.seek(0); // page 0 — cache miss on a deleted page
+            try {
+                r.readInt();
+                fail("expected failure when loading a deleted page");
+            } catch (RuntimeException expected) {
+            }
+        }
+        assertEquals("one load failed", 1, sup.getCacheLoadFailure());
+        assertTrue("at least one load succeeded (page 1)",
+                sup.getCacheLoadSuccess() >= 1);
+        sup.close();
+    }
+
+    @Test
+    public void sharedCacheReceivesLoadsFromPageReader() throws Exception {
+        // With a SharedSegmentPageCache present, the PageStoreReader loader
+        // delegates to it. Two readers on different PageStoreReader.Suppliers
+        // must share the same loaded bytes via the global cache.
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        int pageSize = 128;
+        long[] ids = writeFixedSizePages(dsm, 3, pageSize, 3L * pageSize);
+        AtomicInteger reads = new AtomicInteger(0);
+        MemoryDataStorageManager countingDsm = new MemoryDataStorageManager() {
+            @Override
+            public <X> X readIndexPage(String tableSpace, String uuid, Long pageId,
+                                       DataReader<X> reader) throws DataStorageManagerException {
+                reads.incrementAndGet();
+                return super.readIndexPage(tableSpace, uuid, pageId, reader);
+            }
+        };
+        // Re-populate the counting DSM (IDs on MemoryDataStorageManager are
+        // per-instance, so we must rewrite the pages).
+        long[] idsCounting = writeFixedSizePages(countingDsm, 3, pageSize, 3L * pageSize);
+
+        // Shared cache with a direct loader that reads through the counting DSM,
+        // mimicking what PersistentVectorStore.loadGraphChunkPage does.
+        SharedSegmentPageCache shared = new SharedSegmentPageCache(1L << 20, key ->
+                countingDsm.readIndexPage(key.tableSpaceUUID(), key.indexUUID(), key.pageId(),
+                        in -> {
+                            int type = in.readVInt();
+                            assertEquals(CHUNK_TYPE, type);
+                            int len = in.readVInt();
+                            byte[] data = new byte[len];
+                            in.readArray(len, data);
+                            return data;
+                        }));
+
+        try (PageStoreReader.Supplier supA = new PageStoreReader.Supplier(
+                countingDsm, TS, IDX, idsCounting,
+                calculatePageSizes(3, pageSize, 3L * pageSize), CHUNK_TYPE, 1, shared);
+             PageStoreReader.Supplier supB = new PageStoreReader.Supplier(
+                countingDsm, TS, IDX, idsCounting,
+                calculatePageSizes(3, pageSize, 3L * pageSize), CHUNK_TYPE, 1, shared)) {
+
+            int before = reads.get();
+            try (RandomAccessReader r = supA.get()) {
+                r.seek(0);
+                r.readInt();
+            }
+            try (RandomAccessReader r = supB.get()) {
+                r.seek(0);
+                r.readInt();
+            }
+            int after = reads.get();
+            assertEquals("second supplier must hit the shared cache — no extra DSM read",
+                    1, after - before);
+        }
+        // the DSM used to stage pages above (dsm) was not hit in this test; silence unused.
+        assertTrue("primary DSM unused for counting", ids.length == idsCounting.length);
+    }
+
+    @Test
+    public void closeInvalidatesSharedCacheEntries() throws Exception {
+        // When the segment is closed, its pages must be evicted from the
+        // shared cache so a subsequent segment with colliding pageIds does
+        // not accidentally serve stale bytes.
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        int pageSize = 16;
+        long[] ids = writeFixedSizePages(dsm, 2, pageSize, 2L * pageSize);
+        AtomicInteger loaderCalls = new AtomicInteger(0);
+        SharedSegmentPageCache shared = new SharedSegmentPageCache(1L << 20, key -> {
+            loaderCalls.incrementAndGet();
+            return dsm.readIndexPage(key.tableSpaceUUID(), key.indexUUID(), key.pageId(),
+                    in -> {
+                        in.readVInt(); // type
+                        int len = in.readVInt();
+                        byte[] data = new byte[len];
+                        in.readArray(len, data);
+                        return data;
+                    });
+        });
+        PageStoreReader.Supplier sup = new PageStoreReader.Supplier(
+                dsm, TS, IDX, ids, calculatePageSizes(2, pageSize, 2L * pageSize),
+                CHUNK_TYPE, 2, shared);
+        try (RandomAccessReader r = sup.get()) {
+            r.seek(0);
+            r.readInt();
+        }
+        int afterFirst = loaderCalls.get();
+        // Caffeine size accounting is async; drain maintenance before asserting.
+        shared.cleanUp();
+        assertTrue("shared cache has a page for this segment",
+                shared.size() > 0);
+        sup.close();
+        // After close, loading the same pageId via the shared cache must
+        // re-invoke the loader because close() invalidated those keys.
+        shared.load(new SharedSegmentPageCache.PageKey(TS, IDX, ids[0]));
+        assertEquals("shared cache entry was invalidated by supplier.close()",
+                afterFirst + 1, loaderCalls.get());
     }
 
     @Test
