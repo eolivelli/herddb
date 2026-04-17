@@ -74,6 +74,12 @@ server:
     # caches. 5 min is enough to let a checkpoint durably capture the LSN
     # before cleanup and lets dropOldLedgers actually prune between checkpoints.
     server.bookkeeper.ledgers.retention.period: "300000"       # 5 min (ms)
+    # The server enforces (checkpoint.period < retention.period / 2), so a
+    # 5-min retention requires a checkpoint period < 150 s. Default is 15 min,
+    # which would fail validation. Drop to 1 min — more frequent checkpoints
+    # also reduce the per-checkpoint catch-up backlog that was the root cause
+    # of issue #145 (LSN mismatch after a 25-min waitForInstanceCatchUp).
+    server.checkpoint.period: "60000"                          # 1 min (ms)
   resources:
     requests:
       memory: "23Gi"

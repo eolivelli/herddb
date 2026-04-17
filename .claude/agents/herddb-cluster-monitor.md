@@ -87,6 +87,61 @@ Extract `rfs_readrange_bytes` and `rfs_readrange_requests`. If bytes grew
 significantly since last tick during a query phase, log a warning
 (indicates disk cache overflow → MinIO fallthrough).
 
+### Step 5: Bookie metrics (every tick — critical during ingest/checkpoint)
+
+```bash
+kubectl exec herddb-bookkeeper-0 -- curl -s http://localhost:8000/metrics
+```
+
+The BookKeeper bookie exposes Prometheus-format metrics on port **8000**
+(configured via `prometheusStatsHttpPort` in `bookie.properties`). Extract
+and report these specific families — they are the ones that diagnose
+backpressure, journal pressure, and ledger growth during sustained ingest:
+
+**Memory / journal memory budget** (Gauge) — `bookie_journal_JOURNAL_MEMORY_USED` / `bookie_journal_JOURNAL_MEMORY_MAX`
+Used ÷ Max ≥ 0.80 → warning (journal is throttling writes on memory pressure).
+
+**Journal queue depth** (Counter, treat as gauge of "currently in-flight")
+- `bookie_journal_JOURNAL_QUEUE_SIZE` — pending journal writes
+- `bookie_journal_JOURNAL_FORCE_WRITE_QUEUE_SIZE` — pending fsync batches
+Either growing monotonically → warning (journal not keeping up with writers).
+
+**Backpressure signals** (the primary reason this step exists)
+- `bookie_ADD_ENTRY_IN_PROGRESS` — in-flight `addEntry` RPCs vs. `maxAddsInProgressLimit`
+- `bookie_ADD_ENTRY_BLOCKED` — count of adds parked on the semaphore waiting for a permit
+- `bookie_ADD_ENTRY_REJECTED` — adds rejected outright
+Any non-zero `ADD_ENTRY_BLOCKED` → warning; growing `ADD_ENTRY_REJECTED` → fatal.
+
+**Skip-list (memtable) throttling**
+- `bookie_SKIP_LIST_THROTTLING` — number of throttle events (memtable full)
+Non-zero and growing → warning (bookie memtable is undersized for the write rate).
+
+**Ledger storage / write throughput**
+- `bookie_journal_JOURNAL_WRITE_BYTES` — total bytes appended; delta per tick = journal MB/s
+- `bookie_flush_BYTES` (or `bookie_FLUSH_SIZE`) — bytes flushed from memtable to entry log
+Use deltas between ticks, not absolute values. Sustained zero delta during ingest is also a warning.
+
+Metric name prefix reference (confirmed from live k3s-local bookie
+2026-04-17, image `herddb/herddb-server:0.30.0-SNAPSHOT` after #142 fix):
+
+| Grep pattern | Example line |
+|---|---|
+| `^bookie_journal_JOURNAL_MEMORY_USED` | `bookie_journal_JOURNAL_MEMORY_USED{journalIndex="0"} 0` |
+| `^bookie_journal_JOURNAL_MEMORY_MAX` | `bookie_journal_JOURNAL_MEMORY_MAX{journalIndex="0"} 53477376` |
+| `^bookie_journal_JOURNAL_QUEUE_SIZE` | `bookie_journal_JOURNAL_QUEUE_SIZE{journalIndex="0"} 0` |
+| `^bookie_journal_JOURNAL_FORCE_WRITE_QUEUE_SIZE` | `bookie_journal_JOURNAL_FORCE_WRITE_QUEUE_SIZE{journalIndex="0"} 0` |
+| `^bookie_journal_JOURNAL_WRITE_BYTES` | `bookie_journal_JOURNAL_WRITE_BYTES{journalIndex="0"} 96` |
+| `^bookkeeper_server_ADD_ENTRY_BLOCKED` | `bookkeeper_server_ADD_ENTRY_BLOCKED 0` |
+| `^bookkeeper_server_ADD_ENTRY_IN_PROGRESS` | `bookkeeper_server_ADD_ENTRY_IN_PROGRESS 0` |
+| `^bookie_SKIP_LIST_FLUSH_BYTES` | `bookie_SKIP_LIST_FLUSH_BYTES 0` |
+| `^bookie_ledger_dir_.*_usage` | `bookie_ledger_dir__opt_herddb_bookie_data_ledgers_usage 28.8` |
+| `^bookie_JOURNAL_DIRS` | `bookie_JOURNAL_DIRS 1` |
+
+Note the **mixed prefixes**: journal memory/queue use `bookie_journal_*`;
+semaphore/backpressure uses `bookkeeper_server_*` (no `bookie_` prefix);
+skip-list uses `bookie_*`; ledger PVC usage uses `bookie_ledger_dir_…_usage`
+(percentage). Grep permissively — if a family is still absent, omit it.
+
 ## Output Format
 
 Return a single structured text block, no markdown, each line with a specific
@@ -99,9 +154,15 @@ Phase: ingest  Progress: op=5123/10000 (51%)
 PodStatus: 8 pods Running/Ready
 IS-0: watermark L=5 O=5123, mem=2.1 GiB — OK
 IS-1: watermark L=5 O=5122, mem=2.0 GiB — OK
+Bookie: jmem=142M/512M (28%)  jq=0 fwq=0  blocked=0 rejected=0  skipThr=0  wbytes=+38MB/60s
 LogErrors: none detected
 Verdict: healthy
 ```
+
+The `Bookie:` line is compact and single-line. Include only the families
+that are actually present in `/metrics`; drop the rest. Express deltas
+(bytes/ops since previous tick) where it is meaningful, absolutes where
+it is (queue sizes, memory gauges).
 
 In case of a detected issue, mark the verdict as `warning` or `fatal`:
 

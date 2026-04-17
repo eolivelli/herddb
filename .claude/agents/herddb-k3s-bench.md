@@ -139,6 +139,40 @@ If `rfs_readrange_bytes` grows during query phases (not only during
 `--checkpoint`), the disk cache has overflowed and reads are falling through
 to MinIO.
 
+### Bookie metrics (read-only, for supervision)
+
+```
+kubectl --kubeconfig .kubeconfig exec herddb-bookkeeper-0 -- \
+    curl -s http://localhost:8000/metrics
+```
+Key families (all published by the embedded BookKeeper bookie once the
+`BookKeeperMainWrapper` `statsProvider` wiring is in place — new Docker
+image 2026-04-17 onwards; absent on older images, issue #142):
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `bookie_journal_JOURNAL_MEMORY_USED` / `_MAX` | gauge | Journal memory budget pressure. Used÷Max ≥ 0.80 → journal back-pressure imminent |
+| `bookie_journal_JOURNAL_QUEUE_SIZE` | gauge | Pending journal writes (should stay near 0; sustained > 0 → journal not keeping up) |
+| `bookie_journal_JOURNAL_FORCE_WRITE_QUEUE_SIZE` | gauge | Pending fsync batches (same interpretation as above) |
+| `bookie_journal_JOURNAL_WRITE_BYTES` | counter | Total journal bytes; delta per tick = current journal MB/s |
+| `bookie_journal_JOURNAL_SYNC` | opstat | Fsync latency distribution |
+| `bookie_journal_JOURNAL_FLUSH_LATENCY` | opstat | Memory→filesystem flush latency |
+| `bookie_ADD_ENTRY_IN_PROGRESS` | gauge | In-flight addEntry RPCs vs. maxAddsInProgressLimit |
+| `bookie_ADD_ENTRY_BLOCKED` | gauge | Adds currently parked on the backpressure semaphore; non-zero = backpressure engaged on ≥1 channel |
+| `bookie_ADD_ENTRY_REJECTED` | counter | Adds rejected outright (blacklisted channel etc.); growing = fatal |
+| `bookie_SKIP_LIST_THROTTLING` | counter | Memtable-full throttle events; growing = memtable undersized |
+| `bookie_ledger_NUM_OPEN_LEDGERS` | gauge | Open ledgers resident on this bookie; correlates with ledger PVC usage |
+| `bookie_ledger_LEDGERS_LOCATIONS_NUM_ENTRIES` | gauge | Total entries tracked by DbLedgerStorage |
+
+Interpretation rules:
+- Use **deltas** between ticks for the counters (journal write bytes, rejected, skip-list throttling). Absolute values aren't informative.
+- `ADD_ENTRY_BLOCKED > 0` for **one** tick may be transient GC noise. Sustained over ≥ 2 ticks → warning. Combined with rising `JOURNAL_QUEUE_SIZE` or `JOURNAL_MEMORY_USED/MAX > 80%` → fatal-ish; stop-and-collect.
+- If the metric family is absent (old image or older BK release), the agent should omit it silently, not warn.
+
+If names are slightly different in your image (e.g. legacy
+`bookkeeper_server_journal_*` prefix), grep permissively — the code source
+is `bookkeeper-server/…/bookie/stats/*.java` and the shape is stable.
+
 ### Other read-only commands
 
 - `docker image inspect herddb/herddb-server:0.30.0-SNAPSHOT` — verify image
@@ -484,6 +518,9 @@ The agent supervises a running benchmark at ≤60 s cadence. Each tick:
 4. `indexing-admin engine-stats --json` per IS replica — watch `total_estimated_memory_bytes`,
    `tailer_watermark_ledger`, `tailer_watermark_offset`
 5. File-server metrics via `curl http://localhost:9847/metrics` every few ticks
+6. Bookie metrics via `curl http://localhost:8000/metrics` on every tick during ingest/checkpoint — watch
+   `bookie_journal_JOURNAL_MEMORY_USED/MAX`, `bookie_journal_JOURNAL_QUEUE_SIZE`,
+   `bookie_ADD_ENTRY_BLOCKED`, `bookie_ADD_ENTRY_REJECTED`, `bookie_SKIP_LIST_THROTTLING`
 
 ### indexing-admin
 Available as `/usr/local/bin/indexing-admin` in the tools pod. Run via:
