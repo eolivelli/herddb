@@ -35,6 +35,7 @@ import io.netty.buffer.ByteBufInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -784,14 +785,33 @@ public class BookkeeperCommitLog extends CommitLog {
         if (ledgersRetentionPeriod <= 0) {
             return;
         }
+        // Ledgers at or after the last checkpoint LSN are still needed to replay the log
+        // during recovery (see recovery() — it starts reading at lastCheckPoint.ledgerId).
+        // Time-based retention must never delete them. When no checkpoint has happened yet
+        // (START_OF_TIME, ledgerId = -1) the floor is -1 and every active ledger is kept.
+        final long ledgerLimit = Math.min(lastCheckPointSequenceNumber.ledgerId, currentLedgerId);
         LOGGER.log(Level.INFO,
-                "dropOldLedgers lastCheckPointSequenceNumber: {0}, ledgersRetentionPeriod: {1} ,lastLedgerId: {2}, currentLedgerId: {3}, tablespace {4}, actualLedgersList {5}",
-                new Object[]{lastCheckPointSequenceNumber, ledgersRetentionPeriod, lastLedgerId, currentLedgerId, tableSpaceDescription(), actualLedgersList});
+                "dropOldLedgers lastCheckPointSequenceNumber: {0}, ledgersRetentionPeriod: {1}, ledgerLimit: {2}, lastLedgerId: {3}, currentLedgerId: {4}, tablespace {5}, actualLedgersList {6}",
+                new Object[]{lastCheckPointSequenceNumber, ledgersRetentionPeriod, ledgerLimit,
+                        lastLedgerId, currentLedgerId, tableSpaceDescription(), actualLedgersList});
         long min_timestamp = System.currentTimeMillis() - ledgersRetentionPeriod;
         List<Long> oldLedgers = actualLedgersList.getOldLedgers(min_timestamp);
         LOGGER.log(Level.INFO,
                 "dropOldLedgers currentLedgerId: {0}, lastLedgerId: {1}, dropping ledgers before {2}: {3} tablespace {4}",
                 new Object[]{currentLedgerId, lastLedgerId, new java.sql.Timestamp(min_timestamp), oldLedgers, tableSpaceDescription()});
+        List<Long> keptForRecovery = new ArrayList<>();
+        oldLedgers.removeIf(id -> {
+            if (id >= ledgerLimit) {
+                keptForRecovery.add(id);
+                return true;
+            }
+            return false;
+        });
+        if (!keptForRecovery.isEmpty()) {
+            LOGGER.log(Level.INFO,
+                    "dropOldLedgers keeping {0} retention-expired ledger(s) still needed for recovery from checkpoint {1}: {2} tablespace {3}",
+                    new Object[]{keptForRecovery.size(), lastCheckPointSequenceNumber, keptForRecovery, tableSpaceDescription()});
+        }
         oldLedgers.remove(this.currentLedgerId);
         oldLedgers.remove(this.lastLedgerId);
         if (oldLedgers.isEmpty()) {
