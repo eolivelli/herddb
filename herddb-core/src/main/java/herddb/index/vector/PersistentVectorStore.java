@@ -379,6 +379,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     private volatile List<Long> provisionalPageIds;
 
+    /**
+     * Multipart files written during Phase B whose containing checkpoint has
+     * not yet become durable. Each entry is {@code {tableSpace, uuid, fileType}}
+     * and the mirror of {@link #provisionalPageIds} for the multipart API.
+     * If Phase B or Phase C-prep aborts, {@link #rollbackProvisionalArtefacts()}
+     * calls {@link DataStorageManager#deleteMultipartIndexFile} for each entry
+     * so partially-written artefacts do not linger on disk.
+     */
+    private volatile List<String[]> provisionalMultipartFiles;
+
     /** Metric: provisional pages rolled back by the last failure recovery. */
     private final AtomicLong totalRolledBackPages = new AtomicLong(0);
     /** Metric: how many Phase B attempts have failed since the last success. */
@@ -1541,10 +1551,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         // Phase B: build graphs, write to disk (NO lock)
-        // Install a provisional-page tracker BEFORE any writes so the failure path
-        // can reclaim partially-written pages instead of leaking them until the
-        // next (possibly never-arriving) successful checkpoint.
+        // Install provisional-artefact trackers BEFORE any writes so the failure
+        // path can reclaim partially-written pages / multipart files instead of
+        // leaking them until the next (possibly never-arriving) successful
+        // checkpoint.
         this.provisionalPageIds = Collections.synchronizedList(new ArrayList<>());
+        this.provisionalMultipartFiles = Collections.synchronizedList(new ArrayList<>());
         // Reset compaction progress counters so a describe-index sampled
         // mid-Phase-B reflects this checkpoint's totals, not the previous one.
         compactionNodesDone.set(0);
@@ -1566,7 +1578,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         } catch (IOException | RuntimeException e) {
             LOGGER.log(Level.SEVERE, "checkpoint " + indexName + ": Phase B exception", e);
-            rollbackProvisionalPages();
+            rollbackProvisionalArtefacts();
             consecutiveCheckpointFailures.incrementAndGet();
             totalCheckpointFailures.incrementAndGet();
             recoverFromPhaseBFailure(snapshotShards);
@@ -1595,20 +1607,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 dropSegmentBLinkStorage(seg);
             }
             // Phase B had already persisted an IndexStatus containing these new
-            // segments, so the pages are now referenced on disk. We still call
-            // rollbackProvisionalPages as a best-effort to delete them directly;
-            // any that fail to delete will be reconciled by the next successful
-            // indexCheckpoint sweep.
-            rollbackProvisionalPages();
+            // segments, so the artefacts are now referenced on disk. We still
+            // call rollbackProvisionalArtefacts as a best-effort to delete them
+            // directly; any that fail to delete will be reconciled by the next
+            // successful indexCheckpoint sweep.
+            rollbackProvisionalArtefacts();
             consecutiveCheckpointFailures.incrementAndGet();
             totalCheckpointFailures.incrementAndGet();
             recoverFromPhaseBFailure(snapshotShards);
             throw e;
         }
 
-        // Phase B + prep succeeded: the pages belong to the new persisted state.
-        // Clear the tracker without deleting anything, and reset the failure count.
+        // Phase B + prep succeeded: the artefacts belong to the new persisted
+        // state. Clear the trackers without deleting anything, and reset the
+        // failure count.
         this.provisionalPageIds = null;
+        this.provisionalMultipartFiles = null;
         consecutiveCheckpointFailures.set(0);
 
         // Phase C: swap + cleanup (brief write lock)
@@ -2042,14 +2056,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 uploadBytesTotal.addAndGet(graphSize);
                 uploadingActive.incrementAndGet();
                 String graphFilePath;
+                String segUuid = indexUUID + "_seg" + segmentId;
                 try {
                     graphFilePath = dataStorageManager.writeMultipartIndexFile(
                             tableSpaceUUID,
-                            indexUUID + "_seg" + segmentId, "graph",
+                            segUuid, "graph",
                             tempFile, uploadBytesDone::addAndGet);
                 } finally {
                     uploadingActive.decrementAndGet();
                 }
+                trackProvisionalMultipartFile(segUuid, "graph");
 
                 ConcurrentHashMap<Integer, Bytes> ordinalToPk = buildOrdinalToPk(shard);
                 Path mapFile = writeFusedPQMapDataToTempFile(shardView, ordinalToPk);
@@ -2061,11 +2077,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     try {
                         mapFilePath = dataStorageManager.writeMultipartIndexFile(
                                 tableSpaceUUID,
-                                indexUUID + "_seg" + segmentId, "map",
+                                segUuid, "map",
                                 mapFile, uploadBytesDone::addAndGet);
                     } finally {
                         uploadingActive.decrementAndGet();
                     }
+                    trackProvisionalMultipartFile(segUuid, "map");
                     compactionNodesDone.addAndGet(shardSize);
                     return new SegmentWriteResult(segmentId,
                             graphFilePath, graphSize,
@@ -2211,43 +2228,86 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
-     * Deletes any pageIds tracked in {@link #provisionalPageIds}. Called when
-     * Phase B or Phase C-prep aborts before the new state becomes durable so
-     * that the partially-written pages do not linger on disk until the next
-     * successful {@code indexCheckpoint} sweep (which may never arrive if the
-     * disk is full).
+     * Deletes any artefacts tracked in {@link #provisionalPageIds} and
+     * {@link #provisionalMultipartFiles}. Called when Phase B or Phase C-prep
+     * aborts before the new state becomes durable so that the partially-written
+     * pages / multipart files do not linger on disk until the next successful
+     * {@code indexCheckpoint} sweep (which may never arrive if the disk is full).
      *
-     * <p>The method always clears the tracker, whether or not any deletes
+     * <p>The method always clears both trackers, whether or not any deletes
      * succeeded. Delete failures are logged but not rethrown — the failure has
      * already been signalled via the original Phase B exception.
+     *
+     * <p>The {@link #totalRolledBackPages} / {@link #lastRolledBackPages} metrics
+     * count both page-based and multipart-file rollbacks as a single "rolled-back
+     * artefact" unit.
      */
-    private void rollbackProvisionalPages() {
-        List<Long> toRollback = this.provisionalPageIds;
+    private void rollbackProvisionalArtefacts() {
+        List<Long> pageTracker = this.provisionalPageIds;
+        List<String[]> multipartTracker = this.provisionalMultipartFiles;
         this.provisionalPageIds = null;
-        if (toRollback == null || toRollback.isEmpty()) {
-            return;
-        }
-        List<Long> snapshot;
-        synchronized (toRollback) {
-            snapshot = new ArrayList<>(toRollback);
-        }
+        this.provisionalMultipartFiles = null;
+
         int rolled = 0;
         int failed = 0;
-        for (long pageId : snapshot) {
-            try {
-                dataStorageManager.deleteIndexPage(tableSpaceUUID, indexUUID, pageId);
-                rolled++;
-            } catch (DataStorageManagerException e) {
-                failed++;
-                LOGGER.log(Level.WARNING,
-                        "checkpoint " + indexName + ": failed to delete provisional pageId " + pageId, e);
+        if (pageTracker != null && !pageTracker.isEmpty()) {
+            List<Long> snapshot;
+            synchronized (pageTracker) {
+                snapshot = new ArrayList<>(pageTracker);
+            }
+            for (long pageId : snapshot) {
+                try {
+                    dataStorageManager.deleteIndexPage(tableSpaceUUID, indexUUID, pageId);
+                    rolled++;
+                } catch (DataStorageManagerException e) {
+                    failed++;
+                    LOGGER.log(Level.WARNING,
+                            "checkpoint " + indexName + ": failed to delete provisional pageId " + pageId, e);
+                }
+            }
+        }
+        if (multipartTracker != null && !multipartTracker.isEmpty()) {
+            List<String[]> snapshot;
+            synchronized (multipartTracker) {
+                snapshot = new ArrayList<>(multipartTracker);
+            }
+            for (String[] entry : snapshot) {
+                try {
+                    dataStorageManager.deleteMultipartIndexFile(entry[0], entry[1], entry[2]);
+                    rolled++;
+                } catch (DataStorageManagerException e) {
+                    failed++;
+                    LOGGER.log(Level.WARNING,
+                            "checkpoint " + indexName + ": failed to delete provisional multipart file "
+                                    + entry[0] + "/" + entry[1] + "/" + entry[2], e);
+                } catch (RuntimeException e) {
+                    // UnsupportedOperationException from read-replica / BK backends etc.
+                    // We should never reach here with the current backends, but be
+                    // defensive: a broken delete must not crash the rollback path.
+                    failed++;
+                    LOGGER.log(Level.WARNING,
+                            "checkpoint " + indexName + ": failed to delete provisional multipart file "
+                                    + entry[0] + "/" + entry[1] + "/" + entry[2], e);
+                }
             }
         }
         totalRolledBackPages.addAndGet(rolled);
         lastRolledBackPages.set(rolled);
         LOGGER.log(Level.WARNING,
-                "checkpoint {0}: rolled back {1} provisional pages ({2} delete failures)",
+                "checkpoint {0}: rolled back {1} provisional artefacts ({2} delete failures)",
                 new Object[]{indexName, rolled, failed});
+    }
+
+    /**
+     * Records a successfully-written multipart file in the in-flight provisional
+     * tracker (if one is installed). Called by the Phase B segment writers so
+     * that a mid-Phase-B abort can reclaim the partially-written artefacts.
+     */
+    private void trackProvisionalMultipartFile(String uuidWithSeg, String fileType) {
+        List<String[]> tracker = this.provisionalMultipartFiles;
+        if (tracker != null) {
+            tracker.add(new String[]{tableSpaceUUID, uuidWithSeg, fileType});
+        }
     }
 
     /**
@@ -2518,17 +2578,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
             long graphFileSize = Files.size(graphTempFile);
             uploadBytesTotal.addAndGet(graphFileSize);
             String graphFilePath;
+            String segUuid = indexUUID + "_seg" + s.segmentId;
             uploadingActive.incrementAndGet();
             try {
                 graphFilePath = dataStorageManager.writeMultipartIndexFile(
                         tableSpaceUUID,
-                        indexUUID + "_seg" + s.segmentId,
+                        segUuid,
                         "graph",
                         graphTempFile,
                         uploadBytesDone::addAndGet);
             } finally {
                 uploadingActive.decrementAndGet();
             }
+            trackProvisionalMultipartFile(segUuid, "graph");
 
             Path mapTempFile = writeFusedPQMapDataToTempFile(
                     new VectorStorageRandomAccessVectorValues(partStorage, snapshotDimension),
@@ -2541,13 +2603,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 try {
                     mapFilePath = dataStorageManager.writeMultipartIndexFile(
                             tableSpaceUUID,
-                            indexUUID + "_seg" + s.segmentId,
+                            segUuid,
                             "map",
                             mapTempFile,
                             uploadBytesDone::addAndGet);
                 } finally {
                     uploadingActive.decrementAndGet();
                 }
+                trackProvisionalMultipartFile(segUuid, "map");
                 return new SegmentWriteResult(s.segmentId,
                         graphFilePath, graphFileSize,
                         mapFilePath, mapFileSize,

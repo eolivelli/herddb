@@ -30,6 +30,7 @@ import herddb.index.vector.PersistentVectorStore;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
@@ -38,50 +39,61 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.LongConsumer;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 /**
  * Tests for Phase B failure recovery in {@link PersistentVectorStore}:
- * provisional pageIds must be rolled back when a checkpoint Phase B or
- * Phase C-prep aborts, so that leaked pages do not pile up on disk.
+ * provisional multipart files must be rolled back when a checkpoint Phase B or
+ * Phase C-prep aborts, so that leaked artefacts do not pile up on disk.
  */
 public class PersistentVectorStoreFailureRecoveryTest {
 
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
-    /** Counts every {@code writeIndexPage} call and records the live set of pages. */
+    /**
+     * Counts every {@code writeMultipartIndexFile} call and records the live
+     * set of multipart artefacts. Phase B in the multipart-only vector store
+     * no longer writes via {@code writeIndexPage}, so all failure injection
+     * and rollback assertions now work at the multipart level.
+     */
     private static final class TrackingDSM extends MemoryDataStorageManager {
-        final Set<Long> alivePages = ConcurrentHashMap.newKeySet();
+        /** Multipart logical paths currently alive (not deleted). */
+        final Set<String> aliveMultipartFiles = ConcurrentHashMap.newKeySet();
+        /** Number of successful writeMultipartIndexFile calls observed, including the one that was armed to throw. */
         final AtomicInteger writeCount = new AtomicInteger(0);
         final AtomicInteger deleteCount = new AtomicInteger(0);
-        /** If > 0, the Nth writeIndexPage call will throw. 1-indexed. */
+        /** If > 0, the Nth writeMultipartIndexFile call will throw. 1-indexed. */
         volatile int throwOnWriteNumber = -1;
-        /** If non-null, calls to deleteIndexPage throw. */
+        /** If non-null, calls to deleteMultipartIndexFile throw. */
         volatile DataStorageManagerException deleteThrows;
 
         @Override
-        public void writeIndexPage(String tableSpace, String indexName, long pageId, DataWriter writer)
-                throws DataStorageManagerException {
+        public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                              Path tempFile, LongConsumer progress)
+                throws IOException, DataStorageManagerException {
             int n = writeCount.incrementAndGet();
             if (n == throwOnWriteNumber) {
                 throw new DataStorageManagerException("injected write failure at call #" + n);
             }
-            super.writeIndexPage(tableSpace, indexName, pageId, writer);
-            alivePages.add(pageId);
+            String path = super.writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile, progress);
+            aliveMultipartFiles.add(path);
+            return path;
         }
 
         @Override
-        public void deleteIndexPage(String tableSpace, String indexName, long pageId)
+        public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
                 throws DataStorageManagerException {
             deleteCount.incrementAndGet();
             if (deleteThrows != null) {
                 throw deleteThrows;
             }
-            super.deleteIndexPage(tableSpace, indexName, pageId);
-            alivePages.remove(pageId);
+            String key = tableSpace + "/" + uuid + "/" + fileType;
+            super.deleteMultipartIndexFile(tableSpace, uuid, fileType);
+            aliveMultipartFiles.remove(key);
         }
     }
 
@@ -115,8 +127,8 @@ public class PersistentVectorStoreFailureRecoveryTest {
     public void phaseBFailureRollsBackAllProvisionalPages() throws Exception {
         // Arrange: a store that successfully completes one checkpoint (baseline),
         // then a second checkpoint fails partway through Phase B. After the
-        // failure, alivePages should NOT contain any page written by the failed
-        // attempt — everything should roll back to the baseline set.
+        // failure, aliveMultipartFiles should NOT contain any artefact written
+        // by the failed attempt — everything should roll back to the baseline set.
         Path tmpDir = tmpFolder.newFolder().toPath();
         TrackingDSM dsm = new TrackingDSM();
         int dim = 32;
@@ -124,22 +136,23 @@ public class PersistentVectorStoreFailureRecoveryTest {
         try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
             store.start();
             // Two initial batches + two checkpoints to build up multiple sealed
-            // segments, so the next Phase B writes several pages we can
-            // interrupt partway through.
+            // segments, so the next Phase B writes several multipart files we
+            // can interrupt partway through.
             addVectors(store, 300, dim, 1);
             store.checkpoint();
             addVectors(store, 300, dim, 2);
             store.checkpoint();
 
-            Set<Long> baselinePages = new HashSet<>(dsm.alivePages);
+            Set<String> baselineFiles = new HashSet<>(dsm.aliveMultipartFiles);
             int baselineWrites = dsm.writeCount.get();
-            assertFalse("baseline checkpoint should have written pages", baselinePages.isEmpty());
+            assertFalse("baseline checkpoint should have written multipart artefacts",
+                    baselineFiles.isEmpty());
 
             // Add more data. This batch will be bigger so Phase B writes
-            // multiple pages and we can interrupt in the middle.
+            // multiple files and we can interrupt in the middle.
             addVectors(store, 1200, dim, 3);
 
-            // Inject a failure on the 2nd write of the next Phase B.
+            // Inject a failure on the 2nd multipart write of the next Phase B.
             dsm.throwOnWriteNumber = baselineWrites + 2;
 
             try {
@@ -149,10 +162,10 @@ public class PersistentVectorStoreFailureRecoveryTest {
                 // ok
             }
 
-            // Assert: no page written by the failed attempt remains.
-            assertEquals("alive pages must equal the baseline after rollback",
-                    baselinePages, dsm.alivePages);
-            assertTrue("rolled-back pages metric must be > 0",
+            // Assert: no multipart artefact written by the failed attempt remains.
+            assertEquals("alive multipart files must equal the baseline after rollback",
+                    baselineFiles, dsm.aliveMultipartFiles);
+            assertTrue("rolled-back artefact metric must be > 0",
                     store.getTotalRolledBackPages() > 0);
             assertEquals("one consecutive failure recorded",
                     1, store.getConsecutiveCheckpointFailures());
