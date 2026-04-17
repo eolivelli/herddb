@@ -101,6 +101,11 @@ public class SharedSegmentPageCache {
                 return false;
             }
             PageKey k = (PageKey) o;
+            // Fast path: both fields are precomputed in the constructor, so a
+            // hash mismatch is a certain non-equal without touching the strings.
+            if (hash != k.hash) {
+                return false;
+            }
             return pageId == k.pageId
                     && tableSpaceUUID.equals(k.tableSpaceUUID)
                     && indexUUID.equals(k.indexUUID);

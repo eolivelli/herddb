@@ -324,13 +324,21 @@ final class PageStoreReader implements RandomAccessReader {
         }
 
         int cachedPages() {
-            // Caffeine counts may lag on pending writes; force cleanup for tests.
-            cache.cleanUp();
             return (int) cache.estimatedSize();
         }
 
         CacheStats stats() {
             return cache.stats();
+        }
+
+        /**
+         * Forces any pending Caffeine maintenance (eviction, reference-expiration)
+         * to run on the caller's thread. Visible for tests that assert on an
+         * exact post-eviction count; never call from the hot read path — cleanUp
+         * walks the write buffer under a lock and is not cheap.
+         */
+        void drainMaintenance() {
+            cache.cleanUp();
         }
 
         void clearCache() {
@@ -404,6 +412,15 @@ final class PageStoreReader implements RandomAccessReader {
         /** Visible for tests. */
         int getCachedPages() {
             return source.cachedPages();
+        }
+
+        /**
+         * Visible for tests: forces the Caffeine maintenance pass to run so that
+         * {@link #getCachedPages()} and {@code eviction}-related stats reflect a
+         * converged state. Not cheap — never call from production code paths.
+         */
+        void drainCacheMaintenance() {
+            source.drainMaintenance();
         }
 
         /** Visible for tests. */

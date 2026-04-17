@@ -177,6 +177,8 @@ public class PageStoreReaderTest {
             assertTrue("some pages must have missed, got "
                             + (missesAfter - missesBefore),
                     missesAfter - missesBefore >= 4);
+            // Caffeine eviction is async; drain it before asserting a strict count.
+            sup.drainCacheMaintenance();
             assertEquals("LRU must still be bounded", 2, sup.getCachedPages());
         }
     }
@@ -390,7 +392,9 @@ public class PageStoreReaderTest {
                 r.seek(0);
                 r.readFully(buf);
             }
-            // After streaming through all 40 pages with cache of 4, LRU should still be bounded
+            // After streaming through all 40 pages with cache of 4, LRU should still be bounded.
+            // Caffeine eviction is async — drain before asserting a strict count.
+            sup.drainCacheMaintenance();
             assertEquals("cache still bounded after streaming", 4, sup.getCachedPages());
         }
     }
