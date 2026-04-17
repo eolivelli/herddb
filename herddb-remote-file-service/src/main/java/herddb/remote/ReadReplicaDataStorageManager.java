@@ -116,6 +116,23 @@ public class ReadReplicaDataStorageManager extends DataStorageManager {
                 client, logicalPath, fileSize, writeBlockSize, bufferSize, null);
     }
 
+    private static UnsupportedOperationException readOnly(String op) {
+        return new UnsupportedOperationException(
+                op + " is not supported on ReadReplicaDataStorageManager — read replicas never write.");
+    }
+
+    @Override
+    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                          java.nio.file.Path tempFile,
+                                          java.util.function.LongConsumer progress) {
+        throw readOnly("writeMultipartIndexFile");
+    }
+
+    @Override
+    public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType) {
+        throw readOnly("deleteMultipartIndexFile");
+    }
+
     // -------------------------------------------------------------------------
     // Page deserialization (matches FileDataStorageManager format)
     // -------------------------------------------------------------------------

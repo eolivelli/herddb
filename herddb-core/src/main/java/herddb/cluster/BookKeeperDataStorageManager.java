@@ -323,6 +323,41 @@ public class BookKeeperDataStorageManager extends DataStorageManager {
         }
     }
 
+    /**
+     * Vector indexes persist large graph and map artefacts via the multipart
+     * API, which does not map cleanly onto BookKeeper's ledger-per-write
+     * model. The combination is therefore unsupported on purpose — callers
+     * should use a file- or remote-file-based storage manager.
+     */
+    @Override
+    public boolean supportsVectorIndexes() {
+        return false;
+    }
+
+    private static UnsupportedOperationException vectorIndexesUnsupported() {
+        return new UnsupportedOperationException(
+                "Vector indexes are not supported on BookKeeperDataStorageManager. "
+                        + "Use a file- or remote-file-based DataStorageManager.");
+    }
+
+    @Override
+    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                          java.nio.file.Path tempFile,
+                                          java.util.function.LongConsumer progress) {
+        throw vectorIndexesUnsupported();
+    }
+
+    @Override
+    public io.github.jbellis.jvector.disk.ReaderSupplier multipartIndexReaderSupplier(
+            String tableSpace, String uuid, String fileType, long fileSize) {
+        throw vectorIndexesUnsupported();
+    }
+
+    @Override
+    public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType) {
+        throw vectorIndexesUnsupported();
+    }
+
     @Override
     public void eraseTablespaceData(String tableSpace) throws DataStorageManagerException {
         SystemInstrumentation.instrumentationPoint("eraseTablespaceData", tableSpace);

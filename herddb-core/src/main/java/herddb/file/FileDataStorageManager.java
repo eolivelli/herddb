@@ -62,6 +62,7 @@ import java.io.IOError;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.channels.FileChannel;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -1018,6 +1019,333 @@ public class FileDataStorageManager extends DataStorageManager {
             Files.deleteIfExists(pageFile);
         } catch (IOException err) {
             throw new DataStorageManagerException(err);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Multipart large-file support (FusedPQ graphs, map data, etc.)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Default block size for multipart files on local filesystem (256 MiB).
+     * Big blocks keep the per-block fsync / rename overhead low and
+     * limit directory-entry churn for large vector-index artefacts.
+     */
+    public static final int DEFAULT_MULTIPART_BLOCK_SIZE =
+            SystemProperties.getIntSystemProperty("herddb.file.multipart.blocksize", 256 * 1024 * 1024);
+
+    private int multipartBlockSize = DEFAULT_MULTIPART_BLOCK_SIZE;
+
+    /** Visible for tests only — lets a test exercise multi-block behaviour without writing hundreds of MB. */
+    void setMultipartBlockSizeForTests(int blockSize) {
+        if (blockSize <= 0) {
+            throw new IllegalArgumentException("blockSize must be > 0");
+        }
+        this.multipartBlockSize = blockSize;
+    }
+
+    private Path getMultipartDirectory(String tableSpace, String uuid, String fileType) {
+        return getIndexDirectory(tableSpace, uuid).resolve("multipart").resolve(fileType);
+    }
+
+    private static String blockFileName(int blockIndex) {
+        return String.format(java.util.Locale.ROOT, "block-%08d", blockIndex);
+    }
+
+    @Override
+    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                          Path tempFile,
+                                          java.util.function.LongConsumer progress)
+            throws IOException, DataStorageManagerException {
+        Path dir = getMultipartDirectory(tableSpace, uuid, fileType);
+        // Start from a clean directory so previous artefacts do not leak into reads.
+        if (Files.exists(dir)) {
+            Files.walkFileTree(dir, DeleteFileVisitor.INSTANCE);
+        }
+        Files.createDirectories(dir);
+
+        int blockSize = multipartBlockSize;
+        long totalBytes = 0L;
+        int blockIndex = 0;
+        try (FileChannel src = FileChannel.open(tempFile, StandardOpenOption.READ)) {
+            long remaining = src.size();
+            long srcPosition = 0L;
+            while (srcPosition < remaining) {
+                long blockLen = Math.min((long) blockSize, remaining - srcPosition);
+                Path blockFile = dir.resolve(blockFileName(blockIndex));
+                Path blockTmp = dir.resolve(blockFileName(blockIndex) + ".tmp");
+                try (FileChannel dst = FileChannel.open(blockTmp,
+                        StandardOpenOption.WRITE,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING)) {
+                    // transferTo is allowed to move fewer bytes than requested on a
+                    // single call, so loop until the full block has been copied.
+                    long written = 0L;
+                    while (written < blockLen) {
+                        long n = src.transferTo(srcPosition + written, blockLen - written, dst);
+                        if (n <= 0) {
+                            throw new IOException(
+                                    "transferTo stalled at offset " + (srcPosition + written)
+                                            + " while writing " + blockFile);
+                        }
+                        written += n;
+                    }
+                    if (requirefsync) {
+                        dst.force(false);
+                    }
+                }
+                Files.move(blockTmp, blockFile,
+                        StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                if (progress != null && blockLen > 0) {
+                    progress.accept(blockLen);
+                }
+                srcPosition += blockLen;
+                totalBytes += blockLen;
+                blockIndex++;
+            }
+        }
+        // Per-block fsync above already forces block bytes to disk; directory fsync is a
+        // best-effort extra that some filesystems (ext4 with data=ordered) need for
+        // strict rename durability, but the herddb runtime does not require that
+        // here — reads will see the committed block files once the writes return.
+        LOGGER.log(Level.FINE,
+                "writeMultipartIndexFile {0}: {1} bytes in {2} blocks of {3}",
+                new Object[]{dir, totalBytes, blockIndex, blockSize});
+        return dir.toString();
+    }
+
+    @Override
+    public io.github.jbellis.jvector.disk.ReaderSupplier multipartIndexReaderSupplier(
+            String tableSpace, String uuid, String fileType, long fileSize)
+            throws DataStorageManagerException {
+        Path dir = getMultipartDirectory(tableSpace, uuid, fileType);
+        if (!Files.isDirectory(dir)) {
+            throw new DataStorageManagerException("multipart directory not found: " + dir);
+        }
+        // All blocks are the same size except (possibly) the last short tail, so we
+        // infer the block size from block 0. For empty files any positive value works.
+        int blockSize = multipartBlockSize;
+        Path firstBlock = dir.resolve(blockFileName(0));
+        if (Files.isRegularFile(firstBlock)) {
+            long firstBlockSize;
+            try {
+                firstBlockSize = Files.size(firstBlock);
+            } catch (IOException err) {
+                // Reading a file's size is a trivial stat() call on any sane
+                // filesystem — if it fails, the underlying storage is broken
+                // and we should not silently fall back to a possibly wrong
+                // block size, that would produce corrupt reads.
+                throw new DataStorageManagerException(
+                        "Failed to probe block size for " + firstBlock, err);
+            }
+            if (firstBlockSize > 0 && firstBlockSize <= Integer.MAX_VALUE) {
+                blockSize = (int) firstBlockSize;
+            }
+        }
+        return new BlockDirReaderSupplier(dir, fileSize, blockSize);
+    }
+
+    @Override
+    public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
+            throws DataStorageManagerException {
+        Path dir = getMultipartDirectory(tableSpace, uuid, fileType);
+        if (!Files.exists(dir)) {
+            return;
+        }
+        try {
+            Files.walkFileTree(dir, DeleteFileVisitor.INSTANCE);
+        } catch (IOException err) {
+            throw new DataStorageManagerException(err);
+        }
+    }
+
+    /**
+     * {@link io.github.jbellis.jvector.disk.ReaderSupplier} that returns readers
+     * over a directory of fixed-size {@code block-NNNNNNNN} files. The last
+     * block may be shorter. Each {@link #get()} call hands out a fresh
+     * {@link BlockDirReader} with its own per-block {@link java.nio.channels.FileChannel}
+     * cache so readers are independent across threads.
+     */
+    private static final class BlockDirReaderSupplier
+            implements io.github.jbellis.jvector.disk.ReaderSupplier {
+
+        private final Path dir;
+        private final long fileSize;
+        private final int blockSize;
+
+        BlockDirReaderSupplier(Path dir, long fileSize, int blockSize) {
+            this.dir = dir;
+            this.fileSize = fileSize;
+            this.blockSize = blockSize;
+        }
+
+        @Override
+        public io.github.jbellis.jvector.disk.RandomAccessReader get() throws IOException {
+            return new BlockDirReader(dir, fileSize, blockSize);
+        }
+
+        @Override
+        public void close() {
+            // readers own their channels
+        }
+    }
+
+    /**
+     * Random-access reader over a directory of fixed-size block files. Not thread-safe:
+     * jvector creates one per thread via {@link BlockDirReaderSupplier}.
+     */
+    private static final class BlockDirReader
+            implements io.github.jbellis.jvector.disk.RandomAccessReader {
+
+        private final Path dir;
+        private final long fileSize;
+        private final int blockSize;
+        private final java.util.Map<Integer, java.nio.channels.FileChannel> openBlocks =
+                new java.util.HashMap<>();
+        private long position;
+
+        BlockDirReader(Path dir, long fileSize, int blockSize) {
+            this.dir = dir;
+            this.fileSize = fileSize;
+            this.blockSize = blockSize;
+        }
+
+        private java.nio.channels.FileChannel channelFor(int blockIndex) throws IOException {
+            java.nio.channels.FileChannel ch = openBlocks.get(blockIndex);
+            if (ch == null) {
+                Path blockFile = dir.resolve(blockFileName(blockIndex));
+                ch = java.nio.channels.FileChannel.open(blockFile, StandardOpenOption.READ);
+                openBlocks.put(blockIndex, ch);
+            }
+            return ch;
+        }
+
+        @Override
+        public void seek(long offset) {
+            this.position = offset;
+        }
+
+        @Override
+        public long getPosition() {
+            return position;
+        }
+
+        @Override
+        public long length() {
+            return fileSize;
+        }
+
+        @Override
+        public void readFully(byte[] bytes) throws IOException {
+            readFully(bytes, 0, bytes.length);
+        }
+
+        private void readFully(byte[] bytes, int off, int len) throws IOException {
+            int remaining = len;
+            int dst = off;
+            while (remaining > 0) {
+                if (position >= fileSize) {
+                    throw new java.io.EOFException("position " + position + " beyond file size " + fileSize);
+                }
+                int blockIndex = (int) (position / blockSize);
+                int blockOffset = (int) (position % blockSize);
+                int bytesInBlock = blockSize - blockOffset;
+                int toRead = Math.min(remaining, bytesInBlock);
+                long bytesLeftInFile = fileSize - position;
+                if (toRead > bytesLeftInFile) {
+                    toRead = (int) bytesLeftInFile;
+                }
+                java.nio.channels.FileChannel ch = channelFor(blockIndex);
+                java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(bytes, dst, toRead);
+                int read = 0;
+                while (read < toRead) {
+                    int n = ch.read(bb, blockOffset + read);
+                    if (n < 0) {
+                        throw new java.io.EOFException("unexpected EOF in block " + blockIndex);
+                    }
+                    read += n;
+                }
+                position += toRead;
+                dst += toRead;
+                remaining -= toRead;
+            }
+        }
+
+        @Override
+        public void readFully(java.nio.ByteBuffer buffer) throws IOException {
+            int remaining = buffer.remaining();
+            byte[] tmp = new byte[remaining];
+            readFully(tmp);
+            buffer.put(tmp);
+        }
+
+        @Override
+        public void readFully(long[] vector) throws IOException {
+            byte[] bytes = new byte[vector.length * Long.BYTES];
+            readFully(bytes);
+            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.BIG_ENDIAN);
+            for (int i = 0; i < vector.length; i++) {
+                vector[i] = bb.getLong();
+            }
+        }
+
+        @Override
+        public int readInt() throws IOException {
+            byte[] b = new byte[Integer.BYTES];
+            readFully(b);
+            return java.nio.ByteBuffer.wrap(b).order(java.nio.ByteOrder.BIG_ENDIAN).getInt();
+        }
+
+        @Override
+        public long readLong() throws IOException {
+            byte[] b = new byte[Long.BYTES];
+            readFully(b);
+            return java.nio.ByteBuffer.wrap(b).order(java.nio.ByteOrder.BIG_ENDIAN).getLong();
+        }
+
+        @Override
+        public float readFloat() throws IOException {
+            byte[] b = new byte[Float.BYTES];
+            readFully(b);
+            return java.nio.ByteBuffer.wrap(b).order(java.nio.ByteOrder.BIG_ENDIAN).getFloat();
+        }
+
+        @Override
+        public void read(int[] ints, int offset, int count) throws IOException {
+            byte[] bytes = new byte[count * Integer.BYTES];
+            readFully(bytes);
+            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.BIG_ENDIAN);
+            for (int i = 0; i < count; i++) {
+                ints[offset + i] = bb.getInt();
+            }
+        }
+
+        @Override
+        public void read(float[] floats, int offset, int count) throws IOException {
+            byte[] bytes = new byte[count * Float.BYTES];
+            readFully(bytes);
+            java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.BIG_ENDIAN);
+            for (int i = 0; i < count; i++) {
+                floats[offset + i] = bb.getFloat();
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            IOException firstError = null;
+            for (java.nio.channels.FileChannel ch : openBlocks.values()) {
+                try {
+                    ch.close();
+                } catch (IOException e) {
+                    if (firstError == null) {
+                        firstError = e;
+                    }
+                }
+            }
+            openBlocks.clear();
+            if (firstError != null) {
+                throw firstError;
+            }
         }
     }
 

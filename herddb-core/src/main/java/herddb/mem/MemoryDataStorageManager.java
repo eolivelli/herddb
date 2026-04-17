@@ -94,6 +94,7 @@ public class MemoryDataStorageManager extends DataStorageManager {
     private final ConcurrentHashMap<String, byte[]> indexStatuses = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, List<Table>> tablesByTablespace = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, List<Index>> indexesByTablespace = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, byte[]> multipartFiles = new ConcurrentHashMap<>();
 
     @Override
     public int getActualNumberOfPages(String tableSpace, String tableName) throws DataStorageManagerException {
@@ -309,6 +310,69 @@ public class MemoryDataStorageManager extends DataStorageManager {
         indexpages.remove(tableSpace + "." + indexName + "_" + pageId);
     }
 
+    private static String multipartKey(String tableSpace, String uuid, String fileType) {
+        return tableSpace + "/" + uuid + "/" + fileType;
+    }
+
+    @Override
+    public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                          java.nio.file.Path tempFile,
+                                          java.util.function.LongConsumer progress)
+            throws IOException, DataStorageManagerException {
+        byte[] content = java.nio.file.Files.readAllBytes(tempFile);
+        String key = multipartKey(tableSpace, uuid, fileType);
+        multipartFiles.put(key, content);
+        if (progress != null && content.length > 0) {
+            progress.accept(content.length);
+        }
+        return key;
+    }
+
+    @Override
+    public io.github.jbellis.jvector.disk.ReaderSupplier multipartIndexReaderSupplier(
+            String tableSpace, String uuid, String fileType, long fileSize)
+            throws DataStorageManagerException {
+        String key = multipartKey(tableSpace, uuid, fileType);
+        byte[] content = multipartFiles.get(key);
+        if (content == null) {
+            throw new DataStorageManagerException("multipart file not found: " + key);
+        }
+        return new ByteArrayReaderSupplier(content);
+    }
+
+    @Override
+    public void deleteMultipartIndexFile(String tableSpace, String uuid, String fileType)
+            throws DataStorageManagerException {
+        multipartFiles.remove(multipartKey(tableSpace, uuid, fileType));
+    }
+
+    /**
+     * In-memory {@link io.github.jbellis.jvector.disk.ReaderSupplier} backed by a
+     * single {@code byte[]}. Each {@code get()} hands out a fresh
+     * {@link io.github.jbellis.jvector.disk.ByteBufferReader} over a duplicate
+     * view so per-thread readers have independent positions.
+     */
+    private static final class ByteArrayReaderSupplier
+            implements io.github.jbellis.jvector.disk.ReaderSupplier {
+
+        private final byte[] data;
+
+        ByteArrayReaderSupplier(byte[] data) {
+            this.data = data;
+        }
+
+        @Override
+        public io.github.jbellis.jvector.disk.RandomAccessReader get() {
+            return new io.github.jbellis.jvector.disk.ByteBufferReader(
+                    java.nio.ByteBuffer.wrap(data).order(java.nio.ByteOrder.BIG_ENDIAN));
+        }
+
+        @Override
+        public void close() {
+            // nothing to release
+        }
+    }
+
     @Override
     public List<PostCheckpointAction> tableCheckpoint(String tableSpace, String tableName, TableStatus tableStatus, boolean pin) throws DataStorageManagerException {
 
@@ -459,11 +523,14 @@ public class MemoryDataStorageManager extends DataStorageManager {
         indexStatuses.clear();
         tablesByTablespace.clear();
         indexesByTablespace.clear();
+        multipartFiles.clear();
     }
 
     @Override
     public void eraseTablespaceData(String tableSpace) throws DataStorageManagerException {
         tablesByTablespace.remove(tableSpace);
+        String prefix = tableSpace + "/";
+        multipartFiles.keySet().removeIf(k -> k.startsWith(prefix));
     }
 
     @Override

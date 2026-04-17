@@ -29,10 +29,12 @@ import herddb.index.vector.PersistentVectorStore;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.function.LongConsumer;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -159,19 +161,20 @@ public class PersistentVectorStoreParallelPhaseBTest {
     }
 
     /**
-     * A DSM that can be armed to fail on the next write, simulating e.g. ENOSPC
-     * during Phase B. Used to test error propagation and recovery.
+     * A DSM that can be armed to fail on the next multipart write, simulating
+     * e.g. ENOSPC during Phase B. Used to test error propagation and recovery.
      */
     private static final class FailingDSM extends MemoryDataStorageManager {
         volatile boolean shouldFail = false;
 
         @Override
-        public void writeIndexPage(String tableSpace, String indexName, long pageId, DataWriter writer)
-                throws DataStorageManagerException {
+        public String writeMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                              Path tempFile, LongConsumer progress)
+                throws IOException, DataStorageManagerException {
             if (shouldFail) {
                 throw new DataStorageManagerException("injected Phase B write failure");
             }
-            super.writeIndexPage(tableSpace, indexName, pageId, writer);
+            return super.writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile, progress);
         }
     }
 
