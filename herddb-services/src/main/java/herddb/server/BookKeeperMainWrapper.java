@@ -269,7 +269,9 @@ public class BookKeeperMainWrapper implements AutoCloseable {
         }
 
         BookieConfiguration bkConf = new BookieConfiguration(conf);
-        this.embeddedServer = EmbeddedServer.builder(bkConf).build();
+        this.embeddedServer = EmbeddedServer.builder(bkConf)
+                .statsProvider(statsProvider)
+                .build();
         embeddedServer.getLifecycleComponentStack().start();
 
         if (waitForBookieServiceState(Lifecycle.State.STARTED)) {
