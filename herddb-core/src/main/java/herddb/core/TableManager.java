@@ -199,6 +199,14 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     private volatile boolean checkPointRunning = false;
 
     /**
+     * Test-only hook fired inside {@link #checkpoint(double, double, long, long, long, boolean, long)}
+     * after Phase A releases the checkpoint write lock and before Phase B starts flushing pages.
+     * Used by the regression tests for issue #145 to deterministically drive DML that commits
+     * during Phase B. {@code null} in production.
+     */
+    private volatile Runnable duringPhaseBAction;
+
+    /**
      * Allow checkpoint
      */
     private final StampedLock checkpointLock = new StampedLock();
@@ -3464,6 +3472,17 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         /* === PHASE B: No checkpoint lock — DML proceeds concurrently === */
         /* ============================================================== */
 
+        /*
+         * Test-only hook that fires AFTER Phase A releases the checkpoint write lock
+         * but BEFORE Phase B starts flushing pages. Used by the regression tests for
+         * issue #145 to deterministically drive DML that commits during Phase B so
+         * its effects end up in pages flushed by Phase C's remainingNewPages loop.
+         * Production code leaves {@code duringPhaseBAction} null.
+         */
+        if (duringPhaseBAction != null) {
+            duringPhaseBAction.run();
+        }
+
         /* **************************** */
         /* *** Dirty pages handling *** */
         /* **************************** */
@@ -3662,11 +3681,30 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
 
             /*
+             * Re-read the log position AFTER all page flushes (Phase B + Phase C remaining newPages)
+             * completed, under the Phase C write lock. This LSN is an upper bound on the LSN of any
+             * entry whose effect is in a flushed page for THIS table — Phase C just flushed every
+             * remaining dirty page, so at this moment every entry with LSN ≤ postFlushSequenceNumber
+             * that affects this table is persisted.
+             *
+             * Persisting this LSN (rather than the Phase-A snapshot) as TableStatus.sequenceNumber
+             * makes the per-table recovery filter in {@code apply(...)} and
+             * {@code onTransactionCommit(...)} correctly skip entries/commits that were applied to
+             * flushed pages during Phase B — previously those entries could be replayed and
+             * re-applied, tripping duplicate-key {@code IllegalStateException} during recovery of
+             * the tablespace (issue #145).
+             *
+             * Phase C holds checkpointLock.asWriteLock(), so no concurrent DML on this table can
+             * advance the log between this read and the tableStatus write.
+             */
+            final LogSequenceNumber postFlushSequenceNumber = log.getLastSequenceNumber();
+
+            /*
              * Checkpoint the primary key index (BLink tree).
              * The write lock guarantees no threads are modifying the index concurrently,
              * which is required by BLink's checkpoint() contract.
              */
-            actions.addAll(keyToPage.checkpoint(sequenceNumber, pin));
+            actions.addAll(keyToPage.checkpoint(postFlushSequenceNumber, pin));
             maybeWarnOnActionAccumulation(actions);
             keytopagecheckpoint = System.currentTimeMillis();
 
@@ -3678,7 +3716,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
              * entire lifetime of `tableStatus` (it is consumed by
              * dataStorageManager.tableCheckpoint below and discarded).
              */
-            TableStatus tableStatus = new TableStatus(table.name, sequenceNumber,
+            TableStatus tableStatus = new TableStatus(table.name, postFlushSequenceNumber,
                     Bytes.longToByteArray(nextPrimaryKeyValue.get()), nextPageId,
                     pageSet.getActivePagesView());
 
@@ -3697,7 +3735,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
             checkPointRunning = false;
 
-            result = new TableCheckpoint(table.name, sequenceNumber, actions);
+            result = new TableCheckpoint(table.name, postFlushSequenceNumber, actions);
 
             end = System.currentTimeMillis();
             if (flushedRecords > 0) {
@@ -4468,6 +4506,17 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     @Override
     public boolean isStarted() {
         return started;
+    }
+
+    /**
+     * Test-only: install a {@link Runnable} that fires inside
+     * {@link #checkpoint(double, double, long, long, long, boolean, long)} after
+     * Phase A releases the checkpoint write lock and before Phase B begins flushing.
+     * Used by the regression tests for issue #145 to deterministically drive DML
+     * that commits during Phase B.
+     */
+    public void setDuringPhaseBAction(Runnable duringPhaseBAction) {
+        this.duringPhaseBAction = duringPhaseBAction;
     }
 
     @Override
