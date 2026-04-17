@@ -207,6 +207,14 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     private volatile Runnable duringPhaseBAction;
 
     /**
+     * Test-only counter incremented once per page flushed by {@link #drainPendingNewPages()}
+     * <strong>outside</strong> the checkpoint write lock. Lets tests assert that the drain path
+     * absorbed the backlog that accumulated during Phase B + {@code indexManager.checkpoint}.
+     */
+    private final java.util.concurrent.atomic.AtomicLong drainedNewPagesOutsideLock =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /**
      * Allow checkpoint
      */
     private final StampedLock checkpointLock = new StampedLock();
@@ -1020,7 +1028,17 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 recordsFlushed += page.size();
             }
         }
+        drainedNewPagesOutsideLock.addAndGet(snapshot.size());
         return new long[]{pagesFlushed, recordsFlushed};
+    }
+
+    /**
+     * @return number of pages that {@link #drainPendingNewPages()} has flushed outside the
+     *         checkpoint write lock since this {@code TableManager} was instantiated.
+     *         Visible for tests.
+     */
+    long getDrainedNewPagesOutsideLock() {
+        return drainedNewPagesOutsideLock.get();
     }
 
     /**
