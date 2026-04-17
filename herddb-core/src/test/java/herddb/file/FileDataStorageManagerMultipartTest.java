@@ -23,7 +23,6 @@ package herddb.file;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import herddb.storage.DataStorageManagerException;
@@ -237,27 +236,6 @@ public class FileDataStorageManagerMultipartTest {
                     // NoSuchFileException / IOException — surface any kind of IO error, content doesn't matter here
                 }
             }
-        }
-    }
-
-    @Test
-    public void readerSupplierProbeFallsBackOnProbeError() throws Exception {
-        // If block 0 is present but its size cannot be read (e.g. permissions issue),
-        // the reader still boots using the configured default block size. We verify
-        // the happy path that exercises the probe path, then corrupt permissions
-        // only to the extent we can portably, falling back to verifying that any
-        // reader instance still gets a non-null supplier.
-        byte[] payload = makePayload(500);
-        Path tempFile = folder.newFile("x.bin").toPath();
-        Files.write(tempFile, payload);
-        try (FileDataStorageManager dsm = new FileDataStorageManager(folder.newFolder().toPath())) {
-            dsm.initIndex("ts", "idx");
-            dsm.writeMultipartIndexFile("ts", "idx", "graph", tempFile, null);
-
-            ReaderSupplier supplier =
-                    dsm.multipartIndexReaderSupplier("ts", "idx", "graph", payload.length);
-            assertNotNull("supplier must be returned even when probe is only best-effort", supplier);
-            supplier.close();
         }
     }
 

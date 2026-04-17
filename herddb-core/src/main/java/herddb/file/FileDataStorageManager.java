@@ -1127,15 +1127,19 @@ public class FileDataStorageManager extends DataStorageManager {
         int blockSize = multipartBlockSize;
         Path firstBlock = dir.resolve(blockFileName(0));
         if (Files.isRegularFile(firstBlock)) {
+            long firstBlockSize;
             try {
-                long firstBlockSize = Files.size(firstBlock);
-                if (firstBlockSize > 0 && firstBlockSize <= Integer.MAX_VALUE) {
-                    blockSize = (int) firstBlockSize;
-                }
+                firstBlockSize = Files.size(firstBlock);
             } catch (IOException err) {
-                LOGGER.log(Level.WARNING,
-                        "Failed to probe block size for " + firstBlock
-                                + ", falling back to configured default " + blockSize, err);
+                // Reading a file's size is a trivial stat() call on any sane
+                // filesystem — if it fails, the underlying storage is broken
+                // and we should not silently fall back to a possibly wrong
+                // block size, that would produce corrupt reads.
+                throw new DataStorageManagerException(
+                        "Failed to probe block size for " + firstBlock, err);
+            }
+            if (firstBlockSize > 0 && firstBlockSize <= Integer.MAX_VALUE) {
+                blockSize = (int) firstBlockSize;
             }
         }
         return new BlockDirReaderSupplier(dir, fileSize, blockSize);
