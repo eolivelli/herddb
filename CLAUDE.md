@@ -11,6 +11,17 @@ mvn -B checkstyle:check apache-rat:check spotbugs:check install -DskipTests -Pci
 ```
 This matches what `.github/workflows/pr-validation.yml` runs in CI (checkstyle, Apache RAT license headers, SpotBugs).
 
+For any change related to indexes, checkpoints, or concurrency, also run every
+subclass of `DirectMultipleConcurrentUpdatesSuite` (in
+`herddb-core/src/test/java/herddb/server/hammer/`) and make sure they all pass:
+```
+mvn -pl herddb-core -Dtest='DirectMultipleConcurrentUpdatesSuiteNoIndexesTest,DirectMultipleConcurrentUpdatesSuiteWithNonUniqueIndexesTest,DirectMultipleConcurrentUpdatesSuiteWithUniqueIndexesTest' test
+```
+These hammer tests exercise concurrent DML with periodic checkpoints and
+recovery, so they are the main regression gate for the primary-key index, the
+checkpoint pipeline, and transaction isolation. Run them multiple times when
+the first pass is green to reduce the chance of a flake masking a real bug.
+
 ## Test Categories
 Tests that require ZooKeeper/BookKeeper infrastructure (cluster mode) must be annotated with
 `@Category(ClusterTest.class)` (import `herddb.core.ClusterTest` and `org.junit.experimental.categories.Category`).
