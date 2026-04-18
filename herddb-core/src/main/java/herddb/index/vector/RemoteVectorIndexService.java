@@ -24,6 +24,7 @@ import herddb.log.LogSequenceNumber;
 import herddb.utils.Bytes;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * SPI interface for remote vector index search.
@@ -77,6 +78,22 @@ public interface RemoteVectorIndexService extends AutoCloseable {
      * @throws InterruptedException if the waiting thread is interrupted
      */
     boolean waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber, long timeoutMs) throws InterruptedException;
+
+    /**
+     * Returns the minimum LSN across all known IndexingService instances for
+     * the given tablespace — the floor below which commit-log segments must
+     * not be deleted while tailers are active.
+     * <p>
+     * Returns {@link Optional#empty()} when no instances are configured for
+     * this tablespace (no retention constraint). Returns
+     * {@link Optional#of(Object) Optional.of(LogSequenceNumber.START_OF_TIME)}
+     * if any instance is unreachable, which forces maximum retention until
+     * the instance comes back.
+     *
+     * @param tablespace the tablespace whose tailers should be queried
+     * @return the retention floor, or {@link Optional#empty()} when no tailers exist
+     */
+    Optional<LogSequenceNumber> getMinProcessedLsn(String tablespace);
 
     /**
      * Status information for a remote vector index.

@@ -24,23 +24,16 @@ import herddb.model.Statement;
 
 /**
  * Triggers a full checkpoint on all tablespaces.
+ * <p>
+ * The optional second SQL argument ({@code EXECUTE CHECKPOINT 'ts', timeoutSeconds})
+ * is parsed for backward compatibility but no longer has any effect: the checkpoint
+ * no longer blocks on external indexing-service catch-up. Use
+ * {@code EXECUTE WAITFORINDEXES 'ts', timeoutSeconds} as an explicit sync barrier
+ * when clients need to observe a tailer-consistent view.
  */
 public class CheckpointStatement extends Statement {
 
-    public static final long DEFAULT_CATCHUP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-
-    private final long catchUpTimeoutMs;
-
     public CheckpointStatement(String tableSpace) {
-        this(tableSpace, DEFAULT_CATCHUP_TIMEOUT_MS);
-    }
-
-    public CheckpointStatement(String tableSpace, long catchUpTimeoutMs) {
         super(tableSpace);
-        this.catchUpTimeoutMs = catchUpTimeoutMs;
-    }
-
-    public long getCatchUpTimeoutMs() {
-        return catchUpTimeoutMs;
     }
 }

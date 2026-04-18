@@ -111,6 +111,11 @@ public class VectorIndexManagerSearchStreamTest {
         }
 
         @Override
+        public java.util.Optional<LogSequenceNumber> getMinProcessedLsn(String tablespace) {
+            return java.util.Optional.empty();
+        }
+
+        @Override
         public void close() {
             // no-op
         }

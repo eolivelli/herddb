@@ -629,7 +629,7 @@ public class BookKeeperCommitLogTest {
                 info.setLedgersTimestamps(backdated);
                 man.saveActualLedgersList(tableSpaceUUID, info);
 
-                writer.dropOldLedgers(checkpointLsn);
+                writer.dropOldLedgers(checkpointLsn, LogSequenceNumber.START_OF_TIME);
 
                 List<Long> remaining = writer.getActualLedgersList().getActiveLedgers();
                 for (Long id : below) {
@@ -694,11 +694,74 @@ public class BookKeeperCommitLogTest {
                 info.setLedgersTimestamps(backdated);
                 man.saveActualLedgersList(tableSpaceUUID, info);
 
-                writer.dropOldLedgers(LogSequenceNumber.START_OF_TIME);
+                writer.dropOldLedgers(LogSequenceNumber.START_OF_TIME, LogSequenceNumber.START_OF_TIME);
 
                 List<Long> after = writer.getActualLedgersList().getActiveLedgers();
                 assertEquals("no ledgers may be dropped before any checkpoint has happened",
                         before, after);
+            }
+        }
+    }
+
+    /**
+     * A tailers floor below the checkpoint LSN must pin retention at the floor:
+     * ledgers the tailer has not yet processed stay on disk even though the
+     * checkpoint LSN alone would allow dropping them.
+     */
+    @Test
+    public void testDropOldLedgersHonorsTailersFloor() throws Exception {
+        final String tableSpaceUUID = UUID.randomUUID().toString();
+        final String name = TableSpace.DEFAULT;
+        final String nodeid = "nodeid";
+        ServerConfiguration serverConfiguration = newServerConfigurationWithAutoPort();
+        try (ZookeeperMetadataStorageManager man = new ZookeeperMetadataStorageManager(testEnv.getAddress(),
+                testEnv.getTimeout(), testEnv.getPath());
+                BookkeeperCommitLogManager logManager = new BookkeeperCommitLogManager(man, serverConfiguration, NullStatsLogger.INSTANCE)) {
+            logManager.setLedgersRetentionPeriod(1);
+            man.start();
+            logManager.start();
+
+            try (BookkeeperCommitLog writer = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
+                writer.startWriting(1);
+                writer.log(LogEntryFactory.beginTransaction(1), true).getLogSequenceNumber();
+                writer.rollNewLedger();
+                writer.log(LogEntryFactory.beginTransaction(2), true).getLogSequenceNumber();
+                writer.rollNewLedger();
+                writer.log(LogEntryFactory.beginTransaction(3), true).getLogSequenceNumber();
+                writer.rollNewLedger();
+                writer.log(LogEntryFactory.beginTransaction(4), true).getLogSequenceNumber();
+
+                List<Long> ledgerIds = new ArrayList<>(writer.getActualLedgersList().getActiveLedgers());
+                assertTrue("need at least three ledgers, got " + ledgerIds, ledgerIds.size() >= 3);
+
+                // Checkpoint at the last ledger — without a tailer floor, everything
+                // before it would be eligible for deletion.
+                long checkpointLedger = ledgerIds.get(ledgerIds.size() - 1);
+                LogSequenceNumber checkpointLsn = new LogSequenceNumber(checkpointLedger, 0);
+                // Tailer is still reading the first ledger: pin retention there.
+                long tailerLedger = ledgerIds.get(0);
+                LogSequenceNumber tailerFloor = new LogSequenceNumber(tailerLedger, 0);
+
+                // Age every ledger so time-based retention is satisfied.
+                LedgersInfo info = writer.getActualLedgersList();
+                List<Long> backdated = new ArrayList<>();
+                for (int i = 0; i < ledgerIds.size(); i++) {
+                    backdated.add(0L);
+                }
+                info.setLedgersTimestamps(backdated);
+                man.saveActualLedgersList(tableSpaceUUID, info);
+
+                writer.dropOldLedgers(checkpointLsn, tailerFloor);
+
+                List<Long> remaining = writer.getActualLedgersList().getActiveLedgers();
+                assertTrue("ledger " + tailerLedger + " must be kept (tailer still needs it); remaining=" + remaining,
+                        remaining.contains(tailerLedger));
+                for (Long id : ledgerIds) {
+                    if (id >= checkpointLedger) {
+                        assertTrue("ledger " + id + " at/after checkpoint must be kept; remaining=" + remaining,
+                                remaining.contains(id));
+                    }
+                }
             }
         }
     }

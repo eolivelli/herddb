@@ -97,6 +97,7 @@ public class VectorBench {
         // Summary accumulators
         double ingestionWallSecs = -1, indexWallSecs = -1, queryWallSecs = -1;
         double checkpointPostIngestSecs = -1, checkpointPostIndexSecs = -1;
+        double waitForIndexesSecs = -1;
         long ingestionRows = 0;
         double ingestionThroughput = 0;
         MetricsCollector.Stats ingestionLatency = null;
@@ -389,6 +390,19 @@ public class VectorBench {
             });
         }
 
+        // Phase 5c: Wait for external tailers (indexing services) to catch up.
+        // Without this barrier, ANN queries can miss recently inserted vectors because the
+        // VectorIndexManager checkpoint no longer blocks on tailer catch-up.
+        if (config.waitForIndexes) {
+            out.info("Waiting for indexing services to catch up (timeout " + config.waitForIndexesTimeoutSeconds + "s)...");
+            waitForIndexesSecs = runWithProgress(out, "wait_for_indexes", "=== WAIT FOR INDEXES ===", () -> {
+                try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+                     Statement stmt = conn.createStatement()) {
+                    stmt.execute("EXECUTE WAITFORINDEXES 'herd', " + config.waitForIndexesTimeoutSeconds);
+                }
+            });
+        }
+
         // Phase 6: Queries
         out.header("=== QUERY PHASE ===");
         out.phaseStart("query");
@@ -467,6 +481,7 @@ public class VectorBench {
         double totalWallSecs = (System.nanoTime() - benchmarkStartNs) / 1e9;
         emitSummary(out, config, ingestionWallSecs, ingestionRows, ingestionThroughput, ingestionLatency,
                 checkpointPostIngestSecs, indexWallSecs, checkpointPostIndexSecs,
+                waitForIndexesSecs,
                 queryWallSecs, queriesRun, queryThroughput, queryLatency,
                 recall, recallK, recallQueries, totalWallSecs);
 
@@ -487,6 +502,7 @@ public class VectorBench {
                                     double checkpointPostIngestSecs,
                                     double indexWallSecs,
                                     double checkpointPostIndexSecs,
+                                    double waitForIndexesSecs,
                                     double queryWallSecs, long queriesRun, double queryThroughput,
                                     MetricsCollector.Stats queryLatency,
                                     double recall, int recallK, int recallQueries,
@@ -534,6 +550,13 @@ public class VectorBench {
             LinkedHashMap<String, Object> f = new LinkedHashMap<>();
             f.put("wall_time_s", round1(checkpointPostIndexSecs));
             out.phaseEnd("checkpoint_post_index", f);
+        }
+
+        if (waitForIndexesSecs >= 0) {
+            LinkedHashMap<String, Object> f = new LinkedHashMap<>();
+            f.put("wall_time_s", round1(waitForIndexesSecs));
+            f.put("timeout_s", config.waitForIndexesTimeoutSeconds);
+            out.phaseEnd("wait_for_indexes", f);
         }
 
         if (queryLatency != null) {

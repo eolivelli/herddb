@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -126,6 +127,11 @@ public class MockRemoteVectorIndexService implements RemoteVectorIndexService {
     @Override
     public boolean waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber, long timeoutMs) {
         return true; // mock always succeeds immediately
+    }
+
+    @Override
+    public Optional<LogSequenceNumber> getMinProcessedLsn(String tablespace) {
+        return Optional.empty();
     }
 
     @Override

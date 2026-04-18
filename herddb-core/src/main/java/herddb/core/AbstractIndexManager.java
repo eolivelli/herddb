@@ -36,6 +36,7 @@ import herddb.utils.LocalLockManager;
 import java.util.AbstractMap.SimpleImmutableEntry;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Stream;
 
 /**
@@ -148,19 +149,34 @@ public abstract class AbstractIndexManager implements AutoCloseable {
     public abstract List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin) throws DataStorageManagerException;
 
     /**
-     * Ensures that all data is persisted from disk, with a timeout for remote catch-up.
-     * The default implementation delegates to {@link #checkpoint(LogSequenceNumber, boolean)},
-     * ignoring the timeout. Subclasses that need remote synchronization (e.g. vector indexes)
-     * should override this method.
+     * Retention floor for the commit log, in support of external tailers that
+     * consume this index's log entries (e.g. remote indexing services).
+     * Implementations with no external tailer return {@link Optional#empty()}
+     * so the checkpoint LSN alone drives retention. Implementations whose state
+     * lives in external tailers return the minimum LSN currently processed
+     * across all known tailers, or {@link LogSequenceNumber#START_OF_TIME} if
+     * any known tailer is unreachable (forces maximum retention until the
+     * tailer comes back).
      *
-     * @param sequenceNumber the checkpoint LSN
-     * @param pin whether to pin the checkpoint
-     * @param catchUpTimeoutMs maximum time to wait for remote catch-up in milliseconds
-     * @return list of post-checkpoint actions
-     * @throws DataStorageManagerException on storage errors or catch-up timeout
+     * @return the retention floor LSN, or empty when no external tailer exists
      */
-    public List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin, long catchUpTimeoutMs) throws DataStorageManagerException {
-        return checkpoint(sequenceNumber, pin);
+    public Optional<LogSequenceNumber> getTailersMinLsn() {
+        return Optional.empty();
+    }
+
+    /**
+     * Blocks until external tailers for this index have processed the commit
+     * log up to at least {@code targetLsn}, or the timeout expires. The
+     * default implementation is a no-op (returns {@code true}) because most
+     * indexes have no external tailer.
+     *
+     * @param targetLsn the LSN all tailers must reach
+     * @param timeoutMs maximum time to wait in milliseconds
+     * @return {@code true} if all tailers caught up in time, {@code false} on timeout
+     * @throws InterruptedException if the waiting thread is interrupted
+     */
+    public boolean waitForTailersCatchUp(LogSequenceNumber targetLsn, long timeoutMs) throws InterruptedException {
+        return true;
     }
 
     /**

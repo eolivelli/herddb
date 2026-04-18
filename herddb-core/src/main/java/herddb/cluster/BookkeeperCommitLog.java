@@ -781,7 +781,8 @@ public class BookkeeperCommitLog extends CommitLog {
     }
 
     @Override
-    public void dropOldLedgers(LogSequenceNumber lastCheckPointSequenceNumber) throws LogNotAvailableException {
+    public void dropOldLedgers(LogSequenceNumber lastCheckPointSequenceNumber,
+                                LogSequenceNumber tailersFloor) throws LogNotAvailableException {
         if (ledgersRetentionPeriod <= 0) {
             return;
         }
@@ -789,19 +790,31 @@ public class BookkeeperCommitLog extends CommitLog {
         // during recovery (see recovery() — it starts reading at lastCheckPoint.ledgerId).
         // Time-based retention must never delete them. When no checkpoint has happened yet
         // (START_OF_TIME, ledgerId = -1) the floor is -1 and every active ledger is kept.
-        final long ledgerLimit = Math.min(lastCheckPointSequenceNumber.ledgerId, currentLedgerId);
+        long ledgerLimit = Math.min(lastCheckPointSequenceNumber.ledgerId, currentLedgerId);
+        // Honor an external tailers floor (e.g. remote indexing services): we must not
+        // delete ledgers any tailer still needs to read. START_OF_TIME (ledgerId = -1)
+        // means "no tailer constraint" and collapses to the pre-tailer behavior; any
+        // real floor pins retention at min(ledgerLimit, tailersFloor.ledgerId).
+        if (tailersFloor != null && tailersFloor.ledgerId >= 0
+                && tailersFloor.ledgerId < ledgerLimit) {
+            LOGGER.log(Level.INFO,
+                    "dropOldLedgers pinning retention at tailersFloor {0} (was {1}), tablespace {2}",
+                    new Object[]{tailersFloor, ledgerLimit, tableSpaceDescription()});
+            ledgerLimit = tailersFloor.ledgerId;
+        }
         LOGGER.log(Level.INFO,
-                "dropOldLedgers lastCheckPointSequenceNumber: {0}, ledgersRetentionPeriod: {1}, ledgerLimit: {2}, lastLedgerId: {3}, currentLedgerId: {4}, tablespace {5}, actualLedgersList {6}",
-                new Object[]{lastCheckPointSequenceNumber, ledgersRetentionPeriod, ledgerLimit,
+                "dropOldLedgers lastCheckPointSequenceNumber: {0}, tailersFloor: {1}, ledgersRetentionPeriod: {2}, ledgerLimit: {3}, lastLedgerId: {4}, currentLedgerId: {5}, tablespace {6}, actualLedgersList {7}",
+                new Object[]{lastCheckPointSequenceNumber, tailersFloor, ledgersRetentionPeriod, ledgerLimit,
                         lastLedgerId, currentLedgerId, tableSpaceDescription(), actualLedgersList});
         long min_timestamp = System.currentTimeMillis() - ledgersRetentionPeriod;
         List<Long> oldLedgers = actualLedgersList.getOldLedgers(min_timestamp);
         LOGGER.log(Level.INFO,
                 "dropOldLedgers currentLedgerId: {0}, lastLedgerId: {1}, dropping ledgers before {2}: {3} tablespace {4}",
                 new Object[]{currentLedgerId, lastLedgerId, new java.sql.Timestamp(min_timestamp), oldLedgers, tableSpaceDescription()});
+        final long finalLedgerLimit = ledgerLimit;
         List<Long> keptForRecovery = new ArrayList<>();
         oldLedgers.removeIf(id -> {
-            if (id >= ledgerLimit) {
+            if (id >= finalLedgerLimit) {
                 keptForRecovery.add(id);
                 return true;
             }

@@ -63,6 +63,8 @@ public class Config {
     int ingestMaxOpsPerSecond = 100_000; // 0 = unlimited
     int ingestCommitRetries = 3;
     int checkpointTimeoutSeconds = 300;
+    boolean waitForIndexes = false;
+    int waitForIndexesTimeoutSeconds = 600;
     boolean noProgress = false;
     OutputFormat outputFormat = OutputFormat.TEXT;
     /**
@@ -104,6 +106,11 @@ public class Config {
                 "Retries per failed batch commit before failing the run (default: 3, "
                         + "exponential back-off 10s/20s/40s...)");
         opts.addOption(null, "checkpoint-timeout-seconds", true, "Seconds to wait for the Indexing Service to catch up during --checkpoint (default: 300)");
+        opts.addOption(null, "wait-for-indexes", false,
+                "Before running queries, run EXECUTE WAITFORINDEXES to block until all external tailers (indexing services) have caught up. "
+                        + "Required for reliable recall numbers when tailers are in use.");
+        opts.addOption(null, "wait-for-indexes-timeout", true,
+                "Seconds to wait for external tailers to catch up during --wait-for-indexes (default: 600)");
         opts.addOption(null, "no-progress", false,
                 "Disable animated spinner; emit one plain \\n-terminated line per progress sample "
                         + "(implicitly enabled when VECTOR_BENCH_NO_PROGRESS=1 or --output-format=json)");
@@ -220,6 +227,12 @@ public class Config {
         }
         if (cmd.hasOption("checkpoint-timeout-seconds")) {
             cfg.checkpointTimeoutSeconds = Integer.parseInt(cmd.getOptionValue("checkpoint-timeout-seconds"));
+        }
+        if (cmd.hasOption("wait-for-indexes")) {
+            cfg.waitForIndexes = true;
+        }
+        if (cmd.hasOption("wait-for-indexes-timeout")) {
+            cfg.waitForIndexesTimeoutSeconds = Integer.parseInt(cmd.getOptionValue("wait-for-indexes-timeout"));
         }
         if (cmd.hasOption("no-progress")) {
             cfg.noProgress = true;
@@ -345,6 +358,12 @@ public class Config {
         if (props.containsKey("checkpoint-timeout-seconds")) {
             checkpointTimeoutSeconds = Integer.parseInt(props.getProperty("checkpoint-timeout-seconds"));
         }
+        if (props.containsKey("wait-for-indexes")) {
+            waitForIndexes = Boolean.parseBoolean(props.getProperty("wait-for-indexes"));
+        }
+        if (props.containsKey("wait-for-indexes-timeout")) {
+            waitForIndexesTimeoutSeconds = Integer.parseInt(props.getProperty("wait-for-indexes-timeout"));
+        }
         if (props.containsKey("no-progress")) {
             noProgress = Boolean.parseBoolean(props.getProperty("no-progress"));
         }
@@ -429,6 +448,8 @@ public class Config {
                 + ", dropTable=" + dropTable
                 + ", checkpoint=" + checkpoint
                 + ", checkpointTimeoutSeconds=" + checkpointTimeoutSeconds
+                + ", waitForIndexes=" + waitForIndexes
+                + ", waitForIndexesTimeoutSeconds=" + waitForIndexesTimeoutSeconds
                 + ", clientTimeoutSeconds=" + clientTimeoutSeconds
                 + ", noProgress=" + noProgress
                 + ", outputFormat=" + outputFormat

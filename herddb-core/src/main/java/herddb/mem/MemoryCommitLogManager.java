@@ -103,7 +103,8 @@ public class MemoryCommitLogManager extends CommitLogManager {
             }
 
             @Override
-            public void dropOldLedgers(LogSequenceNumber lastCheckPointSequenceNumber) throws LogNotAvailableException {
+            public void dropOldLedgers(LogSequenceNumber lastCheckPointSequenceNumber,
+                                        LogSequenceNumber tailersFloor) throws LogNotAvailableException {
             }
 
             @Override

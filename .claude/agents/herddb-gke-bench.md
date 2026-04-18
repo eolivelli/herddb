@@ -170,7 +170,8 @@ invariants.
 
 ```
 ./scripts/run-bench.sh --dataset sift10k -n 10000 -k 100 \
-    --ingest-max-ops 40000 --ingest-threads 8 --batch-size 10000 --checkpoint
+    --ingest-max-ops 40000 --ingest-threads 8 --batch-size 10000 \
+    --checkpoint --wait-for-indexes
 ```
 
 Rules that apply to every workload, including user-specified ones:
@@ -184,12 +185,18 @@ Rules that apply to every workload, including user-specified ones:
   If the user's command omits any of these flags, add them and tell
   the user you added them.
 - **Recall / query phases must only run AFTER a successful
-  checkpoint.** If the user's command includes a recall phase but no
+  checkpoint AND a `--wait-for-indexes` barrier.** The checkpoint no
+  longer blocks on external indexing-service catch-up, so without
+  `--wait-for-indexes` recall is measured against a partially populated
+  index. If the user's command includes a recall phase but no
   `--checkpoint`, insert `--checkpoint` before the recall flags and
-  tell the user. If the checkpoint phase fails, do NOT proceed to the
+  tell the user. Always pair it with `--wait-for-indexes` (insert if
+  missing). If the checkpoint phase fails, do NOT proceed to the
   recall phase — go to the failure path.
 - **Checkpoint timeout.** Always pass `--checkpoint-timeout-seconds 1800`.
   Never use a lower value.
+- **Wait-for-indexes timeout.** Always pass
+  `--wait-for-indexes-timeout 1800`. Never use a lower value.
 - **Custom datasets** live in `gs://herddb-datasets`. The tools pod
   is pre-configured with `VECTORBENCH_DATASETS_BUCKET=gs://herddb-datasets`
   (via the Helm chart's `tools.gcs.datasetsBucket`). To run a custom
@@ -459,9 +466,12 @@ preserve existing `section` / `timestamp` helpers, and add `--help`
   traces and SEVERE log lines **verbatim**.
 - Never attempt to recover a faulty cluster. Collect, file, stop.
 - Never run recall / query phases before a successful checkpoint.
+- Always pair `--checkpoint` with `--wait-for-indexes` before recall queries;
+  the checkpoint no longer blocks on indexing-service catch-up.
 - Default ingest uses `--ingest-max-ops 40000 --ingest-threads 8 --batch-size 10000`
   unless the user overrides them.
-- Always use `--checkpoint-timeout-seconds 1800`. Never use a lower value.
+- Always use `--checkpoint-timeout-seconds 1800` and
+  `--wait-for-indexes-timeout 1800`. Never use lower values.
 - Long waits (minutes/hours) are acceptable, but supervision MUST
   tick at least every 60 s while a bench is running.
 - Never create a GH issue on success. Issues are for failures or
