@@ -27,7 +27,7 @@ import herddb.core.PostCheckpointAction;
 import herddb.core.RecordSetFactory;
 import herddb.file.FileRecordSetFactory;
 import herddb.index.KeyToPageIndex;
-import herddb.index.blink.BLinkKeyToPageIndex;
+import herddb.index.KeyToPageIndexFactory;
 import herddb.log.LogSequenceNumber;
 import herddb.model.Index;
 import herddb.model.Record;
@@ -1634,7 +1634,7 @@ public class BookKeeperDataStorageManager extends DataStorageManager {
 
     @Override
     public KeyToPageIndex createKeyToPageMap(String tablespace, String name, MemoryManager memoryManager) throws DataStorageManagerException {
-        return new BLinkKeyToPageIndex(tablespace, name, memoryManager, this);
+        return KeyToPageIndexFactory.create(tablespace, name, memoryManager, this);
     }
 
     @Override
