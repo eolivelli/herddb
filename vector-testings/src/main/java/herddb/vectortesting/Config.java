@@ -61,6 +61,7 @@ public class Config {
     boolean indexBeforeIngest = true;
     int resumeFrom = 0; // skip first N vectors; row IDs start from N
     int ingestMaxOpsPerSecond = 100_000; // 0 = unlimited
+    int ingestCommitRetries = 3;
     int checkpointTimeoutSeconds = 300;
     boolean noProgress = false;
     OutputFormat outputFormat = OutputFormat.TEXT;
@@ -92,6 +93,9 @@ public class Config {
         opts.addOption(null, "index-before-ingest", false, "Create vector index before ingestion instead of after");
         opts.addOption(null, "resume-from", true, "Skip first N vectors and start row IDs from N (default: 0)");
         opts.addOption(null, "ingest-max-ops", true, "Max ingestion ops/s across all threads, 0=unlimited (default: 100000)");
+        opts.addOption(null, "ingest-commit-retries", true,
+                "Retries per failed batch commit before failing the run (default: 3, "
+                        + "exponential back-off 10s/20s/40s...)");
         opts.addOption(null, "checkpoint-timeout-seconds", true, "Seconds to wait for the Indexing Service to catch up during --checkpoint (default: 300)");
         opts.addOption(null, "no-progress", false,
                 "Disable animated spinner; emit one plain \\n-terminated line per progress sample "
@@ -201,6 +205,9 @@ public class Config {
         }
         if (cmd.hasOption("ingest-max-ops")) {
             cfg.ingestMaxOpsPerSecond = Integer.parseInt(cmd.getOptionValue("ingest-max-ops"));
+        }
+        if (cmd.hasOption("ingest-commit-retries")) {
+            cfg.ingestCommitRetries = Integer.parseInt(cmd.getOptionValue("ingest-commit-retries"));
         }
         if (cmd.hasOption("checkpoint-timeout-seconds")) {
             cfg.checkpointTimeoutSeconds = Integer.parseInt(cmd.getOptionValue("checkpoint-timeout-seconds"));
@@ -320,6 +327,9 @@ public class Config {
         if (props.containsKey("ingest-max-ops")) {
             ingestMaxOpsPerSecond = Integer.parseInt(props.getProperty("ingest-max-ops"));
         }
+        if (props.containsKey("ingest-commit-retries")) {
+            ingestCommitRetries = Integer.parseInt(props.getProperty("ingest-commit-retries"));
+        }
         if (props.containsKey("checkpoint-timeout-seconds")) {
             checkpointTimeoutSeconds = Integer.parseInt(props.getProperty("checkpoint-timeout-seconds"));
         }
@@ -396,6 +406,7 @@ public class Config {
                 + (similarity != null ? " (override)" : " (dataset default)")
                 + (resumeFrom > 0 ? ", resumeFrom=" + resumeFrom : "")
                 + ", ingestMaxOpsPerSecond=" + (ingestMaxOpsPerSecond > 0 ? ingestMaxOpsPerSecond : "unlimited")
+                + ", ingestCommitRetries=" + ingestCommitRetries
                 + ", indexBeforeIngest=" + indexBeforeIngest
                 + ", skipIngest=" + skipIngest
                 + ", skipIndex=" + skipIndex
