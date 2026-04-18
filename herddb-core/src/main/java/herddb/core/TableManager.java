@@ -970,7 +970,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
             case ALREADY_FLUSHED:
                 /* Already flushed (and possibly unloaded) by another thread */
-                LOGGER.log(Level.INFO, "New page {0} already flushed in a concurrent thread", page.pageId);
+                LOGGER.log(Level.FINE, "New page {0} already flushed in a concurrent thread", page.pageId);
                 return;
 
             case EMPTY_FLUSH:
@@ -1086,7 +1086,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         try {
 
             if (!page.writable) {
-                LOGGER.log(Level.INFO, "Mutable page {0} already flushed in a concurrent thread", page.pageId);
+                LOGGER.log(Level.FINE, "Mutable page {0} already flushed in a concurrent thread", page.pageId);
                 return FlushNewPageResult.ALREADY_FLUSHED;
             }
 
@@ -1102,7 +1102,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         lock.lock();
         try {
             if (!page.writable) {
-                LOGGER.log(Level.INFO, "Mutable page {0} already flushed in a concurrent thread", page.pageId);
+                LOGGER.log(Level.FINE, "Mutable page {0} already flushed in a concurrent thread", page.pageId);
                 return FlushNewPageResult.ALREADY_FLUSHED;
             }
 
@@ -3236,6 +3236,12 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
         long buildingPageSize = buildingPage.getUsedMemory();
 
+        /* Progress tracking for issue #165: emit periodic INFO during long Phase B runs. */
+        final long loopStart = System.currentTimeMillis();
+        long nextProgressLogAt = loopStart + 30_000L;
+        int processedPages = 0;
+        final int totalPages = workingPages.size();
+
         /* Building page lock (not needed on clean small pages) */
         Lock lock = null;
 
@@ -3459,6 +3465,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                         }
                     }
 
+                }
+
+                processedPages++;
+                final long nowMs = System.currentTimeMillis();
+                if (processedPages % 1000 == 0 || nowMs >= nextProgressLogAt) {
+                    LOGGER.log(Level.INFO,
+                            "checkpoint {0}.{1} Phase B progress: {2}/{3} pages flushed, {4} records, elapsed {5} ms",
+                            new Object[]{table.tablespace, table.name, processedPages, totalPages,
+                                    flushedRecords, nowMs - loopStart});
+                    nextProgressLogAt = nowMs + 30_000L;
                 }
 
                 /* Do not continue if we have used up all given time */
@@ -3754,9 +3770,17 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
          * page. Phase C's final flush loop still runs under the write lock to preserve the
          * issue #46 invariant.
          */
+        final long drainStart = System.currentTimeMillis();
+        LOGGER.log(Level.INFO,
+                "checkpoint {0}.{1} draining pending new pages before Phase C (post-index elapsed {2} ms)",
+                new Object[]{table.tablespace, table.name, drainStart - indexcheckpoint});
         long[] drainedCounts = drainPendingNewPages();
         flushedNewPages += (int) drainedCounts[0];
         flushedRecords += drainedCounts[1];
+        LOGGER.log(Level.INFO,
+                "checkpoint {0}.{1} drain complete: {2} pages, {3} records in {4} ms",
+                new Object[]{table.tablespace, table.name, drainedCounts[0], drainedCounts[1],
+                        System.currentTimeMillis() - drainStart});
 
 
         /* ================================================================== */
@@ -3876,9 +3900,17 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
              * The write lock guarantees no threads are modifying the index concurrently,
              * which is required by BLink's checkpoint() contract.
              */
+            final long keyToPageStart = System.currentTimeMillis();
+            LOGGER.log(Level.INFO,
+                    "checkpoint {0}.{1} Phase C: checkpointing PK index at {2} ({3} active pages)",
+                    new Object[]{table.tablespace, table.name, postFlushSequenceNumber,
+                            pageSet.getActivePagesCount()});
             actions.addAll(keyToPage.checkpoint(postFlushSequenceNumber, pin));
             maybeWarnOnActionAccumulation(actions);
             keytopagecheckpoint = System.currentTimeMillis();
+            LOGGER.log(Level.INFO,
+                    "checkpoint {0}.{1} Phase C: PK index checkpoint done in {2} ms",
+                    new Object[]{table.tablespace, table.name, keytopagecheckpoint - keyToPageStart});
 
             pageSet.checkpointDone(flushedPages);
 
@@ -3892,9 +3924,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                     Bytes.longToByteArray(nextPrimaryKeyValue.get()), nextPageId,
                     pageSet.getActivePagesView());
 
+            final long tableStatusStart = System.currentTimeMillis();
+            LOGGER.log(Level.INFO,
+                    "checkpoint {0}.{1} Phase C: writing table status to storage ({2} active pages)",
+                    new Object[]{table.tablespace, table.name, pageSet.getActivePagesCount()});
             actions.addAll(dataStorageManager.tableCheckpoint(tableSpaceUUID, table.uuid, tableStatus, pin));
             maybeWarnOnActionAccumulation(actions);
             tablecheckpoint = System.currentTimeMillis();
+            LOGGER.log(Level.INFO,
+                    "checkpoint {0}.{1} Phase C: table status written in {2} ms",
+                    new Object[]{table.tablespace, table.name, tablecheckpoint - tableStatusStart});
 
             /*
              * Can happen when at checkpoint start all pages are set as dirty or immutable (immutable or

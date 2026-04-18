@@ -2571,13 +2571,35 @@ public class TableSpaceManager {
 
                     /* *** Phase C: write checkpoint marker — no tablespace lock needed *** */
                     // we are sure that all data has been flushed. upon recovery we will replay the log starting from this position
+                    final long writeCheckpointStart = System.currentTimeMillis();
+                    LOGGER.log(Level.INFO,
+                            "{0} checkpoint {1} Phase C: writing checkpoint sequence number {2} to storage",
+                            new Object[]{nodeId, tableSpaceName, logSequenceNumber});
                     actions.addAll(dataStorageManager.writeCheckpointSequenceNumber(tableSpaceUUID, logSequenceNumber));
+                    LOGGER.log(Level.INFO,
+                            "{0} checkpoint {1} Phase C: checkpoint sequence number written in {2} ms",
+                            new Object[]{nodeId, tableSpaceName,
+                                    System.currentTimeMillis() - writeCheckpointStart});
 
                     /* Indexes checkpoint is handled by TableManagers */
                     if (leader) {
+                        final long dropStart = System.currentTimeMillis();
+                        LOGGER.log(Level.INFO,
+                                "{0} checkpoint {1}: dropping old ledgers before {2}",
+                                new Object[]{nodeId, tableSpaceName, logSequenceNumber});
                         log.dropOldLedgers(logSequenceNumber);
+                        LOGGER.log(Level.INFO,
+                                "{0} checkpoint {1}: old ledger drop complete in {2} ms",
+                                new Object[]{nodeId, tableSpaceName, System.currentTimeMillis() - dropStart});
                         // Notify shared-storage read replicas of the new checkpoint
+                        final long publishStart = System.currentTimeMillis();
                         publishCheckpointLsnToMetadata(logSequenceNumber);
+                        final long publishElapsed = System.currentTimeMillis() - publishStart;
+                        if (publishElapsed > 1000) {
+                            LOGGER.log(Level.INFO,
+                                    "{0} checkpoint {1}: published checkpoint LSN to metadata in {2} ms",
+                                    new Object[]{nodeId, tableSpaceName, publishElapsed});
+                        }
                     }
 
                     _logSequenceNumber = log.getLastSequenceNumber();
