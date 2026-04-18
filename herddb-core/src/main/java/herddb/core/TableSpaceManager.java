@@ -199,6 +199,20 @@ public class TableSpaceManager {
     private volatile boolean failed;
     private LogSequenceNumber actualLogSequenceNumber;
 
+    /**
+     * LSN durably flushed by the last completed checkpoint. {@code null} until the first checkpoint finishes.
+     * Populated in the {@code finally} block of {@link #checkpoint(boolean, boolean, boolean, long)}.
+     */
+    private volatile LogSequenceNumber lastCheckpointSequenceNumber;
+    /**
+     * Wall-clock timestamp (epoch millis) when the last checkpoint completed; {@code 0} until the first one.
+     */
+    private volatile long lastCheckpointTimestamp;
+    /**
+     * Duration in milliseconds of the last completed checkpoint; {@code 0} until the first one.
+     */
+    private volatile long lastCheckpointDurationMs;
+
     // only for tests
     private Runnable afterTableCheckPointAction;
 
@@ -2585,6 +2599,13 @@ public class TableSpaceManager {
             LOGGER.log(Level.INFO, "{0} checkpoint finish {1} started ad {2}, finished at {3}, total time {4} ms",
                     new Object[]{nodeId, tableSpaceName, logSequenceNumber, _logSequenceNumber, Long.toString(_stop - _start)});
             checkpointTimeStats.registerSuccessfulEvent(_stop, TimeUnit.MILLISECONDS);
+            // Record per-tablespace checkpoint status for syslogstatus. Only update when we actually
+            // persisted a checkpoint marker (logSequenceNumber is non-null and not start-of-time).
+            if (logSequenceNumber != null && !logSequenceNumber.isStartOfTime()) {
+                this.lastCheckpointSequenceNumber = logSequenceNumber;
+                this.lastCheckpointTimestamp = _stop;
+                this.lastCheckpointDurationMs = _stop - _start;
+            }
         }
     }
 
@@ -2879,6 +2900,29 @@ public class TableSpaceManager {
 
     public CommitLog getLog() {
         return log;
+    }
+
+    /**
+     * LSN durably flushed by the last completed checkpoint, or {@code null} if no checkpoint has
+     * completed yet on this node (fresh tablespace, empty log, or recovery still running).
+     */
+    public LogSequenceNumber getLastCheckpointSequenceNumber() {
+        return lastCheckpointSequenceNumber;
+    }
+
+    /**
+     * Wall-clock time (epoch millis) when the last checkpoint completed, or {@code 0} if no
+     * checkpoint has completed yet on this node.
+     */
+    public long getLastCheckpointTimestamp() {
+        return lastCheckpointTimestamp;
+    }
+
+    /**
+     * Duration (ms) of the last completed checkpoint, or {@code 0} if no checkpoint has completed.
+     */
+    public long getLastCheckpointDurationMs() {
+        return lastCheckpointDurationMs;
     }
 
     public ExecutorService getCallbacksExecutor() {

@@ -239,6 +239,57 @@ class BenchOutputTest {
     }
 
     @Test
+    void plainStatusEmitsFlattenedKeyValueLine() {
+        ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        BenchOutput.PlainBenchOutput out = new BenchOutput.PlainBenchOutput(printStream(sink));
+
+        LinkedHashMap<String, Object> commitlog = new LinkedHashMap<>();
+        commitlog.put("ledger", 145L);
+        commitlog.put("offset", 12345L);
+        LinkedHashMap<String, Object> checkpoint = new LinkedHashMap<>();
+        checkpoint.put("ledger", 130L);
+        checkpoint.put("lag_ledgers", 15);
+        LinkedHashMap<String, Object> fields = new LinkedHashMap<>();
+        fields.put("commitlog", commitlog);
+        fields.put("checkpoint", checkpoint);
+
+        out.status("ingest", 1200.0, fields);
+
+        String captured = captureUtf8(sink).trim();
+        assertTrue(captured.startsWith("[status] phase=ingest"),
+                "status line must start with [status] tag; got: " + captured);
+        assertTrue(captured.contains("elapsed_s=1200"));
+        assertTrue(captured.contains("commitlog_ledger=145"));
+        assertTrue(captured.contains("commitlog_offset=12345"));
+        assertTrue(captured.contains("checkpoint_ledger=130"));
+        assertTrue(captured.contains("checkpoint_lag_ledgers=15"));
+    }
+
+    @Test
+    void jsonStatusEventHasNestedStructure() throws Exception {
+        ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        BenchOutput.JsonBenchOutput out = new BenchOutput.JsonBenchOutput(printStream(sink));
+
+        LinkedHashMap<String, Object> commitlog = new LinkedHashMap<>();
+        commitlog.put("ledger", 145L);
+        commitlog.put("offset", 12345L);
+        LinkedHashMap<String, Object> fields = new LinkedHashMap<>();
+        fields.put("commitlog", commitlog);
+
+        out.status("ingest", 1200.0, fields);
+
+        String captured = captureUtf8(sink).trim();
+        JsonNode node = MAPPER.readTree(captured);
+        assertEquals("status", node.get("event").asText());
+        assertEquals("ingest", node.get("phase").asText());
+        assertEquals(1200.0, node.get("elapsed_s").asDouble(), 0.001);
+        JsonNode cl = node.get("commitlog");
+        assertNotNull(cl, "commitlog object must survive JSON serialization: " + captured);
+        assertEquals(145L, cl.get("ledger").asLong());
+        assertEquals(12345L, cl.get("offset").asLong());
+    }
+
+    @Test
     void jsonSuppressesTextHeadersAndInfo() throws Exception {
         ByteArrayOutputStream sink = new ByteArrayOutputStream();
         BenchOutput.JsonBenchOutput out = new BenchOutput.JsonBenchOutput(printStream(sink));
