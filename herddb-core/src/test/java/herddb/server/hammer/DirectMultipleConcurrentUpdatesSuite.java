@@ -43,6 +43,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -79,6 +80,10 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
         serverConfiguration.set(ServerConfiguration.PROPERTY_LOGDIR, folder.newFolder().getAbsolutePath());
 
         ConcurrentHashMap<String, Long> expectedValue = new ConcurrentHashMap<>();
+        // issue #157: per-key history of writes (thread, op, tx, oldValue -> newValue) — dumped
+        // when erroredKeys is non-empty so we can match stale reads against the actual sequence
+        // of committed writes. CopyOnWriteArrayList keeps appends from different threads safe.
+        ConcurrentHashMap<String, List<String>> writeHistory = new ConcurrentHashMap<>();
         try (Server server = new Server(serverConfiguration)) {
             server.start();
             server.waitForStandaloneBoot();
@@ -156,6 +161,13 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
                                                                   commitTransaction(manager, TableSpace.DEFAULT, transactionId);
                                                               }
                                                               expectedValue.put(key, value);
+                                                              writeHistory
+                                                                      .computeIfAbsent(key, unused -> new CopyOnWriteArrayList<>())
+                                                                      .add(String.format("t=%d tid=%d %s %d->%d",
+                                                                              Thread.currentThread().getId(),
+                                                                              transactionId,
+                                                                              update ? "UPD" : "GET",
+                                                                              actual, value));
 
                                                           } catch (Exception err) {
                                                               throw new RuntimeException(err);
@@ -187,6 +199,9 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
                         System.out.println("expected value " + data.get("n1") + ", but got " + Long.valueOf(entry.getValue()) + " for key " + entry.getKey());
                         erroredKeys.add(entry.getKey());
                     }
+                }
+                if (!erroredKeys.isEmpty()) {
+                    dumpHistory("PRE-RESTART", erroredKeys, expectedValue, writeHistory);
                 }
                 assertTrue(erroredKeys.isEmpty());
 
@@ -225,7 +240,33 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
                     erroredKeys.add(entry.getKey());
                 }
             }
+            if (!erroredKeys.isEmpty()) {
+                dumpHistory("POST-RESTART", erroredKeys, expectedValue, writeHistory);
+            }
             assertTrue(erroredKeys.isEmpty());
         }
+    }
+
+    /**
+     * Diagnostics for issue #157. Print the full writer-thread history for every key that the
+     * final scan returned a stale value for. "expected" is the last value any thread put into
+     * {@code expectedValue}; the dump lets us correlate it with the (threadId, txId, oldValue,
+     * newValue) sequence of committed writes on the same key.
+     */
+    private static void dumpHistory(
+            String stage,
+            List<String> erroredKeys,
+            Map<String, Long> expectedValue,
+            Map<String, List<String>> writeHistory) {
+        System.out.println("=== issue-157 diagnostics [" + stage + "] — " + erroredKeys.size() + " errored keys ===");
+        for (String key : erroredKeys) {
+            Long expected = expectedValue.get(key);
+            List<String> history = writeHistory.getOrDefault(key, Collections.emptyList());
+            System.out.println("  key=" + key + " expected=" + expected + " history(" + history.size() + "):");
+            for (String h : history) {
+                System.out.println("    " + h);
+            }
+        }
+        System.out.println("=== end issue-157 diagnostics [" + stage + "] ===");
     }
 }
