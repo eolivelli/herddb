@@ -80,20 +80,9 @@ server:
     # also reduce the per-checkpoint catch-up backlog that was the root cause
     # of issue #145 (LSN mismatch after a 25-min waitForInstanceCatchUp).
     server.checkpoint.period: "60000"                          # 1 min (ms)
-    # --- BookKeeper client resilience tuning (issue #152) ---
-    # Default addEntryTimeoutSec=5 is too short: the single bookie can stall
-    # for 7-10 s during simultaneous entry-log rotation + journal roll (burst
-    # of 4 fsyncs observed at bigann 28% ingest). After 5 s the BK client
-    # fires handleBookieFailure() → ensembleChangeLoop() → with only one
-    # bookie available the ensemble change always fails with
-    # BKNotEnoughBookiesException → commitlog is permanently marked failed.
-    # 30 s gives 3-4× headroom over the worst observed stall with no risk of
-    # masking real bookie crashes (those take much longer or never recover).
-    # addEntryQuorumTimeoutSec caps the overall per-write wall-clock time;
-    # set to 2× addEntryTimeoutSec so a genuinely stuck bookie eventually
-    # surfaces as a hard error rather than hanging forever.
-    bookkeeper.addEntryTimeoutSec: "30"
-    bookkeeper.addEntryQuorumTimeoutSec: "60"
+    # BookKeeper client resilience tuning (addEntryTimeoutSec=30,
+    # addEntryQuorumTimeoutSec=60) is now the BookkeeperCommitLogManager
+    # default — see issue #152.
   resources:
     requests:
       memory: "23Gi"
