@@ -61,13 +61,15 @@ server:
   extraConfig:
     indexing.service.timeout: "300"
     # --- BookKeeper commit-log tuning (experiment for issues #141 / #145) ---
-    # Default max ledger size is 1 GiB (BookkeeperCommitLog.maxLedgerSizeBytes,
-    # defaulted from ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_MAX_SIZE).
-    # At bigann's ~200 B/entry that is ~5–7 M INSERTs per ledger, so by the
-    # time the scheduled checkpoint fires (~15 min) the cluster has a handful
-    # of fat ledgers pinned on the single bookie. Force more frequent
-    # rollovers so each ledger is smaller and can be dropped sooner.
-    server.bookkeeper.ledgers.max.size: "134217728"            # 128 MiB
+    # Ledger max size raised to 10 GiB (from 128 MiB) for bigann 100M ingest.
+    # At 128 MiB (~200 B/entry × 640k entries/ledger) the server rolled a new
+    # ledger every ~30 s under 20k ops/s, writing an ever-growing activeLedgers
+    # list to ZooKeeper on every roll. By the time 162 ledgers had accumulated
+    # the ZK write latency contributed to a ZK session expiry (issue #160).
+    # With 10 GiB ledgers (~50 M entries each) the server creates ~2 ledgers
+    # per hour instead of ~120, dramatically reducing ZK write frequency and
+    # activeLedgers list growth.
+    server.bookkeeper.ledgers.max.size: "10737418240"          # 10 GiB
     # Default retention is 2 days (1000*60*60*24*2 ms). On a 30-min bench
     # that's "never" — closed ledgers pile up on the bookie's ledgers PVC
     # and keep per-ledger state alive in the bookie's memtable/file-handle
@@ -80,9 +82,17 @@ server:
     # also reduce the per-checkpoint catch-up backlog that was the root cause
     # of issue #145 (LSN mismatch after a 25-min waitForInstanceCatchUp).
     server.checkpoint.period: "60000"                          # 1 min (ms)
-    # BookKeeper client resilience tuning (addEntryTimeoutSec=30,
-    # addEntryQuorumTimeoutSec=60) is now the BookkeeperCommitLogManager
-    # default — see issue #152.
+    # --- BookKeeper client resilience tuning (issues #152, #164) ---
+    # The code default (issue #152) is now addEntryTimeoutSec=30 /
+    # addEntryQuorumTimeoutSec=60. Overridden here to 3600/7200 s because
+    # checkpoint-induced bookie fsync stalls in the bigann 100M run reached
+    # 309 s (issue #164). With only one bookie, any timeout triggers
+    # ensemble-change → BKNotEnoughBookiesException → permanent commit-log
+    # failure. 3600 s effectively disables the per-entry timeout for benchmark
+    # purposes; a truly dead bookie will be detected by ZooKeeper session
+    # expiry (30 s default) + pod restart, not by addEntry timeout.
+    bookkeeper.addEntryTimeoutSec: "3600"
+    bookkeeper.addEntryQuorumTimeoutSec: "7200"
   resources:
     requests:
       memory: "23Gi"
@@ -190,6 +200,19 @@ bookkeeper:
     # Raised to FINE so the write-processor DEBUG lines above reach the console.
     java.util.logging.ConsoleHandler.level = FINE
     java.util.logging.ConsoleHandler.formatter = java.util.logging.SimpleFormatter
+  # Disable bookie journal fsync (journalSyncData=false) for benchmark use.
+  # With journalSyncData=true (default), the bookie calls fdatasync() after
+  # every journal flush batch — a single fsync during a checkpoint-induced I/O
+  # burst can stall for 300+ s, triggering addEntry timeouts and
+  # BKNotEnoughBookiesException (issue #164). With journalSyncData=false the
+  # bookie acknowledges entries after writing to the OS page cache (no fsync).
+  # journalPageCacheFlushIntervalMSec controls how often the page cache is
+  # flushed to disk (default: 1000 ms); data is still durably written, just
+  # not synchronously confirmed. Risk: on OS crash buffered-but-unsynced journal
+  # entries may be lost — acceptable for vector benchmarks.
+  extraConfig:
+    journalSyncData: "false"
+    journalPageCacheFlushIntervalMSec: "1000"
   # Journal PVC raised to 100 Gi (from 1 Gi) for long-running bigann ingests:
   # the 2026-04-17 bigann 100M run saw the ledger PVC hit 16 GB by 27% progress,
   # so the journal also needs significant headroom for in-flight writes and
