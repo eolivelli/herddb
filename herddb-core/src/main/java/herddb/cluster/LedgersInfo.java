@@ -21,6 +21,7 @@
 package herddb.cluster;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import herddb.utils.MetadataCompression;
 import herddb.utils.SimpleByteArrayInputStream;
 import herddb.utils.VisibleByteArrayOutputStream;
 import java.io.IOException;
@@ -66,10 +67,9 @@ public class LedgersInfo {
 
     public synchronized byte[] serialize() {
         try {
-
             VisibleByteArrayOutputStream oo = new VisibleByteArrayOutputStream();
             MAPPER.writeValue(oo, this);
-            return oo.toByteArray();
+            return MetadataCompression.compressGzip(oo.toByteArray());
         } catch (IOException impossible) {
             throw new RuntimeException(impossible);
         }
@@ -82,7 +82,10 @@ public class LedgersInfo {
             return info;
         }
         try {
-            LedgersInfo info = MAPPER.readValue(new SimpleByteArrayInputStream(data), LedgersInfo.class);
+            byte[] json = MetadataCompression.looksGzip(data)
+                    ? MetadataCompression.decompressGzip(data)
+                    : data;
+            LedgersInfo info = MAPPER.readValue(new SimpleByteArrayInputStream(json), LedgersInfo.class);
             info.setZkVersion(zkVersion);
             return info;
         } catch (IOException impossible) {

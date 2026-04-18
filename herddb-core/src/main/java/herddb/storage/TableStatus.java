@@ -26,6 +26,9 @@ import herddb.log.LogSequenceNumber;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataInputStream;
 import herddb.utils.ExtendedDataOutputStream;
+import herddb.utils.MetadataCompression;
+import herddb.utils.SimpleByteArrayInputStream;
+import herddb.utils.VisibleByteArrayOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
@@ -64,9 +67,26 @@ public class TableStatus {
         this.nextPageId = nextPageId;
     }
 
+    /**
+     * {@code flags} bit 0: the remaining payload (everything after the flags
+     * field) is written as a single length-prefixed GZIP-compressed byte
+     * array. Keeps per-checkpoint on-disk / znode size bounded even when
+     * {@link #activePages} grows to thousands of entries.
+     */
+    static final long FLAG_COMPRESSED = 0x1L;
+
     public void serialize(ExtendedDataOutputStream output) throws IOException {
         output.writeVLong(1); // version
-        output.writeVLong(0); // flags for future implementations
+        output.writeVLong(FLAG_COMPRESSED); // flags
+
+        VisibleByteArrayOutputStream payload = new VisibleByteArrayOutputStream();
+        try (ExtendedDataOutputStream inner = new ExtendedDataOutputStream(payload)) {
+            writePayload(inner);
+        }
+        output.writeArray(MetadataCompression.compressGzip(payload.toByteArray()));
+    }
+
+    private void writePayload(ExtendedDataOutputStream output) throws IOException {
         output.writeUTF(tableName);
         output.writeLong(sequenceNumber.ledgerId);
         output.writeLong(sequenceNumber.offset);
@@ -84,10 +104,25 @@ public class TableStatus {
 
     public static TableStatus deserialize(ExtendedDataInputStream in) throws IOException {
         long version = in.readVLong(); // version
-        long flags = in.readVLong(); // flags for future implementations
-        if (version != 1 || flags != 0) {
-            throw new DataStorageManagerException("corrupted table status");
+        long flags = in.readVLong(); // flags
+        if (version != 1) {
+            throw new DataStorageManagerException("corrupted table status (version " + version + ")");
         }
+        if ((flags & ~FLAG_COMPRESSED) != 0) {
+            throw new DataStorageManagerException("corrupted table status (unknown flags " + flags + ")");
+        }
+        if ((flags & FLAG_COMPRESSED) != 0) {
+            byte[] compressed = in.readArray();
+            byte[] raw = MetadataCompression.decompressGzip(compressed);
+            try (ExtendedDataInputStream inner = new ExtendedDataInputStream(new SimpleByteArrayInputStream(raw))) {
+                return readPayload(inner);
+            }
+        }
+        // Legacy path: plain payload follows the flags field directly.
+        return readPayload(in);
+    }
+
+    private static TableStatus readPayload(ExtendedDataInputStream in) throws IOException {
         String tableName = in.readUTF();
         long ledgerId = in.readLong();
         long offset = in.readLong();
