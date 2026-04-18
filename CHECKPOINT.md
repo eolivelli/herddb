@@ -276,23 +276,46 @@ A `DataPage` transitions:
 
 ### BLink Primary-Key Index
 
-The BLink tree (`BLinkKeyToPageIndex`) maps primary keys → page IDs. It is checkpointed in
-**Phase C** under the `checkpointLock` write lock.
+The BLink tree maps primary keys → page IDs and is checkpointed in **Phase C**
+under the `checkpointLock` write lock.
+
+Since release 0.30 there are **two** BLink implementations selected at boot by
+the `herddb.index.pk.mode` system property (default `incremental`):
+
+- **Legacy** — `BLinkKeyToPageIndex`. Serialises the full tree node list into
+  `IndexStatus.indexData` on every checkpoint. Cost per checkpoint is O(N) in
+  tree size.
+- **Incremental** — `IncrementalBLinkKeyToPageIndex`. Writes a small manifest
+  plus one delta-log page per checkpoint, with periodic snapshot refresh.
+  Cost per (non-snapshot) checkpoint is O(changes since the previous checkpoint).
+
+Both use the same in-memory `BLink` tree and the same node-page byte layout —
+they differ only in how checkpoint metadata is persisted. Full format details
+are in [BLINK.md](./BLINK.md).
 
 ```mermaid
 flowchart LR
-    PC[Phase C write lock] --> BL["BLink.checkpoint()\nserialises all tree nodes\nto BLinkMetadata"]
-    BL --> DS[DataStorageManager.indexCheckpoint\nIndexStatus = metadata + LSN]
-    DS --> POST[PostCheckpointAction:\ndelete old BLink pages]
+    PC[Phase C write lock] --> BL["BLink.checkpoint()\nproduces full node-metadata list"]
+    BL -->|legacy| LEG["BLinkKeyToPageIndex\nserialises all nodes\ninto IndexStatus.indexData"]
+    BL -->|incremental| INC["IncrementalBLinkKeyToPageIndex\ndiffs against previous state\nwrites small manifest + delta page\n(periodic snapshot refresh)"]
+    LEG --> DS[DataStorageManager.indexCheckpoint\nIndexStatus]
+    INC --> DS
+    DS --> POST[PostCheckpointAction:\ndelete pages not in preserve set]
 ```
 
-**Why Phase C?** The BLink checkpoint serialises the entire tree structure. It requires
-no concurrent structural modifications (key inserts/deletes during serialisation would
-invalidate the serialised state). The write lock guarantees this. Because BLink is a
-B-tree-like structure with per-node read/write locks, its checkpoint is relatively fast.
+**Why Phase C?** The BLink checkpoint iterates the tree structure. It requires
+no concurrent structural modifications (key inserts/deletes during serialisation
+would invalidate the returned state). The write lock guarantees this. Because
+BLink is a B-tree-like structure with per-node read/write locks, its checkpoint
+is relatively fast.
 
-**DML interaction**: Key inserts/deletes happen under the DML read lock on `checkpointLock`,
-so they cannot overlap with Phase C.
+**DML interaction**: Key inserts/deletes happen under the DML read lock on
+`checkpointLock`, so they cannot overlap with Phase C.
+
+**Format mismatch**: if on-disk metadata was written with one mode and the
+JVM is configured for the other, `start()` fails fast with a clear error
+message pointing to the `herddb.index.pk.mode` system property. See
+[BLINK.md §4.8](./BLINK.md#48-format-mismatch-detection).
 
 ---
 

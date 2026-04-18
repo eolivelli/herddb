@@ -26,7 +26,7 @@ import herddb.core.RecordSetFactory;
 import herddb.file.FileDataStorageManager;
 import herddb.file.FileRecordSetFactory;
 import herddb.index.KeyToPageIndex;
-import herddb.index.blink.BLinkKeyToPageIndex;
+import herddb.index.KeyToPageIndexFactory;
 import herddb.log.LogSequenceNumber;
 import herddb.model.Index;
 import herddb.model.Record;
@@ -954,7 +954,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     @Override
     public KeyToPageIndex createKeyToPageMap(String tableSpace, String uuid,
             MemoryManager memoryManager) throws DataStorageManagerException {
-        return new BLinkKeyToPageIndex(tableSpace, uuid, memoryManager, this);
+        return KeyToPageIndexFactory.create(tableSpace, uuid, memoryManager, this);
     }
 
     @Override
