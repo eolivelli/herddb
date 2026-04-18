@@ -33,10 +33,13 @@ public class MetricsCollector {
     private final LongAdder count = new LongAdder();
     private final long[] reservoir = new long[MAX_SAMPLES];
     private final AtomicLong samplesStored = new AtomicLong(0);
+    /** Nanoseconds of the most recently recorded event; 0 when none recorded yet. */
+    private final AtomicLong lastNanos = new AtomicLong(0);
 
     public void record(long nanos) {
         long n = count.longValue() + 1; // approximate position before increment
         count.increment();
+        lastNanos.set(nanos);
         long stored = samplesStored.get();
         if (stored < MAX_SAMPLES) {
             // Fill reservoir sequentially until full
@@ -55,6 +58,11 @@ public class MetricsCollector {
 
     public long getCount() {
         return count.sum();
+    }
+
+    /** Nanoseconds of the most recently recorded event; 0 when none recorded yet. */
+    public long getLastNanos() {
+        return lastNanos.get();
     }
 
     public Stats computeStats() {

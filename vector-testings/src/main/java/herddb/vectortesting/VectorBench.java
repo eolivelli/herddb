@@ -249,6 +249,50 @@ public class VectorBench {
             progressThread.setDaemon(true);
             progressThread.start();
 
+            // Optional status thread: every statusIntervalSeconds, query the server's
+            // syslogstatus/systablestats/sysindexstatus tables and emit a [status] line.
+            // Independent of the progress thread so slow server queries don't stall progress.
+            Thread statusThread = null;
+            if (config.statusIntervalSeconds > 0) {
+                final long statusIntervalMs = (long) config.statusIntervalSeconds * 1000L;
+                final MetricsCollector ingestMetricsForStatus = ingestMetrics;
+                final long ingestStartForStatus = ingestStart;
+                final AtomicLong commitsTotalForStatus = commitsTotal;
+                final AtomicLong commitsRecoveredForStatus = commitsRecovered;
+                statusThread = new Thread(() -> {
+                    ServerStatusSampler sampler = new ServerStatusSampler(config);
+                    long nextSample = System.currentTimeMillis() + statusIntervalMs;
+                    while (!ingestDone.get()) {
+                        try {
+                            long now = System.currentTimeMillis();
+                            if (now < nextSample) {
+                                Thread.sleep(Math.min(500L, nextSample - now));
+                                continue;
+                            }
+                            nextSample = now + statusIntervalMs;
+                            LinkedHashMap<String, Object> fields = sampler.sample();
+                            LinkedHashMap<String, Object> commits = new LinkedHashMap<>();
+                            commits.put("total", commitsTotalForStatus.get());
+                            commits.put("recovered", commitsRecoveredForStatus.get());
+                            MetricsCollector.Stats s = ingestMetricsForStatus.computeStats();
+                            commits.put("last_ms", round2(ingestMetricsForStatus.getLastNanos() / 1e6));
+                            commits.put("avg_ms", round2(s.meanNanos() / 1e6));
+                            commits.put("p50_ms", round2(s.p50Nanos() / 1e6));
+                            commits.put("p99_ms", round2(s.p99Nanos() / 1e6));
+                            commits.put("max_ms", round2(s.maxNanos() / 1e6));
+                            fields.put("commits", commits);
+                            double elapsed = (System.nanoTime() - ingestStartForStatus) / 1e9;
+                            out.status("ingest", elapsed, fields);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                }, "vector-bench-status");
+                statusThread.setDaemon(true);
+                statusThread.start();
+            }
+
             try (DatasetLoader.VectorStream stream = loader.streamBaseVectors(config.resumeFrom, toIngest)) {
                 for (float[] vec : stream) {
                     ingestQueue.put(vec);
@@ -263,6 +307,9 @@ public class VectorBench {
 
             ingestDone.set(true);
             progressThread.join();
+            if (statusThread != null) {
+                statusThread.join();
+            }
             double ingestSecs = (System.nanoTime() - ingestStart) / 1e9;
             out.phaseDone("ingest", ingestSecs);
 

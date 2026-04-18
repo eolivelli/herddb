@@ -60,6 +60,14 @@ abstract class BenchOutput {
      */
     abstract void progress(String phase, double elapsedSecs, String statusLine, LinkedHashMap<String, Object> fields);
 
+    /**
+     * Emits a server-status snapshot, structurally similar to {@link #progress} but always
+     * visible (no rate-limiting, no spinner). Used by the dedicated status thread that
+     * dumps {@code syslogstatus} / {@code systablestats} / {@code sysindexstatus} during
+     * ingestion.
+     */
+    abstract void status(String phase, double elapsedSecs, LinkedHashMap<String, Object> fields);
+
     /** Prints the "done in NNs" line at the end of a phase. */
     abstract void phaseDone(String phase, double elapsedSecs);
 
@@ -151,6 +159,15 @@ abstract class BenchOutput {
         }
 
         @Override
+        void status(String phase, double elapsedSecs, LinkedHashMap<String, Object> fields) {
+            // Print on its own line so the spinner's \r-overwrite doesn't clobber it, and so
+            // the next spinner update redraws cleanly.
+            out.println();
+            out.println("  [status] " + PlainBenchOutput.formatStatusLine(phase, elapsedSecs, fields));
+            out.flush();
+        }
+
+        @Override
         void phaseEnd(String phase, LinkedHashMap<String, Object> fields) {
             out.println(PlainBenchOutput.formatPhaseLine(phase, fields));
         }
@@ -239,6 +256,11 @@ abstract class BenchOutput {
         }
 
         @Override
+        void status(String phase, double elapsedSecs, LinkedHashMap<String, Object> fields) {
+            out.println("  [status] " + formatStatusLine(phase, elapsedSecs, fields));
+        }
+
+        @Override
         void phaseEnd(String phase, LinkedHashMap<String, Object> fields) {
             out.println(formatPhaseLine(phase, fields));
         }
@@ -266,6 +288,35 @@ abstract class BenchOutput {
                 all.putAll(fields);
             }
             return renderKeyValues(all);
+        }
+
+        static String formatStatusLine(String phase, double elapsedSecs, LinkedHashMap<String, Object> fields) {
+            LinkedHashMap<String, Object> all = new LinkedHashMap<>();
+            all.put("phase", phase);
+            all.put("elapsed_s", roundOneDecimal(elapsedSecs));
+            if (fields != null) {
+                flattenInto(all, "", fields);
+            }
+            return renderKeyValues(all);
+        }
+
+        /**
+         * Flattens a potentially nested {@code fields} map into {@code target}, joining
+         * nested keys with {@code _}. Example: {@code {"commitlog":{"ledger":145}}} becomes
+         * {@code commitlog_ledger=145}. This keeps the status line's human-readable shape
+         * stable regardless of how callers nest data for the JSON event.
+         */
+        @SuppressWarnings("unchecked")
+        private static void flattenInto(LinkedHashMap<String, Object> target, String prefix, Map<String, Object> fields) {
+            for (Map.Entry<String, Object> e : fields.entrySet()) {
+                String key = prefix.isEmpty() ? e.getKey() : prefix + "_" + e.getKey();
+                Object v = e.getValue();
+                if (v instanceof Map) {
+                    flattenInto(target, key, (Map<String, Object>) v);
+                } else {
+                    target.put(key, v);
+                }
+            }
         }
 
         static String formatSummary(LinkedHashMap<String, Object> fields) {
@@ -412,6 +463,18 @@ abstract class BenchOutput {
         @Override
         void phaseDone(String phase, double elapsedSecs) {
             // phase_end carries the definitive metrics; a bare "done" is noise in NDJSON.
+        }
+
+        @Override
+        void status(String phase, double elapsedSecs, LinkedHashMap<String, Object> fields) {
+            LinkedHashMap<String, Object> m = new LinkedHashMap<>();
+            m.put("event", "status");
+            m.put("phase", phase);
+            m.put("elapsed_s", elapsedSecs);
+            if (fields != null) {
+                m.putAll(fields);
+            }
+            write(m);
         }
 
         @Override

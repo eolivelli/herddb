@@ -65,6 +65,13 @@ public class Config {
     int checkpointTimeoutSeconds = 300;
     boolean noProgress = false;
     OutputFormat outputFormat = OutputFormat.TEXT;
+    /**
+     * Interval in seconds between periodic {@code [status]} dumps during ingestion.
+     * A dedicated JDBC connection queries {@code syslogstatus}, {@code systablestats} and
+     * {@code sysindexstatus} every {@code N} seconds so checkpoint / index-tail lag is
+     * visible in the run log. {@code 0} disables the status thread entirely.
+     */
+    int statusIntervalSeconds = 60;
 
     private static Options buildOptions() {
         Options opts = new Options();
@@ -102,6 +109,8 @@ public class Config {
                         + "(implicitly enabled when VECTOR_BENCH_NO_PROGRESS=1 or --output-format=json)");
         opts.addOption(null, "output-format", true,
                 "Output format: text (default) or json (NDJSON, one object per line). json implies --no-progress.");
+        opts.addOption(null, "status-interval-seconds", true,
+                "Seconds between server-status dumps during ingestion; 0 disables (default: 60)");
         opts.addOption(null, "config", true, "Path to properties file");
         opts.addOption("h", "help", false, "Show help");
         return opts;
@@ -217,6 +226,9 @@ public class Config {
         }
         if (cmd.hasOption("output-format")) {
             cfg.outputFormat = parseOutputFormat(cmd.getOptionValue("output-format"));
+        }
+        if (cmd.hasOption("status-interval-seconds")) {
+            cfg.statusIntervalSeconds = Integer.parseInt(cmd.getOptionValue("status-interval-seconds"));
         }
 
         // Env var fallbacks (only applied when the CLI flag was not set).
@@ -339,6 +351,9 @@ public class Config {
         if (props.containsKey("output-format")) {
             outputFormat = parseOutputFormat(props.getProperty("output-format"));
         }
+        if (props.containsKey("status-interval-seconds")) {
+            statusIntervalSeconds = Integer.parseInt(props.getProperty("status-interval-seconds"));
+        }
     }
 
     private static OutputFormat parseOutputFormat(String raw) {
@@ -417,6 +432,7 @@ public class Config {
                 + ", clientTimeoutSeconds=" + clientTimeoutSeconds
                 + ", noProgress=" + noProgress
                 + ", outputFormat=" + outputFormat
+                + ", statusIntervalSeconds=" + statusIntervalSeconds
                 + '}';
     }
 }
