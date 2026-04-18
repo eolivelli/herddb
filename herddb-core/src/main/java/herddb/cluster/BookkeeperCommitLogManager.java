@@ -20,6 +20,7 @@
 
 package herddb.cluster;
 
+import com.google.common.annotations.VisibleForTesting;
 import herddb.log.CommitLogManager;
 import herddb.log.LogEntry;
 import herddb.log.LogNotAvailableException;
@@ -51,6 +52,20 @@ import org.apache.bookkeeper.stats.StatsLogger;
  */
 public class BookkeeperCommitLogManager extends CommitLogManager {
 
+    /**
+     * Default BK client {@code addEntryTimeoutSec} applied by HerdDB. Overrides the
+     * BookKeeper built-in default of 5s, which is too short to survive simultaneous
+     * entry-log rotation + journal roll bursts on a single bookie (issue #152).
+     */
+    static final int DEFAULT_ADD_ENTRY_TIMEOUT_SEC = 30;
+
+    /**
+     * Default BK client {@code addEntryQuorumTimeoutSec} applied by HerdDB. Caps the
+     * overall wall-clock of a single add-entry quorum at 2x the per-bookie timeout
+     * so a genuinely stuck bookie eventually surfaces as a hard error (issue #152).
+     */
+    static final int DEFAULT_ADD_ENTRY_QUORUM_TIMEOUT_SEC = 60;
+
     private final ZookeeperMetadataStorageManager metadataStorageManager;
     private int ensemble = 1;
     private int writeQuorumSize = 1;
@@ -78,6 +93,16 @@ public class BookkeeperCommitLogManager extends CommitLogManager {
                 ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT));
         config.setEnableParallelRecoveryRead(true);
         config.setEnableDigestTypeAutodetection(true);
+
+        // BookKeeper's built-in addEntryTimeoutSec default (5s) is too short for bursts of
+        // simultaneous entry-log rotation + journal roll on a single bookie, which has been
+        // observed to stall writes for 7-10s (issue #152). 30s gives ~6x headroom and
+        // addEntryQuorumTimeoutSec=60s caps the overall wall-clock so a genuinely stuck
+        // bookie surfaces as an error. Applied before the property passthrough loop so that
+        // explicit bookkeeper.addEntryTimeoutSec / bookkeeper.addEntryQuorumTimeoutSec values
+        // in the server configuration still win.
+        config.setAddEntryTimeout(DEFAULT_ADD_ENTRY_TIMEOUT_SEC);
+        config.setAddEntryQuorumTimeout(DEFAULT_ADD_ENTRY_QUORUM_TIMEOUT_SEC);
 
         /* Setups values from configuration */
         for (String key : serverConfiguration.keys()) {
@@ -112,6 +137,11 @@ public class BookkeeperCommitLogManager extends CommitLogManager {
 
     public BookKeeper getBookKeeper() {
         return bookKeeper;
+    }
+
+    @VisibleForTesting
+    ClientConfiguration getClientConfiguration() {
+        return config;
     }
 
     private void forceLastAddConfirmed() {
