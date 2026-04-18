@@ -221,15 +221,21 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     private final StampedLock checkpointLock = new StampedLock();
 
     /**
-     * LSN of the last transactional commit whose apply to this table's pages has fully
-     * completed. Phase C reads this — rather than {@code log.getLastSequenceNumber()} —
-     * as {@code TableStatus.sequenceNumber}. See issue #157: log.getLastSequenceNumber
+     * LSN of the last log entry whose apply to this table's pages has fully completed.
+     * Phase C reads this — rather than {@code log.getLastSequenceNumber()} — as
+     * {@code TableStatus.sequenceNumber}. See issue #157: log.getLastSequenceNumber
      * can return the LSN of a commit whose apply is still waiting on the checkpoint
      * read lock; persisting that LSN would cause recovery to silently skip the commit
-     * after a restart (its change is not yet in any flushed page). Updated at the end
-     * of {@link #onTransactionCommit}, under the checkpoint read lock and after every
-     * applyInsert/applyUpdate/applyDelete for the transaction is done. Monotonic via
-     * {@link AtomicReference#updateAndGet}.
+     * after a restart (its change is not yet in any flushed page). Updated:
+     * <ul>
+     *   <li>At the end of {@link #onTransactionCommit} (under the checkpoint read
+     *       lock), with the transaction's COMMIT LSN, after every applyInsert/
+     *       applyUpdate/applyDelete for the transaction is done.</li>
+     *   <li>At the end of {@link #apply} for entries with {@code transactionId == 0}
+     *       (non-transactional DML and TRUNCATE), with the entry's LSN, after the
+     *       apply has touched pages.</li>
+     * </ul>
+     * Monotonic via {@link AtomicReference#updateAndGet}.
      */
     private final AtomicReference<LogSequenceNumber> lastAppliedSequenceNumber =
             new AtomicReference<>(LogSequenceNumber.START_OF_TIME);
@@ -2379,6 +2385,28 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             break;
             default:
                 throw new IllegalArgumentException("unhandled entry type " + entry.type);
+        }
+
+        /*
+         * Publish this entry's LSN into lastAppliedSequenceNumber for the same reason as
+         * {@link #onTransactionCommit}: Phase C uses this field as postFlushSequenceNumber, and
+         * it must cover every entry whose effect is in memory before Phase C reads it. We reach
+         * here for non-transactional DML (INSERT/UPDATE/DELETE with transactionId == 0, which
+         * runs applyInsert/applyUpdate/applyDelete inline) and for TRUNCATE (always logged with
+         * transactionId == 0 by {@link herddb.log.LogEntryFactory#truncate}). Transactional DML
+         * takes the "register-with-transaction" path earlier in the switch and does NOT touch
+         * pages, so the counter is bumped from {@code onTransactionCommit} instead.
+         *
+         * Entries filtered out by the recovery filter at lines ~2216/~2245 took an early
+         * {@code return} above and never reach this point, so we don't advance the counter for
+         * them — correct, since their effect is already in flushed pages from a prior run.
+         * See issue #157.
+         */
+        if (entry.transactionId == 0) {
+            final LogSequenceNumber entryLsn = writeResult.getLogSequenceNumber();
+            if (entryLsn != null) {
+                lastAppliedSequenceNumber.updateAndGet(cur -> entryLsn.after(cur) ? entryLsn : cur);
+            }
         }
 
     }
