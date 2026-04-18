@@ -207,6 +207,14 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     private volatile Runnable duringPhaseBAction;
 
     /**
+     * Test-only counter incremented once per page flushed by {@link #drainPendingNewPages()}
+     * <strong>outside</strong> the checkpoint write lock. Lets tests assert that the drain path
+     * absorbed the backlog that accumulated during Phase B + {@code indexManager.checkpoint}.
+     */
+    private final java.util.concurrent.atomic.AtomicLong drainedNewPagesOutsideLock =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /**
      * Allow checkpoint
      */
     private final StampedLock checkpointLock = new StampedLock();
@@ -963,6 +971,74 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
      */
     private boolean flushNewPageForUnload(DataPage page) {
         return FlushNewPageResult.FLUSHED == flushNewPage(page, null);
+    }
+
+    /**
+     * Flush whatever is in {@link #newPages} outside the checkpoint write lock.
+     *
+     * <p>The checkpoint write lock is acquired briefly, only long enough to snapshot
+     * {@code newPages} and rotate {@link #currentDirtyRecordsPage} to a fresh mutable
+     * page via {@link #createNewPage(long)} — same pattern as Phase A. After the rotate,
+     * every page in the snapshot is immutable (no DML can target them because
+     * {@link #allocateLivePage} checks against the new current page id), so
+     * {@link #flushNewPageForCheckpoint} can safely run outside {@code checkpointLock}.
+     * Concurrent commits proceed while the potentially I/O-heavy flush runs.
+     *
+     * <p>Used by Phase C to absorb the backlog of pages accumulated while Phase B and
+     * {@link AbstractIndexManager#checkpoint} ran (the latter can spend minutes in
+     * {@code waitForCatchUp}). Without this drain, Phase C's write-lock window grows
+     * proportionally to ingest throughput × checkpoint duration and starves commits on
+     * {@link #CHECKPOINT_LOCK_READ_TIMEOUT}.
+     *
+     * <p>This does NOT guarantee {@code newPages} is empty on return: concurrent DML
+     * after the rotate can create new pages. Phase C still performs a final flush pass
+     * under the write lock to preserve the issue #46 invariant
+     * ({@code newPages} must be empty before {@code keyToPage.checkpoint()}).
+     *
+     * @return {@code { pagesFlushed, recordsFlushed }} for non-empty pages in the
+     *         snapshot, so the caller can add them to the checkpoint stats.
+     */
+    private long[] drainPendingNewPages() throws DataStorageManagerException {
+        List<DataPage> snapshot;
+        boolean lockAcquired;
+        try {
+            lockAcquired = checkpointLock.asWriteLock().tryLock(CHECKPOINT_LOCK_WRITE_TIMEOUT, TimeUnit.SECONDS);
+        } catch (InterruptedException err) {
+            throw new DataStorageManagerException("interrupted while waiting for checkpoint lock (drain newPages)", err);
+        }
+        if (!lockAcquired) {
+            throw new DataStorageManagerException("timed out while waiting for checkpoint lock (drain newPages), write lock "
+                    + checkpointLock.writeLock());
+        }
+        try {
+            if (newPages.isEmpty()) {
+                return new long[]{0, 0};
+            }
+            snapshot = new ArrayList<>(newPages.values());
+            createNewPage(nextPageId++);
+        } finally {
+            checkpointLock.asWriteLock().unlock();
+        }
+        long pagesFlushed = 0;
+        long recordsFlushed = 0;
+        for (DataPage page : snapshot) {
+            flushNewPageForCheckpoint(page, null);
+            if (!page.isEmpty()) {
+                ++pagesFlushed;
+                recordsFlushed += page.size();
+            }
+        }
+        drainedNewPagesOutsideLock.addAndGet(snapshot.size());
+        return new long[]{pagesFlushed, recordsFlushed};
+    }
+
+    /**
+     * @return number of pages that {@link #drainPendingNewPages()} has flushed outside the
+     *         checkpoint write lock since this {@code TableManager} was instantiated.
+     *         Visible for tests.
+     */
+    long getDrainedNewPagesOutsideLock() {
+        return drainedNewPagesOutsideLock.get();
     }
 
     /**
@@ -3601,6 +3677,22 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
         indexcheckpoint = System.currentTimeMillis();
 
+        /*
+         * Drain the backlog of pages that accumulated in newPages during Phase B and
+         * indexManager.checkpoint (which can spend minutes in VectorIndexManager's
+         * waitForCatchUp). This flushes them outside the Phase C write lock, preventing
+         * commits from timing out on CHECKPOINT_LOCK_READ_TIMEOUT while Phase C serially
+         * writes hundreds or thousands of pages to remote storage.
+         *
+         * The residual (pages created between this drain and the Phase C tryLock below) is
+         * bounded by DML rate × lock acquisition latency, normally one partially-filled
+         * page. Phase C's final flush loop still runs under the write lock to preserve the
+         * issue #46 invariant.
+         */
+        long[] drainedCounts = drainPendingNewPages();
+        flushedNewPages += (int) drainedCounts[0];
+        flushedRecords += drainedCounts[1];
+
 
         /* ================================================================== */
         /* === PHASE C: Brief write lock — finalize metadata and PK index === */
@@ -3631,12 +3723,15 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
 
             /*
-             * Flush any remaining newPages (the current DML page created by Phase A plus any
-             * additional pages allocated by allocateLivePage during Phase B). Without this, keys
-             * that were inserted/updated during Phase B live on a page whose content was never
-             * persisted, and keyToPage.checkpoint below would record a mapping to that unflushed
-             * page — a recovery scan would then fail with "no record in memory for K" because
-             * the page is missing from activePages and from storage (issue #46).
+             * Flush any residual newPages. drainPendingNewPages() just before Phase C already
+             * flushed the bulk of what accumulated during Phase B + indexManager.checkpoint.
+             * What remains here is the small tail: the fresh current page created by the last
+             * drain, plus any pages concurrent DML allocated between unlock-of-drain and
+             * acquire-of-Phase-C-write-lock (typically one partially-filled page).
+             *
+             * We still MUST run this pass: keyToPage.checkpoint() below requires newPages
+             * empty, else it records mappings to pages missing from activePages and storage,
+             * and recovery fails with "no record in memory for K" (issue #46).
              *
              * Phase C holds checkpointLock.asWriteLock(), so no concurrent DML can reach
              * applyInsert/applyUpdate/applyDelete while we flush these pages. After the flush,
