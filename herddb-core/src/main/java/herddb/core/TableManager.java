@@ -109,6 +109,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -218,6 +219,20 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
      * Allow checkpoint
      */
     private final StampedLock checkpointLock = new StampedLock();
+
+    /**
+     * LSN of the last transactional commit whose apply to this table's pages has fully
+     * completed. Phase C reads this — rather than {@code log.getLastSequenceNumber()} —
+     * as {@code TableStatus.sequenceNumber}. See issue #157: log.getLastSequenceNumber
+     * can return the LSN of a commit whose apply is still waiting on the checkpoint
+     * read lock; persisting that LSN would cause recovery to silently skip the commit
+     * after a restart (its change is not yet in any flushed page). Updated at the end
+     * of {@link #onTransactionCommit}, under the checkpoint read lock and after every
+     * applyInsert/applyUpdate/applyDelete for the transaction is done. Monotonic via
+     * {@link AtomicReference#updateAndGet}.
+     */
+    private final AtomicReference<LogSequenceNumber> lastAppliedSequenceNumber =
+            new AtomicReference<>(LogSequenceNumber.START_OF_TIME);
 
     /**
      * auto_increment support
@@ -671,6 +686,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             nextPrimaryKeyValue.set(Bytes.toLong(tableStatus.nextPrimaryKeyValue, 0));
             nextPageId = tableStatus.nextPageId;
             bootSequenceNumber = tableStatus.sequenceNumber;
+            lastAppliedSequenceNumber.set(bootSequenceNumber);
             activePagesAtBoot.putAll(tableStatus.activePages);
         }
         keyToPage.start(bootSequenceNumber, created);
@@ -2177,6 +2193,19 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                     }
                 }
             }
+            /*
+             * Publish the commit's LSN as "last fully applied" BEFORE releasing the
+             * checkpoint read lock. Phase C acquires the write lock only after all
+             * readers have released; at that point every apply whose LSN is below
+             * this value has its change in memory and will be flushed. Applies still
+             * waiting for the read lock have NOT bumped this counter yet, so their
+             * LSNs stay above the Phase-C snapshot and get replayed from the WAL on
+             * restart. See issue #157.
+             */
+            LogSequenceNumber commitLsn = transaction.lastSequenceNumber;
+            if (commitLsn != null) {
+                lastAppliedSequenceNumber.updateAndGet(cur -> commitLsn.after(cur) ? commitLsn : cur);
+            }
         } finally {
             checkpointLock.asReadLock().unlock();
         }
@@ -3320,6 +3349,13 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                              * buildingPage
                              */
                             checkpointProcessedDirtyRecords.inc();
+                            if (LOGGER.isLoggable(Level.FINE)) {
+                                final Long currentPageId = keyToPage.get(unshared.key);
+                                LOGGER.log(Level.FINE,
+                                        "issue-157 dirty-page CAS-fail: table {0}.{1} key={2} oldPageId={3} buildingPage={4} currentKeyToPage={5}",
+                                        new Object[]{table.tablespace, table.name, unshared.key,
+                                            page.pageId, buildingPage.pageId, currentPageId});
+                            }
                         }
 
                     } else {
@@ -3341,10 +3377,11 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                          */
                         boolean handled = keyToPage.put(unshared.key, buildingPage.pageId, page.pageId);
                         if (!handled) {
+                            final Long currentPageId = keyToPage.get(unshared.key);
                             LOGGER.log(Level.INFO,
-                                    "Concurrent DML modified a record on clean page {0} during checkpoint compaction"
-                                            + " for table {1}.{2}. Aborting compaction of this page.",
-                                    new Object[]{page.pageId, table.tablespace, table.name});
+                                    "issue-157 clean-page CAS-fail: table {0}.{1} key={2} oldPageId={3} buildingPage={4} currentKeyToPage={5} — aborting compaction of this page.",
+                                    new Object[]{table.tablespace, table.name, unshared.key,
+                                        page.pageId, buildingPage.pageId, currentPageId});
                             abortPageCompaction = true;
                             break;
                         }
@@ -3776,23 +3813,35 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
 
             /*
-             * Re-read the log position AFTER all page flushes (Phase B + Phase C remaining newPages)
-             * completed, under the Phase C write lock. This LSN is an upper bound on the LSN of any
-             * entry whose effect is in a flushed page for THIS table — Phase C just flushed every
-             * remaining dirty page, so at this moment every entry with LSN ≤ postFlushSequenceNumber
-             * that affects this table is persisted.
+             * Use the LSN of the last log entry whose apply to THIS table has fully completed
+             * (tracked by {@link #lastAppliedSequenceNumber}, updated at the end of
+             * {@link #onTransactionCommit} under the checkpoint read lock). Phase C holds the
+             * write lock; the StampedLock contract guarantees that every reader has released
+             * before the write lock is granted, so every commit whose apply completed has
+             * already published its LSN to this field, and its change is sitting in a page
+             * that Phase C has flushed (currentDirtyRecordsPage or an earlier newPage).
+             *
+             * We cannot use {@code log.getLastSequenceNumber()} here: it returns the last LSN
+             * ASSIGNED to the log, which includes commits whose apply callbacks are still
+             * queued on callbacksExecutor and blocked on the checkpoint read lock. Persisting
+             * such an LSN as {@code TableStatus.sequenceNumber} loses those commits on restart —
+             * their applies run after Phase C releases the lock, writing to the fresh
+             * currentDirtyRecordsPage which is not flushed until the next checkpoint, while
+             * the per-table recovery filter at line 2114 skips their WAL entries because
+             * the persisted LSN already advertised them as applied. See issue #157.
              *
              * Persisting this LSN (rather than the Phase-A snapshot) as TableStatus.sequenceNumber
-             * makes the per-table recovery filter in {@code apply(...)} and
-             * {@code onTransactionCommit(...)} correctly skip entries/commits that were applied to
-             * flushed pages during Phase B — previously those entries could be replayed and
-             * re-applied, tripping duplicate-key {@code IllegalStateException} during recovery of
-             * the tablespace (issue #145).
-             *
-             * Phase C holds checkpointLock.asWriteLock(), so no concurrent DML on this table can
-             * advance the log between this read and the tableStatus write.
+             * still gets us the issue #145 guarantee — entries applied to flushed pages during
+             * Phase B are correctly skipped on recovery — because those applies updated
+             * lastAppliedSequenceNumber before Phase C read it.
              */
-            final LogSequenceNumber postFlushSequenceNumber = log.getLastSequenceNumber();
+            final LogSequenceNumber postFlushSequenceNumber = lastAppliedSequenceNumber.get();
+            if (LOGGER.isLoggable(Level.FINE)) {
+                LOGGER.log(Level.FINE,
+                        "issue-157 phase-C LSN: table {0}.{1} phaseA={2} postFlush={3} flushedDirty={4} flushedSmall={5} flushedNew={6} newPagesLeft={7}",
+                        new Object[]{table.tablespace, table.name, sequenceNumber, postFlushSequenceNumber,
+                            flushedDirtyPages, flushedSmallPages, flushedNewPages, newPages.size()});
+            }
 
             /*
              * Checkpoint the primary key index (BLink tree).
