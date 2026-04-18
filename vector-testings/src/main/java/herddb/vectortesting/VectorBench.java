@@ -201,12 +201,15 @@ public class VectorBench {
             BlockingQueue<float[]> ingestQueue = new ArrayBlockingQueue<>(1000);
             AtomicBoolean producerDone = new AtomicBoolean(false);
             AtomicLong rowId = new AtomicLong(config.resumeFrom);
+            AtomicLong commitsTotal = new AtomicLong(0);
+            AtomicLong commitsRecovered = new AtomicLong(0);
 
             long ingestStart = System.nanoTime();
 
             ExecutorService ingestPool = Executors.newFixedThreadPool(config.ingestThreads);
             for (int t = 0; t < config.ingestThreads; t++) {
-                ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId, ingestMetrics, ingestStatus, ingestStart));
+                ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId, ingestMetrics,
+                        ingestStatus, ingestStart, commitsTotal, commitsRecovered));
             }
 
             // Progress display thread runs during the entire ingestion
@@ -228,6 +231,8 @@ public class VectorBench {
                     fields.put("total", (long) totalRowsTarget);
                     fields.put("ops_per_sec", opsPerSec);
                     fields.put("eta_s", etaSecs);
+                    fields.put("commits", commitsTotal.get());
+                    fields.put("recovered_commits", commitsRecovered.get());
                     fields.put("heap_used_mb", usedMb);
                     fields.put("heap_max_mb", maxMb);
 

@@ -377,6 +377,7 @@ abstract class BenchOutput {
             m.put("checkpoint", config.checkpoint);
             m.put("checkpoint_timeout_seconds", config.checkpointTimeoutSeconds);
             m.put("ingest_max_ops_per_second", config.ingestMaxOpsPerSecond);
+            m.put("ingest_commit_retries", config.ingestCommitRetries);
             write(m);
         }
 

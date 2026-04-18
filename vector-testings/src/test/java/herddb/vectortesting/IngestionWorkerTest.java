@@ -26,8 +26,11 @@ import herddb.jdbc.PreparedStatementAsync;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -127,16 +130,113 @@ class IngestionWorkerTest {
     }
 
     private IngestionWorker createTestWorker() {
-        Config config = new Config();
-        return new IngestionWorker(
+        return createTestWorker(new Config(), new AtomicLong(0), new AtomicLong(0));
+    }
+
+    private IngestionWorker createTestWorker(Config config, AtomicLong commitsTotal, AtomicLong commitsRecovered) {
+        IngestionWorker worker = new IngestionWorker(
                 config,
                 new java.util.concurrent.LinkedBlockingQueue<>(),
                 new java.util.concurrent.atomic.AtomicBoolean(false),
                 new java.util.concurrent.atomic.AtomicLong(0),
                 new MetricsCollector(),
-                new java.util.concurrent.atomic.AtomicReference<>(),
-                System.nanoTime()
+                new java.util.concurrent.atomic.AtomicReference<>(""),
+                System.nanoTime(),
+                commitsTotal,
+                commitsRecovered
         );
+        worker.backoffBaseMillis = 0L; // keep tests fast
+        return worker;
+    }
+
+    /**
+     * Retry succeeds after two transient commit failures: the batch is replayed each
+     * time, so addBatch() is called {@code (retries-before-success + 1) * batchSize}
+     * times, and commitsRecovered increments exactly once when the final commit
+     * lands.
+     */
+    @Test
+    void testCommitRetrySucceedsAfterTransient() throws Exception {
+        FakePreparedStatement ps = new FakePreparedStatement();
+        FakeConnection conn = new FakeConnection();
+        conn.commitFailsRemaining = 2; // two failures then success
+
+        Config config = new Config();
+        config.ingestCommitRetries = 3;
+        AtomicLong commitsTotal = new AtomicLong(0);
+        AtomicLong commitsRecovered = new AtomicLong(0);
+        IngestionWorker worker = createTestWorker(config, commitsTotal, commitsRecovered);
+
+        List<IngestionWorker.PendingRow> batch = new ArrayList<>();
+        batch.add(new IngestionWorker.PendingRow(1L, new float[]{1f, 2f}));
+        batch.add(new IngestionWorker.PendingRow(2L, new float[]{3f, 4f}));
+
+        long latency = worker.commitWithRetry(ps, conn, batch, System.nanoTime());
+
+        assertTrue(latency > 0, "latency should be positive");
+        assertEquals(1L, commitsTotal.get(), "exactly one logical commit succeeded");
+        assertEquals(1L, commitsRecovered.get(), "recovered counter should be 1 (retried to success)");
+        assertEquals(3, conn.commitAttempts, "three commit attempts (two failures + success)");
+        assertTrue(conn.rollbackCount >= 2, "rollback invoked after each failure");
+        // The batch was replayed twice after the two failures, so addBatch was called
+        // 2 (initial, set up by caller) + 2*2 (two replays) = expect at least 4 replays.
+        assertEquals(batch.size() * 2, ps.addBatchCallCount,
+                "batch replayed exactly once per failed attempt");
+    }
+
+    /**
+     * Retries are exhausted — the final exception is rethrown and recovered counter
+     * stays at 0.
+     */
+    @Test
+    void testCommitRetryExhausted() {
+        FakePreparedStatement ps = new FakePreparedStatement();
+        FakeConnection conn = new FakeConnection();
+        conn.failOnCommit = true; // every commit fails
+
+        Config config = new Config();
+        config.ingestCommitRetries = 2;
+        AtomicLong commitsTotal = new AtomicLong(0);
+        AtomicLong commitsRecovered = new AtomicLong(0);
+        IngestionWorker worker = createTestWorker(config, commitsTotal, commitsRecovered);
+
+        List<IngestionWorker.PendingRow> batch = new ArrayList<>();
+        batch.add(new IngestionWorker.PendingRow(1L, new float[]{1f}));
+
+        SQLException ex = assertThrows(SQLException.class,
+                () -> worker.commitWithRetry(ps, conn, batch, System.nanoTime()));
+        assertEquals("Commit failed", ex.getMessage());
+        assertEquals(3, conn.commitAttempts, "initial + 2 retries = 3 attempts");
+        assertEquals(0L, commitsTotal.get());
+        assertEquals(0L, commitsRecovered.get());
+    }
+
+    /**
+     * {@code InterruptedException} inside executeBatchAsync().get() is reported as
+     * an ExecutionException by the JDBC async API and still propagates on the first
+     * attempt — we must not retry interrupts.
+     */
+    @Test
+    void testCommitRetryPropagatesExecutionExceptionOnInterrupt() {
+        FakePreparedStatement ps = new FakePreparedStatement();
+        ps.failMode = FailMode.INTERRUPTED;
+        FakeConnection conn = new FakeConnection();
+
+        Config config = new Config();
+        config.ingestCommitRetries = 3;
+        AtomicLong commitsTotal = new AtomicLong(0);
+        AtomicLong commitsRecovered = new AtomicLong(0);
+        IngestionWorker worker = createTestWorker(config, commitsTotal, commitsRecovered);
+
+        List<IngestionWorker.PendingRow> batch = new ArrayList<>();
+        batch.add(new IngestionWorker.PendingRow(1L, new float[]{1f}));
+
+        // The Future wraps the InterruptedException as ExecutionException — the retry
+        // loop treats it like any other ExecutionException and will exhaust retries.
+        assertThrows(ExecutionException.class,
+                () -> worker.commitWithRetry(ps, conn, batch, System.nanoTime()));
+        assertEquals(0L, commitsTotal.get());
+        assertEquals(0L, commitsRecovered.get());
     }
 
     private enum FailMode {
@@ -148,6 +248,7 @@ class IngestionWorkerTest {
      */
     private static class FakePreparedStatement implements PreparedStatement, PreparedStatementAsync {
         boolean batchExecuted = false;
+        int addBatchCallCount = 0;
         FailMode failMode = FailMode.NONE;
 
         @Override
@@ -196,6 +297,7 @@ class IngestionWorkerTest {
         }
         @Override
         public void addBatch() throws SQLException {
+            addBatchCallCount++;
         }
         @Override
         public void setObject(int parameterIndex, Object x) throws SQLException {
@@ -522,10 +624,18 @@ class IngestionWorkerTest {
     private static class FakeConnection implements Connection {
         boolean committed = false;
         boolean failOnCommit = false;
+        int commitFailsRemaining = 0;
+        int commitAttempts = 0;
+        int rollbackCount = 0;
 
         @Override
         public void commit() throws SQLException {
+            commitAttempts++;
             if (failOnCommit) {
+                throw new SQLException("Commit failed");
+            }
+            if (commitFailsRemaining > 0) {
+                commitFailsRemaining--;
                 throw new SQLException("Commit failed");
             }
             committed = true;
@@ -557,6 +667,7 @@ class IngestionWorkerTest {
         }
         @Override
         public void rollback() throws SQLException {
+            rollbackCount++;
         }
         @Override
         public void close() throws SQLException {

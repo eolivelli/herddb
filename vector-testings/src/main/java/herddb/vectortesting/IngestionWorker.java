@@ -24,6 +24,8 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -33,6 +35,17 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public class IngestionWorker implements Runnable {
 
+    /** Row held in memory until its batch is successfully committed. */
+    static final class PendingRow {
+        final long id;
+        final float[] vec;
+
+        PendingRow(long id, float[] vec) {
+            this.id = id;
+            this.vec = vec;
+        }
+    }
+
     private final Config config;
     private final BlockingQueue<float[]> queue;
     private final AtomicBoolean done;
@@ -40,8 +53,19 @@ public class IngestionWorker implements Runnable {
     private final MetricsCollector metrics;
     private final AtomicReference<String> statusLine;
     private final long ingestStartNanos;
+    private final AtomicLong commitsTotal;
+    private final AtomicLong commitsRecovered;
 
-    public IngestionWorker(Config config, BlockingQueue<float[]> queue, AtomicBoolean done, AtomicLong rowId, MetricsCollector metrics, AtomicReference<String> statusLine, long ingestStartNanos) {
+    /**
+     * Base of the exponential back-off between commit retries, in milliseconds.
+     * Defaults to 10 seconds per issue #153 (10s, 20s, 40s, ...); tests override
+     * this to a tiny value to keep the suite fast.
+     */
+    long backoffBaseMillis = 10_000L;
+
+    public IngestionWorker(Config config, BlockingQueue<float[]> queue, AtomicBoolean done, AtomicLong rowId,
+                           MetricsCollector metrics, AtomicReference<String> statusLine, long ingestStartNanos,
+                           AtomicLong commitsTotal, AtomicLong commitsRecovered) {
         this.config = config;
         this.queue = queue;
         this.done = done;
@@ -49,6 +73,8 @@ public class IngestionWorker implements Runnable {
         this.metrics = metrics;
         this.statusLine = statusLine;
         this.ingestStartNanos = ingestStartNanos;
+        this.commitsTotal = commitsTotal;
+        this.commitsRecovered = commitsRecovered;
     }
 
     private static String formatEta(double seconds) {
@@ -70,7 +96,6 @@ public class IngestionWorker implements Runnable {
 
     /**
      * Flush accumulated batch using executeBatchAsync and commit.
-     * Records batch+commit latency to metrics.
      *
      * @param ps prepared statement with accumulated batch
      * @param conn connection for commit
@@ -82,29 +107,91 @@ public class IngestionWorker implements Runnable {
      */
     private long flushBatch(PreparedStatement ps, Connection conn, long batchStartNanos)
             throws SQLException, ExecutionException, InterruptedException {
-        // Execute accumulated batch asynchronously
         ps.unwrap(PreparedStatementAsync.class).executeBatchAsync().get();
-        // Commit the transaction
         conn.commit();
-        // Calculate and return latency
         return System.nanoTime() - batchStartNanos;
     }
 
     /**
      * Package-private method for testing flushBatch behavior.
-     * Delegates to the private flushBatch method.
-     *
-     * @param ps prepared statement with accumulated batch
-     * @param conn connection for commit
-     * @param batchStartNanos nanosecond timestamp when batch started
-     * @return latency in nanoseconds (batch + commit)
-     * @throws SQLException if batch execution or commit fails
-     * @throws ExecutionException if async batch execution fails
-     * @throws InterruptedException if async batch execution is interrupted
      */
     long testFlushBatch(PreparedStatement ps, Connection conn, long batchStartNanos)
             throws SQLException, ExecutionException, InterruptedException {
         return flushBatch(ps, conn, batchStartNanos);
+    }
+
+    /**
+     * Commit the accumulated batch, retrying on transient {@link SQLException} or
+     * {@link ExecutionException}. On each failure the connection is rolled back,
+     * the prepared statement's batch is cleared, and the in-memory batch is
+     * replayed into the statement before the next attempt. Back-off is
+     * exponential: {@code backoffBaseMillis * 2^attempt} (10s, 20s, 40s...).
+     *
+     * <p>{@link InterruptedException} is never retried — it surfaces immediately
+     * so pool shutdowns terminate the worker promptly.
+     *
+     * @return the latency (batch + commit) of the successful attempt, in nanos
+     */
+    long commitWithRetry(PreparedStatement ps, Connection conn, List<PendingRow> batch, long batchStartNanos)
+            throws SQLException, ExecutionException, InterruptedException {
+        int maxRetries = Math.max(0, config.ingestCommitRetries);
+        Exception lastError = null;
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                long latencyNanos = flushBatch(ps, conn, batchStartNanos);
+                commitsTotal.incrementAndGet();
+                if (attempt > 0) {
+                    commitsRecovered.incrementAndGet();
+                }
+                return latencyNanos;
+            } catch (SQLException | ExecutionException e) {
+                lastError = e;
+                safelyRollback(conn);
+                safelyClearBatch(ps);
+                if (attempt == maxRetries) {
+                    break;
+                }
+                long backoffMs = backoffBaseMillis * (1L << attempt);
+                statusLine.set(String.format(
+                        "commit failed (attempt %d/%d), retrying in %ds: %s",
+                        attempt + 1, maxRetries + 1, backoffMs / 1000,
+                        e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()));
+                System.err.printf("Commit attempt %d/%d failed, retrying in %d ms: %s%n",
+                        attempt + 1, maxRetries + 1, backoffMs, e);
+                Thread.sleep(backoffMs);
+                replayBatch(ps, batch);
+            }
+        }
+        if (lastError instanceof SQLException) {
+            throw (SQLException) lastError;
+        }
+        throw (ExecutionException) lastError;
+    }
+
+    private static void replayBatch(PreparedStatement ps, List<PendingRow> batch) throws SQLException {
+        for (PendingRow row : batch) {
+            ps.setLong(1, row.id);
+            ps.setObject(2, row.vec);
+            ps.addBatch();
+        }
+    }
+
+    private static void safelyRollback(Connection conn) {
+        try {
+            conn.rollback();
+        } catch (SQLException rollbackError) {
+            System.err.println("Rollback failed during retry: " + rollbackError.getMessage());
+        }
+    }
+
+    private static void safelyClearBatch(PreparedStatement ps) {
+        try {
+            ps.clearBatch();
+        } catch (SQLException clearError) {
+            // The PS may have been closed or be in a bad state; surface for debugging
+            // but continue — the replay loop will re-populate its batch.
+            System.err.println("clearBatch failed during retry: " + clearError.getMessage());
+        }
     }
 
     @Override
@@ -113,7 +200,7 @@ public class IngestionWorker implements Runnable {
         try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password)) {
             conn.setAutoCommit(false);
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                int batchCount = 0;
+                List<PendingRow> pendingBatch = new ArrayList<>(Math.max(1, config.batchSize));
                 long lastCommitTime = System.currentTimeMillis();
                 final long maxCommitIntervalMs = 30_000; // 30 seconds
                 long batchStartNanos = 0;
@@ -131,20 +218,21 @@ public class IngestionWorker implements Runnable {
                         break; // poison pill
                     }
                     long id = rowId.getAndIncrement();
-                    if (batchCount == 0) {
+                    if (pendingBatch.isEmpty()) {
                         batchStartNanos = System.nanoTime();
                     }
                     ps.setLong(1, id);
                     ps.setObject(2, vec);
                     ps.addBatch();
-                    batchCount++;
+                    pendingBatch.add(new PendingRow(id, vec));
 
                     long now = System.currentTimeMillis();
-                    if (batchCount >= config.batchSize || (batchCount > 0 && now - lastCommitTime >= maxCommitIntervalMs)) {
-                        long latencyNanos = flushBatch(ps, conn, batchStartNanos);
+                    if (pendingBatch.size() >= config.batchSize
+                            || (!pendingBatch.isEmpty() && now - lastCommitTime >= maxCommitIntervalMs)) {
+                        long latencyNanos = commitWithRetry(ps, conn, pendingBatch, batchStartNanos);
                         metrics.record(latencyNanos);
-                        rowsIngested += batchCount;
-                        batchCount = 0;
+                        rowsIngested += pendingBatch.size();
+                        pendingBatch.clear();
                         lastCommitTime = now;
                     }
 
@@ -165,32 +253,32 @@ public class IngestionWorker implements Runnable {
                         long remaining = config.numRows - rowsIngested;
                         double etaSecs = rowsPerSec > 0 ? remaining / rowsPerSec : 0;
                         String etaStr = formatEta(etaSecs);
-                        statusLine.set(String.format("Ingested %d/%d rows | %.0f ops/s | batch mean: %.2f ms | batch p50: %.2f ms | batch p99: %.2f ms | ETA: %s",
+                        statusLine.set(String.format(
+                                "Ingested %d/%d rows | %.0f ops/s | commits: %d (recovered: %d) | "
+                                        + "batch mean: %.2f ms | batch p50: %.2f ms | batch p99: %.2f ms | ETA: %s",
                                 rowsIngested,
                                 config.numRows,
                                 rowsPerSec,
+                                commitsTotal.get(),
+                                commitsRecovered.get(),
                                 s.meanNanos() / 1_000_000.0,
                                 s.p50Nanos() / 1_000_000.0,
                                 s.p99Nanos() / 1_000_000.0,
                                 etaStr));
                     }
                 }
-                if (batchCount > 0) {
-                    long latencyNanos = flushBatch(ps, conn, batchStartNanos);
+                if (!pendingBatch.isEmpty()) {
+                    long latencyNanos = commitWithRetry(ps, conn, pendingBatch, batchStartNanos);
                     metrics.record(latencyNanos);
-                    rowsIngested += batchCount;
+                    rowsIngested += pendingBatch.size();
+                    pendingBatch.clear();
                 }
             } catch (SQLException | ExecutionException | InterruptedException e) {
                 System.err.println("Ingestion error: " + e.getMessage());
                 e.printStackTrace();
-                try {
-                    conn.rollback();
-                } catch (SQLException rollbackError) {
-                    System.err.println("Rollback failed: " + rollbackError.getMessage());
-                    rollbackError.printStackTrace();
-                }
+                safelyRollback(conn);
             }
-        } catch (Exception e) {
+        } catch (SQLException e) {
             System.err.println("Connection error: " + e.getMessage());
             e.printStackTrace();
         }
