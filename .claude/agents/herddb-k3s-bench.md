@@ -54,6 +54,14 @@ before running anything. All paths below are relative to that directory.
   `write-report.sh` will not produce a report.
 - `./scripts/collect-logs.sh` — dump pod logs into a timestamped dir. Last
   line is `LOGS_DIR=<path>`.
+- `./scripts/analyze-server-checkpoints.sh [--run-log <f>] [--lines N] [--previous]`
+  — pull `herddb-server-0` log from the live cluster and generate an HTML
+  checkpoint-dynamics report. Last line is `REPORT=<path>`. Use when a
+  supervision tick detects checkpoint lock timeouts or slow checkpoint phases.
+- `./scripts/analyze-is-checkpoints.sh [--replica N] [--lines N] [--no-live] [--previous]`
+  — pull `herddb-indexing-service-<N>` log from the live cluster and generate
+  an HTML IS checkpoint / vector-index-layout report. Last line is
+  `REPORT=<path>`. Use when IS Phase B is slow or watermark lag is growing.
 - `./scripts/write-report.sh <run-log-path>` — turn a run log into a markdown
   report. Last line is `REPORT=<path>`.
 - `./scripts/open-issue.sh --title <t> --body-file <p> [--logs-dir <d>]` —
@@ -287,6 +295,21 @@ If any VERDICT is `fatal`: stop the background `run-bench.sh` task immediately,
 then proceed to §Failure handling. Do NOT attempt to mitigate on the running
 cluster.
 
+**Checkpoint timeout escalation (warning-level, non-fatal):** If a TICK
+SUMMARY contains any of the following signals, immediately spawn the
+`herddb-checkpoint-analyzer` sub-agent (see §Checkpoint analysis) **before**
+the next tick, while the cluster is still running:
+
+- The log snippet includes `"timed out while acquiring checkpoint lock"`
+- The log snippet includes `"forcing rollback of abandoned transaction"`
+- The current phase is `checkpoint` and the tick has been in that phase for
+  more than 5 consecutive ticks with no LSN advancement visible from
+  `indexing-admin engine-stats`
+
+The checkpoint-analyzer runs in the background (non-blocking). Its
+CHECKPOINT ANALYSIS SUMMARY is included verbatim in the final GitHub issue
+body if the run subsequently fails, and is shown to the user either way.
+
 ---
 
 ## Failure handling
@@ -309,6 +332,14 @@ non-zero exit, or supervision-detected fault):
 
 3. Run `./scripts/collect-logs.sh` and capture `LOGS_DIR=<dir>`.
 
+3a. **Checkpoint failures only** — if the failure phase is `checkpoint` or
+    `ingest` AND the log contains `"timed out while acquiring checkpoint lock"`
+    or `"forcing rollback of abandoned transaction"`, spawn the
+    `herddb-checkpoint-analyzer` sub-agent now (with `LOGS_DIR` from step 3
+    and `RUN_LOG` if available). Capture its CHECKPOINT ANALYSIS SUMMARY for
+    inclusion in the issue body. This runs sequentially (not in background)
+    so the summary is available before the issue is written.
+
 4. If a run log exists, run `./scripts/write-report.sh <RUN_LOG>` and
    capture `REPORT=<path>`.
 
@@ -323,6 +354,9 @@ non-zero exit, or supervision-detected fault):
      source pod — include the full `Exception in thread` or `SEVERE:`
      block. Do NOT summarize; paste raw lines.
    - the exit code of `run-bench.sh`, if applicable,
+   - **if a CHECKPOINT ANALYSIS SUMMARY was produced (step 3a)**: include it
+     verbatim in a fenced block, and list the HTML report paths
+     (`REPORT_SERVER`, `REPORT_IS`) as artefact pointers.
    - the **full current `values.yaml`** inlined in a fenced code block,
    - if profiles/heap dump were taken: the MAT "Problem Suspect 1"
      description and `PROFILES_DIR` path,
@@ -365,6 +399,56 @@ open a GitHub issue (issue, not failure report) describing:
 
 Use `open-issue.sh` without `--logs-dir` (profiles are HTML, not plain-text
 logs).
+
+---
+
+## Checkpoint analysis
+
+Spawn the `herddb-checkpoint-analyzer` sub-agent whenever:
+
+1. **A supervision tick detects a checkpoint lock timeout** (see §Supervision
+   escalation rule above).
+2. **The bench exits non-zero** and the failure phase is `checkpoint` or
+   `ingest` with `DataStorageManagerException` in the log.
+3. **The user explicitly asks** for a checkpoint analysis (e.g. "why is the
+   checkpoint slow?", "show me the IS segment layout").
+4. **IS watermark lag is growing** across 3+ consecutive ticks (tailer
+   watermark advancing less than 50% of the server LSN delta per tick).
+
+Example invocation:
+
+```
+Agent(
+  description: "Checkpoint analysis — lock timeout in tick 12",
+  subagent_type: "herddb-checkpoint-analyzer",
+  prompt: """
+  Analyze HerdDB checkpoint dynamics.
+  WORK_DIR: herddb-kubernetes/src/main/helm/herddb/examples/k3s-local
+  COMPONENT: both
+  LOGS_DIR: <LOGS_DIR if already collected, otherwise omit>
+  RUN_LOG: <RUN_LOG path>
+  IS_REPLICAS: 1
+  REASON: supervision tick 12 — "timed out while acquiring checkpoint lock" in herddb-server-0 log
+  """
+)
+```
+
+The agent returns a CHECKPOINT ANALYSIS SUMMARY with per-component verdicts
+(`ok` / `slow` / `timeout-risk` / `already-failed` / `lag-risk`) and a
+prioritised [CRITICAL] / [WARNING] / [INFO] recommendation list.
+
+**If `ServerVerdict: already-failed`**: the run has already experienced data
+loss due to silent transaction rollbacks. Include the full CHECKPOINT ANALYSIS
+SUMMARY verbatim in the GitHub issue body (in addition to the standard stack
+traces). The summary shows the exact checkpoint duration that exceeded the
+commit lock timeout, and the count of rolled-back transactions.
+
+**If `ServerVerdict: timeout-risk`**: warn the user that the next long
+checkpoint may trigger commit lock timeouts, but do NOT stop the run.
+
+The checkpoint-analyzer writes HTML reports to `HERDDB_TESTS_HOME/` (or
+`reports/`). Always include the REPORT paths in the GitHub issue body as
+artefact pointers so developers can open the interactive charts.
 
 ---
 
