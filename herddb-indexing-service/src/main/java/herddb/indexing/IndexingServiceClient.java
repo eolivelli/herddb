@@ -43,6 +43,7 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -420,6 +421,42 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         LOGGER.log(Level.WARNING, "Instance {0} did not catch up for tablespace {1} to {2} within timeout ({3} ms)",
                 new Object[]{server, tablespace, target, timeoutMs});
         return false;
+    }
+
+    @Override
+    public Optional<LogSequenceNumber> getMinProcessedLsn(String tablespace) {
+        ServerSnapshot s = this.snapshot;
+        if (s.servers.isEmpty()) {
+            return Optional.empty();
+        }
+        LogSequenceNumber min = null;
+        for (Map.Entry<String, ManagedChannel> serverEntry : s.channels.entrySet()) {
+            String server = serverEntry.getKey();
+            ManagedChannel channel = serverEntry.getValue();
+            try {
+                IndexingServiceGrpc.IndexingServiceBlockingStub stub =
+                        IndexingServiceGrpc.newBlockingStub(channel)
+                                .withDeadlineAfter(timeoutSeconds, TimeUnit.SECONDS);
+                GetIndexStatusResponse resp = stub.getIndexStatus(GetIndexStatusRequest.newBuilder()
+                        .setTablespace(tablespace)
+                        .setTable("")
+                        .setIndex("")
+                        .build());
+                LogSequenceNumber instanceLsn = new LogSequenceNumber(
+                        resp.getLastLsnLedger(), resp.getLastLsnOffset());
+                if (min == null || min.after(instanceLsn)) {
+                    min = instanceLsn;
+                }
+            } catch (RuntimeException e) {
+                // Plugin boundary: any gRPC failure means we can't be sure the tailer
+                // has made progress, so we force maximum retention.
+                LOGGER.log(Level.WARNING,
+                        "getMinProcessedLsn: instance {0} unreachable for tablespace {1}: {2}",
+                        new Object[]{server, tablespace, e.getMessage()});
+                return Optional.of(LogSequenceNumber.START_OF_TIME);
+            }
+        }
+        return Optional.ofNullable(min);
     }
 
     public List<String> getServers() {

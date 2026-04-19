@@ -66,6 +66,7 @@ import herddb.model.commands.GetStatement;
 import herddb.model.commands.ScanStatement;
 import herddb.model.commands.TableConsistencyCheckStatement;
 import herddb.model.commands.TableSpaceConsistencyCheckStatement;
+import herddb.model.commands.WaitForIndexesStatement;
 import herddb.network.Channel;
 import herddb.network.ServerHostData;
 import herddb.proto.Pdu;
@@ -770,11 +771,27 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
             return CompletableFuture.completedFuture(dropTableSpace((DropTableSpaceStatement) statement));
         }
         if (statement instanceof CheckpointStatement) {
-            CheckpointStatement checkpointStatement = (CheckpointStatement) statement;
             try {
-                checkpoint(checkpointStatement.getCatchUpTimeoutMs());
-            } catch (Exception e) {
+                checkpoint();
+            } catch (DataStorageManagerException | LogNotAvailableException e) {
                 return Futures.exception(new StatementExecutionException("CHECKPOINT failed: " + e.getMessage(), e));
+            }
+            return CompletableFuture.completedFuture(new DDLStatementExecutionResult(TransactionContext.NOTRANSACTION_ID));
+        }
+        if (statement instanceof WaitForIndexesStatement) {
+            WaitForIndexesStatement waitStatement = (WaitForIndexesStatement) statement;
+            TableSpaceManager manager = tablesSpaces.get(waitStatement.getTableSpace());
+            if (manager == null) {
+                return Futures.exception(new NotLeaderException("No such tableSpace " + waitStatement.getTableSpace()
+                        + " here (at " + nodeId + ")"));
+            }
+            try {
+                manager.waitForIndexes(waitStatement.getTimeoutMs());
+            } catch (StatementExecutionException e) {
+                return Futures.exception(e);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return Futures.exception(new StatementExecutionException("WAITFORINDEXES interrupted", e));
             }
             return CompletableFuture.completedFuture(new DDLStatementExecutionResult(TransactionContext.NOTRANSACTION_ID));
         }
@@ -1004,12 +1021,8 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
     }
 
     public void checkpoint() throws DataStorageManagerException, LogNotAvailableException {
-        checkpoint(Long.MAX_VALUE);
-    }
-
-    public void checkpoint(long catchUpTimeoutMs) throws DataStorageManagerException, LogNotAvailableException {
         for (TableSpaceManager man : tablesSpaces.values()) {
-            man.checkpoint(false, false, false, catchUpTimeoutMs);
+            man.checkpoint(false, false, false);
         }
     }
 

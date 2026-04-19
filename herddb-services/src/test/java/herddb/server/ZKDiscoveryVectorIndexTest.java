@@ -195,8 +195,11 @@ public class ZKDiscoveryVectorIndexTest {
                                             "INSERT INTO t1(id, vec) VALUES(?, ?)",
                                             0, false, true, Arrays.asList(4, vecW));
 
-                                    // Force checkpoint so the indexing service catches up
+                                    // Force checkpoint then wait for the indexing service to catch up
                                     server.getManager().checkpoint();
+                                    con.executeUpdate(TableSpace.DEFAULT,
+                                            "EXECUTE WAITFORINDEXES 'herd', 60",
+                                            0, false, true, Collections.emptyList());
 
                                     // ANN search for vector closest to X axis
                                     float[] query = {1.0f, 0.0f, 0.0f, 0.0f};
@@ -356,8 +359,11 @@ public class ZKDiscoveryVectorIndexTest {
                                         "INSERT INTO t1(id, vec) VALUES(?, ?)",
                                         0, false, true, Arrays.asList(4, vecW));
 
-                                // Force checkpoint so both indexing services catch up
+                                // Force checkpoint then wait for both indexing services to catch up
                                 server.getManager().checkpoint();
+                                con.executeUpdate(TableSpace.DEFAULT,
+                                        "EXECUTE WAITFORINDEXES 'herd', 60",
+                                        0, false, true, Collections.emptyList());
 
                                 // ANN search for vector closest to Y axis
                                 float[] query = {0.0f, 1.0f, 0.0f, 0.0f};
@@ -502,6 +508,9 @@ public class ZKDiscoveryVectorIndexTest {
                                             0, false, true, Arrays.asList(2, vecY));
 
                                     server.getManager().checkpoint();
+                                    con.executeUpdate(TableSpace.DEFAULT,
+                                            "EXECUTE WAITFORINDEXES 'herd', 60",
+                                            0, false, true, Collections.emptyList());
 
                                     float[] query = {1.0f, 0.0f, 0.0f, 0.0f};
                                     try (ScanResultSet scan = con.executeScan(TableSpace.DEFAULT,
@@ -627,6 +636,9 @@ public class ZKDiscoveryVectorIndexTest {
                                         0, false, true, Arrays.asList(2, vecY));
 
                                 server.getManager().checkpoint();
+                                con.executeUpdate(TableSpace.DEFAULT,
+                                        "EXECUTE WAITFORINDEXES 'herd', 60",
+                                        0, false, true, Collections.emptyList());
 
                                 float[] query = {0.0f, 1.0f, 0.0f, 0.0f};
                                 try (ScanResultSet scan = con.executeScan(TableSpace.DEFAULT,

@@ -724,9 +724,10 @@ public class FileCommitLog extends CommitLog {
     }
 
     @Override
-    public void dropOldLedgers(LogSequenceNumber lastCheckPointSequenceNumber) throws LogNotAvailableException {
-        LOGGER.log(Level.SEVERE, "dropOldLedgers {2} lastCheckPointSequenceNumber: {0}, currentLedgerId: {1}",
-                new Object[]{lastCheckPointSequenceNumber, currentLedgerId, tableSpaceName});
+    public void dropOldLedgers(LogSequenceNumber lastCheckPointSequenceNumber,
+                                LogSequenceNumber tailersFloor) throws LogNotAvailableException {
+        LOGGER.log(Level.SEVERE, "dropOldLedgers {3} lastCheckPointSequenceNumber: {0}, tailersFloor: {1}, currentLedgerId: {2}",
+                new Object[]{lastCheckPointSequenceNumber, tailersFloor, currentLedgerId, tableSpaceName});
 
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(logDirectory)) {
             List<Path> names = new ArrayList<>();
@@ -744,6 +745,15 @@ public class FileCommitLog extends CommitLog {
             int count = 0;
 
             long ledgerLimit = Math.min(lastCheckPointSequenceNumber.ledgerId, currentLedgerId);
+            // Tailer floor: don't delete files any external tailer still needs.
+            // START_OF_TIME (ledgerId = -1) means "no constraint".
+            if (tailersFloor != null && tailersFloor.ledgerId >= 0
+                    && tailersFloor.ledgerId < ledgerLimit) {
+                LOGGER.log(Level.INFO,
+                        "dropOldLedgers {0}: pinning retention at tailersFloor {1} (was {2})",
+                        new Object[]{tableSpaceName, tailersFloor, ledgerLimit});
+                ledgerLimit = tailersFloor.ledgerId;
+            }
 
             for (Path path : names) {
                 boolean lastFile = path.equals(last);

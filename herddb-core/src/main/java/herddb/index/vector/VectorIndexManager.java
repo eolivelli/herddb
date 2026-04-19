@@ -39,6 +39,7 @@ import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -132,36 +133,43 @@ public class VectorIndexManager extends AbstractIndexManager {
     @Override
     public List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin)
             throws DataStorageManagerException {
-        return checkpoint(sequenceNumber, pin, DEFAULT_CATCHUP_TIMEOUT_MS);
+        // Vector index state lives in the remote IndexingService, which persists its own
+        // watermarks via its tailer. Checkpoint is a no-op here; commit-log retention is
+        // enforced via getTailersMinLsn() and the client-triggered EXECUTE WAITFORINDEXES.
+        return Collections.emptyList();
     }
 
-    private static final long DEFAULT_CATCHUP_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+    @Override
+    public Optional<LogSequenceNumber> getTailersMinLsn() {
+        try {
+            return remoteService().getMinProcessedLsn(tableSpaceUUID);
+        } catch (RuntimeException e) {
+            // Broad catch: RemoteVectorIndexService is a plugin boundary (gRPC client);
+            // any failure must not crash the checkpoint and must pin retention.
+            LOGGER.log(Level.WARNING,
+                    "getTailersMinLsn: remote service error, pinning retention at START_OF_TIME", e);
+            return Optional.of(LogSequenceNumber.START_OF_TIME);
+        }
+    }
 
     @Override
-    public List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin, long catchUpTimeoutMs)
-            throws DataStorageManagerException {
-        LOGGER.log(Level.INFO, "checkpoint index {0} on table {1} tablespace {2}, targetLSN={3}, pin={4}, timeout={5}ms",
-                new Object[]{index.name, index.table, tableSpaceUUID, sequenceNumber, pin, catchUpTimeoutMs});
+    public boolean waitForTailersCatchUp(LogSequenceNumber targetLsn, long timeoutMs) throws InterruptedException {
+        LOGGER.log(Level.INFO,
+                "waitForTailersCatchUp index {0} on table {1} tablespace {2}, targetLSN={3}, timeout={4}ms",
+                new Object[]{index.name, index.table, tableSpaceUUID, targetLsn, timeoutMs});
         long start = System.nanoTime();
-        try {
-            boolean caughtUp = remoteService().waitForCatchUp(tableSpaceUUID, sequenceNumber, catchUpTimeoutMs);
-            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-            if (!caughtUp) {
-                LOGGER.log(Level.WARNING, "checkpoint index {0} on table {1} waitForCatchUp timed out after {2} ms",
-                        new Object[]{index.name, index.table, elapsedMs});
-                throw new DataStorageManagerException(
-                        "IndexingService catch-up timed out after " + elapsedMs + " ms for index " + index.name);
-            }
-            LOGGER.log(Level.INFO, "checkpoint index {0} on table {1} waitForCatchUp completed in {2} ms",
+        boolean caughtUp = remoteService().waitForCatchUp(tableSpaceUUID, targetLsn, timeoutMs);
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        if (!caughtUp) {
+            LOGGER.log(Level.WARNING,
+                    "waitForTailersCatchUp index {0} on table {1} timed out after {2} ms",
                     new Object[]{index.name, index.table, elapsedMs});
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-            LOGGER.log(Level.SEVERE, "checkpoint index {0} on table {1} interrupted after {2} ms",
+        } else {
+            LOGGER.log(Level.INFO,
+                    "waitForTailersCatchUp index {0} on table {1} completed in {2} ms",
                     new Object[]{index.name, index.table, elapsedMs});
-            throw new DataStorageManagerException("interrupted while waiting for IndexingService catch-up", e);
         }
-        return Collections.emptyList();
+        return caughtUp;
     }
 
     @Override

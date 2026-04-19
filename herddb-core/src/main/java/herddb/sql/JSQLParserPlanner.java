@@ -69,6 +69,7 @@ import herddb.model.commands.TableConsistencyCheckStatement;
 import herddb.model.commands.TableSpaceConsistencyCheckStatement;
 import herddb.model.commands.TruncateTableStatement;
 import herddb.model.commands.UpdateStatement;
+import herddb.model.commands.WaitForIndexesStatement;
 import herddb.model.planner.AggregateOp;
 import herddb.model.planner.BindableTableScanOp;
 import herddb.model.planner.FilterOp;
@@ -1072,15 +1073,38 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
                             "CHECKPOINT requires a tableSpaceName parameter");
                 }
                 if (paramCount == 2) {
+                    // Second argument preserved for backward compatibility; its value is ignored.
+                    // External-tailer catch-up is now the job of EXECUTE WAITFORINDEXES.
                     Object timeoutObj = resolveValue(execute.getExprList().getExpressions().get(1), true);
-                    if (timeoutObj == null || !(timeoutObj instanceof Number)) {
+                    if (timeoutObj != null && !(timeoutObj instanceof Number)) {
                         throw new StatementExecutionException(
                                 "CHECKPOINT timeout must be a number (seconds)");
                     }
-                    long timeoutMs = ((Number) timeoutObj).longValue() * 1000;
-                    return new CheckpointStatement(tableSpaceName.toString(), timeoutMs);
                 }
                 return new CheckpointStatement(tableSpaceName.toString());
+            }
+            case "WAITFORINDEXES": {
+                int paramCount = execute.getExprList() == null ? 0 : execute.getExprList().getExpressions().size();
+                if (paramCount != 2) {
+                    throw new StatementExecutionException(
+                            "WAITFORINDEXES requires two parameters (EXECUTE WAITFORINDEXES tableSpaceName, timeoutSeconds)");
+                }
+                Object tableSpaceName = resolveValue(execute.getExprList().getExpressions().get(0), true);
+                if (tableSpaceName == null) {
+                    throw new StatementExecutionException(
+                            "WAITFORINDEXES requires a tableSpaceName parameter");
+                }
+                Object timeoutObj = resolveValue(execute.getExprList().getExpressions().get(1), true);
+                if (timeoutObj == null || !(timeoutObj instanceof Number)) {
+                    throw new StatementExecutionException(
+                            "WAITFORINDEXES timeout must be a number (seconds)");
+                }
+                long timeoutSeconds = ((Number) timeoutObj).longValue();
+                if (timeoutSeconds <= 0) {
+                    throw new StatementExecutionException(
+                            "WAITFORINDEXES timeout must be strictly positive, got " + timeoutSeconds);
+                }
+                return new WaitForIndexesStatement(tableSpaceName.toString(), timeoutSeconds * 1000L);
             }
             case "COMMITTRANSACTION": {
                 if (execute.getExprList() == null || execute.getExprList().getExpressions().size() != 2) {

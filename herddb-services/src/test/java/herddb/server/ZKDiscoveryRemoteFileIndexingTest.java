@@ -214,8 +214,12 @@ public class ZKDiscoveryRemoteFileIndexingTest {
                                                     "INSERT INTO t1(id, vec) VALUES(?, ?)",
                                                     0, false, true, Arrays.asList(4, vecW));
 
-                                            // Checkpoint to flush data to remote storage
+                                            // Checkpoint to flush data to remote storage, then wait
+                                            // for the indexing service to catch up on the log.
                                             server.getManager().checkpoint();
+                                            con.executeUpdate(TableSpace.DEFAULT,
+                                                    "EXECUTE WAITFORINDEXES 'herd', 60",
+                                                    0, false, true, Collections.emptyList());
 
                                             // ANN search for vector closest to Y axis
                                             float[] query = {0.0f, 1.0f, 0.0f, 0.0f};
@@ -378,6 +382,9 @@ public class ZKDiscoveryRemoteFileIndexingTest {
                                                     0, false, true, Arrays.asList(2, vecY));
 
                                             server.getManager().checkpoint();
+                                            con.executeUpdate(TableSpace.DEFAULT,
+                                                    "EXECUTE WAITFORINDEXES 'herd', 60",
+                                                    0, false, true, Collections.emptyList());
 
                                             float[] query = {0.0f, 1.0f, 0.0f, 0.0f};
                                             try (ScanResultSet scan = con.executeScan(TableSpace.DEFAULT,

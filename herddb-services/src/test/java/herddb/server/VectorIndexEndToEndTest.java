@@ -254,8 +254,12 @@ public class VectorIndexEndToEndTest {
                                 "INSERT INTO t1(id, vec) VALUES(?, ?)",
                                 0, false, true, Arrays.asList(3, vecZ));
 
-                        // Force a checkpoint to make sure the indexing service has caught up
+                        // Force a checkpoint, then wait for the indexing service to catch up
+                        // (checkpoint no longer implicitly syncs tailers — see WAITFORINDEXES).
                         server.getManager().checkpoint();
+                        con.executeUpdate(TableSpace.DEFAULT,
+                                "EXECUTE WAITFORINDEXES 'herd', 60",
+                                0, false, true, Collections.emptyList());
 
                         // Search for the vector closest to X axis
                         float[] query = {1.0f, 0.0f, 0.0f, 0.0f};

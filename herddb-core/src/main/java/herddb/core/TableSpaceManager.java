@@ -2415,11 +2415,6 @@ public class TableSpaceManager {
 
     // visible for testing
     public TableSpaceCheckpoint checkpoint(boolean full, boolean pin, boolean alreadLocked) throws DataStorageManagerException, LogNotAvailableException {
-        return checkpoint(full, pin, alreadLocked, Long.MAX_VALUE);
-    }
-
-    // visible for testing
-    public TableSpaceCheckpoint checkpoint(boolean full, boolean pin, boolean alreadLocked, long catchUpTimeoutMs) throws DataStorageManagerException, LogNotAvailableException {
         if (virtual) {
             return null;
         }
@@ -2465,7 +2460,7 @@ public class TableSpaceManager {
 
                     for (AbstractTableManager tableManager : tables.values()) {
                         if (!tableManager.isSystemTable()) {
-                            TableCheckpoint checkpoint = full ? tableManager.fullCheckpoint(pin) : tableManager.checkpoint(pin, catchUpTimeoutMs);
+                            TableCheckpoint checkpoint = full ? tableManager.fullCheckpoint(pin) : tableManager.checkpoint(pin);
                             if (checkpoint != null) {
                                 LOGGER.log(Level.INFO, "checkpoint done for table {0}.{1} (pin: {2})", new Object[]{tableSpaceName, tableManager.getTable().name, pin});
                                 actions.addAll(checkpoint.actions);
@@ -2479,7 +2474,8 @@ public class TableSpaceManager {
 
                     actions.addAll(dataStorageManager.writeCheckpointSequenceNumber(tableSpaceUUID, logSequenceNumber));
                     if (leader) {
-                        log.dropOldLedgers(logSequenceNumber);
+                        LogSequenceNumber tailersFloor = computeTailersRetentionFloor();
+                        log.dropOldLedgers(logSequenceNumber, tailersFloor);
                         // Notify shared-storage read replicas of the new checkpoint
                         publishCheckpointLsnToMetadata(logSequenceNumber);
                     }
@@ -2547,7 +2543,7 @@ public class TableSpaceManager {
                         // recovery will replay only actions with log position after the actual table-local checkpoint
                         if (!tableManager.isSystemTable()) {
                             try {
-                                TableCheckpoint checkpoint = full ? tableManager.fullCheckpoint(pin) : tableManager.checkpoint(pin, catchUpTimeoutMs);
+                                TableCheckpoint checkpoint = full ? tableManager.fullCheckpoint(pin) : tableManager.checkpoint(pin);
                                 if (checkpoint != null) {
                                     LOGGER.log(Level.INFO, "checkpoint done for table {0}.{1} (pin: {2})", new Object[]{tableSpaceName, tableManager.getTable().name, pin});
                                     actions.addAll(checkpoint.actions);
@@ -2584,10 +2580,11 @@ public class TableSpaceManager {
                     /* Indexes checkpoint is handled by TableManagers */
                     if (leader) {
                         final long dropStart = System.currentTimeMillis();
+                        LogSequenceNumber tailersFloor = computeTailersRetentionFloor();
                         LOGGER.log(Level.INFO,
-                                "{0} checkpoint {1}: dropping old ledgers before {2}",
-                                new Object[]{nodeId, tableSpaceName, logSequenceNumber});
-                        log.dropOldLedgers(logSequenceNumber);
+                                "{0} checkpoint {1}: dropping old ledgers before {2}, tailersFloor={3}",
+                                new Object[]{nodeId, tableSpaceName, logSequenceNumber, tailersFloor});
+                        log.dropOldLedgers(logSequenceNumber, tailersFloor);
                         LOGGER.log(Level.INFO,
                                 "{0} checkpoint {1}: old ledger drop complete in {2} ms",
                                 new Object[]{nodeId, tableSpaceName, System.currentTimeMillis() - dropStart});
@@ -2637,6 +2634,75 @@ public class TableSpaceManager {
         } catch (Exception err) {
             LOGGER.log(Level.WARNING, "Failed to publish checkpoint LSN to metadata for " + tableSpaceName, err);
         }
+    }
+
+    /**
+     * Blocks until every external tailer attached to an index in this
+     * tablespace has processed the commit log up to the LSN observed when
+     * this method starts, or the timeout expires.
+     *
+     * @param timeoutMs maximum time to wait across all indexes
+     * @throws StatementExecutionException if at least one index did not catch up before the deadline
+     */
+    public void waitForIndexes(long timeoutMs) throws StatementExecutionException, InterruptedException {
+        if (timeoutMs <= 0) {
+            throw new StatementExecutionException(
+                    "WAITFORINDEXES timeoutMs must be strictly positive, got " + timeoutMs);
+        }
+        LogSequenceNumber target = log.getLastWrittenSequenceNumber();
+        if (target == null || target.isStartOfTime()) {
+            LOGGER.log(Level.INFO,
+                    "{0} waitForIndexes {1}: log has no written entries yet, nothing to wait for",
+                    new Object[]{nodeId, tableSpaceName});
+            return;
+        }
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        List<String> lagging = new ArrayList<>();
+        for (AbstractIndexManager index : indexes.values()) {
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                lagging.add(index.getIndexName());
+                continue;
+            }
+            boolean caughtUp = index.waitForTailersCatchUp(target, remaining);
+            if (!caughtUp) {
+                lagging.add(index.getIndexName());
+            }
+        }
+        if (!lagging.isEmpty()) {
+            throw new StatementExecutionException(
+                    "WAITFORINDEXES timed out after " + timeoutMs + " ms waiting for tablespace "
+                    + tableSpaceName + " indexes " + lagging + " to reach " + target);
+        }
+        LOGGER.log(Level.INFO,
+                "{0} waitForIndexes {1}: all tailers reached {2}",
+                new Object[]{nodeId, tableSpaceName, target});
+    }
+
+    /**
+     * Computes the commit-log retention floor contributed by external tailers
+     * across every index in this tablespace. Returns {@link LogSequenceNumber#START_OF_TIME}
+     * when no index contributes a floor (meaning: no tailer constraint; the
+     * commit log falls back to its default retention behavior). Short-circuits
+     * to {@code START_OF_TIME} the moment any index reports it — a tailer we
+     * can't reach pins retention entirely.
+     */
+    private LogSequenceNumber computeTailersRetentionFloor() {
+        LogSequenceNumber floor = null;
+        for (AbstractIndexManager index : indexes.values()) {
+            Optional<LogSequenceNumber> contributed = index.getTailersMinLsn();
+            if (!contributed.isPresent()) {
+                continue;
+            }
+            LogSequenceNumber lsn = contributed.get();
+            if (LogSequenceNumber.START_OF_TIME.equals(lsn)) {
+                return LogSequenceNumber.START_OF_TIME;
+            }
+            if (floor == null || floor.after(lsn)) {
+                floor = lsn;
+            }
+        }
+        return floor != null ? floor : LogSequenceNumber.START_OF_TIME;
     }
 
     private CompletableFuture<StatementExecutionResult> beginTransactionAsync(StatementEvaluationContext context, boolean releaseLock) throws StatementExecutionException {

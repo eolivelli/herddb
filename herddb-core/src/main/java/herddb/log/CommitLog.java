@@ -102,7 +102,25 @@ public abstract class CommitLog implements AutoCloseable {
 
     public abstract boolean isClosed();
 
-    public abstract void dropOldLedgers(LogSequenceNumber lastCheckPointSequenceNumber) throws LogNotAvailableException;
+    /**
+     * Drops old commit-log segments that are no longer needed for recovery.
+     * <p>
+     * Implementations must retain every segment whose ledger ID is {@code >=}
+     * {@code lastCheckPointSequenceNumber.ledgerId} (needed to replay
+     * post-checkpoint entries on recovery) and every segment whose ledger ID
+     * is {@code >= tailersFloor.ledgerId} when {@code tailersFloor.ledgerId >= 0}
+     * (needed by external tailers, e.g. remote indexing services). Passing
+     * {@link LogSequenceNumber#START_OF_TIME} (ledgerId = -1) for
+     * {@code tailersFloor} means "no additional tailer constraint" and
+     * collapses to the pre-tailer behavior.
+     *
+     * @param lastCheckPointSequenceNumber LSN of the last completed checkpoint
+     * @param tailersFloor                 minimum LSN that external tailers still need,
+     *                                     or {@link LogSequenceNumber#START_OF_TIME} if none
+     */
+    public abstract void dropOldLedgers(
+            LogSequenceNumber lastCheckPointSequenceNumber,
+            LogSequenceNumber tailersFloor) throws LogNotAvailableException;
 
     protected CommitLogListener[] listeners = null;
 

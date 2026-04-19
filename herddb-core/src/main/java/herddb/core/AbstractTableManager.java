@@ -90,14 +90,6 @@ public interface AbstractTableManager extends AutoCloseable {
     TableCheckpoint checkpoint(boolean pin) throws DataStorageManagerException;
 
     /**
-     * Perform a checkpoint with a timeout for remote index catch-up.
-     * The default implementation delegates to {@link #checkpoint(boolean)}.
-     */
-    default TableCheckpoint checkpoint(boolean pin, long catchUpTimeoutMs) throws DataStorageManagerException {
-        return checkpoint(pin);
-    }
-
-    /**
      * Performs a full deep checkpoint cleaning as much space as possible.
      * <p>
      * It's an hint for table manager for perform a more aggressive checkpoint.
