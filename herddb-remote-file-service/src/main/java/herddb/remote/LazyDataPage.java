@@ -161,8 +161,19 @@ public final class LazyDataPage extends DataPage {
 
     @Override
     public Collection<Record> getRecordsForFlush() {
-        throw new UnsupportedOperationException(
-                "LazyDataPage is read-only; a lazy page must never be flushed");
+        // A lazy page never ends up on the flush path (it is always
+        // immutable and never marked dirty), but TableManager's checkpoint
+        // compaction also calls this method on clean pages that happen to
+        // be resident in memory — see TableManager.java:3314. We fetch the
+        // full page in a single eager read so compaction gets every record
+        // without issuing N individual byte-range calls.
+        try {
+            return dsm.readPage(tableSpace, uuid, pageId);
+        } catch (DataStorageManagerException e) {
+            throw new LazyValueFetchException(
+                    "Failed to materialise lazy page " + tableSpace + "/" + uuid
+                            + "#" + pageId + " for iteration", e);
+        }
     }
 
     // LazyDataPage identity is inherited from DataPage (pageId-based).

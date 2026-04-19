@@ -50,4 +50,20 @@ class RemoteTestUtils {
         return ((ScanResult) manager.executePlan(
                 translated.plan, translated.context, TransactionContext.NO_TRANSACTION)).dataScanner;
     }
+
+    static DMLStatementExecutionResult executeUpdateWithContext(DBManager manager, String query,
+            List<Object> parameters, TransactionContext txCtx) throws StatementExecutionException {
+        TranslatedQuery translated = manager.getPlanner().translate(
+                TableSpace.DEFAULT, query, parameters, true, true, false, -1);
+        return (DMLStatementExecutionResult) manager.executePlan(
+                translated.plan, translated.context, txCtx);
+    }
+
+    static DataScanner scanWithContext(DBManager manager, String query,
+            List<Object> parameters, TransactionContext txCtx) throws StatementExecutionException {
+        TranslatedQuery translated = manager.getPlanner().translate(
+                TableSpace.DEFAULT, query, parameters, true, true, false, -1);
+        return ((ScanResult) manager.executePlan(
+                translated.plan, translated.context, txCtx)).dataScanner;
+    }
 }

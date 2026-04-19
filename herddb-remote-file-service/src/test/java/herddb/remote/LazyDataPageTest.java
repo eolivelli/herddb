@@ -26,13 +26,13 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 import herddb.core.DataPage;
 import herddb.model.Record;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicLong;
@@ -206,15 +206,27 @@ public class LazyDataPageTest {
     }
 
     @Test
-    public void getRecordsForFlushThrows() throws Exception {
-        List<Record> records = makeRecords(2, 32);
+    public void getRecordsForFlushMaterialisesViaEagerReadPage() throws Exception {
+        // Compaction paths in TableManager iterate a resident page via
+        // getRecordsForFlush(). For lazy pages this triggers a single
+        // eager readPage() — one round trip instead of N.
+        List<Record> records = makeRecords(20, 64);
         storage.writePage(TS, UUID, PAGE_ID, records);
         DataPage page = storage.loadLazyDataPage(TS, UUID, PAGE_ID, null, Long.MAX_VALUE);
-        try {
-            callGetRecordsForFlush(page);
-            fail("expected UnsupportedOperationException");
-        } catch (UnsupportedOperationException expected) {
-            assertNotNull(expected.getMessage());
+        client.reset();
+
+        Collection<Record> materialised = page.getRecordsForFlush();
+        assertEquals(records.size(), materialised.size());
+
+        // Verify every original record shows up once.
+        java.util.Map<Bytes, byte[]> fromPage = new java.util.HashMap<>();
+        for (Record r : materialised) {
+            fromPage.put(r.key, r.value.to_array());
+        }
+        for (Record expected : records) {
+            byte[] actual = fromPage.get(expected.key);
+            assertNotNull("key not found: " + expected.key, actual);
+            assertArrayEquals(expected.value.to_array(), actual);
         }
     }
 
@@ -266,9 +278,5 @@ public class LazyDataPageTest {
 
     private static boolean callIsEmpty(DataPage page) {
         return page.isEmpty();
-    }
-
-    private static void callGetRecordsForFlush(DataPage page) {
-        page.getRecordsForFlush();
     }
 }
