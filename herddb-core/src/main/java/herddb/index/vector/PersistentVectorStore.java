@@ -1038,7 +1038,24 @@ public class PersistentVectorStore extends AbstractVectorStore {
         if (vector == null || vector.length == 0) {
             return;
         }
+        addVectorInternal(pk, vector.length, VTS.createFloatVector(vector));
+    }
 
+    /**
+     * Zero-copy variant of {@link #addVector(Bytes, float[])}: wraps the caller-owned
+     * buffer as a {@code VectorFloat<?>} view via {@code wrapFloatVector} rather than
+     * materializing a {@code float[]}. The buffer is not retained past this call.
+     */
+    @Override
+    public void addVector(Bytes pk, ByteBuffer vector) {
+        if (vector == null || vector.remaining() == 0) {
+            return;
+        }
+        int dim = vector.remaining() / Float.BYTES;
+        addVectorInternal(pk, dim, VTS.wrapFloatVector(vector));
+    }
+
+    private void addVectorInternal(Bytes pk, int dim, VectorFloat<?> vec) {
         // Back-pressure: if checkpoint Phase B is active and live cap exceeded,
         // wait for Phase C to complete before proceeding.
         CountDownLatch latch = checkpointPhaseComplete;
@@ -1062,15 +1079,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
         stateLock.readLock().lock();
         try {
             if (dimension == 0) {
-                initBuilderForDimension(vector.length);
+                initBuilderForDimension(dim);
             }
-            if (vector.length != dimension) {
+            if (dim != dimension) {
                 LOGGER.log(Level.WARNING,
                         "vector dimension mismatch on insert: expected {0} but got {1}, skipping",
-                        new Object[]{dimension, vector.length});
+                        new Object[]{dimension, dim});
                 return;
             }
-            VectorFloat<?> vec = VTS.createFloatVector(vector);
 
             List<LiveGraphShard> shards = this.liveShards;
             LiveGraphShard active = shards.get(shards.size() - 1);
@@ -1146,8 +1162,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     @Override
     public List<Map.Entry<Bytes, Float>> search(float[] queryVector, int topK) {
+        return searchInternal(VTS.createFloatVector(queryVector), topK);
+    }
+
+    /**
+     * Zero-copy variant of {@link #search(float[], int)}: interprets the caller-owned
+     * buffer's remaining bytes as the query vector without materializing a {@code float[]}.
+     * The buffer is not retained past this call.
+     */
+    @Override
+    public List<Map.Entry<Bytes, Float>> search(ByteBuffer queryVector, int topK) {
+        return searchInternal(VTS.wrapFloatVector(queryVector), topK);
+    }
+
+    private List<Map.Entry<Bytes, Float>> searchInternal(VectorFloat<?> qv, int topK) {
         List<Map.Entry<Bytes, Float>> results = new ArrayList<>();
-        VectorFloat<?> qv = VTS.createFloatVector(queryVector);
 
         // Overquery each source to improve recall when merging across segments.
         // Each source returns more candidates; the final merge picks the true topK.
