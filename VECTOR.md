@@ -829,7 +829,7 @@ compaction thread wakes (timer or memory pressure)
 <dependency>
     <groupId>io.github.jbellis</groupId>
     <artifactId>jvector</artifactId>
-    <version>4.0.0-rc.9-SNAPSHOT</version>
+    <version>4.0.0-rc.9-herddb-SNAPSHOT</version>
 </dependency>
 ```
 

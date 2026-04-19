@@ -21,6 +21,8 @@
 package herddb.index.vector;
 
 import herddb.utils.Bytes;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Predicate;
@@ -45,11 +47,46 @@ public abstract class AbstractVectorStore implements AutoCloseable {
 
     public abstract void addVector(Bytes pk, float[] vector);
 
+    /**
+     * Zero-copy counterpart of {@link #addVector(Bytes, float[])}. Stores from the
+     * caller-owned buffer's current position up to its limit as a vector of
+     * {@code remaining() / Float.BYTES} floats; the buffer is not retained past
+     * this call.
+     *
+     * <p>Implementations that can consume the buffer directly (e.g. jvector-backed
+     * stores wrapping it as a {@code BufferVectorFloat}) should override this method
+     * to avoid the {@code float[]} materialization that the default implementation
+     * performs as a compatibility fallback.
+     *
+     * <p>Use {@link ByteOrder#LITTLE_ENDIAN} for the native-SIMD fast path; big-endian
+     * buffers still work correctly but only under the Panama fallback.
+     */
+    public void addVector(Bytes pk, ByteBuffer vector) {
+        if (vector == null) {
+            return;
+        }
+        float[] floats = new float[vector.remaining() / Float.BYTES];
+        vector.asFloatBuffer().get(floats);
+        addVector(pk, floats);
+    }
+
     public abstract void removeVector(Bytes pk);
 
     public abstract int size();
 
     public abstract List<Map.Entry<Bytes, Float>> search(float[] queryVector, int topK);
+
+    /**
+     * Zero-copy counterpart of {@link #search(float[], int)}. Interprets the
+     * caller-owned buffer's remaining bytes as the query vector; the buffer is not
+     * retained past this call. See {@link #addVector(Bytes, ByteBuffer)} for the
+     * copy / byte-order contract.
+     */
+    public List<Map.Entry<Bytes, Float>> search(ByteBuffer queryVector, int topK) {
+        float[] floats = new float[queryVector.remaining() / Float.BYTES];
+        queryVector.asFloatBuffer().get(floats);
+        return search(floats, topK);
+    }
 
     public abstract long estimatedMemoryUsageBytes();
 
