@@ -118,6 +118,35 @@ public abstract class DataStorageManager implements AutoCloseable {
     public abstract void writePage(String tableSpace, String uuid, long pageId, Collection<Record> newPage)
             throws DataStorageManagerException;
 
+    /**
+     * Returns {@code true} if this storage manager can build lazy data pages —
+     * pages whose in-memory form holds only keys and per-record value offsets,
+     * with values fetched on demand from the backing store when a record is
+     * looked up.
+     *
+     * <p>Implementations that return {@code true} must also implement
+     * {@link #loadLazyDataPage}. The default is {@code false}, meaning the
+     * {@link herddb.core.TableManager} eager-loads the page via
+     * {@link #readPage} and wraps it in a regular {@code DataPage}.
+     */
+    public boolean supportsLazyPageLoad() {
+        return false;
+    }
+
+    /**
+     * Loads a data page in its lazy form: only the key / value-offset index
+     * is materialised in heap. Individual record values are fetched on
+     * demand when {@link herddb.core.DataPage#get} is called.
+     *
+     * <p>Must be overridden by implementations that return {@code true} from
+     * {@link #supportsLazyPageLoad()}.
+     */
+    public herddb.core.DataPage loadLazyDataPage(String tableSpace, String uuid, Long pageId,
+            herddb.core.TableManager owner, long maxSize) throws DataStorageManagerException {
+        throw new UnsupportedOperationException(
+                "Lazy page loading not supported by " + getClass().getName());
+    }
+
     @FunctionalInterface
     public interface DataWriter {
 

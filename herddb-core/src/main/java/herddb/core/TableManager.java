@@ -3015,9 +3015,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
         long ioStart = System.currentTimeMillis();
 
-        final List<Record> page;
+        final DataPage result;
         try {
-            page = dataStorageManager.readPage(tableSpaceUUID, table.uuid, pageId);
+            if (dataStorageManager.supportsLazyPageLoad()) {
+                result = dataStorageManager.loadLazyDataPage(
+                        tableSpaceUUID, table.uuid, pageId, this, maxLogicalPageSize);
+            } else {
+                final List<Record> page = dataStorageManager.readPage(
+                        tableSpaceUUID, table.uuid, pageId);
+                result = buildImmutableDataPage(pageId, page);
+            }
         } catch (DataPageDoesNotExistException e) {
             return null;
         } finally {
@@ -3025,8 +3032,6 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         }
 
         long ioStop = System.currentTimeMillis();
-
-        final DataPage result = buildImmutableDataPage(pageId, page);
 
         if (LOGGER.isLoggable(Level.FINE)) {
             long stop = System.currentTimeMillis();
@@ -3053,17 +3058,26 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             result = pages.computeIfAbsent(pageId, (id) -> {
                 try {
                     computed.value = true;
-                    List<Record> page;
+                    DataPage newPage;
                     maxCurrentPagesLoads.acquireUninterruptibly();
                     try {
-                        page = dataStorageManager.readPage(tableSpaceUUID, table.uuid, pageId);
+                        if (dataStorageManager.supportsLazyPageLoad()) {
+                            // Lazy path: fetch only header + index via byte-range
+                            // reads; values remain in remote storage until a
+                            // DataPage.get(key) call triggers a fetch.
+                            newPage = dataStorageManager.loadLazyDataPage(
+                                    tableSpaceUUID, table.uuid, pageId, this, maxLogicalPageSize);
+                        } else {
+                            List<Record> page = dataStorageManager.readPage(
+                                    tableSpaceUUID, table.uuid, pageId);
+                            newPage = buildImmutableDataPage(pageId, page);
+                        }
                     } finally {
                         maxCurrentPagesLoads.release();
                     }
 
                     loadedPagesCount.increment();
-
-                    return buildImmutableDataPage(pageId, page);
+                    return newPage;
                 } catch (DataStorageManagerException err) {
                     throw new RuntimeException(err);
                 }

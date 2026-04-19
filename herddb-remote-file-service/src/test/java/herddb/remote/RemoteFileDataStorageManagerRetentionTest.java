@@ -163,10 +163,15 @@ public class RemoteFileDataStorageManagerRetentionTest {
     }
 
     private boolean pageExists(long pageId) {
-        return client.readFile(TS + "/" + TABLE_UUID + "/data/" + pageId + ".page") != null;
+        // Data pages are stored as multipart files; listFiles returns the
+        // logical path regardless of on-disk storage layout.
+        String logicalPath = TS + "/" + TABLE_UUID + "/data/" + pageId + ".page";
+        return client.listFiles(TS + "/" + TABLE_UUID + "/data/").contains(logicalPath);
     }
 
     private boolean indexPageExists(long pageId) {
+        // Index pages are still single-file; both readFile and the listFiles
+        // logical view find them.
         return client.readFile(TS + "/" + INDEX_UUID + "/index/" + pageId + ".page") != null;
     }
 

@@ -352,6 +352,18 @@ public final class ServerConfiguration {
     public static final String PROPERTY_DISK_SWAP_MAX_RECORDS = "server.disk.swap.max.records";
     public static final int PROPERTY_DISK_SWAP_MAX_RECORDS_DEFAULT = 10000;
 
+    /**
+     * Maximum bytes held by the in-heap cache of on-demand value bytes used by
+     * the lazy data-page loading path in the remote-file-service
+     * {@code DataStorageManager}. Only applies when pages are stored on a
+     * remote file service (not the local {@code FileDataStorageManager}).
+     * Set to {@code 0} to disable the cache entirely — every
+     * {@code DataPage.get(key)} then re-issues a byte-range read. Defaults to
+     * 256 MiB.
+     */
+    public static final String PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES = "server.remote.lazy.value.cache.bytes";
+    public static final long PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES_DEFAULT = 256L * 1024L * 1024L;
+
     public static final String PROPERTY_MAX_LOGICAL_PAGE_SIZE = "server.memory.page.size";
     public static final long PROPERTY_MAX_LOGICAL_PAGE_SIZE_DEFAULT = 1 * 1024 * 1024;
 
