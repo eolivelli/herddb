@@ -561,6 +561,20 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         }
     }
 
+    @Override
+    public boolean supportsLazyPageLoad() {
+        return true;
+    }
+
+    @Override
+    public herddb.core.DataPage loadLazyDataPage(String tableSpace, String uuid, Long pageId,
+            herddb.core.TableManager owner, long maxSize) throws DataStorageManagerException {
+        LazyDataPageFormat.FixedHeader h = readPageHeader(tableSpace, uuid, pageId);
+        List<LazyDataPageFormat.RecordMetadata> metadata = readPageIndex(tableSpace, uuid, pageId, h);
+        return LazyDataPage.build(owner, pageId, maxSize,
+                this, tableSpace, uuid, h, metadata);
+    }
+
     private static boolean isNotFound(RuntimeException e) {
         // readFileRangeAsync wraps io.grpc status exceptions; surface common
         // "not found" conditions as DataPageDoesNotExistException.
