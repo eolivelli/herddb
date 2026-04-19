@@ -154,8 +154,12 @@ public class StaticDiscoveryRemoteFileIndexingTest {
                                             "INSERT INTO t1(id, vec) VALUES(?, ?)",
                                             0, false, true, Arrays.asList(3, vecZ));
 
-                                    // Checkpoint to flush data to remote storage
+                                    // Checkpoint to flush data to remote storage, then wait for
+                                    // the indexing service to catch up on the commit log.
                                     server.getManager().checkpoint();
+                                    con.executeUpdate(TableSpace.DEFAULT,
+                                            "EXECUTE WAITFORINDEXES 'herd', 60",
+                                            0, false, true, Collections.emptyList());
 
                                     // ANN search for vector closest to X axis
                                     float[] query = {1.0f, 0.0f, 0.0f, 0.0f};
