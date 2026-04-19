@@ -55,6 +55,7 @@ public class IngestionWorker implements Runnable {
     private final long ingestStartNanos;
     private final AtomicLong commitsTotal;
     private final AtomicLong commitsRecovered;
+    private final AtomicLong rowsCommitted;
 
     /**
      * Base of the exponential back-off between commit retries, in milliseconds.
@@ -65,7 +66,7 @@ public class IngestionWorker implements Runnable {
 
     public IngestionWorker(Config config, BlockingQueue<float[]> queue, AtomicBoolean done, AtomicLong rowId,
                            MetricsCollector metrics, AtomicReference<String> statusLine, long ingestStartNanos,
-                           AtomicLong commitsTotal, AtomicLong commitsRecovered) {
+                           AtomicLong commitsTotal, AtomicLong commitsRecovered, AtomicLong rowsCommitted) {
         this.config = config;
         this.queue = queue;
         this.done = done;
@@ -75,6 +76,7 @@ public class IngestionWorker implements Runnable {
         this.ingestStartNanos = ingestStartNanos;
         this.commitsTotal = commitsTotal;
         this.commitsRecovered = commitsRecovered;
+        this.rowsCommitted = rowsCommitted;
     }
 
     private static String formatEta(double seconds) {
@@ -140,6 +142,7 @@ public class IngestionWorker implements Runnable {
             try {
                 long latencyNanos = flushBatch(ps, conn, batchStartNanos);
                 commitsTotal.incrementAndGet();
+                rowsCommitted.addAndGet(batch.size());
                 if (attempt > 0) {
                     commitsRecovered.incrementAndGet();
                 }
@@ -273,14 +276,14 @@ public class IngestionWorker implements Runnable {
                     rowsIngested += pendingBatch.size();
                     pendingBatch.clear();
                 }
-            } catch (SQLException | ExecutionException | InterruptedException e) {
-                System.err.println("Ingestion error: " + e.getMessage());
-                e.printStackTrace();
-                safelyRollback(conn);
             }
-        } catch (SQLException e) {
-            System.err.println("Connection error: " + e.getMessage());
-            e.printStackTrace();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Ingestion worker interrupted", e);
+        } catch (SQLException | ExecutionException e) {
+            // Propagate: awaitTermination ignores task exceptions, so swallowing here
+            // would silently drop the uncommitted pendingBatch.
+            throw new RuntimeException("Ingestion worker failed", e);
         }
     }
 }
