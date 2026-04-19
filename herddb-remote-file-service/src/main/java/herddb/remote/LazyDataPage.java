@@ -165,6 +165,20 @@ public final class LazyDataPage extends DataPage {
                 "LazyDataPage is read-only; a lazy page must never be flushed");
     }
 
+    // LazyDataPage identity is inherited from DataPage (pageId-based).
+    // Overriding equals/hashCode explicitly to silence SpotBugs'
+    // EQ_DOESNT_OVERRIDE_EQUALS: this class adds no state that participates
+    // in page equality.
+    @Override
+    public boolean equals(Object obj) {
+        return super.equals(obj);
+    }
+
+    @Override
+    public int hashCode() {
+        return super.hashCode();
+    }
+
     /**
      * Wraps a remote fetch failure so the caller (typically
      * {@link herddb.core.TableManager}) sees a runtime exception instead of a

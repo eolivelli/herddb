@@ -30,7 +30,6 @@ import herddb.remote.LazyDataPageFormat.FixedHeader;
 import herddb.remote.LazyDataPageFormat.RecordMetadata;
 import herddb.storage.DataPageDoesNotExistException;
 import herddb.utils.Bytes;
-import io.netty.buffer.ByteBuf;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;

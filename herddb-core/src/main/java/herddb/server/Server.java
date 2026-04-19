@@ -481,8 +481,13 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                         LOGGER.log(Level.WARNING, "Failed to re-query file servers after listener registration", e);
                     }
                 }
+                Map<String, Object> dsmConfig = new HashMap<>();
+                dsmConfig.put(ServerConfiguration.PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES,
+                        configuration.getLong(
+                                ServerConfiguration.PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES,
+                                ServerConfiguration.PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES_DEFAULT));
                 DataStorageManager dsm = factory.createDataStorageManager(
-                        dataDirectory, tmpDirectory, diskswapThreshold, client);
+                        dataDirectory, tmpDirectory, diskswapThreshold, client, dsmConfig);
 
                 // Optionally enable checkpoint metadata publication to S3 for read replicas
                 boolean publishToRemote = configuration.getBoolean(

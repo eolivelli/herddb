@@ -22,6 +22,7 @@ package herddb.remote;
 
 import herddb.server.RemoteFileClient;
 import herddb.server.RemoteFileServiceFactory;
+import herddb.server.ServerConfiguration;
 import herddb.server.SharedCheckpointMetadata;
 import herddb.storage.DataStorageManager;
 import java.nio.file.Path;
@@ -52,8 +53,36 @@ public class RemoteFileServiceFactoryImpl implements RemoteFileServiceFactory {
     @Override
     public DataStorageManager createDataStorageManager(
             Path dataDirectory, Path tmpDirectory, int swapThreshold, RemoteFileClient client) {
+        return createDataStorageManager(dataDirectory, tmpDirectory, swapThreshold, client,
+                java.util.Collections.emptyMap());
+    }
+
+    @Override
+    public DataStorageManager createDataStorageManager(
+            Path dataDirectory, Path tmpDirectory, int swapThreshold,
+            RemoteFileClient client, Map<String, Object> config) {
+        long valueCacheBytes = readLong(config,
+                ServerConfiguration.PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES,
+                ServerConfiguration.PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES_DEFAULT);
+        LazyValueCache cache = new LazyValueCache(valueCacheBytes);
         return new RemoteFileDataStorageManager(
-                dataDirectory, tmpDirectory, swapThreshold, (RemoteFileServiceClient) client);
+                dataDirectory, tmpDirectory, swapThreshold,
+                (RemoteFileServiceClient) client, cache);
+    }
+
+    private static long readLong(Map<String, Object> config, String key, long defaultValue) {
+        Object v = config.get(key);
+        if (v == null) {
+            return defaultValue;
+        }
+        if (v instanceof Number) {
+            return ((Number) v).longValue();
+        }
+        try {
+            return Long.parseLong(v.toString());
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
     }
 
     @Override
