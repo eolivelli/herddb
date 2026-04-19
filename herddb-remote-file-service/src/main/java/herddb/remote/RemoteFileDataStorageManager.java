@@ -121,16 +121,35 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     private volatile long minRetentionMillis = 0L;
     private volatile long maxRetentionMillis = Long.MAX_VALUE;
 
+    private final LazyValueCache lazyValueCache;
+
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
             RemoteFileServiceClient client) {
+        this(localMetadataDir, tmpDir, swapThreshold, client, new LazyValueCache(0L));
+    }
+
+    public RemoteFileDataStorageManager(
+            Path localMetadataDir, Path tmpDir, int swapThreshold,
+            RemoteFileServiceClient client, LazyValueCache lazyValueCache) {
         this.tmpDir = tmpDir;
         this.swapThreshold = swapThreshold;
         this.client = client;
+        this.lazyValueCache = lazyValueCache == null ? new LazyValueCache(0L) : lazyValueCache;
         this.localMetadataManager = new FileDataStorageManager(
                 localMetadataDir, tmpDir, swapThreshold,
                 false, false, false, false, false,
                 new NullStatsLogger());
+    }
+
+    /** Value cache used by lazy page loads. */
+    LazyValueCache getLazyValueCache() {
+        return lazyValueCache;
+    }
+
+    /** Client used for all remote I/O. Visible for lazy-page loading. */
+    RemoteFileServiceClient getClient() {
+        return client;
     }
 
     /**
@@ -375,15 +394,36 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     public List<Record> readPage(String tableSpace, String uuid, Long pageId)
             throws DataStorageManagerException {
         String path = remoteDataPagePath(tableSpace, uuid, pageId);
-        ByteBuf data = client.readFileAsByteBuf(path);
-        if (data == null) {
+        int blockSize = client.getBlockSize();
+        byte[] headerBytes = client.readFileRange(path, 0L,
+                LazyDataPageFormat.FIXED_HEADER_SIZE, blockSize);
+        if (headerBytes == null || headerBytes.length < LazyDataPageFormat.FIXED_HEADER_SIZE) {
             throw new DataPageDoesNotExistException(
                     "No such remote page: " + tableSpace + "_" + uuid + "." + pageId);
         }
+        LazyDataPageFormat.FixedHeader h;
+        ByteBuf headerBuf = io.netty.buffer.Unpooled.wrappedBuffer(headerBytes);
         try {
-            return LazyDataPageFormat.readAllRecords(data);
+            h = LazyDataPageFormat.readHeader(headerBuf);
         } finally {
-            data.release();
+            headerBuf.release();
+        }
+        long totalSize = h.totalSize();
+        if (totalSize > (long) Integer.MAX_VALUE) {
+            throw new DataStorageManagerException(
+                    "remote page too big to read eagerly: " + path + " totalSize=" + totalSize);
+        }
+        byte[] full = client.readFileRange(path, 0L, (int) totalSize, blockSize);
+        if (full == null || full.length < totalSize) {
+            throw new DataStorageManagerException(
+                    "short read for remote page " + path + ": expected " + totalSize
+                            + " got " + (full == null ? 0 : full.length));
+        }
+        ByteBuf buf = io.netty.buffer.Unpooled.wrappedBuffer(full);
+        try {
+            return LazyDataPageFormat.readAllRecords(buf);
+        } finally {
+            buf.release();
         }
     }
 
@@ -393,10 +433,146 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         String path = remoteDataPagePath(tableSpace, uuid, pageId);
         ByteBuf buf = LazyDataPageFormat.write(newPage);
         try {
-            client.writeFile(path, buf);
+            writeAsMultipart(path, buf);
         } finally {
             buf.release();
         }
+        // Any cached values under this (tableSpace/uuid/pageId) now refer to
+        // stale bytes — drop them so a subsequent lazy read sees the new page.
+        lazyValueCache.invalidateForPage(tableSpace, uuid, pageId);
+    }
+
+    /**
+     * Writes {@code buf} as a multipart object at {@code path} so that
+     * subsequent {@link RemoteFileServiceClient#readFileRange} calls can
+     * satisfy byte-range reads. Blocks larger than a single server block
+     * are split into consecutive blocks.
+     */
+    private void writeAsMultipart(String path, ByteBuf buf) {
+        final int blockSize = client.getBlockSize();
+        final int total = buf.readableBytes();
+        if (total == 0) {
+            // empty content: still create block 0 so readers see a valid file
+            client.writeFileBlock(path, 0L, io.netty.buffer.Unpooled.EMPTY_BUFFER);
+            return;
+        }
+        long blockIndex = 0L;
+        int pos = buf.readerIndex();
+        int remaining = total;
+        while (remaining > 0) {
+            int chunk = Math.min(remaining, blockSize);
+            ByteBuf slice = buf.slice(pos, chunk);
+            client.writeFileBlock(path, blockIndex, slice);
+            pos += chunk;
+            remaining -= chunk;
+            blockIndex++;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Lazy read helpers (range-read v2 pages)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Reads the 22-byte fixed header of a v2 page via a byte-range read and
+     * returns the parsed counts/sizes. Throws
+     * {@link DataPageDoesNotExistException} if the remote file is absent.
+     */
+    LazyDataPageFormat.FixedHeader readPageHeader(String tableSpace, String uuid, long pageId)
+            throws DataStorageManagerException {
+        String path = remoteDataPagePath(tableSpace, uuid, pageId);
+        byte[] headerBytes;
+        try {
+            headerBytes = client.readFileRange(path, 0L,
+                    LazyDataPageFormat.FIXED_HEADER_SIZE, client.getBlockSize());
+        } catch (RuntimeException e) {
+            if (isNotFound(e)) {
+                throw new DataPageDoesNotExistException(
+                        "No such remote page: " + tableSpace + "_" + uuid + "." + pageId);
+            }
+            throw new DataStorageManagerException("Error reading remote page header: " + path, e);
+        }
+        if (headerBytes == null || headerBytes.length < LazyDataPageFormat.FIXED_HEADER_SIZE) {
+            throw new DataPageDoesNotExistException(
+                    "No such remote page: " + tableSpace + "_" + uuid + "." + pageId);
+        }
+        ByteBuf tmp = io.netty.buffer.Unpooled.wrappedBuffer(headerBytes);
+        try {
+            return LazyDataPageFormat.readHeader(tmp);
+        } finally {
+            tmp.release();
+        }
+    }
+
+    /**
+     * Reads the index section of a v2 page via a byte-range read and returns
+     * the per-record metadata (key + value offset + value length).
+     */
+    List<LazyDataPageFormat.RecordMetadata> readPageIndex(String tableSpace, String uuid,
+            long pageId, LazyDataPageFormat.FixedHeader h) throws DataStorageManagerException {
+        if (h.indexSize == 0) {
+            return Collections.emptyList();
+        }
+        String path = remoteDataPagePath(tableSpace, uuid, pageId);
+        byte[] indexBytes;
+        try {
+            indexBytes = client.readFileRange(path,
+                    LazyDataPageFormat.FIXED_HEADER_SIZE, h.indexSize, client.getBlockSize());
+        } catch (RuntimeException e) {
+            throw new DataStorageManagerException("Error reading remote page index: " + path, e);
+        }
+        if (indexBytes == null || indexBytes.length < h.indexSize) {
+            throw new DataStorageManagerException("Short read for remote page index: " + path);
+        }
+        ByteBuf tmp = io.netty.buffer.Unpooled.wrappedBuffer(indexBytes);
+        try {
+            return LazyDataPageFormat.readIndex(tmp, h.numRecords);
+        } finally {
+            tmp.release();
+        }
+    }
+
+    /**
+     * Fetches a single record value from a v2 page, consulting the value
+     * cache first and issuing a byte-range read against remote storage on
+     * miss. Returns a freshly-owned {@code byte[]}.
+     */
+    byte[] readPageValue(String tableSpace, String uuid, long pageId,
+            LazyDataPageFormat.FixedHeader h, long valueOffset, int valueLength)
+            throws DataStorageManagerException {
+        if (valueLength == 0) {
+            return new byte[0];
+        }
+        LazyValueCache.ValueKey key = new LazyValueCache.ValueKey(
+                tableSpace, uuid, pageId, valueOffset);
+        try {
+            return lazyValueCache.getOrFetch(key, () -> {
+                long absolute = LazyDataPageFormat.absoluteValueOffset(h, valueOffset);
+                String path = remoteDataPagePath(tableSpace, uuid, pageId);
+                byte[] bytes = client.readFileRange(path, absolute, valueLength, client.getBlockSize());
+                if (bytes == null || bytes.length < valueLength) {
+                    throw new IllegalStateException("Short read for value at "
+                            + path + "[" + absolute + "+" + valueLength + "]");
+                }
+                return bytes;
+            });
+        } catch (IllegalStateException e) {
+            throw new DataStorageManagerException(e.getMessage(), e);
+        }
+    }
+
+    private static boolean isNotFound(RuntimeException e) {
+        // readFileRangeAsync wraps io.grpc status exceptions; surface common
+        // "not found" conditions as DataPageDoesNotExistException.
+        Throwable t = e;
+        while (t != null) {
+            String msg = t.getMessage();
+            if (msg != null && (msg.contains("NOT_FOUND") || msg.contains("does not exist"))) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
     }
 
     @Override
@@ -752,6 +928,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         String key = tableSpace + "/" + uuid;
         lastCheckpointedDataPages.remove(key);
         pendingDataDeletions.remove(key);
+        lazyValueCache.invalidateForTable(tableSpace, uuid);
     }
 
     @Override
@@ -781,6 +958,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         lastCheckpointedIndexPages.keySet().removeIf(k -> k.startsWith(prefix));
         pendingDataDeletions.keySet().removeIf(k -> k.startsWith(prefix));
         pendingIndexDeletions.keySet().removeIf(k -> k.startsWith(prefix));
+        lazyValueCache.invalidateForTablespace(tableSpace);
     }
 
     @Override

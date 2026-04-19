@@ -130,15 +130,18 @@ public class RemoteFileDataStorageManagerBasicTest {
         page.add(new Record(Bytes.from_string("charlie"), Bytes.from_string("C".repeat(16))));
         storage.writePage("ts1", "uuid1", 42L, page);
 
-        byte[] raw = client.readFile("ts1/uuid1/data/42.page");
-        assertNotNull(raw);
-        // Magic at bytes [0..4): "HDP2"
-        int magic = ((raw[0] & 0xff) << 24)
-                | ((raw[1] & 0xff) << 16)
-                | ((raw[2] & 0xff) << 8)
-                | (raw[3] & 0xff);
+        // Pages are stored as multipart (one block per ~4 MiB) so that
+        // byte-range reads work; fetch the first 5 bytes of block 0 to
+        // verify the magic and version.
+        byte[] prefix = client.readFileRange(
+                "ts1/uuid1/data/42.page", 0L, 5, client.getBlockSize());
+        assertNotNull(prefix);
+        int magic = ((prefix[0] & 0xff) << 24)
+                | ((prefix[1] & 0xff) << 16)
+                | ((prefix[2] & 0xff) << 8)
+                | (prefix[3] & 0xff);
         assertEquals(LazyDataPageFormat.MAGIC, magic);
-        assertEquals(LazyDataPageFormat.VERSION_V2, raw[4]);
+        assertEquals(LazyDataPageFormat.VERSION_V2, prefix[4]);
 
         // Round-trip via the DSM.
         List<Record> read = storage.readPage("ts1", "uuid1", 42L);
