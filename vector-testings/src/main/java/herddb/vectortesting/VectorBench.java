@@ -30,8 +30,10 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -204,13 +206,15 @@ public class VectorBench {
             AtomicLong rowId = new AtomicLong(config.resumeFrom);
             AtomicLong commitsTotal = new AtomicLong(0);
             AtomicLong commitsRecovered = new AtomicLong(0);
+            AtomicLong rowsCommitted = new AtomicLong(0);
 
             long ingestStart = System.nanoTime();
 
             ExecutorService ingestPool = Executors.newFixedThreadPool(config.ingestThreads);
+            List<Future<?>> ingestFutures = new ArrayList<>(config.ingestThreads);
             for (int t = 0; t < config.ingestThreads; t++) {
-                ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId, ingestMetrics,
-                        ingestStatus, ingestStart, commitsTotal, commitsRecovered));
+                ingestFutures.add(ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId,
+                        ingestMetrics, ingestStatus, ingestStart, commitsTotal, commitsRecovered, rowsCommitted)));
             }
 
             // Progress display thread runs during the entire ingestion
@@ -306,6 +310,27 @@ public class VectorBench {
             ingestPool.shutdown();
             ingestPool.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
 
+            // awaitTermination ignores task-level exceptions, so a worker that died
+            // mid-flush leaves its partial batch silently uncommitted unless we
+            // explicitly drain each Future.
+            for (Future<?> f : ingestFutures) {
+                try {
+                    f.get();
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                    throw new IllegalStateException("Ingest worker failed: " + cause.getMessage(), cause);
+                }
+            }
+
+            long rowsAssigned = rowId.get() - config.resumeFrom;
+            long committed = rowsCommitted.get();
+            if (committed != rowsAssigned) {
+                throw new IllegalStateException(String.format(
+                        "Ingest lost %d rows: assigned=%d committed=%d "
+                                + "(no worker exception surfaced — investigate logs)",
+                        rowsAssigned - committed, rowsAssigned, committed));
+            }
+
             ingestDone.set(true);
             progressThread.join();
             if (statusThread != null) {
@@ -330,7 +355,7 @@ public class VectorBench {
 
             // Verify row count matches ingested records
             if (!config.skipVerify) {
-                long expectedRows = rowId.get();
+                long expectedRows = config.resumeFrom + rowsCommitted.get();
                 long[] actualCount = {0};
                 runWithProgress(out, "verification", "=== VERIFICATION (COUNT) ===", () -> {
                     try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);

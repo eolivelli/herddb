@@ -130,10 +130,15 @@ class IngestionWorkerTest {
     }
 
     private IngestionWorker createTestWorker() {
-        return createTestWorker(new Config(), new AtomicLong(0), new AtomicLong(0));
+        return createTestWorker(new Config(), new AtomicLong(0), new AtomicLong(0), new AtomicLong(0));
     }
 
     private IngestionWorker createTestWorker(Config config, AtomicLong commitsTotal, AtomicLong commitsRecovered) {
+        return createTestWorker(config, commitsTotal, commitsRecovered, new AtomicLong(0));
+    }
+
+    private IngestionWorker createTestWorker(Config config, AtomicLong commitsTotal, AtomicLong commitsRecovered,
+                                             AtomicLong rowsCommitted) {
         IngestionWorker worker = new IngestionWorker(
                 config,
                 new java.util.concurrent.LinkedBlockingQueue<>(),
@@ -143,7 +148,8 @@ class IngestionWorkerTest {
                 new java.util.concurrent.atomic.AtomicReference<>(""),
                 System.nanoTime(),
                 commitsTotal,
-                commitsRecovered
+                commitsRecovered,
+                rowsCommitted
         );
         worker.backoffBaseMillis = 0L; // keep tests fast
         return worker;
@@ -209,6 +215,80 @@ class IngestionWorkerTest {
         assertEquals(3, conn.commitAttempts, "initial + 2 retries = 3 attempts");
         assertEquals(0L, commitsTotal.get());
         assertEquals(0L, commitsRecovered.get());
+    }
+
+    /**
+     * A successful {@code commitWithRetry} bumps {@code rowsCommitted} by exactly
+     * the batch size — this counter is how {@code VectorBench} detects silent
+     * data loss (issue #173) before the 270 s COUNT(*) verification.
+     */
+    @Test
+    void testCommitWithRetryIncrementsRowsCommitted() throws Exception {
+        FakePreparedStatement ps = new FakePreparedStatement();
+        FakeConnection conn = new FakeConnection();
+
+        AtomicLong commitsTotal = new AtomicLong(0);
+        AtomicLong commitsRecovered = new AtomicLong(0);
+        AtomicLong rowsCommitted = new AtomicLong(0);
+        IngestionWorker worker = createTestWorker(new Config(), commitsTotal, commitsRecovered, rowsCommitted);
+
+        List<IngestionWorker.PendingRow> batch = new ArrayList<>();
+        for (int i = 0; i < 7; i++) {
+            batch.add(new IngestionWorker.PendingRow(i, new float[]{(float) i}));
+        }
+
+        worker.commitWithRetry(ps, conn, batch, System.nanoTime());
+
+        assertEquals(7L, rowsCommitted.get(), "rowsCommitted should equal batch size after one successful commit");
+        assertEquals(1L, commitsTotal.get());
+    }
+
+    /**
+     * When retries eventually succeed, {@code rowsCommitted} is bumped exactly once
+     * (not per-attempt) — the counter must reflect rows actually persisted, not
+     * attempted flushes.
+     */
+    @Test
+    void testRowsCommittedBumpedOnceDespiteRetries() throws Exception {
+        FakePreparedStatement ps = new FakePreparedStatement();
+        FakeConnection conn = new FakeConnection();
+        conn.commitFailsRemaining = 2;
+
+        Config config = new Config();
+        config.ingestCommitRetries = 3;
+        AtomicLong rowsCommitted = new AtomicLong(0);
+        IngestionWorker worker = createTestWorker(config, new AtomicLong(0), new AtomicLong(0), rowsCommitted);
+
+        List<IngestionWorker.PendingRow> batch = new ArrayList<>();
+        batch.add(new IngestionWorker.PendingRow(1L, new float[]{1f}));
+        batch.add(new IngestionWorker.PendingRow(2L, new float[]{2f}));
+
+        worker.commitWithRetry(ps, conn, batch, System.nanoTime());
+
+        assertEquals(2L, rowsCommitted.get(), "rowsCommitted should be bumped exactly once, not per-attempt");
+    }
+
+    /**
+     * When retries are exhausted, {@code rowsCommitted} stays at zero — no rows
+     * were persisted, so none should be counted as committed.
+     */
+    @Test
+    void testRowsCommittedNotBumpedOnExhaustedRetries() {
+        FakePreparedStatement ps = new FakePreparedStatement();
+        FakeConnection conn = new FakeConnection();
+        conn.failOnCommit = true;
+
+        Config config = new Config();
+        config.ingestCommitRetries = 2;
+        AtomicLong rowsCommitted = new AtomicLong(0);
+        IngestionWorker worker = createTestWorker(config, new AtomicLong(0), new AtomicLong(0), rowsCommitted);
+
+        List<IngestionWorker.PendingRow> batch = new ArrayList<>();
+        batch.add(new IngestionWorker.PendingRow(1L, new float[]{1f}));
+
+        assertThrows(SQLException.class,
+                () -> worker.commitWithRetry(ps, conn, batch, System.nanoTime()));
+        assertEquals(0L, rowsCommitted.get());
     }
 
     /**
