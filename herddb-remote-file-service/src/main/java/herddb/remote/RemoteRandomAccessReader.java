@@ -22,9 +22,10 @@ package herddb.remote;
 
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
+import io.netty.buffer.ByteBuf;
+import io.netty.util.ReferenceCountUtil;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
 import org.apache.bookkeeper.stats.Counter;
@@ -67,7 +68,15 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
     private final Counter clientReadRequests;
 
     private long position;
-    private byte[] blockBuffer;
+    /**
+     * Pooled direct ByteBuf holding the currently-cached block. Owned by this reader
+     * and released in {@link #close()} (and on every reload). All accessors
+     * ({@link #readInt}, {@link #readLong}, {@link #readFloat}, {@link #readFully},
+     * {@link #read}) operate at absolute offsets via Netty's getX(int) primitives,
+     * which compile to Unsafe memcpy/load — no per-call temporary allocations.
+     */
+    @Nullable
+    private ByteBuf blockBuffer;
     private long bufferedBlockIndex = -1;
 
     /**
@@ -151,12 +160,23 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
 
     @Override
     public int readInt() throws IOException {
-        byte[] buf = new byte[4];
-        readFully(buf);
-        return ((buf[0] & 0xFF) << 24)
-                | ((buf[1] & 0xFF) << 16)
-                | ((buf[2] & 0xFF) << 8)
-                | (buf[3] & 0xFF);
+        ensureBlockLoaded();
+        int offsetInBlock = (int) (position % bufferSize);
+        // Block boundary check: an int never spans two blocks because writeBlockSize
+        // is constrained to be a multiple of bufferSize (see constructor); but the
+        // logical end-of-file may sit mid-block. Fall back to readFully(byte[4]) only
+        // if the int crosses a block boundary inside this buffered window.
+        if (offsetInBlock + Integer.BYTES <= blockBuffer.readableBytes()) {
+            int v = blockBuffer.getInt(offsetInBlock); // big-endian, matches the previous bit-shift code
+            position += Integer.BYTES;
+            return v;
+        }
+        byte[] tmp = new byte[Integer.BYTES];
+        readFully(tmp);
+        return ((tmp[0] & 0xFF) << 24)
+                | ((tmp[1] & 0xFF) << 16)
+                | ((tmp[2] & 0xFF) << 8)
+                | (tmp[3] & 0xFF);
     }
 
     @Override
@@ -166,11 +186,18 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
 
     @Override
     public long readLong() throws IOException {
-        byte[] buf = new byte[8];
-        readFully(buf);
+        ensureBlockLoaded();
+        int offsetInBlock = (int) (position % bufferSize);
+        if (offsetInBlock + Long.BYTES <= blockBuffer.readableBytes()) {
+            long v = blockBuffer.getLong(offsetInBlock); // big-endian
+            position += Long.BYTES;
+            return v;
+        }
+        byte[] tmp = new byte[Long.BYTES];
+        readFully(tmp);
         long v = 0;
-        for (int i = 0; i < 8; i++) {
-            v = (v << 8) | (buf[i] & 0xFF);
+        for (int i = 0; i < Long.BYTES; i++) {
+            v = (v << 8) | (tmp[i] & 0xFF);
         }
         return v;
     }
@@ -182,9 +209,11 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         while (remaining > 0) {
             ensureBlockLoaded();
             int offsetInBlock = (int) (position % bufferSize);
-            int available = blockBuffer.length - offsetInBlock;
+            int available = blockBuffer.readableBytes() - offsetInBlock;
             int toCopy = Math.min(available, remaining);
-            System.arraycopy(blockBuffer, offsetInBlock, dest, destOffset, toCopy);
+            // getBytes(int srcIndex, byte[] dst, int dstIndex, int length) is a single
+            // Unsafe memcpy from the pooled direct buffer into the heap array.
+            blockBuffer.getBytes(offsetInBlock, dest, destOffset, toCopy);
             position += toCopy;
             destOffset += toCopy;
             remaining -= toCopy;
@@ -193,9 +222,19 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
 
     @Override
     public void readFully(ByteBuffer buffer) throws IOException {
-        byte[] tmp = new byte[buffer.remaining()];
-        readFully(tmp);
-        buffer.put(tmp);
+        while (buffer.hasRemaining()) {
+            ensureBlockLoaded();
+            int offsetInBlock = (int) (position % bufferSize);
+            int available = blockBuffer.readableBytes() - offsetInBlock;
+            int toCopy = Math.min(available, buffer.remaining());
+            // Bounded view of the destination so getBytes copies exactly toCopy bytes
+            // without overshooting; no temporary heap array.
+            ByteBuffer view = buffer.duplicate();
+            view.limit(view.position() + toCopy);
+            blockBuffer.getBytes(offsetInBlock, view);
+            buffer.position(buffer.position() + toCopy);
+            position += toCopy;
+        }
     }
 
     @Override
@@ -214,17 +253,18 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
 
     @Override
     public void read(float[] floats, int offset, int count) throws IOException {
-        byte[] buf = new byte[count * 4];
-        readFully(buf);
-        ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.BIG_ENDIAN);
         for (int i = 0; i < count; i++) {
-            floats[offset + i] = bb.getFloat();
+            floats[offset + i] = readFloat();
         }
     }
 
     @Override
     public void close() throws IOException {
-        // stateless; nothing to close
+        if (blockBuffer != null) {
+            ReferenceCountUtil.safeRelease(blockBuffer);
+            blockBuffer = null;
+            bufferedBlockIndex = -1;
+        }
     }
 
     private void ensureBlockLoaded() throws IOException {
@@ -242,7 +282,7 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
             clientReadRequests.inc();
         }
         long startNanos = System.nanoTime();
-        byte[] data = client.readFileRange(path, bufferOffset, requestLength, writeBlockSize);
+        ByteBuf data = client.readFileRangeAsByteBuf(path, bufferOffset, requestLength, writeBlockSize);
         long elapsedNanos = System.nanoTime() - startNanos;
         if (data == null) {
             if (clientReadLatency != null) {
@@ -258,6 +298,10 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         }
         if (clientReadBytes != null) {
             clientReadBytes.inc();
+        }
+        // Release the previously cached block (if any) before reassigning.
+        if (blockBuffer != null) {
+            ReferenceCountUtil.safeRelease(blockBuffer);
         }
         blockBuffer = data;
         bufferedBlockIndex = bufferIndex;

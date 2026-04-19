@@ -94,8 +94,12 @@ public final class ReadResult {
     /**
      * Get content as byte array copy (convenience method).
      * <p>
-     * This makes a heap copy from the pooled direct ByteBuf.
-     * Prefer using {@link #byteBuf()} directly for better performance.
+     * This makes a heap copy from the pooled direct ByteBuf — used by tests only.
+     * Production code paths must use {@link #byteBuf()} (and call {@link #release()}
+     * when done) so the bytes flow zero-copy through the cache layers and onto the
+     * gRPC wire. Adding a new production caller reintroduces the
+     * {@code ReadResult.content} allocation hot-path that the cache-layer
+     * refactor removed.
      *
      * @return copy of content bytes, or null if NOT_FOUND
      */
