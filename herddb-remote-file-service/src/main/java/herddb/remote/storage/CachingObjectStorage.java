@@ -73,7 +73,7 @@ public class CachingObjectStorage implements ObjectStorage {
     private final ExecutorService executor;
     private final Cache<String, Long> diskLru;
     private final Striped<ReadWriteLock> locks = Striped.lazyWeakReadWriteLock(STRIPES);
-    private final ConcurrentHashMap<String, CompletableFuture<ReadResult>> inFlightReads = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, CompletableFuture<ByteBuf>> inFlightReads = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CompletableFuture<Void>> inFlightWrites = new ConcurrentHashMap<>();
 
     public CachingObjectStorage(ObjectStorage inner, Path cacheDir, ExecutorService executor,
@@ -169,6 +169,58 @@ public class CachingObjectStorage implements ObjectStorage {
         return result;
     }
 
+    /**
+     * Asynchronously writes {@code buf}'s readable bytes to a cache file using
+     * {@link AsynchronousFileChannel}. The caller must hold a refcount on
+     * {@code buf}; this method releases that refcount when the write completes
+     * (success or failure). The buffer's reader/writer indices are not modified.
+     */
+    private CompletableFuture<Void> writeCacheFileAsync(String path, ByteBuf buf) {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        Path target = cacheFilePath(path);
+        Path tmp = cacheDir.resolve(target.getFileName() + ".tmp");
+        int len = buf.readableBytes();
+
+        try {
+            AsynchronousFileChannel channel = AsynchronousFileChannel.open(
+                    tmp, StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            // nioBuffer on a direct pooled ByteBuf returns a view, no copy.
+            ByteBuffer nio = buf.nioBuffer(buf.readerIndex(), len);
+            channel.write(nio, 0, null, new CompletionHandler<Integer, Void>() {
+                @Override
+                public void completed(Integer bytesWritten, Void attachment) {
+                    try {
+                        channel.close();
+                        Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                        result.complete(null);
+                    } catch (Throwable t) {
+                        deleteCacheFile(path);
+                        result.completeExceptionally(t);
+                    } finally {
+                        buf.release();
+                    }
+                }
+
+                @Override
+                public void failed(Throwable exc, Void attachment) {
+                    try {
+                        channel.close();
+                    } catch (IOException ignored) {
+                    }
+                    deleteCacheFile(path);
+                    buf.release();
+                    result.completeExceptionally(exc);
+                }
+            });
+        } catch (Throwable t) {
+            deleteCacheFile(path);
+            buf.release();
+            result.completeExceptionally(t);
+        }
+
+        return result;
+    }
+
     private void deleteCacheFile(String path) {
         try {
             Files.deleteIfExists(cacheFilePath(path));
@@ -197,6 +249,38 @@ public class CachingObjectStorage implements ObjectStorage {
                     return;
                 }
                 diskLru.put(path, (long) content.length);
+                pending.complete(null);
+            } finally {
+                inFlightWrites.remove(path, pending);
+            }
+        });
+
+        return pending;
+    }
+
+    /**
+     * ByteBuf overload of {@link #admitToDisk(String, byte[])}. The caller must hold
+     * a refcount on {@code buf}; this method releases that refcount when the disk
+     * write completes (success or failure). The buffer's reader/writer indices are
+     * not modified.
+     */
+    private CompletableFuture<Void> admitToDisk(String path, ByteBuf buf) {
+        CompletableFuture<Void> pending = new CompletableFuture<>();
+        CompletableFuture<Void> existing = inFlightWrites.putIfAbsent(path, pending);
+        if (existing != null) {
+            // Another thread is already writing this path; release our retain and attach.
+            buf.release();
+            return existing;
+        }
+
+        int size = buf.readableBytes();
+        writeCacheFileAsync(path, buf).whenComplete((v, err) -> {
+            try {
+                if (err != null) {
+                    pending.completeExceptionally(err);
+                    return;
+                }
+                diskLru.put(path, (long) size);
                 pending.complete(null);
             } finally {
                 inFlightWrites.remove(path, pending);
@@ -291,38 +375,87 @@ public class CachingObjectStorage implements ObjectStorage {
      * Loads {@code path} from the inner storage, deduplicating concurrent loads of the
      * same key. On a successful load the bytes are written to disk and registered in
      * the LRU before being returned.
+     * <p>
+     * The pooled {@link ByteBuf} from the inner storage is kept end-to-end: it is
+     * shared by the disk-write path and by every concurrent caller (each gets a
+     * {@code retainedDuplicate} via {@code pending.thenApply}). No heap copy.
      */
     private CompletableFuture<ReadResult> loadAndCache(String path) {
-        CompletableFuture<ReadResult> pending = new CompletableFuture<>();
-        CompletableFuture<ReadResult> existing = inFlightReads.putIfAbsent(path, pending);
+        CompletableFuture<ByteBuf> pending = new CompletableFuture<>();
+        // Register the wrapDuplicate dependent BEFORE issuing inner.read. inner.read
+        // may complete synchronously (e.g. test fakes returning a completed future),
+        // and the disk-write completion runs on an I/O thread that races with this
+        // method's return. Keeping the dependent attached up front guarantees it
+        // fires inside pending.complete — while the alive-for-followers retain is
+        // still held — instead of after the alive retain has already been released.
+        CompletableFuture<ReadResult> resultFuture = pending.thenApply(CachingObjectStorage::wrapDuplicate);
+
+        CompletableFuture<ByteBuf> existing = inFlightReads.putIfAbsent(path, pending);
         if (existing != null) {
-            return existing;
+            return existing.thenApply(CachingObjectStorage::wrapDuplicate);
         }
-        inner.read(path).thenCompose(result -> {
-            if (result.status() == ReadResult.Status.FOUND) {
-                // Write to cache asynchronously before returning the result
-                byte[] content = result.content();  // Make copy before releasing
-                result.release();  // Release the pooled ByteBuf
-                return admitToDisk(path, content).thenApply(v -> {
-                    // Need to return a new ReadResult with the content
-                    ByteBuf newBuf = PooledByteBufAllocator.DEFAULT.directBuffer(content.length);
-                    newBuf.writeBytes(content);
-                    return ReadResult.found(newBuf);
-                });
-            }
-            return CompletableFuture.completedFuture(result);
-        }).whenComplete((result, err) -> {
-            try {
-                if (err != null) {
+        inner.read(path).whenComplete((result, err) -> {
+            if (err != null) {
+                try {
                     pending.completeExceptionally(err);
-                } else {
-                    pending.complete(result);
+                } finally {
+                    inFlightReads.remove(path, pending);
                 }
+                return;
+            }
+            if (result.status() != ReadResult.Status.FOUND) {
+                try {
+                    pending.complete(null);
+                } finally {
+                    inFlightReads.remove(path, pending);
+                }
+                return;
+            }
+            ByteBuf buf = result.byteBuf();
+            // Two extra retains:
+            //   +1 for admitToDisk (released inside writeCacheFileAsync when the disk write finishes).
+            //   +1 to keep buf alive across pending.complete so all dependents
+            //      (original caller + any in-flight followers) can retainedDuplicate.
+            // The original `result`'s refcount is dropped right after.
+            buf.retain(2);
+            CompletableFuture<Void> diskWrite = admitToDisk(path, buf);
+            try {
+                diskWrite.whenComplete((v, e) -> {
+                    try {
+                        if (e != null) {
+                            try {
+                                pending.completeExceptionally(e);
+                            } finally {
+                                inFlightReads.remove(path, pending);
+                            }
+                            return;
+                        }
+                        try {
+                            // pending.complete fires all dependents synchronously here:
+                            // each does retainedDuplicate(buf), bumping refcount per caller.
+                            pending.complete(buf);
+                        } finally {
+                            inFlightReads.remove(path, pending);
+                        }
+                    } finally {
+                        // Drop the alive-for-followers retain. Each successful follower
+                        // already holds its own retainedDuplicate; failed completion has
+                        // no followers to keep alive.
+                        buf.release();
+                    }
+                });
             } finally {
-                inFlightReads.remove(path, pending);
+                result.release();
             }
         });
-        return pending;
+        return resultFuture;
+    }
+
+    private static ReadResult wrapDuplicate(ByteBuf buf) {
+        if (buf == null) {
+            return ReadResult.notFound();
+        }
+        return ReadResult.found(buf.retainedDuplicate());
     }
 
     @Override
@@ -418,9 +551,8 @@ public class CachingObjectStorage implements ObjectStorage {
             }
             int to = Math.min(offsetInBlock + length, blockLength);
             int sliceLength = to - offsetInBlock;
-            ByteBuf sliceBuf = PooledByteBufAllocator.DEFAULT.directBuffer(sliceLength);
-            sliceBuf.writeBytes(blockBuf, blockBuf.readerIndex() + offsetInBlock, sliceLength);
-            return ReadResult.found(sliceBuf);
+            // retainedSlice shares the underlying memory; no copy.
+            return ReadResult.found(blockBuf.retainedSlice(blockBuf.readerIndex() + offsetInBlock, sliceLength));
         } finally {
             full.release();
         }

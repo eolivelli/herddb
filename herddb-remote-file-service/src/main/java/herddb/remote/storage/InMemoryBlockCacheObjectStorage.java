@@ -22,10 +22,9 @@ package herddb.remote.storage;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalListener;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.PooledByteBufAllocator;
-import io.netty.buffer.Unpooled;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -53,8 +52,8 @@ import java.util.concurrent.ConcurrentHashMap;
 public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
 
     private final ObjectStorage inner;
-    private final Cache<BlockKey, byte[]> cache;
-    private final ConcurrentHashMap<BlockKey, CompletableFuture<ReadResult>> inFlight = new ConcurrentHashMap<>();
+    private final Cache<BlockKey, ByteBuf> cache;
+    private final ConcurrentHashMap<BlockKey, CompletableFuture<ByteBuf>> inFlight = new ConcurrentHashMap<>();
     private final long maxBytes;
 
     public InMemoryBlockCacheObjectStorage(ObjectStorage inner, long maxBytes) {
@@ -65,7 +64,15 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
         this.maxBytes = maxBytes;
         this.cache = Caffeine.newBuilder()
                 .maximumWeight(maxBytes)
-                .weigher((BlockKey k, byte[] v) -> v == null ? 0 : v.length)
+                .weigher((BlockKey k, ByteBuf v) -> v == null ? 0 : v.readableBytes())
+                // Release the cache's retain on eviction (and on explicit invalidate*).
+                // Caffeine fires the removal listener for both size-based eviction and
+                // explicit invalidate(...)/invalidateAll(...) calls — covers all paths.
+                .removalListener((RemovalListener<BlockKey, ByteBuf>) (key, value, cause) -> {
+                    if (value != null) {
+                        value.release();
+                    }
+                })
                 .recordStats()
                 .build();
     }
@@ -90,9 +97,9 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
      */
     public long estimatedBytes() {
         long total = 0;
-        for (byte[] v : cache.asMap().values()) {
+        for (ByteBuf v : cache.asMap().values()) {
             if (v != null) {
-                total += v.length;
+                total += v.readableBytes();
             }
         }
         return total;
@@ -122,46 +129,57 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
         int offsetInBlock = (int) (offset % blockSize);
         BlockKey key = new BlockKey(path, blockIndex);
 
-        byte[] cached = cache.getIfPresent(key);
+        ByteBuf cached = cache.getIfPresent(key);
         if (cached != null) {
             return CompletableFuture.completedFuture(slice(cached, offsetInBlock, length));
         }
 
-        CompletableFuture<ReadResult> pending = new CompletableFuture<>();
-        CompletableFuture<ReadResult> existing = inFlight.putIfAbsent(key, pending);
+        CompletableFuture<ByteBuf> pending = new CompletableFuture<>();
+        // Register the slice dependent BEFORE issuing the inner read, so that if
+        // inner.readRange completes synchronously the wrapping happens inside
+        // pending.complete — see CachingObjectStorage.loadAndCache for the same race.
+        CompletableFuture<ReadResult> resultFuture = pending.thenApply(buf -> slice(buf, offsetInBlock, length));
+
+        CompletableFuture<ByteBuf> existing = inFlight.putIfAbsent(key, pending);
         if (existing != null) {
-            return existing.thenApply(full -> slice(fullBytes(full), offsetInBlock, length));
+            return existing.thenApply(buf -> slice(buf, offsetInBlock, length));
         }
 
         long blockStartOffset = blockIndex * (long) blockSize;
         inner.readRange(path, blockStartOffset, blockSize, blockSize).whenComplete((result, err) -> {
-            try {
-                if (err != null) {
-                    pending.completeExceptionally(err);
-                    return;
-                }
+            if (err != null) {
                 try {
-                    byte[] content = result.content();  // Extract bytes from pooled ByteBuf
-                    if (result.status() == ReadResult.Status.FOUND && content != null) {
-                        cache.put(key, content);
-                    }
-                    // Create a new ReadResult wrapping extracted bytes
-                    ReadResult toReturn;
-                    if (result.status() == ReadResult.Status.FOUND) {
-                        toReturn = ReadResult.found(Unpooled.wrappedBuffer(content));
-                    } else {
-                        toReturn = ReadResult.notFound();
-                    }
-                    pending.complete(toReturn);
+                    pending.completeExceptionally(err);
                 } finally {
-                    result.release();  // Release the original pooled ByteBuf
+                    inFlight.remove(key, pending);
                 }
+                return;
+            }
+            if (result.status() != ReadResult.Status.FOUND) {
+                try {
+                    pending.complete(null);
+                } finally {
+                    inFlight.remove(key, pending);
+                }
+                return;
+            }
+            ByteBuf buf = result.byteBuf();
+            // +1 for the cache's ownership; +1 to keep buf alive across pending.complete
+            // so all dependents (the original caller + any in-flight followers) can
+            // retainedSlice while the buf is still referenced. The original `result`'s
+            // refcount is dropped right after.
+            buf.retain(2);
+            cache.put(key, buf);
+            try {
+                pending.complete(buf);
             } finally {
                 inFlight.remove(key, pending);
+                buf.release();   // alive-for-followers retain
+                result.release(); // original ReadResult's refcount
             }
         });
 
-        return pending.thenApply(full -> slice(fullBytes(full), offsetInBlock, length));
+        return resultFuture;
     }
 
     @Override
@@ -216,25 +234,22 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
         cache.invalidateAll(toDrop);
     }
 
-    private static byte[] fullBytes(ReadResult full) {
-        if (full == null || full.status() != ReadResult.Status.FOUND) {
-            return null;
-        }
-        return full.content();
-    }
-
-    private static ReadResult slice(byte[] block, int offsetInBlock, int length) {
+    /**
+     * Returns a {@link ReadResult} whose buffer is a {@code retainedSlice} view of
+     * {@code block} — no copy. The caller releases the result; {@code block} keeps
+     * its existing refcounts (typically held by the cache and/or callers).
+     */
+    private static ReadResult slice(ByteBuf block, int offsetInBlock, int length) {
         if (block == null) {
             return ReadResult.notFound();
         }
-        if (offsetInBlock >= block.length) {
+        int blockLen = block.readableBytes();
+        if (offsetInBlock >= blockLen) {
             return ReadResult.notFound();
         }
-        int to = Math.min(offsetInBlock + length, block.length);
+        int to = Math.min(offsetInBlock + length, blockLen);
         int sliceLen = to - offsetInBlock;
-        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(sliceLen);
-        buf.writeBytes(block, offsetInBlock, sliceLen);
-        return ReadResult.found(buf);
+        return ReadResult.found(block.retainedSlice(block.readerIndex() + offsetInBlock, sliceLen));
     }
 
     /** Package-private: force Caffeine maintenance. Used by tests. */

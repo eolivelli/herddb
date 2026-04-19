@@ -26,6 +26,7 @@ import static org.junit.Assert.assertNotNull;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import java.io.ByteArrayInputStream;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -344,5 +345,109 @@ public class RemoteRandomAccessReaderTest {
                         (byte) (BLOCK_SIZE + 7), (byte) (BLOCK_SIZE + 8)}, b2);
             }
         }
+    }
+
+    /**
+     * Exercises every accessor on a single file to lock in the ByteBuf-backed
+     * decode paths: {@code readFully(ByteBuffer)}, {@code readFully(long[])},
+     * {@code read(int[], ...)}, {@code read(float[], ...)}. Reads cross both
+     * a write-block boundary (every {@value READFULLY_WRITE_BLOCK} bytes) and
+     * a buffer-window boundary (every {@value READFULLY_BUFFER} bytes) so the
+     * reload path is hit for each accessor flavour. Endianness must match the
+     * pre-rewrite big-endian decoding.
+     */
+    @Test
+    public void testEveryAccessor() throws Exception {
+        // Layout of the file (200 bytes):
+        //   bytes [0..16)   — 4 ints used by read(int[])
+        //   bytes [16..32)  — 4 floats used by read(float[])
+        //   bytes [32..48)  — 2 longs used by readFully(long[])
+        //   bytes [48..58)  — 10 bytes copied via readFully(ByteBuffer)
+        //   bytes [58..62)  — 1 int used by readInt() at a non-aligned offset
+        //   bytes [62..70)  — 1 long used by readLong() across a buffer boundary (62..70 spans 64)
+        //   bytes [70..200) — sequential payload, used by readFully(byte[])
+        byte[] data = new byte[200];
+        ByteBuffer src = ByteBuffer.wrap(data);
+        int[] expectedInts = new int[]{0x01020304, 0x05060708, 0x090a0b0c, 0x0d0e0f10};
+        for (int v : expectedInts) {
+            src.putInt(v);
+        }
+        float[] expectedFloats = new float[]{1.5f, -2.25f, 1e-3f, 42.0f};
+        for (float v : expectedFloats) {
+            src.putInt(Float.floatToIntBits(v));
+        }
+        long[] expectedLongs = new long[]{0x0102030405060708L, 0x1011121314151617L};
+        for (long v : expectedLongs) {
+            src.putLong(v);
+        }
+        byte[] expectedBytes = "abcdefghij".getBytes();
+        src.put(expectedBytes);
+        int crossBufferInt = 0xCAFEBABE;
+        src.putInt(crossBufferInt);
+        long crossBufferLong = 0x0123456789ABCDEFL;
+        src.putLong(crossBufferLong);
+        // remaining bytes [70..200): sequence (byte) i
+        for (int i = src.position(); i < data.length; i++) {
+            data[i] = (byte) i;
+        }
+
+        client.writeMultipartFile("ts/idx/accessors", new ByteArrayInputStream(data),
+                READFULLY_WRITE_BLOCK);
+        try (RemoteRandomAccessReader reader = openReadFullyReader("ts/idx/accessors", data.length)) {
+            int[] actualInts = new int[expectedInts.length];
+            reader.seek(0);
+            reader.read(actualInts, 0, actualInts.length);
+            assertArrayEquals(expectedInts, actualInts);
+            assertEquals(16, reader.getPosition());
+
+            float[] actualFloats = new float[expectedFloats.length];
+            reader.read(actualFloats, 0, actualFloats.length);
+            assertArrayEquals(expectedFloats, actualFloats, 0.0f);
+            assertEquals(32, reader.getPosition());
+
+            long[] actualLongs = new long[expectedLongs.length];
+            reader.readFully(actualLongs);
+            assertArrayEquals(expectedLongs, actualLongs);
+            assertEquals(48, reader.getPosition());
+
+            ByteBuffer dst = ByteBuffer.allocate(expectedBytes.length);
+            reader.readFully(dst);
+            assertEquals(expectedBytes.length, dst.position());
+            byte[] actualBytes = new byte[expectedBytes.length];
+            dst.flip();
+            dst.get(actualBytes);
+            assertArrayEquals(expectedBytes, actualBytes);
+            assertEquals(58, reader.getPosition());
+
+            // readInt() at byte 58 — within one buffer window (window 3 = bytes [48..64)).
+            assertEquals(crossBufferInt, reader.readInt());
+            assertEquals(62, reader.getPosition());
+
+            // readLong() at byte 62 — crosses the buffer boundary at byte 64.
+            assertEquals(crossBufferLong, reader.readLong());
+            assertEquals(70, reader.getPosition());
+
+            // Tail bytes via readFully(byte[]) cross a write-block boundary at byte 64
+            // and a second one at byte 128.
+            byte[] tail = new byte[data.length - (int) reader.getPosition()];
+            reader.readFully(tail);
+            assertArrayEquals(Arrays.copyOfRange(data, 70, data.length), tail);
+            assertEquals(data.length, reader.getPosition());
+        }
+    }
+
+    /** Calling close() twice must be safe and not over-release the cached buffer. */
+    @Test
+    public void testCloseIsIdempotent() throws Exception {
+        byte[] data = seqBytes(BLOCK_SIZE);
+        client.writeMultipartFile("ts/idx/close", new ByteArrayInputStream(data), BLOCK_SIZE);
+
+        RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
+                client, "ts/idx/close", data.length, BLOCK_SIZE);
+        reader.seek(0);
+        byte[] tmp = new byte[4];
+        reader.readFully(tmp); // forces a block load
+        reader.close();
+        reader.close(); // must not throw or over-release
     }
 }

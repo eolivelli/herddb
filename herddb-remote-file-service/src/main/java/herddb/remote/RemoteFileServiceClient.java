@@ -43,7 +43,9 @@ import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.util.ReferenceCountUtil;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -423,8 +425,12 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                     public void onNext(ReadFileResponse response) {
                         if (response.getFound()) {
                             ByteString content = response.getContent();
-                            ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(content.size());
-                            buf.writeBytes(content.asReadOnlyByteBuffer());
+                            int size = content.size();
+                            ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(size);
+                            // Single copy from the protobuf LiteralByteString into the
+                            // pooled direct buffer; matches doReadFileRangeAsByteBufAsync.
+                            content.copyTo(buf.nioBuffer(0, size));
+                            buf.writerIndex(size);
                             result = buf;
                         }
                     }
@@ -654,6 +660,106 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     /**
+     * ByteBuf variant of {@link #readFileRangeAsync(String, long, int, int)} —
+     * the response bytes land directly in a pooled direct {@link ByteBuf} via
+     * {@code ByteString.copyTo(ByteBuffer)}, skipping the throw-away
+     * {@code byte[]} that {@code response.getContent().toByteArray()} would
+     * allocate. The protobuf parser still materialises the response payload
+     * once inside its {@code LiteralByteString} (gRPC marshaller-mandated copy);
+     * eliminating that requires bypassing protobuf entirely.
+     * <p>
+     * Cross-block ranges are returned as a {@link CompositeByteBuf} view of the
+     * two slices — no extra arraycopy. Caller MUST {@code release()} the result
+     * when done. Returns {@code null} if the file is not found.
+     */
+    public CompletableFuture<ByteBuf> readFileRangeAsByteBufAsync(String path, long offset,
+                                                                  int length, int blockSize) {
+        long startBlock = offset / blockSize;
+        long endBlock = (offset + length - 1) / blockSize;
+        if (startBlock == endBlock) {
+            return doReadFileRangeAsByteBufAsync(path, offset, length, blockSize);
+        }
+        int firstBlockEnd = (int) ((startBlock + 1) * (long) blockSize - offset);
+        int secondLength = length - firstBlockEnd;
+        return doReadFileRangeAsByteBufAsync(path, offset, firstBlockEnd, blockSize)
+                .thenCompose(first -> {
+                    if (first == null) {
+                        return CompletableFuture.completedFuture((ByteBuf) null);
+                    }
+                    long secondOffset = (startBlock + 1) * (long) blockSize;
+                    return doReadFileRangeAsByteBufAsync(path, secondOffset, secondLength, blockSize)
+                            .thenApply(second -> {
+                                if (second == null) {
+                                    return first;
+                                }
+                                // CompositeByteBuf gives a contiguous view over the two
+                                // pooled slices without copying their bytes. addComponent
+                                // takes ownership of the component's refcount.
+                                CompositeByteBuf composite = PooledByteBufAllocator.DEFAULT
+                                        .compositeDirectBuffer(2);
+                                composite.addComponent(true, first);
+                                composite.addComponent(true, second);
+                                return composite;
+                            })
+                            .exceptionally(t -> {
+                                ReferenceCountUtil.safeRelease(first);
+                                if (t instanceof RuntimeException) {
+                                    throw (RuntimeException) t;
+                                }
+                                throw new RuntimeException(t);
+                            });
+                });
+    }
+
+    private CompletableFuture<ByteBuf> doReadFileRangeAsByteBufAsync(String path, long offset,
+                                                                    int length, int blockSize) {
+        return retryAsync(() -> {
+            long blockIndex = offset / blockSize;
+            CompletableFuture<ByteBuf> future = new CompletableFuture<>();
+            readStubForBlock(path, blockIndex).readFileRange(
+                    ReadFileRangeRequest.newBuilder()
+                            .setPath(path)
+                            .setOffset(offset)
+                            .setLength(length)
+                            .setBlockSize(blockSize)
+                            .build(),
+                    new StreamObserver<ReadFileRangeResponse>() {
+                        private ByteBuf result;
+
+                        @Override
+                        public void onNext(ReadFileRangeResponse response) {
+                            if (response.getFound()) {
+                                ByteString content = response.getContent();
+                                int size = content.size();
+                                ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(size);
+                                // copyTo writes into the ByteBuffer view of the pooled buf
+                                // and the protobuf parser already holds the bytes in heap;
+                                // this is the single copy from heap into direct memory.
+                                content.copyTo(buf.nioBuffer(0, size));
+                                buf.writerIndex(size);
+                                result = buf;
+                            }
+                        }
+
+                        @Override
+                        public void onError(Throwable t) {
+                            if (result != null) {
+                                result.release();
+                                result = null;
+                            }
+                            future.completeExceptionally(t);
+                        }
+
+                        @Override
+                        public void onCompleted() {
+                            future.complete(result);
+                        }
+                    });
+            return future;
+        }, "readFileRange", path, 0);
+    }
+
+    /**
      * Writes an {@link InputStream} as a multipart file, splitting into blocks of {@code blockSize}.
      * Uses a pooled heap ByteBuf internally to avoid per-block allocations.
      * Blocks are written sequentially. Returns the total number of bytes written.
@@ -783,6 +889,14 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
     public byte[] readFileRange(String path, long offset, int length, int blockSize) {
         return getUnchecked(readFileRangeAsync(path, offset, length, blockSize));
+    }
+
+    /**
+     * Synchronous variant of {@link #readFileRangeAsByteBufAsync}.
+     * Caller MUST {@code release()} the returned buffer when done.
+     */
+    public ByteBuf readFileRangeAsByteBuf(String path, long offset, int length, int blockSize) {
+        return getUnchecked(readFileRangeAsByteBufAsync(path, offset, length, blockSize));
     }
 
     public int getBlockSize() {
