@@ -20,6 +20,13 @@
 # Install:
 #   helm install herddb . -f examples/gke/values.yaml \
 #     --set fileServer.s3.bucket=<your-bucket-name>
+#
+# Memory layout (heap + direct + ~1 GiB JVM overhead = container limit):
+#   server          :  14 g heap + 17 g direct + 1 g = 32 GiB
+#   fileServer      :   6 g heap +  8 g direct + 1 g = 15 g  (< 16 GiB)
+#   indexingService :  24 g heap +  6 g direct + 1 g = 31 g  (< 32 GiB)
+#   bookkeeper      :   2 g heap +  1 g direct + 1 g =  4 g  (< 8 GiB)
+#   zookeeper       : 512 m heap + 512 m direct       = ~1 g  (< 4 GiB)
 
 image:
   # Always re-pull so that re-pushed tags (common during active
@@ -32,20 +39,27 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  javaOpts: "-Xms20g -Xmx20g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
+  # 14 g heap + 17 g direct + ~1 g JVM overhead = 32 GiB container.
+  # --add-modules jdk.incubator.vector: required for Panama Vector API (jvector 4.x).
+  # -Dio.netty.maxDirectMemory=0: tell Netty to respect -XX:MaxDirectMemorySize
+  # instead of defaulting to heap size, preventing RSS from exceeding the container
+  # limit under heavy gRPC traffic.
+  javaOpts: "-Xms14g -Xmx14g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=17g"
   storage:
     data:
       size: 10Gi
     commitlog:
       size: 5Gi
   extraConfig:
-    # --- BookKeeper commit-log tuning (experiment for issues #141 / #145) ---
-    # Default max ledger size is 1 GiB (ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_MAX_SIZE).
-    # At bigann's ~200 B/entry that is ~5–7 M INSERTs per ledger, so by the
-    # time the scheduled checkpoint fires (~15 min) the cluster has a handful
-    # of fat ledgers pinned on the single bookie. Force more frequent
-    # rollovers so each ledger is smaller and can be dropped sooner.
-    server.bookkeeper.ledgers.max.size: "134217728"            # 128 MiB
+    indexing.service.timeout: "300"
+    # --- BookKeeper commit-log tuning ---
+    # 10 GiB ledgers: at high ingest rates (20k+ ops/s) the server rolls a new
+    # ledger every ~30 s with 128 MiB ledgers, writing an ever-growing activeLedgers
+    # list to ZooKeeper on every roll. By the time 162 ledgers accumulate the ZK
+    # write latency contributes to a ZK session expiry (issue #160).
+    # With 10 GiB ledgers (~50 M entries each) the server creates ~2 ledgers per
+    # hour instead of ~120, dramatically reducing ZK write frequency.
+    server.bookkeeper.ledgers.max.size: "10737418240"          # 10 GiB
     # Default retention is 2 days (1000*60*60*24*2 ms). On a typical bench
     # run that's "never" — closed ledgers pile up on the bookie's ledgers PVC
     # and keep per-ledger state alive in the bookie's memtable/file-handle
@@ -58,17 +72,32 @@ server:
     # also reduce the per-checkpoint catch-up backlog that was the root cause
     # of issue #145 (LSN mismatch after a 25-min waitForInstanceCatchUp).
     server.checkpoint.period: "60000"                          # 1 min (ms)
+    # --- BookKeeper client resilience tuning (issues #152, #164) ---
+    # The code default (issue #152) is addEntryTimeoutSec=30 /
+    # addEntryQuorumTimeoutSec=60. Overridden here because checkpoint-induced
+    # bookie fsync stalls in long runs reached 309 s (issue #164). With only
+    # one bookie, any timeout triggers ensemble-change →
+    # BKNotEnoughBookiesException → permanent commit-log failure.
+    # 3600 s effectively disables the per-entry timeout for benchmark purposes;
+    # a truly dead bookie will be detected by ZooKeeper session expiry (30 s
+    # default) + pod restart, not by addEntry timeout.
+    bookkeeper.addEntryTimeoutSec: "3600"
+    bookkeeper.addEntryQuorumTimeoutSec: "7200"
   resources:
     requests:
-      memory: "23Gi"
-      cpu: "8"
+      memory: "32Gi"
+      cpu: "16"
     limits:
-      memory: "23Gi"
-      cpu: "8"
+      memory: "32Gi"
+      cpu: "16"
 
 fileServer:
   replicaCount: 2
-  javaOpts: "-Xms12g -Xmx12g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=3g"
+  # 6 g heap + 8 g direct + ~1 g JVM overhead = 15 g (< 16 GiB container).
+  # The file server's hot path is disk-cache NIO I/O and gRPC streaming;
+  # generous direct memory is more valuable than heap here.
+  # -Dio.netty.maxDirectMemory=0 tells Netty to respect -XX:MaxDirectMemorySize.
+  javaOpts: "-Xms6g -Xmx6g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=8g"
   storageMode: s3
   s3:
     endpoint: "https://storage.googleapis.com"
@@ -81,13 +110,14 @@ fileServer:
     # On-disk cache limit: maximum bytes the file server may keep in its
     # local disk cache (backed by the PVC below). This is NOT an in-memory
     # cache — pages are stored on the PVC's block device and evicted to GCS
-    # when the limit is reached. Set it slightly below the PVC size to leave
-    # headroom for temporary write buffers.  150 Gi = 161061273600 bytes.
-    cacheMaxBytes: 161061273600
     # GCS's S3-compatible endpoint requires path-style addressing and rejects
     # the AWS SDK v2 default request checksums (CRC32/CRC64NVME). Enable the
     # compatibility mode so the S3 client is configured to match GCS.
     gcsCompatibility: true
+    # when the limit is reached. Set 10 GB below the PVC size to leave
+    # headroom for temporary write buffers.
+    # 200 Gi (214748364800 B) − 10 GB (10000000000 B) = 204748364800 B.
+    cacheMaxBytes: 204748364800
   storage:
     size: 200Gi
   resources:
@@ -103,25 +133,63 @@ minio:
 
 zookeeper:
   enabled: true
-  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=512m"
+  javaOpts: "-Xms512m -Xmx512m -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=512m"
   storage:
     size: 10Gi
   resources:
     requests:
-      memory: "4Gi"
-      cpu: "4"
+      memory: "768Mi"
+      cpu: "0.25"
     limits:
-      memory: "4Gi"
-      cpu: "4"
+      memory: "768Mi"
+      cpu: "0.5"
 
 bookkeeper:
   enabled: true
   replicaCount: 1
-  javaOpts: "-Xms6g -Xmx6g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
-  # Journal PVC raised to 100 Gi (from 1 Gi) for long-running bigann ingests.
-  # journalWriteData was previously set to "false" to reduce journal I/O;
-  # removed here so the bookie journals payload data (safer durability, and
-  # we now have plenty of PVC headroom).
+  # 2 g heap + 1 g direct + ~1 g JVM overhead → 4 g; container = 8 GiB.
+  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
+  # Enable FINE logging for BK write processors so OperationRejectedException
+  # (bookie backpressure) becomes visible.
+  loggingProperties: |
+    handlers=java.util.logging.ConsoleHandler
+
+    # Default global logging level
+    .level= INFO
+
+    # BookKeeper bookie — raised from SEVERE so WARN-level messages are visible:
+    # non-writable channels, fenced-ledger warnings, bookie state transitions.
+    org.apache.bookkeeper.level=WARNING
+
+    # Enable FINE (= SLF4J DEBUG) only for the two write-processor classes so that
+    # OperationRejectedException (backpressure) becomes visible when the bookie
+    # storage cannot keep up with the write rate.
+    # One log line per rejected addEntry — potentially verbose under sustained
+    # back-pressure, but that is the signal needed to diagnose silent write failures.
+    org.apache.bookkeeper.proto.WriteEntryProcessorV3.level=FINE
+    org.apache.bookkeeper.proto.WriteEntryProcessor.level=FINE
+
+    ############################################################
+    # Handler specific properties.
+    ############################################################
+    # Raised to FINE so the write-processor DEBUG lines above reach the console.
+    java.util.logging.ConsoleHandler.level = FINE
+    java.util.logging.ConsoleHandler.formatter = java.util.logging.SimpleFormatter
+  # Disable bookie journal fsync (journalSyncData=false) for benchmark use.
+  # With journalSyncData=true (default), the bookie calls fdatasync() after
+  # every journal flush batch — a single fsync during a checkpoint-induced I/O
+  # burst can stall for 300+ s, triggering addEntry timeouts and
+  # BKNotEnoughBookiesException (issue #164). With journalSyncData=false the
+  # bookie acknowledges entries after writing to the OS page cache (no fsync).
+  # journalPageCacheFlushIntervalMSec controls how often the page cache is
+  # flushed to disk (default: 1000 ms); data is still durably written, just
+  # not synchronously confirmed. Risk: on OS crash buffered-but-unsynced journal
+  # entries may be lost — acceptable for vector benchmarks.
+  extraConfig:
+    journalSyncData: "false"
+    journalPageCacheFlushIntervalMSec: "1000"
+  # Journal PVC raised to 100 Gi for long-running ingests.
+  # Ledger PVC at 500 Gi for extended GKE benchmark runs (bigann-scale).
   storage:
     journal:
       size: 100Gi
@@ -129,17 +197,26 @@ bookkeeper:
       size: 500Gi
   resources:
     requests:
-      memory: "8Gi"
-      cpu: "4"
+      memory: "3Gi"
+      cpu: "0.25"
     limits:
-      memory: "8Gi"
-      cpu: "4"
+      memory: "3Gi"
+      cpu: "0.5"
 
 indexingService:
   enabled: true
   storageMode: remote
   replicaCount: 2
-  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=2g -Dio.netty.allocator.numDirectArenas=16"
+  # 24 g heap + 6 g direct + ~1 g JVM overhead = 31 g (< 32 GiB container; 1 GiB headroom).
+  # Heap sized for HNSW graph segment caching — the primary IS working set.
+  # 6 g direct: needed for zero-copy ByteBuffer vectors (jvector 4.x) and concurrent
+  # gRPC streaming under load; 2 g was insufficient under heavy query traffic.
+  # --add-modules jdk.incubator.vector: required for Panama Vector API (jvector 4.x).
+  # -Dio.netty.maxDirectMemory=0 tells Netty to respect -XX:MaxDirectMemorySize.
+  # numDirectArenas=16 spreads Netty allocations to reduce lock contention (issue #122).
+  # tailbatchsize=1000 caps the BK read batch per followTheLeader() call in the IS
+  # tailer, cutting retained working set by 10× vs. the 10000 default (issue #180).
+  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=6g -Dio.netty.allocator.numDirectArenas=16 -Dherddb.commitlog.tailbatchsize=1000"
   storage:
     data:
       size: 20Gi
@@ -167,6 +244,16 @@ tools:
   storage:
     datasets:
       size: 200Gi
+  # Heap raised to 6 g: sift10m base set (10M × 128-dim × 4 B = 5.12 GB)
+  # must fit in JVM heap during ingest. Container limit = heap + ~1 GiB overhead.
+  javaOpts: "-Xms512m -Xmx6g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
+  resources:
+    requests:
+      memory: "7Gi"
+      cpu: "0.5"
+    limits:
+      memory: "7Gi"
+      cpu: "1"
 
 prometheus:
   enabled: false

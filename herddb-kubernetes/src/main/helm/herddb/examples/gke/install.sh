@@ -10,8 +10,7 @@
 #                                      # the Docker image.
 #
 #   ./install.sh --non-interactive \   # scripted — consumes flags /
-#       --image-tag 0.30.0-SNAPSHOT    # env vars only, never prompts,
-#                                      # never builds or pushes.
+#       --image-tag 0.30.0-SNAPSHOT    # env vars only, never prompts.
 #
 # Non-interactive flags (all optional unless noted):
 #
@@ -20,6 +19,12 @@
 #   --image-tag <tag>          default: $IMAGE_TAG or 0.30.0-SNAPSHOT
 #   --bucket <gcs-bucket>      default: $GCS_BUCKET or herddb-pages
 #   --location <region>        default: $GCS_LOCATION or us-central1
+#   --push                     tag (if needed) and push the local image
+#                              to the registry; assumes the image is
+#                              already built as herddb/herddb-server:<ver>
+#                              or already tagged as <repo>:<tag>.
+#   --build-and-push           run 'mvn … -Ddocker -DskipTests' first,
+#                              then tag and push (full rebuild path).
 #   --no-create-bucket         fail instead of creating the file-server bucket
 #   --no-create-secret         fail instead of creating herddb-gcs-credentials
 #   --no-create-pull-secret    fail instead of creating ghcr-credentials
@@ -45,6 +50,8 @@ CREATE_BUCKET=true
 CREATE_SECRET=true
 CREATE_PULL_SECRET=true
 WAIT_FOR_PODS=true
+DO_PUSH=false
+DO_BUILD=false
 # Any remaining --set k=v etc. go through to helm.
 HELM_EXTRA_ARGS=()
 
@@ -55,6 +62,8 @@ while [[ $# -gt 0 ]]; do
         --image-tag)            IMAGE_TAG="$2"; shift 2 ;;
         --bucket)               GCS_BUCKET="$2"; shift 2 ;;
         --location)             GCS_LOCATION="$2"; shift 2 ;;
+        --push)                 DO_PUSH=true; shift ;;
+        --build-and-push)       DO_BUILD=true; DO_PUSH=true; shift ;;
         --no-create-bucket)     CREATE_BUCKET=false; shift ;;
         --no-create-secret)     CREATE_SECRET=false; shift ;;
         --no-create-pull-secret) CREATE_PULL_SECRET=false; shift ;;
@@ -94,21 +103,37 @@ echo "==> Image:    ${IMAGE_REPO}:${IMAGE_TAG}"
 echo "==> Bucket:   gs://${GCS_BUCKET} (${GCS_LOCATION})"
 echo "==> Mode:     $( $NON_INTERACTIVE && echo non-interactive || echo interactive )"
 
-# ── 0b. Optional image build & push (interactive only) ──────────
-if ! $NON_INTERACTIVE; then
+# ── 0b. Optional image build & push ─────────────────────────────
+# In interactive mode: prompt the user (original behaviour).
+# In non-interactive mode: honour --push / --build-and-push flags.
+_do_tag_and_push() {
+    local repo_root="$1"
+    BUILD_VERSION="$(cd "$repo_root" && mvn help:evaluate -Dexpression=project.version -q -DforceStdout)"
+    SOURCE_IMAGE="herddb/herddb-server:${BUILD_VERSION}"
+    if [[ "$SOURCE_IMAGE" != "${IMAGE_REPO}:${IMAGE_TAG}" ]]; then
+        echo "==> Tagging ${SOURCE_IMAGE} as ${IMAGE_REPO}:${IMAGE_TAG}..."
+        docker tag "$SOURCE_IMAGE" "${IMAGE_REPO}:${IMAGE_TAG}"
+    fi
+    echo "==> Pushing ${IMAGE_REPO}:${IMAGE_TAG}..."
+    docker push "${IMAGE_REPO}:${IMAGE_TAG}"
+}
+
+if $NON_INTERACTIVE; then
+    if $DO_BUILD || $DO_PUSH; then
+        REPO_ROOT="$(cd "$CHART_DIR/../../../../.." && pwd)"
+        if $DO_BUILD; then
+            echo "==> Building Docker image (this may take a few minutes)..."
+            (cd "$REPO_ROOT" && mvn clean package -Ddocker -DskipTests)
+        fi
+        _do_tag_and_push "$REPO_ROOT"
+    fi
+else
     read -rp "Build and push Docker image ${IMAGE_REPO}:${IMAGE_TAG}? [y/N] " build_image
     if [[ "$build_image" =~ ^[Yy]$ ]]; then
         REPO_ROOT="$(cd "$CHART_DIR/../../../../.." && pwd)"
         echo "==> Building Docker image (this may take a few minutes)..."
         (cd "$REPO_ROOT" && mvn clean package -Ddocker -DskipTests)
-        BUILD_VERSION="$(cd "$REPO_ROOT" && mvn help:evaluate -Dexpression=project.version -q -DforceStdout)"
-        SOURCE_IMAGE="herddb/herddb-server:${BUILD_VERSION}"
-        if [[ "$SOURCE_IMAGE" != "${IMAGE_REPO}:${IMAGE_TAG}" ]]; then
-            echo "==> Tagging ${SOURCE_IMAGE} as ${IMAGE_REPO}:${IMAGE_TAG}..."
-            docker tag "$SOURCE_IMAGE" "${IMAGE_REPO}:${IMAGE_TAG}"
-        fi
-        echo "==> Pushing ${IMAGE_REPO}:${IMAGE_TAG}..."
-        docker push "${IMAGE_REPO}:${IMAGE_TAG}"
+        _do_tag_and_push "$REPO_ROOT"
     fi
 fi
 
