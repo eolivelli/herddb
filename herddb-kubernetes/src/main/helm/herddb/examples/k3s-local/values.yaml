@@ -126,6 +126,11 @@ fileServer:
     # NOTE: this key must be under fileServer.s3 — the template reads
     # .Values.fileServer.s3.cacheMaxBytes (not .Values.fileServer.cacheMaxBytes).
     cacheMaxBytes: 214748364800
+    # MinIO requires path-style S3 addressing. The chart auto-enables this
+    # whenever minio.enabled=true, so setting it here is redundant — kept
+    # explicit for parity with examples/gke/values.yaml and so the rendered
+    # fileserver.properties clearly shows s3.gcs.compatibility=true.
+    gcsCompatibility: true
   storage:
     # 200 GiB: sized to hold the full bigann 10M segment data in the local
     # disk cache without any MinIO fallback on warm queries.
