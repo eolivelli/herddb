@@ -246,14 +246,12 @@ public class LazyDataPageFailureAndComplexTest {
     }
 
     // NOTE: a symmetrical "UPDATE fails cleanly when value read fails" test
-    // would expose a pre-existing HerdDB behaviour unrelated to the lazy
-    // page load feature: a remote value-fetch failure raised from inside
-    // TableManager.accessRecord during an UPDATE leaves a StampedLock held
-    // in TableSpaceManager, so DBManager.close() blocks indefinitely on
-    // Activator join. This is orthogonal to the lazy-page contract — the
-    // same lock leak would happen if the legacy eager readPage() failed
-    // mid-UPDATE. Leaving the UPDATE-failure scenario uncovered here; a
-    // separate fix for the lock leak can add it later.
+    // is intentionally omitted — see issue #181. A remote value-fetch
+    // failure raised from inside TableManager during an UPDATE leaves a
+    // StampedLock held in TableSpaceManager, so DBManager.close() blocks
+    // indefinitely on Activator join. The same lock leak exists with the
+    // legacy eager readPage() path, so it is not a lazy-page regression;
+    // once #181 is fixed, add the symmetrical test here.
 
     @Test
     public void retryAfterFailureSucceeds() throws Exception {
