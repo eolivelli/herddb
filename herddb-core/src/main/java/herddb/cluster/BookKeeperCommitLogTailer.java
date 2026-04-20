@@ -19,11 +19,13 @@
  */
 package herddb.cluster;
 
+import com.google.common.annotations.VisibleForTesting;
 import herddb.log.CommitLog;
 import herddb.log.CommitLogTailing;
 import herddb.log.LogNotAvailableException;
 import herddb.log.LogSequenceNumber;
 import herddb.server.ServerConfiguration;
+import java.util.Properties;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.bookkeeper.stats.NullStatsLogger;
@@ -45,6 +47,7 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
     private final String bkLedgersPath;
     private final String tableSpaceUUID;
     private final EntryConsumer consumer;
+    private final Properties bookkeeperClientProperties;
 
     private volatile LogSequenceNumber watermark;
     private volatile boolean running = true;
@@ -64,6 +67,29 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
             LogSequenceNumber startFrom,
             EntryConsumer consumer
     ) {
+        this(zkAddress, zkSessionTimeout, zkPath, bkLedgersPath, tableSpaceUUID,
+                startFrom, consumer, new Properties());
+    }
+
+    /**
+     * Constructor that accepts extra BookKeeper client configuration. Any
+     * {@code bookkeeper.*} key in {@code bookkeeperClientProperties} is
+     * applied to the {@link org.apache.bookkeeper.conf.ClientConfiguration}
+     * built by {@link BookkeeperCommitLogManager}, on top of the
+     * tailer-specific defaults (notably, speculative reads are disabled by
+     * default — the tailer is a sequential follower and a speculative second
+     * copy only adds load without reducing latency).
+     */
+    public BookKeeperCommitLogTailer(
+            String zkAddress,
+            int zkSessionTimeout,
+            String zkPath,
+            String bkLedgersPath,
+            String tableSpaceUUID,
+            LogSequenceNumber startFrom,
+            EntryConsumer consumer,
+            Properties bookkeeperClientProperties
+    ) {
         this.zkAddress = zkAddress;
         this.zkSessionTimeout = zkSessionTimeout;
         this.zkPath = zkPath;
@@ -71,6 +97,8 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
         this.tableSpaceUUID = tableSpaceUUID;
         this.watermark = startFrom;
         this.consumer = consumer;
+        this.bookkeeperClientProperties = bookkeeperClientProperties != null
+                ? bookkeeperClientProperties : new Properties();
     }
 
     @Override
@@ -157,12 +185,54 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
         ServerConfiguration serverConfig = new ServerConfiguration();
         serverConfig.set(ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH, bkLedgersPath);
 
+        // Disable speculative reads by default for the tailer. BookKeeper's
+        // built-in default enables them, but for a single sequential
+        // follower that reads each entry at most once per ledger, the
+        // second speculative copy only adds load. Applied before the
+        // operator-supplied properties, so an operator can still re-enable
+        // it by setting bookkeeper.firstSpeculativeReadTimeout explicitly
+        // (see issue #180).
+        serverConfig.set("bookkeeper.firstSpeculativeReadTimeout", "0");
+        serverConfig.set("bookkeeper.maxSpeculativeReadTimeout", "0");
+
+        // Apply operator-supplied BookKeeper client settings (issue #180).
+        // Without this, IS operators have no way to tune the tailer's
+        // BookKeeper client — the manager's bookkeeper.* passthrough loop
+        // only sees keys set on this ServerConfiguration.
+        for (String key : bookkeeperClientProperties.stringPropertyNames()) {
+            if (key.startsWith("bookkeeper.") || key.startsWith("bookie.")) {
+                serverConfig.set(key, bookkeeperClientProperties.getProperty(key));
+            }
+        }
+
         commitLogManager = new BookkeeperCommitLogManager(metadataManager, serverConfig, NullStatsLogger.INSTANCE);
         commitLogManager.start();
 
         // Create a commit log instance for following (not writing)
         // The localNodeId is just for identification in logs
         commitLog = commitLogManager.createCommitLog(tableSpaceUUID, "indexing-tailer", "indexing-tailer");
+    }
+
+    /**
+     * For tests: exposes the {@link BookkeeperCommitLogManager} created in
+     * {@link #initBookKeeper()} so tests can inspect the resulting
+     * {@code ClientConfiguration}. Returns {@code null} if BookKeeper has not
+     * been initialized yet.
+     */
+    @VisibleForTesting
+    public BookkeeperCommitLogManager getCommitLogManagerForTest() {
+        return commitLogManager;
+    }
+
+    /**
+     * For tests: returns the effective BookKeeper {@code ClientConfiguration}
+     * used by this tailer, after defaults and operator overrides have been
+     * applied. Returns {@code null} if BookKeeper has not been initialized
+     * yet.
+     */
+    @VisibleForTesting
+    public org.apache.bookkeeper.conf.ClientConfiguration getClientConfigurationForTest() {
+        return commitLogManager != null ? commitLogManager.getClientConfiguration() : null;
     }
 
     private void closeBookKeeper() {

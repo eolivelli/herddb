@@ -502,8 +502,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     IndexingServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT);
             LOGGER.log(Level.INFO, "Creating BookKeeperCommitLogTailer, zk={0}, tsUUID={1}",
                     new Object[]{zkAddress, tableSpaceUUID});
+            // Pass bookkeeper.*/bookie.* settings through to the tailer's BK
+            // client; the tailer filters on those prefixes (issue #180).
+            java.util.Properties bkClientProps = config.asProperties();
             tailer = new BookKeeperCommitLogTailer(zkAddress, zkSessionTimeout, zkPath,
-                    bkLedgersPath, tableSpaceUUID, tailerStart, this::processEntry);
+                    bkLedgersPath, tableSpaceUUID, tailerStart, this::processEntry, bkClientProps);
         } else {
             tailer = new FileCommitLogTailer(logDirectory, tableSpaceUUID, tailerStart, this::processEntry);
         }
@@ -1018,6 +1021,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         java.util.Map<String, Index> tracked =
                 getSchemaTrackerIndexes();
         tracked.put(index.name, index);
+        // Reflection write bypasses applyEntry() so the per-table vector
+        // index cache does not get invalidated — drop it explicitly.
+        schemaTracker.invalidateVectorIndexCache();
         vectorStores.put(storeKey(index.table, index.name), store);
     }
 
