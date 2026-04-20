@@ -38,6 +38,8 @@ import herddb.model.Index;
 import herddb.model.Record;
 import herddb.model.Table;
 import herddb.model.TableSpace;
+import herddb.remote.RemoteFileDataStorageManager;
+import herddb.remote.SegmentBlockCache;
 import herddb.server.ServerConfiguration;
 import herddb.storage.DataStorageManager;
 import herddb.utils.Bytes;
@@ -115,6 +117,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private DataStorageManager dataStorageManager;
     private long maxVectorMemoryBytes = Long.MAX_VALUE;
     private volatile String tableSpaceUUID;
+
+    /**
+     * Shared multipart-block cache used by {@link RemoteRandomAccessReader} on
+     * the vector-search hot path. Created in {@link #start()} from
+     * {@link IndexingServerConfiguration#PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES}
+     * and installed on the {@link RemoteFileDataStorageManager} when the DSM
+     * is a remote one. Replaces the page-keyed {@code SharedSegmentPageCache}
+     * that was removed when page-based persistence was dropped.
+     */
+    private volatile SegmentBlockCache segmentBlockCache;
 
     private ExecutorService[] applyWorkers;
     private int applyParallelism;
@@ -325,14 +337,26 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT);
             LOGGER.log(Level.INFO, "vector index maxLiveBytesPerCheckpoint: {0} bytes",
                     maxLiveBytesPerCheckpoint);
-            final long segmentPageCacheMaxBytes = config.getLong(
+            long segmentPageCacheMaxBytes = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES,
                     IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES_DEFAULT);
-            // segmentPageCacheMaxBytes is accepted for config compatibility but
-            // has no effect after the page-based cache was removed. A follow-up
-            // change will reintroduce a multipart-aware cache and log its size.
-            LOGGER.log(Level.INFO, "vector index segmentPageCacheMaxBytes: {0} (unused pending multipart cache)",
-                    segmentPageCacheMaxBytes);
+            // A value of 0 (default) means "auto-size": budget the cache at 1/4 of
+            // the JVM max heap. This matches the documented behaviour of the config
+            // property and the historical SharedSegmentPageCache default.
+            if (segmentPageCacheMaxBytes == 0) {
+                segmentPageCacheMaxBytes = Runtime.getRuntime().maxMemory() / 4;
+            }
+            this.segmentBlockCache = new SegmentBlockCache(segmentPageCacheMaxBytes);
+            LOGGER.log(Level.INFO,
+                    "vector index segmentPageCacheMaxBytes: {0} (active={1})",
+                    new Object[]{segmentPageCacheMaxBytes, segmentBlockCache.isActive()});
+            // Install the cache + stats logger on the remote DSM so that every
+            // multipartIndexReaderSupplier it builds routes reads through it.
+            if (dataStorageManager instanceof RemoteFileDataStorageManager) {
+                ((RemoteFileDataStorageManager) dataStorageManager)
+                        .setSegmentBlockCache(segmentBlockCache, statsLogger);
+            }
+            registerSegmentBlockCacheMetrics(segmentBlockCache);
 
             final long vectorMemLimit = maxVectorMemoryBytes;
             final VectorMemoryBudget budget = this;
@@ -1659,12 +1683,102 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 }
             });
             pvs.setSegmentSizeStats(indexStats.getOpStatsLogger("segment_size_bytes"));
-
-            // Segment graph-page cache gauges were removed when the page-based
-            // persistence path was deleted. A multipart-aware cache will be
-            // re-introduced as a follow-up, at which point its gauges will be
-            // registered here.
         }
+    }
+
+    /**
+     * Registers Prometheus gauges + derived counters for the shared
+     * {@link SegmentBlockCache}. Called once from {@link #start()} after the
+     * cache is created. All metrics are read lazily via {@link Gauge#getSample}
+     * so they stay in sync without any bookkeeping on the hot path.
+     */
+    private void registerSegmentBlockCacheMetrics(SegmentBlockCache cache) {
+        StatsLogger local = this.statsLogger;
+        if (local == null) {
+            return;
+        }
+        StatsLogger scope = local.scope("indexing").scope("segment_block_cache");
+        scope.registerGauge("hits", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.hitCount();
+            }
+        });
+        scope.registerGauge("misses", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.missCount();
+            }
+        });
+        scope.registerGauge("evictions", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.evictionCount();
+            }
+        });
+        scope.registerGauge("load_success", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.loadSuccessCount();
+            }
+        });
+        scope.registerGauge("load_failure", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.loadFailureCount();
+            }
+        });
+        scope.registerGauge("load_time_nanos_total", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.totalLoadTimeNanos();
+            }
+        });
+        scope.registerGauge("size_entries", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.estimatedSize();
+            }
+        });
+        scope.registerGauge("size_bytes", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.weightedSize();
+            }
+        });
+        scope.registerGauge("max_bytes", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return cache.maxBytes();
+            }
+        });
     }
 
     @Override

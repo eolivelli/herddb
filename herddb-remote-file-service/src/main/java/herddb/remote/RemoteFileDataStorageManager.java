@@ -61,7 +61,9 @@ import java.util.function.Function;
 import java.util.function.LongConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import javax.annotation.Nullable;
 import org.apache.bookkeeper.stats.NullStatsLogger;
+import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
  * DataStorageManager that stores page data on remote RemoteFileService instances
@@ -123,6 +125,23 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     private final LazyValueCache lazyValueCache;
 
+    /**
+     * Optional shared multipart-block cache used by {@link RemoteRandomAccessReader}
+     * on the vector-index search path. Installed by the indexing-service engine
+     * at startup via {@link #setSegmentBlockCache}. May be {@code null} (no
+     * caching) for non-indexing callers.
+     */
+    @Nullable
+    private volatile SegmentBlockCache segmentBlockCache;
+
+    /**
+     * Optional stats logger forwarded to every {@link RemoteRandomAccessReader}
+     * created by {@link #multipartIndexReaderSupplier}, wired alongside the
+     * block cache. Drives the {@code rfs_client_read_*} counters.
+     */
+    @Nullable
+    private volatile StatsLogger readerStatsLogger;
+
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
             RemoteFileServiceClient client) {
@@ -150,6 +169,30 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     /** Client used for all remote I/O. Visible for lazy-page loading. */
     RemoteFileServiceClient getClient() {
         return client;
+    }
+
+    /**
+     * Installs an optional shared {@link SegmentBlockCache} (and optional
+     * stats logger) to be used by every {@link RemoteRandomAccessReader}
+     * returned from {@link #multipartIndexReaderSupplier}. Intended to be
+     * called once at startup, before any vector-index segment is loaded.
+     * Passing {@code null} disables caching for subsequently-created readers.
+     */
+    public void setSegmentBlockCache(@Nullable SegmentBlockCache cache,
+                                     @Nullable StatsLogger statsLogger) {
+        this.segmentBlockCache = cache;
+        this.readerStatsLogger = statsLogger;
+        if (cache != null) {
+            LOGGER.log(Level.INFO,
+                    "SegmentBlockCache installed: active={0}, maxBytes={1}",
+                    new Object[]{cache.isActive(), cache.maxBytes()});
+        }
+    }
+
+    /** Visible for indexing-service gauges. */
+    @Nullable
+    public SegmentBlockCache getSegmentBlockCache() {
+        return segmentBlockCache;
     }
 
     /**
@@ -704,7 +747,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
         int writeBlockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
         return new RemoteRandomAccessReader.Supplier(
-                client, logicalPath, fileSize, writeBlockSize, READ_BUFFER_SIZE, null);
+                client, logicalPath, fileSize, writeBlockSize, READ_BUFFER_SIZE,
+                readerStatsLogger, segmentBlockCache);
     }
 
     @Override
@@ -717,6 +761,12 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             LOGGER.log(Level.WARNING,
                     "deleteMultipartIndexFile: non-fatal error deleting {0}: {1}",
                     new Object[]{logicalPath, e.getMessage()});
+        }
+        // Drop any cached blocks for this path so a future segment rewritten
+        // under the same logical path does not serve stale bytes.
+        SegmentBlockCache cache = this.segmentBlockCache;
+        if (cache != null) {
+            cache.invalidatePath(logicalPath);
         }
     }
 
@@ -973,6 +1023,10 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         pendingDataDeletions.keySet().removeIf(k -> k.startsWith(prefix));
         pendingIndexDeletions.keySet().removeIf(k -> k.startsWith(prefix));
         lazyValueCache.invalidateForTablespace(tableSpace);
+        SegmentBlockCache cache = this.segmentBlockCache;
+        if (cache != null) {
+            cache.invalidatePrefix(prefix);
+        }
     }
 
     @Override
