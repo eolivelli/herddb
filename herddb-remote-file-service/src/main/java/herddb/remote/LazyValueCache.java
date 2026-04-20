@@ -124,6 +124,13 @@ public final class LazyValueCache {
         return cache == null ? 0L : cache.estimatedSize();
     }
 
+    /** Package-private: force Caffeine maintenance. Used by tests. */
+    void cleanUp() {
+        if (cache != null) {
+            cache.cleanUp();
+        }
+    }
+
     /** Caffeine stats snapshot, or {@code null} if the cache is disabled. */
     public CacheStats stats() {
         return cache == null ? null : cache.stats();

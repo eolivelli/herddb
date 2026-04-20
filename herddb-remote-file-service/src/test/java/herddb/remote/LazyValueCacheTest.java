@@ -94,6 +94,10 @@ public class LazyValueCacheTest {
             });
         }
         assertEquals(16, loaderCalls.get());
+        // Caffeine weight-based eviction flows through an async write buffer;
+        // drain it before refetching so the test does not race the maintenance
+        // thread on CI.
+        cache.cleanUp();
         // Now fetch the very first keys again; some must have been evicted
         // and re-loaded. We don't pin down exactly which ones are resident
         // (Caffeine's TinyLFU makes no such guarantee), only that the cache
