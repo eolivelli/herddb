@@ -69,12 +69,19 @@ public class StandardDatasetPublisher {
         System.out.println("  Output dir:  " + config.outputDir);
         System.out.println("  GCS path:    " + (config.gsPath != null ? config.gsPath : "(upload skipped)"));
 
-        // Ensure source files exist (downloading from FTP if needed).
+        // Ensure source files exist (downloading from FTP if needed). Skip the
+        // query/gt ensure call when the files are already on disk under any
+        // known layout — ensureBigannFile blindly re-invokes `tar` otherwise
+        // and the second extraction fails because files already exist.
         DatasetLoader loader = new DatasetLoader(config.datasetDir, config.preset, null);
         loader.ensureDataset();
-        loader.ensureQueryAndGroundTruth();
-
         File sourceDir = loader.getDatasetSubDir();
+        if (!queryAndGroundTruthAlreadyPresent(sourceDir, config.preset)) {
+            loader.ensureQueryAndGroundTruth();
+        } else {
+            System.out.println("Query and ground-truth files already present, skipping download.");
+        }
+
         File outputDir = new File(config.outputDir);
         if (!outputDir.mkdirs() && !outputDir.isDirectory()) {
             throw new IOException("Cannot create output directory: " + outputDir.getAbsolutePath());
@@ -83,10 +90,12 @@ public class StandardDatasetPublisher {
         // Stage the three flat data files under canonical names.
         File stagedBase = stageFile(sourceDir, config.preset.baseFile, outputDir, config.preset.baseFile);
         File stagedQuery = stageFile(sourceDir, config.preset.queryFile, outputDir, config.preset.queryFile);
-        // BIGANN's ground truth lives under a subdirectory; flatten the name
-        // so it sits next to the descriptor and base/query files.
+        // BIGANN's ground truth lives under a subdirectory and — in the
+        // real TEXMEX tarball — under a different filename convention than
+        // the preset declares; resolve whichever the local copy actually has.
+        String sourceGtName = resolveGroundTruthSource(sourceDir, config.preset);
         String stagedGtName = flattenGroundTruthName(config.preset);
-        File stagedGt = stageFile(sourceDir, config.preset.groundTruthFile, outputDir, stagedGtName);
+        File stagedGt = stageFile(sourceDir, sourceGtName, outputDir, stagedGtName);
 
         // Inspect the staged files to derive metadata for the descriptor.
         VecFormat baseFormat = config.preset.baseFormat;
@@ -151,6 +160,46 @@ public class StandardDatasetPublisher {
             return "bigann_groundtruth.ivecs";
         }
         return preset.groundTruthFile;
+    }
+
+    /**
+     * Return the relative path under {@code sourceDir} where the ground truth
+     * for {@code preset} actually lives on disk. The BIGANN preset declares
+     * {@code bigann_gnd/idx_1000000000.ivecs} but the real
+     * {@code bigann_gnd.tar.gz} from TEXMEX extracts to
+     * {@code gnd/idx_1000M.ivecs}; try both so a freshly-downloaded tree works
+     * as well as a hand-renamed one.
+     */
+    private static String resolveGroundTruthSource(File sourceDir, DatasetPreset preset) {
+        String[] candidates;
+        if (preset == DatasetPreset.BIGANN) {
+            candidates = new String[]{preset.groundTruthFile, "gnd/idx_1000M.ivecs"};
+        } else if (preset == DatasetPreset.SIFT10M) {
+            candidates = new String[]{preset.groundTruthFile, "gnd/idx_10M.ivecs"};
+        } else {
+            candidates = new String[]{preset.groundTruthFile};
+        }
+        for (String rel : candidates) {
+            if (new File(sourceDir, rel).exists()
+                    || new File(sourceDir, rel + ".gz").exists()) {
+                return rel;
+            }
+        }
+        // Nothing found — return preset default so stageFile produces the
+        // normal error message.
+        return preset.groundTruthFile;
+    }
+
+    private static boolean queryAndGroundTruthAlreadyPresent(File sourceDir, DatasetPreset preset) {
+        if (preset != DatasetPreset.BIGANN && preset != DatasetPreset.SIFT10M) {
+            return false; // let the loader decide
+        }
+        boolean queryHere = new File(sourceDir, preset.queryFile).exists()
+                || new File(sourceDir, preset.queryFile + ".gz").exists();
+        String gt = resolveGroundTruthSource(sourceDir, preset);
+        boolean gtHere = new File(sourceDir, gt).exists()
+                || new File(sourceDir, gt + ".gz").exists();
+        return queryHere && gtHere;
     }
 
     /**

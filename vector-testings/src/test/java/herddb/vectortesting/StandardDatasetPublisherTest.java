@@ -132,6 +132,41 @@ class StandardDatasetPublisherTest {
     }
 
     @Test
+    void publishBigannFindsGroundTruthInTexmexLayout(@TempDir Path tmp) throws Exception {
+        // The actual TEXMEX bigann_gnd.tar.gz extracts to gnd/idx_1000M.ivecs
+        // (no bigann_ prefix, abbreviated count) — different from the preset's
+        // declared path. The publisher must find it regardless.
+        int dim = 4;
+        int baseCount = 8;
+        int queryCount = 2;
+        int gtK = 3;
+
+        File sourceDatasetRoot = new File(tmp.toFile(), "src");
+        File sourceSubDir = new File(sourceDatasetRoot, DatasetPreset.BIGANN.subDir);
+        new File(sourceSubDir, "gnd").mkdirs();
+
+        writeBvecs(new File(sourceSubDir, "bigann_base.bvecs"), dim, baseCount, 0);
+        writeBvecs(new File(sourceSubDir, "bigann_query.bvecs"), dim, queryCount, 50);
+        // Only the TEXMEX-layout gt exists — not the preset-declared one.
+        writeIvecs(new File(sourceSubDir, "gnd/idx_1000M.ivecs"), gtK, queryCount);
+
+        File stagingDir = new File(tmp.toFile(), "staging");
+
+        StandardDatasetPublisher.main(new String[]{
+                "--dataset", "bigann",
+                "--dataset-dir", sourceDatasetRoot.getAbsolutePath(),
+                "--output-dir", stagingDir.getAbsolutePath()
+        });
+
+        assertTrue(new File(stagingDir, "bigann_groundtruth.ivecs").isFile(),
+                "publisher should have found gnd/idx_1000M.ivecs and staged it flat");
+        JsonNode root = new ObjectMapper().readTree(
+                new File(stagingDir, "bigann_descriptor.json"));
+        assertEquals(gtK, root.get("groundTruthK").asInt());
+        assertEquals(queryCount, root.get("numQueries").asLong());
+    }
+
+    @Test
     void descriptorDefaultsToFvecsWhenFormatMissing(@TempDir Path tmp) throws Exception {
         File dir = tmp.toFile();
         File descriptor = new File(dir, "noformat_descriptor.json");
