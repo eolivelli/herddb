@@ -95,9 +95,8 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
     // Guarded by synchronized(this) for growing
     private volatile long fileSize;
 
-    // Per-copy reusable buffer to avoid allocations in getVector (null for original instances)
-    private final float[] sharedBuffer;
-    private final VectorFloat<?> sharedVector;
+    // Copy instances share file/channels with the original and must NOT close them
+    private final boolean isCopy;
 
     ChannelFileBackedVectorValues(int dimension, long expectedSize, Path tempDir) throws IOException {
         this.dimension = dimension;
@@ -112,8 +111,7 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
 
         // No large pre-allocation; file starts empty and grows on demand
         this.fileSize = 0;
-        this.sharedBuffer = null;
-        this.sharedVector = null;
+        this.isCopy = false;
 
         if (expectedSize <= ARRAY_INDEX_THRESHOLD) {
             this.offsetIndex = new ArrayOffsetIndex((int) Math.max(expectedSize, 16));
@@ -127,7 +125,7 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
                                            FileChannel channel, AtomicInteger count,
                                            AtomicLong appendPosition, OffsetIndex offsetIndex,
                                            ConcurrentLinkedQueue<FileChannel> openReadChannels,
-                                           long fileSize, boolean shared) {
+                                           long fileSize) {
         this.dimension = dimension;
         this.vectorByteSize = (long) dimension * Float.BYTES;
         this.filePath = filePath;
@@ -139,13 +137,7 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
         this.openReadChannels = openReadChannels;
         this.readChannel = ThreadLocal.withInitial(this::openReadChannel);
         this.fileSize = fileSize;
-        if (shared) {
-            this.sharedBuffer = new float[dimension];
-            this.sharedVector = VTS.createFloatVector(sharedBuffer);
-        } else {
-            this.sharedBuffer = null;
-            this.sharedVector = null;
-        }
+        this.isCopy = true;
     }
 
     private ByteBuffer getOrAllocateBuffer() {
@@ -264,10 +256,10 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
         ByteBuffer buf = getOrAllocateBuffer();
         readFullyAt(buf, offset);
         buf.flip();
-
-        float[] floats = sharedBuffer != null ? sharedBuffer : new float[dimension];
-        buf.asFloatBuffer().get(floats);
-        return sharedVector != null ? sharedVector : VTS.createFloatVector(floats);
+        // Zero-copy: wrap the thread-local direct buffer as a VectorFloat view. The
+        // returned VectorFloat aliases the buffer, so callers must treat it per the
+        // isValueShared()=true contract (no retention across calls on this thread).
+        return VTS.wrapFloatVector(buf);
     }
 
     @Override
@@ -278,12 +270,12 @@ class ChannelFileBackedVectorValues extends FileBackedVectorValues {
     @Override
     public RandomAccessVectorValues copy() {
         return new ChannelFileBackedVectorValues(dimension, filePath, raf, channel, count,
-                appendPosition, offsetIndex, openReadChannels, fileSize, true);
+                appendPosition, offsetIndex, openReadChannels, fileSize);
     }
 
     @Override
     public void close() throws IOException {
-        if (sharedBuffer != null) {
+        if (isCopy) {
             return; // copy — shared resources owned by the original
         }
         try {

@@ -26,6 +26,8 @@ import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -48,6 +50,11 @@ class MmapFileBackedVectorValues extends FileBackedVectorValues {
 
     private final int dimension;
     private final long vectorByteSize;
+    /**
+     * Maximum segment size, rounded DOWN to a whole multiple of {@link #vectorByteSize}
+     * so that a vector never straddles a segment boundary — a straddle would defeat
+     * the zero-copy slice-and-wrap path in {@link #getVector(int)}.
+     */
     private final int maxSegmentSize;
     private final Path filePath;
     private final RandomAccessFile raf;
@@ -58,14 +65,19 @@ class MmapFileBackedVectorValues extends FileBackedVectorValues {
     private volatile MappedByteBuffer[] segments;
     private volatile long mappedSize;
 
-    // Per-copy reusable buffer to avoid allocations in getVector (null for original instances)
-    private final float[] sharedBuffer;
-    private final VectorFloat<?> sharedVector;
+    // Copy instances share file/channels with the original and must NOT close them
+    private final boolean isCopy;
 
     MmapFileBackedVectorValues(int dimension, long expectedSize, Path tempDir, int maxSegmentSize) throws IOException {
         this.dimension = dimension;
         this.vectorByteSize = (long) dimension * Float.BYTES;
-        this.maxSegmentSize = maxSegmentSize;
+        if (vectorByteSize > maxSegmentSize) {
+            throw new IllegalArgumentException(
+                    "vectorByteSize " + vectorByteSize + " exceeds maxSegmentSize " + maxSegmentSize
+                    + "; a single vector does not fit in one mapped segment");
+        }
+        // Round down to a multiple of vectorByteSize so vectors never straddle segments.
+        this.maxSegmentSize = (int) ((maxSegmentSize / vectorByteSize) * vectorByteSize);
         this.filePath = Files.createTempFile(tempDir, "vec-rebuild-", ".tmp");
         this.raf = new RandomAccessFile(filePath.toFile(), "rw");
         this.channel = raf.getChannel();
@@ -74,15 +86,14 @@ class MmapFileBackedVectorValues extends FileBackedVectorValues {
         raf.setLength(initialSize);
         this.mappedSize = initialSize;
         this.segments = mapSegments(initialSize);
-        this.sharedBuffer = null;
-        this.sharedVector = null;
+        this.isCopy = false;
     }
 
     // Constructor for copy() — shares the same file, optionally with a reusable read buffer
     private MmapFileBackedVectorValues(int dimension, Path filePath, RandomAccessFile raf,
                                         FileChannel channel, AtomicInteger count,
                                         MappedByteBuffer[] segments, long mappedSize,
-                                        int maxSegmentSize, boolean shared) {
+                                        int maxSegmentSize) {
         this.dimension = dimension;
         this.vectorByteSize = (long) dimension * Float.BYTES;
         this.maxSegmentSize = maxSegmentSize;
@@ -92,13 +103,7 @@ class MmapFileBackedVectorValues extends FileBackedVectorValues {
         this.count = count;
         this.segments = segments;
         this.mappedSize = mappedSize;
-        if (shared) {
-            this.sharedBuffer = new float[dimension];
-            this.sharedVector = VTS.createFloatVector(sharedBuffer);
-        } else {
-            this.sharedBuffer = null;
-            this.sharedVector = null;
-        }
+        this.isCopy = true;
     }
 
     private MappedByteBuffer[] mapSegments(long totalSize) throws IOException {
@@ -107,7 +112,11 @@ class MmapFileBackedVectorValues extends FileBackedVectorValues {
         while (offset < totalSize) {
             long remaining = totalSize - offset;
             int segSize = (int) Math.min(remaining, maxSegmentSize);
-            segs.add(channel.map(FileChannel.MapMode.READ_WRITE, offset, segSize));
+            MappedByteBuffer seg = channel.map(FileChannel.MapMode.READ_WRITE, offset, segSize);
+            // Native order is required for jvector's native-SIMD fast path when the
+            // segment is later wrapped as a VectorFloat in getVector.
+            seg.order(ByteOrder.nativeOrder());
+            segs.add(seg);
             offset += segSize;
         }
         return segs.toArray(new MappedByteBuffer[0]);
@@ -178,15 +187,16 @@ class MmapFileBackedVectorValues extends FileBackedVectorValues {
     @Override
     public VectorFloat<?> getVector(int nodeId) {
         long offset = (long) nodeId * vectorByteSize;
-        float[] floats = sharedBuffer != null ? sharedBuffer : new float[dimension];
         MappedByteBuffer[] segs = segments;
-        for (int i = 0; i < dimension; i++) {
-            long pos = offset + (long) i * Float.BYTES;
-            int segIndex = (int) (pos / maxSegmentSize);
-            int segOffset = (int) (pos % maxSegmentSize);
-            floats[i] = segs[segIndex].getFloat(segOffset);
-        }
-        return sharedVector != null ? sharedVector : VTS.createFloatVector(floats);
+        int segIndex = (int) (offset / maxSegmentSize);
+        int segOffset = (int) (offset % maxSegmentSize);
+        // maxSegmentSize is aligned to vectorByteSize in the constructor, so a vector
+        // never straddles a segment boundary — a single slice covers it.
+        ByteBuffer view = segs[segIndex].duplicate();
+        view.position(segOffset).limit(segOffset + (int) vectorByteSize);
+        ByteBuffer slice = view.slice();
+        slice.order(ByteOrder.nativeOrder());
+        return VTS.wrapFloatVector(slice);
     }
 
     @Override
@@ -197,12 +207,12 @@ class MmapFileBackedVectorValues extends FileBackedVectorValues {
     @Override
     public RandomAccessVectorValues copy() {
         return new MmapFileBackedVectorValues(dimension, filePath, raf, channel, count,
-                segments, mappedSize, maxSegmentSize, true);
+                segments, mappedSize, maxSegmentSize);
     }
 
     @Override
     public void close() throws IOException {
-        if (sharedBuffer != null) {
+        if (isCopy) {
             return; // copy — shared resources owned by the original
         }
         // Force unmap is not strictly possible via public API, but the GC will handle it.
