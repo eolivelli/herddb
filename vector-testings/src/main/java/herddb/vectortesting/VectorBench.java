@@ -151,7 +151,7 @@ public class VectorBench {
             out.info("Ground truth not available: " + e.getMessage());
         }
 
-        int actualRows = config.numRows;
+        long actualRows = config.numRows;
 
         // Phase 2: Drop table (if requested)
         if (config.dropTable) {
@@ -189,7 +189,7 @@ public class VectorBench {
 
         // Phase 4: Ingestion
         if (!config.skipIngest) {
-            int toIngest = actualRows - config.resumeFrom;
+            long toIngest = actualRows - config.resumeFrom;
             if (toIngest <= 0) {
                 out.info("resumeFrom (" + config.resumeFrom + ") >= rows (" + actualRows + "), nothing to ingest.");
             } else {
@@ -219,7 +219,7 @@ public class VectorBench {
 
             // Progress display thread runs during the entire ingestion
             AtomicBoolean ingestDone = new AtomicBoolean(false);
-            final int totalRowsTarget = config.numRows;
+            final long totalRowsTarget = config.numRows;
             Thread progressThread = new Thread(() -> {
                 Runtime rt = Runtime.getRuntime();
                 while (!ingestDone.get()) {
@@ -233,7 +233,7 @@ public class VectorBench {
 
                     LinkedHashMap<String, Object> fields = new LinkedHashMap<>();
                     fields.put("rows", rowsIngested);
-                    fields.put("total", (long) totalRowsTarget);
+                    fields.put("total", totalRowsTarget);
                     fields.put("ops_per_sec", opsPerSec);
                     fields.put("eta_s", etaSecs);
                     fields.put("commits", commitsTotal.get());
@@ -605,7 +605,7 @@ public class VectorBench {
 
         LinkedHashMap<String, Object> summaryFields = new LinkedHashMap<>();
         summaryFields.put("dataset", config.dataset.name());
-        summaryFields.put("rows", (long) config.numRows);
+        summaryFields.put("rows", config.numRows);
         summaryFields.put("similarity", config.effectiveSimilarity());
         summaryFields.put("total_wall_time_s", round1(totalWallSecs));
         out.summary(summaryFields);

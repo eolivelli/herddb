@@ -581,24 +581,44 @@ public class DatasetLoader {
         String baseFileName = preset == DatasetPreset.CUSTOM && customDescriptor != null
                 ? customDescriptor.baseFile : preset.baseFile;
         File file = new File(getDatasetSubDir(), baseFileName);
-        if (preset.baseFormat == VecFormat.BVECS) {
+        VecFormat format = resolveBaseFormat();
+        if (format == VecFormat.BVECS) {
             return loadBvecs(openInputStream(file), maxVectors);
         } else {
             return loadFvecs(openInputStream(file), maxVectors);
         }
     }
 
+    /**
+     * Resolve the on-disk format for the base/query vector files. For CUSTOM
+     * datasets the format comes from the descriptor JSON; for other presets it
+     * is hard-coded in the enum.
+     */
+    private VecFormat resolveBaseFormat() {
+        if (preset == DatasetPreset.CUSTOM && customDescriptor != null) {
+            return customDescriptor.format;
+        }
+        return preset.baseFormat;
+    }
+
+    private VecFormat resolveQueryFormat() {
+        if (preset == DatasetPreset.CUSTOM && customDescriptor != null) {
+            return customDescriptor.format;
+        }
+        return preset.queryFormat;
+    }
+
     public interface VectorStream extends Iterable<float[]>, Closeable {}
 
-    public VectorStream streamBaseVectors(int maxVectors) throws IOException {
-        return streamBaseVectors(0, maxVectors);
+    public VectorStream streamBaseVectors(long maxVectors) throws IOException {
+        return streamBaseVectors(0L, maxVectors);
     }
 
     /**
      * Stream up to {@code maxVectors} base vectors, skipping the first {@code skipVectors}.
      * Row IDs should start from {@code skipVectors} when resuming ingestion.
      */
-    public VectorStream streamBaseVectors(int skipVectors, int maxVectors) throws IOException {
+    public VectorStream streamBaseVectors(long skipVectors, long maxVectors) throws IOException {
         if (preset.baseFormat == VecFormat.HDF5) {
             return streamHdf5Vectors(skipVectors, maxVectors);
         }
@@ -607,7 +627,7 @@ public class DatasetLoader {
         File file = new File(getDatasetSubDir(), baseFileName);
         InputStream in = openInputStream(file);
         DataInputStream dis = new DataInputStream(in);
-        VecFormat format = preset.baseFormat;
+        VecFormat format = resolveBaseFormat();
 
         if (skipVectors > 0) {
             System.out.println("  Skipping " + skipVectors + " vectors to resume from position " + skipVectors + "...");
@@ -624,7 +644,7 @@ public class DatasetLoader {
             @Override
             public Iterator<float[]> iterator() {
                 return new Iterator<float[]>() {
-                    private int count = 0;
+                    private long count = 0;
                     private float[] next = null;
                     private boolean eof = false;
 
@@ -691,8 +711,8 @@ public class DatasetLoader {
     }
 
     /** Skip {@code count} vectors in-place from a DataInputStream of FVECS or BVECS format. */
-    private static void skipVecsInStream(DataInputStream dis, VecFormat format, int count) throws IOException {
-        for (int i = 0; i < count; i++) {
+    private static void skipVecsInStream(DataInputStream dis, VecFormat format, long count) throws IOException {
+        for (long i = 0; i < count; i++) {
             int dim = readLittleEndianInt(dis);
             long bytesToSkip = (format == VecFormat.BVECS) ? dim : (long) dim * 4;
             long remaining = bytesToSkip;
@@ -709,13 +729,15 @@ public class DatasetLoader {
         }
     }
 
-    private VectorStream streamHdf5Vectors(int skipVectors, int maxVectors) {
-        // Load all vectors from HDF5 into memory, then stream from the array
+    private VectorStream streamHdf5Vectors(long skipVectors, long maxVectors) {
+        // Load all vectors from HDF5 into memory, then stream from the array.
+        // HDF5 datasets are bounded by int array indices; the long signature is
+        // for consistency with streamBaseVectors().
         HdfFile hdf = new HdfFile(getHdf5File().toPath());
         Dataset ds = hdf.getDatasetByPath("train");
         float[][] data = (float[][]) ds.getData();
-        int start = Math.min(skipVectors, data.length);
-        int end = Math.min(start + maxVectors, data.length);
+        int start = (int) Math.min(skipVectors, data.length);
+        int end = (int) Math.min((long) start + maxVectors, data.length);
         System.out.println("  Loaded " + data.length + " vectors from HDF5 into memory, streaming [" + start + ", " + end + ")");
         return new VectorStream() {
             @Override
@@ -756,7 +778,8 @@ public class DatasetLoader {
         String queryFileName = preset == DatasetPreset.CUSTOM && customDescriptor != null
                 ? customDescriptor.queryFile : preset.queryFile;
         File file = new File(getDatasetSubDir(), queryFileName);
-        if (preset.queryFormat == VecFormat.BVECS) {
+        VecFormat format = resolveQueryFormat();
+        if (format == VecFormat.BVECS) {
             return loadBvecs(openInputStream(file), maxVectors);
         } else {
             return loadFvecs(openInputStream(file), maxVectors);
@@ -859,19 +882,24 @@ public class DatasetLoader {
     static class DatasetDescriptor {
         final String name;
         final String similarity;
+        final VecFormat format;
         final int dimensions;
-        final int totalVectors;
-        final int numQueries;
+        // Long-valued — datasets like BIGANN already exceed INT_MAX and future
+        // work targets 20 B+ vector corpora.
+        final long totalVectors;
+        final long numQueries;
         final int groundTruthK;
         final String baseFile;
         final String queryFile;
         final String groundTruthFile;
 
-        DatasetDescriptor(String name, String similarity, int dimensions, int totalVectors,
-                          int numQueries, int groundTruthK,
+        DatasetDescriptor(String name, String similarity, VecFormat format,
+                          int dimensions, long totalVectors,
+                          long numQueries, int groundTruthK,
                           String baseFile, String queryFile, String groundTruthFile) {
             this.name = name;
             this.similarity = similarity;
+            this.format = format;
             this.dimensions = dimensions;
             this.totalVectors = totalVectors;
             this.numQueries = numQueries;
@@ -887,14 +915,30 @@ public class DatasetLoader {
             return new DatasetDescriptor(
                     root.path("name").asText("custom"),
                     root.path("similarity").asText("euclidean"),
+                    parseFormat(root.path("format").asText("fvecs")),
                     root.path("dimensions").asInt(0),
-                    root.path("totalVectors").asInt(0),
-                    root.path("numQueries").asInt(0),
+                    root.path("totalVectors").asLong(0L),
+                    root.path("numQueries").asLong(0L),
                     root.path("groundTruthK").asInt(0),
                     root.path("baseFile").asText(null),
                     root.path("queryFile").asText(null),
                     root.path("groundTruthFile").asText(null)
             );
+        }
+
+        private static VecFormat parseFormat(String s) throws IOException {
+            if (s == null || s.isEmpty()) {
+                return VecFormat.FVECS;
+            }
+            switch (s.toLowerCase(java.util.Locale.ROOT)) {
+                case "fvecs":
+                    return VecFormat.FVECS;
+                case "bvecs":
+                    return VecFormat.BVECS;
+                default:
+                    throw new IOException("Unsupported descriptor format: " + s
+                            + " (expected fvecs or bvecs)");
+            }
         }
     }
 
@@ -917,6 +961,7 @@ public class DatasetLoader {
                 + ", Vectors: " + customDescriptor.totalVectors
                 + ", Dimensions: " + customDescriptor.dimensions
                 + ", Similarity: " + customDescriptor.similarity
+                + ", Format: " + customDescriptor.format
                 + ", Queries: " + customDescriptor.numQueries
                 + ", GroundTruth-K: " + customDescriptor.groundTruthK);
         return customDescriptor;
