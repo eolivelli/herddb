@@ -413,7 +413,7 @@ abstract class BenchOutput {
             m.put("jdbc_url", config.jdbcUrl);
             m.put("dataset", config.dataset.name());
             m.put("table", config.tableName);
-            m.put("rows", (long) config.numRows);
+            m.put("rows", config.numRows);
             m.put("ingest_threads", config.ingestThreads);
             m.put("batch_size", config.batchSize);
             m.put("query_threads", config.queryThreads);

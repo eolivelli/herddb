@@ -42,7 +42,7 @@ public class Config {
     String datasetDir = "./datasets";
     String datasetUrl = null; // null means use preset default
     DatasetLoader.DatasetPreset dataset = DatasetLoader.DatasetPreset.SIFT1M;
-    int numRows = 100_000;
+    long numRows = 100_000L;
     int ingestThreads = 4;
     int batchSize = 500;
     int queryThreads = 4;
@@ -59,7 +59,7 @@ public class Config {
     int clientTimeoutSeconds = 7200 * 4; // 8 hours
     String similarity = null; // null = use dataset default
     boolean indexBeforeIngest = true;
-    int resumeFrom = 0; // skip first N vectors; row IDs start from N
+    long resumeFrom = 0L; // skip first N vectors; row IDs start from N
     int ingestMaxOpsPerSecond = 100_000; // 0 = unlimited
     int ingestCommitRetries = 3;
     int checkpointTimeoutSeconds = 300;
@@ -168,7 +168,7 @@ public class Config {
             cfg.datasetUrl = cmd.getOptionValue("dataset-url");
         }
         if (cmd.hasOption("rows")) {
-            cfg.numRows = Integer.parseInt(cmd.getOptionValue("rows"));
+            cfg.numRows = Long.parseLong(cmd.getOptionValue("rows"));
         }
         if (cmd.hasOption("ingest-threads")) {
             cfg.ingestThreads = Integer.parseInt(cmd.getOptionValue("ingest-threads"));
@@ -217,7 +217,7 @@ public class Config {
             cfg.indexBeforeIngest = true;
         }
         if (cmd.hasOption("resume-from")) {
-            cfg.resumeFrom = Integer.parseInt(cmd.getOptionValue("resume-from"));
+            cfg.resumeFrom = Long.parseLong(cmd.getOptionValue("resume-from"));
         }
         if (cmd.hasOption("ingest-max-ops")) {
             cfg.ingestMaxOpsPerSecond = Integer.parseInt(cmd.getOptionValue("ingest-max-ops"));
@@ -299,7 +299,7 @@ public class Config {
             datasetUrl = props.getProperty("dataset-url");
         }
         if (props.containsKey("rows")) {
-            numRows = Integer.parseInt(props.getProperty("rows"));
+            numRows = Long.parseLong(props.getProperty("rows"));
         }
         if (props.containsKey("ingest-threads")) {
             ingestThreads = Integer.parseInt(props.getProperty("ingest-threads"));
@@ -347,7 +347,7 @@ public class Config {
             indexBeforeIngest = Boolean.parseBoolean(props.getProperty("index-before-ingest"));
         }
         if (props.containsKey("resume-from")) {
-            resumeFrom = Integer.parseInt(props.getProperty("resume-from"));
+            resumeFrom = Long.parseLong(props.getProperty("resume-from"));
         }
         if (props.containsKey("ingest-max-ops")) {
             ingestMaxOpsPerSecond = Integer.parseInt(props.getProperty("ingest-max-ops"));

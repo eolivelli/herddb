@@ -71,7 +71,7 @@ fi
 
 echo "Uploading dataset to $GS_PATH ..."
 echo "Files:"
-ls -lh "$DATASET_DIR"/*.fvecs "$DATASET_DIR"/*.ivecs "$DATASET_DIR"/*_descriptor.json 2>/dev/null || true
+ls -lh "$DATASET_DIR"/*.fvecs "$DATASET_DIR"/*.bvecs "$DATASET_DIR"/*.ivecs "$DATASET_DIR"/*_descriptor.json 2>/dev/null || true
 ls -lh "$DATASET_DIR"/*.csv "$DATASET_DIR"/*.zip 2>/dev/null || true
 echo ""
 
