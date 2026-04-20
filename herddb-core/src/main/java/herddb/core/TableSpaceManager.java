@@ -1324,19 +1324,21 @@ public class TableSpaceManager {
         public void run() {
             try (CommitLog.FollowerContext context = log.startFollowing(actualLogSequenceNumber)) {
                 while (!isLeader() && !closed) {
-                    long readLock = acquireReadLock("follow");
-                    try {
-                        log.followTheLeader(actualLogSequenceNumber, (LogSequenceNumber num, LogEntry u) -> {
-                            try {
-                                apply(new CommitLogResult(num, false, true), u, false);
-                            } catch (Throwable t) {
-                                throw new RuntimeException(t);
-                            }
-                            return !isLeader() && !closed;
-                        }, context);
-                    } finally {
-                        releaseReadLock(readLock, "follow");
-                    }
+                    // Acquire the read lock per applied entry rather than around the whole
+                    // followTheLeader call: the BK long-poll inside would otherwise hold
+                    // the lock for up to LONG_POLL_TIMEOUT every iteration and starve
+                    // writers (e.g. a follower-side checkpoint) on the StampedLock.
+                    log.followTheLeader(actualLogSequenceNumber, (LogSequenceNumber num, LogEntry u) -> {
+                        long readLock = acquireReadLock("follow");
+                        try {
+                            apply(new CommitLogResult(num, false, true), u, false);
+                        } catch (Throwable t) {
+                            throw new RuntimeException(t);
+                        } finally {
+                            releaseReadLock(readLock, "follow");
+                        }
+                        return !isLeader() && !closed;
+                    }, context);
                 }
             } catch (Throwable t) {
                 LOGGER.log(Level.SEVERE, "follower error " + tableSpaceName, t);
