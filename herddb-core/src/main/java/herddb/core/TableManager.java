@@ -330,6 +330,15 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         LOGGER.log(Level.INFO, "Table " + table.name + ", receiving dump,"
                 + "done at external logPosition " + dumpLogSequenceNumber);
         this.dumpLogSequenceNumber = dumpLogSequenceNumber;
+        // The dump reflects all writes up to dumpLogSequenceNumber, so advance
+        // lastAppliedSequenceNumber accordingly. Otherwise the first checkpoint
+        // after the dump (e.g. the post-download checkpoint on a freshly
+        // bootstrapped follower, which applies no log entries) would persist
+        // TableStatus.sequenceNumber = START_OF_TIME, and on restart recovery
+        // would be unable to locate the records that live in the already-on-disk
+        // pages.
+        lastAppliedSequenceNumber.updateAndGet(cur ->
+                dumpLogSequenceNumber.after(cur) ? dumpLogSequenceNumber : cur);
     }
 
     void restoreFinished() {
@@ -692,7 +701,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             nextPrimaryKeyValue.set(Bytes.toLong(tableStatus.nextPrimaryKeyValue, 0));
             nextPageId = tableStatus.nextPageId;
             bootSequenceNumber = tableStatus.sequenceNumber;
-            lastAppliedSequenceNumber.set(bootSequenceNumber);
+            // Monotonic: prepareForRestore() may have already published a
+            // higher LSN (the dump's target position) when bootstrapping a
+            // follower from a snapshot. On a fresh table the persisted
+            // TableStatus is synthesised with START_OF_TIME, and a plain set()
+            // here would silently roll that pre-set dump LSN back to -1/-1,
+            // which made post-download checkpoints persist an unusable
+            // TableStatus.sequenceNumber on the follower.
+            final LogSequenceNumber bootLsn = bootSequenceNumber;
+            lastAppliedSequenceNumber.updateAndGet(cur ->
+                    bootLsn.after(cur) ? bootLsn : cur);
             activePagesAtBoot.putAll(tableStatus.activePages);
         }
         keyToPage.start(bootSequenceNumber, created);

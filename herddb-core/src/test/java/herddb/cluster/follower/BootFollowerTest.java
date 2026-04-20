@@ -459,15 +459,23 @@ public class BootFollowerTest extends MultiServerBase {
                 server_2.start();
                 assertTrue(server_2.getManager().waitForTablespace(TableSpace.DEFAULT, 60000, false));
 
-                for (int i = 0; i < size; i++) {
-                    GetResult found = server_2.getManager().get(new GetStatement(TableSpace.DEFAULT, "t1", Bytes.from_int(i), null, false), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
-                            TransactionContext.NO_TRANSACTION);
-                    if (found.found()) {
-                        break;
+                // Verify that the recovered rows are visible after reboot.
+                // Bounded wait keeps the test from hanging for ~33 min if the
+                // follower fails to recover — the original loop could sleep
+                // up to 20_000 × 100 ms before giving up.
+                TestUtils.waitForCondition(() -> {
+                    for (int i = 0; i < size; i++) {
+                        GetResult found = server_2.getManager().get(
+                                new GetStatement(TableSpace.DEFAULT, "t1",
+                                        Bytes.from_int(i), null, false),
+                                StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                                TransactionContext.NO_TRANSACTION);
+                        if (found.found()) {
+                            return true;
+                        }
                     }
-                    Thread.sleep(100);
-                }
-
+                    return false;
+                }, TestUtils.NOOP, 30, "recovered data visible on rebooted follower");
             }
 
             assertEquals(3, callCount.get());
