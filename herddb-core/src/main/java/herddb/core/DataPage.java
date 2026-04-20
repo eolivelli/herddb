@@ -36,7 +36,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * @author enrico.olivelli
  * @author diego.salvi
  */
-public final class DataPage extends Page<TableManager> {
+public class DataPage extends Page<TableManager> {
 
     /**
      * Constant entry size accounting for HashMap$Node overhead.
@@ -73,7 +73,7 @@ public final class DataPage extends Page<TableManager> {
      */
     public boolean writable;
 
-    DataPage(TableManager owner, long pageId, long maxSize, long estimatedSize, Map<Bytes, Record> data, boolean immutable) {
+    protected DataPage(TableManager owner, long pageId, long maxSize, long estimatedSize, Map<Bytes, Record> data, boolean immutable) {
         super(owner, pageId);
         this.maxSize = maxSize;
         this.immutable = immutable;
@@ -125,7 +125,7 @@ public final class DataPage extends Page<TableManager> {
         return prev;
     }
 
-    Record get(Bytes key) {
+    public Record get(Bytes key) {
         return data.get(key);
     }
 
@@ -180,23 +180,23 @@ public final class DataPage extends Page<TableManager> {
         data.remove(record.key);
     }
 
-    boolean isEmpty() {
+    public boolean isEmpty() {
         return data.isEmpty();
     }
 
-    int size() {
+    public int size() {
         return data.size();
     }
 
-    Collection<Record> getRecordsForFlush() {
+    public Collection<Record> getRecordsForFlush() {
         return data.values();
     }
 
-    Set<Bytes> getKeysForDebug() {
+    public Set<Bytes> getKeysForDebug() {
         return data.keySet();
     }
 
-    long getUsedMemory() {
+    public long getUsedMemory() {
         return usedMemory.get();
     }
 

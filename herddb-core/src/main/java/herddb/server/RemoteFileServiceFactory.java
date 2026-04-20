@@ -67,6 +67,18 @@ public interface RemoteFileServiceFactory {
             Path dataDirectory, Path tmpDirectory, int swapThreshold, RemoteFileClient client);
 
     /**
+     * Config-aware overload. The default delegates to the legacy method so
+     * that implementations predating the lazy-page-load feature keep
+     * compiling. New implementations should override this overload to wire
+     * in config-driven knobs such as the lazy value-cache size.
+     */
+    default DataStorageManager createDataStorageManager(
+            Path dataDirectory, Path tmpDirectory, int swapThreshold,
+            RemoteFileClient client, Map<String, Object> config) {
+        return createDataStorageManager(dataDirectory, tmpDirectory, swapThreshold, client);
+    }
+
+    /**
      * Creates a promotable (initially read-only) data storage manager for
      * shared-storage replicas.
      */

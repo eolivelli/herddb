@@ -118,6 +118,41 @@ public class RemoteFileDataStorageManagerBasicTest {
     }
 
     @Test
+    public void testWrittenPageUsesV2Format() throws Exception {
+        // Lock in the on-disk format: pages written by the remote DSM must
+        // start with the v2 magic and be decodable as a v2 page.
+        storage.initTablespace("ts1");
+        storage.initTable("ts1", "uuid1");
+
+        List<Record> page = new ArrayList<>();
+        page.add(new Record(Bytes.from_string("alpha"), Bytes.from_string("A".repeat(64))));
+        page.add(new Record(Bytes.from_string("bravo"), Bytes.from_string("B".repeat(128))));
+        page.add(new Record(Bytes.from_string("charlie"), Bytes.from_string("C".repeat(16))));
+        storage.writePage("ts1", "uuid1", 42L, page);
+
+        // Pages are stored as multipart (one block per ~4 MiB) so that
+        // byte-range reads work; fetch the first 5 bytes of block 0 to
+        // verify the magic and version.
+        byte[] prefix = client.readFileRange(
+                "ts1/uuid1/data/42.page", 0L, 5, client.getBlockSize());
+        assertNotNull(prefix);
+        int magic = ((prefix[0] & 0xff) << 24)
+                | ((prefix[1] & 0xff) << 16)
+                | ((prefix[2] & 0xff) << 8)
+                | (prefix[3] & 0xff);
+        assertEquals(LazyDataPageFormat.MAGIC, magic);
+        assertEquals(LazyDataPageFormat.VERSION_V2, prefix[4]);
+
+        // Round-trip via the DSM.
+        List<Record> read = storage.readPage("ts1", "uuid1", 42L);
+        assertEquals(3, read.size());
+        assertEquals(page.get(0).key, read.get(0).key);
+        assertEquals(page.get(0).value, read.get(0).value);
+        assertEquals(page.get(2).key, read.get(2).key);
+        assertEquals(page.get(2).value, read.get(2).value);
+    }
+
+    @Test
     public void testWriteAndReadIndexPage() throws Exception {
         storage.initTablespace("ts1");
         storage.initIndex("ts1", "idx1");
