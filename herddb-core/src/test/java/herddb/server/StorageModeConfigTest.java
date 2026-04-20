@@ -29,7 +29,6 @@ public class StorageModeConfigTest {
     public void testStorageModeConstants() {
         assertEquals("local", ServerConfiguration.PROPERTY_STORAGE_MODE_LOCAL);
         assertEquals("remote", ServerConfiguration.PROPERTY_STORAGE_MODE_REMOTE);
-        assertEquals("bookkeeper", ServerConfiguration.PROPERTY_STORAGE_MODE_BOOKKEEPER);
         assertEquals("server.storage.mode", ServerConfiguration.PROPERTY_STORAGE_MODE);
     }
 

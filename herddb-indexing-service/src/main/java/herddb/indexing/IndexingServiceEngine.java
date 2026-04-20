@@ -177,8 +177,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 LOGGER.log(Level.INFO, "Indexing service cluster metadata directory: {0}", metadataDirectory);
                 return new FileMetadataStorageManager(metadataDirectory);
             }
-            case ServerConfiguration.PROPERTY_MODE_CLUSTER:
-            case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER: {
+            case ServerConfiguration.PROPERTY_MODE_CLUSTER: {
                 String zkAddress = config.getString(IndexingServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS,
                         IndexingServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS_DEFAULT);
                 int zkSessionTimeout = config.getInt(IndexingServerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT,

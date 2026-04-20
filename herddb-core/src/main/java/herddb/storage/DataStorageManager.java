@@ -214,10 +214,9 @@ public abstract class DataStorageManager implements AutoCloseable {
      * Reports whether this storage manager can host vector indexes
      * ({@code PersistentVectorStore}). Vector indexes persist large graph and
      * map artefacts via the multipart API above; backends that cannot
-     * implement it (notably {@link herddb.cluster.BookKeeperDataStorageManager})
-     * must override this to {@code false} so callers can fail fast with a
-     * clear error rather than a cryptic {@code UnsupportedOperationException}
-     * during checkpoint.
+     * implement it must override this to {@code false} so callers can fail
+     * fast with a clear error rather than a cryptic
+     * {@code UnsupportedOperationException} during checkpoint.
      */
     public boolean supportsVectorIndexes() {
         return true;

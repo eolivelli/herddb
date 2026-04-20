@@ -638,11 +638,10 @@ crash mid-write, the incomplete temp file is ignored on recovery.
 `PostCheckpointAction` after all pins on that checkpoint have been released. This is why
 pinned checkpoints (used by dumps) temporarily increase disk usage.
 
-### BookKeeperDataStorageManager (FileDataStorageManager in cluster mode)
+### Cluster mode page storage
 
-In the BookKeeper cluster setup, the `FileDataStorageManager` is still used for page/table
-data (stored locally on each node), while `BookKeeperCommitLog` handles the WAL. There is
-no separate "BookKeeper data storage manager" — the data storage is always file-based.
+In cluster mode the `FileDataStorageManager` is used for page/table data (stored locally
+on each node), while `BookKeeperCommitLog` handles the WAL.
 
 This means:
 - Page files live on the local filesystem of the leader node.

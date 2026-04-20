@@ -1365,9 +1365,7 @@ public class TableSpaceManager {
     }
 
     private void startAsFollower() throws DataStorageManagerException, LogNotAvailableException {
-        if (dbmanager.getMode().equals(ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER)) {
-            // in diskless cluster mode there is no need to really 'follow' the leader
-        } else if (dbmanager.getMode().equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)) {
+        if (dbmanager.getMode().equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)) {
             // shared-storage mode: follow checkpoints from S3 via ZK watches
             checkpointFollowerThread = new CheckpointFollowerThread();
             dbmanager.submit(checkpointFollowerThread);
