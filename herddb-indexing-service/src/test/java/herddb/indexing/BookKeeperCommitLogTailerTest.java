@@ -19,6 +19,7 @@
  */
 package herddb.indexing;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
@@ -35,7 +36,9 @@ import herddb.model.Table;
 import herddb.server.ServerConfiguration;
 import herddb.utils.ZKTestEnv;
 import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.CopyOnWriteArrayList;
+import org.apache.bookkeeper.conf.ClientConfiguration;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.junit.After;
 import org.junit.Before;
@@ -145,6 +148,82 @@ public class BookKeeperCommitLogTailerTest {
                 writerLog.close();
             }
         }
+    }
+
+    @Test
+    public void testSpeculativeReadsDisabledByDefault() throws Exception {
+        // Issue #180: the tailer is a sequential follower; speculative reads
+        // only add load. Verify the built-in default flips them off.
+        BookKeeperCommitLogTailer tailer = new BookKeeperCommitLogTailer(
+                testEnv.getAddress(),
+                testEnv.getTimeout(),
+                testEnv.getPath(),
+                ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT,
+                "test-ts-spec-defaults",
+                LogSequenceNumber.START_OF_TIME,
+                (lsn, entry) -> { /* no-op */ }
+        );
+        Thread t = new Thread(tailer, "test-bk-tailer-spec-defaults");
+        t.setDaemon(true);
+        t.start();
+        try {
+            ClientConfiguration cfg = waitForClientConfig(tailer);
+            assertEquals("firstSpeculativeReadTimeout default must be 0",
+                    0, cfg.getFirstSpeculativeReadTimeout());
+            assertEquals("maxSpeculativeReadTimeout default must be 0",
+                    0, cfg.getMaxSpeculativeReadTimeout());
+        } finally {
+            tailer.close();
+            t.join(5_000);
+        }
+    }
+
+    @Test
+    public void testBookkeeperPropertiesArePassedThrough() throws Exception {
+        // Issue #180: the bookkeeper.* prefix must reach the BK client. A
+        // non-default value for firstSpeculativeReadTimeout confirms both
+        // the passthrough (change #3) and that the operator override wins
+        // over the built-in default (change #4).
+        Properties bkProps = new Properties();
+        bkProps.setProperty("bookkeeper.firstSpeculativeReadTimeout", "50");
+        bkProps.setProperty("bookkeeper.readTimeout", "17");
+
+        BookKeeperCommitLogTailer tailer = new BookKeeperCommitLogTailer(
+                testEnv.getAddress(),
+                testEnv.getTimeout(),
+                testEnv.getPath(),
+                ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT,
+                "test-ts-bk-props",
+                LogSequenceNumber.START_OF_TIME,
+                (lsn, entry) -> { /* no-op */ },
+                bkProps
+        );
+        Thread t = new Thread(tailer, "test-bk-tailer-props");
+        t.setDaemon(true);
+        t.start();
+        try {
+            ClientConfiguration cfg = waitForClientConfig(tailer);
+            assertEquals("operator-supplied firstSpeculativeReadTimeout must win",
+                    50, cfg.getFirstSpeculativeReadTimeout());
+            assertEquals("arbitrary bookkeeper.* property must be visible",
+                    "17", cfg.getProperty("readTimeout"));
+        } finally {
+            tailer.close();
+            t.join(5_000);
+        }
+    }
+
+    private static ClientConfiguration waitForClientConfig(
+            BookKeeperCommitLogTailer tailer) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 15_000;
+        while (System.currentTimeMillis() < deadline) {
+            ClientConfiguration cfg = tailer.getClientConfigurationForTest();
+            if (cfg != null) {
+                return cfg;
+            }
+            Thread.sleep(100);
+        }
+        throw new AssertionError("tailer did not initialize BK client within 15s");
     }
 
     @Test

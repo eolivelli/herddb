@@ -244,7 +244,13 @@ indexingService:
   # Netty memory tuning: io.netty.maxDirectMemory=0 respects -XX:MaxDirectMemorySize cap
   # instead of defaulting to heap size; 512m cap is sufficient for gRPC messages.
   # numDirectArenas=16 spreads Netty allocations to reduce lock contention (issue #122).
-  javaOpts: "-Xms9g -Xmx9g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=2g -Dio.netty.allocator.numDirectArenas=16"
+  # herddb.commitlog.tailbatchsize=1000 caps the BK read batch issued per
+  # followTheLeader() call in the IS tailer. The 10000 default retains up to
+  # 10K PendingReadOp objects (plus protocol payloads) per batch, which
+  # drove IS heap to 91% during a bigann-200M run (issue #180). 1000 leaves
+  # the steady-state throughput headroom while cutting the retained working
+  # set by 10x.
+  javaOpts: "-Xms9g -Xmx9g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=2g -Dio.netty.allocator.numDirectArenas=16 -Dherddb.commitlog.tailbatchsize=1000"
   storage:
     data:
       size: 5Gi
