@@ -25,7 +25,6 @@ import herddb.auth.oidc.OidcTokenValidator;
 import herddb.auth.oidc.PrincipalExtractor;
 import herddb.auth.oidc.sasl.TokenAuthenticator;
 import herddb.client.ClientConfiguration;
-import herddb.cluster.BookKeeperDataStorageManager;
 import herddb.cluster.BookkeeperCommitLogManager;
 import herddb.cluster.EmbeddedBookie;
 import herddb.cluster.ZookeeperMetadataStorageManager;
@@ -320,7 +319,6 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 LOGGER.log(Level.INFO, "Use this JDBC URL to connect to this server: {0}", new Object[]{jdbcUrl});
                 break;
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
-            case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER:
                 this.embeddedBookie = new EmbeddedBookie(baseDirectory, configuration, (ZookeeperMetadataStorageManager) this.metadataStorageManager, statsProvider);
                 jdbcUrl = "jdbc:herddb:zookeeper:" + configuration.getString(ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS_DEFAULT) + configuration.getString(ServerConfiguration.PROPERTY_ZOOKEEPER_PATH, ServerConfiguration.PROPERTY_ZOOKEEPER_PATH_DEFAULT);
                 LOGGER.log(Level.INFO, "Use this JDBC URL to connect to this HerdDB cluster: {0}", new Object[]{jdbcUrl});
@@ -378,7 +376,6 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 Path metadataDirectory = this.baseDirectory.resolve(configuration.getString(ServerConfiguration.PROPERTY_METADATADIR, ServerConfiguration.PROPERTY_METADATADIR_DEFAULT));
                 return new FileMetadataStorageManager(metadataDirectory);
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
-            case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER:
             case ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE:
                 return new ZookeeperMetadataStorageManager(configuration.getString(ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS_DEFAULT),
                         configuration.getInt(ServerConfiguration.PROPERTY_ZOOKEEPER_SESSIONTIMEOUT, ServerConfiguration.PROPERTY_ZOOKEEPER_SESSIONTIMEOUT_DEFAULT),
@@ -393,11 +390,8 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         if (mode.equals(ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE)) {
             return buildSharedStorageDataManager(nodeId);
         }
-        String defaultStorageMode = mode.equals(ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER)
-                ? ServerConfiguration.PROPERTY_STORAGE_MODE_BOOKKEEPER
-                : ServerConfiguration.PROPERTY_STORAGE_MODE_LOCAL;
         String storageMode = configuration.getString(
-                ServerConfiguration.PROPERTY_STORAGE_MODE, defaultStorageMode);
+                ServerConfiguration.PROPERTY_STORAGE_MODE, ServerConfiguration.PROPERTY_STORAGE_MODE_LOCAL);
         LOGGER.log(Level.INFO, "Storage mode is {0}, server mode is {1}, for nodeId {2}",
                 new Object[]{storageMode, mode, nodeId});
         switch (storageMode) {
@@ -412,17 +406,6 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 boolean hashChecksEnabled = configuration.getBoolean(ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED, ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
                 boolean hashWritesEnabled = configuration.getBoolean(ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED, ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT);
                 return new FileDataStorageManager(dataDirectory, tmpDirectory, diskswapThreshold, requirefsync, pageodirect, indexodirect, hashChecksEnabled, hashWritesEnabled, statsLogger);
-            }
-            case ServerConfiguration.PROPERTY_STORAGE_MODE_BOOKKEEPER: {
-                if (!mode.equals(ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER)) {
-                    throw new RuntimeException(ServerConfiguration.PROPERTY_STORAGE_MODE + "="
-                            + ServerConfiguration.PROPERTY_STORAGE_MODE_BOOKKEEPER
-                            + " is only supported with " + ServerConfiguration.PROPERTY_MODE + "="
-                            + ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER);
-                }
-                int diskswapThreshold = configuration.getInt(ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS, ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS_DEFAULT);
-                return new BookKeeperDataStorageManager(nodeId, tmpDirectory, diskswapThreshold, (ZookeeperMetadataStorageManager) metadataStorageManager,
-                        (BookkeeperCommitLogManager) this.commitLogManager, this.statsLogger);
             }
             case ServerConfiguration.PROPERTY_STORAGE_MODE_REMOTE: {
                 int diskswapThreshold = configuration.getInt(ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS, ServerConfiguration.PROPERTY_DISK_SWAP_MAX_RECORDS_DEFAULT);
@@ -607,7 +590,6 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                         statsLogger.scope("txlog")
                 );
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
-            case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER:
             case ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE:
                 BookkeeperCommitLogManager bkmanager = new BookkeeperCommitLogManager((ZookeeperMetadataStorageManager) this.metadataStorageManager, configuration, statsLogger);
                 bkmanager.setAckQuorumSize(configuration.getInt(ServerConfiguration.PROPERTY_BOOKKEEPER_ACKQUORUMSIZE, ServerConfiguration.PROPERTY_BOOKKEEPER_ACKQUORUMSIZE_DEFAULT));
@@ -641,7 +623,6 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 return new MemoryLocalNodeIdManager(dataDirectory);
             case ServerConfiguration.PROPERTY_MODE_STANDALONE:
             case ServerConfiguration.PROPERTY_MODE_CLUSTER:
-            case ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER:
             case ServerConfiguration.PROPERTY_MODE_SHARED_STORAGE:
                 return new LocalNodeIdManager(dataDirectory);
             default:

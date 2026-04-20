@@ -20,7 +20,7 @@ serviceAccount:
 server:
   # Server mode: "standalone" or "cluster"
   mode: standalone
-  # Storage mode: "local", "remote", or "bookkeeper"
+  # Storage mode: "local" or "remote"
   storageMode: remote
   replicaCount: 1
   port: 7000

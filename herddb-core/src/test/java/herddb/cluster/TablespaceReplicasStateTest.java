@@ -22,9 +22,7 @@ package herddb.cluster;
 
 import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import static herddb.core.TestUtils.scan;
-import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import herddb.core.ClusterTest;
 import herddb.model.ColumnTypes;
@@ -37,7 +35,6 @@ import herddb.model.commands.AlterTableSpaceStatement;
 import herddb.model.commands.CreateTableStatement;
 import herddb.server.Server;
 import herddb.server.ServerConfiguration;
-import herddb.storage.DataStorageManagerException;
 import herddb.utils.DataAccessor;
 import herddb.utils.TestUtils;
 import herddb.utils.ZKTestEnv;
@@ -45,7 +42,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
-import org.apache.zookeeper.KeeperException;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -146,10 +142,10 @@ public class TablespaceReplicasStateTest {
 
 
     @Test
-    public void testDisklessCluster() throws Exception {
+    public void testClusterLeaderSwitch() throws Exception {
         ServerConfiguration serverconfig_1 = newServerConfigurationWithAutoPort(folder.newFolder().toPath());
         serverconfig_1.set(ServerConfiguration.PROPERTY_NODEID, "server1");
-        serverconfig_1.set(ServerConfiguration.PROPERTY_MODE, ServerConfiguration.PROPERTY_MODE_DISKLESSCLUSTER);
+        serverconfig_1.set(ServerConfiguration.PROPERTY_MODE, ServerConfiguration.PROPERTY_MODE_CLUSTER);
         serverconfig_1.set(ServerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, testEnv.getAddress());
         serverconfig_1.set(ServerConfiguration.PROPERTY_ZOOKEEPER_PATH, testEnv.getPath());
         serverconfig_1.set(ServerConfiguration.PROPERTY_ZOOKEEPER_SESSIONTIMEOUT, testEnv.getTimeout());
@@ -238,16 +234,6 @@ public class TablespaceReplicasStateTest {
                         return scan.consume().size() > 0;
                     }
                 }, TestUtils.NOOP, 60, "waiting for server1 replica state to become 'follower'");
-
-                // the TableSpaceManager for a follower must not be able to perform a checkpoint
-                DataStorageManagerException err = TestUtils.expectThrows(DataStorageManagerException.class,
-                        () -> {
-                            server_1.getManager().getTableSpaceManager(TableSpace.DEFAULT).checkpoint(true, false, false);
-                        });
-                // ZooKeeper BadVersionException is expected because
-                // server1 is not holding the expected version of znode metdata
-                assertThat(err.getCause(), instanceOf(KeeperException.BadVersionException.class));
-
             }
         }
     }
