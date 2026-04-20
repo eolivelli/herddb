@@ -56,9 +56,16 @@ if [ -z "$DESCRIPTOR" ]; then
     echo "The dataset may not be auto-configurable by VectorBench."
 fi
 
-# Verify gsutil is available
-if ! command -v gsutil &> /dev/null; then
-    echo "ERROR: gsutil not found. Install Google Cloud SDK:"
+# Prefer the modern `gcloud storage` CLI (parallel by default) and fall back
+# to `gsutil -m` for older gcloud installations. See
+# https://docs.cloud.google.com/storage/docs/gsutil-transition-to-gcloud.
+if gcloud storage --help &>/dev/null; then
+    UPLOAD_CMD=(gcloud storage cp -r)
+elif command -v gsutil &>/dev/null; then
+    echo "NOTE: 'gcloud storage' not available, falling back to gsutil."
+    UPLOAD_CMD=(gsutil -m cp -r)
+else
+    echo "ERROR: neither 'gcloud storage' nor 'gsutil' found. Install Google Cloud SDK:"
     echo "  https://cloud.google.com/sdk/docs/install"
     exit 1
 fi
@@ -69,14 +76,13 @@ if [[ "$GS_PATH" == */ ]]; then
     GS_PATH="${GS_PATH}${DIR_NAME}"
 fi
 
-echo "Uploading dataset to $GS_PATH ..."
+echo "Uploading dataset to $GS_PATH using: ${UPLOAD_CMD[*]}"
 echo "Files:"
 ls -lh "$DATASET_DIR"/*.fvecs "$DATASET_DIR"/*.bvecs "$DATASET_DIR"/*.ivecs "$DATASET_DIR"/*_descriptor.json 2>/dev/null || true
 ls -lh "$DATASET_DIR"/*.csv "$DATASET_DIR"/*.zip 2>/dev/null || true
 echo ""
 
-# Upload all dataset files (parallel composite uploads for large files)
-gsutil -m cp -r "$DATASET_DIR"/* "$GS_PATH/"
+"${UPLOAD_CMD[@]}" "$DATASET_DIR"/* "$GS_PATH/"
 
 echo ""
 echo "Upload complete."
