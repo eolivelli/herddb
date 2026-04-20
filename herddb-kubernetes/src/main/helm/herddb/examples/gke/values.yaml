@@ -84,6 +84,10 @@ fileServer:
     # when the limit is reached. Set it slightly below the PVC size to leave
     # headroom for temporary write buffers.  150 Gi = 161061273600 bytes.
     cacheMaxBytes: 161061273600
+    # GCS's S3-compatible endpoint requires path-style addressing and rejects
+    # the AWS SDK v2 default request checksums (CRC32/CRC64NVME). Enable the
+    # compatibility mode so the S3 client is configured to match GCS.
+    gcsCompatibility: true
   storage:
     size: 200Gi
   resources:

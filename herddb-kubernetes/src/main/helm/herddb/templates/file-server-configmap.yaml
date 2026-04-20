@@ -39,6 +39,9 @@ data:
     s3.prefix={{ .Values.fileServer.s3.prefix }}
     {{- end }}
     cache.max.bytes={{ .Values.fileServer.s3.cacheMaxBytes | int64 }}
+    {{- if or .Values.fileServer.s3.gcsCompatibility .Values.minio.enabled }}
+    s3.gcs.compatibility=true
+    {{- end }}
     {{- end }}
     http.enable=true
     http.port={{ .Values.fileServer.httpPort }}

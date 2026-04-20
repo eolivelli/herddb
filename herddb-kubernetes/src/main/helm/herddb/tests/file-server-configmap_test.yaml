@@ -223,3 +223,35 @@ tests:
       - notMatchRegex:
           path: data["fileserver.properties"]
           pattern: "s3\\.access\\.key=minioadmin"
+
+  - it: should not emit s3.gcs.compatibility by default in s3 mode
+    set:
+      fileServer.storageMode: s3
+      fileServer.s3.bucket: my-bucket
+      fileServer.s3.accessKey: mykey
+      fileServer.s3.secretKey: mysecret
+    asserts:
+      - notMatchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.gcs\\.compatibility"
+
+  - it: should emit s3.gcs.compatibility=true when gcsCompatibility flag is on
+    set:
+      fileServer.storageMode: s3
+      fileServer.s3.bucket: my-bucket
+      fileServer.s3.accessKey: mykey
+      fileServer.s3.secretKey: mysecret
+      fileServer.s3.gcsCompatibility: true
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.gcs\\.compatibility=true"
+
+  - it: should auto-enable s3.gcs.compatibility when minio is enabled
+    set:
+      fileServer.storageMode: s3
+      minio.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["fileserver.properties"]
+          pattern: "s3\\.gcs\\.compatibility=true"

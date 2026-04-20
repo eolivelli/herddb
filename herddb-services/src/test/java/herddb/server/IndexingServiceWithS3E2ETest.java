@@ -145,6 +145,9 @@ public class IndexingServiceWithS3E2ETest {
         config.setProperty("s3.prefix", testPrefix);
         config.setProperty("cache.dir", fileServerDataDir.resolve("s3-cache").toString());
         config.setProperty("cache.max.bytes", String.valueOf(64 * 1024 * 1024));
+        // MinIO requires path-style addressing; enable the GCS-compat bundle so
+        // the server-side client configures pathStyleAccessEnabled(true).
+        config.setProperty("s3.gcs.compatibility", "true");
         return config;
     }
 

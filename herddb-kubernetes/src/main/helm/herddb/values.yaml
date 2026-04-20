@@ -81,6 +81,12 @@ fileServer:
     prefix: ""
     # Local disk cache size in bytes (default 1 GB). The PVC is always used as cache dir.
     cacheMaxBytes: 1073741824
+    # Enable GCS-compatibility tweaks on the S3 client:
+    #  - path-style addressing (required by GCS and MinIO)
+    #  - disable SDK v2 default request/response checksums (GCS rejects them)
+    # Default false = behave as a standard AWS S3 client. Auto-enabled when
+    # minio.enabled=true (the in-cluster MinIO also needs path-style addressing).
+    gcsCompatibility: false
   storage:
     size: 10Gi
     storageClass: ""

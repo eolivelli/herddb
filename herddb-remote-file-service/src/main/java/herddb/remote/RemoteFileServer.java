@@ -58,6 +58,8 @@ import org.eclipse.jetty.servlet.ServletContextHandler;
 import org.eclipse.jetty.servlet.ServletHolder;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.checksums.RequestChecksumCalculation;
+import software.amazon.awssdk.core.checksums.ResponseChecksumValidation;
 import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
@@ -314,14 +316,31 @@ public class RemoteFileServer implements AutoCloseable {
         // the OS page cache serves hot data under kernel-managed memory pressure.
         long cacheMaxBytes = Long.parseLong(
                 config.getProperty("cache.max.bytes", String.valueOf(DEFAULT_CACHE_MAX_BYTES)));
+        // GCS's S3-compatible endpoint (and MinIO) requires path-style addressing and
+        // rejects the AWS SDK v2 default request/response checksums (CRC32/CRC64NVME).
+        // Enabling this flag bundles both workarounds. Off by default so the client
+        // behaves like a standard AWS S3 client (virtual-hosted-style, SDK-managed
+        // checksum validation).
+        boolean gcsCompatibility = Boolean.parseBoolean(
+                config.getProperty("s3.gcs.compatibility", "false"));
 
         S3AsyncClientBuilder clientBuilder = S3AsyncClient.builder()
                 .region(Region.of(region))
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create(accessKey, secretKey)))
-                .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build())
                 // Use AWS CRT async HTTP client for better stability and non-blocking shutdown
                 .httpClientBuilder(AwsCrtAsyncHttpClient.builder());
+        if (gcsCompatibility) {
+            LOGGER.log(Level.INFO, "S3 client: GCS compatibility mode enabled "
+                    + "(path-style addressing, SDK checksums WHEN_REQUIRED)");
+            clientBuilder
+                    .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build())
+                    .requestChecksumCalculation(RequestChecksumCalculation.WHEN_REQUIRED)
+                    .responseChecksumValidation(ResponseChecksumValidation.WHEN_REQUIRED);
+        } else {
+            LOGGER.log(Level.INFO, "S3 client: standard AWS mode "
+                    + "(virtual-hosted-style, SDK default checksums)");
+        }
 
         if (endpoint != null && !endpoint.isEmpty()) {
             clientBuilder.endpointOverride(URI.create(endpoint));
