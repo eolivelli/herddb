@@ -598,7 +598,12 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                 }
                 return bytes;
             });
-        } catch (IllegalStateException e) {
+        } catch (RuntimeException e) {
+            // Broad catch: the loader delegates to the remote client, which can raise
+            // any unchecked exception on a wire failure. Wrapping as
+            // DataStorageManagerException keeps the method contract and lets
+            // LazyDataPage.get() route the error into a HerdDBInternalException
+            // that TableManager's defensive catches unwind (issue #181).
             throw new DataStorageManagerException(e.getMessage(), e);
         }
     }

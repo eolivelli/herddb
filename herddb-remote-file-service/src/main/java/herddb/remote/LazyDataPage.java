@@ -21,6 +21,7 @@
 package herddb.remote;
 
 import herddb.core.DataPage;
+import herddb.core.HerdDBInternalException;
 import herddb.core.TableManager;
 import herddb.model.Record;
 import herddb.remote.LazyDataPageFormat.FixedHeader;
@@ -195,8 +196,12 @@ public final class LazyDataPage extends DataPage {
      * {@link herddb.core.TableManager}) sees a runtime exception instead of a
      * checked {@code DataStorageManagerException}. Callers can unwrap via
      * {@link Throwable#getCause()}.
+     *
+     * <p>Extends {@link HerdDBInternalException} so TableManager's existing
+     * defensive catches unwind locks instead of letting it escape synchronously
+     * and leak the TableSpaceManager read stamp (issue #181).
      */
-    public static final class LazyValueFetchException extends RuntimeException {
+    public static final class LazyValueFetchException extends HerdDBInternalException {
         private static final long serialVersionUID = 1L;
 
         LazyValueFetchException(String message, Throwable cause) {
