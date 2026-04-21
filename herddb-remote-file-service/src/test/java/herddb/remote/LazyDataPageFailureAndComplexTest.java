@@ -245,13 +245,45 @@ public class LazyDataPageFailureAndComplexTest {
         }
     }
 
-    // NOTE: a symmetrical "UPDATE fails cleanly when value read fails" test
-    // is intentionally omitted — see issue #181. A remote value-fetch
-    // failure raised from inside TableManager during an UPDATE leaves a
-    // StampedLock held in TableSpaceManager, so DBManager.close() blocks
-    // indefinitely on Activator join. The same lock leak exists with the
-    // legacy eager readPage() path, so it is not a lazy-page regression;
-    // once #181 is fixed, add the symmetrical test here.
+    // Regression test for issue #181: a RuntimeException from a value
+    // fetch during an UPDATE used to leak the TableSpaceManager read stamp
+    // and hang DBManager.close(). The @Test timeout guards against that
+    // regression: without the LazyValueFetchException reclassification,
+    // the try-with-resources close of `Embedded` would block forever on
+    // TableSpaceManager.acquireWriteLock("closeTablespace").
+    @Test(timeout = 60_000)
+    public void updateFailsCleanlyWhenValueReadFails() throws Exception {
+        try (RemoteEnv env = new RemoteEnv(folder)) {
+        // Phase 1: populate + checkpoint with a normal client.
+        try (Embedded e = new Embedded(env)) {
+            createTablespace(e.manager, TS);
+            createIntStringTable(e.manager, TS, "t1");
+            for (int i = 0; i < 20; i++) {
+                RemoteTestUtils.executeUpdate(e.manager,
+                        "INSERT INTO " + TS + ".t1(id, n) VALUES(?, ?)",
+                        Arrays.asList(i, "name-" + i));
+            }
+            e.manager.checkpoint();
+        }
+        // Phase 2: reopen, inject value-read failures, attempt UPDATE.
+        try (Embedded e = new Embedded(env)) {
+            assertTrue(e.manager.waitForBootOfLocalTablespaces(10000));
+            e.client.failValueReads.set(true);
+            try {
+                RemoteTestUtils.executeUpdate(e.manager,
+                        "UPDATE " + TS + ".t1 SET n = ? WHERE id = ?",
+                        Arrays.asList("updated", 7));
+                fail("expected UPDATE to fail when the remote value read fails");
+            } catch (Exception expected) {
+                // Surface contains our simulated failure somewhere in the cause chain.
+                assertTrue("exception chain must contain simulated failure; got " + expected,
+                        containsCauseMessage(expected, "simulated remote read failure"));
+            }
+            // The try-with-resources close of `e` must complete within the
+            // @Test timeout; that is the actual regression check for #181.
+        }
+        }
+    }
 
     @Test
     public void retryAfterFailureSucceeds() throws Exception {
