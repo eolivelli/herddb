@@ -54,7 +54,10 @@ import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -131,6 +134,23 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private ExecutorService[] applyWorkers;
     private int applyParallelism;
     private volatile Throwable asyncError;
+
+    /**
+     * Single-thread executor that runs {@link #checkpointAndSaveWatermark()}
+     * off the tailer thread (issue #213). The tailer must never block on a
+     * Phase B Future.get(); instead it hands the checkpoint work to this
+     * executor via {@link #triggerCheckpointAsync()} and keeps dispatching
+     * entries to the apply-worker pool.
+     */
+    private ExecutorService checkpointExecutor;
+
+    /**
+     * Tracks the most recently submitted tailer-driven checkpoint so that
+     * {@link #triggerCheckpointAsync()} can coalesce new triggers while one
+     * is still running, and {@link #forceCheckpointAndSaveWatermark()} and
+     * {@link #close()} can await it.
+     */
+    private volatile Future<?> inflightCheckpoint;
 
     /**
      * Wall-clock time at which {@link #start()} finished, used by the
@@ -232,8 +252,29 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     /**
      * Exposes the checkpoint+watermark save path for tests and the cluster
      * E2E test that needs to force a checkpoint at a specific point in time.
+     *
+     * <p>Issue #213: tailer-driven checkpoints now run on a background
+     * executor. To preserve the post-condition callers rely on — "after this
+     * returns, a fresh checkpoint has completed and, if successful, the
+     * watermark has been persisted" — we first await any in-flight async
+     * checkpoint, then run a synchronous one on the caller thread.
      */
     public void forceCheckpointAndSaveWatermark() {
+        Future<?> inflight = this.inflightCheckpoint;
+        if (inflight != null) {
+            try {
+                inflight.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOGGER.log(Level.WARNING, "Interrupted awaiting in-flight checkpoint in forceCheckpointAndSaveWatermark");
+                return;
+            } catch (ExecutionException e) {
+                // The async task already logged the failure; we still run a
+                // fresh sync checkpoint below so the caller's post-condition
+                // is satisfied.
+                LOGGER.log(Level.FINE, "In-flight async checkpoint ended with failure", e.getCause());
+            }
+        }
         checkpointAndSaveWatermark();
     }
 
@@ -429,6 +470,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
         LOGGER.log(Level.INFO, "DML apply workers started, parallelism={0}, queueCapacity={1}",
                 new Object[]{applyParallelism, queueCapacity});
+
+        // Single-thread executor that runs tailer-driven checkpoints off the
+        // tailer thread (issue #213). Must be started before the tailer so
+        // triggerCheckpointAsync() can submit tasks as soon as the tailer
+        // starts processing entries.
+        checkpointExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "indexing-checkpoint");
+            t.setDaemon(true);
+            return t;
+        });
 
         // Validate instance identity
         if (numInstances < 1) {
@@ -657,11 +708,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             entriesSinceLastCheckpoint++;
 
             // Periodically force a checkpoint and then persist the watermark.
+            // The checkpoint runs on a dedicated thread (issue #213) so the
+            // tailer never blocks on Phase B Future.get() and the apply-worker
+            // pool keeps receiving entries throughout the checkpoint window.
             // The watermark is saved ONLY after all stores successfully
             // checkpoint — never at any other time. See
             // {@link WatermarkStore} for the save contract.
             if (entriesSinceLastCheckpoint >= watermarkCheckpointIntervalEntries) {
-                checkpointAndSaveWatermark();
+                triggerCheckpointAsync();
             }
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error processing entry at LSN " + lsn + ": " + entry, e);
@@ -716,6 +770,41 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         checkAsyncError();
     }
 
+    /**
+     * Called from the tailer thread when the watermark-checkpoint-interval
+     * threshold is reached. Hands the checkpoint off to
+     * {@link #checkpointExecutor} so the tailer returns immediately and keeps
+     * dispatching entries to the apply-worker pool while Phase B runs.
+     *
+     * <p>If a previous tailer-driven checkpoint is still running, the trigger
+     * is coalesced: {@code entriesSinceLastCheckpoint} is NOT reset, so the
+     * next call to {@code processEntry} will try again and fire as soon as
+     * the in-flight checkpoint completes. The {@code checkpointLock.tryLock}
+     * inside {@code PersistentVectorStore.doCheckpoint} already makes
+     * overlapping cycles a safe no-op, so at-most-one submission is purely a
+     * throughput optimisation.
+     */
+    private void triggerCheckpointAsync() {
+        Future<?> inflight = this.inflightCheckpoint;
+        if (inflight != null && !inflight.isDone()) {
+            LOGGER.log(Level.FINE,
+                    "Checkpoint trigger coalesced: previous tailer-driven checkpoint still running");
+            return;
+        }
+        if (checkpointExecutor == null || checkpointExecutor.isShutdown()) {
+            // Engine is closing or not fully started; skip silently.
+            return;
+        }
+        entriesSinceLastCheckpoint = 0;
+        try {
+            this.inflightCheckpoint = checkpointExecutor.submit(this::checkpointAndSaveWatermark);
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // Submitted during shutdown race — acceptable; the next tailer
+            // trigger (if the engine survives) will retry.
+            LOGGER.log(Level.FINE, "Checkpoint trigger rejected (executor shutting down)");
+        }
+    }
+
     private void checkAsyncError() {
         Throwable err = asyncError;
         if (err != null) {
@@ -755,6 +844,26 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     // package-private for testing
     void awaitPendingWorkForTest() {
         awaitPendingWork();
+    }
+
+    /**
+     * Invokes {@link #triggerCheckpointAsync()} (used by tests that want to
+     * exercise the async checkpoint path without driving the full
+     * {@code processEntry} code path).
+     */
+    // package-private for testing
+    void triggerCheckpointAsyncForTest() {
+        triggerCheckpointAsync();
+    }
+
+    /**
+     * Returns the currently tracked in-flight tailer-driven checkpoint
+     * {@link Future}, or {@code null} if none is tracked (used by tests to
+     * verify coalescing and shutdown semantics).
+     */
+    // package-private for testing
+    Future<?> getInflightCheckpointFutureForTest() {
+        return inflightCheckpoint;
     }
 
     /**
@@ -1804,6 +1913,28 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+
+        // Shut down the checkpoint executor BEFORE the apply workers so that
+        // any in-flight Phase B can complete and save the watermark. Doing
+        // this after the apply workers are shut down would cause the in-flight
+        // checkpoint's awaitPendingWork() barrier-submit to fail with
+        // RejectedExecutionException.
+        if (checkpointExecutor != null) {
+            checkpointExecutor.shutdown();
+            try {
+                if (!checkpointExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+                    LOGGER.log(Level.WARNING,
+                            "In-flight checkpoint did not complete within 30s of shutdown; forcing shutdownNow");
+                    checkpointExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                checkpointExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+            checkpointExecutor = null;
+            inflightCheckpoint = null;
+            LOGGER.info("Checkpoint executor shut down");
         }
 
         // Drain and shut down apply workers
