@@ -3036,6 +3036,14 @@ public class TableSpaceManager {
         return callbacksExecutor;
     }
 
+    /**
+     * Expose the DBManager-scoped checkpoint flush executor so TableManager can
+     * dispatch Phase-B page writes in parallel without reaching for DBManager directly.
+     */
+    public ExecutorService getCheckpointFlushExecutor() {
+        return dbmanager.getCheckpointFlushExecutor();
+    }
+
     @Override
     public String toString() {
         return "TableSpaceManager [nodeId=" + nodeId

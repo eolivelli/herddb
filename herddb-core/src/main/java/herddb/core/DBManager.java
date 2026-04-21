@@ -175,6 +175,15 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
     private Gauge<Integer> activeTablespacesGauge;
     private final ExecutorService followersThreadPool;
 
+    /**
+     * Dedicated pool used by {@code TableManager} checkpoint flush loops to
+     * dispatch data-page writes to remote storage in parallel. Kept separate
+     * from {@link #callbacksExecutor} so saturating the checkpoint path cannot
+     * starve commit callbacks (the metric this pool exists to protect).
+     * Sized via {@link ServerConfiguration#PROPERTY_CHECKPOINT_FLUSH_THREADS}.
+     */
+    private final ExecutorService checkpointFlushExecutor;
+
     public DBManager(
             String nodeId, MetadataStorageManager metadataStorageManager, DataStorageManager dataStorageManager,
             CommitLogManager commitLogManager, Path tmpDirectory, herddb.network.ServerHostData hostData
@@ -212,6 +221,27 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
         // todo: make it configurable, cached have some pitfalls under load
         this.followersThreadPool = Executors.newCachedThreadPool((Runnable r) -> new FastThreadLocalThread(
                 r, "herddb-worker-" + (hostData == null ? "local" : hostData.getHost() + ":" + hostData.getPort()) + "-" + r));
+        int checkpointFlushThreads = configuration.getInt(
+                ServerConfiguration.PROPERTY_CHECKPOINT_FLUSH_THREADS,
+                ServerConfiguration.PROPERTY_CHECKPOINT_FLUSH_THREADS_DEFAULT);
+        if (checkpointFlushThreads <= 0) {
+            // same escape hatch as callbacksExecutor: run flushes on the caller
+            // thread when tests/embedded users opt out of the pool.
+            this.checkpointFlushExecutor = MoreExecutors.newDirectExecutorService();
+        } else {
+            this.checkpointFlushExecutor = Executors.newFixedThreadPool(checkpointFlushThreads,
+                    new ThreadFactory() {
+                        private final AtomicLong count = new AtomicLong();
+
+                        @Override
+                        public Thread newThread(final Runnable r) {
+                            final String marker = hostData == null ? "local"
+                                    : hostData.getHost() + ":" + hostData.getPort();
+                            return new FastThreadLocalThread(r,
+                                    "db-checkpoint-flush-" + marker + "-" + count.incrementAndGet());
+                        }
+                    });
+        }
         this.recordSetFactory = dataStorageManager.createRecordSetFactory();
         this.metadataStorageManager = metadataStorageManager;
         this.dataStorageManager = dataStorageManager;
@@ -1003,11 +1033,13 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
         }
         mainStatsLogger.unregisterGauge("active_tablespaces", activeTablespacesGauge);
         callbacksExecutor.shutdownNow();
+        checkpointFlushExecutor.shutdownNow();
 
         // lastly give a chance to not "leak" even if not critical (ie not keep used instances after close())
         try {
             followersThreadPool.awaitTermination(1, SECONDS);
             callbacksExecutor.awaitTermination(1, SECONDS); // give a chance to not "leak" even if not critical
+            checkpointFlushExecutor.awaitTermination(1, SECONDS);
         } catch (final InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -1597,6 +1629,14 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
 
     public ExecutorService getCallbacksExecutor() {
         return callbacksExecutor;
+    }
+
+    /**
+     * Dedicated executor used by {@code TableManager} checkpoint flush loops
+     * to fan out page writes to remote storage in parallel.
+     */
+    public ExecutorService getCheckpointFlushExecutor() {
+        return checkpointFlushExecutor;
     }
 
     public ServerSidePreparedStatementCache getPreparedStatementsCache() {

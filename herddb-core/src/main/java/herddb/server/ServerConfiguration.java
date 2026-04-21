@@ -119,6 +119,18 @@ public final class ServerConfiguration {
     public static final int PROPERTY_CHECKPOINT_FLUSH_PARALLELISM_DEFAULT = 16;
 
     /**
+     * Thread pool size for the dedicated checkpoint-flush executor used by
+     * {@code TableManager} to fan out Phase-B data page writes to remote
+     * storage in parallel. Kept separate from the shared
+     * {@link #PROPERTY_ASYNC_WORKER_THREADS} pool (which runs commit callbacks)
+     * so a slow checkpoint flush cannot starve commit latency — which is the
+     * metric this pool exists to protect.
+     */
+    public static final String PROPERTY_CHECKPOINT_FLUSH_THREADS =
+            "server.checkpoint.flush.threads";
+    public static final int PROPERTY_CHECKPOINT_FLUSH_THREADS_DEFAULT = 16;
+
+    /**
      * When true, the leader publishes checkpoint metadata to remote storage (S3)
      * so that shared-storage read replicas can consume it.
      */
