@@ -56,6 +56,14 @@ public class BookKeeperMainWrapper implements AutoCloseable {
     static final String PROPERTY_HTTP_PORT = "httpServerPort";
     static final int DEFAULT_HTTP_PORT = 8000;
 
+    /**
+     * Default bookie {@code zkTimeout} applied by the HerdDB wrapper. Overrides
+     * BookKeeper's built-in 10s default so a GC pause or a transient ZK leader
+     * election doesn't drop the bookie's ZK session. 40s matches the HerdDB-wide
+     * ZK session timeout default.
+     */
+    static final int DEFAULT_ZK_TIMEOUT_MS = 40_000;
+
     private final Properties configuration;
     private final PidFileLocker pidFileLocker;
     private EmbeddedServer embeddedServer;
@@ -208,6 +216,7 @@ public class BookKeeperMainWrapper implements AutoCloseable {
         // Core settings
         String zkServers = configuration.getProperty("zkServers", "localhost:2181");
         conf.setZkServers(zkServers);
+        conf.setZkTimeout(DEFAULT_ZK_TIMEOUT_MS);
         conf.setZkLedgersRootPath(configuration.getProperty("zkLedgersRootPath", "/ledgers"));
 
         int port = Integer.parseInt(configuration.getProperty("bookiePort", "3181"));

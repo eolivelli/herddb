@@ -66,6 +66,15 @@ public class BookkeeperCommitLogManager extends CommitLogManager {
      */
     static final int DEFAULT_ADD_ENTRY_QUORUM_TIMEOUT_SEC = 60;
 
+    /**
+     * Default BK client {@code zkTimeout} applied by HerdDB. Overrides BookKeeper's
+     * built-in 10s default. 40s matches the HerdDB-wide ZK session timeout default
+     * ({@link ServerConfiguration#PROPERTY_ZOOKEEPER_SESSIONTIMEOUT_DEFAULT}) and
+     * gives the BK client enough headroom to ride out a GC pause or a transient ZK
+     * leader election without dropping its session.
+     */
+    static final int DEFAULT_ZK_TIMEOUT_MS = 40_000;
+
     private final ZookeeperMetadataStorageManager metadataStorageManager;
     private int ensemble = 1;
     private int writeQuorumSize = 1;
@@ -88,7 +97,7 @@ public class BookkeeperCommitLogManager extends CommitLogManager {
 
         config.setThrottleValue(0);
         config.setZkServers(metadataStorageManager.getZkAddress());
-        config.setZkTimeout(metadataStorageManager.getZkSessionTimeout());
+        config.setZkTimeout(DEFAULT_ZK_TIMEOUT_MS);
         config.setZkLedgersRootPath(serverConfiguration.getString(ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH,
                 ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT));
         config.setEnableParallelRecoveryRead(true);
