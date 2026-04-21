@@ -92,7 +92,6 @@
         <!-- needed in tests for TLS certificate autogeneration on jdk-15+ -->
         <libs.bouncycastle>1.70</libs.bouncycastle>
         <libs.calcite>1.40.0</libs.calcite>
-        <libs.commonslang>2.6</libs.commonslang>
         <libs.jackson.mapper>2.14.1</libs.jackson.mapper>
         <libs.zookeeper>3.9.3</libs.zookeeper>
         <libs.jsqlparser>3.2</libs.jsqlparser>
@@ -145,11 +144,6 @@
 
     <dependencyManagement>
         <dependencies>
-            <dependency>
-                <groupId>commons-lang</groupId>
-                <artifactId>commons-lang</artifactId>
-                <version>${libs.commonslang}</version>
-            </dependency>
             <dependency>
                 <groupId>io.netty</groupId>
                 <artifactId>netty-transport</artifactId>
