@@ -61,7 +61,6 @@ import java.util.function.Function;
 import java.util.function.LongConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import javax.annotation.Nullable;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.apache.bookkeeper.stats.StatsLogger;
 
@@ -126,21 +125,21 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     private final LazyValueCache lazyValueCache;
 
     /**
-     * Optional shared multipart-block cache used by {@link RemoteRandomAccessReader}
-     * on the vector-index search path. Installed by the indexing-service engine
-     * at startup via {@link #setSegmentBlockCache}. May be {@code null} (no
-     * caching) for non-indexing callers.
+     * Shared multipart-block cache used by {@link RemoteRandomAccessReader}
+     * on the vector-index search path. Starts as
+     * {@link SegmentBlockCache#disabled()} (pass-through, no caching) and is
+     * replaced by the indexing-service engine at startup via
+     * {@link #setSegmentBlockCache}. Never {@code null}.
      */
-    @Nullable
-    private volatile SegmentBlockCache segmentBlockCache;
+    private volatile SegmentBlockCache segmentBlockCache = SegmentBlockCache.disabled();
 
     /**
-     * Optional stats logger forwarded to every {@link RemoteRandomAccessReader}
-     * created by {@link #multipartIndexReaderSupplier}, wired alongside the
-     * block cache. Drives the {@code rfs_client_read_*} counters.
+     * Stats logger forwarded to every {@link RemoteRandomAccessReader}
+     * created by {@link #multipartIndexReaderSupplier}. Starts as
+     * {@link NullStatsLogger#INSTANCE} and is replaced by the indexing-service
+     * engine alongside the block cache. Never {@code null}.
      */
-    @Nullable
-    private volatile StatsLogger readerStatsLogger;
+    private volatile StatsLogger readerStatsLogger = NullStatsLogger.INSTANCE;
 
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
@@ -172,25 +171,25 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     }
 
     /**
-     * Installs an optional shared {@link SegmentBlockCache} (and optional
-     * stats logger) to be used by every {@link RemoteRandomAccessReader}
-     * returned from {@link #multipartIndexReaderSupplier}. Intended to be
-     * called once at startup, before any vector-index segment is loaded.
-     * Passing {@code null} disables caching for subsequently-created readers.
+     * Installs the shared {@link SegmentBlockCache} and stats logger to be
+     * used by every {@link RemoteRandomAccessReader} returned from
+     * {@link #multipartIndexReaderSupplier}. Intended to be called once at
+     * startup, before any vector-index segment is loaded. Pass
+     * {@link SegmentBlockCache#disabled()} and/or
+     * {@link NullStatsLogger#INSTANCE} to disable either feature without
+     * reintroducing null checks on the hot path.
      */
-    public void setSegmentBlockCache(@Nullable SegmentBlockCache cache,
-                                     @Nullable StatsLogger statsLogger) {
-        this.segmentBlockCache = cache;
-        this.readerStatsLogger = statsLogger;
-        if (cache != null) {
-            LOGGER.log(Level.INFO,
-                    "SegmentBlockCache installed: active={0}, maxBytes={1}",
-                    new Object[]{cache.isActive(), cache.maxBytes()});
-        }
+    public void setSegmentBlockCache(SegmentBlockCache cache, StatsLogger statsLogger) {
+        this.segmentBlockCache = java.util.Objects.requireNonNull(cache,
+                "cache (use SegmentBlockCache.disabled() to disable)");
+        this.readerStatsLogger = java.util.Objects.requireNonNull(statsLogger,
+                "statsLogger (use NullStatsLogger.INSTANCE to disable)");
+        LOGGER.log(Level.INFO,
+                "SegmentBlockCache installed: active={0}, maxBytes={1}",
+                new Object[]{cache.isActive(), cache.maxBytes()});
     }
 
-    /** Visible for indexing-service gauges. */
-    @Nullable
+    /** Visible for indexing-service gauges. Never {@code null}. */
     public SegmentBlockCache getSegmentBlockCache() {
         return segmentBlockCache;
     }
@@ -764,10 +763,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         }
         // Drop any cached blocks for this path so a future segment rewritten
         // under the same logical path does not serve stale bytes.
-        SegmentBlockCache cache = this.segmentBlockCache;
-        if (cache != null) {
-            cache.invalidatePath(logicalPath);
-        }
+        segmentBlockCache.invalidatePath(logicalPath);
     }
 
     // -------------------------------------------------------------------------
@@ -1023,10 +1019,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         pendingDataDeletions.keySet().removeIf(k -> k.startsWith(prefix));
         pendingIndexDeletions.keySet().removeIf(k -> k.startsWith(prefix));
         lazyValueCache.invalidateForTablespace(tableSpace);
-        SegmentBlockCache cache = this.segmentBlockCache;
-        if (cache != null) {
-            cache.invalidatePrefix(prefix);
-        }
+        segmentBlockCache.invalidatePrefix(prefix);
     }
 
     @Override

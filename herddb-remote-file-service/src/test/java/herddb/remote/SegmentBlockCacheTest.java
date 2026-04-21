@@ -24,10 +24,11 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.HashSet;
@@ -44,18 +45,29 @@ import org.junit.Test;
  * Covers the {@link SegmentBlockCache} behavioural contract inherited from
  * the deleted {@code SharedSegmentPageCache}: hits vs misses, concurrent
  * single-flight loading, byte-weighted eviction, path invalidation, stats
- * accessors, and pass-through mode when the cache is disabled.
+ * accessors, and pass-through mode via {@link SegmentBlockCache#disabled()}.
  */
 public class SegmentBlockCacheTest {
 
     private static final int BLOCK = 1024;
 
-    private static byte[] fill(int len, byte value) {
-        byte[] b = new byte[len];
+    /** Allocates a pooled direct buffer with the given byte pattern. */
+    private static ByteBuf direct(int len, byte value) {
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(len);
         for (int i = 0; i < len; i++) {
-            b[i] = value;
+            buf.writeByte(value);
         }
-        return b;
+        return buf;
+    }
+
+    private static byte[] readAllAndRelease(ByteBuf buf) {
+        try {
+            byte[] out = new byte[buf.readableBytes()];
+            buf.getBytes(buf.readerIndex(), out);
+            return out;
+        } finally {
+            buf.release();
+        }
     }
 
     @Test
@@ -64,14 +76,20 @@ public class SegmentBlockCacheTest {
         AtomicInteger loads = new AtomicInteger();
         SegmentBlockCache.BlockLoader loader = (p, off, len) -> {
             loads.incrementAndGet();
-            return fill(BLOCK, (byte) 0x42);
+            return direct(BLOCK, (byte) 0x42);
         };
 
-        byte[] first = cache.getBlock("seg", 0L, BLOCK, loader);
-        byte[] second = cache.getBlock("seg", 0L, BLOCK, loader);
+        ByteBuf first = cache.getBlock("seg", 0L, BLOCK, loader);
+        ByteBuf second = cache.getBlock("seg", 0L, BLOCK, loader);
 
-        assertEquals("loader invoked exactly once", 1, loads.get());
-        assertSame("cache hit returns same array", first, second);
+        try {
+            assertEquals("loader invoked exactly once", 1, loads.get());
+            assertEquals("two retained slices have identical content",
+                    first.getByte(0), second.getByte(0));
+        } finally {
+            first.release();
+            second.release();
+        }
         assertEquals(1L, cache.hitCount());
         assertEquals(1L, cache.missCount());
         assertEquals(1L, cache.loadSuccessCount());
@@ -80,10 +98,10 @@ public class SegmentBlockCacheTest {
     @Test
     public void differentOffsetsProduceDifferentEntries() throws Exception {
         SegmentBlockCache cache = new SegmentBlockCache(1_000_000);
-        SegmentBlockCache.BlockLoader loader = (p, off, len) -> fill(BLOCK, (byte) off);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) off);
 
-        byte[] b0 = cache.getBlock("seg", 0L, BLOCK, loader);
-        byte[] b1 = cache.getBlock("seg", BLOCK, BLOCK, loader);
+        byte[] b0 = readAllAndRelease(cache.getBlock("seg", 0L, BLOCK, loader));
+        byte[] b1 = readAllAndRelease(cache.getBlock("seg", BLOCK, BLOCK, loader));
 
         assertEquals((byte) 0, b0[0]);
         assertEquals((byte) BLOCK, b1[0]);
@@ -106,18 +124,23 @@ public class SegmentBlockCacheTest {
                 Thread.currentThread().interrupt();
                 throw new IOException("interrupted", e);
             }
-            return fill(BLOCK, (byte) 0xA5);
+            return direct(BLOCK, (byte) 0xA5);
         };
 
         ExecutorService pool = Executors.newFixedThreadPool(32);
         try {
-            Set<byte[]> observed = Collections.newSetFromMap(new ConcurrentHashMap<>());
+            Set<Byte> observedFirstByte = Collections.newSetFromMap(new ConcurrentHashMap<>());
             CountDownLatch started = new CountDownLatch(32);
             for (int i = 0; i < 32; i++) {
                 pool.submit(() -> {
                     started.countDown();
                     try {
-                        observed.add(cache.getBlock("seg", 0L, BLOCK, loader));
+                        ByteBuf slice = cache.getBlock("seg", 0L, BLOCK, loader);
+                        try {
+                            observedFirstByte.add(slice.getByte(0));
+                        } finally {
+                            slice.release();
+                        }
                     } catch (IOException e) {
                         throw new RuntimeException(e);
                     }
@@ -131,7 +154,7 @@ public class SegmentBlockCacheTest {
             assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
             assertEquals("loader invoked once despite 32 concurrent misses",
                     1, loaderCalls.get());
-            assertEquals("all waiters see the identical cached byte[]", 1, observed.size());
+            assertEquals("all waiters see identical bytes", 1, observedFirstByte.size());
         } finally {
             pool.shutdownNow();
         }
@@ -141,10 +164,10 @@ public class SegmentBlockCacheTest {
     public void byteWeightedEvictionRespectsBudget() throws Exception {
         // Budget = 4 KB, entries = 1 KB each. Loading 20 entries forces eviction.
         SegmentBlockCache cache = new SegmentBlockCache(4L * BLOCK);
-        SegmentBlockCache.BlockLoader loader = (p, off, len) -> fill(BLOCK, (byte) 1);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 1);
 
         for (int i = 0; i < 20; i++) {
-            cache.getBlock("seg", (long) i * BLOCK, BLOCK, loader);
+            cache.getBlock("seg", (long) i * BLOCK, BLOCK, loader).release();
         }
         cache.cleanUp();
 
@@ -157,10 +180,10 @@ public class SegmentBlockCacheTest {
     @Test
     public void invalidatePathDropsOnlyMatchingEntries() throws Exception {
         SegmentBlockCache cache = new SegmentBlockCache(1_000_000);
-        SegmentBlockCache.BlockLoader loader = (p, off, len) -> fill(BLOCK, (byte) 0);
-        cache.getBlock("segA", 0L, BLOCK, loader);
-        cache.getBlock("segA", BLOCK, BLOCK, loader);
-        cache.getBlock("segB", 0L, BLOCK, loader);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 0);
+        cache.getBlock("segA", 0L, BLOCK, loader).release();
+        cache.getBlock("segA", BLOCK, BLOCK, loader).release();
+        cache.getBlock("segB", 0L, BLOCK, loader).release();
 
         cache.invalidatePath("segA");
 
@@ -172,10 +195,10 @@ public class SegmentBlockCacheTest {
     @Test
     public void invalidatePrefixDropsAllEntriesUnderPrefix() throws Exception {
         SegmentBlockCache cache = new SegmentBlockCache(1_000_000);
-        SegmentBlockCache.BlockLoader loader = (p, off, len) -> fill(BLOCK, (byte) 0);
-        cache.getBlock("ts1/idx/a", 0L, BLOCK, loader);
-        cache.getBlock("ts1/idx/b", 0L, BLOCK, loader);
-        cache.getBlock("ts2/idx/a", 0L, BLOCK, loader);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 0);
+        cache.getBlock("ts1/idx/a", 0L, BLOCK, loader).release();
+        cache.getBlock("ts1/idx/b", 0L, BLOCK, loader).release();
+        cache.getBlock("ts2/idx/a", 0L, BLOCK, loader).release();
 
         cache.invalidatePrefix("ts1/");
 
@@ -193,7 +216,7 @@ public class SegmentBlockCacheTest {
             if (call == 1) {
                 throw new IOException("transient");
             }
-            return fill(BLOCK, (byte) 1);
+            return direct(BLOCK, (byte) 1);
         };
 
         IOException thrown = assertThrows(IOException.class,
@@ -203,8 +226,12 @@ public class SegmentBlockCacheTest {
         // Subsequent call must not surface the previous failure: Caffeine does
         // not memoize negative results, so the loader runs a second time and
         // succeeds.
-        byte[] value = cache.getBlock("seg", 0L, BLOCK, failingThenOk);
-        assertEquals((byte) 1, value[0]);
+        ByteBuf value = cache.getBlock("seg", 0L, BLOCK, failingThenOk);
+        try {
+            assertEquals((byte) 1, value.getByte(0));
+        } finally {
+            value.release();
+        }
         assertEquals("loader invoked twice: one failure + one success", 2, calls.get());
     }
 
@@ -219,18 +246,18 @@ public class SegmentBlockCacheTest {
     }
 
     @Test
-    public void zeroMaxBytesBypassesCache() throws Exception {
-        SegmentBlockCache cache = new SegmentBlockCache(0);
-        assertFalse("cache disabled", cache.isActive());
+    public void disabledSingletonBypassesCache() throws Exception {
+        SegmentBlockCache cache = SegmentBlockCache.disabled();
+        assertFalse("disabled singleton is inactive", cache.isActive());
 
         AtomicInteger calls = new AtomicInteger();
         SegmentBlockCache.BlockLoader loader = (p, off, len) -> {
             calls.incrementAndGet();
-            return fill(BLOCK, (byte) 7);
+            return direct(BLOCK, (byte) 7);
         };
 
-        byte[] a = cache.getBlock("seg", 0L, BLOCK, loader);
-        byte[] b = cache.getBlock("seg", 0L, BLOCK, loader);
+        byte[] a = readAllAndRelease(cache.getBlock("seg", 0L, BLOCK, loader));
+        byte[] b = readAllAndRelease(cache.getBlock("seg", 0L, BLOCK, loader));
         assertNotNull(a);
         assertNotNull(b);
         assertArrayEquals(a, b);
@@ -238,9 +265,13 @@ public class SegmentBlockCacheTest {
                 2, calls.get());
         assertEquals(0L, cache.hitCount());
         assertEquals(0L, cache.missCount());
-        assertEquals("passthrough loads tracked via fallback counter",
-                2L, cache.loadSuccessCount());
         assertEquals(0L, cache.weightedSize());
+    }
+
+    @Test
+    public void disabledSingletonIsShared() {
+        assertTrue("disabled() is a singleton",
+                SegmentBlockCache.disabled() == SegmentBlockCache.disabled());
     }
 
     @Test
@@ -249,13 +280,13 @@ public class SegmentBlockCacheTest {
         AtomicInteger calls = new AtomicInteger();
         SegmentBlockCache.BlockLoader loader = (p, off, len) -> {
             calls.incrementAndGet();
-            return fill(BLOCK, (byte) 0);
+            return direct(BLOCK, (byte) 0);
         };
 
         assertFalse(cache.containsBlock("seg", 0L, BLOCK));
         assertEquals("containsBlock must not call the loader", 0, calls.get());
 
-        cache.getBlock("seg", 0L, BLOCK, loader);
+        cache.getBlock("seg", 0L, BLOCK, loader).release();
         assertTrue(cache.containsBlock("seg", 0L, BLOCK));
     }
 
@@ -275,9 +306,9 @@ public class SegmentBlockCacheTest {
     @Test
     public void clearRemovesAllEntries() throws Exception {
         SegmentBlockCache cache = new SegmentBlockCache(1_000_000);
-        SegmentBlockCache.BlockLoader loader = (p, off, len) -> fill(BLOCK, (byte) 0);
-        cache.getBlock("segA", 0L, BLOCK, loader);
-        cache.getBlock("segB", 0L, BLOCK, loader);
+        SegmentBlockCache.BlockLoader loader = (p, off, len) -> direct(BLOCK, (byte) 0);
+        cache.getBlock("segA", 0L, BLOCK, loader).release();
+        cache.getBlock("segB", 0L, BLOCK, loader).release();
         assertEquals(2L, cache.estimatedSize());
         cache.clear();
         cache.cleanUp();

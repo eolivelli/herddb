@@ -23,13 +23,14 @@ package herddb.remote;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 import io.netty.util.ReferenceCountUtil;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
 import org.apache.bookkeeper.stats.Counter;
+import org.apache.bookkeeper.stats.NullStatsLogger;
 import org.apache.bookkeeper.stats.OpStatsLogger;
 import org.apache.bookkeeper.stats.StatsLogger;
 
@@ -61,13 +62,9 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
     private final long totalSize;
     private final int writeBlockSize;
     private final int bufferSize;
-    @Nullable
     private final OpStatsLogger clientReadLatency;
-    @Nullable
     private final Counter clientReadBytes;
-    @Nullable
     private final Counter clientReadRequests;
-    @Nullable
     private final SegmentBlockCache blockCache;
 
     private long position;
@@ -84,24 +81,30 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
 
     /**
      * Full constructor with separate write block size (routing / chunk lookup),
-     * read buffer size (internal window for sequential reads), optional stats
-     * logger, and optional shared {@link SegmentBlockCache}.
+     * read buffer size (internal window for sequential reads), stats logger,
+     * and shared {@link SegmentBlockCache}.
+     *
+     * <p>Both {@code statsLogger} and {@code blockCache} are mandatory and
+     * non-null. Pass {@link NullStatsLogger#INSTANCE} to disable metrics and
+     * {@link SegmentBlockCache#disabled()} to disable caching — this keeps
+     * the hot path free of null checks.
      *
      * @param writeBlockSize the multipart chunk size used by the writer; must
      *                       be a multiple of the effective buffer size so that
      *                       a buffer window never crosses a chunk boundary
      * @param bufferSize     the read-side buffer window; capped to
      *                       {@code writeBlockSize} if larger
-     * @param statsLogger    optional stats logger for client-side metrics (nullable)
-     * @param blockCache     optional shared block cache; when non-null reads
-     *                       go through the cache and per-request counters
-     *                       (hits/misses) are recorded into the current
-     *                       {@link VectorSearchRequestContext}
+     * @param statsLogger    stats logger for client-side metrics; use
+     *                       {@link NullStatsLogger#INSTANCE} to disable
+     * @param blockCache     shared block cache; use
+     *                       {@link SegmentBlockCache#disabled()} to disable
      */
     public RemoteRandomAccessReader(RemoteFileServiceClient client, String path,
                                     long totalSize, int writeBlockSize, int bufferSize,
-                                    @Nullable StatsLogger statsLogger,
-                                    @Nullable SegmentBlockCache blockCache) {
+                                    StatsLogger statsLogger,
+                                    SegmentBlockCache blockCache) {
+        Objects.requireNonNull(statsLogger, "statsLogger (use NullStatsLogger.INSTANCE to disable)");
+        Objects.requireNonNull(blockCache, "blockCache (use SegmentBlockCache.disabled() to disable)");
         if (writeBlockSize <= 0) {
             throw new IllegalArgumentException("writeBlockSize must be > 0, got " + writeBlockSize);
         }
@@ -121,25 +124,23 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         this.bufferSize = effective;
         this.blockCache = blockCache;
 
-        if (statsLogger != null) {
-            StatsLogger clientScope = statsLogger.scope("rfs").scope("client");
-            this.clientReadLatency = clientScope.getOpStatsLogger("read_latency");
-            this.clientReadBytes = clientScope.getCounter("read_bytes");
-            this.clientReadRequests = clientScope.getCounter("read_requests");
-        } else {
-            this.clientReadLatency = null;
-            this.clientReadBytes = null;
-            this.clientReadRequests = null;
-        }
+        StatsLogger clientScope = statsLogger.scope("rfs").scope("client");
+        this.clientReadLatency = clientScope.getOpStatsLogger("read_latency");
+        this.clientReadBytes = clientScope.getCounter("read_bytes");
+        this.clientReadRequests = clientScope.getCounter("read_requests");
     }
 
     /**
-     * Convenience constructor without a block cache.
+     * Convenience constructor without a block cache (uses
+     * {@link SegmentBlockCache#disabled()}). A {@code null} stats logger is
+     * normalised to {@link NullStatsLogger#INSTANCE}.
      */
     public RemoteRandomAccessReader(RemoteFileServiceClient client, String path,
                                     long totalSize, int writeBlockSize, int bufferSize,
                                     @Nullable StatsLogger statsLogger) {
-        this(client, path, totalSize, writeBlockSize, bufferSize, statsLogger, null);
+        this(client, path, totalSize, writeBlockSize, bufferSize,
+                statsLogger != null ? statsLogger : NullStatsLogger.INSTANCE,
+                SegmentBlockCache.disabled());
     }
 
     /**
@@ -150,16 +151,19 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
     public RemoteRandomAccessReader(RemoteFileServiceClient client, String path,
                                     long totalSize, int blockSize,
                                     @Nullable StatsLogger statsLogger) {
-        this(client, path, totalSize, blockSize, blockSize, statsLogger, null);
+        this(client, path, totalSize, blockSize, blockSize,
+                statsLogger != null ? statsLogger : NullStatsLogger.INSTANCE,
+                SegmentBlockCache.disabled());
     }
 
     /**
-     * Convenience constructor without stats logging (backward compatibility).
-     * Equivalent to {@code RemoteRandomAccessReader(client, path, totalSize, blockSize, blockSize, null)}.
+     * Convenience constructor without stats logging or caching — suitable for
+     * tests and simple callers.
      */
     public RemoteRandomAccessReader(RemoteFileServiceClient client, String path,
                                     long totalSize, int blockSize) {
-        this(client, path, totalSize, blockSize, blockSize, null, null);
+        this(client, path, totalSize, blockSize, blockSize,
+                NullStatsLogger.INSTANCE, SegmentBlockCache.disabled());
     }
 
     @Override
@@ -297,73 +301,35 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
             throw new IOException("Read past end of file: position=" + position
                     + " totalSize=" + totalSize);
         }
-        final ByteBuf data;
-        final long elapsedNanos;
-        if (blockCache != null && blockCache.isActive()) {
-            // Decide hit vs miss *before* calling getBlock so the counter
-            // reflects whether the bytes came from memory or from a gRPC call.
-            VectorSearchRequestContext ctx = VectorSearchRequestContext.current();
-            boolean wasCached = blockCache.containsBlock(path, bufferOffset, bufferSize);
-            long startNanos = System.nanoTime();
-            byte[] bytes;
-            try {
-                bytes = blockCache.getBlock(path, bufferOffset, bufferSize,
-                        (p, off, len) -> fetchBytesFromRemote(p, off, len, bufferIndex));
-            } catch (IOException e) {
-                if (ctx != null && !wasCached) {
-                    ctx.recordCacheMiss();
-                }
-                throw e;
-            }
-            elapsedNanos = System.nanoTime() - startNanos;
-            if (ctx != null) {
-                if (wasCached) {
-                    ctx.recordCacheHit();
-                } else {
-                    ctx.recordCacheMiss();
-                }
-                // Even a cache hit represents one "logical read for a search",
-                // so count it in the per-request readFileRange accumulator.
-                ctx.recordReadFileRange(requestLength, elapsedNanos);
-            }
-            data = Unpooled.wrappedBuffer(bytes, 0, requestLength);
-        } else {
-            long startNanos = System.nanoTime();
-            ByteBuf fetched;
-            try {
-                fetched = client.readFileRangeAsByteBuf(path, bufferOffset, requestLength, writeBlockSize);
-            } catch (RuntimeException e) {
-                elapsedNanos = System.nanoTime() - startNanos;
-                if (clientReadLatency != null) {
-                    clientReadLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
-                }
-                throw e;
-            }
-            elapsedNanos = System.nanoTime() - startNanos;
-            if (fetched == null) {
-                if (clientReadLatency != null) {
-                    clientReadLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
-                }
-                throw new IOException("Block not found: path=" + path + " bufferIndex=" + bufferIndex);
-            }
-            if (clientReadRequests != null) {
-                clientReadRequests.inc();
-            }
-            if (clientReadBytes != null) {
-                clientReadBytes.addCount(requestLength);
-            }
-            if (clientReadLatency != null) {
-                clientReadLatency.registerSuccessfulEvent(elapsedNanos, TimeUnit.NANOSECONDS);
-            }
-            VectorSearchRequestContext ctx = VectorSearchRequestContext.current();
-            if (ctx != null) {
-                // No cache configured: every read is a miss from the request's POV.
+        // Decide hit vs miss *before* calling getBlock so the per-request
+        // counter reflects whether the bytes came from memory or from gRPC.
+        // With SegmentBlockCache.disabled() containsBlock always returns
+        // false, which correctly attributes every read as a miss.
+        VectorSearchRequestContext ctx = VectorSearchRequestContext.current();
+        boolean wasCached = blockCache.containsBlock(path, bufferOffset, bufferSize);
+        long startNanos = System.nanoTime();
+        ByteBuf data;
+        try {
+            data = blockCache.getBlock(path, bufferOffset, bufferSize,
+                    (p, off, len) -> fetchBlockFromRemote(p, off, len, bufferIndex));
+        } catch (IOException e) {
+            if (ctx != null && !wasCached) {
                 ctx.recordCacheMiss();
-                ctx.recordReadFileRange(requestLength, elapsedNanos);
             }
-            data = fetched;
+            throw e;
         }
-        // Release the previously cached block (if any) before reassigning.
+        long elapsedNanos = System.nanoTime() - startNanos;
+        if (ctx != null) {
+            if (wasCached) {
+                ctx.recordCacheHit();
+            } else {
+                ctx.recordCacheMiss();
+            }
+            // Even a cache hit represents one "logical read for a search",
+            // so count it in the per-request readFileRange accumulator.
+            ctx.recordReadFileRange(requestLength, elapsedNanos);
+        }
+        // Release the previously cached slice (if any) before reassigning.
         if (blockBuffer != null) {
             ReferenceCountUtil.safeRelease(blockBuffer);
         }
@@ -374,15 +340,15 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
     /**
      * Loader callback invoked by {@link SegmentBlockCache} on a miss. Performs
      * the actual {@code readFileRange} gRPC call, updates the client-side
-     * counters ({@code rfs_client_read_*}), and returns a fresh heap-owned
-     * copy of the bytes so that the cache can own them independently of Netty
-     * pooling.
+     * counters ({@code rfs_client_read_*}), and returns a fresh pooled direct
+     * {@link ByteBuf} that the cache (or, in pass-through mode, the caller)
+     * takes ownership of.
      *
      * <p>The {@code len} argument is the nominal block size used for cache
      * keying; at end-of-file the actual fetch is clamped to the remaining
      * bytes so we don't request past {@link #totalSize}.
      */
-    private byte[] fetchBytesFromRemote(String p, long off, int len, long bufferIndex)
+    private ByteBuf fetchBlockFromRemote(String p, long off, int len, long bufferIndex)
             throws IOException {
         int actualLength = (int) Math.min((long) len, totalSize - off);
         if (actualLength <= 0) {
@@ -394,37 +360,19 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
             fetched = client.readFileRangeAsByteBuf(p, off, actualLength, writeBlockSize);
         } catch (RuntimeException e) {
             long elapsedNanos = System.nanoTime() - startNanos;
-            if (clientReadLatency != null) {
-                clientReadLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
-            }
+            clientReadLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
             throw new IOException("readFileRange failed: path=" + p + " offset=" + off
                     + " length=" + actualLength, e);
         }
         long elapsedNanos = System.nanoTime() - startNanos;
         if (fetched == null) {
-            if (clientReadLatency != null) {
-                clientReadLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
-            }
+            clientReadLatency.registerFailedEvent(elapsedNanos, TimeUnit.NANOSECONDS);
             throw new IOException("Block not found: path=" + p + " bufferIndex=" + bufferIndex);
         }
-        try {
-            if (clientReadRequests != null) {
-                clientReadRequests.inc();
-            }
-            if (clientReadBytes != null) {
-                clientReadBytes.addCount(fetched.readableBytes());
-            }
-            if (clientReadLatency != null) {
-                clientReadLatency.registerSuccessfulEvent(elapsedNanos, TimeUnit.NANOSECONDS);
-            }
-            // Copy out into a byte[] so the cache owns the bytes; release the
-            // pooled netty buffer immediately.
-            byte[] copy = new byte[fetched.readableBytes()];
-            fetched.getBytes(fetched.readerIndex(), copy);
-            return copy;
-        } finally {
-            ReferenceCountUtil.safeRelease(fetched);
-        }
+        clientReadRequests.inc();
+        clientReadBytes.addCount(fetched.readableBytes());
+        clientReadLatency.registerSuccessfulEvent(elapsedNanos, TimeUnit.NANOSECONDS);
+        return fetched;
     }
 
     /**
@@ -438,31 +386,35 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         private final long totalSize;
         private final int writeBlockSize;
         private final int bufferSize;
-        @Nullable
         private final StatsLogger statsLogger;
-        @Nullable
         private final SegmentBlockCache blockCache;
 
         public Supplier(RemoteFileServiceClient client, String path,
                         long totalSize, int writeBlockSize, int bufferSize,
-                        @Nullable StatsLogger statsLogger,
-                        @Nullable SegmentBlockCache blockCache) {
+                        StatsLogger statsLogger,
+                        SegmentBlockCache blockCache) {
             this.client = client;
             this.path = path;
             this.totalSize = totalSize;
             this.writeBlockSize = writeBlockSize;
             this.bufferSize = bufferSize;
-            this.statsLogger = statsLogger;
-            this.blockCache = blockCache;
+            this.statsLogger = Objects.requireNonNull(statsLogger,
+                    "statsLogger (use NullStatsLogger.INSTANCE to disable)");
+            this.blockCache = Objects.requireNonNull(blockCache,
+                    "blockCache (use SegmentBlockCache.disabled() to disable)");
         }
 
         /**
-         * Convenience constructor without a block cache.
+         * Convenience constructor without a block cache (uses
+         * {@link SegmentBlockCache#disabled()}). {@code null} stats logger is
+         * normalised to {@link NullStatsLogger#INSTANCE}.
          */
         public Supplier(RemoteFileServiceClient client, String path,
                         long totalSize, int writeBlockSize, int bufferSize,
                         @Nullable StatsLogger statsLogger) {
-            this(client, path, totalSize, writeBlockSize, bufferSize, statsLogger, null);
+            this(client, path, totalSize, writeBlockSize, bufferSize,
+                    statsLogger != null ? statsLogger : NullStatsLogger.INSTANCE,
+                    SegmentBlockCache.disabled());
         }
 
         /**
@@ -472,15 +424,18 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
         public Supplier(RemoteFileServiceClient client, String path,
                         long totalSize, int blockSize,
                         @Nullable StatsLogger statsLogger) {
-            this(client, path, totalSize, blockSize, blockSize, statsLogger, null);
+            this(client, path, totalSize, blockSize, blockSize,
+                    statsLogger != null ? statsLogger : NullStatsLogger.INSTANCE,
+                    SegmentBlockCache.disabled());
         }
 
         /**
-         * Convenience constructor without stats logging (backward compatibility).
+         * Convenience constructor without stats logging or caching.
          */
         public Supplier(RemoteFileServiceClient client, String path,
                         long totalSize, int blockSize) {
-            this(client, path, totalSize, blockSize, blockSize, null, null);
+            this(client, path, totalSize, blockSize, blockSize,
+                    NullStatsLogger.INSTANCE, SegmentBlockCache.disabled());
         }
 
         @Override

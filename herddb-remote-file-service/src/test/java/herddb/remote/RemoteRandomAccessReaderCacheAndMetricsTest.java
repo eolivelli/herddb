@@ -91,7 +91,7 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
 
         RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
                 client, "ts/idx/one", data.length, BLOCK_SIZE, BLOCK_SIZE,
-                statsLogger, null);
+                statsLogger, SegmentBlockCache.disabled());
         // Sequential read over 3 blocks — should trigger exactly 3 RPCs.
         byte[] buf = new byte[BLOCK_SIZE * 3];
         reader.readFully(buf);
@@ -111,7 +111,7 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
 
         RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
                 client, "ts/idx/ctx", data.length, BLOCK_SIZE, BLOCK_SIZE,
-                statsLogger, null);
+                statsLogger, SegmentBlockCache.disabled());
         VectorSearchRequestContext ctx = VectorSearchRequestContext.begin();
         try {
             byte[] buf = new byte[BLOCK_SIZE * 2];
@@ -135,7 +135,7 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
 
         RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
                 client, "ts/idx/no-ctx", data.length, BLOCK_SIZE, BLOCK_SIZE,
-                statsLogger, null);
+                statsLogger, SegmentBlockCache.disabled());
         byte[] buf = new byte[BLOCK_SIZE];
         reader.readFully(buf);
         reader.close();

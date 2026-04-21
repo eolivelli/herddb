@@ -22,12 +22,15 @@ package herddb.remote;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalCause;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.util.ReferenceCountUtil;
 import java.io.IOException;
 import java.util.Iterator;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
-import javax.annotation.Nullable;
 
 /**
  * Shared, byte-weighted, multipart-aware block cache for remote vector-index
@@ -37,36 +40,47 @@ import javax.annotation.Nullable;
  *
  * <p>Keys are {@code (path, blockIndex)} pairs where {@code path} is the
  * logical multipart path used by {@link RemoteRandomAccessReader} and
- * {@code blockIndex = offset / blockSize}. Values are {@code byte[]} payloads
- * owned by the cache. On a miss the provided {@link BlockLoader} is invoked
- * exactly once per key (Caffeine {@code get} de-duplicates concurrent misses);
- * the same {@code byte[]} instance is then handed to all waiters. The array
- * is immutable once returned: callers must not mutate it.
+ * {@code blockIndex = offset / blockSize}. Values are pooled direct
+ * {@link ByteBuf}s owned by the cache; on a hit {@link #getBlock} returns a
+ * fresh {@link ByteBuf#retainedSlice() retained slice} which the caller is
+ * responsible for releasing. On eviction the cache releases its own reference
+ * via a Caffeine removal listener.
  *
- * <p>Eviction is byte-weighted LRU bounded by {@code maxBytes}. A value of
- * {@code 0} (or negative) turns the cache off — {@link #getBlock} then invokes
- * the loader on every call and caches nothing.
- *
- * <p>Why {@code byte[]} instead of a direct {@code ByteBuf}: the cache is
- * long-lived and shared across readers, so owning Netty-pooled buffers would
- * require an explicit {@code RemovalListener} to release them on eviction and
- * careful ref-counting on every hit. Storing {@code byte[]} keeps lifecycle
- * trivial; readers wrap the array with {@code Unpooled.wrappedBuffer(byte[])}
- * for a zero-copy {@code ByteBuf} view.
+ * <p>Eviction is byte-weighted LRU bounded by {@code maxBytes}. A budget of
+ * {@code 0} (or negative) disables caching: use {@link #disabled()} to get a
+ * pass-through singleton that always invokes the loader and caches nothing.
+ * Callers always hold a non-null {@code SegmentBlockCache} — the disabled
+ * instance is interchangeable with a real one and eliminates null checks.
  *
  * @author enrico.olivelli
  */
 public final class SegmentBlockCache {
 
-    /** Loads a single block when the cache misses. */
+    /**
+     * Loads a single block when the cache misses. The returned {@link ByteBuf}
+     * must be caller-owned: the cache takes ownership and is responsible for
+     * releasing it on eviction. Implementations are free to return a pooled
+     * direct buffer (the typical case for network reads).
+     */
     @FunctionalInterface
     public interface BlockLoader {
-        byte[] load(String path, long offset, int length) throws IOException;
+        ByteBuf load(String path, long offset, int length) throws IOException;
+    }
+
+    private static final SegmentBlockCache DISABLED = new SegmentBlockCache(0L);
+
+    /**
+     * @return a singleton pass-through cache. Calls to {@link #getBlock}
+     *     always invoke the loader; no entries are stored. Intended for
+     *     configurations where the block cache is explicitly off, or for
+     *     tests / tooling that does not care about caching.
+     */
+    public static SegmentBlockCache disabled() {
+        return DISABLED;
     }
 
     private final long maxBytes;
-    @Nullable
-    private final Cache<BlockKey, byte[]> cache;
+    private final Cache<BlockKey, ByteBuf> cache;
     private final AtomicLong passthroughLoads = new AtomicLong();
     private final AtomicLong passthroughLoadFailures = new AtomicLong();
 
@@ -77,7 +91,14 @@ public final class SegmentBlockCache {
         } else {
             this.cache = Caffeine.newBuilder()
                     .maximumWeight(maxBytes)
-                    .weigher((BlockKey k, byte[] v) -> v == null ? 0 : v.length)
+                    .weigher((BlockKey k, ByteBuf v) -> v == null ? 0 : v.capacity())
+                    .removalListener((BlockKey k, ByteBuf v, RemovalCause cause) -> {
+                        // Release the cache's reference when the entry leaves
+                        // the cache. Callers receive retained slices, so an
+                        // eviction while a slice is in flight does not cause
+                        // use-after-free.
+                        ReferenceCountUtil.safeRelease(v);
+                    })
                     .recordStats()
                     .build();
         }
@@ -97,16 +118,18 @@ public final class SegmentBlockCache {
      * cache first and invoking {@code loader} on miss. {@code offset} must be
      * a multiple of {@code length} — this is the natural alignment used by
      * {@link RemoteRandomAccessReader}, where the read window is a fixed-size
-     * sliding buffer. The value is returned as a caller-read-only {@code byte[]};
-     * do not mutate.
+     * sliding buffer.
+     *
+     * <p><b>Ownership</b>: the returned {@link ByteBuf} is a caller-owned
+     * retained slice; the caller MUST release it exactly once. The underlying
+     * shared entry is released automatically when evicted.
      *
      * @param path       logical multipart path
      * @param offset     block start, must be a multiple of {@code length}
-     * @param length     block length in bytes (>= 0); when cache is inactive
-     *                   the loader receives exactly these arguments
+     * @param length     block length in bytes (> 0)
      * @param loader     invoked at most once per key on miss
      */
-    public byte[] getBlock(String path, long offset, int length, BlockLoader loader)
+    public ByteBuf getBlock(String path, long offset, int length, BlockLoader loader)
             throws IOException {
         Objects.requireNonNull(path, "path");
         Objects.requireNonNull(loader, "loader");
@@ -117,38 +140,47 @@ public final class SegmentBlockCache {
             throw new IllegalArgumentException("offset must be >= 0, got " + offset);
         }
         if (cache == null) {
+            // Pass-through: loader owns the buffer, no retain/release dance.
             return invokeLoader(loader, path, offset, length);
         }
         long blockIndex = offset / length;
         BlockKey key = new BlockKey(path, blockIndex);
         try {
-            return cache.get(key, k -> {
+            ByteBuf shared = cache.get(key, k -> {
                 try {
-                    byte[] bytes = loader.load(path, offset, length);
-                    if (bytes == null) {
+                    ByteBuf loaded = loader.load(path, offset, length);
+                    if (loaded == null) {
                         throw new CacheLoadException(new IOException(
                                 "loader returned null for " + path + "@" + offset));
                     }
-                    return bytes;
+                    return loaded;
                 } catch (IOException e) {
                     throw new CacheLoadException(e);
                 }
             });
+            if (shared == null) {
+                throw new IOException("cache load returned null for " + path + "@" + offset);
+            }
+            // retainedSlice bumps the refcount on the shared entry and returns
+            // a duplicate view with its own reader/writer indices. The caller
+            // releases the slice; the cache releases the shared entry on
+            // eviction.
+            return shared.retainedSlice(0, shared.readableBytes());
         } catch (CacheLoadException e) {
             throw (IOException) e.getCause();
         }
     }
 
-    private byte[] invokeLoader(BlockLoader loader, String path, long offset, int length)
+    private ByteBuf invokeLoader(BlockLoader loader, String path, long offset, int length)
             throws IOException {
         try {
-            byte[] bytes = loader.load(path, offset, length);
-            if (bytes == null) {
+            ByteBuf buf = loader.load(path, offset, length);
+            if (buf == null) {
                 passthroughLoadFailures.incrementAndGet();
                 throw new IOException("loader returned null for " + path + "@" + offset);
             }
             passthroughLoads.incrementAndGet();
-            return bytes;
+            return buf;
         } catch (IOException e) {
             passthroughLoadFailures.incrementAndGet();
             throw e;
@@ -220,6 +252,42 @@ public final class SegmentBlockCache {
         if (cache != null) {
             cache.cleanUp();
         }
+    }
+
+    /**
+     * Convenience used by tests: copy a cached entry's bytes into a heap
+     * array without affecting LRU ordering. Returns {@code null} when the
+     * entry is not cached.
+     */
+    byte[] peekBytes(String path, long offset, int length) {
+        if (cache == null) {
+            return null;
+        }
+        long blockIndex = offset / length;
+        ByteBuf shared = cache.asMap().get(new BlockKey(path, blockIndex));
+        if (shared == null) {
+            return null;
+        }
+        byte[] copy = new byte[shared.readableBytes()];
+        shared.getBytes(shared.readerIndex(), copy);
+        return copy;
+    }
+
+    /**
+     * Convenience for the common pattern of wrapping a heap byte[] from a
+     * legacy loader into an unpooled {@link ByteBuf} that the cache can own.
+     */
+    public static ByteBuf wrapForCache(byte[] bytes) {
+        return io.netty.buffer.Unpooled.wrappedBuffer(bytes);
+    }
+
+    /**
+     * Allocates a pooled direct buffer of {@code length} bytes. Exposed for
+     * loaders that build their own payload rather than copying from another
+     * {@link ByteBuf}.
+     */
+    public static ByteBuf allocateDirect(int length) {
+        return PooledByteBufAllocator.DEFAULT.directBuffer(length);
     }
 
     // ---------------------------------------------------------------------

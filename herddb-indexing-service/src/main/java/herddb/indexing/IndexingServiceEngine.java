@@ -346,15 +346,23 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             if (segmentPageCacheMaxBytes == 0) {
                 segmentPageCacheMaxBytes = Runtime.getRuntime().maxMemory() / 4;
             }
-            this.segmentBlockCache = new SegmentBlockCache(segmentPageCacheMaxBytes);
+            this.segmentBlockCache = segmentPageCacheMaxBytes > 0
+                    ? new SegmentBlockCache(segmentPageCacheMaxBytes)
+                    : SegmentBlockCache.disabled();
             LOGGER.log(Level.INFO,
                     "vector index segmentPageCacheMaxBytes: {0} (active={1})",
                     new Object[]{segmentPageCacheMaxBytes, segmentBlockCache.isActive()});
             // Install the cache + stats logger on the remote DSM so that every
             // multipartIndexReaderSupplier it builds routes reads through it.
+            // Stats logger may still be null at this point (set later by
+            // IndexingServer.start()); fall back to NullStatsLogger so the DSM
+            // setter can enforce non-null.
             if (dataStorageManager instanceof RemoteFileDataStorageManager) {
+                StatsLogger readerStats = this.statsLogger != null
+                        ? this.statsLogger
+                        : org.apache.bookkeeper.stats.NullStatsLogger.INSTANCE;
                 ((RemoteFileDataStorageManager) dataStorageManager)
-                        .setSegmentBlockCache(segmentBlockCache, statsLogger);
+                        .setSegmentBlockCache(segmentBlockCache, readerStats);
             }
             registerSegmentBlockCacheMetrics(segmentBlockCache);
 
