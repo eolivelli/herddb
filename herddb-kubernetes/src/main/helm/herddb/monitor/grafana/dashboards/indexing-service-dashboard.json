@@ -3857,6 +3857,186 @@
       "showTitle": true,
       "title": "File Server I/O Isolation (issue #100)",
       "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 400,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "indexing_segment_block_cache_size_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "used [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "indexing_segment_block_cache_max_bytes{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "max [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "seriesOverrides": [
+            {
+              "alias": "/max/",
+              "fill": 0,
+              "dashes": true
+            }
+          ],
+          "title": "Shared Segment Block Cache — Size (bytes)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "bytes", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 401,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "indexing_segment_block_cache_size_entries{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "entries [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Shared Segment Block Cache — Entries",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "decimals": 0, "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 402,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(indexing_segment_block_cache_hits{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "hits/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(indexing_segment_block_cache_misses{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "misses/s [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "title": "Shared Segment Block Cache — Hits / Misses (1m)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 403,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 2,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(indexing_segment_block_cache_hits{job=\"indexing-service\",instance=~\"$instance\"}[1m]) / clamp_min(rate(indexing_segment_block_cache_hits{job=\"indexing-service\",instance=~\"$instance\"}[1m]) + rate(indexing_segment_block_cache_misses{job=\"indexing-service\",instance=~\"$instance\"}[1m]), 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "hit ratio [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Shared Segment Block Cache — Hit Ratio (1m)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "percentunit", "logBase": 1, "max": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 404,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(indexing_segment_block_cache_evictions{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "evictions/s [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Shared Segment Block Cache — Evictions (1m)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 405,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(indexing_segment_block_cache_load_time_nanos_total{job=\"indexing-service\",instance=~\"$instance\"}[1m]) / clamp_min(rate(indexing_segment_block_cache_load_success{job=\"indexing-service\",instance=~\"$instance\"}[1m]) + rate(indexing_segment_block_cache_load_failure{job=\"indexing-service\",instance=~\"$instance\"}[1m]), 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "avg load ns [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Shared Segment Block Cache — Average Block Load Latency",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ns", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Shared Segment Block Cache (issue #196)",
+      "titleSize": "h6"
     }
   ],
   "schemaVersion": 14,

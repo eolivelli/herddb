@@ -246,9 +246,11 @@ public class SegmentBlockCacheTest {
     }
 
     @Test
-    public void disabledSingletonBypassesCache() throws Exception {
-        SegmentBlockCache cache = SegmentBlockCache.disabled();
-        assertFalse("disabled singleton is inactive", cache.isActive());
+    public void zeroMaxBytesBypassesCache() throws Exception {
+        // A fresh disabled cache (rather than the shared disabled() singleton)
+        // gives deterministic counter values for this assertion.
+        SegmentBlockCache cache = new SegmentBlockCache(0);
+        assertFalse("cache disabled", cache.isActive());
 
         AtomicInteger calls = new AtomicInteger();
         SegmentBlockCache.BlockLoader loader = (p, off, len) -> {
@@ -266,6 +268,8 @@ public class SegmentBlockCacheTest {
         assertEquals(0L, cache.hitCount());
         assertEquals(0L, cache.missCount());
         assertEquals(0L, cache.weightedSize());
+        assertEquals("passthrough loads tracked via load_success counter",
+                2L, cache.loadSuccessCount());
     }
 
     @Test

@@ -23,7 +23,6 @@ package herddb.remote;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.RemovalCause;
-import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.util.ReferenceCountUtil;
@@ -81,8 +80,17 @@ public final class SegmentBlockCache {
 
     private final long maxBytes;
     private final Cache<BlockKey, ByteBuf> cache;
-    private final AtomicLong passthroughLoads = new AtomicLong();
-    private final AtomicLong passthroughLoadFailures = new AtomicLong();
+    // We track hit/miss/load stats ourselves because the only way to do an
+    // atomic retain-under-lock is via asMap().compute(), and Caffeine's
+    // recordStats() does not count compute() invocations as gets. Keeping our
+    // own counters is also what makes the stats meaningful for the Grafana
+    // panels and the per-request cache_hits_per_request histogram.
+    private final AtomicLong hits = new AtomicLong();
+    private final AtomicLong misses = new AtomicLong();
+    private final AtomicLong evictions = new AtomicLong();
+    private final AtomicLong loadSuccess = new AtomicLong();
+    private final AtomicLong loadFailure = new AtomicLong();
+    private final AtomicLong loadTimeNanos = new AtomicLong();
 
     public SegmentBlockCache(long maxBytes) {
         this.maxBytes = maxBytes;
@@ -97,9 +105,11 @@ public final class SegmentBlockCache {
                         // the cache. Callers receive retained slices, so an
                         // eviction while a slice is in flight does not cause
                         // use-after-free.
+                        if (cause != null && cause.wasEvicted()) {
+                            evictions.incrementAndGet();
+                        }
                         ReferenceCountUtil.safeRelease(v);
                     })
-                    .recordStats()
                     .build();
         }
     }
@@ -124,6 +134,14 @@ public final class SegmentBlockCache {
      * retained slice; the caller MUST release it exactly once. The underlying
      * shared entry is released automatically when evicted.
      *
+     * <p><b>Concurrency</b>: retain happens under the map's per-entry lock
+     * via {@link java.util.concurrent.ConcurrentMap#compute compute}, so it
+     * can never race with the removal listener's release. This avoids a
+     * nasty {@link io.netty.util.IllegalReferenceCountException} that would
+     * otherwise fire when an entry is evicted between
+     * {@code cache.get()} returning a reference and the caller bumping its
+     * refcount.
+     *
      * @param path       logical multipart path
      * @param offset     block start, must be a multiple of {@code length}
      * @param length     block length in bytes (> 0)
@@ -145,44 +163,86 @@ public final class SegmentBlockCache {
         }
         long blockIndex = offset / length;
         BlockKey key = new BlockKey(path, blockIndex);
+
+        // Everything happens inside a single asMap().compute() call so that
+        // the retain is atomic with the entry-present check — no window for
+        // the removal listener to release underneath us. Caffeine serialises
+        // concurrent callers on the same key, giving single-flight semantics
+        // for the loader. Hit/miss/load stats are recorded manually inside
+        // the function because Caffeine's recordStats() does not instrument
+        // asMap().compute().
+        ByteBuf retained;
         try {
-            ByteBuf shared = cache.get(key, k -> {
-                try {
-                    ByteBuf loaded = loader.load(path, offset, length);
-                    if (loaded == null) {
-                        throw new CacheLoadException(new IOException(
-                                "loader returned null for " + path + "@" + offset));
-                    }
-                    return loaded;
-                } catch (IOException e) {
-                    throw new CacheLoadException(e);
+            retained = cache.asMap().compute(key, (k, existing) -> {
+                if (existing != null) {
+                    // Hit: bump refcount by one so the caller has a handle
+                    // independent of the cache's ownership.
+                    hits.incrementAndGet();
+                    existing.retain();
+                    return existing;
                 }
+                // Miss: run the loader. Loader returns a buf with refCnt=1
+                // (its own fresh allocation). We retain once more so the
+                // final refCnt=2 means "one ref owned by the cache (released
+                // on eviction), one ref owned by the caller".
+                misses.incrementAndGet();
+                long startNanos = System.nanoTime();
+                ByteBuf loaded;
+                try {
+                    loaded = loader.load(path, offset, length);
+                } catch (IOException ioe) {
+                    loadFailure.incrementAndGet();
+                    loadTimeNanos.addAndGet(System.nanoTime() - startNanos);
+                    throw new CacheLoadException(ioe);
+                }
+                loadTimeNanos.addAndGet(System.nanoTime() - startNanos);
+                if (loaded == null) {
+                    loadFailure.incrementAndGet();
+                    throw new CacheLoadException(new IOException(
+                            "loader returned null for " + path + "@" + offset));
+                }
+                loadSuccess.incrementAndGet();
+                loaded.retain();
+                return loaded;
             });
-            if (shared == null) {
-                throw new IOException("cache load returned null for " + path + "@" + offset);
-            }
-            // retainedSlice bumps the refcount on the shared entry and returns
-            // a duplicate view with its own reader/writer indices. The caller
-            // releases the slice; the cache releases the shared entry on
-            // eviction.
-            return shared.retainedSlice(0, shared.readableBytes());
         } catch (CacheLoadException e) {
             throw (IOException) e.getCause();
+        }
+        if (retained == null) {
+            // Should not happen: compute returns non-null either via the hit
+            // branch or via the loader branch (loader null/throw becomes
+            // CacheLoadException). Defensive fallback.
+            return invokeLoader(loader, path, offset, length);
+        }
+        try {
+            // retainedSlice bumps the shared refcount again and returns a
+            // caller-owned view with independent reader/writer indices.
+            return retained.retainedSlice(0, retained.readableBytes());
+        } finally {
+            // Drop the "caller retain" we added inside compute; the slice
+            // we returned carries its own ref, so the shared entry stays
+            // alive as long as either the cache holds it or a slice is
+            // outstanding.
+            retained.release();
         }
     }
 
     private ByteBuf invokeLoader(BlockLoader loader, String path, long offset, int length)
             throws IOException {
+        long startNanos = System.nanoTime();
         try {
             ByteBuf buf = loader.load(path, offset, length);
             if (buf == null) {
-                passthroughLoadFailures.incrementAndGet();
+                loadFailure.incrementAndGet();
+                loadTimeNanos.addAndGet(System.nanoTime() - startNanos);
                 throw new IOException("loader returned null for " + path + "@" + offset);
             }
-            passthroughLoads.incrementAndGet();
+            loadSuccess.incrementAndGet();
+            loadTimeNanos.addAndGet(System.nanoTime() - startNanos);
             return buf;
         } catch (IOException e) {
-            passthroughLoadFailures.incrementAndGet();
+            loadFailure.incrementAndGet();
+            loadTimeNanos.addAndGet(System.nanoTime() - startNanos);
             throw e;
         }
     }
@@ -291,31 +351,33 @@ public final class SegmentBlockCache {
     }
 
     // ---------------------------------------------------------------------
-    // Stats accessors — all return 0 when the cache is disabled.
+    // Stats accessors. Hits/misses are 0 when the cache is disabled (pass-
+    // through mode) because no lookups happen; load_success / load_failure /
+    // load_time still track the pass-through loader calls.
     // ---------------------------------------------------------------------
 
     public long hitCount() {
-        return cache == null ? 0 : stats().hitCount();
+        return hits.get();
     }
 
     public long missCount() {
-        return cache == null ? 0 : stats().missCount();
+        return misses.get();
     }
 
     public long evictionCount() {
-        return cache == null ? 0 : stats().evictionCount();
+        return evictions.get();
     }
 
     public long loadSuccessCount() {
-        return cache == null ? passthroughLoads.get() : stats().loadSuccessCount();
+        return loadSuccess.get();
     }
 
     public long loadFailureCount() {
-        return cache == null ? passthroughLoadFailures.get() : stats().loadFailureCount();
+        return loadFailure.get();
     }
 
     public long totalLoadTimeNanos() {
-        return cache == null ? 0 : stats().totalLoadTime();
+        return loadTimeNanos.get();
     }
 
     public long estimatedSize() {
@@ -329,10 +391,6 @@ public final class SegmentBlockCache {
         return cache.policy().eviction()
                 .map(e -> e.weightedSize().orElse(0L))
                 .orElse(0L);
-    }
-
-    private CacheStats stats() {
-        return cache.stats();
     }
 
     // ---------------------------------------------------------------------
