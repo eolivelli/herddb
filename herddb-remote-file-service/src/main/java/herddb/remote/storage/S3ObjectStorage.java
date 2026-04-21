@@ -241,8 +241,21 @@ public class S3ObjectStorage implements ObjectStorage {
                 .bucket(bucket)
                 .key(toKey(path))
                 .build();
-        // S3 DELETE is idempotent; always returns true
-        return client.deleteObject(request).thenApply(resp -> Boolean.TRUE);
+        // S3 DELETE is idempotent: native S3 silently succeeds for a missing key, but
+        // S3-compatible stores (notably GCS) surface it as NoSuchKeyException. The end
+        // state — object absent — is what the caller wanted, so treat 404 as success.
+        return client.deleteObject(request)
+                .<Boolean>thenApply(resp -> Boolean.TRUE)
+                .exceptionally(t -> {
+                    Throwable cause = (t instanceof CompletionException) ? t.getCause() : t;
+                    if (cause instanceof NoSuchKeyException) {
+                        return Boolean.TRUE;
+                    }
+                    if (cause instanceof RuntimeException) {
+                        throw (RuntimeException) cause;
+                    }
+                    throw new RuntimeException(cause);
+                });
     }
 
     @Override
