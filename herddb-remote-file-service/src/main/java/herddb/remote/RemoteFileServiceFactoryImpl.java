@@ -64,10 +64,13 @@ public class RemoteFileServiceFactoryImpl implements RemoteFileServiceFactory {
         long valueCacheBytes = readLong(config,
                 ServerConfiguration.PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES,
                 ServerConfiguration.PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES_DEFAULT);
+        int blockParallelism = readInt(config,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT);
         LazyValueCache cache = new LazyValueCache(valueCacheBytes);
         return new RemoteFileDataStorageManager(
                 dataDirectory, tmpDirectory, swapThreshold,
-                (RemoteFileServiceClient) client, cache);
+                (RemoteFileServiceClient) client, cache, blockParallelism);
     }
 
     private static long readLong(Map<String, Object> config, String key, long defaultValue) {
@@ -80,6 +83,21 @@ public class RemoteFileServiceFactoryImpl implements RemoteFileServiceFactory {
         }
         try {
             return Long.parseLong(v.toString());
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+
+    private static int readInt(Map<String, Object> config, String key, int defaultValue) {
+        Object v = config.get(key);
+        if (v == null) {
+            return defaultValue;
+        }
+        if (v instanceof Number) {
+            return ((Number) v).intValue();
+        }
+        try {
+            return Integer.parseInt(v.toString());
         } catch (NumberFormatException e) {
             return defaultValue;
         }

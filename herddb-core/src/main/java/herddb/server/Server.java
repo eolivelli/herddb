@@ -469,6 +469,10 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                         configuration.getLong(
                                 ServerConfiguration.PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES,
                                 ServerConfiguration.PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES_DEFAULT));
+                dsmConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM,
+                        configuration.getInt(
+                                ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM,
+                                ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT));
                 DataStorageManager dsm = factory.createDataStorageManager(
                         dataDirectory, tmpDirectory, diskswapThreshold, client, dsmConfig);
 

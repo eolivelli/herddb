@@ -94,6 +94,31 @@ public final class ServerConfiguration {
     public static final int PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT = 10;
 
     /**
+     * Maximum number of block uploads that a single {@code writePage} invocation
+     * may keep in flight when splitting a page into multipart blocks for
+     * {@link herddb.remote.RemoteFileDataStorageManager}. Larger values speed up
+     * checkpoint flush to remote storage at the cost of more concurrent HTTP/2
+     * streams and transient memory held in gRPC buffers. The parent ByteBuf stays
+     * pinned until all block futures complete.
+     */
+    public static final String PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM =
+            "remote.file.block.parallelism";
+    public static final int PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT = 8;
+
+    /**
+     * Maximum number of concurrent page/index-page writes to remote storage
+     * during a single checkpoint flush (e.g. parallel BLink node writes in
+     * {@code BLinkKeyToPageIndex.checkpoint}). Bounds the global fan-out so a
+     * small remote cluster is not saturated. Combined with
+     * {@link #PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM} the total in-flight
+     * gRPC streams from a checkpoint are at most
+     * {@code flush.parallelism * block.parallelism}.
+     */
+    public static final String PROPERTY_CHECKPOINT_FLUSH_PARALLELISM =
+            "server.checkpoint.flush.parallelism";
+    public static final int PROPERTY_CHECKPOINT_FLUSH_PARALLELISM_DEFAULT = 16;
+
+    /**
      * When true, the leader publishes checkpoint metadata to remote storage (S3)
      * so that shared-storage read replicas can consume it.
      */
