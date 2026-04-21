@@ -22,7 +22,7 @@
 #     --set fileServer.s3.bucket=<your-bucket-name>
 #
 # Memory layout (heap + direct + ~1 GiB JVM overhead = container limit):
-#   server          :  14 g heap + 17 g direct + 1 g = 32 GiB
+#   server          :  22 g heap + 17 g direct + 1 g = 40 GiB
 #   fileServer      :   6 g heap +  8 g direct + 1 g = 15 g  (< 16 GiB)
 #   indexingService :  24 g heap +  6 g direct + 1 g = 31 g  (< 32 GiB)
 #   bookkeeper      :   2 g heap +  1 g direct + 1 g =  4 g  (< 8 GiB)
@@ -39,12 +39,14 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  # 14 g heap + 17 g direct + ~1 g JVM overhead = 32 GiB container.
+  # 22 g heap + 17 g direct + ~1 g JVM overhead = 40 GiB container.
+  # Heap raised from 14 g to 22 g (+8 GB) to give the server more room for
+  # the page index, dirty-page map, and transaction working set at high row counts.
   # --add-modules jdk.incubator.vector: required for Panama Vector API (jvector 4.x).
   # -Dio.netty.maxDirectMemory=0: tell Netty to respect -XX:MaxDirectMemorySize
   # instead of defaulting to heap size, preventing RSS from exceeding the container
   # limit under heavy gRPC traffic.
-  javaOpts: "-Xms14g -Xmx14g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=17g"
+  javaOpts: "-Xms22g -Xmx22g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=17g"
   storage:
     data:
       size: 10Gi
@@ -60,18 +62,19 @@ server:
     # With 10 GiB ledgers (~50 M entries each) the server creates ~2 ledgers per
     # hour instead of ~120, dramatically reducing ZK write frequency.
     server.bookkeeper.ledgers.max.size: "10737418240"          # 10 GiB
-    # Default retention is 2 days (1000*60*60*24*2 ms). On a typical bench
-    # run that's "never" — closed ledgers pile up on the bookie's ledgers PVC
-    # and keep per-ledger state alive in the bookie's memtable/file-handle
-    # caches. 5 min is enough to let a checkpoint durably capture the LSN
-    # before cleanup and lets dropOldLedgers actually prune between checkpoints.
-    server.bookkeeper.ledgers.retention.period: "300000"       # 5 min (ms)
-    # The server enforces (checkpoint.period < retention.period / 2), so a
-    # 5-min retention requires a checkpoint period < 150 s. Default is 15 min,
-    # which would fail validation. Drop to 1 min — more frequent checkpoints
-    # also reduce the per-checkpoint catch-up backlog that was the root cause
-    # of issue #145 (LSN mismatch after a 25-min waitForInstanceCatchUp).
-    server.checkpoint.period: "60000"                          # 1 min (ms)
+    # Retention raised to 35 min to satisfy the server constraint:
+    # checkpoint.period < retention.period / 2
+    # → retention.period must be > 2 × 900,000 ms = 1,800,000 ms.
+    # 2,100,000 ms (35 min) gives a comfortable margin. Closed ledgers may
+    # accumulate for up to 35 min before dropOldLedgers prunes them; with
+    # 500 GiB ledger PVCs this is well within capacity for a 100M-row bench.
+    server.bookkeeper.ledgers.retention.period: "2100000"      # 35 min (ms)
+    # Raised from 1 min to 15 min (900,000 ms). Fewer but larger checkpoints
+    # reduce the fraction of wall-clock time spent in full-flush stalls
+    # (see issue #202: checkpoint page-flush blocks ingest commits). The 1-min
+    # period was chosen originally to work around a 5-min retention limit; now
+    # that retention is 35 min the original default of 15 min is safe again.
+    server.checkpoint.period: "900000"                         # 15 min (ms)
     # --- BookKeeper client resilience tuning (issues #152, #164) ---
     # The code default (issue #152) is addEntryTimeoutSec=30 /
     # addEntryQuorumTimeoutSec=60. Overridden here because checkpoint-induced
@@ -83,12 +86,34 @@ server:
     # default) + pod restart, not by addEntry timeout.
     bookkeeper.addEntryTimeoutSec: "3600"
     bookkeeper.addEntryQuorumTimeoutSec: "7200"
+    # --- BookKeeper ledger layout (2-bookie ensemble) ---
+    # ensemble=2: stripe entries across both bookies for load balancing.
+    # write quorum=1: each entry is written to 1 bookie (no replication overhead).
+    # ack quorum=1: one bookie ack is sufficient to commit.
+    # opportunisticStriping=true: rotate writes across ensemble members even when
+    # write quorum < ensemble, so both bookies receive an equal share of traffic.
+    server.bookkeeper.ensemble.size: "2"
+    server.bookkeeper.write.quorum.size: "1"
+    server.bookkeeper.ack.quorum.size: "1"
+    bookkeeper.opportunisticStriping: "true"
+    # BookKeeper V2 wire protocol (no protobuf framing).
+    # V2 avoids protobuf serialisation/deserialisation on every addEntry /
+    # readEntries call, reducing CPU overhead and GC pressure on both the
+    # server and the bookie. The bookie auto-negotiates; no bookie-side change
+    # is needed. Must be set to the same value in the indexing service (below)
+    # because the IS is also a BK client (commit-log tailer).
+    bookkeeper.useV2WireProtocol: "true"
+    # Raise the BK client's ZK session timeout (ZKMetadataDriverBase uses conf.getZkTimeout(),
+    # which defaults to 10s) to match the server's own ZK session timeout (40s).
+    # Without this the embedded BK client's ZK session can expire before the server's own
+    # ZK session, causing NoNode /ledgers/available → LogNotAvailableException (issue #210).
+    bookkeeper.zkTimeout: "40000"
   resources:
     requests:
-      memory: "32Gi"
+      memory: "40Gi"
       cpu: "16"
     limits:
-      memory: "32Gi"
+      memory: "40Gi"
       cpu: "16"
 
 fileServer:
@@ -146,7 +171,7 @@ zookeeper:
 
 bookkeeper:
   enabled: true
-  replicaCount: 1
+  replicaCount: 2
   # 2 g heap + 1 g direct + ~1 g JVM overhead → 4 g; container = 8 GiB.
   javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
   # Enable FINE logging for BK write processors so OperationRejectedException
@@ -188,6 +213,9 @@ bookkeeper:
   extraConfig:
     journalSyncData: "false"
     journalPageCacheFlushIntervalMSec: "1000"
+    # Raise bookie ZK session timeout from the 10s default (AbstractConfiguration.getZkTimeout())
+    # to 40s so it survives checkpoint-induced I/O bursts without expiring (issue #210).
+    zkTimeout: "40000"
   # Journal PVC raised to 100 Gi for long-running ingests.
   # Ledger PVC at 500 Gi for extended GKE benchmark runs (bigann-scale).
   storage:
@@ -222,6 +250,24 @@ indexingService:
       size: 20Gi
     log:
       size: 5Gi
+  extraConfig:
+    # BookKeeper V2 wire protocol — mirrors the server setting above.
+    # The IS reads BK ledgers as a commit-log tailer; enabling V2 here
+    # removes protobuf overhead from every readEntries call.
+    bookkeeper.useV2WireProtocol: "true"
+    # IS own ZK session timeout (used by ZookeeperMetadataStorageManager and
+    # CommitLogTailer — IndexingServerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT,
+    # default already 40000 ms but made explicit here for visibility).
+    server.zookeeper.session.timeout: "40000"
+    # IS embedded BK client ZK session timeout (ZKMetadataDriverBase uses
+    # conf.getZkTimeout() which defaults to 10s — raise to 40s, matching issue #210 fix).
+    bookkeeper.zkTimeout: "40000"
+    # DML apply worker parallelism (IndexingServerConfiguration.PROPERTY_APPLY_PARALLELISM).
+    # Default is 0 (auto = availableProcessors / 2 = 8 on a 16-CPU pod).
+    # Set explicitly to 16 so all allocated CPUs are used for HNSW indexing work.
+    # Confirmed via per-thread flamegraph (profiles-herddb-indexing-service-0-20260421-155442)
+    # that the auto default left 8 CPUs idle.
+    indexing.apply.parallelism: "16"
   resources:
     requests:
       memory: "32Gi"
@@ -256,7 +302,7 @@ tools:
       cpu: "1"
 
 prometheus:
-  enabled: false
+  enabled: true
 
 grafana:
-  enabled: false
+  enabled: true

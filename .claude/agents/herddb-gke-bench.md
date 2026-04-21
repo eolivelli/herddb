@@ -197,13 +197,23 @@ Rules that apply to every workload, including user-specified ones:
   Never use a lower value.
 - **Wait-for-indexes timeout.** Always pass
   `--wait-for-indexes-timeout 1800`. Never use a lower value.
-- **Custom datasets** live in `gs://herddb-datasets`. The tools pod
-  is pre-configured with `VECTORBENCH_DATASETS_BUCKET=gs://herddb-datasets`
-  (via the Helm chart's `tools.gcs.datasetsBucket`). To run a custom
-  dataset, pass
-  `--dataset-url "$VECTORBENCH_DATASETS_BUCKET/<path>"` through
-  `run-bench.sh`. Standard presets (`sift10k`, `sift1m`, `gist1m`,
-  …) resolve via their built-in public URLs as usual.
+- **Custom datasets** live in `gs://herddb-datasets`. To run a GCS-hosted
+  dataset you MUST pass **both** `--dataset custom` AND
+  `--dataset-url "gs://herddb-datasets/<path>"` through `run-bench.sh`.
+  The `--dataset custom` flag activates the GCS download path in
+  `DatasetLoader`; without it `--dataset-url` is ignored and the loader
+  falls back to HTTP, producing `unknown protocol: gs` errors.
+  `$VECTORBENCH_DATASETS_BUCKET` is set inside the tools pod but NOT in
+  the local shell — always write the literal `gs://herddb-datasets` URL.
+  Example:
+  ```
+  ./scripts/run-bench.sh \
+      --dataset custom \
+      --dataset-url "gs://herddb-datasets/bigann/published/bigann_descriptor.json" \
+      -n 200000000 -k 10 ...
+  ```
+  Standard presets (`sift10k`, `sift1m`, `gist1m`, …) use `--dataset <preset>`
+  without `--dataset-url` and resolve via built-in public URLs as usual.
 
 ---
 

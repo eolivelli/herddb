@@ -9,7 +9,8 @@
 #
 # Usage (async-profiler profiles):
 #   ./scripts/diagnostics.sh --pod <pod> --profile \
-#       [--profile-duration <secs>] [--profiler-home <path>]
+#       [--profile-duration <secs>] [--profiler-home <path>] \
+#       [--per-thread]
 #
 # Defaults:
 #   --pod               herddb-file-server-0
@@ -18,6 +19,12 @@
 #   --profile-duration  30  (total seconds for the single JFR recording)
 #   --profiler-home     $PROFILER_HOME  (local async-profiler distribution
 #                       containing lib/jfr-converter.jar)
+#   --per-thread        disabled; when enabled, generates an additional set of
+#                       per-thread flamegraphs (profile_cpu_threads.html, etc.)
+#                       by passing --threads to jfr-converter for each event.
+#                       Useful to diagnose uneven CPU utilisation across a
+#                       thread pool (e.g. verifying all 16 IS worker threads
+#                       are active vs. a single hot thread doing all the work).
 #
 # Output (heap dump):
 #   Prints  HEAP_DUMP=<local-path>  on the last line on success.
@@ -30,6 +37,7 @@
 #   downloads the JFR, then runs $PROFILER_HOME/lib/jfr-converter.jar
 #   locally to generate profile_cpu.html, profile_wall.html,
 #   profile_alloc.html and profile_lock.html.
+#   With --per-thread also generates profile_cpu_threads.html, etc.
 #   Prints  PROFILES_DIR=<local-dir>  on the last line on success.
 #
 set -euo pipefail
@@ -44,6 +52,7 @@ MAT_HOME="${MAT_HOME:-${HOME}/mat}"
 PROFILE=false
 PROFILE_DURATION=30
 PROFILER_HOME="${PROFILER_HOME:-}"
+PER_THREAD=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -53,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --profile)           PROFILE=true;            shift   ;;
         --profile-duration)  PROFILE_DURATION="$2";  shift 2 ;;
         --profiler-home)     PROFILER_HOME="$2";     shift 2 ;;
+        --per-thread)        PER_THREAD=true;         shift   ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -102,13 +112,23 @@ if $PROFILE; then
 
     kubectl -n default exec "$POD" -- rm -rf "$REMOTE_DIR" || true
 
-    echo "  Generating flamegraphs with $CONVERTER_JAR ..."
+    echo "  Generating aggregate flamegraphs with $CONVERTER_JAR ..."
     for event in cpu wall alloc lock; do
         echo "    - profile_${event}.html"
         java -jar "$CONVERTER_JAR" "--${event}" \
             "${LOCAL_DIR}/profile.jfr" \
             "${LOCAL_DIR}/profile_${event}.html"
     done
+
+    if $PER_THREAD; then
+        echo "  Generating per-thread flamegraphs (--threads) ..."
+        for event in cpu wall alloc lock; do
+            echo "    - profile_${event}_threads.html"
+            java -jar "$CONVERTER_JAR" "--${event}" --threads \
+                "${LOCAL_DIR}/profile.jfr" \
+                "${LOCAL_DIR}/profile_${event}_threads.html"
+        done
+    fi
 
     echo ""
     echo "PROFILES_DIR=$LOCAL_DIR"
