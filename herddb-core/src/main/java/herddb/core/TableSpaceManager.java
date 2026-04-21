@@ -832,6 +832,25 @@ public class TableSpaceManager {
         }
     }
 
+    /**
+     * Fast-path count of committed rows for {@code SELECT COUNT(*) FROM t} in
+     * autocommit. Reuses the same existence / visibility checks as
+     * {@link #scan(ScanStatement, StatementEvaluationContext, TransactionContext, boolean, boolean)}
+     * and returns the primary-key index size directly, so the query
+     * completes in O(1) regardless of table size.
+     */
+    public long fastCountRowsNoTransaction(String table) throws StatementExecutionException {
+        AbstractTableManager tableManager = tables.get(table);
+        if (tableManager == null) {
+            throw new TableDoesNotExistException("no table " + table + " in tablespace " + tableSpaceName);
+        }
+        if (tableManager.getCreatedInTransaction() > 0) {
+            throw new TableDoesNotExistException("no table " + table + " in tablespace " + tableSpaceName
+                    + ". created temporary in transaction " + tableManager.getCreatedInTransaction());
+        }
+        return tableManager.getKeyToPageIndex().size();
+    }
+
     private void downloadTableSpaceData() throws MetadataStorageManagerException, DataStorageManagerException, LogNotAvailableException {
         TableSpace tableSpaceData = metadataStorageManager.describeTableSpace(tableSpaceName);
         String leaderId = tableSpaceData.leaderId;

@@ -34,6 +34,7 @@ import herddb.model.StatementExecutionException;
 import herddb.model.StatementExecutionResult;
 import herddb.model.TransactionContext;
 import herddb.model.Tuple;
+import herddb.model.commands.ScanStatement;
 import herddb.sql.AggregatedColumnCalculator;
 import herddb.sql.expressions.AccessCurrentRowExpression;
 import herddb.sql.expressions.CompiledSQLExpression;
@@ -89,6 +90,12 @@ public class AggregateOp implements PlannerOp {
             boolean lockRequired, boolean forWrite
     ) throws StatementExecutionException {
 
+        StatementExecutionResult fastCount = tryFastCountStar(tableSpaceManager, transactionContext,
+                lockRequired, forWrite);
+        if (fastCount != null) {
+            return fastCount;
+        }
+
         StatementExecutionResult input = this.input.execute(tableSpaceManager, transactionContext, context, lockRequired, forWrite);
         ScanResult downstreamScanResult = (ScanResult) input;
         final DataScanner inputScanner = downstreamScanResult.dataScanner;
@@ -96,6 +103,57 @@ public class AggregateOp implements PlannerOp {
                 tableSpaceManager.getDbmanager().getRecordSetFactory());
         return new ScanResult(downstreamScanResult.transactionId, filtered);
 
+    }
+
+    /**
+     * Short-circuit for {@code SELECT COUNT(*) FROM t} in autocommit: when the
+     * aggregate is a single unconditioned COUNT over a bare table scan we can
+     * answer the query from the primary-key index size in O(1), skipping the
+     * full page scan entirely. Returns {@code null} when the pattern does not
+     * match, in which case the caller falls back to the regular aggregate
+     * path. See issue #186.
+     */
+    private StatementExecutionResult tryFastCountStar(
+            TableSpaceManager tableSpaceManager,
+            TransactionContext transactionContext,
+            boolean lockRequired, boolean forWrite
+    ) throws StatementExecutionException {
+        // only applies in autocommit: an explicit transaction must still drain
+        // the scan so that in-flight uncommitted inserts / deletes are visible.
+        if (transactionContext.transactionId > 0) {
+            return null;
+        }
+        if (lockRequired || forWrite) {
+            return null;
+        }
+        if (aggtypes.length != 1 || !"COUNT".equalsIgnoreCase(aggtypes[0])) {
+            return null;
+        }
+        if (!argLists.get(0).isEmpty()) {
+            // COUNT(col) / COUNT(1) — different semantics
+            return null;
+        }
+        if (!groupedFiledsIndexes.isEmpty()) {
+            return null;
+        }
+        if (!(input instanceof SimpleScanOp)) {
+            return null;
+        }
+        ScanStatement stmt = ((SimpleScanOp) input).getStatement();
+        if (stmt.getPredicate() != null
+                || stmt.getComparator() != null
+                || stmt.getLimits() != null) {
+            return null;
+        }
+
+        long count = tableSpaceManager.fastCountRowsNoTransaction(stmt.getTable());
+
+        RecordSetFactory recordSetFactory = tableSpaceManager.getDbmanager().getRecordSetFactory();
+        MaterializedRecordSet results = recordSetFactory.createFixedSizeRecordSet(1, fieldnames, columns);
+        results.add(new Tuple(fieldnames, new Object[]{count}));
+        results.writeFinished();
+        SimpleDataScanner scanner = new SimpleDataScanner(null, results);
+        return new ScanResult(transactionContext.transactionId, scanner);
     }
 
     private static class Group {
