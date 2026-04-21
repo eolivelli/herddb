@@ -32,6 +32,7 @@ import herddb.model.Index;
 import herddb.model.Record;
 import herddb.model.Table;
 import herddb.model.Transaction;
+import herddb.server.ServerConfiguration;
 import herddb.storage.DataPageDoesNotExistException;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
@@ -55,7 +56,10 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
@@ -79,6 +83,13 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     private final RemoteFileServiceClient client;
     private final Path tmpDir;
     private final int swapThreshold;
+
+    /**
+     * Maximum number of concurrent block uploads per {@link #writePage} call
+     * when splitting a page into multipart blocks. Configured via
+     * {@link ServerConfiguration#PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM}.
+     */
+    private final int blockUploadParallelism;
 
     /**
      * When set, checkpoint metadata (TableStatus, IndexStatus, table/index definitions,
@@ -144,16 +155,26 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
             RemoteFileServiceClient client) {
-        this(localMetadataDir, tmpDir, swapThreshold, client, new LazyValueCache(0L));
+        this(localMetadataDir, tmpDir, swapThreshold, client, new LazyValueCache(0L),
+                ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT);
     }
 
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
             RemoteFileServiceClient client, LazyValueCache lazyValueCache) {
+        this(localMetadataDir, tmpDir, swapThreshold, client, lazyValueCache,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT);
+    }
+
+    public RemoteFileDataStorageManager(
+            Path localMetadataDir, Path tmpDir, int swapThreshold,
+            RemoteFileServiceClient client, LazyValueCache lazyValueCache,
+            int blockUploadParallelism) {
         this.tmpDir = tmpDir;
         this.swapThreshold = swapThreshold;
         this.client = client;
         this.lazyValueCache = lazyValueCache == null ? new LazyValueCache(0L) : lazyValueCache;
+        this.blockUploadParallelism = Math.max(1, blockUploadParallelism);
         this.localMetadataManager = new FileDataStorageManager(
                 localMetadataDir, tmpDir, swapThreshold,
                 false, false, false, false, false,
@@ -489,6 +510,15 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * subsequent {@link RemoteFileServiceClient#readFileRange} calls can
      * satisfy byte-range reads. Blocks larger than a single server block
      * are split into consecutive blocks.
+     * <p>
+     * For multi-block payloads, block uploads are dispatched concurrently
+     * via {@link RemoteFileServiceClient#writeFileBlockAsync}, bounded to
+     * {@link #blockUploadParallelism} in-flight at any time. Each slice is
+     * a view over the caller-owned parent {@code buf}; the parent must stay
+     * live until this method returns, which is guaranteed because every
+     * submitted future is joined before we return (success or failure).
+     * Writes to the same {@code path} target different {@code blockIndex}
+     * keys and can legally complete out of order.
      */
     private void writeAsMultipart(String path, ByteBuf buf) {
         final int blockSize = client.getBlockSize();
@@ -498,16 +528,77 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             client.writeFileBlock(path, 0L, io.netty.buffer.Unpooled.EMPTY_BUFFER);
             return;
         }
+        if (total <= blockSize) {
+            // single-block fast path — avoid CompletableFuture / semaphore overhead
+            client.writeFileBlock(path, 0L, buf.slice(buf.readerIndex(), total));
+            return;
+        }
+        final int maxInFlight = Math.max(1, blockUploadParallelism);
+        final Semaphore permits = new Semaphore(maxInFlight);
+        final List<CompletableFuture<Void>> futures = new ArrayList<>();
         long blockIndex = 0L;
         int pos = buf.readerIndex();
         int remaining = total;
-        while (remaining > 0) {
-            int chunk = Math.min(remaining, blockSize);
-            ByteBuf slice = buf.slice(pos, chunk);
-            client.writeFileBlock(path, blockIndex, slice);
-            pos += chunk;
-            remaining -= chunk;
-            blockIndex++;
+        RuntimeException submissionFailure = null;
+        try {
+            while (remaining > 0) {
+                permits.acquire();
+                int chunk = Math.min(remaining, blockSize);
+                ByteBuf slice = buf.slice(pos, chunk);
+                CompletableFuture<Void> future;
+                try {
+                    future = client.writeFileBlockAsync(path, blockIndex, slice);
+                } catch (RuntimeException ex) {
+                    // Synchronous failure while submitting the stub call; release the permit,
+                    // stop submitting, and fall through to drain the in-flight futures so
+                    // the parent ByteBuf is safe to release after we return.
+                    permits.release();
+                    submissionFailure = ex;
+                    break;
+                }
+                futures.add(future.whenComplete((r, t) -> permits.release()));
+                pos += chunk;
+                remaining -= chunk;
+                blockIndex++;
+            }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            // Drain whatever futures we did submit; the parent ByteBuf belongs to the caller.
+            joinAllSilently(futures);
+            throw new RuntimeException("Interrupted during parallel block upload of " + path, ex);
+        }
+        CompletionException joinFailure = null;
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        } catch (CompletionException ex) {
+            joinFailure = ex;
+        }
+        if (submissionFailure != null) {
+            throw submissionFailure;
+        }
+        if (joinFailure != null) {
+            Throwable cause = joinFailure.getCause();
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            throw joinFailure;
+        }
+    }
+
+    /**
+     * Join every future unconditionally so the caller can safely release the
+     * parent ByteBuf even when some blocks failed. Individual failures are
+     * swallowed here — the outer {@code allOf(...).join()} call in the
+     * happy-path surfaces the root cause.
+     */
+    private static void joinAllSilently(List<CompletableFuture<Void>> futures) {
+        for (CompletableFuture<Void> f : futures) {
+            try {
+                f.join();
+            } catch (CompletionException ignored) {
+                // another future already carries the original error; we just need the buf pinned
+                // until every in-flight gRPC call is done, success or failure.
+            }
         }
     }
 
@@ -660,6 +751,42 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         } catch (IOException e) {
             throw new RuntimeException("Error writing remote index page: " + path, e);
         }
+    }
+
+    @Override
+    public CompletableFuture<Void> writeIndexPageAsync(String tableSpace, String uuid, long pageId,
+            DataWriter writer) {
+        // Serialize synchronously on the caller thread (so the DataWriter state is fully
+        // consumed before we return), then dispatch the network write asynchronously.
+        String path = remoteIndexPagePath(tableSpace, uuid, pageId);
+        final ByteBuf buf;
+        try {
+            buf = serializeIndexPage(writer);
+        } catch (IOException e) {
+            CompletableFuture<Void> failed = new CompletableFuture<>();
+            failed.completeExceptionally(
+                    new RuntimeException("Error serializing remote index page: " + path, e));
+            return failed;
+        }
+        final CompletableFuture<Void> result = new CompletableFuture<>();
+        try {
+            client.writeFileAsync(path, buf).whenComplete((bytesWritten, err) -> {
+                try {
+                    if (err != null) {
+                        result.completeExceptionally(err);
+                    } else {
+                        result.complete(null);
+                    }
+                } finally {
+                    buf.release();
+                }
+            });
+        } catch (RuntimeException ex) {
+            // Synchronous failure building the stub: release the buf now and fail the future.
+            buf.release();
+            result.completeExceptionally(ex);
+        }
+        return result;
     }
 
     @Override

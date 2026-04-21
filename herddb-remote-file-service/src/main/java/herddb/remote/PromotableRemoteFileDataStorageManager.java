@@ -146,6 +146,12 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
     }
 
     @Override
+    public java.util.concurrent.CompletableFuture<Void> writeIndexPageAsync(String tableSpace,
+            String uuid, long pageId, DataWriter writer) {
+        return activeDelegate.writeIndexPageAsync(tableSpace, uuid, pageId, writer);
+    }
+
+    @Override
     public void fullTableScan(String tableSpace, String uuid, FullTableScanConsumer consumer) throws DataStorageManagerException {
         activeDelegate.fullTableScan(tableSpace, uuid, consumer);
     }

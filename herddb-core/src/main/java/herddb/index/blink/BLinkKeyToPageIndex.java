@@ -45,6 +45,7 @@ import herddb.storage.IndexStatus;
 import herddb.utils.ByteArrayCursor;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataOutputStream;
+import herddb.utils.SystemProperties;
 import herddb.utils.VisibleByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -57,6 +58,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
@@ -71,6 +75,20 @@ import java.util.stream.Stream;
 public class BLinkKeyToPageIndex implements KeyToPageIndex {
 
     private static final Logger LOGGER = Logger.getLogger(BLinkKeyToPageIndex.class.getName());
+
+    /**
+     * Maximum number of dirty BLink nodes that a single
+     * {@link #checkpoint(LogSequenceNumber, boolean)} invocation will keep in
+     * flight when dispatching their page writes through
+     * {@link DataStorageManager#writeIndexPageAsync}. Tuned via the
+     * {@code herddb.checkpoint.flush.parallelism} system property (matches the
+     * user-facing {@code server.checkpoint.flush.parallelism} server config).
+     * Defaults to 16 to match
+     * {@code ServerConfiguration.PROPERTY_CHECKPOINT_FLUSH_PARALLELISM_DEFAULT}.
+     */
+    private static final int CHECKPOINT_FLUSH_PARALLELISM =
+            Math.max(1, SystemProperties.getIntSystemProperty(
+                    "herddb.checkpoint.flush.parallelism", 16));
 
     public static final byte METADATA_PAGE = 0;
     public static final byte INNER_NODE_PAGE = 1;
@@ -94,6 +112,19 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
     private final BLinkIndexDataStorage<Bytes, Long> indexDataStorage;
 
     private volatile BLink<Bytes, Long> tree;
+
+    /**
+     * When non-null, {@link BLinkIndexDataStorageImpl#createPage} dispatches
+     * node writes through
+     * {@link DataStorageManager#writeIndexPageAsync(String, String, long, DataStorageManager.DataWriter)}
+     * and accumulates the returned futures on this batch. Set only for the
+     * duration of {@link #checkpoint(LogSequenceNumber, boolean)} so DML-driven
+     * page writes (splits, deletes) continue to go through the synchronous
+     * {@link DataStorageManager#writeIndexPage} path. Access is protected by
+     * the fact that checkpoint is serialized at the caller (the TableManager
+     * Phase-C write lock).
+     */
+    private volatile AsyncIndexWriteBatch currentBatch;
 
     private final AtomicBoolean closed;
 
@@ -341,7 +372,24 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
                 return Collections.emptyList();
             }
 
-            BLinkMetadata<Bytes> metadata = getTree().checkpoint();
+            /*
+             * Install a per-checkpoint batch so node-page writes go through
+             * writeIndexPageAsync and run concurrently (issue #202). The BLink
+             * tree traversal itself remains sequential, but the remote I/O is
+             * fanned out up to CHECKPOINT_FLUSH_PARALLELISM in flight. All
+             * futures are awaited below before we persist the IndexStatus, so
+             * the checkpoint marker never references a page whose bytes are
+             * not yet durable.
+             */
+            AsyncIndexWriteBatch batch = new AsyncIndexWriteBatch(CHECKPOINT_FLUSH_PARALLELISM);
+            BLinkMetadata<Bytes> metadata;
+            currentBatch = batch;
+            try {
+                metadata = getTree().checkpoint();
+            } finally {
+                currentBatch = null;
+            }
+            awaitBatch(batch);
 
             byte[] metaPage = MetadataSerializer.INSTANCE.write(metadata);
 
@@ -361,6 +409,56 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
 
         } catch (IOException err) {
             throw new DataStorageManagerException(err);
+        }
+    }
+
+    /**
+     * Joins every async index-page write submitted during checkpoint. If any
+     * future failed, surface the first root cause as a
+     * {@link DataStorageManagerException}; other failed futures are silently
+     * drained so that by the time we return all gRPC activity is quiesced and
+     * the checkpoint can fail cleanly without leaking work to the next phase.
+     */
+    private void awaitBatch(AsyncIndexWriteBatch batch) throws DataStorageManagerException {
+        List<CompletableFuture<Void>> futures = batch.snapshot();
+        if (futures.isEmpty()) {
+            return;
+        }
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).join();
+        } catch (CompletionException ex) {
+            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            if (cause instanceof DataStorageManagerException) {
+                throw (DataStorageManagerException) cause;
+            }
+            throw new DataStorageManagerException(
+                    "Error awaiting async BLink index page writes for index " + indexName, cause);
+        }
+    }
+
+    /**
+     * Per-checkpoint batch coordinating async BLink node page writes. Holds
+     * a semaphore bounding the number of in-flight writes and a list of the
+     * submitted futures. Not thread-safe for concurrent batch creation; only
+     * one batch is active at a time because checkpoint is serialized by the
+     * TableManager Phase-C write lock.
+     */
+    private static final class AsyncIndexWriteBatch {
+        final Semaphore permits;
+        // Guarded by `this` since futures are added by the (single) traversal
+        // thread but may be completed by arbitrary gRPC callback threads.
+        private final List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        AsyncIndexWriteBatch(int parallelism) {
+            this.permits = new Semaphore(parallelism);
+        }
+
+        synchronized void add(CompletableFuture<Void> future) {
+            futures.add(future);
+        }
+
+        synchronized List<CompletableFuture<Void>> snapshot() {
+            return new ArrayList<>(futures);
         }
     }
 
@@ -706,7 +804,7 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
                 pageId = newPageId.getAndIncrement();
             }
 
-            dataStorageManager.writeIndexPage(tableSpace, indexName, pageId, out -> {
+            DataStorageManager.DataWriter writer = out -> {
 
                 /* Data version */
                 out.writeVLong(1);
@@ -734,7 +832,36 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
 
                 out.writeByte(NODE_PAGE_END_BLOCK);
 
-            });
+            };
+
+            /*
+             * When a checkpoint is in progress (currentBatch != null) dispatch
+             * the write asynchronously and record the future on the batch; the
+             * outer BLinkKeyToPageIndex.checkpoint joins every future before
+             * persisting the IndexStatus. Outside of checkpoint (e.g. DML
+             * splits or recovery rebuilds), keep the synchronous path so
+             * callers observe the write is durable before returning.
+             */
+            AsyncIndexWriteBatch batch = currentBatch;
+            if (batch != null) {
+                try {
+                    batch.permits.acquire();
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while acquiring BLink async-write permit", ex);
+                }
+                CompletableFuture<Void> future;
+                try {
+                    future = dataStorageManager.writeIndexPageAsync(
+                            tableSpace, indexName, pageId, writer);
+                } catch (RuntimeException ex) {
+                    batch.permits.release();
+                    throw ex;
+                }
+                batch.add(future.whenComplete((v, t) -> batch.permits.release()));
+            } else {
+                dataStorageManager.writeIndexPage(tableSpace, indexName, pageId, writer);
+            }
 
             return pageId;
         }

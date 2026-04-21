@@ -38,6 +38,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
@@ -154,6 +155,35 @@ public abstract class DataStorageManager implements AutoCloseable {
     }
 
     public abstract void writeIndexPage(String tableSpace, String uuid, long pageId, DataWriter writer);
+
+    /**
+     * Async variant of {@link #writeIndexPage}. Implementations that dispatch
+     * the write to remote storage should return a future that completes when
+     * the page is durable; callers (e.g. {@code BLinkKeyToPageIndex.checkpoint}
+     * that fires many writes in parallel) join all the returned futures before
+     * considering the checkpoint complete.
+     *
+     * <p>The default implementation runs {@link #writeIndexPage} synchronously
+     * on the calling thread and returns an already-completed future — adequate
+     * for in-memory and local-disk backends where there is no benefit from
+     * overlapping writes.
+     *
+     * <p>The {@code writer} may be invoked synchronously on the caller thread
+     * to serialize data into a buffer, even when the returned future is still
+     * pending; implementations must finish consuming the writer before
+     * returning, so the caller can safely reuse the {@code DataWriter} state.
+     */
+    public CompletableFuture<Void> writeIndexPageAsync(String tableSpace, String uuid, long pageId,
+            DataWriter writer) {
+        try {
+            writeIndexPage(tableSpace, uuid, pageId, writer);
+            return CompletableFuture.completedFuture(null);
+        } catch (RuntimeException ex) {
+            CompletableFuture<Void> failed = new CompletableFuture<>();
+            failed.completeExceptionally(ex);
+            return failed;
+        }
+    }
 
     /**
      * Deletes a single index page that was previously written with {@link #writeIndexPage}.
