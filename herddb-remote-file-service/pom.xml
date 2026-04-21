@@ -121,6 +121,18 @@
             <artifactId>slf4j-jdk14</artifactId>
             <scope>test</scope>
         </dependency>
+        <!--
+          Pulls in org.apache.bookkeeper.test.TestStatsProvider used by the
+          per-request metrics tests. It lives in bookkeeper-common:tests
+          in BK 4.16.x (it was moved from bookkeeper-server:tests in older
+          releases).
+        -->
+        <dependency>
+            <groupId>org.apache.bookkeeper</groupId>
+            <artifactId>bookkeeper-common</artifactId>
+            <classifier>tests</classifier>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

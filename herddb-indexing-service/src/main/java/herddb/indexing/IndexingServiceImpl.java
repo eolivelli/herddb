@@ -39,6 +39,7 @@ import herddb.indexing.proto.SearchRequest;
 import herddb.indexing.proto.SearchResponse;
 import herddb.indexing.proto.SearchResult;
 import herddb.log.LogSequenceNumber;
+import herddb.remote.VectorSearchRequestContext;
 import herddb.utils.Bytes;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
@@ -73,6 +74,18 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
     private final Counter statusRequests;
     private final Counter statusErrors;
 
+    // Per-request readFileRange metrics — populated from VectorSearchRequestContext
+    // at the end of every search(). Allow attributing network I/O to an
+    // individual VectorSearch RPC (see issue #196).
+    private final Counter searchReadFileRangeCalls;
+    private final Counter searchReadFileRangeBytes;
+    private final Counter searchReadFileRangeWaitNanos;
+    private final OpStatsLogger searchReadFileRangeCallsPerRequest;
+    private final OpStatsLogger searchReadFileRangeBytesPerRequest;
+    private final OpStatsLogger searchReadFileRangeWaitPerRequest;
+    private final OpStatsLogger searchCacheHitsPerRequest;
+    private final OpStatsLogger searchCacheMissesPerRequest;
+
     public IndexingServiceImpl(IndexingServiceEngine engine, StatsLogger statsLogger) {
         this.engine = engine;
         StatsLogger scope = statsLogger.scope("indexing");
@@ -82,12 +95,24 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
         this.searchBytes = scope.getCounter("search_bytes");
         this.statusRequests = scope.getCounter("status_requests");
         this.statusErrors = scope.getCounter("status_errors");
+        this.searchReadFileRangeCalls = scope.getCounter("search_readfilerange_calls");
+        this.searchReadFileRangeBytes = scope.getCounter("search_readfilerange_bytes");
+        this.searchReadFileRangeWaitNanos = scope.getCounter("search_readfilerange_wait_nanos");
+        this.searchReadFileRangeCallsPerRequest =
+                scope.getOpStatsLogger("search_readfilerange_calls_per_request");
+        this.searchReadFileRangeBytesPerRequest =
+                scope.getOpStatsLogger("search_readfilerange_bytes_per_request");
+        this.searchReadFileRangeWaitPerRequest =
+                scope.getOpStatsLogger("search_readfilerange_wait_per_request");
+        this.searchCacheHitsPerRequest = scope.getOpStatsLogger("search_cache_hits_per_request");
+        this.searchCacheMissesPerRequest = scope.getOpStatsLogger("search_cache_misses_per_request");
     }
 
     @Override
     public void search(SearchRequest request, StreamObserver<SearchResponse> responseObserver) {
         searchRequests.inc();
         long start = System.nanoTime();
+        VectorSearchRequestContext ctx = VectorSearchRequestContext.begin();
         try {
             float[] vector = new float[request.getVectorCount()];
             for (int i = 0; i < vector.length; i++) {
@@ -116,17 +141,53 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
             long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
             searchLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
             searchBytes.inc();
+            recordRequestContext(ctx, true);
             responseObserver.onNext(response);
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
             searchErrors.inc();
             long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
             searchLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+            recordRequestContext(ctx, false);
             LOGGER.log(Level.SEVERE, "Search failed for index " + request.getIndex(), e);
             responseObserver.onError(Status.INTERNAL
                     .withDescription(e.getMessage())
                     .withCause(e)
                     .asRuntimeException());
+        } finally {
+            VectorSearchRequestContext.end();
+        }
+    }
+
+    /**
+     * Drains the per-request accumulator into the aggregate counters and the
+     * per-request histograms. Keeps the drain logic in one place so that the
+     * success and failure paths in {@link #search} stay parallel.
+     */
+    private void recordRequestContext(VectorSearchRequestContext ctx, boolean success) {
+        if (ctx == null) {
+            return;
+        }
+        long calls = ctx.getReadFileRangeCalls();
+        long bytes = ctx.getReadFileRangeBytes();
+        long waitNanos = ctx.getReadFileRangeWaitNanos();
+        long hits = ctx.getCacheHits();
+        long misses = ctx.getCacheMisses();
+        searchReadFileRangeCalls.addCount(calls);
+        searchReadFileRangeBytes.addCount(bytes);
+        searchReadFileRangeWaitNanos.addCount(waitNanos);
+        if (success) {
+            searchReadFileRangeCallsPerRequest.registerSuccessfulEvent(calls, TimeUnit.NANOSECONDS);
+            searchReadFileRangeBytesPerRequest.registerSuccessfulEvent(bytes, TimeUnit.NANOSECONDS);
+            searchReadFileRangeWaitPerRequest.registerSuccessfulEvent(waitNanos, TimeUnit.NANOSECONDS);
+            searchCacheHitsPerRequest.registerSuccessfulEvent(hits, TimeUnit.NANOSECONDS);
+            searchCacheMissesPerRequest.registerSuccessfulEvent(misses, TimeUnit.NANOSECONDS);
+        } else {
+            searchReadFileRangeCallsPerRequest.registerFailedEvent(calls, TimeUnit.NANOSECONDS);
+            searchReadFileRangeBytesPerRequest.registerFailedEvent(bytes, TimeUnit.NANOSECONDS);
+            searchReadFileRangeWaitPerRequest.registerFailedEvent(waitNanos, TimeUnit.NANOSECONDS);
+            searchCacheHitsPerRequest.registerFailedEvent(hits, TimeUnit.NANOSECONDS);
+            searchCacheMissesPerRequest.registerFailedEvent(misses, TimeUnit.NANOSECONDS);
         }
     }
 

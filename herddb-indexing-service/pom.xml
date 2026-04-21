@@ -65,6 +65,19 @@
             <artifactId>herddb-utils</artifactId>
             <version>${project.version}</version>
         </dependency>
+        <!--
+          Depend on the remote-file-service module so that IndexingServiceEngine
+          can wire the shared SegmentBlockCache and VectorSearchRequestContext
+          directly into RemoteFileDataStorageManager (both live in
+          herddb-remote-file-service). IndexingServer already constructs a
+          RemoteFileDataStorageManager via RemoteFileServiceFactory, so this
+          merely makes the existing transitive relationship explicit.
+        -->
+        <dependency>
+            <groupId>org.herddb</groupId>
+            <artifactId>herddb-remote-file-service</artifactId>
+            <version>${project.version}</version>
+        </dependency>
         <dependency>
             <groupId>org.herddb</groupId>
             <artifactId>herddb-auth-oidc</artifactId>

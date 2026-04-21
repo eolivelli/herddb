@@ -62,6 +62,7 @@ import java.util.function.LongConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.bookkeeper.stats.NullStatsLogger;
+import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
  * DataStorageManager that stores page data on remote RemoteFileService instances
@@ -123,6 +124,23 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     private final LazyValueCache lazyValueCache;
 
+    /**
+     * Shared multipart-block cache used by {@link RemoteRandomAccessReader}
+     * on the vector-index search path. Starts as
+     * {@link SegmentBlockCache#disabled()} (pass-through, no caching) and is
+     * replaced by the indexing-service engine at startup via
+     * {@link #setSegmentBlockCache}. Never {@code null}.
+     */
+    private volatile SegmentBlockCache segmentBlockCache = SegmentBlockCache.disabled();
+
+    /**
+     * Stats logger forwarded to every {@link RemoteRandomAccessReader}
+     * created by {@link #multipartIndexReaderSupplier}. Starts as
+     * {@link NullStatsLogger#INSTANCE} and is replaced by the indexing-service
+     * engine alongside the block cache. Never {@code null}.
+     */
+    private volatile StatsLogger readerStatsLogger = NullStatsLogger.INSTANCE;
+
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
             RemoteFileServiceClient client) {
@@ -150,6 +168,30 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     /** Client used for all remote I/O. Visible for lazy-page loading. */
     RemoteFileServiceClient getClient() {
         return client;
+    }
+
+    /**
+     * Installs the shared {@link SegmentBlockCache} and stats logger to be
+     * used by every {@link RemoteRandomAccessReader} returned from
+     * {@link #multipartIndexReaderSupplier}. Intended to be called once at
+     * startup, before any vector-index segment is loaded. Pass
+     * {@link SegmentBlockCache#disabled()} and/or
+     * {@link NullStatsLogger#INSTANCE} to disable either feature without
+     * reintroducing null checks on the hot path.
+     */
+    public void setSegmentBlockCache(SegmentBlockCache cache, StatsLogger statsLogger) {
+        this.segmentBlockCache = java.util.Objects.requireNonNull(cache,
+                "cache (use SegmentBlockCache.disabled() to disable)");
+        this.readerStatsLogger = java.util.Objects.requireNonNull(statsLogger,
+                "statsLogger (use NullStatsLogger.INSTANCE to disable)");
+        LOGGER.log(Level.INFO,
+                "SegmentBlockCache installed: active={0}, maxBytes={1}",
+                new Object[]{cache.isActive(), cache.maxBytes()});
+    }
+
+    /** Visible for indexing-service gauges. Never {@code null}. */
+    public SegmentBlockCache getSegmentBlockCache() {
+        return segmentBlockCache;
     }
 
     /**
@@ -704,7 +746,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
         int writeBlockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
         return new RemoteRandomAccessReader.Supplier(
-                client, logicalPath, fileSize, writeBlockSize, READ_BUFFER_SIZE, null);
+                client, logicalPath, fileSize, writeBlockSize, READ_BUFFER_SIZE,
+                readerStatsLogger, segmentBlockCache);
     }
 
     @Override
@@ -718,6 +761,9 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                     "deleteMultipartIndexFile: non-fatal error deleting {0}: {1}",
                     new Object[]{logicalPath, e.getMessage()});
         }
+        // Drop any cached blocks for this path so a future segment rewritten
+        // under the same logical path does not serve stale bytes.
+        segmentBlockCache.invalidatePath(logicalPath);
     }
 
     // -------------------------------------------------------------------------
@@ -973,6 +1019,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         pendingDataDeletions.keySet().removeIf(k -> k.startsWith(prefix));
         pendingIndexDeletions.keySet().removeIf(k -> k.startsWith(prefix));
         lazyValueCache.invalidateForTablespace(tableSpace);
+        segmentBlockCache.invalidatePrefix(prefix);
     }
 
     @Override

@@ -692,9 +692,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.maxVectorMemoryBytes = maxVectorMemoryBytes;
         this.memoryBudget = memoryBudget;
         this.maxLiveBytesPerCheckpoint = maxLiveBytesPerCheckpoint > 0 ? maxLiveBytesPerCheckpoint : 10L * 1024 * 1024 * 1024;
-        // segmentPageCacheMaxBytes is accepted for API compatibility but unused
-        // after removal of the page-based graph cache. A multipart-aware cache
-        // will be re-introduced in a follow-up change.
+        // segmentPageCacheMaxBytes is now honoured by the multipart-aware
+        // SegmentBlockCache, which lives on the RemoteFileDataStorageManager
+        // rather than inside this store — it sits under the jvector reader
+        // (RemoteRandomAccessReader) on the vector-search hot path. The
+        // constructor still validates the value for backward compatibility.
         if (segmentPageCacheMaxBytes < 0) {
             throw new IllegalArgumentException("segmentPageCacheMaxBytes must be >= 0");
         }
