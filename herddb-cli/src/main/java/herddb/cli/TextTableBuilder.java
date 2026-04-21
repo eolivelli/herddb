@@ -21,8 +21,8 @@
 package herddb.cli;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
-import org.apache.commons.lang.StringUtils;
 
 /**
  * @author francesco.caliumi
@@ -45,9 +45,18 @@ public class TextTableBuilder {
         addRowInternal(columns);
         List<String> dashes = new ArrayList<>();
         for (String c : columns) {
-            dashes.add(StringUtils.repeat("-", c.length()));
+            dashes.add(repeatChar('-', c.length()));
         }
         addRowInternal(dashes);
+    }
+
+    private static String repeatChar(char ch, int count) {
+        if (count <= 0) {
+            return "";
+        }
+        char[] buf = new char[count];
+        Arrays.fill(buf, ch);
+        return new String(buf);
     }
 
     private int[] colWidths() {
@@ -64,7 +73,7 @@ public class TextTableBuilder {
                 widths[colNum] =
                         Math.max(
                                 widths[colNum],
-                                StringUtils.length(row[colNum]));
+                                row[colNum] == null ? 0 : row[colNum].length());
             }
         }
 
@@ -84,10 +93,11 @@ public class TextTableBuilder {
         for (String[] row : rows) {
             buf.append("| ");
             for (int colNum = 0; colNum < row.length; colNum++) {
-                buf.append(
-                        StringUtils.rightPad(
-                                StringUtils.defaultString(
-                                        row[colNum]), colWidths[colNum]));
+                String cell = row[colNum] == null ? "" : row[colNum];
+                buf.append(cell);
+                for (int pad = colWidths[colNum] - cell.length(); pad > 0; pad--) {
+                    buf.append(' ');
+                }
                 buf.append(" | ");
             }
 
