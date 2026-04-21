@@ -87,7 +87,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
@@ -625,7 +624,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
         RunningStatementInfo statementInfo = new RunningStatementInfo(query, System.currentTimeMillis(), tableSpace, "", numStatements);
         try {
 
-            List<TranslatedQuery> queries = new ArrayList<>();
+            List<TranslatedQuery> queries = new ArrayList<>(numStatements);
             for (int i = 0; i < numStatements; i++) {
                 List<Object> parameters = batch.get(i);
                 TranslatedQuery translatedQuery = server
@@ -635,8 +634,11 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                 queries.add(translatedQuery);
             }
 
-            List<Long> updateCounts = new CopyOnWriteArrayList<>();
-            List<Map<String, Object>> otherDatas = new CopyOnWriteArrayList<>();
+            // Accumulators are filled strictly in order by the ComputeNext chain
+            // (each callback schedules the next), so plain ArrayLists are safe:
+            // CompletableFuture provides the happens-before between callbacks.
+            List<Long> updateCounts = new ArrayList<>(numStatements);
+            List<Map<String, Object>> otherDatas = new ArrayList<>(numStatements);
 
             class ComputeNext implements BiConsumer<StatementExecutionResult, Throwable> {
 
@@ -1211,7 +1213,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
         }
         try {
 
-            List<TranslatedQuery> queries = new ArrayList<>();
+            List<TranslatedQuery> queries = new ArrayList<>(batch.size());
             for (int i = 0; i < batch.size(); i++) {
                 List<Object> parameters = batch.get(i);
                 TranslatedQuery translatedQuery = server
@@ -1221,8 +1223,12 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                 queries.add(translatedQuery);
             }
 
-            List<Long> updateCounts = new CopyOnWriteArrayList<>();
-            List<Map<RawString, Object>> otherDatas = new CopyOnWriteArrayList<>();
+            // Accumulators are filled strictly in order by the ComputeNext chain
+            // and read by the caller only after finalResult.get() returns, so
+            // plain ArrayLists are safe: CompletableFuture provides the
+            // happens-before for both the chain and the final read.
+            List<Long> updateCounts = new ArrayList<>(batch.size());
+            List<Map<RawString, Object>> otherDatas = new ArrayList<>(batch.size());
             CompletableFuture<Long> finalResult = new CompletableFuture<>();
             class ComputeNext implements BiConsumer<StatementExecutionResult, Throwable> {
 
@@ -1294,7 +1300,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                     .whenComplete(new ComputeNext(1));
 
             long finalTransactionId = finalResult.get();
-            List<DMLResult> returnedValues = new ArrayList<>();
+            List<DMLResult> returnedValues = new ArrayList<>(updateCounts.size());
             for (int i = 0; i < updateCounts.size(); i++) {
                 returnedValues.add(new DMLResult(updateCounts.get(i), otherDatas.get(i).get(RAWSTRING_KEY), otherDatas.get(i), finalTransactionId));
             }
