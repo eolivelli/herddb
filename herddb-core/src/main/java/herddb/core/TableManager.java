@@ -102,8 +102,10 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -300,6 +302,13 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
      * Compaction (small pages) target max milliseconds
      */
     private final long compactionTargetTime;
+
+    /**
+     * Max concurrent page writes dispatched to the checkpoint-flush executor
+     * during Phase B. Read once at construction from
+     * {@link ServerConfiguration#PROPERTY_CHECKPOINT_FLUSH_PARALLELISM}.
+     */
+    private final int checkpointFlushParallelism;
 
     /**
      * Soft upper bound on the number of {@link PostCheckpointAction} entries a
@@ -540,6 +549,11 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 ServerConfiguration.PROPERTY_COMPACTION_DURATION_DEFAULT);
 
         this.compactionTargetTime = compactionTargetTime < 0 ? Long.MAX_VALUE : compactionTargetTime;
+
+        this.checkpointFlushParallelism = Math.max(1,
+                tableSpaceManager.getDbmanager().getServerConfiguration().getInt(
+                        ServerConfiguration.PROPERTY_CHECKPOINT_FLUSH_PARALLELISM,
+                        ServerConfiguration.PROPERTY_CHECKPOINT_FLUSH_PARALLELISM_DEFAULT));
 
         int maxActionsPerCheckpointCycle = tableSpaceManager.getDbmanager().getServerConfiguration().getInt(
                 ServerConfiguration.PROPERTY_CHECKPOINT_MAX_ACTIONS_PER_CYCLE,
@@ -939,6 +953,74 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     }
 
     /**
+     * Bounded-parallel collector of {@code dataStorageManager.writePage} calls
+     * submitted to the DBManager checkpoint-flush executor during Phase B
+     * (issue #202). Lives for a single Phase-B invocation on one table.
+     *
+     * <p>The {@link #submit(Runnable)} call blocks (on a semaphore) when the
+     * configured parallelism limit is reached, so the caller cannot run ahead
+     * of the executor indefinitely and hold unbounded in-memory pages while
+     * their writes queue up. The corresponding permit is released inside the
+     * executor task's {@code finally} block so a throwing flush does not leak
+     * a permit.
+     *
+     * <p>{@link #awaitAll()} joins every submitted future and re-throws the
+     * first failure as a {@link DataStorageManagerException}. All other
+     * failures are drained silently to keep subsequent checkpoint teardown
+     * consistent — the first one already tells the operator what broke.
+     */
+    private static final class CheckpointFlushBatch {
+        private final ExecutorService executor;
+        private final Semaphore permits;
+        private final List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        CheckpointFlushBatch(ExecutorService executor, int parallelism) {
+            this.executor = executor;
+            this.permits = new Semaphore(Math.max(1, parallelism));
+        }
+
+        void submit(Runnable flushAction) throws DataStorageManagerException {
+            try {
+                permits.acquire();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new DataStorageManagerException(
+                        "Interrupted acquiring checkpoint flush permit", e);
+            }
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                try {
+                    flushAction.run();
+                } finally {
+                    permits.release();
+                }
+            }, executor);
+            synchronized (futures) {
+                futures.add(future);
+            }
+        }
+
+        void awaitAll() throws DataStorageManagerException {
+            CompletableFuture<?>[] arr;
+            synchronized (futures) {
+                arr = futures.toArray(new CompletableFuture<?>[0]);
+            }
+            if (arr.length == 0) {
+                return;
+            }
+            try {
+                CompletableFuture.allOf(arr).join();
+            } catch (CompletionException ex) {
+                Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                if (cause instanceof DataStorageManagerException) {
+                    throw (DataStorageManagerException) cause;
+                }
+                throw new DataStorageManagerException(
+                        "Parallel checkpoint page flush failed", cause);
+            }
+        }
+    }
+
+    /**
      * Remove the page from {@link #newPages}, set it as "not writable" and write it
      * to disk
      * <p>
@@ -1059,17 +1141,28 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         } finally {
             checkpointLock.asWriteLock().unlock();
         }
-        long pagesFlushed = 0;
-        long recordsFlushed = 0;
-        for (DataPage page : snapshot) {
-            flushNewPageForCheckpoint(page, null);
-            if (!page.isEmpty()) {
-                ++pagesFlushed;
-                recordsFlushed += page.size();
-            }
+        // Parallel drain (issue #202): pages in the snapshot are independent new pages,
+        // each taking its own page.pageLock. Fan out through the DBManager checkpoint-flush
+        // executor so remote storage I/O overlaps instead of serializing.
+        final CheckpointFlushBatch batch = new CheckpointFlushBatch(
+                tableSpaceManager.getCheckpointFlushExecutor(), checkpointFlushParallelism);
+        final AtomicLong pagesFlushed = new AtomicLong();
+        final AtomicLong recordsFlushed = new AtomicLong();
+        for (DataPage dataPage : snapshot) {
+            final DataPage page = dataPage;
+            final boolean wasNonEmpty = !page.isEmpty();
+            final int recordCount = page.size();
+            batch.submit(() -> {
+                flushNewPageForCheckpoint(page, null);
+                if (wasNonEmpty) {
+                    pagesFlushed.incrementAndGet();
+                    recordsFlushed.addAndGet(recordCount);
+                }
+            });
         }
+        batch.awaitAll();
         drainedNewPagesOutsideLock.addAndGet(snapshot.size());
-        return new long[]{pagesFlushed, recordsFlushed};
+        return new long[]{pagesFlushed.get(), recordsFlushed.get()};
     }
 
     /**
@@ -3747,17 +3840,33 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
          * We pass null as spareDataPage to avoid spare-data stealing which could race with
          * concurrent DML modifying the keyToPage mappings of compacted records in buildingPage.
          * buildingPage will be flushed in Phase C.
+         *
+         * Frozen pages are independent of each other (no shared state, each takes its own
+         * page.pageLock), so their flushes can run concurrently on the DBManager
+         * checkpoint-flush executor (issue #202). Empty pages still go through flush so the
+         * EMPTY_FLUSH path removes them from `pages`/pageReplacementPolicy. The AtomicLongs
+         * avoid any happens-before concern between the executor threads and the main thread
+         * reading the counters after awaitAll returns.
          */
-        long flushedNewPages = 0;
+        final CheckpointFlushBatch frozenFlushBatch = new CheckpointFlushBatch(
+                tableSpaceManager.getCheckpointFlushExecutor(), checkpointFlushParallelism);
+        final AtomicLong frozenFlushedPages = new AtomicLong();
+        final AtomicLong frozenFlushedRecords = new AtomicLong();
         for (DataPage dataPage : frozenNewPages) {
-            /* Always call flush even for empty pages: EMPTY_FLUSH removes the page from `pages` and
-             * pageReplacementPolicy, which is required for the rotated-out currentDirtyRecordsPage. */
-            flushNewPageForCheckpoint(dataPage, null);
-            if (!dataPage.isEmpty()) {
-                ++flushedNewPages;
-                flushedRecords += dataPage.size();
-            }
+            final DataPage page = dataPage;
+            final boolean wasNonEmpty = !page.isEmpty();
+            final int recordCount = page.size();
+            frozenFlushBatch.submit(() -> {
+                flushNewPageForCheckpoint(page, null);
+                if (wasNonEmpty) {
+                    frozenFlushedPages.incrementAndGet();
+                    frozenFlushedRecords.addAndGet(recordCount);
+                }
+            });
         }
+        frozenFlushBatch.awaitAll();
+        long flushedNewPages = frozenFlushedPages.get();
+        flushedRecords += frozenFlushedRecords.get();
 
 
         /* ********************************** */
