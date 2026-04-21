@@ -7,13 +7,16 @@
 #   ./scripts/diagnostics.sh [--pod <pod>] [--analyze] [--mat-home <path>]
 #
 # Usage (async-profiler profiles):
-#   ./scripts/diagnostics.sh --pod <pod> --profile [--profile-duration <secs>]
+#   ./scripts/diagnostics.sh --pod <pod> --profile \
+#       [--profile-duration <secs>] [--profiler-home <path>]
 #
 # Defaults:
 #   --pod               herddb-file-server-0
 #   --analyze           disabled (pass --analyze to run MAT after download)
 #   --mat-home          $MAT_HOME or ~/mat
-#   --profile-duration  30  (seconds per event type)
+#   --profile-duration  30  (total seconds for the single JFR recording)
+#   --profiler-home     $PROFILER_HOME  (local async-profiler distribution
+#                       containing lib/jfr-converter.jar)
 #
 # Output (heap dump):
 #   Prints  HEAP_DUMP=<local-path>  on the last line on success.
@@ -21,14 +24,18 @@
 #   MAT "leak_suspects" report directory.
 #
 # Output (profiles):
-#   Collects cpu / wall / alloc / lock profiles (HTML flamegraphs via
-#   async-profiler at /opt/profiler/bin/asprof) and downloads them.
+#   Runs async-profiler once (--all, ${PROFILE_DURATION}s) inside the pod
+#   to record cpu / wall / alloc / lock events into a single profile.jfr,
+#   downloads the JFR, then runs $PROFILER_HOME/lib/jfr-converter.jar
+#   locally to generate profile_cpu.html, profile_wall.html,
+#   profile_alloc.html and profile_lock.html.
 #   Prints  PROFILES_DIR=<local-dir>  on the last line on success.
 #
 # Requirements:
 #   - kubectl on PATH and .kubeconfig present (run ./install.sh first)
 #   - jcmd present in the target container  (it ships with the HerdDB JDK image)
-#   - For --profile: /opt/profiler/bin/asprof present in the target container
+#   - For --profile: /opt/profiler/bin/asprof present in the target container,
+#     java on the local PATH, and $PROFILER_HOME/lib/jfr-converter.jar locally
 #   - Enough ephemeral storage in the pod's /tmp to hold the dump (~heap-size)
 #   - MAT ParseHeapDump.sh present at $MAT_HOME (only when --analyze is set)
 #
@@ -43,6 +50,7 @@ ANALYZE=false
 MAT_HOME="${MAT_HOME:-${HOME}/mat}"
 PROFILE=false
 PROFILE_DURATION=30
+PROFILER_HOME="${PROFILER_HOME:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -51,15 +59,29 @@ while [[ $# -gt 0 ]]; do
         --mat-home)          MAT_HOME="$2";           shift 2 ;;
         --profile)           PROFILE=true;            shift   ;;
         --profile-duration)  PROFILE_DURATION="$2";  shift 2 ;;
+        --profiler-home)     PROFILER_HOME="$2";     shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PROFILE MODE — async-profiler (cpu / wall / alloc / lock)
+# PROFILE MODE — async-profiler single JFR recording (cpu / wall / alloc / lock)
 # ═══════════════════════════════════════════════════════════════════════════════
 if $PROFILE; then
-    section "async-profiler profiles from pod $POD (${PROFILE_DURATION}s per event)"
+    section "async-profiler JFR from pod $POD (${PROFILE_DURATION}s, cpu+wall+alloc+lock)"
+
+    # ── 0. Local converter prerequisites ───────────────────────────────────────
+    if [[ -z "$PROFILER_HOME" ]]; then
+        echo "ERROR: PROFILER_HOME is not set." >&2
+        echo "       Point it at a local async-profiler distribution containing" >&2
+        echo "       lib/jfr-converter.jar (or pass --profiler-home <path>)." >&2
+        exit 1
+    fi
+    CONVERTER_JAR="$PROFILER_HOME/lib/jfr-converter.jar"
+    if [[ ! -f "$CONVERTER_JAR" ]]; then
+        echo "ERROR: jfr-converter.jar not found at $CONVERTER_JAR" >&2
+        exit 1
+    fi
 
     # ── 1. Find the JVM PID inside the pod ─────────────────────────────────────
     echo "  Locating JVM PID..."
@@ -79,40 +101,31 @@ if $PROFILE; then
 
     ASPROF="/opt/profiler/bin/asprof"
 
-    # ── 3. Four event types (cpu / wall / alloc / lock) ─────────────────────────
-    echo "  [1/4] CPU profile (${PROFILE_DURATION}s)..."
+    # ── 3. Single JFR recording with all events (--all) ────────────────────────
+    echo "  Recording cpu+wall+alloc+lock for ${PROFILE_DURATION}s into profile.jfr..."
     kubectl -n default exec "$POD" -- \
-        "$ASPROF" -d "$PROFILE_DURATION" "$JVM_PID" \
-        -f "${REMOTE_DIR}/profile_cpu.html"
+        "$ASPROF" --all -d "$PROFILE_DURATION" "$JVM_PID" \
+        -f "${REMOTE_DIR}/profile.jfr"
 
-    echo "  [2/4] Wall-clock profile (${PROFILE_DURATION}s)..."
-    kubectl -n default exec "$POD" -- \
-        "$ASPROF" -d "$PROFILE_DURATION" -e wall "$JVM_PID" \
-        -f "${REMOTE_DIR}/profile_wall.html"
-
-    echo "  [3/4] Allocation profile (${PROFILE_DURATION}s)..."
-    kubectl -n default exec "$POD" -- \
-        "$ASPROF" -d "$PROFILE_DURATION" -e alloc "$JVM_PID" \
-        -f "${REMOTE_DIR}/profile_mem.html"
-
-    echo "  [4/4] Lock profile (${PROFILE_DURATION}s)..."
-    kubectl -n default exec "$POD" -- \
-        "$ASPROF" -d "$PROFILE_DURATION" -e lock "$JVM_PID" \
-        -f "${REMOTE_DIR}/profile_locks.html"
-
-    # ── 4. Download profiles to local machine ────────────────────────────────────
+    # ── 4. Download the JFR to the local machine ───────────────────────────────
     TS_LOCAL="$(timestamp)"
     LOCAL_DIR="$REPORTS_DIR/profiles-${POD}-${TS_LOCAL}"
     mkdir -p "$LOCAL_DIR"
 
-    echo "  Downloading profiles to $LOCAL_DIR ..."
-    kubectl -n default cp "${POD}:${REMOTE_DIR}/profile_cpu.html"   "${LOCAL_DIR}/profile_cpu.html"
-    kubectl -n default cp "${POD}:${REMOTE_DIR}/profile_wall.html"  "${LOCAL_DIR}/profile_wall.html"
-    kubectl -n default cp "${POD}:${REMOTE_DIR}/profile_mem.html"   "${LOCAL_DIR}/profile_mem.html"
-    kubectl -n default cp "${POD}:${REMOTE_DIR}/profile_locks.html" "${LOCAL_DIR}/profile_locks.html"
+    echo "  Downloading profile.jfr to $LOCAL_DIR ..."
+    kubectl -n default cp "${POD}:${REMOTE_DIR}/profile.jfr" "${LOCAL_DIR}/profile.jfr"
 
-    # Clean up remote copies to free ephemeral storage
+    # Clean up remote copy to free ephemeral storage
     kubectl -n default exec "$POD" -- rm -rf "$REMOTE_DIR" || true
+
+    # ── 5. Convert JFR into per-event-type flamegraphs locally ─────────────────
+    echo "  Generating flamegraphs with $CONVERTER_JAR ..."
+    for event in cpu wall alloc lock; do
+        echo "    - profile_${event}.html"
+        java -jar "$CONVERTER_JAR" "--${event}" \
+            "${LOCAL_DIR}/profile.jfr" \
+            "${LOCAL_DIR}/profile_${event}.html"
+    done
 
     echo ""
     echo "PROFILES_DIR=$LOCAL_DIR"
