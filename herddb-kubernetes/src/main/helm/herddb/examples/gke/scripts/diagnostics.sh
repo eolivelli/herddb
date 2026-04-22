@@ -10,7 +10,7 @@
 # Usage (async-profiler profiles):
 #   ./scripts/diagnostics.sh --pod <pod> --profile \
 #       [--profile-duration <secs>] [--profiler-home <path>] \
-#       [--per-thread]
+#       [--per-thread] [--cstack-mode fp|dwarf|lbr|vm|no]
 #
 # Usage (thread count):
 #   ./scripts/diagnostics.sh --pod <pod> --thread-count [--thread-filter <pattern>]
@@ -31,6 +31,17 @@
 #                       Useful to diagnose uneven CPU utilisation across a
 #                       thread pool (e.g. verifying all 16 IS worker threads
 #                       are active vs. a single hot thread doing all the work).
+#   --cstack-mode       C/native stack-walking mode passed to asprof --cstack.
+#                       Allowed values: fp | dwarf | lbr | vm | no
+#                       Default: vm  (JVM-managed stack walking — Java + JVM-internal
+#                       frames; no native-library unwinding overhead).
+#                       Use 'fp' if the JVM was launched with
+#                       -XX:+PreserveFramePointer (faster unwinding, more accurate
+#                       for inline frames but requires the JVM flag).
+#                       Use 'lbr' on Intel CPUs that have Last Branch Records for
+#                       near-zero-overhead hardware call-graph sampling.
+#                       Use 'no' to disable C stack walking and record only Java
+#                       frames (equivalent to the previous default behaviour).
 #   --thread-count      print the count of live JVM threads matching --thread-filter.
 #                       Uses jcmd Thread.print inside the pod — no profiler needed.
 #                       Default filter: '' (counts all threads).
@@ -66,6 +77,7 @@ PROFILE=false
 PROFILE_DURATION=30
 PROFILER_HOME="${PROFILER_HOME:-}"
 PER_THREAD=false
+CSTACK_MODE="vm"
 THREAD_COUNT=false
 THREAD_FILTER=""
 JSTACK=false
@@ -79,6 +91,7 @@ while [[ $# -gt 0 ]]; do
         --profile-duration)  PROFILE_DURATION="$2";  shift 2 ;;
         --profiler-home)     PROFILER_HOME="$2";     shift 2 ;;
         --per-thread)        PER_THREAD=true;         shift   ;;
+        --cstack-mode)       CSTACK_MODE="$2";        shift 2 ;;
         --thread-count)      THREAD_COUNT=true;       shift   ;;
         --thread-filter)     THREAD_FILTER="$2";      shift 2 ;;
         --jstack)            JSTACK=true;             shift   ;;
@@ -176,9 +189,10 @@ if $PROFILE; then
 
     ASPROF="/opt/profiler/bin/asprof"
 
-    echo "  Recording cpu+wall+alloc+lock for ${PROFILE_DURATION}s into profile.jfr..."
+    echo "  Recording cpu+wall+alloc+lock for ${PROFILE_DURATION}s (cstack=${CSTACK_MODE}) into profile.jfr..."
     kubectl -n default exec "$POD" -- \
-        "$ASPROF" --all -d "$PROFILE_DURATION" "$JVM_PID" \
+        "$ASPROF" --all --lib --cstack "$CSTACK_MODE" \
+        -d "$PROFILE_DURATION" "$JVM_PID" \
         -f "${REMOTE_DIR}/profile.jfr"
 
     TS_LOCAL="$(timestamp)"
