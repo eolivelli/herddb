@@ -18,8 +18,12 @@ else
 fi
 
 # ── 2. Delete PersistentVolumeClaims ─────────────────────────────
-echo "==> Deleting PersistentVolumeClaims..."
-kubectl delete pvc -l app.kubernetes.io/instance=herddb --ignore-not-found
+# Preserve the tools pod's dataset cache PVC so that large benchmark datasets
+# (e.g. bigann 100M/200M) do not need to be re-downloaded on the next install.
+echo "==> Deleting PersistentVolumeClaims (preserving tools dataset cache)..."
+kubectl get pvc -l app.kubernetes.io/instance=herddb -o name \
+    | grep -v "datasets-herddb-tools" \
+    | xargs --no-run-if-empty kubectl delete --ignore-not-found
 
 echo ""
 echo "==> Teardown complete."

@@ -1,0 +1,18 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard-hdd-zonal
+  annotations:
+    # Created by install.sh — do not edit by hand.
+    # Provides WaitForFirstConsumer binding for pd-standard (HDD) disks on GKE.
+    # The built-in "standard" class uses the legacy kubernetes.io/gce-pd provisioner
+    # with Immediate binding, which causes PVCs to be provisioned in a random zone
+    # before the pod is scheduled, breaking zone-pinned StatefulSets.
+    # This class uses the CSI provisioner with WaitForFirstConsumer so the disk is
+    # always created in the same zone as the pod.
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-standard
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

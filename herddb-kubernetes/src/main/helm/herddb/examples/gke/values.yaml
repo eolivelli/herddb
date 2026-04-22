@@ -151,11 +151,11 @@ fileServer:
     # 200 Gi (214748364800 B) − 10 GB (10000000000 B) = 204748364800 B.
     cacheMaxBytes: 204748364800
   storage:
-    # Use HDD (pd-standard) to avoid the 500 GiB SSD_TOTAL_GB project quota in
-    # europe-west4. The file-server's hot path is the in-process page cache and
-    # GCS fallback reads; sequential disk I/O from the local cache is not on the
-    # critical latency path, so HDD is acceptable here.
-    storageClass: "standard"
+    # standard-rwo: pd-balanced (SSD) with WaitForFirstConsumer — PV is always
+    # provisioned in the same zone as the pod, which is required for zone-pinned
+    # StatefulSets.  File server's hot path is the in-process page cache and GCS
+    # fallback; the local disk is only a cache tier, so pd-balanced is fine here.
+    storageClass: "standard-rwo"
     size: 200Gi
   resources:
     requests:
@@ -242,11 +242,14 @@ bookkeeper:
   # Ledger: HDD (pd-standard) — large sequential append; saves ~1000 GiB of SSD quota.
   # The 500 GiB SSD_TOTAL_GB project quota in europe-west4 is tight; keeping only
   # the journal on SSD stays well within it.
+  # standard-hdd-zonal: pd-standard HDD with WaitForFirstConsumer so the PV is
+  # always provisioned in the same zone as the pod (unlike "standard" which uses
+  # Immediate binding and lands in a random zone, breaking zone-pinned StatefulSets).
   storage:
     journal:
       size: 100Gi
     ledger:
-      storageClass: "standard"
+      storageClass: "standard-hdd-zonal"
       size: 500Gi
   resources:
     requests:
@@ -335,7 +338,7 @@ tools:
     datasets:
       # HDD to avoid SSD quota; dataset files are downloaded once and read
       # sequentially during ingest — HDD throughput is sufficient.
-      storageClass: "standard"
+      storageClass: "standard-hdd-zonal"
       size: 200Gi
   # Heap raised to 6 g: sift10m base set (10M × 128-dim × 4 B = 5.12 GB)
   # must fit in JVM heap during ingest. Container limit = heap + ~1 GiB overhead.

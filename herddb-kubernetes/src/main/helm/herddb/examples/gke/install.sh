@@ -272,6 +272,13 @@ else
     echo "==> Secret 'herddb-gcs-credentials' found."
 fi
 
+# ── 3b. Ensure WaitForFirstConsumer HDD StorageClass exists ─────────
+# The built-in "standard" class uses Immediate binding (PVCs are provisioned
+# before pod scheduling) so zone-pinned pods end up with PVs in the wrong zone.
+# "standard-hdd-zonal" fixes this with WaitForFirstConsumer + pd-standard.
+echo "==> Ensuring StorageClass 'standard-hdd-zonal' exists..."
+kubectl apply -f "$SCRIPT_DIR/standard-hdd-zonal-sc.yaml"
+
 # ── 4. Install or upgrade the Helm chart ──────────────────────────
 if helm status herddb >/dev/null 2>&1; then
     echo "==> Helm release 'herddb' already exists, upgrading..."

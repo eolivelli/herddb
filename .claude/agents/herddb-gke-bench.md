@@ -294,10 +294,41 @@ Agent(
   RunLog: <RUN_LOG path>
   IsReplicas: 2
   TickNum: 7
-  Output a TICK SUMMARY as described in .claude/agents/herddb-cluster-monitor.md
+
+  For each IS get vector_count and estimated_memory_bytes from
+  `indexing-admin describe-index --json` (NOT engine-stats).
+  Compute mem in GiB = estimated_memory_bytes / 1073741824. Warn if > 18 GiB.
+  Compute IS-N lag% = vector_count_IS-N / rows_ingested * 100.
+  With --index-num-shards 4 and 2 IS replicas each IS should hold ~50% of rows.
+
+  Format the TICK SUMMARY exactly as:
+
+  TICK N SUMMARY
+  Variant: gke
+  Phase: <phase>  Progress: rows=X/100000000 (X%)  ETA: ~Xs (~Xh Xm)
+  PodStatus: <compact summary — Running/Ready counts, any restarts>
+  IS-0: vectors=X (X% of rows), mem=X GiB — <OK|WARN>
+  IS-1: vectors=X (X% of rows), mem=X GiB — <OK|WARN>
+  Bookie: [OMIT this line entirely unless blocked>0 or rejected>0 or skipThr>0]
+  LogErrors: <none detected | verbatim error lines>
+  Verdict: <healthy|warning|fatal>
   """
 )
 ```
+
+### Tick format rules
+
+- **ETA**: always include `ETA: ~Xs (~Xh Xm)` on the Progress line, taken
+  from `eta_s` in the run log.
+- **IndexLag**: for each IS report `vectors=X (X% of rows)` where X% =
+  `vector_count / rows_ingested * 100`. Use `describe-index` `vector_count`,
+  not engine-stats watermark offsets. With 2 IS replicas and `--index-num-shards 4`
+  the steady-state target is ~50% per instance. Flag as WARN if an instance
+  falls below 30% or above 70% for 3+ consecutive ticks.
+- **Memory**: use `estimated_memory_bytes` from `describe-index`. Convert to
+  GiB. Warn (WARN) if > 18 GiB (limit is 20 GiB in values.yaml).
+- **Bookie line**: omit entirely when `blocked=0`, `rejected=0`, `skipThr=0`.
+  Only surface it when at least one of those counters is non-zero.
 
 If any VERDICT is `fatal`: stop the background `run-bench.sh` task
 immediately, then proceed to §Failure handling. Do NOT attempt to mitigate
