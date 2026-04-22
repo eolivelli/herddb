@@ -71,11 +71,28 @@ spec:
             - name: http
               containerPort: {{ .Values.bookkeeper.httpPort }}
               protocol: TCP
+          # Use HTTP probes against the bookie's Prometheus-stats HTTP server
+          # (prometheusStatsHttpPort = bookkeeper.httpPort) rather than
+          # tcpSocket on the bookie binary port 3181. The binary-port probe
+          # ran a full Netty auth handshake every 5s per replica, which
+          # spammed the bookie log with connect/disconnect cycles and
+          # drowned out real events (see issue #211). /metrics is what
+          # actually binds 8000 when both httpServerEnabled=true and
+          # prometheusStatsHttpPort are set — the admin /api/v1/* routes
+          # share the port in 4.16 but not reliably across 4.17.x.
           readinessProbe:
-            tcpSocket:
-              port: {{ .Values.bookkeeper.bookiePort }}
+            httpGet:
+              path: /metrics
+              port: {{ .Values.bookkeeper.httpPort }}
             initialDelaySeconds: 10
-            periodSeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: {{ .Values.bookkeeper.httpPort }}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.bookkeeper.resources | nindent 12 }}
           volumeMounts:

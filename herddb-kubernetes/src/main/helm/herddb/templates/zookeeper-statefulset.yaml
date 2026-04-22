@@ -50,11 +50,27 @@ spec:
             - name: metrics
               containerPort: {{ .Values.zookeeper.metricsPort }}
               protocol: TCP
+            - name: admin
+              containerPort: {{ .Values.zookeeper.adminPort }}
+              protocol: TCP
+          # HTTP probes against the ZK 3.6+ AdminServer (admin.serverPort)
+          # using /commands/ruok, rather than tcpSocket on the client port:
+          # the tcpSocket probe made ZK log a
+          # `session = 0x0, Unable to read additional data` line every 5 s
+          # per replica (see issue #211).
           readinessProbe:
-            tcpSocket:
-              port: {{ .Values.zookeeper.clientPort }}
+            httpGet:
+              path: /commands/ruok
+              port: {{ .Values.zookeeper.adminPort }}
             initialDelaySeconds: 5
-            periodSeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /commands/ruok
+              port: {{ .Values.zookeeper.adminPort }}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.zookeeper.resources | nindent 12 }}
           volumeMounts:

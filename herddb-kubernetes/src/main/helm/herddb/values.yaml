@@ -136,6 +136,11 @@ zookeeper:
   replicaCount: 1
   clientPort: 2181
   metricsPort: 7070
+  # ZK 3.6+ AdminServer HTTP port. Used by the pod's readiness/liveness
+  # probes via /commands/ruok so the probe doesn't TCP-connect on the
+  # binary client port (which generates `session = 0x0` log spam — see
+  # issue #211).
+  adminPort: 8080
   javaOpts: ""
   # Optional: override /opt/herddb/conf/logging.properties inside the pod.
   # Empty string = use the logging.properties bundled in the Docker image.

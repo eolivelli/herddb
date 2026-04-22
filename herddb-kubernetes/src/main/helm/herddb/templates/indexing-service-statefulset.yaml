@@ -82,11 +82,23 @@ spec:
             - name: http
               containerPort: {{ .Values.indexingService.httpPort }}
               protocol: TCP
+          # HTTP probes against the indexing-service's Jetty/Prometheus
+          # endpoint (indexingService.httpPort) rather than tcpSocket on the
+          # gRPC port — avoids generating TCP connect/disconnect log noise
+          # on the gRPC port every 5 s (see issue #211).
           readinessProbe:
-            tcpSocket:
-              port: {{ .Values.indexingService.port }}
+            httpGet:
+              path: /metrics
+              port: {{ .Values.indexingService.httpPort }}
             initialDelaySeconds: 10
-            periodSeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: {{ .Values.indexingService.httpPort }}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.indexingService.resources | nindent 12 }}
           volumeMounts:

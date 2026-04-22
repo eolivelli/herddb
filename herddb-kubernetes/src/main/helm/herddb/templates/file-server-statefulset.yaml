@@ -104,11 +104,23 @@ spec:
             - name: http
               containerPort: {{ .Values.fileServer.httpPort }}
               protocol: TCP
+          # HTTP probes against the Jetty/Prometheus endpoint
+          # (fileServer.httpPort) rather than tcpSocket on the gRPC port —
+          # avoids generating TCP connect/disconnect log noise on the gRPC
+          # port every 5 s (see issue #211).
           readinessProbe:
-            tcpSocket:
-              port: {{ .Values.fileServer.port }}
+            httpGet:
+              path: /metrics
+              port: {{ .Values.fileServer.httpPort }}
             initialDelaySeconds: 10
-            periodSeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: {{ .Values.fileServer.httpPort }}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.fileServer.resources | nindent 12 }}
           volumeMounts:

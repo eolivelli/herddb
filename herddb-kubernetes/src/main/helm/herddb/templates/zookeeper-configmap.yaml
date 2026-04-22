@@ -12,6 +12,13 @@ data:
     dataDir=/opt/herddb/zk-data
     clientPort={{ .Values.zookeeper.clientPort }}
     http.port={{ .Values.zookeeper.metricsPort }}
+    # ZK 3.6+ AdminServer: used by the pod readiness/liveness probes
+    # (/commands/ruok). Keeps the binary client port free of junk probe
+    # connections that would otherwise spam the log with `session = 0x0`
+    # (issue #211).
+    admin.enableServer=true
+    admin.serverPort={{ .Values.zookeeper.adminPort }}
+    admin.serverAddress=0.0.0.0
 {{- if .Values.zookeeper.loggingProperties }}
   logging.properties: |
 {{ .Values.zookeeper.loggingProperties | indent 4 }}

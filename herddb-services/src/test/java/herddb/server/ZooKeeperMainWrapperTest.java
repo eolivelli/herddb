@@ -38,6 +38,95 @@ public class ZooKeeperMainWrapperTest {
     public TemporaryFolder folder = new TemporaryFolder();
 
     @Test
+    public void testAdminServerRuok() throws Exception {
+        // This exercises the AdminServer configuration used by the Helm
+        // chart's ZooKeeper readiness/liveness probe (issue #211): with
+        // admin.enableServer=true + admin.serverPort=<port>, GET
+        // /commands/ruok must return HTTP 200 and a JSON body that
+        // identifies the command as "ruok".
+        int clientPort;
+        try (ServerSocket ss = new ServerSocket(0)) {
+            clientPort = ss.getLocalPort();
+        }
+        int httpPort;
+        try (ServerSocket ss = new ServerSocket(0)) {
+            httpPort = ss.getLocalPort();
+        }
+        int adminPort;
+        try (ServerSocket ss = new ServerSocket(0)) {
+            adminPort = ss.getLocalPort();
+        }
+
+        Properties config = new Properties();
+        config.put("tickTime", "2000");
+        config.put("dataDir", folder.newFolder("zk-data-admin").getAbsolutePath());
+        config.put("clientPort", String.valueOf(clientPort));
+        config.put("http.port", String.valueOf(httpPort));
+        // Same settings the Helm chart writes into zoo.cfg.
+        config.put("admin.enableServer", "true");
+        config.put("admin.serverPort", String.valueOf(adminPort));
+        config.put("admin.serverAddress", "0.0.0.0");
+
+        ZooKeeperMainWrapper wrapper = new ZooKeeperMainWrapper(config);
+        Thread runner = new Thread(() -> {
+            try {
+                wrapper.run();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        });
+        runner.setDaemon(true);
+        runner.start();
+
+        try {
+            // Wait for ZK client port to accept connections.
+            boolean ready = false;
+            for (int i = 0; i < 60; i++) {
+                try (java.net.Socket s = new java.net.Socket("localhost", clientPort)) {
+                    ready = true;
+                    break;
+                } catch (Exception e) {
+                    Thread.sleep(500);
+                }
+            }
+            assertTrue("ZooKeeper did not start in time", ready);
+
+            // /commands/ruok must respond 200 once AdminServer is up.
+            String body = null;
+            int responseCode = -1;
+            for (int i = 0; i < 60; i++) {
+                try {
+                    URL ruokUrl = new URL("http://localhost:" + adminPort + "/commands/ruok");
+                    HttpURLConnection conn = (HttpURLConnection) ruokUrl.openConnection();
+                    conn.setRequestMethod("GET");
+                    conn.setConnectTimeout(2000);
+                    conn.setReadTimeout(2000);
+                    responseCode = conn.getResponseCode();
+                    if (responseCode == 200) {
+                        StringBuilder sb = new StringBuilder();
+                        try (BufferedReader reader = new BufferedReader(
+                                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                            String line;
+                            while ((line = reader.readLine()) != null) {
+                                sb.append(line).append('\n');
+                            }
+                        }
+                        body = sb.toString();
+                        break;
+                    }
+                } catch (Exception e) {
+                    Thread.sleep(500);
+                }
+            }
+            assertTrue("Expected HTTP 200 from /commands/ruok, got " + responseCode, responseCode == 200);
+            assertTrue("Expected /commands/ruok body to mention the ruok command, got: " + body,
+                    body != null && body.contains("ruok"));
+        } finally {
+            wrapper.close();
+        }
+    }
+
+    @Test
     public void testBootAndMetrics() throws Exception {
         int clientPort;
         try (ServerSocket ss = new ServerSocket(0)) {
@@ -53,6 +142,10 @@ public class ZooKeeperMainWrapperTest {
         config.put("dataDir", folder.newFolder("zk-data").getAbsolutePath());
         config.put("clientPort", String.valueOf(clientPort));
         config.put("http.port", String.valueOf(httpPort));
+        // ZK 3.6+ enables AdminServer by default on port 8080. Keep this
+        // test focused on /metrics by disabling it — the AdminServer path
+        // is covered by testAdminServerRuok.
+        config.put("admin.enableServer", "false");
         // These properties should be stripped and not cause a ClassNotFoundException
         config.put("metricsProvider.className", "org.apache.zookeeper.metrics.prometheus.PrometheusMetricsProvider");
         config.put("metricsProvider.httpPort", "7070");
