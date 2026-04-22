@@ -301,6 +301,14 @@ indexingService:
     # Confirmed via per-thread flamegraph (profiles-herddb-indexing-service-0-20260421-155442)
     # that the auto default left 8 CPUs idle.
     indexing.apply.parallelism: "16"
+    # Vector store in-memory budget (IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT).
+    # Default 0 means maxMemory/3 = 24 GiB / 3 = 8 GiB.  At 8 GiB the IS triggers
+    # memory-pressure checkpoints (flush to file-server) every second during heavy
+    # ingest, because the HNSW graph grows past 70% of that 8 GiB limit almost
+    # immediately.  Raising to 20 GiB leaves ~4 GiB for BK/Netty/GC overhead and
+    # lets the IS accumulate much larger dirty-segment batches before flushing,
+    # dramatically reducing checkpoint frequency and improving apply throughput.
+    indexing.memory.vector.limit: "21474836480"
   resources:
     requests:
       memory: "32Gi"
