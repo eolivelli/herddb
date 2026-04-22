@@ -37,8 +37,12 @@ import herddb.server.ServerConfiguration;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
 
@@ -48,9 +52,9 @@ import org.junit.Test;
  * DBManager checkpoint-flush executor; these tests prove it by:
  *
  * <ul>
- *   <li>wrapping the {@link MemoryDataStorageManager} so every {@code writePage} call
- *       bumps an in-flight counter and briefly sleeps — the MAX observed in-flight
- *       must exceed 1 when many pages exist, proving the calls actually overlap;</li>
+ *   <li>wrapping the {@link MemoryDataStorageManager} so the first two {@code writePage}
+ *       calls deterministically rendezvous through a latch — a timeout there means the
+ *       Phase-B flush serialised, which fails loudly with {@code maxInFlight == 1};</li>
  *   <li>injecting a failure on the N-th {@code writePage} and asserting the whole
  *       checkpoint fails with a recognisable cause, not a silent partial-success.</li>
  * </ul>
@@ -68,7 +72,6 @@ public class CheckpointParallelFlushTest {
         config.set(ServerConfiguration.PROPERTY_CHECKPOINT_FLUSH_PARALLELISM, 8);
 
         InFlightTrackingStorage ds = new InFlightTrackingStorage();
-        ds.pageWriteDelayMillis = 40L;
         String nodeId = "localhost";
         try (DBManager manager = new DBManager(nodeId,
                 new MemoryMetadataStorageManager(), ds, new MemoryCommitLogManager(),
@@ -89,7 +92,15 @@ public class CheckpointParallelFlushTest {
                         Arrays.asList("k" + i, "payload-" + i + "-padding-padding-padding"));
             }
 
+            // Pre-warm the checkpoint-flush executor so the cold-start of the second worker
+            // thread cannot masquerade as serial execution under the assertion below.
+            primeExecutor(manager.getCheckpointFlushExecutor(), 2);
+
             ds.resetCounters();
+            // Rendezvous: the first two writePage calls must meet at this latch before
+            // either one returns. If the Phase-B flush ever serialises, the first writer
+            // times out and maxInFlight stays at 1 → the assertion fails deterministically.
+            ds.concurrencyLatch = new CountDownLatch(2);
             manager.checkpoint();
 
             assertTrue("expected writePage to be invoked during checkpoint, got "
@@ -163,17 +174,42 @@ public class CheckpointParallelFlushTest {
     }
 
     /**
+     * Fire {@code parties} no-op tasks through the checkpoint-flush executor that meet
+     * at a {@link CyclicBarrier} so {@code parties} worker threads are guaranteed to be
+     * alive and warm before the real checkpoint begins. Without this step the first
+     * {@code writePage} submission can complete before the second worker thread is even
+     * dispatched by the OS, making parallel execution look serial.
+     */
+    private static void primeExecutor(ExecutorService executor, int parties) throws Exception {
+        CyclicBarrier barrier = new CyclicBarrier(parties);
+        CountDownLatch done = new CountDownLatch(parties);
+        for (int i = 0; i < parties; i++) {
+            executor.execute(() -> {
+                try {
+                    barrier.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException | BrokenBarrierException | TimeoutException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        assertTrue("checkpoint-flush executor did not warm up in time",
+                done.await(15, TimeUnit.SECONDS));
+    }
+
+    /**
      * {@link MemoryDataStorageManager} wrapper that counts {@code writePage} invocations,
-     * tracks peak concurrency, optionally sleeps to widen the overlap window, and
-     * optionally fails on the N-th invocation.
+     * tracks peak concurrency, deterministically rendezvous the first N concurrent
+     * writers through a latch, and optionally fails on the N-th invocation.
      */
     private static final class InFlightTrackingStorage extends MemoryDataStorageManager {
         final AtomicInteger writePageCount = new AtomicInteger();
         final AtomicInteger inFlight = new AtomicInteger();
         final AtomicInteger maxInFlight = new AtomicInteger();
-        volatile long pageWriteDelayMillis = 0L;
+        volatile CountDownLatch concurrencyLatch;
+        volatile long rendezvousTimeoutMillis = 30_000L;
         volatile int failOnWriteCount = -1;
-        private final CountDownLatch dummy = new CountDownLatch(0);
 
         void resetCounters() {
             writePageCount.set(0);
@@ -188,12 +224,19 @@ public class CheckpointParallelFlushTest {
             int current = inFlight.incrementAndGet();
             maxInFlight.accumulateAndGet(current, Math::max);
             try {
+                // Failure injection takes precedence so the failure-path test never hangs
+                // on the rendezvous (it only issues a single writePage before throwing).
                 if (failOnWriteCount > 0 && hits == failOnWriteCount) {
                     throw new RuntimeException("injected writePage failure (#" + hits + ")");
                 }
-                if (pageWriteDelayMillis > 0) {
+                CountDownLatch latch = concurrencyLatch;
+                if (latch != null) {
+                    latch.countDown();
                     try {
-                        dummy.await(pageWriteDelayMillis, TimeUnit.MILLISECONDS);
+                        // Once two writers have met, the latch is at zero and every
+                        // subsequent await() returns immediately, so later pages pay
+                        // no rendezvous cost.
+                        latch.await(rendezvousTimeoutMillis, TimeUnit.MILLISECONDS);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
