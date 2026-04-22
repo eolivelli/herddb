@@ -12,6 +12,12 @@
 #       [--profile-duration <secs>] [--profiler-home <path>] \
 #       [--per-thread]
 #
+# Usage (thread count):
+#   ./scripts/diagnostics.sh --pod <pod> --thread-count [--thread-filter <pattern>]
+#
+# Usage (jstack):
+#   ./scripts/diagnostics.sh --pod <pod> --jstack
+#
 # Defaults:
 #   --pod               herddb-file-server-0
 #   --analyze           disabled (pass --analyze to run MAT after download)
@@ -25,6 +31,13 @@
 #                       Useful to diagnose uneven CPU utilisation across a
 #                       thread pool (e.g. verifying all 16 IS worker threads
 #                       are active vs. a single hot thread doing all the work).
+#   --thread-count      print the count of live JVM threads matching --thread-filter.
+#                       Uses jcmd Thread.print inside the pod — no profiler needed.
+#                       Default filter: '' (counts all threads).
+#                       Example: --thread-count --thread-filter indexing-apply-worker
+#   --jstack            capture a full thread dump via jcmd Thread.print, download it
+#                       to reports/jstack-<pod>-<timestamp>.txt, and print its path
+#                       as JSTACK=<path>. Useful for diagnosing deadlocks or hangs.
 #
 # Output (heap dump):
 #   Prints  HEAP_DUMP=<local-path>  on the last line on success.
@@ -53,6 +66,9 @@ PROFILE=false
 PROFILE_DURATION=30
 PROFILER_HOME="${PROFILER_HOME:-}"
 PER_THREAD=false
+THREAD_COUNT=false
+THREAD_FILTER=""
+JSTACK=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -63,9 +79,71 @@ while [[ $# -gt 0 ]]; do
         --profile-duration)  PROFILE_DURATION="$2";  shift 2 ;;
         --profiler-home)     PROFILER_HOME="$2";     shift 2 ;;
         --per-thread)        PER_THREAD=true;         shift   ;;
+        --thread-count)      THREAD_COUNT=true;       shift   ;;
+        --thread-filter)     THREAD_FILTER="$2";      shift 2 ;;
+        --jstack)            JSTACK=true;             shift   ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+if $THREAD_COUNT; then
+    section "Live thread count in pod $POD"
+
+    echo "  Locating JVM PID..."
+    JVM_PID=$(kubectl -n default exec "$POD" -- sh -c \
+        'jcmd 2>/dev/null | grep -v "^[0-9]* Jcmd$" | awk "NR==1{print \$1}"')
+
+    if [[ -z "$JVM_PID" ]]; then
+        echo "ERROR: could not determine JVM PID in $POD (is jcmd available?)" >&2
+        exit 1
+    fi
+    echo "  JVM PID: $JVM_PID"
+
+    if [[ -n "$THREAD_FILTER" ]]; then
+        echo "  Filter: '$THREAD_FILTER'"
+        COUNT=$(kubectl -n default exec "$POD" -- sh -c \
+            "jcmd $JVM_PID Thread.print 2>/dev/null | grep -c '$THREAD_FILTER'" || true)
+        echo ""
+        echo "  Threads matching '$THREAD_FILTER': $COUNT"
+    else
+        echo "  Filter: (none — counting all threads)"
+        # jcmd Thread.print prints one '"<thread-name>"' header per thread
+        COUNT=$(kubectl -n default exec "$POD" -- sh -c \
+            "jcmd $JVM_PID Thread.print 2>/dev/null | grep -c '^\"'" || true)
+        echo ""
+        echo "  Total live threads: $COUNT"
+    fi
+
+    echo ""
+    echo "THREAD_COUNT=$COUNT"
+    exit 0
+fi
+
+if $JSTACK; then
+    section "Thread dump (jstack) from pod $POD"
+
+    echo "  Locating JVM PID..."
+    JVM_PID=$(kubectl -n default exec "$POD" -- sh -c \
+        'jcmd 2>/dev/null | grep -v "^[0-9]* Jcmd$" | awk "NR==1{print \$1}"')
+
+    if [[ -z "$JVM_PID" ]]; then
+        echo "ERROR: could not determine JVM PID in $POD (is jcmd available?)" >&2
+        exit 1
+    fi
+    echo "  JVM PID: $JVM_PID"
+
+    TS="$(timestamp)"
+    LOCAL_JSTACK="$REPORTS_DIR/jstack-${POD}-${TS}.txt"
+    mkdir -p "$REPORTS_DIR"
+
+    echo "  Capturing thread dump..."
+    kubectl -n default exec "$POD" -- sh -c \
+        "jcmd $JVM_PID Thread.print 2>/dev/null" > "$LOCAL_JSTACK"
+
+    echo ""
+    echo "JSTACK=$LOCAL_JSTACK"
+    exit 0
+fi
 
 if $PROFILE; then
     section "async-profiler JFR from pod $POD (${PROFILE_DURATION}s, cpu+wall+alloc+lock)"

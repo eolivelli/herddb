@@ -172,7 +172,11 @@ zookeeper:
 bookkeeper:
   enabled: true
   replicaCount: 2
-  # 2 g heap + 1 g direct + ~1 g JVM overhead → 4 g; container = 8 GiB.
+  # 2 g heap + 1 g direct + ~1 g JVM overhead → 4 g; container = 4 GiB.
+  # Previously set to 3 GiB which left zero headroom for JVM overhead (metaspace,
+  # code cache, thread stacks, GC structures) — bookie was OOMKilled after ~25 min
+  # of high-throughput ingest (SortedLedgerStorage rapid memtable flushes push
+  # native allocations transiently above MaxDirectMemorySize). Raised to 4 GiB.
   javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
   # Enable FINE logging for BK write processors so OperationRejectedException
   # (bookie backpressure) becomes visible.
@@ -225,16 +229,26 @@ bookkeeper:
       size: 500Gi
   resources:
     requests:
-      memory: "3Gi"
+      memory: "4Gi"
       cpu: "0.25"
     limits:
-      memory: "3Gi"
+      memory: "4Gi"
       cpu: "0.5"
 
 indexingService:
   enabled: true
   storageMode: remote
   replicaCount: 2
+  # Request AVX-512 capable nodes for jvector acceleration.
+  # GKE Autopilot compute classes that provide AVX-512:
+  #   Performance  → Intel C3 (Sapphire Rapids): AVX-512F/BW/VL/DQ/VNNI/FP16  ← recommended
+  #   (default Balanced may land on AMD EPYC Milan or older Intel — AVX2 only)
+  # Uncomment to pin IS pods to AVX-512 nodes:
+  # nodeSelector:
+  #   cloud.google.com/compute-class: "Performance"
+  # Alternative: pin to a specific machine family
+  # nodeSelector:
+  #   cloud.google.com/machine-family: "c3"
   # 24 g heap + 6 g direct + ~1 g JVM overhead = 31 g (< 32 GiB container; 1 GiB headroom).
   # Heap sized for HNSW graph segment caching — the primary IS working set.
   # 6 g direct: needed for zero-copy ByteBuffer vectors (jvector 4.x) and concurrent
@@ -302,7 +316,7 @@ tools:
       cpu: "1"
 
 prometheus:
-  enabled: true
+  enabled: false
 
 grafana:
-  enabled: true
+  enabled: false
