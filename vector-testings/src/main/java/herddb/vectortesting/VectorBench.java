@@ -46,6 +46,19 @@ public class VectorBench {
         void run() throws Exception;
     }
 
+    static String buildCreateVectorIndexSql(Config config) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("CREATE VECTOR INDEX vidx ON ").append(config.tableName).append("(vec)")
+                .append(" WITH m=").append(config.indexM)
+                .append(" beamWidth=").append(config.indexBeamWidth)
+                .append(" similarity=").append(config.effectiveSimilarity())
+                .append(" fusedPQ=true");
+        if (config.indexNumShards > 1) {
+            sb.append(" numShards ").append(config.indexNumShards);
+        }
+        return sb.toString();
+    }
+
     /** Runs a task with a progress spinner and returns elapsed wall-clock seconds. */
     private static double runWithProgress(BenchOutput out, String phase, String label, SqlTask task) throws Exception {
         if (!out.suppressesText()) {
@@ -174,10 +187,7 @@ public class VectorBench {
 
         // Phase 4a: Index creation before ingestion (if requested)
         if (config.indexBeforeIngest && !config.skipIndex) {
-            String indexSql = "CREATE VECTOR INDEX vidx ON " + config.tableName + "(vec)"
-                    + " WITH m=" + config.indexM
-                    + " beamWidth=" + config.indexBeamWidth
-                    + " similarity=" + config.effectiveSimilarity() + " fusedPQ=true";
+            String indexSql = buildCreateVectorIndexSql(config);
             out.info("Executing (pre-ingest): " + indexSql);
             indexWallSecs = runWithProgress(out, "index_creation", "=== INDEX CREATION (pre-ingest) ===", () -> {
                 try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
@@ -389,10 +399,7 @@ public class VectorBench {
 
         // Phase 5: Index creation (post-ingest, unless already created before ingestion)
         if (!config.skipIndex && !config.indexBeforeIngest) {
-            String indexSql = "CREATE VECTOR INDEX vidx ON " + config.tableName + "(vec)"
-                    + " WITH m=" + config.indexM
-                    + " beamWidth=" + config.indexBeamWidth
-                    + " similarity=" + config.effectiveSimilarity() + " fusedPQ=true";
+            String indexSql = buildCreateVectorIndexSql(config);
             out.info("Executing: " + indexSql);
             indexWallSecs = runWithProgress(out, "index_creation", "=== INDEX CREATION ===", () -> {
                 try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);

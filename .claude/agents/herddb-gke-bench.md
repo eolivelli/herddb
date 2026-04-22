@@ -195,6 +195,12 @@ Rules that apply to every workload, including user-specified ones:
   recall phase — go to the failure path.
 - **Checkpoint timeout.** Always pass `--checkpoint-timeout-seconds 1800`.
   Never use a lower value.
+- **Vector index sharding.** `VectorBench` now emits `numShards 4` by default
+  so a 2/4-replica indexing-service cluster actually shards the work across
+  instances (`shardId % numInstances == instanceId`). Do not pass
+  `--index-num-shards` unless the user explicitly asks for a different value
+  (e.g. `--index-num-shards 1` to disable sharding for a single-replica run,
+  or a larger value to match a non-standard `indexingService.replicaCount`).
 - **Wait-for-indexes timeout.** Always pass
   `--wait-for-indexes-timeout 1800`. Never use a lower value.
 - **Custom datasets** live in `gs://herddb-datasets`. To run a GCS-hosted

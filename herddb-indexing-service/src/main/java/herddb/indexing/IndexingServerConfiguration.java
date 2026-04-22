@@ -186,9 +186,6 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_NUM_INSTANCES = "indexing.cluster.numInstances";
     public static final int PROPERTY_NUM_INSTANCES_DEFAULT = 1;
 
-    public static final String PROPERTY_DEFAULT_NUM_SHARDS = "indexing.vector.default.numShards";
-    public static final int PROPERTY_DEFAULT_NUM_SHARDS_DEFAULT = 1;
-
     // Log tailing mode
     public static final String PROPERTY_LOG_TYPE = "indexing.log.type";
     public static final String PROPERTY_LOG_TYPE_DEFAULT = "file";
