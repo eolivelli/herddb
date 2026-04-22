@@ -833,6 +833,62 @@ compaction thread wakes (timer or memory pressure)
 </dependency>
 ```
 
+### Required JVM flags for SIMD performance
+
+jvector's distance-function hot loops rely on the JDK Panama Vector API (and, on
+JDK 22+, a native Panama FFM provider backed by AVX/AVX-512 intrinsics). To reach
+its fastest code path, the JVM must be launched with specific flags. The
+`herddb-services` distribution ships these defaults in `bin/setenv.sh` and in the
+Docker / Helm images, so running HerdDB via `bin/service` or the published
+container picks them up automatically.
+
+**Mandatory flags (applied via `JDK_JAVA_OPTIONS` in `setenv.sh`):**
+
+| Flag | Purpose |
+|------|---------|
+| `--add-modules jdk.incubator.vector` | Loads the incubating Vector API module (Panama). Without it jvector falls back to the scalar `DefaultVectorUtilSupport` implementation and logs a warning at startup. |
+| `--enable-native-access=ALL-UNNAMED` | Required on JDK 22+ for jvector's `NativeVectorUtilSupport` to call the packaged native SIMD library through the Foreign Function & Memory API. |
+| `-XX:CompileCommandFile=conf/jvector-compiler-directives` | Force-inlines jvector's vector-distance implementations (`PanamaVectorUtilSupport`, `NativeVectorUtilSupport`, `DefaultVectorUtilSupport`, `VectorUtil`, `cnative.NativeSimdOps`) at every call site so the SIMD intrinsics stay on the fast path inside graph-search inner loops. |
+
+**Compile-command file** — see
+`herddb-services/src/main/resources/conf/jvector-compiler-directives` for the full
+list of force-inlined classes. The file is packaged into the release zip and
+mounted in Docker and Helm-deployed pods automatically.
+
+**Verifying the flags are active.** At startup `java` prints one
+`CompileCommand: inline io/github/jbellis/jvector/vector/*.* bool inline = true`
+line per directive. If instead you see a warning like
+
+```
+Java vector incubator module is not readable. For optimal vector performance,
+pass '--add-modules jdk.incubator.vector'...
+```
+
+jvector is running in its scalar fallback path — queries will still be correct
+but 5–20× slower depending on dataset dimensionality and CPU.
+
+**Customizing JVM options without losing the jvector baseline.** `setenv.sh`
+supports two additive env vars so that deployments can add flags without having
+to re-specify the defaults:
+
+- `JAVA_OPTS_EXTRA` — appended to `JAVA_OPTS` (heap, GC, -D properties)
+- `JDK_JAVA_OPTIONS_EXTRA` — appended to `JDK_JAVA_OPTIONS` (module opens etc.)
+
+The Helm chart exposes these as `server.javaOptsExtra`,
+`fileServer.javaOptsExtra`, `bookkeeper.javaOptsExtra` and
+`indexingService.javaOptsExtra`. Prefer these over the full-replace
+`*.javaOpts` fields — the latter drop every default, including the jvector
+flags above (`JDK_JAVA_OPTIONS` is kept intact, but you lose the heap/GC
+baseline). Example:
+
+```yaml
+# values.yaml — add a larger heap and -XX:+AlwaysPreTouch without losing
+# the baseline or the jvector flags.
+indexingService:
+  enabled: true
+  javaOptsExtra: "-Xmx16g -XX:+AlwaysPreTouch"
+```
+
 ### Graph builder configuration
 
 ```java
