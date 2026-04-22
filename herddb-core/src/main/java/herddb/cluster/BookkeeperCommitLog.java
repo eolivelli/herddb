@@ -534,6 +534,17 @@ public class BookkeeperCommitLog extends CommitLog {
                     signalLogFailed();
                 }
             }
+            // New ledger is live and durably recorded in ZK.  If a transient
+            // per-entry BK write error (e.g. BKNotEnoughBookiesException during
+            // a ZK session outage) previously set the log-level `failed` flag,
+            // clear it now: this rotation IS the recovery path.  Without this,
+            // log.log() would keep returning LogNotAvailableException on the
+            // freshly-opened ledger and ingest would stay frozen even though
+            // the cluster has recovered (issue #204).  Fatal cases do not
+            // reach this point: BKLedgerFencedException keeps failed=true via
+            // handleBookKeeperFailure, and persistent ledger-creation/ZK-save
+            // failures throw out of openNewLedger before this line.
+            failed = false;
             pendingLedgerId = null;
             return writer;
         } catch (LogNotAvailableException err) {
