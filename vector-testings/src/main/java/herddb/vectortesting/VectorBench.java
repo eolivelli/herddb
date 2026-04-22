@@ -19,6 +19,7 @@
  */
 package herddb.vectortesting;
 
+import com.google.common.util.concurrent.RateLimiter;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.Statement;
@@ -220,11 +221,16 @@ public class VectorBench {
 
             long ingestStart = System.nanoTime();
 
+            RateLimiter ingestRateLimiter = config.ingestMaxOpsPerSecond > 0
+                    ? RateLimiter.create(config.ingestMaxOpsPerSecond)
+                    : null;
+
             ExecutorService ingestPool = Executors.newFixedThreadPool(config.ingestThreads);
             List<Future<?>> ingestFutures = new ArrayList<>(config.ingestThreads);
             for (int t = 0; t < config.ingestThreads; t++) {
                 ingestFutures.add(ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId,
-                        ingestMetrics, ingestStatus, ingestStart, commitsTotal, commitsRecovered, rowsCommitted)));
+                        ingestMetrics, ingestStatus, ingestStart, commitsTotal, commitsRecovered, rowsCommitted,
+                        ingestRateLimiter)));
             }
 
             // Progress display thread runs during the entire ingestion

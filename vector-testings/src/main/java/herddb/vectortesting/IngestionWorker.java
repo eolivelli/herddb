@@ -19,6 +19,7 @@
  */
 package herddb.vectortesting;
 
+import com.google.common.util.concurrent.RateLimiter;
 import herddb.jdbc.PreparedStatementAsync;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -56,6 +57,7 @@ public class IngestionWorker implements Runnable {
     private final AtomicLong commitsTotal;
     private final AtomicLong commitsRecovered;
     private final AtomicLong rowsCommitted;
+    private final RateLimiter ingestRateLimiter;
 
     /**
      * Base of the exponential back-off between commit retries, in milliseconds.
@@ -66,7 +68,8 @@ public class IngestionWorker implements Runnable {
 
     public IngestionWorker(Config config, BlockingQueue<float[]> queue, AtomicBoolean done, AtomicLong rowId,
                            MetricsCollector metrics, AtomicReference<String> statusLine, long ingestStartNanos,
-                           AtomicLong commitsTotal, AtomicLong commitsRecovered, AtomicLong rowsCommitted) {
+                           AtomicLong commitsTotal, AtomicLong commitsRecovered, AtomicLong rowsCommitted,
+                           RateLimiter ingestRateLimiter) {
         this.config = config;
         this.queue = queue;
         this.done = done;
@@ -77,6 +80,7 @@ public class IngestionWorker implements Runnable {
         this.commitsTotal = commitsTotal;
         this.commitsRecovered = commitsRecovered;
         this.rowsCommitted = rowsCommitted;
+        this.ingestRateLimiter = ingestRateLimiter;
     }
 
     private static String formatEta(double seconds) {
@@ -232,20 +236,19 @@ public class IngestionWorker implements Runnable {
                     long now = System.currentTimeMillis();
                     if (pendingBatch.size() >= config.batchSize
                             || (!pendingBatch.isEmpty() && now - lastCommitTime >= maxCommitIntervalMs)) {
+                        int batchRows = pendingBatch.size();
                         long latencyNanos = commitWithRetry(ps, conn, pendingBatch, batchStartNanos);
                         metrics.record(latencyNanos);
-                        rowsIngested += pendingBatch.size();
+                        rowsIngested += batchRows;
                         pendingBatch.clear();
                         lastCommitTime = now;
-                    }
 
-                    // Throttle if max ops/s is configured
-                    if (config.ingestMaxOpsPerSecond > 0) {
-                        double expectedElapsedSecs = (double) rowsIngested / config.ingestMaxOpsPerSecond;
-                        double actualElapsedSecs = (System.nanoTime() - ingestStartNanos) / 1e9;
-                        double sleepSecs = expectedElapsedSecs - actualElapsedSecs;
-                        if (sleepSecs > 0.001) {
-                            Thread.sleep((long) (sleepSecs * 1000));
+                        if (ingestRateLimiter != null) {
+                            // Shared across all ingestion workers, so --ingest-max-ops is a
+                            // true global cap. Guava's acquire() is uninterruptible; wait
+                            // time is bounded by batchRows / rate, so worker shutdown via
+                            // done.get() remains responsive on the next poll() iteration.
+                            ingestRateLimiter.acquire(batchRows);
                         }
                     }
 
