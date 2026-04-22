@@ -259,7 +259,7 @@ bookkeeper:
 indexingService:
   enabled: true
   storageMode: remote
-  replicaCount: 1
+  replicaCount: 2
   # Request AVX-512 capable nodes for jvector acceleration.
   # europe-west4 (Netherlands) has both C3 (Intel Sapphire Rapids, AVX-512F/BW/VL/DQ/VNNI/FP16)
   # and C3D (AMD EPYC Genoa, AVX-512F/BW/VL/DQ/VNNI).  Either is a significant upgrade
