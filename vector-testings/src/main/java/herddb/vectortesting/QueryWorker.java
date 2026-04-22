@@ -19,13 +19,16 @@
  */
 package herddb.vectortesting;
 
+import com.google.common.util.concurrent.RateLimiter;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 public class QueryWorker implements Runnable {
 
@@ -36,9 +39,16 @@ public class QueryWorker implements Runnable {
     private final MetricsCollector metrics;
     private final List<List<Integer>> allResults;
     private final AtomicReference<String> statusLine;
+    /**
+     * Re-read per iteration so an admin-issued rate change (which swaps the
+     * underlying {@link RateLimiter}) takes effect on the next query without
+     * restarting the worker.
+     */
+    private final Supplier<RateLimiter> queryRateLimiter;
 
     public QueryWorker(Config config, List<float[]> queryVectors, int startIdx, int endIdx,
-                       MetricsCollector metrics, List<List<Integer>> allResults, AtomicReference<String> statusLine) {
+                       MetricsCollector metrics, List<List<Integer>> allResults,
+                       AtomicReference<String> statusLine, Supplier<RateLimiter> queryRateLimiter) {
         this.config = config;
         this.queryVectors = queryVectors;
         this.startIdx = startIdx;
@@ -46,15 +56,33 @@ public class QueryWorker implements Runnable {
         this.metrics = metrics;
         this.allResults = allResults;
         this.statusLine = statusLine;
+        this.queryRateLimiter = queryRateLimiter;
     }
 
     @Override
     public void run() {
-        String sql = "SELECT id FROM " + config.tableName
-                + " ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT " + config.topK;
         try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password)) {
-            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            PreparedStatement ps = null;
+            int preparedK = -1;
+            try {
                 for (int i = startIdx; i < endIdx; i++) {
+                    // Re-read topK per iteration so the admin API's
+                    // /query/config/top-k override takes effect without a restart.
+                    int k = config.topK;
+                    if (ps == null || k != preparedK) {
+                        if (ps != null) {
+                            ps.close();
+                        }
+                        String sql = "SELECT id FROM " + config.tableName
+                                + " ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT " + k;
+                        ps = conn.prepareStatement(sql);
+                        preparedK = k;
+                    }
+
+                    RateLimiter currentLimiter = queryRateLimiter.get();
+                    if (currentLimiter != null) {
+                        currentLimiter.acquire(1);
+                    }
                     long start = System.nanoTime();
                     ps.setObject(1, queryVectors.get(i));
                     List<Integer> ids = new ArrayList<>();
@@ -63,9 +91,9 @@ public class QueryWorker implements Runnable {
                             ids.add(rs.getInt(1));
                         }
                     }
-                    if (ids.size() != config.topK) {
+                    if (ids.size() != k) {
                         System.err.println("FATAL: query " + i + " returned " + ids.size()
-                                + " results, expected " + config.topK);
+                                + " results, expected " + k);
                         System.exit(1);
                     }
                     long elapsed = System.nanoTime() - start;
@@ -84,8 +112,12 @@ public class QueryWorker implements Runnable {
                                 s.maxNanos() / 1_000_000.0));
                     }
                 }
+            } finally {
+                if (ps != null) {
+                    ps.close();
+                }
             }
-        } catch (Exception e) {
+        } catch (SQLException e) {
             System.err.println("Query error in range [" + startIdx + ", " + endIdx + "): " + e.getMessage());
             e.printStackTrace();
         }

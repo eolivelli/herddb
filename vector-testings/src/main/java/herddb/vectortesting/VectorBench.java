@@ -19,7 +19,6 @@
  */
 package herddb.vectortesting;
 
-import com.google.common.util.concurrent.RateLimiter;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.Statement;
@@ -98,16 +97,31 @@ public class VectorBench {
         long benchmarkStartNs = System.nanoTime();
         Config config = Config.parse(args);
         BenchOutput out = BenchOutput.create(config);
+        BenchRuntime runtime = new BenchRuntime(config);
+        AdminApiServer adminServer = null;
+        int adminPort = AdminApiServer.readPortFromSystemProperty();
+        if (adminPort > 0) {
+            adminServer = new AdminApiServer(runtime, adminPort);
+            int bound = adminServer.start();
+            out.info("Admin API listening on http://0.0.0.0:" + bound
+                    + " (set -D" + AdminApiServer.PORT_SYSTEM_PROPERTY + "=0 to disable)");
+        } else {
+            out.info("Admin API disabled (" + AdminApiServer.PORT_SYSTEM_PROPERTY + "=" + adminPort + ")");
+        }
         try {
-            runBenchmark(config, out, benchmarkStartNs);
+            runBenchmark(config, out, benchmarkStartNs, runtime);
         } catch (Exception e) {
             // Top-level catch so NDJSON consumers get a structured error event before the JVM exits.
             out.error(e);
             throw e;
+        } finally {
+            if (adminServer != null) {
+                adminServer.stop();
+            }
         }
     }
 
-    private static void runBenchmark(Config config, BenchOutput out, long benchmarkStartNs) throws Exception {
+    private static void runBenchmark(Config config, BenchOutput out, long benchmarkStartNs, BenchRuntime runtime) throws Exception {
         out.config(config);
 
         // Summary accumulators
@@ -200,6 +214,16 @@ public class VectorBench {
 
         // Phase 4: Ingestion
         if (!config.skipIngest) {
+            if (config.resumeFromAuto) {
+                try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+                     Statement stmt = conn.createStatement();
+                     java.sql.ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM " + config.tableName)) {
+                    rs.next();
+                    config.resumeFrom = rs.getLong(1);
+                }
+                out.info("resume-from=auto resolved to " + config.resumeFrom
+                        + " rows (from SELECT COUNT(*) on " + config.tableName + ")");
+            }
             long toIngest = actualRows - config.resumeFrom;
             if (toIngest <= 0) {
                 out.info("resumeFrom (" + config.resumeFrom + ") >= rows (" + actualRows + "), nothing to ingest.");
@@ -221,17 +245,43 @@ public class VectorBench {
 
             long ingestStart = System.nanoTime();
 
-            RateLimiter ingestRateLimiter = config.ingestMaxOpsPerSecond > 0
-                    ? RateLimiter.create(config.ingestMaxOpsPerSecond)
-                    : null;
+            // Shared across all ingestion workers so --ingest-max-ops is a true
+            // global cap. Live-override via POST /ingestion/config/ingest-max-ops
+            // swaps the limiter inside BenchRuntime; workers re-read the
+            // supplier per batch so the swap takes effect on the next acquire.
 
             ExecutorService ingestPool = Executors.newFixedThreadPool(config.ingestThreads);
             List<Future<?>> ingestFutures = new ArrayList<>(config.ingestThreads);
             for (int t = 0; t < config.ingestThreads; t++) {
                 ingestFutures.add(ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId,
                         ingestMetrics, ingestStatus, ingestStart, commitsTotal, commitsRecovered, rowsCommitted,
-                        ingestRateLimiter)));
+                        runtime::ingestRateLimiter)));
             }
+
+            // Feed the admin /status endpoint with a live snapshot of ingestion progress.
+            runtime.setStatusSupplier(() -> {
+                Runtime rt = Runtime.getRuntime();
+                long rows = rowId.get() - config.resumeFrom;
+                double elapsed = (System.nanoTime() - ingestStart) / 1e9;
+                double opsPerSec = elapsed > 0 ? rows / elapsed : 0.0;
+                LinkedHashMap<String, Object> m = new LinkedHashMap<>();
+                m.put("phase", "ingestion");
+                m.put("rows", rows);
+                m.put("total", config.numRows);
+                m.put("ops_per_sec", opsPerSec);
+                m.put("commits", commitsTotal.get());
+                m.put("recovered_commits", commitsRecovered.get());
+                m.put("heap_used_mb", (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024));
+                m.put("heap_max_mb", rt.maxMemory() / (1024 * 1024));
+                MetricsCollector.Stats s = ingestMetrics.computeStats();
+                LinkedHashMap<String, Object> latency = new LinkedHashMap<>();
+                latency.put("mean_ms", round2(s.meanNanos() / 1e6));
+                latency.put("p50_ms", round2(s.p50Nanos() / 1e6));
+                latency.put("p99_ms", round2(s.p99Nanos() / 1e6));
+                latency.put("max_ms", round2(s.maxNanos() / 1e6));
+                m.put("commit_latency", latency);
+                return m;
+            });
 
             // Progress display thread runs during the entire ingestion
             AtomicBoolean ingestDone = new AtomicBoolean(false);
@@ -457,11 +507,32 @@ public class VectorBench {
         for (int t = 0; t < config.queryThreads; t++) {
             int start = t * qChunk;
             int end = (t == config.queryThreads - 1) ? actualQueries : start + qChunk;
-            queryPool.submit(new QueryWorker(config, queryVectors, start, end, queryMetrics, queryResults, queryStatus));
+            queryPool.submit(new QueryWorker(config, queryVectors, start, end, queryMetrics, queryResults, queryStatus,
+                    runtime::queryRateLimiter));
         }
         queryPool.shutdown();
 
         long queryStart = System.nanoTime();
+        runtime.setStatusSupplier(() -> {
+            double elapsed = (System.nanoTime() - queryStart) / 1e9;
+            long done = queryMetrics.getCount();
+            double qps = elapsed > 0 ? done / elapsed : 0.0;
+            MetricsCollector.Stats s = queryMetrics.computeStats();
+            LinkedHashMap<String, Object> m = new LinkedHashMap<>();
+            m.put("phase", "query");
+            m.put("queries_done", done);
+            m.put("total", (long) actualQueries);
+            m.put("qps", qps);
+            m.put("top_k", config.topK);
+            LinkedHashMap<String, Object> latency = new LinkedHashMap<>();
+            latency.put("mean_ms", round2(s.meanNanos() / 1e6));
+            latency.put("p50_ms", round2(s.p50Nanos() / 1e6));
+            latency.put("p95_ms", round2(s.p95Nanos() / 1e6));
+            latency.put("p99_ms", round2(s.p99Nanos() / 1e6));
+            latency.put("max_ms", round2(s.maxNanos() / 1e6));
+            m.put("latency", latency);
+            return m;
+        });
         while (!queryPool.awaitTermination(500, TimeUnit.MILLISECONDS)) {
             double elapsed = (System.nanoTime() - queryStart) / 1e9;
             long queriesDone = queryMetrics.getCount();
