@@ -72,11 +72,23 @@ spec:
             - name: http
               containerPort: {{ .Values.server.httpPort }}
               protocol: TCP
+          # HTTP probes against the server's Jetty/Prometheus endpoint
+          # (server.httpPort) instead of tcpSocket on the binary JDBC port:
+          # binary-port probes were opening and closing connections every
+          # 5 s, generating log noise at scale (see issue #211).
           readinessProbe:
-            tcpSocket:
-              port: {{ .Values.server.port }}
+            httpGet:
+              path: /metrics
+              port: {{ .Values.server.httpPort }}
             initialDelaySeconds: 10
-            periodSeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: {{ .Values.server.httpPort }}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
           volumeMounts:

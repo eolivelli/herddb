@@ -50,11 +50,24 @@ spec:
             - name: metrics
               containerPort: {{ .Values.zookeeper.metricsPort }}
               protocol: TCP
+          # HTTP probes against the ZK Prometheus metrics server
+          # (zookeeper.metricsPort) rather than tcpSocket on the client
+          # port: the tcpSocket probe made ZK log a
+          # `session = 0x0, Unable to read additional data` line every
+          # 5 s per replica (see issue #211).
           readinessProbe:
-            tcpSocket:
-              port: {{ .Values.zookeeper.clientPort }}
+            httpGet:
+              path: /metrics
+              port: {{ .Values.zookeeper.metricsPort }}
             initialDelaySeconds: 5
-            periodSeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: {{ .Values.zookeeper.metricsPort }}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.zookeeper.resources | nindent 12 }}
           volumeMounts:
