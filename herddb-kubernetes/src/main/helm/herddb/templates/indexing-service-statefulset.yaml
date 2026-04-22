@@ -64,10 +64,16 @@ spec:
                 --bind-host=${POD_FQDN} \
                 -Dindexing.instance.id=${ORDINAL} \
                 -Dindexing.cluster.numInstances={{ .Values.indexingService.replicaCount }}
-          {{- if .Values.indexingService.javaOpts }}
+          {{- if or .Values.indexingService.javaOpts .Values.indexingService.javaOptsExtra }}
           env:
+            {{- if .Values.indexingService.javaOpts }}
             - name: JAVA_OPTS
               value: {{ .Values.indexingService.javaOpts | quote }}
+            {{- end }}
+            {{- if .Values.indexingService.javaOptsExtra }}
+            - name: JAVA_OPTS_EXTRA
+              value: {{ .Values.indexingService.javaOptsExtra | quote }}
+            {{- end }}
           {{- end }}
           ports:
             - name: grpc
@@ -88,8 +94,18 @@ spec:
               mountPath: /opt/herddb/indexdata
             - name: log
               mountPath: /opt/herddb/indexlog
+            # Mount each config file with subPath instead of the whole conf
+            # directory so the jvector compiler-directives file (and any other
+            # files bundled in the docker image) stay reachable on the
+            # JVM-relative path conf/jvector-compiler-directives.
             - name: config
-              mountPath: /opt/herddb/conf
+              mountPath: /opt/herddb/conf/indexingservice.properties
+              subPath: indexingservice.properties
+            {{- if .Values.indexingService.loggingProperties }}
+            - name: config
+              mountPath: /opt/herddb/conf/logging.properties
+              subPath: logging.properties
+            {{- end }}
       volumes:
         - name: config
           configMap:

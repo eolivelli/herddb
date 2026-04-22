@@ -54,10 +54,16 @@ spec:
             - server
             - console
             - /opt/herddb/conf/server.properties
-          {{- if .Values.server.javaOpts }}
+          {{- if or .Values.server.javaOpts .Values.server.javaOptsExtra }}
           env:
+            {{- if .Values.server.javaOpts }}
             - name: JAVA_OPTS
               value: {{ .Values.server.javaOpts | quote }}
+            {{- end }}
+            {{- if .Values.server.javaOptsExtra }}
+            - name: JAVA_OPTS_EXTRA
+              value: {{ .Values.server.javaOptsExtra | quote }}
+            {{- end }}
           {{- end }}
           ports:
             - name: jdbc

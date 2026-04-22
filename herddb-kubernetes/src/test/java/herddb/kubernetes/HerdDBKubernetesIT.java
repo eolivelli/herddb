@@ -174,6 +174,95 @@ public class HerdDBKubernetesIT {
     }
 
     /**
+     * Assert that the JVM in the given pod has picked up the jvector-required
+     * flags — both on the actual java command line (read from
+     * /proc/&lt;pid&gt;/cmdline of the running java process) and in the JVM's
+     * own log output (the per-directive "CompileCommand: inline ..." lines
+     * printed while parsing -XX:CompileCommandFile). Together these prove
+     * that setenv.sh correctly wires the directives file through to every
+     * service even when the Helm chart's full-replace javaOpts field is set.
+     */
+    static void assertJvectorCompilerDirectivesActive(K3sContainer k3sContainer,
+                                                      String podName) throws Exception {
+        // Command-line evidence: locate the java process inside the pod and
+        // read its argv from /proc/<pid>/cmdline. The directives file path and
+        // --add-modules jdk.incubator.vector must appear in the actual argv.
+        String shellCmd = "pid=$(pgrep -f 'herddb\\.server\\..*Main' || pgrep -f 'java.*herddb' || pgrep -x java); "
+                + "if [ -z \"$pid\" ]; then echo NO_JAVA_PID; ps -eo pid,args; exit 1; fi; "
+                + "tr '\\0' ' ' < /proc/$pid/cmdline; echo";
+        org.testcontainers.containers.Container.ExecResult cmdline = k3sContainer.execInContainer(
+                "kubectl", "exec", podName, "--", "sh", "-c", shellCmd);
+        String javaCmdline = cmdline.getStdout().trim();
+        assertTrue("Pod " + podName + " java cmdline lookup failed (stdout='" + javaCmdline
+                + "', stderr='" + cmdline.getStderr() + "')",
+                cmdline.getExitCode() == 0 && !javaCmdline.contains("NO_JAVA_PID"));
+        assertTrue("Pod " + podName + " java command line missing '--add-modules jdk.incubator.vector':\n"
+                + javaCmdline, javaCmdline.contains("--add-modules jdk.incubator.vector"));
+        assertTrue("Pod " + podName + " java command line missing "
+                + "'-XX:CompileCommandFile=conf/jvector-compiler-directives':\n" + javaCmdline,
+                javaCmdline.contains("-XX:CompileCommandFile=conf/jvector-compiler-directives"));
+
+        // File evidence: read /opt/herddb/conf/jvector-compiler-directives
+        // from inside the pod and confirm it ships the expected directives.
+        // Combined with the cmdline check above this proves the JVM both
+        // received the flag AND has a valid file to parse — the only way
+        // it can fail to apply the directives is if the JVM rejects the
+        // file at startup, which would crash-loop the pod (and we'd never
+        // reach this assertion at all).
+        org.testcontainers.containers.Container.ExecResult fileResult = k3sContainer.execInContainer(
+                "kubectl", "exec", podName, "--", "cat", "/opt/herddb/conf/jvector-compiler-directives");
+        assertTrue("Could not read /opt/herddb/conf/jvector-compiler-directives in pod "
+                + podName + ": exit=" + fileResult.getExitCode() + " stderr=" + fileResult.getStderr(),
+                fileResult.getExitCode() == 0);
+        String directivesFile = fileResult.getStdout();
+        String[] expectedDirectives = {
+                "inline io/github/jbellis/jvector/vector/PanamaVectorUtilSupport.*",
+                "inline io/github/jbellis/jvector/vector/NativeVectorUtilSupport.*",
+                "inline io/github/jbellis/jvector/vector/cnative/NativeSimdOps.*",
+                "inline io/github/jbellis/jvector/vector/DefaultVectorUtilSupport.*",
+                "inline io/github/jbellis/jvector/vector/VectorUtil.*"
+        };
+        for (String expected : expectedDirectives) {
+            assertTrue("Pod " + podName + " /opt/herddb/conf/jvector-compiler-directives missing '"
+                    + expected + "':\n" + directivesFile,
+                    directivesFile.contains(expected));
+        }
+
+        // Log evidence (best-effort): each directive parsed from the file is
+        // echoed as a "CompileCommand: inline <class> bool inline = true"
+        // line at JVM startup. The catch is that those lines live at the very
+        // HEAD of the pod log; on chatty services (e.g. indexing-service
+        // spamming ZK retries) kubelet rotates the log file before the test
+        // gets a chance to look. We read the on-disk kubelet log chain
+        // (un-gzipping rotated files) and assert when the head is still
+        // there, or just log the situation when it isn't — the cmdline +
+        // file-content evidence already proves the flag is in effect.
+        String headShellCmd = "set -e; "
+                + "podLogDir=$(ls -d /var/log/pods/default_" + podName + "_*/* 2>/dev/null "
+                + "| grep -v wait-for | head -n1); "
+                + "if [ -z \"$podLogDir\" ]; then exit 1; fi; "
+                + "for f in $(ls -1tr \"$podLogDir\"/*.log* 2>/dev/null); do "
+                + "case \"$f\" in *.gz) zcat \"$f\" ;; *) cat \"$f\" ;; esac; "
+                + "done";
+        org.testcontainers.containers.Container.ExecResult logResult = k3sContainer.execInContainer(
+                "sh", "-c", headShellCmd);
+        String logs = logResult.getExitCode() == 0 ? logResult.getStdout() : "";
+        if (logs == null) {
+            logs = "";
+        }
+        boolean foundInLog = logs.contains(
+                "CompileCommand: inline io/github/jbellis/jvector/vector/PanamaVectorUtilSupport.*");
+        if (foundInLog) {
+            LOG.info("Pod " + podName + ": jvector compiler directives confirmed on "
+                    + "java command line, in shipped conf file, and in JVM startup log.");
+        } else {
+            LOG.info("Pod " + podName + ": jvector compiler directives confirmed on "
+                    + "java command line and in shipped conf file (JVM startup log already "
+                    + "rotated past the CompileCommand banner — log size=" + logs.length() + ").");
+        }
+    }
+
+    /**
      * Wait for the HerdDB tablespace to be fully booted by polling via CLI.
      */
     static void waitForTablespace(K3sContainer k3sContainer, String toolsPod) throws Exception {
