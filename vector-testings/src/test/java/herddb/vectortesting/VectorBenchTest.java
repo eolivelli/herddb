@@ -78,6 +78,48 @@ class VectorBenchTest {
     void configResumeFromDefaultIsZero() throws Exception {
         Config cfg = Config.parse(new String[]{});
         assertEquals(0, cfg.resumeFrom);
+        assertEquals(false, cfg.resumeFromAuto);
+    }
+
+    @Test
+    void configResumeFromAutoSetsFlag() throws Exception {
+        Config cfg = Config.parse(new String[]{"--resume-from", "auto"});
+        assertEquals(0, cfg.resumeFrom);
+        assertEquals(true, cfg.resumeFromAuto);
+    }
+
+    @Test
+    void configResumeFromAutoIsCaseInsensitive() throws Exception {
+        Config cfg = Config.parse(new String[]{"--resume-from", "AUTO"});
+        assertEquals(true, cfg.resumeFromAuto);
+
+        Config cfg2 = Config.parse(new String[]{"--resume-from", "Auto"});
+        assertEquals(true, cfg2.resumeFromAuto);
+    }
+
+    @Test
+    void configResumeFromNumericLeavesAutoFalse() throws Exception {
+        Config cfg = Config.parse(new String[]{"--resume-from", "42"});
+        assertEquals(42L, cfg.resumeFrom);
+        assertEquals(false, cfg.resumeFromAuto);
+    }
+
+    @Test
+    void configQueryMaxOpsDefaultIsTen() throws Exception {
+        Config cfg = Config.parse(new String[]{});
+        assertEquals(10, cfg.queryMaxOpsPerSecond);
+    }
+
+    @Test
+    void configQueryMaxOpsOverride() throws Exception {
+        Config cfg = Config.parse(new String[]{"--query-max-ops", "250"});
+        assertEquals(250, cfg.queryMaxOpsPerSecond);
+    }
+
+    @Test
+    void configQueryMaxOpsZeroMeansUnlimited() throws Exception {
+        Config cfg = Config.parse(new String[]{"--query-max-ops", "0"});
+        assertEquals(0, cfg.queryMaxOpsPerSecond);
     }
 
     @Test

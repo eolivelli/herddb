@@ -150,7 +150,7 @@ class IngestionWorkerTest {
                 commitsTotal,
                 commitsRecovered,
                 rowsCommitted,
-                null // no rate limiting in flush/retry tests
+                () -> null // no rate limiting in flush/retry tests
         );
         worker.backoffBaseMillis = 0L; // keep tests fast
         return worker;

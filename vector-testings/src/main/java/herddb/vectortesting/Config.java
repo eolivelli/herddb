@@ -47,7 +47,7 @@ public class Config {
     int batchSize = 500;
     int queryThreads = 4;
     int queryCount = 1000;
-    int topK = 10;
+    volatile int topK = 10;
     boolean topKExplicit = false;
     int indexM = 16;
     int indexBeamWidth = 100;
@@ -61,7 +61,9 @@ public class Config {
     String similarity = null; // null = use dataset default
     boolean indexBeforeIngest = true;
     long resumeFrom = 0L; // skip first N vectors; row IDs start from N
-    int ingestMaxOpsPerSecond = 100_000; // 0 = unlimited
+    boolean resumeFromAuto = false; // when true, resolve resumeFrom from SELECT COUNT(*) before ingest
+    volatile int ingestMaxOpsPerSecond = 100_000; // 0 = unlimited
+    volatile int queryMaxOpsPerSecond = 10; // 0 = unlimited
     int ingestCommitRetries = 3;
     int checkpointTimeoutSeconds = 300;
     boolean waitForIndexes = false;
@@ -104,8 +106,10 @@ public class Config {
         opts.addOption(null, "similarity", true, "Similarity function: euclidean, cosine, dot (default: from dataset)");
         opts.addOption(null, "client-timeout", true, "Client request timeout in seconds (default: 7200)");
         opts.addOption(null, "index-before-ingest", false, "Create vector index before ingestion instead of after");
-        opts.addOption(null, "resume-from", true, "Skip first N vectors and start row IDs from N (default: 0)");
+        opts.addOption(null, "resume-from", true,
+                "Skip first N vectors and start row IDs from N, or 'auto' to query COUNT(*) from the table (default: 0)");
         opts.addOption(null, "ingest-max-ops", true, "Max ingestion ops/s across all threads, 0=unlimited (default: 100000)");
+        opts.addOption(null, "query-max-ops", true, "Max query ops/s across all threads, 0=unlimited (default: 10)");
         opts.addOption(null, "ingest-commit-retries", true,
                 "Retries per failed batch commit before failing the run (default: 3, "
                         + "exponential back-off 10s/20s/40s...)");
@@ -224,10 +228,13 @@ public class Config {
             cfg.indexBeforeIngest = true;
         }
         if (cmd.hasOption("resume-from")) {
-            cfg.resumeFrom = Long.parseLong(cmd.getOptionValue("resume-from"));
+            parseResumeFrom(cfg, cmd.getOptionValue("resume-from"));
         }
         if (cmd.hasOption("ingest-max-ops")) {
             cfg.ingestMaxOpsPerSecond = Integer.parseInt(cmd.getOptionValue("ingest-max-ops"));
+        }
+        if (cmd.hasOption("query-max-ops")) {
+            cfg.queryMaxOpsPerSecond = Integer.parseInt(cmd.getOptionValue("query-max-ops"));
         }
         if (cmd.hasOption("ingest-commit-retries")) {
             cfg.ingestCommitRetries = Integer.parseInt(cmd.getOptionValue("ingest-commit-retries"));
@@ -357,10 +364,13 @@ public class Config {
             indexBeforeIngest = Boolean.parseBoolean(props.getProperty("index-before-ingest"));
         }
         if (props.containsKey("resume-from")) {
-            resumeFrom = Long.parseLong(props.getProperty("resume-from"));
+            parseResumeFrom(this, props.getProperty("resume-from"));
         }
         if (props.containsKey("ingest-max-ops")) {
             ingestMaxOpsPerSecond = Integer.parseInt(props.getProperty("ingest-max-ops"));
+        }
+        if (props.containsKey("query-max-ops")) {
+            queryMaxOpsPerSecond = Integer.parseInt(props.getProperty("query-max-ops"));
         }
         if (props.containsKey("ingest-commit-retries")) {
             ingestCommitRetries = Integer.parseInt(props.getProperty("ingest-commit-retries"));
@@ -382,6 +392,16 @@ public class Config {
         }
         if (props.containsKey("status-interval-seconds")) {
             statusIntervalSeconds = Integer.parseInt(props.getProperty("status-interval-seconds"));
+        }
+    }
+
+    private static void parseResumeFrom(Config cfg, String raw) {
+        if (raw != null && raw.trim().equalsIgnoreCase("auto")) {
+            cfg.resumeFromAuto = true;
+            cfg.resumeFrom = 0L;
+        } else {
+            cfg.resumeFromAuto = false;
+            cfg.resumeFrom = Long.parseLong(raw);
         }
     }
 

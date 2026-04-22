@@ -33,6 +33,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 public class IngestionWorker implements Runnable {
 
@@ -57,7 +58,13 @@ public class IngestionWorker implements Runnable {
     private final AtomicLong commitsTotal;
     private final AtomicLong commitsRecovered;
     private final AtomicLong rowsCommitted;
-    private final RateLimiter ingestRateLimiter;
+    /**
+     * Supplier is re-read per batch so an admin-issued rate change replaces
+     * the underlying {@link RateLimiter} and this worker's <em>next</em>
+     * acquire uses the fresh instance. Returning {@code null} means "no rate
+     * limiting" (test-only path).
+     */
+    private final Supplier<RateLimiter> ingestRateLimiter;
 
     /**
      * Base of the exponential back-off between commit retries, in milliseconds.
@@ -69,7 +76,7 @@ public class IngestionWorker implements Runnable {
     public IngestionWorker(Config config, BlockingQueue<float[]> queue, AtomicBoolean done, AtomicLong rowId,
                            MetricsCollector metrics, AtomicReference<String> statusLine, long ingestStartNanos,
                            AtomicLong commitsTotal, AtomicLong commitsRecovered, AtomicLong rowsCommitted,
-                           RateLimiter ingestRateLimiter) {
+                           Supplier<RateLimiter> ingestRateLimiter) {
         this.config = config;
         this.queue = queue;
         this.done = done;
@@ -243,12 +250,16 @@ public class IngestionWorker implements Runnable {
                         pendingBatch.clear();
                         lastCommitTime = now;
 
-                        if (ingestRateLimiter != null) {
+                        RateLimiter currentLimiter = ingestRateLimiter.get();
+                        if (currentLimiter != null) {
                             // Shared across all ingestion workers, so --ingest-max-ops is a
                             // true global cap. Guava's acquire() is uninterruptible; wait
                             // time is bounded by batchRows / rate, so worker shutdown via
                             // done.get() remains responsive on the next poll() iteration.
-                            ingestRateLimiter.acquire(batchRows);
+                            // We re-read the supplier each batch: if the admin API lowered
+                            // the rate and reserved far into the future, swapping the
+                            // limiter means this next call uses the fresh one.
+                            currentLimiter.acquire(batchRows);
                         }
                     }
 
