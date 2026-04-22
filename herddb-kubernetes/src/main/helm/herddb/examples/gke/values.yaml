@@ -1,7 +1,8 @@
 # HerdDB on GKE with Google Cloud Storage (S3-compatible endpoint).
+# Cluster: cluster1 / europe-west4 / project triple-env-475508-h3
 #
 # Prerequisites:
-#   1. A GKE cluster
+#   1. A GKE cluster (europe-west4 recommended — C3/C3D nodes provide AVX-512)
 #   2. A GCS bucket
 #   3. HMAC keys for a service account with access to the bucket
 #   4. A Kubernetes Secret with the HMAC credentials:
@@ -127,8 +128,7 @@ fileServer:
   s3:
     endpoint: "https://storage.googleapis.com"
     region: "auto"
-    # Bucket name — must be provided at install time via --set
-    bucket: ""
+    bucket: "herddb-pages"
     # Credentials are read from this Kubernetes Secret instead of
     # being embedded in the ConfigMap.
     credentialsSecret: "herddb-gcs-credentials"
@@ -144,6 +144,11 @@ fileServer:
     # 200 Gi (214748364800 B) − 10 GB (10000000000 B) = 204748364800 B.
     cacheMaxBytes: 204748364800
   storage:
+    # Use HDD (pd-standard) to avoid the 500 GiB SSD_TOTAL_GB project quota in
+    # europe-west4. The file-server's hot path is the in-process page cache and
+    # GCS fallback reads; sequential disk I/O from the local cache is not on the
+    # critical latency path, so HDD is acceptable here.
+    storageClass: "standard"
     size: 200Gi
   resources:
     requests:
@@ -220,12 +225,15 @@ bookkeeper:
     # Raise bookie ZK session timeout from the 10s default (AbstractConfiguration.getZkTimeout())
     # to 40s so it survives checkpoint-induced I/O bursts without expiring (issue #210).
     zkTimeout: "40000"
-  # Journal PVC raised to 100 Gi for long-running ingests.
-  # Ledger PVC at 500 Gi for extended GKE benchmark runs (bigann-scale).
+  # Journal: SSD (pd-balanced default) — random write I/O, latency-sensitive.
+  # Ledger: HDD (pd-standard) — large sequential append; saves ~1000 GiB of SSD quota.
+  # The 500 GiB SSD_TOTAL_GB project quota in europe-west4 is tight; keeping only
+  # the journal on SSD stays well within it.
   storage:
     journal:
       size: 100Gi
     ledger:
+      storageClass: "standard"
       size: 500Gi
   resources:
     requests:
@@ -240,15 +248,12 @@ indexingService:
   storageMode: remote
   replicaCount: 2
   # Request AVX-512 capable nodes for jvector acceleration.
-  # GKE Autopilot compute classes that provide AVX-512:
-  #   Performance  → Intel C3 (Sapphire Rapids): AVX-512F/BW/VL/DQ/VNNI/FP16  ← recommended
-  #   (default Balanced may land on AMD EPYC Milan or older Intel — AVX2 only)
-  # Uncomment to pin IS pods to AVX-512 nodes:
-  # nodeSelector:
-  #   cloud.google.com/compute-class: "Performance"
-  # Alternative: pin to a specific machine family
-  # nodeSelector:
-  #   cloud.google.com/machine-family: "c3"
+  # europe-west4 (Netherlands) has both C3 (Intel Sapphire Rapids, AVX-512F/BW/VL/DQ/VNNI/FP16)
+  # and C3D (AMD EPYC Genoa, AVX-512F/BW/VL/DQ/VNNI).  Either is a significant upgrade
+  # over the AMD EPYC Milan (AVX2 only) nodes available in the previous europe-west12 cluster.
+  # "c3" is recommended for best jvector performance (widest AVX-512 feature set).
+  nodeSelector:
+    cloud.google.com/machine-family: "c3"
   # 24 g heap + 6 g direct + ~1 g JVM overhead = 31 g (< 32 GiB container; 1 GiB headroom).
   # Heap sized for HNSW graph segment caching — the primary IS working set.
   # 6 g direct: needed for zero-copy ByteBuffer vectors (jvector 4.x) and concurrent
@@ -303,6 +308,9 @@ tools:
     datasetsBucket: "herddb-datasets"
   storage:
     datasets:
+      # HDD to avoid SSD quota; dataset files are downloaded once and read
+      # sequentially during ingest — HDD throughput is sufficient.
+      storageClass: "standard"
       size: 200Gi
   # Heap raised to 6 g: sift10m base set (10M × 128-dim × 4 B = 5.12 GB)
   # must fit in JVM heap during ingest. Container limit = heap + ~1 GiB overhead.
