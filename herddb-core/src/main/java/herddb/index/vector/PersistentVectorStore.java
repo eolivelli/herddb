@@ -2675,9 +2675,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
             VectorStorageRandomAccessVectorValues allMravv =
                     new VectorStorageRandomAccessVectorValues(allStorage, dim, allVectors.size());
             BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(allMravv, similarityFunction);
+            // Pre-size the base-layer DenseIntMap to totalVectors so the parallel insert
+            // below never hits the spine-grow lock in jvector (issue #223).
             GraphIndexBuilder mergedBuilder = new GraphIndexBuilder(
-                    bsp, dim, m, beamWidth, neighborOverflow, alpha, ADD_HIERARCHY, REFINE_FINAL_GRAPH,
-                    PhysicalCoreExecutor.pool(), CHECKPOINT_POOL);
+                    bsp, dim, List.of(m), beamWidth, neighborOverflow, alpha,
+                    ADD_HIERARCHY, REFINE_FINAL_GRAPH,
+                    PhysicalCoreExecutor.pool(), CHECKPOINT_POOL, totalVectors);
 
             int progressInterval = Math.max(1000, totalVectors / 10);
             java.util.concurrent.ForkJoinTask<?> graphTask = CHECKPOINT_POOL.submit(() ->
@@ -3151,8 +3154,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         VectorStorageRandomAccessVectorValues ravv =
                 new VectorStorageRandomAccessVectorValues(vectorStorage, dim, -1, startNodeId);
         BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(ravv, similarityFunction);
+        // Pass cap as initialCapacity so the jvector base-layer DenseIntMap is pre-sized
+        // for the shard and concurrent addGraphNode avoids the spine-grow lock (issue #223).
         GraphIndexBuilder b = new GraphIndexBuilder(
-                bsp, dim, m, bw, no, a, ADD_HIERARCHY, REFINE_FINAL_GRAPH);
+                bsp, dim, List.of(m), bw, no, a, ADD_HIERARCHY, REFINE_FINAL_GRAPH,
+                PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool(), cap);
         return new LiveGraphShard(p2n, n2p, ravv, b, startNodeId);
     }
 
