@@ -17,8 +17,14 @@
 # under the License.
 
 #JAVA_HOME=
-JDK_JAVA_OPTIONS="${JDK_JAVA_OPTIONS:---add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.rmi/sun.rmi.transport=ALL-UNNAMED --enable-native-access=ALL-UNNAMED}"
-JAVA_OPTS="${JAVA_OPTS:--XX:+UseG1GC -Duser.language=en -Xmx4g -Xms4g -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -Dio.netty.maxDirectMemory=0 -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties --add-modules jdk.incubator.vector -XX:CompileCommandFile=conf/jvector-compiler-directives}"
+# Mandatory JVM flags for jvector: the Panama Vector API module and the
+# HerdDB-shipped compile-command file that force-inlines jvector's hot paths.
+# Kept in JDK_JAVA_OPTIONS (always picked up by the JDK) and appended
+# unconditionally so they survive a custom JAVA_OPTS override (e.g. the
+# Helm chart's server.javaOpts / indexingService.javaOpts).
+JVECTOR_JAVA_OPTS="--add-modules jdk.incubator.vector -XX:CompileCommandFile=conf/jvector-compiler-directives"
+JDK_JAVA_OPTIONS="${JDK_JAVA_OPTIONS:---add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.rmi/sun.rmi.transport=ALL-UNNAMED --enable-native-access=ALL-UNNAMED} $JVECTOR_JAVA_OPTS"
+JAVA_OPTS="${JAVA_OPTS:--XX:+UseG1GC -Duser.language=en -Xmx4g -Xms4g -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -Dio.netty.maxDirectMemory=0 -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties}"
 # Export so the settings reach child java processes started by launcher
 # scripts that rely on the JDK picking JDK_JAVA_OPTIONS up automatically
 # (e.g. indexing-admin.sh, herddb-cli.sh, vector-bench.sh, bookkeeper).
