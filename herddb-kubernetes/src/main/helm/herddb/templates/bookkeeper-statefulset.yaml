@@ -53,10 +53,16 @@ spec:
             - bookkeeper
             - console
             - /opt/herddb/conf/bookie.properties
-          {{- if .Values.bookkeeper.javaOpts }}
+          {{- if or .Values.bookkeeper.javaOpts .Values.bookkeeper.javaOptsExtra }}
           env:
+            {{- if .Values.bookkeeper.javaOpts }}
             - name: JAVA_OPTS
               value: {{ .Values.bookkeeper.javaOpts | quote }}
+            {{- end }}
+            {{- if .Values.bookkeeper.javaOptsExtra }}
+            - name: JAVA_OPTS_EXTRA
+              value: {{ .Values.bookkeeper.javaOptsExtra | quote }}
+            {{- end }}
           {{- end }}
           ports:
             - name: bookie

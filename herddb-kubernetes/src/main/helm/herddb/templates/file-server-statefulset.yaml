@@ -74,11 +74,15 @@ spec:
             - "--port={{ .Values.fileServer.port }}"
             - "--data-dir=/opt/herddb/filedata"
           {{- end }}
-          {{- if or .Values.fileServer.javaOpts .Values.fileServer.s3.credentialsSecret }}
+          {{- if or .Values.fileServer.javaOpts .Values.fileServer.javaOptsExtra .Values.fileServer.s3.credentialsSecret }}
           env:
             {{- if .Values.fileServer.javaOpts }}
             - name: JAVA_OPTS
               value: {{ .Values.fileServer.javaOpts | quote }}
+            {{- end }}
+            {{- if .Values.fileServer.javaOptsExtra }}
+            - name: JAVA_OPTS_EXTRA
+              value: {{ .Values.fileServer.javaOptsExtra | quote }}
             {{- end }}
             {{- if .Values.fileServer.s3.credentialsSecret }}
             - name: S3_ACCESS_KEY

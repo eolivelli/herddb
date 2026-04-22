@@ -25,8 +25,15 @@ server:
   replicaCount: 1
   port: 7000
   httpPort: 9845
-  # JVM options (overrides default JAVA_OPTS from setenv.sh)
+  # JVM options. REPLACES the default JAVA_OPTS from setenv.sh — use only when
+  # you need to change the baseline (GC, heap, -D properties). Note: when set,
+  # you lose the defaults (-XX:+UseG1GC, -Xmx4g, -XX:MaxDirectMemorySize=1g, ...).
+  # Prefer javaOptsExtra below unless you really want to replace the baseline.
   javaOpts: ""
+  # Extra JVM options APPENDED to the defaults from setenv.sh. Use this to add
+  # flags (e.g. "-Xmx8g -XX:+AlwaysPreTouch") without losing the baseline or
+  # the jvector-required --add-modules jdk.incubator.vector. Safe default.
+  javaOptsExtra: ""
   # Optional: override /opt/herddb/conf/logging.properties inside the pod.
   # Empty string = use the logging.properties bundled in the Docker image.
   # Paste the full file content as a multiline YAML string to override without
@@ -55,7 +62,10 @@ fileServer:
   replicaCount: 2
   port: 9846
   httpPort: 9847
+  # See server.javaOpts / server.javaOptsExtra above for the replace-vs-append
+  # semantics. Prefer javaOptsExtra unless you really want to replace.
   javaOpts: ""
+  javaOptsExtra: ""
   # Optional: override /opt/herddb/conf/logging.properties inside the pod.
   # Empty string = use the logging.properties bundled in the Docker image
   # (or JUL built-in defaults when the whole conf dir is ConfigMap-mounted).
@@ -147,7 +157,10 @@ bookkeeper:
   replicaCount: 1
   bookiePort: 3181
   httpPort: 8000
+  # See server.javaOpts / server.javaOptsExtra above for the replace-vs-append
+  # semantics. Prefer javaOptsExtra unless you really want to replace.
   javaOpts: ""
+  javaOptsExtra: ""
   # Optional: override /opt/herddb/conf/logging.properties inside the pod.
   # Empty string = use the logging.properties bundled in the Docker image.
   loggingProperties: ""
@@ -176,7 +189,10 @@ indexingService:
   httpPort: 9851
   # Storage mode: "file" (local), "memory" (testing), or "remote" (remote file server via ZK)
   storageMode: file
+  # See server.javaOpts / server.javaOptsExtra above for the replace-vs-append
+  # semantics. Prefer javaOptsExtra unless you really want to replace.
   javaOpts: ""
+  javaOptsExtra: ""
   # Optional: override /opt/herddb/conf/logging.properties inside the pod.
   # Empty string = use the logging.properties bundled in the Docker image
   # (or JUL built-in defaults when the whole conf dir is ConfigMap-mounted).

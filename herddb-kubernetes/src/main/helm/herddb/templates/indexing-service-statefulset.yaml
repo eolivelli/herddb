@@ -64,10 +64,16 @@ spec:
                 --bind-host=${POD_FQDN} \
                 -Dindexing.instance.id=${ORDINAL} \
                 -Dindexing.cluster.numInstances={{ .Values.indexingService.replicaCount }}
-          {{- if .Values.indexingService.javaOpts }}
+          {{- if or .Values.indexingService.javaOpts .Values.indexingService.javaOptsExtra }}
           env:
+            {{- if .Values.indexingService.javaOpts }}
             - name: JAVA_OPTS
               value: {{ .Values.indexingService.javaOpts | quote }}
+            {{- end }}
+            {{- if .Values.indexingService.javaOptsExtra }}
+            - name: JAVA_OPTS_EXTRA
+              value: {{ .Values.indexingService.javaOptsExtra | quote }}
+            {{- end }}
           {{- end }}
           ports:
             - name: grpc
