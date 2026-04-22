@@ -49,6 +49,10 @@
             <artifactId>commons-cli</artifactId>
         </dependency>
         <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.jhdf</groupId>
             <artifactId>jhdf</artifactId>
             <version>0.10.0</version>

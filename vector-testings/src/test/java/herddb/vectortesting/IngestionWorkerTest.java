@@ -149,7 +149,8 @@ class IngestionWorkerTest {
                 System.nanoTime(),
                 commitsTotal,
                 commitsRecovered,
-                rowsCommitted
+                rowsCommitted,
+                null // no rate limiting in flush/retry tests
         );
         worker.backoffBaseMillis = 0L; // keep tests fast
         return worker;
