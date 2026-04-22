@@ -1,0 +1,15 @@
+{{- if and .Values.tools.enabled .Values.tools.pdb.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "herddb.fullname" . }}-tools
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tools
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: tools
+{{- end }}
