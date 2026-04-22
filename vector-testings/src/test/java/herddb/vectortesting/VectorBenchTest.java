@@ -81,6 +81,76 @@ class VectorBenchTest {
     }
 
     @Test
+    void buildCreateVectorIndexSqlDefaultIncludesNumShardsFour() throws Exception {
+        Config cfg = Config.parse(new String[]{});
+
+        String sql = VectorBench.buildCreateVectorIndexSql(cfg);
+
+        assertEquals(
+                "CREATE VECTOR INDEX vidx ON vector_bench(vec)"
+                        + " WITH m=16 beamWidth=100 similarity=" + cfg.effectiveSimilarity()
+                        + " fusedPQ=true numShards 4",
+                sql);
+    }
+
+    @Test
+    void buildCreateVectorIndexSqlOmitsClauseWhenNumShardsIsOne() throws Exception {
+        Config cfg = Config.parse(new String[]{"--index-num-shards", "1"});
+
+        String sql = VectorBench.buildCreateVectorIndexSql(cfg);
+
+        org.junit.jupiter.api.Assertions.assertFalse(
+                sql.contains("numShards"),
+                "numShards clause must be omitted when indexNumShards <= 1, got: " + sql);
+        assertEquals(
+                "CREATE VECTOR INDEX vidx ON vector_bench(vec)"
+                        + " WITH m=16 beamWidth=100 similarity=" + cfg.effectiveSimilarity()
+                        + " fusedPQ=true",
+                sql);
+    }
+
+    @Test
+    void buildCreateVectorIndexSqlOmitsClauseWhenNumShardsIsZero() throws Exception {
+        Config cfg = Config.parse(new String[]{"--index-num-shards", "0"});
+
+        String sql = VectorBench.buildCreateVectorIndexSql(cfg);
+
+        org.junit.jupiter.api.Assertions.assertFalse(
+                sql.contains("numShards"),
+                "numShards clause must be omitted when indexNumShards <= 1, got: " + sql);
+    }
+
+    @Test
+    void buildCreateVectorIndexSqlUsesCustomNumShards() throws Exception {
+        Config cfg = Config.parse(new String[]{"--index-num-shards", "8"});
+
+        String sql = VectorBench.buildCreateVectorIndexSql(cfg);
+
+        org.junit.jupiter.api.Assertions.assertTrue(
+                sql.endsWith("numShards 8"),
+                "expected trailing `numShards 8`, got: " + sql);
+    }
+
+    @Test
+    void buildCreateVectorIndexSqlReflectsCustomTableAndIndexParams() throws Exception {
+        Config cfg = Config.parse(new String[]{
+                "--table", "my_vectors",
+                "--m", "32",
+                "--beam-width", "200",
+                "--similarity", "cosine",
+                "--index-num-shards", "2"
+        });
+
+        String sql = VectorBench.buildCreateVectorIndexSql(cfg);
+
+        assertEquals(
+                "CREATE VECTOR INDEX vidx ON my_vectors(vec)"
+                        + " WITH m=32 beamWidth=200 similarity=cosine"
+                        + " fusedPQ=true numShards 2",
+                sql);
+    }
+
+    @Test
     void configResumeFromParsedFromCli() throws Exception {
         Config cfg = Config.parse(new String[]{"--resume-from", "500000"});
         assertEquals(500000, cfg.resumeFrom);
