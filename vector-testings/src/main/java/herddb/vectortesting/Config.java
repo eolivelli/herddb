@@ -51,6 +51,7 @@ public class Config {
     boolean topKExplicit = false;
     int indexM = 16;
     int indexBeamWidth = 100;
+    int indexNumShards = 4;
     boolean skipIngest = false;
     boolean skipIndex = false;
     boolean skipVerify = false;
@@ -92,6 +93,9 @@ public class Config {
         opts.addOption("k", null, true, "LIMIT K for ANN queries (default: 10)");
         opts.addOption(null, "m", true, "Vector index M parameter (default: 16)");
         opts.addOption(null, "beam-width", true, "Vector index beamWidth (default: 100)");
+        opts.addOption(null, "index-num-shards", true,
+                "Vector index numShards (default: 4). Set to 1 to disable sharding; "
+                        + "otherwise emitted as `numShards N` in the CREATE VECTOR INDEX DDL.");
         opts.addOption(null, "skip-ingest", false, "Skip ingestion phase");
         opts.addOption(null, "skip-index", false, "Skip index creation");
         opts.addOption(null, "skip-verify", false, "Skip row count verification after ingestion");
@@ -191,6 +195,9 @@ public class Config {
         }
         if (cmd.hasOption("beam-width")) {
             cfg.indexBeamWidth = Integer.parseInt(cmd.getOptionValue("beam-width"));
+        }
+        if (cmd.hasOption("index-num-shards")) {
+            cfg.indexNumShards = Integer.parseInt(cmd.getOptionValue("index-num-shards"));
         }
         if (cmd.hasOption("skip-ingest")) {
             cfg.skipIngest = true;
@@ -321,6 +328,9 @@ public class Config {
         }
         if (props.containsKey("beam-width")) {
             indexBeamWidth = Integer.parseInt(props.getProperty("beam-width"));
+        }
+        if (props.containsKey("index-num-shards")) {
+            indexNumShards = Integer.parseInt(props.getProperty("index-num-shards"));
         }
         if (props.containsKey("skip-ingest")) {
             skipIngest = Boolean.parseBoolean(props.getProperty("skip-ingest"));
