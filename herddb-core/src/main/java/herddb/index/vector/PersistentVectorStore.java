@@ -3158,24 +3158,44 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Rotates the live graph shard if the active shard has reached the max size.
+     *
+     * <p>The expensive allocation ({@link #createEmptyLiveShard} — two preallocated
+     * {@link java.util.concurrent.ConcurrentHashMap}s plus a jvector
+     * {@code GraphIndexBuilder}) runs <em>outside</em> the instance monitor so that
+     * concurrent ingest threads do not block waiting for shard construction.  Only
+     * the publish (volatile swap of {@link #liveShards}) happens under the monitor.
+     *
+     * <p>Under burst contention up to K threads may concurrently build a candidate
+     * shard; K-1 are discarded after the double-check.  That trades a small amount
+     * of wasted allocation at rotation time for eliminating the monitor hold while
+     * the builder is initialized.
      */
-    private synchronized LiveGraphShard rotateLiveShard() {
-        List<LiveGraphShard> shards = this.liveShards;
-        LiveGraphShard active = shards.get(shards.size() - 1);
-        if (active.nodeToPk.size() < computeEffectiveMaxLiveGraphSize()) {
+    private LiveGraphShard rotateLiveShard() {
+        List<LiveGraphShard> snap = this.liveShards;
+        LiveGraphShard active = snap.get(snap.size() - 1);
+        int cap = computeEffectiveMaxLiveGraphSize();
+        if (active.nodeToPk.size() < cap) {
             return active;
         }
-
-        LiveGraphShard newShard = createEmptyLiveShard(dimension, beamWidth, neighborOverflow, alpha);
-        List<LiveGraphShard> newList = new ArrayList<>(shards);
-        newList.add(newShard);
-        this.liveShards = newList;
-
-        LOGGER.log(Level.INFO,
-                "vector store {0}: rotated live graph shard, now {1} shards ({2} vectors in sealed shard)",
-                new Object[]{indexName, newList.size(), active.nodeToPk.size()});
-
-        return newShard;
+        // Allocate outside the monitor: jvector GraphIndexBuilder setup is the
+        // dominant cost in this method (see issue: lock profile hotspot).
+        LiveGraphShard candidate = createEmptyLiveShard(
+                dimension, beamWidth, neighborOverflow, alpha);
+        synchronized (this) {
+            List<LiveGraphShard> cur = this.liveShards;
+            LiveGraphShard curActive = cur.get(cur.size() - 1);
+            if (curActive.nodeToPk.size() < cap) {
+                // Another thread won the race and already published a new shard.
+                return curActive;
+            }
+            List<LiveGraphShard> newList = new ArrayList<>(cur);
+            newList.add(candidate);
+            this.liveShards = newList;
+            LOGGER.log(Level.INFO,
+                    "vector store {0}: rotated live graph shard, now {1} shards ({2} vectors in sealed shard)",
+                    new Object[]{indexName, newList.size(), curActive.nodeToPk.size()});
+            return candidate;
+        }
     }
 
     private void initEmptyLiveShards(int dim, int bw, float no, float a) {
