@@ -154,6 +154,16 @@ public class HerdDBKubernetesIT {
 
         String toolsPod = getToolsPodName();
 
+        // Assert the server JVM picked up the jvector compiler directives both
+        // on the effective command line (JDK_JAVA_OPTIONS NOTE) and in the
+        // parsed directive output (CompileCommand lines).
+        List<Pod> serverPods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "server")
+                .list().getItems();
+        assertEquals("Expected 1 server pod", 1, serverPods.size());
+        assertJvectorCompilerDirectivesActive(k3s, serverPods.get(0).getMetadata().getName());
+
         // Wait for tablespace to be ready via CLI
         waitForTablespace(k3s, toolsPod);
 
@@ -171,6 +181,82 @@ public class HerdDBKubernetesIT {
         assertTrue("Expected 'hello' in output", output.contains("hello"));
         assertTrue("Expected '1' in output", output.contains("1"));
         LOG.info("Row verified.");
+    }
+
+    /**
+     * Assert that the JVM in the given pod has picked up the jvector-required
+     * flags — both on the actual java command line (read from
+     * /proc/&lt;pid&gt;/cmdline of the running java process) and in the JVM's
+     * own log output (the per-directive "CompileCommand: inline ..." lines
+     * printed while parsing -XX:CompileCommandFile). Together these prove
+     * that setenv.sh correctly wires the directives file through to every
+     * service even when the Helm chart's full-replace javaOpts field is set.
+     */
+    static void assertJvectorCompilerDirectivesActive(K3sContainer k3sContainer,
+                                                      String podName) throws Exception {
+        // Command-line evidence: locate the java process inside the pod and
+        // read its argv from /proc/<pid>/cmdline. The directives file path and
+        // --add-modules jdk.incubator.vector must appear in the actual argv.
+        String shellCmd = "pid=$(pgrep -f 'herddb\\.server\\..*Main' || pgrep -f 'java.*herddb' || pgrep -x java); "
+                + "if [ -z \"$pid\" ]; then echo NO_JAVA_PID; ps -eo pid,args; exit 1; fi; "
+                + "tr '\\0' ' ' < /proc/$pid/cmdline; echo";
+        org.testcontainers.containers.Container.ExecResult cmdline = k3sContainer.execInContainer(
+                "kubectl", "exec", podName, "--", "sh", "-c", shellCmd);
+        String javaCmdline = cmdline.getStdout().trim();
+        assertTrue("Pod " + podName + " java cmdline lookup failed (stdout='" + javaCmdline
+                + "', stderr='" + cmdline.getStderr() + "')",
+                cmdline.getExitCode() == 0 && !javaCmdline.contains("NO_JAVA_PID"));
+        assertTrue("Pod " + podName + " java command line missing '--add-modules jdk.incubator.vector':\n"
+                + javaCmdline, javaCmdline.contains("--add-modules jdk.incubator.vector"));
+        assertTrue("Pod " + podName + " java command line missing "
+                + "'-XX:CompileCommandFile=conf/jvector-compiler-directives':\n" + javaCmdline,
+                javaCmdline.contains("-XX:CompileCommandFile=conf/jvector-compiler-directives"));
+
+        // Log evidence: each directive parsed from the file is echoed as a
+        // "CompileCommand: inline <class> bool inline = true" line at JVM
+        // startup. The catch is that those lines live at the very HEAD of
+        // the pod log; on chatty services (e.g. indexing-service spamming
+        // ZK retries) kubelet may rotate the log file before the test even
+        // gets a chance to look. To survive that, read the kubelet on-disk
+        // log files directly from /var/log/pods inside the K3s container —
+        // those keep up to 5 rotated files (~50MB total) by default, which
+        // covers the entire JVM-startup window.
+        String headShellCmd = "set -e; "
+                + "podLogDir=$(ls -d /var/log/pods/default_" + podName + "_*/* 2>/dev/null "
+                + "| grep -v wait-for | head -n1); "
+                + "if [ -z \"$podLogDir\" ]; then echo NO_LOG_DIR; ls -la /var/log/pods/ || true; exit 1; fi; "
+                // Concatenate every log file in age order. Older rotated files
+                // may be gzipped by kubelet; pick zcat or cat per extension so
+                // the JVM-startup output at the head of the chain isn't lost
+                // once rotation has kicked in. (BusyBox zcat lacks -f.)
+                + "for f in $(ls -1tr \"$podLogDir\"/*.log* 2>/dev/null); do "
+                + "case \"$f\" in *.gz) zcat \"$f\" ;; *) cat \"$f\" ;; esac; "
+                + "done";
+        org.testcontainers.containers.Container.ExecResult logResult = k3sContainer.execInContainer(
+                "sh", "-c", headShellCmd);
+        assertTrue("Could not read kubelet log files for pod " + podName + ": exit="
+                + logResult.getExitCode() + " stdout='" + logResult.getStdout()
+                + "' stderr='" + logResult.getStderr() + "'",
+                logResult.getExitCode() == 0 && !logResult.getStdout().contains("NO_LOG_DIR"));
+        String logs = logResult.getStdout();
+        if (logs == null) {
+            logs = "";
+        }
+        String[] expectedDirectives = {
+                "CompileCommand: inline io/github/jbellis/jvector/vector/PanamaVectorUtilSupport.* bool inline = true",
+                "CompileCommand: inline io/github/jbellis/jvector/vector/NativeVectorUtilSupport.* bool inline = true",
+                "CompileCommand: inline io/github/jbellis/jvector/vector/cnative/NativeSimdOps.* bool inline = true",
+                "CompileCommand: inline io/github/jbellis/jvector/vector/DefaultVectorUtilSupport.* bool inline = true",
+                "CompileCommand: inline io/github/jbellis/jvector/vector/VectorUtil.* bool inline = true"
+        };
+        for (String expected : expectedDirectives) {
+            assertTrue("Pod " + podName + " logs missing directive '" + expected
+                    + "' — compile-command file was not loaded by the JVM. "
+                    + "Pod log size=" + logs.length() + " bytes; first 1k chars:\n"
+                    + logs.substring(0, Math.min(1000, logs.length())),
+                    logs.contains(expected));
+        }
+        LOG.info("Pod " + podName + ": jvector compiler directives confirmed on java command line and in logs.");
     }
 
     /**

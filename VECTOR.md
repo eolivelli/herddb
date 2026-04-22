@@ -842,13 +842,21 @@ its fastest code path, the JVM must be launched with specific flags. The
 Docker / Helm images, so running HerdDB via `bin/service` or the published
 container picks them up automatically.
 
-**Mandatory flags (applied via `JDK_JAVA_OPTIONS` in `setenv.sh`):**
+**Mandatory flags (applied by `setenv.sh`):**
 
-| Flag | Purpose |
-|------|---------|
-| `--add-modules jdk.incubator.vector` | Loads the incubating Vector API module (Panama). Without it jvector falls back to the scalar `DefaultVectorUtilSupport` implementation and logs a warning at startup. |
-| `--enable-native-access=ALL-UNNAMED` | Required on JDK 22+ for jvector's `NativeVectorUtilSupport` to call the packaged native SIMD library through the Foreign Function & Memory API. |
-| `-XX:CompileCommandFile=conf/jvector-compiler-directives` | Force-inlines jvector's vector-distance implementations (`PanamaVectorUtilSupport`, `NativeVectorUtilSupport`, `DefaultVectorUtilSupport`, `VectorUtil`, `cnative.NativeSimdOps`) at every call site so the SIMD intrinsics stay on the fast path inside graph-search inner loops. |
+| Flag | Where | Purpose |
+|------|-------|---------|
+| `--add-modules jdk.incubator.vector` | `JAVA_OPTS` (appended unconditionally) | Loads the incubating Vector API module (Panama). Without it jvector falls back to the scalar `DefaultVectorUtilSupport` implementation and logs a warning at startup. |
+| `-XX:CompileCommandFile=conf/jvector-compiler-directives` | `JAVA_OPTS` (appended unconditionally) | Force-inlines jvector's vector-distance implementations (`PanamaVectorUtilSupport`, `NativeVectorUtilSupport`, `DefaultVectorUtilSupport`, `VectorUtil`, `cnative.NativeSimdOps`) at every call site so the SIMD intrinsics stay on the fast path inside graph-search inner loops. |
+| `--enable-native-access=ALL-UNNAMED` | `JDK_JAVA_OPTIONS` | Required on JDK 22+ for jvector's `NativeVectorUtilSupport` to call the packaged native SIMD library through the Foreign Function & Memory API. |
+
+The Vector API + compile-command pair lives in `JAVA_OPTS` (appended after the
+default expansion) so it lands directly on the `java` command line of the
+service processes that pass `JAVA_OPTS` through (`server`, `indexing-service`,
+`file-server`, `bookkeeper`). Tools that intentionally don't pass `JAVA_OPTS`
+through (`herddb-cli.sh`, `herddb-bench.sh`) skip the flags — the CLI doesn't
+load jvector and the extra startup noise can interfere with output capture in
+some `kubectl exec` / testcontainers environments.
 
 **Compile-command file** — see
 `herddb-services/src/main/resources/conf/jvector-compiler-directives` for the full
@@ -877,9 +885,10 @@ to re-specify the defaults:
 The Helm chart exposes these as `server.javaOptsExtra`,
 `fileServer.javaOptsExtra`, `bookkeeper.javaOptsExtra` and
 `indexingService.javaOptsExtra`. Prefer these over the full-replace
-`*.javaOpts` fields — the latter drop every default, including the jvector
-flags above (`JDK_JAVA_OPTIONS` is kept intact, but you lose the heap/GC
-baseline). Example:
+`*.javaOpts` fields — the latter REPLACE the heap/GC/-D baseline. The
+jvector-required flags (`--add-modules jdk.incubator.vector` and
+`-XX:CompileCommandFile=...`) survive a full-replace `javaOpts` because
+`setenv.sh` appends them after the `${JAVA_OPTS:-...}` expansion. Example:
 
 ```yaml
 # values.yaml — add a larger heap and -XX:+AlwaysPreTouch without losing

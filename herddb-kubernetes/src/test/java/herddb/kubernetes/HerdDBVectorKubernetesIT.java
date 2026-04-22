@@ -217,6 +217,21 @@ public class HerdDBVectorKubernetesIT {
 
         String toolsPod = getToolsPodName();
 
+        // Assert the server and each indexing-service pod picked up the
+        // jvector compiler directives both on the effective command line
+        // and in their parsed-directive log output.
+        List<Pod> serverPods = kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "server")
+                .list().getItems();
+        assertEquals("Expected 1 server pod", 1, serverPods.size());
+        HerdDBKubernetesIT.assertJvectorCompilerDirectivesActive(
+                k3s, serverPods.get(0).getMetadata().getName());
+        for (Pod isPod : isPods) {
+            HerdDBKubernetesIT.assertJvectorCompilerDirectivesActive(
+                    k3s, isPod.getMetadata().getName());
+        }
+
         // Wait for tablespace to be ready via CLI
         HerdDBKubernetesIT.waitForTablespace(k3s, toolsPod);
 
