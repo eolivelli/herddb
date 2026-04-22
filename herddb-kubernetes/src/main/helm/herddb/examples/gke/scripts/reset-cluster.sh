@@ -12,6 +12,7 @@
 #   ./scripts/reset-cluster.sh
 #   ./scripts/reset-cluster.sh --pages-bucket herddb-pages --yes
 #   ./scripts/reset-cluster.sh --keep-pvc herddb-tools --keep-pvc herddb-server --yes
+#   ./scripts/reset-cluster.sh --bucket-only --pages-bucket herddb-pages --yes
 #
 # Flags:
 #   --pages-bucket <name>   GCS bucket to empty (default: read from
@@ -21,6 +22,10 @@
 #                           StatefulSet (repeatable). herddb-tools is
 #                           always kept; add more here to preserve
 #                           additional state.
+#   --bucket-only           Skip StatefulSet scale-down, PVC deletion, and
+#                           scale-up. Only empties the GCS pages bucket.
+#                           Useful after teardown.sh has already removed
+#                           all pods and PVCs.
 #   --yes                   Skip the interactive confirmation prompt.
 #
 # On success prints RESET_STATE=<path> pointing at a small JSON-ish
@@ -37,11 +42,13 @@ source "$SCRIPT_DIR/common.sh"
 KEEP_PVCS=("herddb-tools")
 PAGES_BUCKET=""
 ASSUME_YES=false
+BUCKET_ONLY=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pages-bucket) PAGES_BUCKET="$2"; shift 2 ;;
         --keep-pvc)     KEEP_PVCS+=("$2"); shift 2 ;;
+        --bucket-only)  BUCKET_ONLY=true; shift ;;
         --yes)          ASSUME_YES=true; shift ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -88,6 +95,38 @@ is_kept() {
     return 1
 }
 
+# In --bucket-only mode skip StatefulSet discovery entirely.
+if $BUCKET_ONLY; then
+    section "Reset plan (bucket-only)"
+    echo "  Pages bucket:   gs://$PAGES_BUCKET   (will be emptied)"
+    echo "  StatefulSets:   (skipped — --bucket-only)"
+    echo ""
+
+    if ! $ASSUME_YES; then
+        read -rp "Proceed? This will EMPTY the pages bucket. [y/N] " ans
+        if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+            echo "Aborted."
+            exit 1
+        fi
+    fi
+
+    section "Emptying gs://$PAGES_BUCKET"
+    if [[ "$PAGES_BUCKET" == "herddb-datasets" || "$PAGES_BUCKET" == *datasets* ]]; then
+        fatal "BUG: pages bucket '$PAGES_BUCKET' looks like a datasets bucket — refusing."
+    fi
+    gcloud storage rm "gs://${PAGES_BUCKET}/**" --recursive --quiet 2>/dev/null || {
+        echo "  (bucket was already empty)"
+    }
+
+    TS="$(timestamp)"
+    STATE_FILE="$REPORTS_DIR/reset-$TS.state"
+    echo "bucket-only=true" > "$STATE_FILE"
+    echo "pages_bucket=$PAGES_BUCKET" >> "$STATE_FILE"
+    echo ""
+    echo "RESET_STATE=$STATE_FILE"
+    exit 0
+fi
+
 # Filter targets so we never scale the tools pod or any --keep-pvc entry.
 TARGET_STS=()
 for s in "${ALL_STS[@]}"; do
@@ -99,7 +138,7 @@ for s in "${ALL_STS[@]}"; do
 done
 
 if [[ ${#TARGET_STS[@]} -eq 0 ]]; then
-    fatal "no StatefulSets to reset (are you pointed at the right cluster?)."
+    fatal "no StatefulSets to reset (are you pointed at the right cluster?). Use --bucket-only to just empty the GCS bucket."
 fi
 
 section "Reset plan"

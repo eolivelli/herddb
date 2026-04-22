@@ -29,6 +29,18 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.bookkeeper.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.bookkeeper.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.bookkeeper.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       initContainers:
         - name: wait-for-zookeeper
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
