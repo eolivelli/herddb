@@ -94,8 +94,18 @@ spec:
               mountPath: /opt/herddb/indexdata
             - name: log
               mountPath: /opt/herddb/indexlog
+            # Mount each config file with subPath instead of the whole conf
+            # directory so the jvector compiler-directives file (and any other
+            # files bundled in the docker image) stay reachable on the
+            # JVM-relative path conf/jvector-compiler-directives.
             - name: config
-              mountPath: /opt/herddb/conf
+              mountPath: /opt/herddb/conf/indexingservice.properties
+              subPath: indexingservice.properties
+            {{- if .Values.indexingService.loggingProperties }}
+            - name: config
+              mountPath: /opt/herddb/conf/logging.properties
+              subPath: logging.properties
+            {{- end }}
       volumes:
         - name: config
           configMap:
