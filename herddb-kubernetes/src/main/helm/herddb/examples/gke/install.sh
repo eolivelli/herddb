@@ -173,7 +173,7 @@ fi
 
 # ── 2. Check that the GCS bucket exists ───────────────────────────
 echo "==> Checking GCS bucket gs://${GCS_BUCKET}..."
-if ! gcloud storage buckets describe "gs://${GCS_BUCKET}" >/dev/null 2>&1; then
+if ! gcloud storage buckets list --filter="name=${GCS_BUCKET}" --format="value(name)" 2>/dev/null | grep -q "^${GCS_BUCKET}$"; then
     if $NON_INTERACTIVE; then
         if $CREATE_BUCKET; then
             echo "==> Creating bucket gs://${GCS_BUCKET} in ${GCS_LOCATION}..."

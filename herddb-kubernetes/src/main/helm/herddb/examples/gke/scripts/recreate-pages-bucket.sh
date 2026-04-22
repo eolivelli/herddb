@@ -89,9 +89,9 @@ echo "  Project:         $PROJECT"
 echo "  Service account: $SERVICE_ACCOUNT"
 
 CURRENT_LOC="(does not exist)"
-if gcloud storage buckets describe "gs://$BUCKET" --format="value(location)" \
-     --project="$PROJECT" &>/dev/null; then
-  CURRENT_LOC="$(gcloud storage buckets describe "gs://$BUCKET" \
+if gcloud storage buckets list --filter="name=${BUCKET}" --format="value(name)" \
+     --project="$PROJECT" 2>/dev/null | grep -q "^${BUCKET}$"; then
+  CURRENT_LOC="$(gcloud storage buckets list --filter="name=${BUCKET}" \
     --format='value(location)' --project="$PROJECT" 2>/dev/null)"
 fi
 echo "  Current location: $CURRENT_LOC"
@@ -115,7 +115,7 @@ if ! $YES; then
 fi
 
 # ── Delete existing bucket ───────────────────────────────────────────────────
-if gcloud storage buckets describe "gs://$BUCKET" --project="$PROJECT" &>/dev/null; then
+if gcloud storage buckets list --filter="name=${BUCKET}" --format="value(name)" --project="$PROJECT" 2>/dev/null | grep -q "^${BUCKET}$"; then
   section "Deleting all objects in gs://$BUCKET"
   # Use -r (recursive) with ** glob; tolerate empty bucket (|| true)
   gcloud storage rm --recursive "gs://${BUCKET}/**" 2>/dev/null || true
