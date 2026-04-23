@@ -1609,6 +1609,82 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     public void setStatsLogger(StatsLogger statsLogger) {
         this.statsLogger = statsLogger;
         registerTailerMetrics();
+        registerShadowMetrics();
+    }
+
+    /**
+     * Registers shadow-specific Prometheus gauges. Called only when the
+     * engine has been configured as a shadow ({@link #isConfiguredAsShadow()});
+     * for primaries it's a no-op.
+     */
+    private void registerShadowMetrics() {
+        StatsLogger sl = this.statsLogger;
+        if (sl == null || !config.isShadow()) {
+            return;
+        }
+        StatsLogger shadow = sl.scope("shadow");
+        shadow.registerGauge("ready", new Gauge<Integer>() {
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return shadowReady ? 1 : 0;
+            }
+        });
+        shadow.registerGauge("reload_count", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return shadowReloadCount.get();
+            }
+        });
+        shadow.registerGauge("loaded_ledger_id", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return -1L;
+            }
+            @Override
+            public Long getSample() {
+                LogSequenceNumber l = shadowLoadedLsn;
+                return l != null ? l.ledgerId : -1L;
+            }
+        });
+        shadow.registerGauge("loaded_offset", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return -1L;
+            }
+            @Override
+            public Long getSample() {
+                LogSequenceNumber l = shadowLoadedLsn;
+                return l != null ? l.offset : -1L;
+            }
+        });
+        // lag_entries: primary_advertised_offset - loaded_offset when same
+        // ledger, else -1 to signal "unknown across ledgers".
+        shadow.registerGauge("lag_entries", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return -1L;
+            }
+            @Override
+            public Long getSample() {
+                LogSequenceNumber adv = primaryAdvertisedLsn;
+                LogSequenceNumber loaded = shadowLoadedLsn;
+                if (adv == null || loaded == null) {
+                    return -1L;
+                }
+                if (adv.ledgerId != loaded.ledgerId) {
+                    return -1L;
+                }
+                return Math.max(0L, adv.offset - loaded.offset);
+            }
+        });
     }
 
     private void registerTailerMetrics() {
