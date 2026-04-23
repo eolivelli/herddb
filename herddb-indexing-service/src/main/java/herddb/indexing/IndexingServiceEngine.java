@@ -27,6 +27,7 @@ import herddb.core.MemoryManager;
 import herddb.file.FileMetadataStorageManager;
 import herddb.index.vector.AbstractVectorStore;
 import herddb.index.vector.PersistentVectorStore;
+import herddb.index.vector.ReadOnlyVectorStore;
 import herddb.index.vector.VectorIndexManager;
 import herddb.index.vector.VectorMemoryBudget;
 import herddb.log.CommitLogTailing;
@@ -44,6 +45,7 @@ import herddb.remote.RemoteFileDataStorageManager;
 import herddb.remote.SegmentBlockCache;
 import herddb.server.ServerConfiguration;
 import herddb.storage.DataStorageManager;
+import herddb.storage.IndexStatus;
 import herddb.utils.Bytes;
 import herddb.utils.XXHash64Utils;
 import java.io.IOException;
@@ -112,6 +114,21 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     private volatile LogSequenceNumber lastProcessedLsn;
     private long entriesSinceLastCheckpoint;
+
+    // Shadow-replica state (only meaningful when config.isShadow() == true).
+    /** true once this shadow has completed its first successful reload. */
+    private volatile boolean shadowReady;
+    /** Primary's latest advertised LSN read from ZK, or null if never observed. */
+    private volatile LogSequenceNumber primaryAdvertisedLsn;
+    /** Loaded LSN of the shadow's current on-disk view. */
+    private volatile LogSequenceNumber shadowLoadedLsn;
+    /** Wall-clock of the most recent successful reload. */
+    private volatile long shadowLastReloadTimestampMs;
+    /** Count of successful reloads (including the initial one). */
+    private final java.util.concurrent.atomic.AtomicLong shadowReloadCount =
+            new java.util.concurrent.atomic.AtomicLong(0);
+    /** Single-thread executor that serialises reloads (ZK watcher hands off). */
+    private ExecutorService shadowReloadExecutor;
 
     private volatile StatsLogger statsLogger;
 
@@ -542,6 +559,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             } catch (Exception e) {
                 throw new IOException("tablespace-resolved hook failed", e);
             }
+        }
+
+        // Shadow replicas skip the entire commit-log tailer + watermark path.
+        // They discover their indexes by reading the primary's definitions
+        // from the shared storage and serve queries from the on-disk segments
+        // via ReadOnlyVectorStore. Segment freshness is driven by
+        // reload-on-ZK-notify against the primary's advertised LSN (step 5).
+        if (config.isShadow()) {
+            startAsShadow();
+            return;
         }
 
         // Load the watermark now that the watermark store has been configured
@@ -1161,6 +1188,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                             lsn.offset,
                             segmentCount,
                             System.currentTimeMillis()));
+            LOGGER.log(Level.FINE,
+                    "Published indexing-service checkpoint state: instance={0}, lsn={1}, segments={2}",
+                    new Object[]{instanceId, lsn, segmentCount});
         } catch (MetadataStorageManagerException e) {
             LOGGER.log(Level.WARNING,
                     "Failed to publish indexing-service checkpoint state for instance " + instanceId, e);
@@ -1179,6 +1209,206 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         LogSequenceNumber lsn = lastProcessedLsn != null ? lastProcessedLsn : LogSequenceNumber.START_OF_TIME;
         publishCheckpointStateBestEffort(lsn);
     }
+
+    // -------------------------------------------------------------------------
+    // Shadow-replica boot path
+    // -------------------------------------------------------------------------
+
+    /**
+     * Shadow-mode counterpart of the tailer/watermark startup path.
+     *
+     * <p>Discovers the primary's tables and indexes from the shared storage
+     * (no commit-log replay), creates a {@link ReadOnlyVectorStore} for each
+     * vector index, performs an initial reload, and installs a ZK watch on
+     * the primary's advertised state. Every watcher fire enqueues a reload
+     * onto {@link #shadowReloadExecutor}; reloads are serialised.
+     */
+    private void startAsShadow() throws IOException {
+        final int shadowOf = config.getInt(IndexingServerConfiguration.PROPERTY_SHADOW_OF,
+                IndexingServerConfiguration.PROPERTY_SHADOW_OF_UNSET);
+        LOGGER.log(Level.INFO,
+                "IndexingServiceEngine starting in shadow mode (shadowOf={0}); "
+                        + "skipping commit-log tailer and watermark store",
+                shadowOf);
+        this.lastProcessedLsn = LogSequenceNumber.START_OF_TIME;
+        this.startTimeMillis = System.currentTimeMillis();
+
+        shadowReloadExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "indexing-shadow-reload");
+            t.setDaemon(true);
+            return t;
+        });
+
+        // Discover vector indexes directly from the DSM — no SchemaTracker
+        // needed because shadows never process DML. Other index kinds
+        // (non-vector) are ignored: the indexing service handles only vector
+        // indexes. Tables do not need to be tracked either; the store key
+        // (table, index) is what matters for Search RPCs.
+        try {
+            List<Index> indexes = dataStorageManager.loadIndexes(LogSequenceNumber.START_OF_TIME, tableSpaceUUID);
+            for (Index idx : indexes) {
+                if (!Index.TYPE_VECTOR.equals(idx.type)) {
+                    continue;
+                }
+                createShadowVectorStore(idx);
+            }
+        } catch (Exception e) {
+            throw new IOException("Shadow boot failed while discovering schema from storage", e);
+        }
+
+        // Perform an initial reload so the shadow has fresh state before
+        // exposing the gRPC endpoints.
+        IndexingServiceCheckpointState primaryState = null;
+        try {
+            if (metadataStorageManager != null) {
+                primaryState = metadataStorageManager.getIndexingServiceCheckpointState(shadowOf);
+            }
+        } catch (MetadataStorageManagerException e) {
+            LOGGER.log(Level.WARNING, "Failed to read primary's advertised checkpoint state at boot", e);
+        }
+        if (primaryState != null) {
+            this.primaryAdvertisedLsn = primaryState.toLogSequenceNumber();
+        }
+        boolean initialReloadOk = doShadowReload();
+        this.shadowReady = initialReloadOk;
+
+        // Install the ZK watch — every update enqueues a reload.
+        if (metadataStorageManager != null) {
+            try {
+                metadataStorageManager.watchIndexingServiceCheckpointState(shadowOf, state -> {
+                    this.primaryAdvertisedLsn = state.toLogSequenceNumber();
+                    enqueueShadowReload();
+                });
+            } catch (MetadataStorageManagerException e) {
+                LOGGER.log(Level.WARNING,
+                        "Shadow could not install watch on primary's state; reloads will not fire", e);
+            }
+        }
+    }
+
+    /**
+     * Creates a {@link ReadOnlyVectorStore} for the given vector index and
+     * puts it in {@link #vectorStores}. Uses the index's stable UUID so the
+     * shadow reads the primary's on-disk segments at exactly the same storage
+     * path.
+     */
+    private void createShadowVectorStore(Index idx) {
+        final String vectorColumnName = idx.columnNames[0];
+        final int m = config.getInt(IndexingServerConfiguration.PROPERTY_VECTOR_M,
+                IndexingServerConfiguration.PROPERTY_VECTOR_M_DEFAULT);
+        final int beamWidth = config.getInt(IndexingServerConfiguration.PROPERTY_VECTOR_BEAM_WIDTH,
+                IndexingServerConfiguration.PROPERTY_VECTOR_BEAM_WIDTH_DEFAULT);
+        final float neighborOverflow = (float) config.getDouble(
+                IndexingServerConfiguration.PROPERTY_VECTOR_NEIGHBOR_OVERFLOW,
+                IndexingServerConfiguration.PROPERTY_VECTOR_NEIGHBOR_OVERFLOW_DEFAULT);
+        final float alpha = (float) config.getDouble(
+                IndexingServerConfiguration.PROPERTY_VECTOR_ALPHA,
+                IndexingServerConfiguration.PROPERTY_VECTOR_ALPHA_DEFAULT);
+        final boolean fusedPQ = config.getBoolean(IndexingServerConfiguration.PROPERTY_VECTOR_FUSED_PQ,
+                IndexingServerConfiguration.PROPERTY_VECTOR_FUSED_PQ_DEFAULT);
+        final long maxSegmentSize = config.getLong(IndexingServerConfiguration.PROPERTY_VECTOR_MAX_SEGMENT_SIZE,
+                IndexingServerConfiguration.PROPERTY_VECTOR_MAX_SEGMENT_SIZE_DEFAULT);
+        var similarityFunction = PersistentVectorStore.parseSimilarityFunction(
+                idx.properties != null ? idx.properties.get(VectorIndexManager.PROP_SIMILARITY) : null);
+        ReadOnlyVectorStore store = new ReadOnlyVectorStore(
+                idx.name, idx.table, tableSpaceUUID, vectorColumnName,
+                idx.uuid, dataDirectory, dataStorageManager, memoryManager,
+                m, beamWidth, neighborOverflow, alpha,
+                fusedPQ, maxSegmentSize, 0, similarityFunction);
+        try {
+            store.start();
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING,
+                    "Shadow failed to start ReadOnlyVectorStore for index " + idx.name, e);
+            try {
+                store.close();
+            } catch (Exception ignore) {
+                // best-effort
+            }
+            return;
+        }
+        vectorStores.put(storeKey(idx.table, idx.name), store);
+        registerIndexMetrics(idx.tablespace, idx.table, idx.name, store);
+        LOGGER.log(Level.INFO, "Shadow created ReadOnlyVectorStore for index {0}.{1} (uuid={2})",
+                new Object[]{idx.table, idx.name, idx.uuid});
+    }
+
+    /**
+     * Runs a reload of every {@link ReadOnlyVectorStore} managed by this
+     * engine. Returns true iff every store reloaded (or there were no stores
+     * at all and we still consider the shadow ready to serve empty results).
+     */
+    private boolean doShadowReload() {
+        boolean allOk = true;
+        LogSequenceNumber maxLsn = null;
+        for (AbstractVectorStore s : vectorStores.values()) {
+            if (!(s instanceof ReadOnlyVectorStore)) {
+                continue;
+            }
+            ReadOnlyVectorStore ro = (ReadOnlyVectorStore) s;
+            try {
+                IndexStatus status = dataStorageManager.getIndexStatus(
+                        tableSpaceUUID, ro.unwrap().getIndexUuid(), LogSequenceNumber.START_OF_TIME);
+                if (status != null && status.indexData != null && status.indexData.length > 0) {
+                    ro.reloadFromStatus(status);
+                    LogSequenceNumber l = ro.getLoadedLsn();
+                    if (l != null && (maxLsn == null || l.after(maxLsn))) {
+                        maxLsn = l;
+                    }
+                }
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Shadow reload failed for index " + ro, e);
+                allOk = false;
+            }
+        }
+        if (maxLsn != null) {
+            this.shadowLoadedLsn = maxLsn;
+        }
+        if (allOk) {
+            this.shadowLastReloadTimestampMs = System.currentTimeMillis();
+            this.shadowReloadCount.incrementAndGet();
+            this.shadowReady = true;
+        }
+        return allOk;
+    }
+
+    private void enqueueShadowReload() {
+        ExecutorService exec = shadowReloadExecutor;
+        if (exec == null) {
+            return;
+        }
+        try {
+            exec.submit(this::doShadowReload);
+        } catch (java.util.concurrent.RejectedExecutionException ignore) {
+            // executor shut down — no more reloads needed.
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Shadow accessors (used by IndexingServiceImpl's GetShadowStatus /
+    // WaitForCheckpoint RPC implementations landing in step 8).
+    // -------------------------------------------------------------------------
+
+    public boolean isShadowReady() {
+        return shadowReady;
+    }
+
+    public LogSequenceNumber getShadowLoadedLsn() {
+        return shadowLoadedLsn;
+    }
+
+    public LogSequenceNumber getPrimaryAdvertisedLsn() {
+        return primaryAdvertisedLsn;
+    }
+
+    public long getShadowLastReloadTimestampMs() {
+        return shadowLastReloadTimestampMs;
+    }
+
+    public long getShadowReloadCount() {
+        return shadowReloadCount.get();
+    }
+
 
     public List<Map.Entry<Bytes, Float>> search(String tablespace, String table, String index,
                                                   float[] vector, int limit) {
@@ -1957,6 +2187,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     @Override
     public void close() throws Exception {
         LOGGER.info("IndexingServiceEngine closing");
+
+        // Shadow-only: stop the single-thread reload executor.
+        if (shadowReloadExecutor != null) {
+            shadowReloadExecutor.shutdownNow();
+            try {
+                shadowReloadExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            shadowReloadExecutor = null;
+        }
 
         // Stop the tailer
         if (tailer != null) {

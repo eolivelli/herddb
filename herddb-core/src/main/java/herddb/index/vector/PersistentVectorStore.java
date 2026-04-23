@@ -867,6 +867,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return readOnly;
     }
 
+    /** Exposes the internal indexUUID (used by shadows to re-read IndexStatus). */
+    public String getIndexUuid() {
+        return indexUUID;
+    }
+
     /**
      * LogSequenceNumber of the last {@link IndexStatus} applied to this store,
      * or {@code null} if none has been applied. For primaries this is set once

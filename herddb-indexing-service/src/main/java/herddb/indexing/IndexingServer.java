@@ -232,6 +232,21 @@ public class IndexingServer implements AutoCloseable {
                     this.remoteDataStorageManager = (RemoteFileStorageManager) dsm;
                     this.remoteMetaDir = metaDir;
 
+                    // Shadows operate strictly from remote storage. Swap the
+                    // writable RemoteFileDataStorageManager we just built for
+                    // a pure read-only DSM backed by the same client and
+                    // metadata manager — keeps the file-server discovery and
+                    // hydrate-from-S3 plumbing unchanged while forbidding any
+                    // accidental writes. The writable DSM was fully
+                    // constructed and wired above so that the metadata dir
+                    // gets created and the SharedCheckpointMetadata instance
+                    // is ready; we discard it after building the replica DSM.
+                    if (config.isShadow()) {
+                        DataStorageManager replica = factory.createReadReplicaDataStorageManager(
+                                client, shared, remoteTmpDir, Integer.MAX_VALUE);
+                        return replica;
+                    }
+
                     return dsm;
                 } catch (java.io.IOException e) {
                     throw new RuntimeException(
