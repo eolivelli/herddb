@@ -45,7 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: eolivelli/jvector
-          ref: reduce-denseintmap-lock-contention
+          ref: main
           path: jvector
       - name: 'Build jvector'
         run: mvn -B install -DskipTests -Drat.skip=true --file jvector/pom.xml && rm -rf jvector
