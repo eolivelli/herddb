@@ -57,7 +57,7 @@ chart usage.
 ```mermaid
 flowchart LR
   subgraph Clients
-    CLI["JDBC / SQL client<br/>(vector-search queries<br/>load-balanced across shadows)"]
+    CLI["JDBC / SQL client"]
   end
 
   subgraph "Control plane"
@@ -81,10 +81,10 @@ flowchart LR
     OBJ[("S3 / GCS / MinIO")]
   end
 
-  CLI -->|SQL + DML| Leader
-  CLI -. vector search .-> ISvcP
-  CLI -. vector search .-> ISvcS1
-  CLI -. vector search .-> ISvcS2
+  CLI -->|SQL + DML + vector search| Leader
+  Leader -. vector search (LB) .-> ISvcP
+  Leader -. vector search (LB) .-> ISvcS1
+  Leader -. vector search (LB) .-> ISvcS2
 
   Leader -->|append| BK
   Replica -->|tail| BK
@@ -99,10 +99,10 @@ flowchart LR
 
   Leader -. elect / heartbeat .-> ZK
   Replica -. discover .-> ZK
+  Leader -. discover indexing instances .-> ZK
   ISvcP -. publish IndexStatus .-> ZK
   ISvcS1 -. watch .-> ZK
   ISvcS2 -. watch .-> ZK
-  CLI -. discover .-> ZK
 ```
 
 The rest of this section zooms in on individual layers.
@@ -171,8 +171,9 @@ flowchart LR
   automatic fan-out of SQL reads across followers.
 - **Indexing-service shadow replicas** (§4 below) are the tier that
   **does** transparently scale **vector-search read throughput**:
-  the JDBC client load-balances each search query across
-  `{primary, shadow1, shadow2, …}` for the target index.
+  the HerdDB server load-balances each search query across
+  `{primary, shadow1, shadow2, …}` for the target index on behalf
+  of the JDBC client.
 
 ### 3. Shared object storage + file-server cache tier
 
@@ -232,10 +233,11 @@ indexes on its own schedule.
   a new LSN is published, they reload `IndexStatus` from shared
   storage and serve search traffic against it. Shadows therefore
   lag the primary by **at most one checkpoint interval**.
-- The **JDBC client** discovers instances via ZooKeeper and, for each
-  vector-search query, **load-balances across `{primary, shadow1,
-  shadow2, …}`** for the target index, failing over within the pool
-  on `NOT_READY` or retryable errors.
+- The **HerdDB server** discovers indexing-service instances via
+  ZooKeeper and, for each vector-search query received over JDBC,
+  **load-balances across `{primary, shadow1, shadow2, …}`** for
+  the target index, failing over within the pool on `NOT_READY`
+  or retryable errors. JDBC clients see a single SQL endpoint.
 
 ```mermaid
 flowchart LR
@@ -253,7 +255,8 @@ flowchart LR
     S3["Shadow N"]
   end
 
-  Client["JDBC client<br/>(vector-search LB)"]
+  JDBC["JDBC client"]
+  Server["HerdDB server<br/>(vector-search LB)"]
 
   WAL --> P
   P -->|write segments + status| OBJ
@@ -265,10 +268,11 @@ flowchart LR
   OBJ -. reload IndexStatus .-> S2
   OBJ -. reload IndexStatus .-> S3
 
-  Client -. search .-> P
-  Client -. search .-> S1
-  Client -. search .-> S2
-  Client -. search .-> S3
+  JDBC -->|SQL search| Server
+  Server -. gRPC search .-> P
+  Server -. gRPC search .-> S1
+  Server -. gRPC search .-> S2
+  Server -. gRPC search .-> S3
 ```
 
 Scope is strictly horizontal **read** scalability. Shadow-to-primary
