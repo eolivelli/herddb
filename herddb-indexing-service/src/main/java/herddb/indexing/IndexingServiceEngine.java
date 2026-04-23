@@ -33,7 +33,9 @@ import herddb.log.CommitLogTailing;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
 import herddb.log.LogSequenceNumber;
+import herddb.metadata.IndexingServiceCheckpointState;
 import herddb.metadata.MetadataStorageManager;
+import herddb.metadata.MetadataStorageManagerException;
 import herddb.model.Index;
 import herddb.model.Record;
 import herddb.model.Table;
@@ -598,6 +600,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
         this.startTimeMillis = System.currentTimeMillis();
 
+        // Primaries advertise their initial state so shadows booting before
+        // the next checkpoint can still see a valid state znode.
+        publishInitialCheckpointState();
+
         LOGGER.log(Level.INFO,
                 "IndexingServiceEngine started, watermark={0}, tailerStart={1}",
                 new Object[]{watermark, tailerStart});
@@ -1119,9 +1125,59 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to save watermark", e);
             }
+            // Advertise the new durable LSN to ZK so shadow replicas can reload.
+            // Primaries only; shadows never reach this code path (tailer is
+            // not started for them).
+            publishCheckpointStateBestEffort(checkpointLsn);
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "checkpointAndSaveWatermark failed", e);
         }
+    }
+
+    /**
+     * Publishes the engine's current durable LSN + aggregate segment count to
+     * ZooKeeper under {@code /herddb/indexingServices/state/{instanceId}} so
+     * that shadow replicas of this primary can reload their on-disk view.
+     *
+     * <p>Best-effort: a failure to write to ZK never fails the checkpoint — the
+     * watermark has already been saved, so the primary is consistent; the
+     * shadow will simply observe the next successful publish.
+     */
+    private void publishCheckpointStateBestEffort(LogSequenceNumber lsn) {
+        if (metadataStorageManager == null || lsn == null || config.isShadow()) {
+            return;
+        }
+        try {
+            int segmentCount = 0;
+            for (AbstractVectorStore store : vectorStores.values()) {
+                if (store instanceof PersistentVectorStore) {
+                    segmentCount += ((PersistentVectorStore) store).getSegmentCount();
+                }
+            }
+            metadataStorageManager.publishIndexingServiceCheckpointState(
+                    new IndexingServiceCheckpointState(
+                            instanceId,
+                            lsn.ledgerId,
+                            lsn.offset,
+                            segmentCount,
+                            System.currentTimeMillis()));
+        } catch (MetadataStorageManagerException e) {
+            LOGGER.log(Level.WARNING,
+                    "Failed to publish indexing-service checkpoint state for instance " + instanceId, e);
+        }
+    }
+
+    /**
+     * Publishes the initial checkpoint state on engine startup so that shadow
+     * replicas booting before the first post-start checkpoint can still find
+     * a valid state entry for this primary.
+     */
+    void publishInitialCheckpointState() {
+        if (config.isShadow()) {
+            return;
+        }
+        LogSequenceNumber lsn = lastProcessedLsn != null ? lastProcessedLsn : LogSequenceNumber.START_OF_TIME;
+        publishCheckpointStateBestEffort(lsn);
     }
 
     public List<Map.Entry<Bytes, Float>> search(String tablespace, String table, String index,
