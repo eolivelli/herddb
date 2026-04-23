@@ -44,8 +44,7 @@ HerdDB + JVector is designed to run on **Kubernetes on public clouds**.
   S3** is expected to work with minor configuration changes; other
   S3-compatible stores (MinIO is used in local tests) have also been
   exercised.
-- **Docker images** are built from [`herddb-docker/`](./herddb-docker/)
-  (base image `eclipse-temurin:25-jdk`).
+- **Docker images** are built from [`herddb-docker/`](./herddb-docker/).
 - A **Helm chart** plus ready-to-use `values.yaml` for GKE and for a
   local k3s-in-docker stack ships under
   [`herddb-kubernetes/src/main/helm/herddb/`](./herddb-kubernetes/src/main/helm/herddb/).
