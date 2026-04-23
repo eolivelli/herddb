@@ -378,10 +378,6 @@ The underlying shell scripts they drive live under
 [`herddb-kubernetes/src/main/helm/herddb/examples/`](./herddb-kubernetes/src/main/helm/herddb/examples/)
 and can also be run by hand.
 
-## Getting involved
-
-Join the [mailing list](http://lists.herddb.org/mailman/listinfo).
-
 ## License
 
 HerdDB + JVector is distributed under the
