@@ -3125,15 +3125,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /**
      * Estimated heap bytes consumed per live vector, using the same accounting as
      * {@link #shardMemoryBytes(LiveGraphShard)}.
+     *
+     * <p>The HNSW graph-overhead term is delegated to jvector's static helper
+     * {@link OnHeapGraphIndex#estimatedBytesPerNode(int, float)} so the estimate
+     * stays in sync with the actual per-node footprint (e.g. future changes to
+     * {@code ConcurrentNeighborMap} / {@code Neighbors} layout).
      */
     static long estimatedBytesPerVector(int dim, int m, float neighborOverflow) {
-        // int nodeArrayLength = maxOverflowDegree + 1 = (int)(m * neighborOverflow) + 1
-        int nodeArrayLen = (int) (m * neighborOverflow) + 1;
-        // NodeArray.ramBytesUsed(nodeArrayLen):
-        //   OH(16) + size_field(4) + ref+ah nodes(24) + ref+ah scores(24) + nodeArrayLen*(4+4)
-        // Neighbors adds: nodeId(4) + diverseBefore(4)
-        // Plus REF_BYTES(8) for the DenseIntMap slot
-        long graphBytesPerNode = 8L + 16L + 4L + 24L + 24L + (long) nodeArrayLen * 8L + 8L;
+        long graphBytesPerNode = OnHeapGraphIndex.estimatedBytesPerNode(m, neighborOverflow);
         return (long) dim * Float.BYTES   // raw vector
                 + 250L                   // pkToNode + nodeToPk + Bytes PK
                 + graphBytesPerNode;     // HNSW graph overhead per node (layer 0)

@@ -21,6 +21,7 @@ package herddb.index.vector;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import io.github.jbellis.jvector.graph.OnHeapGraphIndex;
 import org.junit.Test;
 
 /**
@@ -44,8 +45,7 @@ public class PersistentVectorStoreCapComputationTest {
         int dim = 128;
         int m = 16;
         float neighborOverflow = 1.2f;
-        int nodeArrayLen = (int) (m * neighborOverflow) + 1; // 20
-        long graphBytesPerNode = 8L + 16L + 4L + 24L + 24L + (long) nodeArrayLen * 8L + 8L;
+        long graphBytesPerNode = OnHeapGraphIndex.estimatedBytesPerNode(m, neighborOverflow);
         long expected = (long) dim * 4 + 250L + graphBytesPerNode;
 
         long result = PersistentVectorStore.estimatedBytesPerVector(dim, m, neighborOverflow);
