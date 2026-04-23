@@ -135,6 +135,11 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_APPLY_QUEUE_CAPACITY = "indexing.apply.queue.capacity";
     public static final int PROPERTY_APPLY_QUEUE_CAPACITY_DEFAULT = 1000;
 
+    // Search parallelism — parallel fan-out across segments and shards within
+    // a single vector search. 0 = auto: max(1, availableProcessors / 2).
+    public static final String PROPERTY_VECTOR_SEARCH_PARALLELISM = "indexing.vector.search.parallelism";
+    public static final int PROPERTY_VECTOR_SEARCH_PARALLELISM_DEFAULT = 0;
+
     /**
      * Tailer-driven watermark checkpoint trigger: after this many entries are
      * processed by the tailer, {@code IndexingServiceEngine} drains pending

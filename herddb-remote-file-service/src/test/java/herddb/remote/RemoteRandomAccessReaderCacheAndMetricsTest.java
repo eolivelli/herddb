@@ -23,6 +23,7 @@ package herddb.remote;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import herddb.utils.VectorSearchRequestContext;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import java.io.ByteArrayInputStream;
 import java.util.List;

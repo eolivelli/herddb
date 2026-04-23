@@ -18,15 +18,19 @@
 
  */
 
-package herddb.remote;
+package herddb.utils;
+
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * Thread-scoped accumulator for per-request metrics on the vector-search hot
- * path. A single {@code VectorSearch} gRPC handler thread executes the whole
- * search synchronously (see {@code IndexingServiceImpl.search} →
- * {@code PersistentVectorStore.searchInternal} → {@code GraphSearcher.search}),
- * so a plain {@link ThreadLocal} is sufficient to correlate
- * {@code readFileRange} calls back to the originating request.
+ * path. A {@code VectorSearch} gRPC handler initiates the search on one thread
+ * (see {@code IndexingServiceImpl.search} → {@code PersistentVectorStore.searchInternal}),
+ * and may fan out to worker threads when intra-query parallelism is enabled
+ * (issue #245). A {@link ThreadLocal} holds the active context on whichever
+ * thread is currently executing {@code readFileRange}; worker threads that
+ * share the same request re-bind the same context via {@link #bind(VectorSearchRequestContext)}
+ * so their reads are attributed to the originating request.
  *
  * <p>Usage pattern from the gRPC handler:
  * <pre>{@code
@@ -41,16 +45,27 @@ package herddb.remote;
  * }
  * }</pre>
  *
- * <p>This class lives in {@code herddb-remote-file-service} (instead of the
- * indexing-service module) because {@code RemoteRandomAccessReader} needs to
- * update the context from the read hot path, and the indexing-service module
- * already depends on this module. Keeping the class here avoids a dependency
- * inversion.
+ * <p>Usage pattern from a worker thread re-binding the parent's context:
+ * <pre>{@code
+ * VectorSearchRequestContext.bind(ctx);
+ * try {
+ *     // ... perform one segment's search
+ * } finally {
+ *     VectorSearchRequestContext.end();
+ * }
+ * }</pre>
  *
- * <p>Fields are plain {@code long}s (no atomics) because access is
- * single-threaded per request. {@link #current()} returns {@code null} outside
- * an active request — callers MUST null-check so that non-search read paths
- * (e.g. data-page lazy loads) don't trip an NPE.
+ * <p>This class lives in {@code herddb-utils} (rather than in
+ * {@code herddb-remote-file-service} or {@code herddb-indexing-service})
+ * because both the read hot path ({@code RemoteRandomAccessReader}) and the
+ * vector-index core ({@code PersistentVectorStore}) need to reach it, and
+ * only {@code herddb-utils} sits below them both in the dependency graph.
+ *
+ * <p>Counters are {@link LongAdder}s so concurrent worker threads can record
+ * {@code readFileRange} events on the same context without contention.
+ * {@link #current()} returns {@code null} outside an active request —
+ * callers MUST null-check so that non-search read paths (e.g. data-page lazy
+ * loads) don't trip an NPE.
  *
  * @author enrico.olivelli
  */
@@ -58,11 +73,11 @@ public final class VectorSearchRequestContext {
 
     private static final ThreadLocal<VectorSearchRequestContext> CURRENT = new ThreadLocal<>();
 
-    private long readFileRangeCalls;
-    private long readFileRangeBytes;
-    private long readFileRangeWaitNanos;
-    private long cacheHits;
-    private long cacheMisses;
+    private final LongAdder readFileRangeCalls = new LongAdder();
+    private final LongAdder readFileRangeBytes = new LongAdder();
+    private final LongAdder readFileRangeWaitNanos = new LongAdder();
+    private final LongAdder cacheHits = new LongAdder();
+    private final LongAdder cacheMisses = new LongAdder();
 
     private VectorSearchRequestContext() {
         // created via begin()
@@ -77,6 +92,20 @@ public final class VectorSearchRequestContext {
         VectorSearchRequestContext ctx = new VectorSearchRequestContext();
         CURRENT.set(ctx);
         return ctx;
+    }
+
+    /**
+     * Binds an existing context to the current thread. Used by worker threads
+     * participating in a parallel vector search so their {@code readFileRange}
+     * calls accumulate into the initiator's context. Null-safe: binding
+     * {@code null} is equivalent to {@link #end()}.
+     */
+    public static void bind(VectorSearchRequestContext ctx) {
+        if (ctx == null) {
+            CURRENT.remove();
+        } else {
+            CURRENT.set(ctx);
+        }
     }
 
     /**
@@ -103,36 +132,36 @@ public final class VectorSearchRequestContext {
      * cache — cache hits use {@link #recordCacheHit()} in addition to this.
      */
     public void recordReadFileRange(int bytes, long elapsedNanos) {
-        readFileRangeCalls++;
-        readFileRangeBytes += bytes;
-        readFileRangeWaitNanos += elapsedNanos;
+        readFileRangeCalls.increment();
+        readFileRangeBytes.add(bytes);
+        readFileRangeWaitNanos.add(elapsedNanos);
     }
 
     public void recordCacheHit() {
-        cacheHits++;
+        cacheHits.increment();
     }
 
     public void recordCacheMiss() {
-        cacheMisses++;
+        cacheMisses.increment();
     }
 
     public long getReadFileRangeCalls() {
-        return readFileRangeCalls;
+        return readFileRangeCalls.sum();
     }
 
     public long getReadFileRangeBytes() {
-        return readFileRangeBytes;
+        return readFileRangeBytes.sum();
     }
 
     public long getReadFileRangeWaitNanos() {
-        return readFileRangeWaitNanos;
+        return readFileRangeWaitNanos.sum();
     }
 
     public long getCacheHits() {
-        return cacheHits;
+        return cacheHits.sum();
     }
 
     public long getCacheMisses() {
-        return cacheMisses;
+        return cacheMisses.sum();
     }
 }
