@@ -59,7 +59,10 @@ server:
     commitlog:
       size: 2Gi
   extraConfig:
-    indexing.service.timeout: "300"
+    # 600 s per-call gRPC deadline for IS search: GIST-class indexes can spend
+    # 400+ s inside a single Phase B checkpoint and the baked-in 120 s default
+    # would time out mid-cycle (issue #235).
+    indexing.service.timeout: "600"
     # --- BookKeeper commit-log tuning (experiment for issues #141 / #145) ---
     # Ledger max size raised to 10 GiB (from 128 MiB) for bigann 100M ingest.
     # At 128 MiB (~200 B/entry × 640k entries/ledger) the server rolled a new

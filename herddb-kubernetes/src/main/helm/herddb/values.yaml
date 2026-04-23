@@ -40,15 +40,8 @@ server:
   # rebuilding the image. The ConfigMap checksum annotation ensures a rolling
   # restart when this value changes.
   loggingProperties: ""
-  # Extra key=value entries appended to server.properties.
-  # `indexing.service.timeout` is the per-call gRPC deadline (seconds) the
-  # server uses when calling the Indexing Service. 600 s is generous enough
-  # to absorb a single IS Phase B at typical workloads; tune lower for
-  # latency-sensitive deployments or higher for large indexes. See
-  # ServerConfiguration.PROPERTY_INDEXING_SERVICE_TIMEOUT_DEFAULT for the
-  # baked-in default when this key is not set.
-  extraConfig:
-    indexing.service.timeout: "600"
+  # Extra key=value entries appended to server.properties
+  extraConfig: {}
   storage:
     data:
       size: 10Gi

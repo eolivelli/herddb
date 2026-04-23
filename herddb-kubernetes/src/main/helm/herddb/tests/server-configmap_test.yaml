@@ -45,12 +45,6 @@ tests:
           path: data["server.properties"]
           pattern: "server\\.node\\.id=mynode"
 
-  - it: should ship indexing.service.timeout=600 as a default extraConfig entry (issue #235)
-    asserts:
-      - matchRegex:
-          path: data["server.properties"]
-          pattern: "indexing\\.service\\.timeout=600"
-
   - it: should configure data and commitlog directories
     asserts:
       - matchRegex:
