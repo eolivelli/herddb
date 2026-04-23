@@ -63,6 +63,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
+import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 
 /**
@@ -195,7 +196,8 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         ServerSnapshot s = this.snapshot;
         String server = s.router.getServer(key);
         return RemoteFileServiceGrpc.newStub(s.readChannels.get(server))
-                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
+                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS)
+                .withMaxOutboundMessageSize(CHANNEL_MAX_MESSAGE_SIZE);
     }
 
     /** Write-plane stub for a specific block (issue #100). */
@@ -204,7 +206,8 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         ServerSnapshot s = this.snapshot;
         String server = s.router.getServer(key);
         return RemoteFileServiceGrpc.newStub(s.writeChannels.get(server))
-                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
+                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS)
+                .withMaxOutboundMessageSize(CHANNEL_MAX_MESSAGE_SIZE);
     }
 
     @Override
@@ -640,8 +643,17 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
                         @Override
                         public void onNext(ReadFileRangeResponse response) {
-                            if (response.getFound()) {
-                                result = response.getContent().toByteArray();
+                            // Broad catch at the gRPC callback boundary: if onNext
+                            // throws (e.g. OutOfMemoryError from toByteArray), gRPC
+                            // replaces the cause with an opaque "CANCELLED: Failed
+                            // to read message." — which makes root-cause analysis
+                            // impossible. Capture the cause directly.
+                            try {
+                                if (response.getFound()) {
+                                    result = response.getContent().toByteArray();
+                                }
+                            } catch (Throwable t) {
+                                future.completeExceptionally(t);
                             }
                         }
 
@@ -652,7 +664,9 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
                         @Override
                         public void onCompleted() {
-                            future.complete(result);
+                            if (!future.isDone()) {
+                                future.complete(result);
+                            }
                         }
                     });
             return future;
@@ -728,23 +742,37 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
                         @Override
                         public void onNext(ReadFileRangeResponse response) {
-                            if (response.getFound()) {
-                                ByteString content = response.getContent();
-                                int size = content.size();
-                                ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(size);
-                                // copyTo writes into the ByteBuffer view of the pooled buf
-                                // and the protobuf parser already holds the bytes in heap;
-                                // this is the single copy from heap into direct memory.
-                                content.copyTo(buf.nioBuffer(0, size));
-                                buf.writerIndex(size);
-                                result = buf;
+                            // Broad catch at the gRPC callback boundary: direct ByteBuf
+                            // allocation and the protobuf copy can throw OOM /
+                            // OutOfDirectMemoryError. gRPC would otherwise rewrap the
+                            // failure as an opaque "CANCELLED: Failed to read message.",
+                            // hiding the real cause from the retry log and metrics.
+                            ByteBuf local = null;
+                            try {
+                                if (response.getFound()) {
+                                    ByteString content = response.getContent();
+                                    int size = content.size();
+                                    local = PooledByteBufAllocator.DEFAULT.directBuffer(size);
+                                    // copyTo writes into the ByteBuffer view of the pooled buf
+                                    // and the protobuf parser already holds the bytes in heap;
+                                    // this is the single copy from heap into direct memory.
+                                    content.copyTo(local.nioBuffer(0, size));
+                                    local.writerIndex(size);
+                                    result = local;
+                                    local = null;
+                                }
+                            } catch (Throwable t) {
+                                if (local != null) {
+                                    ReferenceCountUtil.safeRelease(local);
+                                }
+                                future.completeExceptionally(t);
                             }
                         }
 
                         @Override
                         public void onError(Throwable t) {
                             if (result != null) {
-                                result.release();
+                                ReferenceCountUtil.safeRelease(result);
                                 result = null;
                             }
                             future.completeExceptionally(t);
@@ -752,7 +780,14 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
                         @Override
                         public void onCompleted() {
-                            future.complete(result);
+                            if (!future.isDone()) {
+                                future.complete(result);
+                            } else if (result != null) {
+                                // Future already failed in onNext — release the buffer we
+                                // would have returned so it does not leak.
+                                ReferenceCountUtil.safeRelease(result);
+                                result = null;
+                            }
                         }
                     });
             return future;
@@ -971,8 +1006,17 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
             }
             // Exponential backoff: 1s, 2s, 4s, ...
             long delayMs = 1000L * (1L << (nextAttempt - 1));
-            LOGGER.log(Level.INFO, "remote file {0} retry {1}/{2} for path {3} after {4}ms (error: {5})",
-                    new Object[]{opName, nextAttempt, maxRetries, path, delayMs, error.getMessage()});
+            // Log the full Throwable so the cause chain is visible: gRPC can
+            // swallow the original failure as a generic "CANCELLED: Failed to
+            // read message." when a StreamObserver throws, and dropping the
+            // cause here would hide the real root cause (e.g. OutOfDirectMemoryError).
+            LogRecord record = new LogRecord(Level.INFO,
+                    "remote file " + opName + " retry " + nextAttempt + "/" + maxRetries
+                            + " for path " + path + " after " + delayMs + "ms (error: "
+                            + error + ")");
+            record.setThrown(error);
+            record.setLoggerName(LOGGER.getName());
+            LOGGER.log(record);
             retryScheduler.schedule(() -> {
                 retryAsync(action, opName, path, nextAttempt).whenComplete((r, ex) -> {
                     if (ex != null) {
