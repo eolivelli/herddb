@@ -62,11 +62,15 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
+import org.apache.bookkeeper.stats.Gauge;
+import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
  * Client for RemoteFileService. Manages one ManagedChannel per server and uses
@@ -87,11 +91,51 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     public static final String CONFIG_CLIENT_RETRIES = "remote.file.client.retries";
     /** Configuration key for the default block size used in multipart writes. */
     public static final String CONFIG_CLIENT_BLOCK_SIZE = "remote.file.client.block.size";
+    /**
+     * Configuration key for the maximum number of bytes across all in-flight
+     * {@code readFile}/{@code readFileRange} gRPC calls whose payloads are
+     * currently being staged into a pooled direct {@link ByteBuf}. Each call
+     * reserves a byte budget equal to its requested payload length before
+     * allocation; the reservation is released on the terminal gRPC callback.
+     * The ceiling caps peak direct-memory footprint from in-flight reads,
+     * preventing IS checkpoint Phase C and query bursts that miss the
+     * {@code SegmentBlockCache} from growing Netty's {@code PoolArena}
+     * beyond {@code -XX:MaxDirectMemorySize} (see issue #246).
+     *
+     * <p>Bytes, not request count: {@code readFileRange} is also used by
+     * {@link RemoteRandomAccessReader} with 16 KiB windows, so a per-request
+     * cap would grossly under-count direct-memory pressure from small reads
+     * and over-throttle large ones. The underlying Netty {@code PoolChunk}
+     * size (typically 4 MiB) is irrelevant here: a 16 KiB read contributes
+     * 16 KiB to the reservation, the pool is free to share a chunk across
+     * sibling reads, and the reservation tracks only what the caller asked
+     * for.
+     */
+    public static final String CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES =
+            "remote.file.client.max.inflight.read.bytes";
 
     private static final long DEFAULT_CLIENT_TIMEOUT_SECONDS = 1800; // 30 minutes
     private static final int DEFAULT_CLIENT_RETRIES = 10;
     /** Default multipart block size: 4 MB. */
     public static final int DEFAULT_BLOCK_SIZE = 4 * 1024 * 1024;
+    /**
+     * Default cap on in-flight read bytes: 256 MiB. Chosen so a 3.5 GiB
+     * {@code SegmentBlockCache} plus this cap plus routine gRPC transport
+     * comfortably fit a 6 GiB {@code -XX:MaxDirectMemorySize} budget, while
+     * still admitting tens of thousands of 16 KiB concurrent block reads
+     * ({@code 256 MiB / 16 KiB = 16,384}) or a full fan-out of 4 MiB
+     * Phase-C chunks ({@code 256 MiB / 4 MiB = 64}) without blocking.
+     */
+    public static final long DEFAULT_CLIENT_MAX_INFLIGHT_READ_BYTES = 256L * 1024 * 1024;
+
+    /**
+     * Emit a {@link Level#WARNING} log line if acquiring the reservation
+     * blocks for longer than this threshold. Non-configurable: the threshold
+     * is only meant to surface saturation; the gauge
+     * ({@code remote_file_client_inflight_read_bytes_available}) is the
+     * primary observability signal.
+     */
+    private static final long PERMIT_ACQUIRE_WARN_THRESHOLD_MS = 500;
 
     private static class ServerSnapshot {
         final ConsistentHashRouter router;
@@ -124,6 +168,22 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     private final int maxRetries;
     private final long clientTimeoutSeconds;
     private final int blockSize;
+    private final long maxInflightReadBytes;
+    /**
+     * Gates direct-buffer byte-volume across in-flight RPCs performed by
+     * {@link #doReadFileAsByteBufAsync} and
+     * {@link #doReadFileRangeAsByteBufAsync}. Each call reserves bytes equal
+     * to its requested payload length and releases the same count when the
+     * gRPC stream terminates (onError or onCompleted). Unfair semaphore:
+     * the workload is bursty and latency-insensitive (caller threads are
+     * indistinguishable), so unfair throughput beats FIFO starvation
+     * avoidance here.
+     *
+     * <p>The semaphore is sized as {@code min(maxInflightReadBytes,
+     * Integer.MAX_VALUE)} because {@link Semaphore} uses {@code int} permits
+     * internally; practical caps (≲ 2 GiB) fit comfortably.
+     */
+    private final Semaphore inflightReadBytes;
     private final ScheduledExecutorService retryScheduler;
     private final ClientInterceptor clientInterceptor;
 
@@ -141,6 +201,24 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         this.clientTimeoutSeconds = longConfig(configuration, CONFIG_CLIENT_TIMEOUT, DEFAULT_CLIENT_TIMEOUT_SECONDS);
         this.maxRetries = intConfig(configuration, CONFIG_CLIENT_RETRIES, DEFAULT_CLIENT_RETRIES);
         this.blockSize = intConfig(configuration, CONFIG_CLIENT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE);
+        long configuredMaxInflightBytes = longConfig(configuration, CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES,
+                DEFAULT_CLIENT_MAX_INFLIGHT_READ_BYTES);
+        if (configuredMaxInflightBytes <= 0) {
+            throw new IllegalArgumentException(CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES
+                    + " must be > 0, got " + configuredMaxInflightBytes);
+        }
+        if (configuredMaxInflightBytes < this.blockSize) {
+            throw new IllegalArgumentException(CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES
+                    + " (" + configuredMaxInflightBytes + ") must be >= "
+                    + CONFIG_CLIENT_BLOCK_SIZE + " (" + this.blockSize
+                    + ") so a single full-block read is always admissible");
+        }
+        this.maxInflightReadBytes = configuredMaxInflightBytes;
+        // Semaphore uses int permits; clamp but keep the public view in bytes.
+        int permits = maxInflightReadBytes > Integer.MAX_VALUE
+                ? Integer.MAX_VALUE
+                : (int) maxInflightReadBytes;
+        this.inflightReadBytes = new Semaphore(permits);
         this.retryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "remote-file-retry");
             t.setDaemon(true);
@@ -160,12 +238,109 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
         if (servers.isEmpty()) {
             LOGGER.log(Level.INFO,
-                    "RemoteFileServiceClient: starting with empty server list (awaiting ZK discovery), timeout={0}s, retries={1}",
-                    new Object[]{clientTimeoutSeconds, maxRetries});
+                    "RemoteFileServiceClient: starting with empty server list (awaiting ZK discovery), "
+                            + "timeout={0}s, retries={1}, maxInflightReadBytes={2}",
+                    new Object[]{clientTimeoutSeconds, maxRetries, maxInflightReadBytes});
         } else {
-            LOGGER.log(Level.INFO, "RemoteFileServiceClient: servers={0}, timeout={1}s, retries={2}",
-                    new Object[]{servers, clientTimeoutSeconds, maxRetries});
+            LOGGER.log(Level.INFO,
+                    "RemoteFileServiceClient: servers={0}, timeout={1}s, retries={2}, maxInflightReadBytes={3}",
+                    new Object[]{servers, clientTimeoutSeconds, maxRetries, maxInflightReadBytes});
         }
+    }
+
+    /**
+     * @return the configured maximum number of bytes that may be in flight
+     *     across {@code readFile}/{@code readFileRange} calls at once.
+     */
+    public long maxInflightReadBytes() {
+        return maxInflightReadBytes;
+    }
+
+    /**
+     * @return the number of bytes currently available for reservation.
+     *     Equal to {@link #maxInflightReadBytes()} when idle, approaches
+     *     zero under saturation. Primary observability signal for the
+     *     in-flight read budget; exposed as a Prometheus gauge by the
+     *     Indexing Service.
+     */
+    public long availableInflightReadBytes() {
+        return inflightReadBytes.availablePermits();
+    }
+
+    /**
+     * Reserves {@code bytes} against the in-flight read budget, blocking
+     * the caller until the reservation is satisfied. Emits a
+     * {@link Level#WARNING} log line if the wait exceeds
+     * {@link #PERMIT_ACQUIRE_WARN_THRESHOLD_MS}, a cheap saturation hint
+     * for operators while the gauge carries the precise signal.
+     *
+     * <p>Uses {@code acquireUninterruptibly} so in-flight reads are not
+     * cancelled by thread interrupts from callers that opportunistically
+     * interrupt worker threads. Callers needing true cancellation should
+     * wrap the {@code CompletableFuture} they receive.
+     *
+     * <p>Callers MUST pair every successful acquire with exactly one
+     * {@link #releaseInflightReadBytes(int)} carrying the same byte count
+     * on the terminal gRPC callback path.
+     *
+     * @param bytes the payload size being staged; clamped to the
+     *     {@code Integer.MAX_VALUE} semaphore permit space. Must be > 0.
+     */
+    private void acquireInflightReadBytes(int bytes) {
+        if (bytes <= 0) {
+            throw new IllegalArgumentException("bytes must be > 0, got " + bytes);
+        }
+        if (inflightReadBytes.tryAcquire(bytes)) {
+            return;
+        }
+        long startNanos = System.nanoTime();
+        inflightReadBytes.acquireUninterruptibly(bytes);
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+        if (elapsedMs >= PERMIT_ACQUIRE_WARN_THRESHOLD_MS) {
+            LOGGER.log(Level.WARNING,
+                    "remote file client inflight-read reservation blocked for {0}ms "
+                            + "(requested={1} bytes, available={2}/{3}); consider raising "
+                            + CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES
+                            + " or reducing concurrent IS load",
+                    new Object[]{elapsedMs, bytes, inflightReadBytes.availablePermits(),
+                            maxInflightReadBytes});
+        }
+    }
+
+    /** Releases a byte reservation previously taken via {@link #acquireInflightReadBytes(int)}. */
+    private void releaseInflightReadBytes(int bytes) {
+        inflightReadBytes.release(bytes);
+    }
+
+    /**
+     * Registers {@code inflight_read_bytes_available} and
+     * {@code inflight_read_bytes_max} gauges under the given scope.
+     * Matches the gauges exported by the Indexing Service so the same
+     * Grafana panels work for both servers.
+     */
+    @Override
+    public void registerMetrics(StatsLogger statsLogger) {
+        if (statsLogger == null) {
+            return;
+        }
+        statsLogger.registerGauge("inflight_read_bytes_available", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return availableInflightReadBytes();
+            }
+        });
+        statsLogger.registerGauge("inflight_read_bytes_max", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return maxInflightReadBytes();
+            }
+        });
     }
 
     private static final int CHANNEL_MAX_MESSAGE_SIZE = DEFAULT_BLOCK_SIZE + 1024 * 1024; // 5 MB
@@ -447,39 +622,70 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     private CompletableFuture<ByteBuf> doReadFileAsByteBufAsync(String path) {
         return runDetached(() -> {
             CompletableFuture<ByteBuf> future = new CompletableFuture<>();
-            readStubForPath(path).readFile(
-                    ReadFileRequest.newBuilder().setPath(path).build(),
-                    new StreamObserver<ReadFileResponse>() {
-                        private ByteBuf result;
+            // readFile returns the whole file in a single onNext payload,
+            // whose size is unknown until the server responds. Reserve
+            // blockSize bytes as a conservative proxy: readFile is a legacy
+            // small-object API (metadata, watermarks — not segment data),
+            // so files are typically well under blockSize. Files larger
+            // than blockSize will transiently exceed the in-flight budget
+            // by the difference; acceptable because segment data flows
+            // through readFileRange, not readFile.
+            int reservation = blockSize;
+            acquireInflightReadBytes(reservation);
+            AtomicBoolean reservationReleased = new AtomicBoolean(false);
+            Runnable releaseOnce = () -> {
+                if (reservationReleased.compareAndSet(false, true)) {
+                    releaseInflightReadBytes(reservation);
+                }
+            };
+            try {
+                readStubForPath(path).readFile(
+                        ReadFileRequest.newBuilder().setPath(path).build(),
+                        new StreamObserver<ReadFileResponse>() {
+                            private ByteBuf result;
 
-                        @Override
-                        public void onNext(ReadFileResponse response) {
-                            if (response.getFound()) {
-                                ByteString content = response.getContent();
-                                int size = content.size();
-                                ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(size);
-                                // Single copy from the protobuf LiteralByteString into the
-                                // pooled direct buffer; matches doReadFileRangeAsByteBufAsync.
-                                content.copyTo(buf.nioBuffer(0, size));
-                                buf.writerIndex(size);
-                                result = buf;
+                            @Override
+                            public void onNext(ReadFileResponse response) {
+                                if (response.getFound()) {
+                                    ByteString content = response.getContent();
+                                    int size = content.size();
+                                    ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(size);
+                                    // Single copy from the protobuf LiteralByteString into the
+                                    // pooled direct buffer; matches doReadFileRangeAsByteBufAsync.
+                                    content.copyTo(buf.nioBuffer(0, size));
+                                    buf.writerIndex(size);
+                                    result = buf;
+                                }
                             }
-                        }
 
-                        @Override
-                        public void onError(Throwable t) {
-                            if (result != null) {
-                                result.release();
-                                result = null;
+                            @Override
+                            public void onError(Throwable t) {
+                                try {
+                                    if (result != null) {
+                                        result.release();
+                                        result = null;
+                                    }
+                                    future.completeExceptionally(t);
+                                } finally {
+                                    releaseOnce.run();
+                                }
                             }
-                            future.completeExceptionally(t);
-                        }
 
-                        @Override
-                        public void onCompleted() {
-                            future.complete(result);
-                        }
-                    });
+                            @Override
+                            public void onCompleted() {
+                                try {
+                                    future.complete(result);
+                                } finally {
+                                    releaseOnce.run();
+                                }
+                            }
+                        });
+            } catch (RuntimeException e) {
+                // Synchronous failure (no observer callback will fire) —
+                // release the permit here to keep the semaphore in balance.
+                releaseOnce.run();
+                throw e;
+            }
             return future;
         });
     }
@@ -767,66 +973,98 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         return retryAsync(() -> runDetached(() -> {
             long blockIndex = offset / blockSize;
             CompletableFuture<ByteBuf> future = new CompletableFuture<>();
-            readStubForBlock(path, blockIndex).readFileRange(
-                    ReadFileRangeRequest.newBuilder()
-                            .setPath(path)
-                            .setOffset(offset)
-                            .setLength(length)
-                            .setBlockSize(blockSize)
-                            .build(),
-                    new StreamObserver<ReadFileRangeResponse>() {
-                        private ByteBuf result;
+            // Reserve bytes equal to the requested payload length before
+            // firing the RPC — bounds the peak direct-memory high-water
+            // across concurrent reads. Reservation is released on the
+            // terminal observer callback (onError or onCompleted).
+            // Using bytes (not request count) means 16 KiB block reads
+            // from RemoteRandomAccessReader and 4 MiB Phase C chunks both
+            // contribute to the same budget in proportion to the actual
+            // direct-memory pressure they impose (issue #246).
+            int reservation = length;
+            acquireInflightReadBytes(reservation);
+            AtomicBoolean reservationReleased = new AtomicBoolean(false);
+            Runnable releaseOnce = () -> {
+                if (reservationReleased.compareAndSet(false, true)) {
+                    releaseInflightReadBytes(reservation);
+                }
+            };
+            try {
+                readStubForBlock(path, blockIndex).readFileRange(
+                        ReadFileRangeRequest.newBuilder()
+                                .setPath(path)
+                                .setOffset(offset)
+                                .setLength(length)
+                                .setBlockSize(blockSize)
+                                .build(),
+                        new StreamObserver<ReadFileRangeResponse>() {
+                            private ByteBuf result;
 
-                        @Override
-                        public void onNext(ReadFileRangeResponse response) {
-                            // Broad catch at the gRPC callback boundary: direct ByteBuf
-                            // allocation and the protobuf copy can throw OOM /
-                            // OutOfDirectMemoryError. gRPC would otherwise rewrap the
-                            // failure as an opaque "CANCELLED: Failed to read message.",
-                            // hiding the real cause from the retry log and metrics.
-                            ByteBuf local = null;
-                            try {
-                                if (response.getFound()) {
-                                    ByteString content = response.getContent();
-                                    int size = content.size();
-                                    local = PooledByteBufAllocator.DEFAULT.directBuffer(size);
-                                    // copyTo writes into the ByteBuffer view of the pooled buf
-                                    // and the protobuf parser already holds the bytes in heap;
-                                    // this is the single copy from heap into direct memory.
-                                    content.copyTo(local.nioBuffer(0, size));
-                                    local.writerIndex(size);
-                                    result = local;
-                                    local = null;
+                            @Override
+                            public void onNext(ReadFileRangeResponse response) {
+                                // Broad catch at the gRPC callback boundary: direct ByteBuf
+                                // allocation and the protobuf copy can throw OOM /
+                                // OutOfDirectMemoryError. gRPC would otherwise rewrap the
+                                // failure as an opaque "CANCELLED: Failed to read message.",
+                                // hiding the real cause from the retry log and metrics.
+                                ByteBuf local = null;
+                                try {
+                                    if (response.getFound()) {
+                                        ByteString content = response.getContent();
+                                        int size = content.size();
+                                        local = PooledByteBufAllocator.DEFAULT.directBuffer(size);
+                                        // copyTo writes into the ByteBuffer view of the pooled buf
+                                        // and the protobuf parser already holds the bytes in heap;
+                                        // this is the single copy from heap into direct memory.
+                                        content.copyTo(local.nioBuffer(0, size));
+                                        local.writerIndex(size);
+                                        result = local;
+                                        local = null;
+                                    }
+                                } catch (Throwable t) {
+                                    if (local != null) {
+                                        ReferenceCountUtil.safeRelease(local);
+                                    }
+                                    future.completeExceptionally(t);
                                 }
-                            } catch (Throwable t) {
-                                if (local != null) {
-                                    ReferenceCountUtil.safeRelease(local);
+                            }
+
+                            @Override
+                            public void onError(Throwable t) {
+                                try {
+                                    if (result != null) {
+                                        ReferenceCountUtil.safeRelease(result);
+                                        result = null;
+                                    }
+                                    future.completeExceptionally(t);
+                                } finally {
+                                    releaseOnce.run();
                                 }
-                                future.completeExceptionally(t);
                             }
-                        }
 
-                        @Override
-                        public void onError(Throwable t) {
-                            if (result != null) {
-                                ReferenceCountUtil.safeRelease(result);
-                                result = null;
+                            @Override
+                            public void onCompleted() {
+                                try {
+                                    if (!future.isDone()) {
+                                        future.complete(result);
+                                    } else if (result != null) {
+                                        // Future already failed in onNext — release the buffer we
+                                        // would have returned so it does not leak.
+                                        ReferenceCountUtil.safeRelease(result);
+                                        result = null;
+                                    }
+                                } finally {
+                                    releaseOnce.run();
+                                }
                             }
-                            future.completeExceptionally(t);
-                        }
-
-                        @Override
-                        public void onCompleted() {
-                            if (!future.isDone()) {
-                                future.complete(result);
-                            } else if (result != null) {
-                                // Future already failed in onNext — release the buffer we
-                                // would have returned so it does not leak.
-                                ReferenceCountUtil.safeRelease(result);
-                                result = null;
-                            }
-                        }
-                    });
+                        });
+            } catch (RuntimeException e) {
+                // Stub-side synchronous failure — no observer callback will
+                // ever fire, so release the permit here to keep the
+                // semaphore balanced across retries.
+                releaseOnce.run();
+                throw e;
+            }
             return future;
         }), "readFileRange", path, 0);
     }

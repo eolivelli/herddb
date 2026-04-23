@@ -31,6 +31,7 @@ import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.core.DBManager;
 import herddb.core.stats.ConnectionsInfo;
 import herddb.core.stats.ConnectionsInfoProvider;
+import herddb.core.stats.NettyMemoryMetrics;
 import herddb.file.FileBasedUserManager;
 import herddb.file.FileCommitLogManager;
 import herddb.file.FileDataStorageManager;
@@ -159,6 +160,11 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         this.statsProvider = statsProvider;
         this.statsLogger = statsProvider == null ? new NullStatsLogger() : statsProvider.getStatsLogger("");
         this.configuration = configuration;
+        // Expose Netty direct-memory counters so the unified JVM dashboard
+        // can correlate pool-arena growth against -XX:MaxDirectMemorySize
+        // for every HerdDB service. The gauges carry their own netty_
+        // prefix so we pass the root StatsLogger, not a nested scope.
+        NettyMemoryMetrics.register(statsLogger);
 
         String nodeId = configuration.getString(ServerConfiguration.PROPERTY_NODEID, "");
 
@@ -433,8 +439,12 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
                         configuration.getInt(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
                                 ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT));
+                clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES,
+                        configuration.getLong(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES,
+                                ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES_DEFAULT));
                 RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
                 RemoteFileClient client = factory.createClient(servers, clientConfig);
+                client.registerMetrics(statsLogger.scope("remote_file_client"));
                 // Set up ZK-based discovery listener if applicable
                 if (useZKDiscovery) {
                     metadataStorageManager.addServiceDiscoveryListener(
@@ -536,8 +546,12 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
                 configuration.getInt(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
                         ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT));
+        clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES,
+                configuration.getLong(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES,
+                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES_DEFAULT));
         RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
         RemoteFileClient client = factory.createClient(servers, clientConfig);
+        client.registerMetrics(statsLogger.scope("remote_file_client"));
         // Set up ZK-based discovery listener if applicable
         if (useZKDiscovery) {
             metadataStorageManager.addServiceDiscoveryListener(

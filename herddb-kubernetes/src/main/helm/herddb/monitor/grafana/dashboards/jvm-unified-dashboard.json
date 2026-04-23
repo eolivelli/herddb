@@ -1,0 +1,464 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Unified JVM dashboard for all HerdDB services (server, indexing-service, file-server). Heap, direct memory (JVM + Netty PlatformDependent), GC, threads, and the per-service memory pools / caches / in-flight reservations.",
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "refresh": "30s",
+  "rows": [
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "seriesOverrides": [
+            {"alias": "/max/", "dashes": true, "fill": 0},
+            {"alias": "/committed/", "fill": 0}
+          ],
+          "span": 12,
+          "stack": false,
+          "targets": [
+            {"expr": "jvm_memory_bytes_used{area=\"heap\",job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} heap used [{{instance}}]", "refId": "A"},
+            {"expr": "jvm_memory_bytes_committed{area=\"heap\",job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} heap committed [{{instance}}]", "refId": "B"},
+            {"expr": "jvm_memory_bytes_max{area=\"heap\",job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} heap max [{{instance}}]", "refId": "C"}
+          ],
+          "title": "Heap memory (per service / instance)",
+          "type": "graph",
+          "yaxes": [
+            {"format": "bytes", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Heap"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 2,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "seriesOverrides": [
+            {"alias": "/max/", "dashes": true, "fill": 0},
+            {"alias": "/capacity/", "dashes": true, "fill": 0}
+          ],
+          "span": 6,
+          "stack": false,
+          "targets": [
+            {"expr": "jvm_buffer_direct_used_bytes{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} direct used [{{instance}}]", "refId": "A"},
+            {"expr": "jvm_buffer_direct_capacity_bytes{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} direct capacity [{{instance}}]", "refId": "B"},
+            {"expr": "jvm_memory_direct_bytes_max{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} XX:MaxDirectMemorySize [{{instance}}]", "refId": "C"}
+          ],
+          "title": "Direct memory — JVM view (BufferPool + -XX:MaxDirectMemorySize)",
+          "type": "graph",
+          "yaxes": [
+            {"format": "bytes", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "description": "Netty's own PlatformDependent counter. Returns -1 when Netty defers to the JDK's Bits.reserveMemory (Dio.netty.maxDirectMemory=0); in that case rely on the JVM view on the left. max is the Netty-side ceiling.",
+          "id": 3,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "seriesOverrides": [
+            {"alias": "/max/", "dashes": true, "fill": 0}
+          ],
+          "span": 6,
+          "stack": false,
+          "targets": [
+            {"expr": "netty_used_direct_memory_bytes{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} netty used [{{instance}}]", "refId": "A"},
+            {"expr": "netty_max_direct_memory_bytes{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} netty max [{{instance}}]", "refId": "B"}
+          ],
+          "title": "Direct memory — Netty PoolArena view (PlatformDependent)",
+          "type": "graph",
+          "yaxes": [
+            {"format": "bytes", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Direct memory"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 4,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "stack": false,
+          "targets": [
+            {"expr": "rate(jvm_gc_collection_seconds_sum{job=~\"$job\",instance=~\"$instance\"}[1m])", "legendFormat": "{{job}} {{gc}} [{{instance}}]", "refId": "A"}
+          ],
+          "title": "GC time rate (1m)",
+          "type": "graph",
+          "yaxes": [
+            {"format": "percentunit", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 5,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "stack": false,
+          "targets": [
+            {"expr": "rate(jvm_gc_collection_seconds_count{job=~\"$job\",instance=~\"$instance\"}[1m])", "legendFormat": "{{job}} {{gc}} [{{instance}}]", "refId": "A"}
+          ],
+          "title": "GC count rate (1m)",
+          "type": "graph",
+          "yaxes": [
+            {"format": "short", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "GC"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 6,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "seriesOverrides": [
+            {"alias": "/daemon/", "fill": 0, "dashes": true}
+          ],
+          "span": 6,
+          "stack": false,
+          "targets": [
+            {"expr": "jvm_threads_current{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} current [{{instance}}]", "refId": "A"},
+            {"expr": "jvm_threads_daemon{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} daemon [{{instance}}]", "refId": "B"},
+            {"expr": "jvm_threads_peak{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} peak [{{instance}}]", "refId": "C"}
+          ],
+          "title": "Threads",
+          "type": "graph",
+          "yaxes": [
+            {"format": "short", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 7,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "stack": false,
+          "targets": [
+            {"expr": "process_resident_memory_bytes{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} RSS [{{instance}}]", "refId": "A"},
+            {"expr": "process_virtual_memory_bytes{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} VSZ [{{instance}}]", "refId": "B"}
+          ],
+          "title": "Process memory (RSS / VSZ)",
+          "type": "graph",
+          "yaxes": [
+            {"format": "bytes", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Threads / process"
+    },
+    {
+      "collapse": false,
+      "height": 300,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "description": "Breakdown of heap and non-heap pools per JVM. Useful to tell old-gen pressure from metaspace bloat from G1 eden churn.",
+          "id": 8,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "span": 12,
+          "stack": false,
+          "targets": [
+            {"expr": "jvm_memory_pool_bytes_used{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} {{pool}} used [{{instance}}]", "refId": "A"}
+          ],
+          "title": "Memory pools (heap + non-heap)",
+          "type": "graph",
+          "yaxes": [
+            {"format": "bytes", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Memory pools"
+    },
+    {
+      "collapse": false,
+      "height": 300,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "description": "All service-specific caches and memory managers on one canvas. Some series only exist on some services — that is expected. Panels: IS SegmentBlockCache (direct), file-server in-heap block cache, file-server LazyValueCache, IS vector memory budget, and remote_file_client in-flight read reservation (bytes).",
+          "id": 9,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "seriesOverrides": [
+            {"alias": "/max/", "dashes": true, "fill": 0}
+          ],
+          "span": 12,
+          "stack": false,
+          "targets": [
+            {"expr": "indexing_segment_block_cache_size_bytes{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "IS SegmentBlockCache size [{{instance}}]", "refId": "A"},
+            {"expr": "indexing_segment_block_cache_max_bytes{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "IS SegmentBlockCache max [{{instance}}]", "refId": "B"},
+            {"expr": "rfs_block_cache_size_bytes{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "file-server InMemory block cache size [{{instance}}]", "refId": "C"},
+            {"expr": "rfs_block_cache_max_bytes{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "file-server InMemory block cache max [{{instance}}]", "refId": "D"},
+            {"expr": "remote_file_client_inflight_read_bytes_max{job=~\"$job\",instance=~\"$instance\"} - remote_file_client_inflight_read_bytes_available{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} readFileRange in-flight bytes [{{instance}}]", "refId": "E"},
+            {"expr": "remote_file_client_inflight_read_bytes_max{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} readFileRange in-flight max [{{instance}}]", "refId": "F"}
+          ],
+          "title": "Service caches & memory managers",
+          "type": "graph",
+          "yaxes": [
+            {"format": "bytes", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Service caches"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "description": "Available in-flight read-byte budget (remote_file_client). Approaching zero means readFile/readFileRange callers are blocked on the permit semaphore (issue #246). Exists on server and indexing-service; file-server does not issue reads.",
+          "id": 10,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": true,
+            "rightSide": true,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "seriesOverrides": [
+            {"alias": "/max/", "dashes": true, "fill": 0}
+          ],
+          "span": 12,
+          "stack": false,
+          "targets": [
+            {"expr": "remote_file_client_inflight_read_bytes_available{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} available [{{instance}}]", "refId": "A"},
+            {"expr": "remote_file_client_inflight_read_bytes_max{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "{{job}} max [{{instance}}]", "refId": "B"}
+          ],
+          "title": "remote_file_client in-flight read bytes (saturation signal)",
+          "type": "graph",
+          "yaxes": [
+            {"format": "bytes", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "readFileRange in-flight budget"
+    }
+  ],
+  "schemaVersion": 16,
+  "style": "dark",
+  "tags": [
+    "herddb",
+    "jvm",
+    "memory"
+  ],
+  "templating": {
+    "list": [
+      {
+        "allValue": "",
+        "current": {},
+        "datasource": "Prometheus",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Job",
+        "multi": true,
+        "name": "job",
+        "options": [],
+        "query": "label_values(jvm_memory_bytes_used, job)",
+        "refresh": 1,
+        "regex": "",
+        "sort": 0,
+        "type": "query",
+        "useTags": false
+      },
+      {
+        "allValue": "",
+        "current": {},
+        "datasource": "Prometheus",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Instance",
+        "multi": true,
+        "name": "instance",
+        "options": [],
+        "query": "label_values(jvm_memory_bytes_used{job=~\"$job\"}, instance)",
+        "refresh": 1,
+        "regex": "",
+        "sort": 0,
+        "type": "query",
+        "useTags": false
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "2h",
+      "1d"
+    ],
+    "time_options": [
+      "5m",
+      "15m",
+      "1h",
+      "6h",
+      "12h",
+      "24h",
+      "2d",
+      "7d",
+      "30d"
+    ]
+  },
+  "timezone": "browser",
+  "title": "HerdDB JVM & Memory (all services)",
+  "version": 1
+}

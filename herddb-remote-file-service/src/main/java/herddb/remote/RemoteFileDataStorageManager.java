@@ -186,8 +186,12 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         return lazyValueCache;
     }
 
-    /** Client used for all remote I/O. Visible for lazy-page loading. */
-    RemoteFileServiceClient getClient() {
+    /**
+     * Client used for all remote I/O. Exposed so callers can read client-side
+     * diagnostics such as the in-flight read-permit gauge (issue #246)
+     * without having to thread yet another dependency through the engine.
+     */
+    public RemoteFileServiceClient getClient() {
         return client;
     }
 
