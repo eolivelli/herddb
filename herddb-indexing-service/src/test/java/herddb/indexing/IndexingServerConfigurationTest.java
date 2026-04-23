@@ -22,6 +22,7 @@ package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import java.util.Properties;
 import org.junit.Test;
@@ -210,5 +211,82 @@ public class IndexingServerConfigurationTest {
         config.set(IndexingServerConfiguration.PROPERTY_GRPC_PORT, null);
         // Should fall back to default since property was removed
         assertEquals(9999, config.getInt(IndexingServerConfiguration.PROPERTY_GRPC_PORT, 9999));
+    }
+
+    @Test
+    public void testDefaultRoleIsPrimary() {
+        IndexingServerConfiguration config = new IndexingServerConfiguration();
+        assertEquals("primary", config.getString(
+                IndexingServerConfiguration.PROPERTY_ROLE,
+                IndexingServerConfiguration.PROPERTY_ROLE_DEFAULT));
+        assertFalse(config.isShadow());
+        config.validateRoleAndShadow();
+    }
+
+    @Test
+    public void testValidateRoleAndShadowRejectsUnknownRole() {
+        IndexingServerConfiguration config = new IndexingServerConfiguration()
+                .set(IndexingServerConfiguration.PROPERTY_ROLE, "witness");
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class,
+                config::validateRoleAndShadow);
+        assertTrue(ex.getMessage().contains("indexing.role"));
+        assertTrue(ex.getMessage().contains("witness"));
+    }
+
+    @Test
+    public void testShadowRequiresShadowOf() {
+        IndexingServerConfiguration config = new IndexingServerConfiguration()
+                .set(IndexingServerConfiguration.PROPERTY_ROLE,
+                        IndexingServerConfiguration.ROLE_SHADOW)
+                .set(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "remote")
+                .set(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES, 2);
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class,
+                config::validateRoleAndShadow);
+        assertTrue(ex.getMessage().contains(IndexingServerConfiguration.PROPERTY_SHADOW_OF));
+    }
+
+    @Test
+    public void testShadowOfOutOfRange() {
+        IndexingServerConfiguration config = new IndexingServerConfiguration()
+                .set(IndexingServerConfiguration.PROPERTY_ROLE,
+                        IndexingServerConfiguration.ROLE_SHADOW)
+                .set(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "remote")
+                .set(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES, 2)
+                .set(IndexingServerConfiguration.PROPERTY_SHADOW_OF, 5);
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class,
+                config::validateRoleAndShadow);
+        assertTrue(ex.getMessage().contains("out of range"));
+    }
+
+    @Test
+    public void testShadowRequiresRemoteStorage() {
+        IndexingServerConfiguration config = new IndexingServerConfiguration()
+                .set(IndexingServerConfiguration.PROPERTY_ROLE,
+                        IndexingServerConfiguration.ROLE_SHADOW)
+                .set(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES, 2)
+                .set(IndexingServerConfiguration.PROPERTY_SHADOW_OF, 0)
+                .set(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "file");
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class,
+                config::validateRoleAndShadow);
+        assertTrue(ex.getMessage().contains("remote"));
+    }
+
+    @Test
+    public void testValidShadowConfig() {
+        IndexingServerConfiguration config = new IndexingServerConfiguration()
+                .set(IndexingServerConfiguration.PROPERTY_ROLE,
+                        IndexingServerConfiguration.ROLE_SHADOW)
+                .set(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES, 2)
+                .set(IndexingServerConfiguration.PROPERTY_SHADOW_OF, 0)
+                .set(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "remote");
+        config.validateRoleAndShadow();
+        assertTrue(config.isShadow());
+        assertEquals(0, config.getInt(
+                IndexingServerConfiguration.PROPERTY_SHADOW_OF,
+                IndexingServerConfiguration.PROPERTY_SHADOW_OF_UNSET));
     }
 }
