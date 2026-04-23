@@ -474,7 +474,14 @@ public final class ServerConfiguration {
     public static final String PROPERTY_INDEXING_SERVICE_SERVERS = "indexing.service.servers";
     public static final String PROPERTY_INDEXING_SERVICE_SERVERS_DEFAULT = "";
     public static final String PROPERTY_INDEXING_SERVICE_TIMEOUT = "indexing.service.timeout";
-    public static final long PROPERTY_INDEXING_SERVICE_TIMEOUT_DEFAULT = 30; // seconds
+    // Per-call gRPC deadline (seconds) used by the HerdDB server when calling
+    // the Indexing Service. Large vector indexes can legitimately take tens of
+    // seconds to answer a search when the IS is mid-checkpoint; 120 s is a
+    // production-friendly default (the previous 30 s default was tuned for
+    // small synthetic indexes). Helm ships 600 s in values.yaml for big
+    // GIST-class workloads — override per deployment via
+    // `indexing.service.timeout` in server.extraConfig.
+    public static final long PROPERTY_INDEXING_SERVICE_TIMEOUT_DEFAULT = 120; // seconds
 
     public static final String PROPERTY_PLANNER_WAITFORTABLESPACE_TIMEOUT = "server.planner.waitfortablespace.timeout";
     public static final int PROPERTY_PLANNER_WAITFORTABLESPACE_TIMEOUT_DEFAULT = SystemProperties.getIntSystemProperty("herddb.planner.waitfortablespacetimeout", 60000);
