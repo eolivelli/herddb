@@ -1816,40 +1816,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                 shard, segId, snapshotDimension)));
                     }
 
-                    Throwable firstFailure = null;
-                    for (int i = 0; i < futures.size(); i++) {
-                        try {
-                            SegmentWriteResult r = futures.get(i).get();
-                            if (r != null) {
-                                newSegmentResults.add(r);
-                                totalShardVectors += shardTasks.get(i).shard.nodeToPk.size();
-                            }
-                        } catch (java.util.concurrent.ExecutionException ee) {
-                            if (firstFailure == null) {
-                                firstFailure = ee.getCause() != null ? ee.getCause() : ee;
-                            }
-                            // Cancel remaining futures
-                            for (int j = i + 1; j < futures.size(); j++) {
-                                futures.get(j).cancel(true);
-                            }
-                        } catch (java.util.concurrent.CancellationException ce) {
-                            // A later future was cancelled after an earlier failure in
-                            // this loop. If firstFailure is already set we keep the real
-                            // cause; only record CancellationException as a last-resort
-                            // fallback (e.g. if the executor itself was shut down).
-                            // Without this branch, CancellationException would propagate
-                            // out of futures.get(i).get() and mask the real root cause
-                            // (see issue #234).
-                            if (firstFailure == null) {
-                                firstFailure = ce;
-                            }
-                        } catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
-                            if (firstFailure == null) {
-                                firstFailure = ie;
-                            }
+                    final int[] accumulatedShardVectors = {0};
+                    Throwable firstFailure = awaitAllOrFirstFailure(futures, (i, r) -> {
+                        if (r != null) {
+                            newSegmentResults.add(r);
+                            accumulatedShardVectors[0] += shardTasks.get(i).shard.nodeToPk.size();
                         }
-                    }
+                    });
+                    totalShardVectors += accumulatedShardVectors[0];
 
                     if (firstFailure != null) {
                         if (firstFailure instanceof IOException) {
@@ -1893,6 +1867,60 @@ public class PersistentVectorStore extends AbstractVectorStore {
         persistIndexStatusMultiSegment(sealedSegments, mergeableSegments, newSegmentResults, sequenceNumber);
 
         return newSegmentResults;
+    }
+
+    /**
+     * Callback for {@link #awaitAllOrFirstFailure}: invoked once per
+     * successfully-completed future with its index and the produced value.
+     * Package-private so unit tests in the same package can exercise the
+     * reduction helper directly.
+     */
+    @FunctionalInterface
+    interface IndexedConsumer<T> {
+        void accept(int index, T value);
+    }
+
+    /**
+     * Reduces a list of {@link java.util.concurrent.Future}s: waits for each
+     * in order, invokes {@code onSuccess} on values, cancels the remaining
+     * futures as soon as one throws {@link java.util.concurrent.ExecutionException},
+     * and returns the first real failure (or {@code null} if all succeeded).
+     *
+     * <p>A later future observed as cancelled (because this helper cancelled
+     * it after an earlier failure) does not overwrite the recorded
+     * {@code firstFailure}: the {@link java.util.concurrent.CancellationException}
+     * is kept only as a last-resort fallback so that the real root cause
+     * survives (issue #234). Same treatment for {@link InterruptedException}.
+     *
+     * <p>Package-private for testing.
+     */
+    static <T> Throwable awaitAllOrFirstFailure(
+            List<java.util.concurrent.Future<T>> futures,
+            IndexedConsumer<T> onSuccess) {
+        Throwable firstFailure = null;
+        for (int i = 0; i < futures.size(); i++) {
+            try {
+                T value = futures.get(i).get();
+                onSuccess.accept(i, value);
+            } catch (java.util.concurrent.ExecutionException ee) {
+                if (firstFailure == null) {
+                    firstFailure = ee.getCause() != null ? ee.getCause() : ee;
+                }
+                for (int j = i + 1; j < futures.size(); j++) {
+                    futures.get(j).cancel(true);
+                }
+            } catch (java.util.concurrent.CancellationException ce) {
+                if (firstFailure == null) {
+                    firstFailure = ce;
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                if (firstFailure == null) {
+                    firstFailure = ie;
+                }
+            }
+        }
+        return firstFailure;
     }
 
     /**
@@ -2192,34 +2220,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         poolVectorsList, poolPkList, snapshotDimension, totalSegments)));
             }
             List<SegmentWriteResult> results = new ArrayList<>(slices.size());
-            Throwable firstFailure = null;
-            for (int i = 0; i < futures.size(); i++) {
-                java.util.concurrent.Future<SegmentWriteResult> f = futures.get(i);
-                try {
-                    SegmentWriteResult r = f.get();
-                    results.add(r);
-                    // Release slice references once the segment is durable.
-                    releaseSliceReferences(slices.get(i), poolVectorsList, poolPkList);
-                } catch (java.util.concurrent.ExecutionException ee) {
-                    if (firstFailure == null) {
-                        firstFailure = ee.getCause() != null ? ee.getCause() : ee;
-                    }
-                    for (int j = i + 1; j < futures.size(); j++) {
-                        futures.get(j).cancel(true);
-                    }
-                } catch (java.util.concurrent.CancellationException ce) {
-                    // Subsequent future was cancelled after an earlier failure; keep
-                    // firstFailure pointing at the real cause. See issue #234.
-                    if (firstFailure == null) {
-                        firstFailure = ce;
-                    }
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    if (firstFailure == null) {
-                        firstFailure = ie;
-                    }
-                }
-            }
+            Throwable firstFailure = awaitAllOrFirstFailure(futures, (i, r) -> {
+                results.add(r);
+                // Release slice references once the segment is durable.
+                releaseSliceReferences(slices.get(i), poolVectorsList, poolPkList);
+            });
             if (firstFailure != null) {
                 if (firstFailure instanceof IOException) {
                     throw (IOException) firstFailure;
