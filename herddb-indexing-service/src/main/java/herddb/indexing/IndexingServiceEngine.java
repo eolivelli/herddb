@@ -1393,6 +1393,21 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         return shadowReady;
     }
 
+    /** True iff this engine was configured as a shadow replica (role=shadow). */
+    public boolean isConfiguredAsShadow() {
+        return config.isShadow();
+    }
+
+    /**
+     * Returns the {@link IndexingServerConfiguration#PROPERTY_SHADOW_OF} this
+     * engine was configured with, or {@code -1} if it is a primary (or the
+     * setting is unset, which for a primary is normal).
+     */
+    public int getShadowOfOrMinusOne() {
+        return config.getInt(IndexingServerConfiguration.PROPERTY_SHADOW_OF,
+                IndexingServerConfiguration.PROPERTY_SHADOW_OF_UNSET);
+    }
+
     public LogSequenceNumber getShadowLoadedLsn() {
         return shadowLoadedLsn;
     }

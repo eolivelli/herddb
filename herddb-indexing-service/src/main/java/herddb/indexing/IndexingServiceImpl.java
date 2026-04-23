@@ -73,6 +73,7 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
     private final Counter searchBytes;
     private final Counter statusRequests;
     private final Counter statusErrors;
+    private final Counter shadowNotReadyResponses;
 
     // Per-request readFileRange metrics — populated from VectorSearchRequestContext
     // at the end of every search(). Allow attributing network I/O to an
@@ -95,6 +96,7 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
         this.searchBytes = scope.getCounter("search_bytes");
         this.statusRequests = scope.getCounter("status_requests");
         this.statusErrors = scope.getCounter("status_errors");
+        this.shadowNotReadyResponses = scope.getCounter("shadow_not_ready_responses");
         this.searchReadFileRangeCalls = scope.getCounter("search_readfilerange_calls");
         this.searchReadFileRangeBytes = scope.getCounter("search_readfilerange_bytes");
         this.searchReadFileRangeWaitNanos = scope.getCounter("search_readfilerange_wait_nanos");
@@ -108,8 +110,33 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
         this.searchCacheMissesPerRequest = scope.getOpStatsLogger("search_cache_misses_per_request");
     }
 
+    /**
+     * Short-circuits a query RPC with FAILED_PRECONDITION when this instance
+     * is a shadow replica that has not yet completed its first successful
+     * reload. The description is machine-parseable
+     * ({@code shadow_not_ready:<shadowOf>}) so the HerdDB-side
+     * {@link IndexingServiceClient} can recognise it and fall back to another
+     * endpoint in the same pool.
+     *
+     * @return {@code true} iff the caller should abort the RPC (a NOT_READY
+     *         response has been sent via {@code responseObserver})
+     */
+    private boolean abortIfShadowNotReady(StreamObserver<?> responseObserver) {
+        if (engine.isConfiguredAsShadow() && !engine.isShadowReady()) {
+            shadowNotReadyResponses.inc();
+            responseObserver.onError(Status.FAILED_PRECONDITION
+                    .withDescription("shadow_not_ready:" + engine.getShadowOfOrMinusOne())
+                    .asRuntimeException());
+            return true;
+        }
+        return false;
+    }
+
     @Override
     public void search(SearchRequest request, StreamObserver<SearchResponse> responseObserver) {
+        if (abortIfShadowNotReady(responseObserver)) {
+            return;
+        }
         searchRequests.inc();
         long start = System.nanoTime();
         VectorSearchRequestContext ctx = VectorSearchRequestContext.begin();
@@ -193,6 +220,9 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
 
     @Override
     public void getIndexStatus(GetIndexStatusRequest request, StreamObserver<GetIndexStatusResponse> responseObserver) {
+        if (abortIfShadowNotReady(responseObserver)) {
+            return;
+        }
         statusRequests.inc();
         try {
             IndexingServiceEngine.IndexStatusInfo info = engine.getIndexStatus(
@@ -222,6 +252,9 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
 
     @Override
     public void listIndexes(ListIndexesRequest request, StreamObserver<ListIndexesResponse> responseObserver) {
+        if (abortIfShadowNotReady(responseObserver)) {
+            return;
+        }
         try {
             List<IndexingServiceEngine.IndexDescriptor> indexes = engine.listIndexes();
             ListIndexesResponse.Builder builder = ListIndexesResponse.newBuilder();
@@ -247,6 +280,9 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
 
     @Override
     public void describeIndex(DescribeIndexRequest request, StreamObserver<DescribeIndexResponse> responseObserver) {
+        if (abortIfShadowNotReady(responseObserver)) {
+            return;
+        }
         try {
             IndexingServiceEngine.IndexDetails details = engine.describeIndex(
                     request.getTablespace(),
@@ -304,6 +340,9 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
     @Override
     public void listPrimaryKeys(ListPrimaryKeysRequest request,
                                  StreamObserver<PrimaryKeysChunk> responseObserver) {
+        if (abortIfShadowNotReady(responseObserver)) {
+            return;
+        }
         try {
             int chunkSize = request.getChunkSize() > 0 ? request.getChunkSize() : DEFAULT_PK_CHUNK_SIZE;
             if (chunkSize > MAX_PK_CHUNK_SIZE) {
