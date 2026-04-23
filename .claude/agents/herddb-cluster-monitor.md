@@ -27,7 +27,29 @@ prompt containing:
 All commands are single-line invocations with no pipes or multi-line bash.
 Always use `set -euo pipefail` at the top of any inline bash strings.
 
-### Step 0: Parse run log tail
+### Step 0: VectorBench admin API (primary progress source — ingestion and query phases)
+
+The VectorBench process running inside `herddb-tools-0` exposes a live JSON
+status API on port 8080 (default). **This is the preferred source of truth for
+progress and rates** — it updates in real-time rather than waiting for the 60s
+log interval.
+
+```bash
+kubectl exec herddb-tools-0 -- curl -s http://localhost:8080/status
+```
+
+Extract from the JSON response:
+- `phase` — current phase (`ingestion`, `checkpoint`, `recall`, `done`, `error`)
+- `rows` / `total` — vectors committed so far / total target
+- `ops_per_sec` — current effective ingest (or query) rate as seen by the bench JVM
+- `commits` / `recovered_commits` — total commits; non-zero recovered = retries due to transient errors
+- `commit_latency.mean_ms` / `p50_ms` / `p99_ms` — batch+commit duration (not per-row)
+- `heap_used_mb` / `heap_max_mb` — bench JVM heap (tools pod)
+
+If the API is unavailable (bench not yet started, port not up), fall back to
+reading the run log (Step 0b below).
+
+### Step 0b: Parse run log tail (fallback / supplemental)
 
 ```bash
 Read <RUN_LOG> with offset=<last 1000 lines>
@@ -67,15 +89,42 @@ For each match, note the pod and line snippet.
 
 ### Step 3: Indexing-admin stats (per-IS-replica)
 
+Run **two** commands per IS replica: `list-indexes` for the vector count and
+`engine-stats` for the queue/memory/tailer state.
+
+```bash
+kubectl exec herddb-tools-0 -- indexing-admin list-indexes \
+    --server herddb-indexing-service-<N>.herddb-indexing-service:9850
+```
+
+Extract: `VECTORS` column (= `vector_count`) and `STATUS` for table `vector_bench`
+index `vidx`. This is the authoritative count of successfully indexed vectors.
+
 ```bash
 kubectl exec herddb-tools-0 -- indexing-admin engine-stats \
     --server herddb-indexing-service-<N>.herddb-indexing-service:9850 --json
 ```
 
 For each replica 0 to IS_REPLICAS-1, extract and report:
-- `tailer_watermark_ledger` / `tailer_watermark_offset`
-- `total_estimated_memory_bytes`
+- `tailer_watermark_ledger` / `tailer_watermark_offset` — how far the IS tailer has read
+- `apply_queue_size` / `apply_queue_capacity` — pending vector-insert queue; full (= capacity) means IS is at max throughput
+- `total_estimated_memory_bytes` — live HNSW graph memory; if this nears the IS internal limit (~2.3 GiB by default), IS will trigger a back-pressure checkpoint
+- `jvm_heap_used_pct` — IS JVM heap utilisation
 - Parse memory in GiB (divide by 1e9)
+
+**IS checkpoint status**: also tail the IS log for these keywords (tail 10 lines):
+```bash
+kubectl logs --tail=10 herddb-indexing-service-<N>
+```
+Report if any of these appear: `memory back-pressure`, `checkpoint in progress`,
+`Phase A`, `Phase B`, `Phase C`, `back-pressure released`.
+
+**Server checkpoint status**: scan the last 5 server log lines for
+`local checkpoint finish` to extract the last completed LSN and duration.
+```bash
+kubectl logs --tail=30 herddb-server-0
+```
+Report: `last LSN=(ledger,offset)` and time elapsed since that log line.
 
 ### Step 4: File-server metrics (if in query phase)
 
@@ -145,44 +194,68 @@ skip-list uses `bookie_*`; ledger PVC usage uses `bookie_ledger_dir_…_usage`
 ## Output Format
 
 Return a single structured text block, no markdown, each line with a specific
-marker. This format is designed for the parent agent to parse and accumulate:
+marker. This format is designed for the parent agent to parse and accumulate.
+
+### During ingestion phase (required fields):
 
 ```
 TICK <num> SUMMARY
 Variant: k3s-local
-Phase: ingest  Progress: op=5123/10000 (51%)
-PodStatus: 8 pods Running/Ready
-IS-0: watermark L=5 O=5123, mem=2.1 GiB — OK
-IS-1: watermark L=5 O=5122, mem=2.0 GiB — OK
+Phase: ingestion  rows=460000/1000000 (46%)  rate=3120 rows/s  commits=460 (recovered=0)
+PodStatus: 7 pods Running/Ready; server-0 restarts=1
+IS-0: vectors=372501 (81% of rows), apply_queue=2000/2000 (FULL), mem=1.46 GiB — WARN
+IS-1: vectors=N/A (not deployed)
+ServerCkpt: last LSN=(10,649298) 2m ago
+ISCkpt: back-pressure 57s, checkpoint Phase B in progress
 Bookie: jmem=142M/512M (28%)  jq=0 fwq=0  blocked=0 rejected=0  skipThr=0  wbytes=+38MB/60s
+LogErrors: none detected
+Verdict: warning
+```
+
+Field rules for ingestion ticks:
+- **rows / rate**: take `rows`, `total`, `ops_per_sec` from `GET /status`. Always show both the absolute count and the percentage.
+- **commits**: show `commits` and `recovered_commits` from `/status`. Non-zero `recovered_commits` means workers hit transient commit errors.
+- **IS-N vectors**: take `VECTORS` from `indexing-admin list-indexes`. Compute lag% = `(rows - vectors) / rows * 100`. With 1 IS replica, 100% of rows should be indexed. With 2 replicas and `--index-num-shards 4`, each IS targets ~50%. Flag WARN if lag > 10% sustained.
+- **IS-N apply_queue**: take `apply_queue_size` / `apply_queue_capacity` from `engine-stats`. FULL = IS is at max throughput.
+- **IS-N mem**: take `total_estimated_memory_bytes` from `engine-stats`, convert to GiB.
+- **ServerCkpt**: last completed server checkpoint LSN and time since it completed.
+- **ISCkpt**: any back-pressure or checkpoint phase currently active in IS logs. If no checkpoint is active, omit this line.
+- **Bookie**: omit entirely when `blocked=0`, `rejected=0`, `skipThr=0`.
+
+### During checkpoint / wait-for-indexes / recall phases:
+
+```
+TICK <num> SUMMARY
+Variant: k3s-local
+Phase: checkpoint  Progress: n/a  (server checkpoint triggered by bench)
+PodStatus: 7 pods Running/Ready
+IS-0: vectors=1000000 (100% of rows), apply_queue=0/2000, mem=1.1 GiB — OK
+ServerCkpt: in progress — last LSN=(10,649298) 3m ago
+ISCkpt: none active
 LogErrors: none detected
 Verdict: healthy
 ```
 
-The `Bookie:` line is compact and single-line. Include only the families
-that are actually present in `/metrics`; drop the rest. Express deltas
-(bytes/ops since previous tick) where it is meaningful, absolutes where
-it is (queue sizes, memory gauges).
-
-In case of a detected issue, mark the verdict as `warning` or `fatal`:
+### On warning / fatal:
 
 ```
 TICK <num> SUMMARY
 Variant: gke
-Phase: checkpoint  Progress: n/a
-PodStatus: 8 pods, herddb-indexing-service-1 has 2 restarts
-IS-0: watermark L=5 O=2000, mem=2.5 GiB — OK
-IS-1: watermark L=5 O=2000, mem=2.6 GiB — OK
+Phase: ingestion  rows=500000/1000000 (50%)  rate=4000 rows/s  commits=500 (recovered=0)
+PodStatus: 8 pods; herddb-indexing-service-1 has 2 restarts
+IS-0: vectors=480000 (96% of rows), apply_queue=1500/2000, mem=2.5 GiB — OK
+IS-1: vectors=20000 (4% of rows), apply_queue=2000/2000 (FULL), mem=0.1 GiB — WARN (lag 46%)
+ServerCkpt: last LSN=(5,230000) 1m ago
+ISCkpt: none active
 LogErrors: herddb-file-server-0 SEVERE: "ReadinessProbe failed"
 Verdict: warning
 ```
 
-If an `OutOfMemoryError` is observed:
-
 ```
 TICK <num> SUMMARY
 Phase: recall
-PodStatus: 8 pods, herddb-indexing-service-0 OOMKilled (phase=Failed)
+PodStatus: 8 pods; herddb-indexing-service-0 OOMKilled (phase=Failed)
+IS-0: vectors=N/A (pod restarted), apply_queue=N/A, mem=N/A — FATAL
 LogErrors: herddb-indexing-service-0 java.lang.OutOfMemoryError: Java heap space
 Verdict: fatal
 ```

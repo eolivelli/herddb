@@ -107,6 +107,55 @@ handling and needs to capture raw logs directly, these commands are whitelisted:
 - `kubectl --kubeconfig .kubeconfig logs --tail=200 <pod>`
 - `kubectl --kubeconfig .kubeconfig describe pod <pod>`
 
+### VectorBench admin API (read + live tuning)
+
+The VectorBench JVM inside `herddb-tools-0` exposes a JSON HTTP API on port
+8080 (default). Use `kubectl exec` to reach it.
+
+**Read progress (ingestion and query phases):**
+```
+kubectl --kubeconfig .kubeconfig exec herddb-tools-0 -- curl -s http://localhost:8080/status
+```
+Returns: `phase`, `rows`, `total`, `ops_per_sec`, `commits`, `recovered_commits`,
+`heap_used_mb`, `heap_max_mb`, `commit_latency` (mean/p50/p99/max ms).
+
+```
+kubectl --kubeconfig .kubeconfig exec herddb-tools-0 -- curl -s http://localhost:8080/ingestion/config
+```
+Returns: current `ingest-max-ops`, `ingest-threads`, `batch-size`, `rows`, `ingest-commit-retries`.
+
+```
+kubectl --kubeconfig .kubeconfig exec herddb-tools-0 -- curl -s http://localhost:8080/query/config
+```
+Returns: current `query-max-ops`, `query-threads`, `queries`, `top-k`.
+
+**Tune ingest rate on the fly (integer body = rows/s; 0 = unlimited):**
+```
+kubectl --kubeconfig .kubeconfig exec herddb-tools-0 -- curl -s -X POST http://localhost:8080/ingestion/config/ingest-max-ops -d '<rate>'
+```
+
+**Tune query rate on the fly:**
+```
+kubectl --kubeconfig .kubeconfig exec herddb-tools-0 -- curl -s -X POST http://localhost:8080/query/config/query-max-ops -d '<rate>'
+```
+
+**Change top-K on the fly (takes effect on the next query):**
+```
+kubectl --kubeconfig .kubeconfig exec herddb-tools-0 -- curl -s -X POST http://localhost:8080/query/config/top-k -d '<k>'
+```
+
+⚠️ **Rate-limiter safety rule** — `IngestionWorker` calls `rateLimiter.acquire(batch_size)`
+**after** each commit. At rate `r`, this blocks for `batch_size / r` seconds per worker.
+With 8 workers serialized on the shared limiter, the last worker waits
+`8 × batch_size / r` seconds. Setting a very low rate is catastrophic:
+- `--batch-size 10000 --ingest-max-ops 10` → last worker blocked 8 000 s (2.2 h)
+- `--batch-size 1000 --ingest-max-ops 1000` → 1 s/acquire (safe)
+**Rule: always keep `ingest-max-ops ≥ batch-size`** so each acquire takes ≤ 1 second.
+For ramp tests, start at `batch-size` and step in multiples of `batch-size`.
+Swapping the rate via the admin API does **not** unblock workers already sleeping
+inside `Thread.sleep()` in the old limiter — only workers that start their next
+acquire after the swap use the new rate.
+
 ### Read-only indexing-admin commands (for supervision and diagnostics)
 
 Run via `kubectl exec` inside the tools pod. These are whitelisted for
@@ -266,13 +315,16 @@ the `herddb-cluster-monitor` sub-agent** (see §Supervision delegation above)
 and wait for its TICK SUMMARY.
 
 The cluster-monitor sub-agent handles all per-tick diagnostics:
-- Reading and parsing the run log tail for phase/progress
+- Polling the VectorBench admin API (`GET /status`) for rows, rate, commits
+- Reading the run log tail as fallback / supplemental
 - Checking pod status for crashes / increasing RESTARTS
 - Scanning component logs for error keywords
-- Running indexing-admin stats (per-IS-replica)
+- Running `indexing-admin list-indexes` per IS replica for vector counts
+- Running `indexing-admin engine-stats` per IS replica for queue/memory state
+- Scanning IS and server logs for checkpoint phase / back-pressure signals
 - Polling file-server metrics (query phases)
 
-You receive a structured TICK SUMMARY (~300 tokens, ~15 lines) with a VERDICT:
+You receive a structured TICK SUMMARY (~300 tokens, ~20 lines) with a VERDICT:
 - `healthy` — continue to next tick
 - `warning` — log the warning and continue
 - `fatal` — stop the background task, proceed to §Failure handling
@@ -291,23 +343,32 @@ Agent(
   Variant: k3s-local
   WorkDir: herddb-kubernetes/src/main/helm/herddb/examples/k3s-local
   RunLog: <RUN_LOG path>
-  IsReplicas: 2
+  IsReplicas: 1
   TickNum: 7
 
-  For each IS get vector_count and estimated_memory_bytes from
-  `indexing-admin describe-index --json` (NOT engine-stats).
-  Compute mem in GiB = estimated_memory_bytes / 1073741824. Warn if > 18 GiB.
-  Compute IS-N lag% = vector_count_IS-N / rows_ingested * 100.
-  With --index-num-shards 4 and 2 IS replicas each IS should hold ~50% of rows.
+  Primary progress source: GET /status via
+    kubectl --kubeconfig .kubeconfig exec herddb-tools-0 -- curl -s http://localhost:8080/status
+  Extract: phase, rows, total, ops_per_sec, commits, recovered_commits.
+
+  For each IS get vector_count from `indexing-admin list-indexes` and
+  apply_queue + mem from `indexing-admin engine-stats --json`.
+  Compute IS-N lag% = (rows - vector_count) / rows * 100.
+  With 1 IS replica, target is 100% of rows indexed. Flag WARN if lag > 10%.
+  With 2 IS replicas and --index-num-shards 4, target is ~50% per instance.
+
+  Also scan IS logs (tail 10) for back-pressure / checkpoint phase keywords.
+  Scan server logs (tail 30) for last completed checkpoint LSN.
 
   Format the TICK SUMMARY exactly as:
 
   TICK N SUMMARY
   Variant: k3s-local
-  Phase: <phase>  Progress: rows=X/total (X%)  ETA: ~Xs (~Xh Xm)
+  Phase: <phase>  rows=X/total (X%)  rate=X rows/s  commits=X (recovered=X)
   PodStatus: <compact summary — Running/Ready counts, any restarts>
-  IS-0: vectors=X (X% of rows), mem=X GiB — <OK|WARN>
-  IS-1: vectors=X (X% of rows), mem=X GiB — <OK|WARN>
+  IS-0: vectors=X (X% of rows), apply_queue=X/2000, mem=X GiB — <OK|WARN>
+  IS-1: vectors=X (X% of rows), apply_queue=X/2000, mem=X GiB — <OK|WARN>
+  ServerCkpt: last LSN=(<ledger>,<offset>) <N>m ago  [or: in progress]
+  ISCkpt: <none active | back-pressure Xs, Phase B in progress | etc.>
   Bookie: [OMIT this line entirely unless blocked>0 or rejected>0 or skipThr>0]
   LogErrors: <none detected | verbatim error lines>
   Verdict: <healthy|warning|fatal>
@@ -317,15 +378,13 @@ Agent(
 
 ### Tick format rules
 
-- **ETA**: always include `ETA: ~Xs (~Xh Xm)` on the Progress line, taken
-  from `eta_s` in the run log.
-- **IndexLag**: for each IS report `vectors=X (X% of rows)` where X% =
-  `vector_count / rows_ingested * 100`. Use `describe-index` `vector_count`,
-  not engine-stats watermark offsets. With 2 IS replicas and `--index-num-shards 4`
-  the steady-state target is ~50% per instance. Flag as WARN if an instance
-  falls below 30% or above 70% for 3+ consecutive ticks.
-- **Memory**: use `estimated_memory_bytes` from `describe-index`. Convert to
-  GiB. Warn (WARN) if > 18 GiB.
+- **rows / rate**: take `rows`, `total`, `ops_per_sec` from `GET /status`. Always show the count, percentage, and rate.
+- **commits**: show `commits` and `recovered_commits`. Non-zero recovered → warn.
+- **IS-N vectors**: use `VECTORS` from `indexing-admin list-indexes`, not watermark offsets. Compute lag% = `(rows - vectors) / rows * 100`. Flag WARN if lag > 10% sustained over ≥ 2 ticks.
+- **IS-N apply_queue**: from `engine-stats`. `FULL` = IS at max throughput, lag will grow.
+- **IS-N mem**: `total_estimated_memory_bytes` from `engine-stats`, in GiB. Warn if > 18 GiB (limit is 20 GiB in values.yaml).
+- **ServerCkpt**: last `local checkpoint finish` line from server logs — LSN + age.
+- **ISCkpt**: any active back-pressure or checkpoint phase from IS logs. Omit line if nothing active.
 - **Bookie line**: omit entirely when `blocked=0`, `rejected=0`, `skipThr=0`.
   Only surface it when at least one of those counters is non-zero.
 

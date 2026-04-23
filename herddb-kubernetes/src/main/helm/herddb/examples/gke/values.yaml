@@ -308,10 +308,19 @@ indexingService:
     # Default 0 means maxMemory/3 = 24 GiB / 3 = 8 GiB.  At 8 GiB the IS triggers
     # memory-pressure checkpoints (flush to file-server) every second during heavy
     # ingest, because the HNSW graph grows past 70% of that 8 GiB limit almost
-    # immediately.  Raising to 20 GiB leaves ~4 GiB for BK/Netty/GC overhead and
-    # lets the IS accumulate much larger dirty-segment batches before flushing,
-    # dramatically reducing checkpoint frequency and improving apply throughput.
-    indexing.memory.vector.limit: "21474836480"
+    # immediately.
+    #
+    # History of tuning:
+    #   20 GiB (21474836480): caused OOM during bigann 100M run. jmap histogram showed
+    #     float[] at 13.3 GiB + HNSW graph overhead (int[], ConcurrentNeighborMap, etc.)
+    #     at ~3 GiB + BK/Netty/GC at ~2 GiB = ~22 GiB total → heap exhausted at -Xmx24g.
+    #     The flush is triggered at ~70% of the limit (~14 GiB) but ingest at ~5K
+    #     vectors/s per IS kept pushing past it before the flush could drain.
+    #   14 GiB (15032385536): flush starts at ~70% = ~9.8 GiB, giving ~10 GiB of
+    #     headroom before the 24 GiB heap ceiling. More frequent flushing but avoids
+    #     OOM. File-server CPU was only ~9% during ingest (plenty of headroom for more
+    #     flush traffic). Accepts slightly more checkpoint I/O in exchange for stability.
+    indexing.memory.vector.limit: "15032385536"
   resources:
     requests:
       memory: "32Gi"

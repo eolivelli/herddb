@@ -44,15 +44,17 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  # Heap raised to 20 g for bigann 100M-vector workload.
-  # bigann produces ~52,570 dirty pages (~52.5 GiB checkpoint buffer allocations);
-  # 10 g caused GC-pause connection drop on sift10m (5,257 pages), 12 g survived
-  # sift10m. 20 g gives headroom for the 10× larger bigann checkpoint.
-  # 20 g heap + 1 GiB JVM overhead → 21 GiB container memory.
+  # Heap: 16 g. Previously 20 g (raised for bigann 100M), reduced by 4 g to free
+  # host RAM for other components while still covering sift10m (5,257 dirty pages)
+  # and bigann 10M workloads. Revisit if bigann 100M checkpoint OOMs recur.
+  # Direct memory raised to 2 g: the server's gRPC commit-log client (BookKeeper)
+  # uses Netty direct buffers for addEntry / readEntries payloads; 1 g was
+  # tight under sustained bigann ingest.
+  # 16 g heap + 2 g direct + 1 GiB JVM overhead = 19 GiB → container = 19 GiB.
   # -Dio.netty.maxDirectMemory=0 tells Netty to respect -XX:MaxDirectMemorySize
   # (defaults to -Xmx) rather than doubling it, preventing RSS from exceeding
   # the container limit under heavy gRPC traffic.
-  javaOpts: "-Xms20g -Xmx20g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
+  javaOpts: "-Xms16g -Xmx16g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=2g"
   storage:
     data:
       size: 5Gi
@@ -98,10 +100,10 @@ server:
     bookkeeper.addEntryQuorumTimeoutSec: "7200"
   resources:
     requests:
-      memory: "23Gi"
+      memory: "19Gi"
       cpu: "2"
     limits:
-      memory: "23Gi"
+      memory: "19Gi"
       cpu: "2"
 
 fileServer:
@@ -141,10 +143,10 @@ fileServer:
   resources:
     requests:
       memory: "6Gi"
-      cpu: "0.5"
+      cpu: "2"
     limits:
       memory: "6Gi"
-      cpu: "1"
+      cpu: "2"
 
 minio:
   enabled: true
@@ -163,15 +165,19 @@ minio:
 
 zookeeper:
   enabled: true
+  # 512m heap + 512m direct + ~512m JVM overhead (metaspace, code cache,
+  # thread stacks, GC structures) = ~1.5 g → container = 2 GiB.
+  # (The previous 768Mi limit was too small: it did not account for
+  # MaxDirectMemorySize=512m or JVM non-heap overhead.)
   javaOpts: "-Xms512m -Xmx512m -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=512m"
   storage:
     size: 2Gi
   resources:
     requests:
-      memory: "768Mi"
+      memory: "2Gi"
       cpu: "0.25"
     limits:
-      memory: "768Mi"
+      memory: "2Gi"
       cpu: "0.5"
 
 bookkeeper:
@@ -179,7 +185,9 @@ bookkeeper:
   replicaCount: 1
   # Heap raised to 2 g (from 512 m): 38 k ops/s from 8 ingest threads caused
   # frequent GC pauses on 512 m heap, making the bookie temporarily unavailable.
-  # 2 g + 1 GiB JVM overhead → 3 GiB container memory.
+  # 2 g heap + 1 g direct + 1 GiB JVM overhead = 4 GiB → container = 4 GiB.
+  # (The previous 3 GiB limit was too small: it ignored MaxDirectMemorySize=1g,
+  # leaving the bookie at OOMKill risk under sustained ingest write pressure.)
   javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
   # Enable FINE logging for BK write processors so OperationRejectedException
   # (bookie backpressure) becomes visible. FINE is set only here in the k3s-local
@@ -234,23 +242,33 @@ bookkeeper:
       size: 10Gi
   resources:
     requests:
-      memory: "3Gi"
+      memory: "4Gi"
       cpu: "0.25"
     limits:
-      memory: "3Gi"
+      memory: "4Gi"
       cpu: "0.5"
 
 indexingService:
   enabled: true
   storageMode: remote
   replicaCount: 1
-  # Heap raised to 9 g: sift10m builds 221 FusedPQ segments (~17 GB total graph
-  # data); with 5 g the IS had to evict/reload segments on every query causing
-  # ~25s/query. 9 g allows more segments resident in memory simultaneously,
-  # which should significantly reduce query latency.
-  # 9 g heap + 1 GiB JVM overhead → 10 GiB container memory.
-  # Netty memory tuning: io.netty.maxDirectMemory=0 respects -XX:MaxDirectMemorySize cap
-  # instead of defaulting to heap size; 512m cap is sufficient for gRPC messages.
+  # Heap: 7 g. Previously 9 g, reduced by 2 g to free host RAM for other
+  # components. 7 g still allows a good number of FusedPQ segments resident
+  # simultaneously; eviction pressure will increase on sift10m (221 segments,
+  # ~17 GB total) — revisit if query latency regresses significantly.
+  # JVM-tracked memory: 7 g heap + 6 g direct + 1 GiB JVM overhead = 14 g.
+  # Container 20 GiB: peak budget for gist1m (10 segs × 390 MB native/mmap Phase C):
+  #   7g heap + 6g direct + 1g overhead + 3.9g native = 17.9 GiB < 20 GiB ✓
+  # Direct memory raised from 2 g to 6 g (issue #238):
+  #   The SegmentBlockCache (Caffeine LRU) auto-sizes to maxMemory/4 = 7g/4 = 1.75 GiB
+  #   using pooled Netty direct ByteBufs. With MaxDirectMemorySize=2g, the cache alone
+  #   consumed ~1.75 GiB leaving only ~250 MB for concurrent gRPC readFileRange streams
+  #   (4 MB chunks each). Four concurrent query threads exhausted the 250 MB headroom →
+  #   OutOfMemoryError: Cannot reserve 4194304 bytes of direct buffer memory.
+  #   Raising to 6 g gives 4.25 GiB headroom above the 1.75 GiB cache for concurrent
+  #   streaming reads without changing the container limit (17.9 GiB < 20 GiB for gist1m).
+  #   NOTE: for bigann-100M (27 segs × 583 MB = 15.7 GiB native Phase C), use GKE
+  #   values with a 32 GiB IS container; k3s-local 20 GiB is sized for gist1m/sift10m.
   # numDirectArenas=16 spreads Netty allocations to reduce lock contention (issue #122).
   # herddb.commitlog.tailbatchsize=1000 caps the BK read batch issued per
   # followTheLeader() call in the IS tailer. The 10000 default retains up to
@@ -258,7 +276,7 @@ indexingService:
   # drove IS heap to 91% during a bigann-200M run (issue #180). 1000 leaves
   # the steady-state throughput headroom while cutting the retained working
   # set by 10x.
-  javaOpts: "-Xms9g -Xmx9g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=2g -Dio.netty.allocator.numDirectArenas=16 -Dherddb.commitlog.tailbatchsize=1000"
+  javaOpts: "-Xms7g -Xmx7g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=6g -Dio.netty.allocator.numDirectArenas=16 -Dherddb.commitlog.tailbatchsize=1000"
   storage:
     data:
       size: 5Gi
@@ -266,10 +284,10 @@ indexingService:
       size: 2Gi
   resources:
     requests:
-      memory: "10Gi"
+      memory: "20Gi"
       cpu: "4"
     limits:
-      memory: "10Gi"
+      memory: "20Gi"
       cpu: "4"
 
 tools:
@@ -278,14 +296,17 @@ tools:
     datasets:
       size: 10Gi
   # Heap raised to 6 g: sift10m base set (10M × 128-dim × 4 B = 5.12 GB)
-  # must fit in JVM heap during ingest. Container limit = heap + ~1 GiB overhead.
+  # must fit in JVM heap during ingest.
+  # 6 g heap (max) + 1 g direct + 1 GiB JVM overhead = 8 GiB → container = 8 GiB.
+  # (The previous 7 GiB limit ignored MaxDirectMemorySize=1g and was at risk of
+  # OOMKill when the JVM expanded to its maximum heap during large dataset ingest.)
   javaOpts: "-Xms512m -Xmx6g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
   resources:
     requests:
-      memory: "7Gi"
+      memory: "8Gi"
       cpu: "0.5"
     limits:
-      memory: "7Gi"
+      memory: "8Gi"
       cpu: "1"
 
 prometheus:
