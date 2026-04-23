@@ -245,29 +245,28 @@ public class BookKeeperCommitLogTest {
                 writer.log(LogEntryFactory.beginTransaction(1), true).getLogSequenceNumber();
 
                 this.testEnv.pauseBookie();
-                // this is deemed to fail and we will close the log
+                // The write fails because the single bookie is paused; the
+                // callback's signalLogFailed() then marks the log as failed.
                 TestUtils.assertThrows(LogNotAvailableException.class, ()
                         -> writer.log(LogEntryFactory.beginTransaction(2), true).getLogSequenceNumber()
                 );
                 assertTrue(writer.isFailed());
 
-                // this one will fail as well
-                TestUtils.assertThrows(LogNotAvailableException.class, ()
-                        -> writer.log(LogEntryFactory.beginTransaction(2), true).getLogSequenceNumber()
-                );
-
-                // no way to recover this instance of BookkeeperCommitLog
-                // we will bounce the leader and it will restart with a full recovery
-                // in a production env you do not have only one bookie, and the failure
-                // of a single bookie will be handled with an ensemble change
                 this.testEnv.resumeBookie();
 
-                TestUtils.assertThrows(LogNotAvailableException.class, ()
-                        -> writer.log(LogEntryFactory.beginTransaction(2), true).getLogSequenceNumber()
-                );
+                // Regression for issue #204: before the fix, `failed = true`
+                // was sticky — the commit log permanently rejected writes on
+                // any freshly-opened ledger even after the cluster recovered.
+                // After the fix, the next log call rotates the ledger via
+                // getValidWriter -> openNewLedger, which clears `failed` on
+                // successful ledger creation and lets the write through.
+                LogSequenceNumber lsnOnNewLedger = writer.log(LogEntryFactory.beginTransaction(2), true)
+                        .getLogSequenceNumber();
+                assertNotNull(lsnOnNewLedger);
+                assertFalse(writer.isFailed());
             }
 
-            // check expected reads
+            // check expected reads: one entry on ledger 1 (tx=1) plus one entry on ledger 2 (tx=2)
             try (BookkeeperCommitLog reader = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
                 List<Map.Entry<LogSequenceNumber, LogEntry>> list = new ArrayList<>();
                 reader.recovery(LogSequenceNumber.START_OF_TIME, (lsn, entry) -> {
@@ -275,9 +274,12 @@ public class BookKeeperCommitLogTest {
                         list.add(new AbstractMap.SimpleImmutableEntry<>(lsn, entry));
                     }
                 }, false);
-                assertEquals(1, list.size());
+                assertEquals(2, list.size());
 
                 assertTrue(list.get(0).getKey().after(LogSequenceNumber.START_OF_TIME));
+                assertTrue(list.get(1).getKey().after(list.get(0).getKey()));
+                // second entry must live on a fresh ledger created by the recovery rotation
+                assertTrue(list.get(1).getKey().ledgerId != list.get(0).getKey().ledgerId);
             }
 
         }
@@ -306,9 +308,8 @@ public class BookKeeperCommitLogTest {
                 writer.log(LogEntryFactory.beginTransaction(1), true).getLogSequenceNumber();
 
                 this.testEnv.pauseBookie();
-                // this is deemed to fail and we will close the log
 
-                // writer won't see the failure, because this is a deferred write
+                // writer won't see the failure yet, because this is a deferred write
                 writer.log(LogEntryFactory.beginTransaction(2), false).getLogSequenceNumber();
 
                 // this one will fail as well, and we will catch the error, because this is a sync write
@@ -317,18 +318,21 @@ public class BookKeeperCommitLogTest {
                         -> writer.log(LogEntryFactory.beginTransaction(2), true).getLogSequenceNumber()
                 );
 
-                // no way to recover this instance of BookkeeperCommitLog
-                // we will bounce the leader and it will restart with a full recovery
-                // in a production env you do not have only one bookie, and the failure
-                // of a single bookie will be handled with an ensemble change
                 this.testEnv.resumeBookie();
 
-                TestUtils.assertThrows(LogNotAvailableException.class, ()
-                        -> writer.log(LogEntryFactory.beginTransaction(2), true).getLogSequenceNumber()
-                );
+                // Once the bookie is back the log auto-recovers by rolling a new
+                // ledger on the next call.  See issue #204: before the fix the
+                // per-entry failure set a sticky `failed=true` flag that kept
+                // subsequent writes rejected even after the cluster recovered.
+                LogSequenceNumber lsnOnNewLedger = writer.log(LogEntryFactory.beginTransaction(2), true)
+                        .getLogSequenceNumber();
+                assertNotNull(lsnOnNewLedger);
+                assertFalse(writer.isFailed());
             }
 
-            // check expected reads
+            // check expected reads: at least the 4 entries that were already
+            // acked before the bookie pause must be visible, plus the one we
+            // wrote after recovery on the new ledger.
             try (BookkeeperCommitLog reader = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
                 List<Map.Entry<LogSequenceNumber, LogEntry>> list = new ArrayList<>();
                 reader.recovery(LogSequenceNumber.START_OF_TIME, (lsn, entry) -> {
@@ -336,7 +340,7 @@ public class BookKeeperCommitLogTest {
                         list.add(new AbstractMap.SimpleImmutableEntry<>(lsn, entry));
                     }
                 }, false);
-                assertEquals(4, list.size());
+                assertTrue("unexpected entry count on reader: " + list.size(), list.size() >= 5);
             }
 
         }
@@ -418,21 +422,33 @@ public class BookKeeperCommitLogTest {
                     }
                 }
 
-                // even if we restart the bookie we must not be able to acknowledge the write
+                // After the bookie comes back, the log must recover by rolling
+                // a new ledger on the next call (issue #204).  The in-flight
+                // entries from the paused window are lost, but new writes work.
                 testEnv.resumeBookie();
-                TestUtils.assertThrows(LogNotAvailableException.class, ()
-                        -> writer.log(entry, true).getLogSequenceNumber()
-                );
+                LogSequenceNumber lsnAfter = writer.log(entry, true).getLogSequenceNumber();
+                assertNotNull(lsnAfter);
+                assertFalse(writer.isFailed());
             }
 
             try (BookkeeperCommitLog reader = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
                 List<Map.Entry<LogSequenceNumber, LogEntry>> list = new ArrayList<>();
+                Set<Long> ledgerIds = new HashSet<>();
                 reader.recovery(LogSequenceNumber.START_OF_TIME, (a, b) -> {
                     if (b.type != LogEntryType.NOOP) {
                         list.add(new AbstractMap.SimpleImmutableEntry<>(a, b));
+                        ledgerIds.add(a.ledgerId);
                     }
                 }, false);
-                assertTrue("unexpected number of entries on reader: " + list.size(), list.size() <= 80);
+                // After recovery we expect AT LEAST the post-resume sync write on a
+                // new ledger in addition to any entries that made it to BK before the
+                // pause.  The total is bounded above by the entries we tried to write.
+                assertTrue("too few entries on reader: " + list.size(), list.size() >= 1);
+                assertTrue("too many entries on reader: " + list.size(),
+                        list.size() <= numberOfEntries + 1);
+                // Expect at least two distinct ledgers: maxLedgerSize rotations during
+                // the initial loop plus the recovery rotation on the post-resume write.
+                assertTrue("expected multiple ledgers, got: " + ledgerIds, ledgerIds.size() >= 2);
             }
 
         }
