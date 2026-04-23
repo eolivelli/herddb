@@ -83,7 +83,7 @@ public class IndexingServiceClientFanOutTest {
                 entry(new byte[]{2}, 0.8f))));
         FakeIndexingServer broken = start(new ThrowingImpl(Status.UNAVAILABLE.withDescription("boom")));
 
-        client = new IndexingServiceClient(Arrays.asList(ok.address(), broken.address()), 10);
+        client = IndexingServiceClient.fromAddresses(Arrays.asList(ok.address(), broken.address()), 10);
 
         try {
             client.search("herd", "t1", "vidx", new float[]{1, 0, 0}, 5);
@@ -121,7 +121,7 @@ public class IndexingServiceClientFanOutTest {
                 entry(new byte[]{'b', 3}, 0.4f),
                 entry(new byte[]{'b', 4}, 0.2f))));
 
-        client = new IndexingServiceClient(Arrays.asList(serverA.address(), serverB.address()), 10);
+        client = IndexingServiceClient.fromAddresses(Arrays.asList(serverA.address(), serverB.address()), 10);
 
         List<Map.Entry<Bytes, Float>> results =
                 client.search("herd", "t1", "vidx", new float[]{1, 0, 0}, 3);
@@ -150,7 +150,7 @@ public class IndexingServiceClientFanOutTest {
         FakeIndexingServer slowB = start(new DelayedResponseImpl(Collections.singletonList(
                 entry(new byte[]{'b'}, 0.8f)), delayMs));
 
-        client = new IndexingServiceClient(Arrays.asList(slowA.address(), slowB.address()), 10);
+        client = IndexingServiceClient.fromAddresses(Arrays.asList(slowA.address(), slowB.address()), 10);
 
         long start = System.nanoTime();
         List<Map.Entry<Bytes, Float>> results =
@@ -172,7 +172,7 @@ public class IndexingServiceClientFanOutTest {
                 entry(new byte[]{1}, 0.9f),
                 entry(new byte[]{2}, 0.5f))));
 
-        client = new IndexingServiceClient(Collections.singletonList(only.address()), 10);
+        client = IndexingServiceClient.fromAddresses(Collections.singletonList(only.address()), 10);
 
         List<Map.Entry<Bytes, Float>> results =
                 client.search("herd", "t1", "vidx", new float[]{1, 0, 0}, 5);

@@ -104,21 +104,6 @@ public class ZookeeperIndexingServiceInstancesTest {
     }
 
     @Test
-    public void legacyListIndexingServicesReturnsAddresses() throws Exception {
-        try (ZookeeperMetadataStorageManager mgr = newManager()) {
-            mgr.registerIndexingServiceInstance(
-                    IndexingServiceInstanceDescriptor.primary("p0", "host-p0:9850", 0));
-            mgr.registerIndexingServiceInstance(
-                    IndexingServiceInstanceDescriptor.shadow("s0", "host-s0:9850", 0));
-
-            List<String> addresses = mgr.listIndexingServices();
-            assertEquals(2, addresses.size());
-            assertTrue(addresses.contains("host-p0:9850"));
-            assertTrue(addresses.contains("host-s0:9850"));
-        }
-    }
-
-    @Test
     public void ephemeralCleanupOnClose() throws Exception {
         try (ZookeeperMetadataStorageManager writer = newManager()) {
             writer.registerIndexingServiceInstance(

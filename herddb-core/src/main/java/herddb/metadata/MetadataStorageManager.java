@@ -139,16 +139,6 @@ public abstract class MetadataStorageManager implements AutoCloseable {
         }
     }
 
-    public void registerIndexingService(String serviceId, String address) throws MetadataStorageManagerException {
-    }
-
-    public void unregisterIndexingService(String serviceId) throws MetadataStorageManagerException {
-    }
-
-    public List<String> listIndexingServices() throws MetadataStorageManagerException {
-        return Collections.emptyList();
-    }
-
     // -------------------------------------------------------------------------
     // Role-aware indexing-service registration (shadows + primaries) and
     // checkpoint-state publication (primary -> shadows). Non-ZK implementations
@@ -224,16 +214,6 @@ public abstract class MetadataStorageManager implements AutoCloseable {
 
     public final void removeServiceDiscoveryListener(ServiceDiscoveryListener listener) {
         serviceDiscoveryListeners.remove(listener);
-    }
-
-    protected final void notifyIndexingServicesChanged(List<String> addresses) {
-        for (ServiceDiscoveryListener l : serviceDiscoveryListeners) {
-            try {
-                l.onIndexingServicesChanged(addresses);
-            } catch (Exception e) {
-                // listener is best-effort; never propagate out of the notify path
-            }
-        }
     }
 
     protected final void notifyIndexingServiceInstancesChanged(List<IndexingServiceInstanceDescriptor> instances) {

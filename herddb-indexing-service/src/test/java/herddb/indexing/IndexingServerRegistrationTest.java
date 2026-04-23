@@ -92,12 +92,13 @@ public class IndexingServerRegistrationTest {
         final List<String> registeredIndexingServices = new ArrayList<>();
 
         @Override
-        public void registerIndexingService(String serviceId, String address) {
-            registeredIndexingServices.add(address);
+        public void registerIndexingServiceInstance(
+                herddb.metadata.IndexingServiceInstanceDescriptor descriptor) {
+            registeredIndexingServices.add(descriptor.getAddress());
         }
 
         @Override
-        public void unregisterIndexingService(String serviceId) {
+        public void unregisterIndexingServiceInstance(String serviceId) {
             registeredIndexingServices.remove(serviceId);
         }
 

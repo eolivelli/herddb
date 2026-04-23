@@ -28,7 +28,7 @@ import java.util.List;
 /**
  * One-shot helper that connects to ZooKeeper, reads the list of registered
  * indexing service instances, and disconnects. Used by the
- * {@code indexing-admin list-instances} CLI command.
+ * {@code indexing-admin list-instances} / {@code list-shadows} CLI commands.
  */
 public final class ZkInstanceDiscovery {
 
@@ -37,33 +37,12 @@ public final class ZkInstanceDiscovery {
     private ZkInstanceDiscovery() {
     }
 
-    /** Legacy address-only listing (primary+shadow addresses, no role info). */
-    public static List<String> listInstances(String zkAddress, String basePath) throws MetadataStorageManagerException {
+    public static List<IndexingServiceInstanceDescriptor> listInstances(
+            String zkAddress, String basePath) throws MetadataStorageManagerException {
         return listInstances(zkAddress, basePath, DEFAULT_SESSION_TIMEOUT_MS);
     }
 
-    public static List<String> listInstances(String zkAddress, String basePath,
-                                               int sessionTimeoutMs) throws MetadataStorageManagerException {
-        ZookeeperMetadataStorageManager mgr = new ZookeeperMetadataStorageManager(zkAddress, sessionTimeoutMs, basePath);
-        try {
-            mgr.start();
-            return mgr.listIndexingServices();
-        } finally {
-            try {
-                mgr.close();
-            } catch (MetadataStorageManagerException ignore) {
-                // best effort
-            }
-        }
-    }
-
-    /** Full listing with role/instanceId/shadowOf metadata. */
-    public static List<IndexingServiceInstanceDescriptor> listInstanceDescriptors(
-            String zkAddress, String basePath) throws MetadataStorageManagerException {
-        return listInstanceDescriptors(zkAddress, basePath, DEFAULT_SESSION_TIMEOUT_MS);
-    }
-
-    public static List<IndexingServiceInstanceDescriptor> listInstanceDescriptors(
+    public static List<IndexingServiceInstanceDescriptor> listInstances(
             String zkAddress, String basePath, int sessionTimeoutMs)
             throws MetadataStorageManagerException {
         ZookeeperMetadataStorageManager mgr = new ZookeeperMetadataStorageManager(

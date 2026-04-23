@@ -136,7 +136,8 @@ public class ZKDiscoveryVectorIndexTest {
                         engine.start();
 
                         // 1. Verify indexing service is registered in ZK
-                        List<String> services = server.getMetadataStorageManager().listIndexingServices();
+                        List<herddb.metadata.IndexingServiceInstanceDescriptor> services =
+                                server.getMetadataStorageManager().listIndexingServiceInstances();
                         assertFalse("Indexing service should be discoverable via ZK", services.isEmpty());
 
                         // 2. Create IndexingServiceClient from ZK-discovered addresses
@@ -149,8 +150,9 @@ public class ZKDiscoveryVectorIndexTest {
                         server.getMetadataStorageManager().addServiceDiscoveryListener(
                                 new ServiceDiscoveryListener() {
                                     @Override
-                                    public void onIndexingServicesChanged(List<String> currentAddresses) {
-                                        client.updateServers(currentAddresses);
+                                    public void onIndexingServiceInstancesChanged(
+                                            List<herddb.metadata.IndexingServiceInstanceDescriptor> currentInstances) {
+                                        client.updateInstances(currentInstances);
                                     }
 
                                     @Override
@@ -302,7 +304,8 @@ public class ZKDiscoveryVectorIndexTest {
                     engine2.start();
 
                     // Verify both indexing services are registered in ZK
-                    List<String> services = server.getMetadataStorageManager().listIndexingServices();
+                    List<herddb.metadata.IndexingServiceInstanceDescriptor> services =
+                                server.getMetadataStorageManager().listIndexingServiceInstances();
                     assertEquals("Both indexing services should be discoverable via ZK",
                             2, services.size());
 
@@ -314,8 +317,9 @@ public class ZKDiscoveryVectorIndexTest {
                     server.getMetadataStorageManager().addServiceDiscoveryListener(
                             new ServiceDiscoveryListener() {
                                 @Override
-                                public void onIndexingServicesChanged(List<String> currentAddresses) {
-                                    client.updateServers(currentAddresses);
+                                public void onIndexingServiceInstancesChanged(
+                                        List<herddb.metadata.IndexingServiceInstanceDescriptor> currentInstances) {
+                                    client.updateInstances(currentInstances);
                                 }
 
                                 @Override
@@ -462,7 +466,8 @@ public class ZKDiscoveryVectorIndexTest {
 
                         // Now wire the client — this mimics ServerMain's ZK discovery code
                         MetadataStorageManager msm = server.getMetadataStorageManager();
-                        List<String> discovered = msm.listIndexingServices();
+                        List<herddb.metadata.IndexingServiceInstanceDescriptor> discovered =
+                                msm.listIndexingServiceInstances();
                         assertFalse("Indexing service should already be in ZK", discovered.isEmpty());
 
                         IndexingServiceClient client = new IndexingServiceClient(discovered, 30);
@@ -470,8 +475,9 @@ public class ZKDiscoveryVectorIndexTest {
 
                         msm.addServiceDiscoveryListener(new ServiceDiscoveryListener() {
                             @Override
-                            public void onIndexingServicesChanged(List<String> currentAddresses) {
-                                client.updateServers(currentAddresses);
+                            public void onIndexingServiceInstancesChanged(
+                                    List<herddb.metadata.IndexingServiceInstanceDescriptor> currentInstances) {
+                                client.updateInstances(currentInstances);
                             }
 
                             @Override
@@ -479,9 +485,10 @@ public class ZKDiscoveryVectorIndexTest {
                             }
                         });
                         // Re-query after listener registration (the fix)
-                        List<String> currentServers = msm.listIndexingServices();
+                        List<herddb.metadata.IndexingServiceInstanceDescriptor> currentServers =
+                                msm.listIndexingServiceInstances();
                         if (!currentServers.isEmpty()) {
-                            client.updateServers(currentServers);
+                            client.updateInstances(currentServers);
                         }
 
                         try {
@@ -569,7 +576,8 @@ public class ZKDiscoveryVectorIndexTest {
 
                 // Wire the client BEFORE the indexing service is registered (empty list)
                 MetadataStorageManager msm = server.getMetadataStorageManager();
-                List<String> discovered = msm.listIndexingServices();
+                List<herddb.metadata.IndexingServiceInstanceDescriptor> discovered =
+                        msm.listIndexingServiceInstances();
                 assertTrue("No indexing service registered yet", discovered.isEmpty());
 
                 IndexingServiceClient client = new IndexingServiceClient(discovered, 30);
@@ -577,8 +585,9 @@ public class ZKDiscoveryVectorIndexTest {
 
                 msm.addServiceDiscoveryListener(new ServiceDiscoveryListener() {
                     @Override
-                    public void onIndexingServicesChanged(List<String> currentAddresses) {
-                        client.updateServers(currentAddresses);
+                    public void onIndexingServiceInstancesChanged(
+                            List<herddb.metadata.IndexingServiceInstanceDescriptor> currentInstances) {
+                        client.updateInstances(currentInstances);
                     }
 
                     @Override
@@ -586,9 +595,10 @@ public class ZKDiscoveryVectorIndexTest {
                     }
                 });
                 // Re-query after listener registration (the fix) — still empty here
-                List<String> requeried = msm.listIndexingServices();
+                List<herddb.metadata.IndexingServiceInstanceDescriptor> requeried =
+                        msm.listIndexingServiceInstances();
                 if (!requeried.isEmpty()) {
-                    client.updateServers(requeried);
+                    client.updateInstances(requeried);
                 }
 
                 // NOW start and register the indexing service — ZK watcher should fire

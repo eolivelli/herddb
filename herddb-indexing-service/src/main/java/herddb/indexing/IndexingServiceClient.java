@@ -30,7 +30,6 @@ import herddb.indexing.proto.SearchResponse;
 import herddb.indexing.proto.SearchResult;
 import herddb.log.LogSequenceNumber;
 import herddb.metadata.IndexingServiceInstanceDescriptor;
-import herddb.server.DynamicServiceClient;
 import herddb.utils.Bytes;
 import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
@@ -61,17 +60,19 @@ import java.util.logging.Logger;
 
 /**
  * gRPC client for the IndexingService.
- * Manages connections to one or more IndexingService instances (full replicas).
- * <p>
- * Search fans out to all instances and merges results by score.
- * If only one instance is configured, results are returned as-is (already sorted by similarity).
- * <p>
- * Supports dynamic server list updates via {@link #updateServers(List)}.
- * A volatile snapshot swap pattern ensures lock-free reads in the hot path.
+ * Manages connections to one or more IndexingService instances (primaries +
+ * shadow replicas). Endpoints are grouped into pools keyed by effective
+ * {@code instanceId} (a shadow shares its {@code shadowOf} primary's pool).
+ * Search dispatches one RPC per pool, round-robin within the pool, with
+ * fallback inside the pool on NOT_READY / retryable gRPC status.
+ *
+ * <p>Dynamic updates flow through
+ * {@link #updateInstances(List)}. A volatile snapshot swap pattern ensures
+ * lock-free reads in the hot path.
  *
  * @author enrico.olivelli
  */
-public class IndexingServiceClient implements RemoteVectorIndexService, DynamicServiceClient {
+public class IndexingServiceClient implements RemoteVectorIndexService {
 
     private static final Logger LOGGER = Logger.getLogger(IndexingServiceClient.class.getName());
 
@@ -81,8 +82,8 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     private final long timeoutSeconds;
     private final ClientInterceptor clientInterceptor;
     /**
-     * Released once the client has seen at least one non-empty server list,
-     * either at construction or via {@link #updateServers(List)}. Used by
+     * Released once the client has seen at least one non-empty instance list,
+     * either at construction or via {@link #updateInstances(List)}. Used by
      * {@link #awaitServersReady(long)} to let callers block on cold-cluster
      * ZK discovery before issuing the first RPC.
      */
@@ -128,15 +129,12 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     }
 
     private static class ServerSnapshot {
-        /** Legacy flat server list (addresses only). */
-        final List<String> servers;
-        /** Legacy channels by address — kept so getMinProcessedLsn-style iteration works unchanged. */
+        /** Channels by address — iterated by {@link #getIndexStatus} and {@link #getMinProcessedLsn}. */
         final Map<String, ManagedChannel> channels;
         /** One pool per effective instanceId; iteration order is deterministic (sorted). */
         final List<Pool> pools;
 
-        ServerSnapshot(List<String> servers, Map<String, ManagedChannel> channels, List<Pool> pools) {
-            this.servers = Collections.unmodifiableList(new ArrayList<>(servers));
+        ServerSnapshot(Map<String, ManagedChannel> channels, List<Pool> pools) {
             this.channels = Collections.unmodifiableMap(new HashMap<>(channels));
             this.pools = Collections.unmodifiableList(new ArrayList<>(pools));
         }
@@ -177,42 +175,39 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         return false;
     }
 
-    public IndexingServiceClient(List<String> servers, long timeoutSeconds) {
-        this(servers, timeoutSeconds, null);
+    public IndexingServiceClient(List<IndexingServiceInstanceDescriptor> instances, long timeoutSeconds) {
+        this(instances, timeoutSeconds, null);
     }
 
-    public IndexingServiceClient(List<String> servers, long timeoutSeconds, ClientInterceptor clientInterceptor) {
+    public IndexingServiceClient(List<IndexingServiceInstanceDescriptor> instances,
+                                 long timeoutSeconds, ClientInterceptor clientInterceptor) {
         this.timeoutSeconds = timeoutSeconds;
         this.clientInterceptor = clientInterceptor;
-        Map<String, ManagedChannel> channels = new HashMap<>();
-        for (String server : servers) {
-            channels.put(server, buildChannel(server));
-        }
-        this.snapshot = new ServerSnapshot(servers, channels, buildLegacyPools(servers, channels));
-        if (!servers.isEmpty()) {
+        this.snapshot = buildSnapshot(instances, Collections.emptyMap());
+        if (!instances.isEmpty()) {
             this.serversReadyLatch.countDown();
         }
     }
 
     /**
-     * Builds pools from a flat address list. When only addresses are known
-     * (legacy constructor path) each address is assigned to its own pool with
-     * a unique effective instanceId — this preserves the pre-shadow
-     * fan-out-to-all-instances behaviour.
+     * Convenience factory for callers that only have a flat address list
+     * (typically static configuration of a single-primary deployment): each
+     * address becomes its own pool with a unique effective instanceId and
+     * role=primary. For shadow-aware discovery use
+     * {@link #IndexingServiceClient(List, long)} with descriptors.
      */
-    private static List<Pool> buildLegacyPools(List<String> servers, Map<String, ManagedChannel> channels) {
-        List<Pool> pools = new ArrayList<>(servers.size());
-        for (int i = 0; i < servers.size(); i++) {
-            String addr = servers.get(i);
-            Endpoint ep = new Endpoint(addr, channels.get(addr),
-                    IndexingServiceInstanceDescriptor.ROLE_PRIMARY, i);
-            pools.add(new Pool(i, java.util.Collections.singletonList(ep)));
-        }
-        return pools;
+    public static IndexingServiceClient fromAddresses(List<String> addresses, long timeoutSeconds) {
+        return fromAddresses(addresses, timeoutSeconds, null);
     }
 
-    public IndexingServiceClient(List<String> servers) {
-        this(servers, DEFAULT_TIMEOUT_SECONDS);
+    public static IndexingServiceClient fromAddresses(List<String> addresses, long timeoutSeconds,
+                                                      ClientInterceptor interceptor) {
+        List<IndexingServiceInstanceDescriptor> instances = new ArrayList<>(addresses.size());
+        for (int i = 0; i < addresses.size(); i++) {
+            String addr = addresses.get(i);
+            instances.add(IndexingServiceInstanceDescriptor.primary(addr, addr, i));
+        }
+        return new IndexingServiceClient(instances, timeoutSeconds, interceptor);
     }
 
     private ManagedChannel buildChannel(String server) {
@@ -227,53 +222,15 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         return b.build();
     }
 
-    @Override
     public boolean awaitServersReady(long timeoutMs) throws InterruptedException {
         return serversReadyLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
-    @Override
-    public synchronized void updateServers(List<String> newServers) {
-        if (newServers.isEmpty()) {
-            LOGGER.log(Level.WARNING, "updateServers called with empty list, keeping current servers");
-            return;
-        }
-
-        ServerSnapshot current = this.snapshot;
-
-        // Compute diff
-        Set<String> added = new LinkedHashSet<>(newServers);
-        added.removeAll(current.channels.keySet());
-
-        Set<String> removed = new LinkedHashSet<>(current.channels.keySet());
-        removed.removeAll(new HashSet<>(newServers));
-
-        // Build new channels map: reuse existing, add new
-        Map<String, ManagedChannel> newChannels = new HashMap<>();
-        for (String server : newServers) {
-            ManagedChannel existing = current.channels.get(server);
-            if (existing != null) {
-                newChannels.put(server, existing);
-            } else {
-                newChannels.put(server, buildChannel(server));
-            }
-        }
-
-        this.snapshot = new ServerSnapshot(newServers, newChannels,
-                buildLegacyPools(newServers, newChannels));
-        serversReadyLatch.countDown();
-
-        LOGGER.log(Level.INFO, "Updated indexing service servers: {0} (added: {1}, removed: {2})",
-                new Object[]{newServers, added, removed});
-
-        shutdownRemovedChannels(current, removed);
-    }
-
     /**
-     * Shadow-aware counterpart of {@link #updateServers(List)}. Groups
-     * instances by effective instanceId (a shadow shares its {@code shadowOf}
-     * primary's pool). Search fans out once per pool and falls back within a
-     * pool on NOT_READY or a retryable gRPC status.
+     * Atomically replaces the pooled endpoint list. Groups instances by
+     * effective instanceId (a shadow shares its {@code shadowOf} primary's
+     * pool). Search fans out once per pool and falls back within a pool on
+     * NOT_READY or a retryable gRPC status.
      */
     public synchronized void updateInstances(List<IndexingServiceInstanceDescriptor> newInstances) {
         if (newInstances == null || newInstances.isEmpty()) {
@@ -282,23 +239,36 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         }
 
         ServerSnapshot current = this.snapshot;
+        ServerSnapshot next = buildSnapshot(newInstances, current.channels);
 
-        // Build the fresh address list + channels (reuse where possible).
-        List<String> addresses = new ArrayList<>(newInstances.size());
+        Set<String> removed = new LinkedHashSet<>(current.channels.keySet());
+        removed.removeAll(next.channels.keySet());
+
+        this.snapshot = next;
+        serversReadyLatch.countDown();
+
+        LOGGER.log(Level.INFO, "Updated indexing service instances: {0} pools, {1} endpoints",
+                new Object[]{next.pools.size(), next.channels.size()});
+
+        shutdownRemovedChannels(current, removed);
+    }
+
+    /**
+     * Builds a {@link ServerSnapshot} from descriptors, reusing channels from
+     * {@code existingChannels} where addresses overlap.
+     */
+    private ServerSnapshot buildSnapshot(List<IndexingServiceInstanceDescriptor> instances,
+                                         Map<String, ManagedChannel> existingChannels) {
         Map<String, ManagedChannel> newChannels = new HashMap<>();
-        for (IndexingServiceInstanceDescriptor d : newInstances) {
-            addresses.add(d.getAddress());
-            ManagedChannel existing = current.channels.get(d.getAddress());
-            if (existing != null) {
-                newChannels.put(d.getAddress(), existing);
-            } else if (!newChannels.containsKey(d.getAddress())) {
-                newChannels.put(d.getAddress(), buildChannel(d.getAddress()));
+        for (IndexingServiceInstanceDescriptor d : instances) {
+            if (!newChannels.containsKey(d.getAddress())) {
+                ManagedChannel existing = existingChannels.get(d.getAddress());
+                newChannels.put(d.getAddress(),
+                        existing != null ? existing : buildChannel(d.getAddress()));
             }
         }
-
-        // Group by effective instanceId.
         TreeMap<Integer, List<Endpoint>> byInstance = new TreeMap<>();
-        for (IndexingServiceInstanceDescriptor d : newInstances) {
+        for (IndexingServiceInstanceDescriptor d : instances) {
             int effective = d.effectiveInstanceId();
             ManagedChannel ch = newChannels.get(d.getAddress());
             byInstance.computeIfAbsent(effective, k -> new ArrayList<>())
@@ -308,17 +278,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         for (Map.Entry<Integer, List<Endpoint>> e : byInstance.entrySet()) {
             pools.add(new Pool(e.getKey(), e.getValue()));
         }
-
-        Set<String> removed = new LinkedHashSet<>(current.channels.keySet());
-        removed.removeAll(new HashSet<>(addresses));
-
-        this.snapshot = new ServerSnapshot(addresses, newChannels, pools);
-        serversReadyLatch.countDown();
-
-        LOGGER.log(Level.INFO, "Updated indexing service instances: {0} pools, {1} endpoints",
-                new Object[]{pools.size(), addresses.size()});
-
-        shutdownRemovedChannels(current, removed);
+        return new ServerSnapshot(newChannels, pools);
     }
 
     private void shutdownRemovedChannels(ServerSnapshot current, Set<String> removed) {
@@ -376,7 +336,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
 
         LOGGER.log(Level.FINE,
                 "client search: tablespace={0}, table={1}, index={2}, limit={3}, vectorDim={4}, pools={5}, endpoints={6}",
-                new Object[]{tablespace, table, index, limit, vector.length, s.pools.size(), s.servers.size()});
+                new Object[]{tablespace, table, index, limit, vector.length, s.pools.size(), s.channels.size()});
         long start = System.nanoTime();
 
         SearchRequest.Builder requestBuilder = SearchRequest.newBuilder()
@@ -546,7 +506,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     public RemoteVectorIndexService.IndexStatusInfo getIndexStatus(String tablespace, String table, String index) {
         ServerSnapshot s = this.snapshot;
 
-        if (s.servers.isEmpty()) {
+        if (s.channels.isEmpty()) {
             throw new RuntimeException("No indexing service instances available");
         }
 
@@ -592,7 +552,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     @Override
     public boolean waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber, long timeoutMs) throws InterruptedException {
         ServerSnapshot s = this.snapshot;
-        if (s.servers.isEmpty()) {
+        if (s.channels.isEmpty()) {
             LOGGER.log(Level.WARNING, "waitForCatchUp: no indexing service instances available");
             return false;
         }
@@ -645,7 +605,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     @Override
     public Optional<LogSequenceNumber> getMinProcessedLsn(String tablespace) {
         ServerSnapshot s = this.snapshot;
-        if (s.servers.isEmpty()) {
+        if (s.channels.isEmpty()) {
             return Optional.empty();
         }
         LogSequenceNumber min = null;
@@ -679,7 +639,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
     }
 
     public List<String> getServers() {
-        return snapshot.servers;
+        return new ArrayList<>(snapshot.channels.keySet());
     }
 
     @Override

@@ -155,8 +155,8 @@ public class ZKDiscoveryRemoteFileIndexingTest {
                                 engine.start();
 
                                 // Verify indexing service is registered in ZK
-                                List<String> indexingServices =
-                                        server.getMetadataStorageManager().listIndexingServices();
+                                List<herddb.metadata.IndexingServiceInstanceDescriptor> indexingServices =
+                                        server.getMetadataStorageManager().listIndexingServiceInstances();
                                 assertFalse("Indexing service should be discoverable via ZK",
                                         indexingServices.isEmpty());
 
@@ -168,8 +168,9 @@ public class ZKDiscoveryRemoteFileIndexingTest {
                                 server.getMetadataStorageManager().addServiceDiscoveryListener(
                                         new ServiceDiscoveryListener() {
                                             @Override
-                                            public void onIndexingServicesChanged(List<String> currentAddresses) {
-                                                client.updateServers(currentAddresses);
+                                            public void onIndexingServiceInstancesChanged(
+                                                    List<herddb.metadata.IndexingServiceInstanceDescriptor> currentInstances) {
+                                                client.updateInstances(currentInstances);
                                             }
 
                                             @Override
@@ -351,8 +352,8 @@ public class ZKDiscoveryRemoteFileIndexingTest {
                                 engine.start();
 
                                 // Wire indexing client to HerdDB server
-                                List<String> indexingServices =
-                                        server.getMetadataStorageManager().listIndexingServices();
+                                List<herddb.metadata.IndexingServiceInstanceDescriptor> indexingServices =
+                                        server.getMetadataStorageManager().listIndexingServiceInstances();
                                 assertFalse("Indexing service should be discoverable",
                                         indexingServices.isEmpty());
                                 IndexingServiceClient client = new IndexingServiceClient(indexingServices, 30);

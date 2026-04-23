@@ -84,8 +84,6 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
             indexingServiceCheckpointWatchers = new ConcurrentHashMap<>();
 
     // For re-registration after session expiry
-    private volatile String registeredIndexingServiceId;
-    private volatile String registeredIndexingServiceAddress;
     private volatile IndexingServiceInstanceDescriptor registeredIndexingServiceDescriptor;
     private volatile String registeredFileServerId;
     private volatile String registeredFileServerAddress;
@@ -106,9 +104,10 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
     private final Watcher indexingServicesWatcher = (WatchedEvent event) -> {
         if (event.getType() == Watcher.Event.EventType.NodeChildrenChanged) {
             try {
-                // listIndexingServiceInstances re-arms the watch and emits both the
-                // legacy address-only callback and the new descriptor callback.
-                listIndexingServiceInstances();
+                // The watcher fires on every child set change: re-list (which
+                // re-arms the watcher) AND push the fresh descriptor list to
+                // registered listeners.
+                notifyIndexingServiceInstancesChanged(listIndexingServiceInstances());
             } catch (MetadataStorageManagerException e) {
                 LOGGER.log(Level.WARNING, "Error refreshing indexing services list", e);
             }
@@ -167,19 +166,12 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
         this.zooKeeper = zk;
         LOGGER.info("Connected to ZK " + zk);
 
-        // Re-register services after session expiry. Prefer the descriptor-based
-        // registration when available (role/instanceId/shadowOf preserved).
+        // Re-register services after session expiry.
         if (registeredIndexingServiceDescriptor != null) {
             try {
                 registerIndexingServiceInstance(registeredIndexingServiceDescriptor);
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Failed to re-register indexing service instance after session expiry", e);
-            }
-        } else if (registeredIndexingServiceId != null) {
-            try {
-                registerIndexingService(registeredIndexingServiceId, registeredIndexingServiceAddress);
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "Failed to re-register indexing service after session expiry", e);
             }
         }
         if (registeredFileServerId != null) {
@@ -568,36 +560,18 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
                 ensureZooKeeper().delete(ledgersPath + "/" + child, -1);
             }
             {
-                // Delete children of indexing-services/instances (ephemeral, but
-                // also handles leftovers from prior sessions) and state (persistent).
-                try {
-                    List<String> instanceChildren =
-                            ensureZooKeeper().getChildren(indexingServicesInstancesPath, false);
-                    for (String child : instanceChildren) {
-                        ensureZooKeeper().delete(indexingServicesInstancesPath + "/" + child, -1);
-                    }
-                } catch (KeeperException.NoNodeException ok) {
-                    // path absent on legacy clusters — nothing to clean
+                // Delete children of indexing-services/instances (ephemeral)
+                // and state (persistent). The /instances and /state subnodes
+                // themselves are preserved — ensureRoot() re-creates them.
+                List<String> instanceChildren =
+                        ensureZooKeeper().getChildren(indexingServicesInstancesPath, false);
+                for (String child : instanceChildren) {
+                    ensureZooKeeper().delete(indexingServicesInstancesPath + "/" + child, -1);
                 }
-                try {
-                    List<String> stateChildren =
-                            ensureZooKeeper().getChildren(indexingServicesStatePath, false);
-                    for (String child : stateChildren) {
-                        ensureZooKeeper().delete(indexingServicesStatePath + "/" + child, -1);
-                    }
-                } catch (KeeperException.NoNodeException ok) {
-                    // path absent on legacy clusters — nothing to clean
-                }
-                // Finally, also delete any stray direct children under indexingServicesPath
-                // (legacy flat registrations or the "instances" / "state" subnodes
-                // themselves on a full wipe). We preserve the subnodes on a normal
-                // clear because ensureRoot() re-creates them.
-                List<String> indexingChildren = ensureZooKeeper().getChildren(indexingServicesPath, false);
-                for (String child : indexingChildren) {
-                    if ("instances".equals(child) || "state".equals(child)) {
-                        continue;
-                    }
-                    ensureZooKeeper().delete(indexingServicesPath + "/" + child, -1);
+                List<String> stateChildren =
+                        ensureZooKeeper().getChildren(indexingServicesStatePath, false);
+                for (String child : stateChildren) {
+                    ensureZooKeeper().delete(indexingServicesStatePath + "/" + child, -1);
                 }
             }
             {
@@ -641,29 +615,6 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
     }
 
     @Override
-    public void registerIndexingService(String serviceId, String address) throws MetadataStorageManagerException {
-        // Legacy shim: callers that only know the address register as a primary
-        // with instanceId=0. New code should use registerIndexingServiceInstance.
-        registerIndexingServiceInstance(
-                IndexingServiceInstanceDescriptor.primary(serviceId, address, 0));
-    }
-
-    @Override
-    public void unregisterIndexingService(String serviceId) throws MetadataStorageManagerException {
-        unregisterIndexingServiceInstance(serviceId);
-    }
-
-    @Override
-    public List<String> listIndexingServices() throws MetadataStorageManagerException {
-        List<IndexingServiceInstanceDescriptor> instances = listIndexingServiceInstances();
-        List<String> addresses = new ArrayList<>(instances.size());
-        for (IndexingServiceInstanceDescriptor d : instances) {
-            addresses.add(d.getAddress());
-        }
-        return addresses;
-    }
-
-    @Override
     public void registerIndexingServiceInstance(IndexingServiceInstanceDescriptor descriptor)
             throws MetadataStorageManagerException {
         try {
@@ -675,8 +626,6 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
                 ensureZooKeeper().setData(path, data, -1);
             }
             this.registeredIndexingServiceDescriptor = descriptor;
-            this.registeredIndexingServiceId = descriptor.getServiceId();
-            this.registeredIndexingServiceAddress = descriptor.getAddress();
             LOGGER.log(Level.INFO, "Registered indexing service instance: {0}", descriptor);
         } catch (KeeperException | InterruptedException | IOException err) {
             handleSessionExpiredError(err);
@@ -689,8 +638,6 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
         try {
             ensureZooKeeper().delete(indexingServicesInstancesPath + "/" + serviceId, -1);
             this.registeredIndexingServiceDescriptor = null;
-            this.registeredIndexingServiceId = null;
-            this.registeredIndexingServiceAddress = null;
             LOGGER.log(Level.INFO, "Unregistered indexing service instance: {0}", serviceId);
         } catch (KeeperException.NoNodeException ok) {
             // already gone
@@ -713,7 +660,6 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
                 return Collections.emptyList();
             }
             List<IndexingServiceInstanceDescriptor> result = new ArrayList<>(children.size());
-            List<String> addresses = new ArrayList<>(children.size());
             for (String child : children) {
                 try {
                     byte[] data = ensureZooKeeper().getData(
@@ -721,7 +667,6 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
                     IndexingServiceInstanceDescriptor descriptor =
                             IndexingServiceInstanceDescriptor.deserialize(data);
                     result.add(descriptor);
-                    addresses.add(descriptor.getAddress());
                 } catch (KeeperException.NoNodeException gone) {
                     // node disappeared between getChildren and getData — skip.
                 } catch (IOException parseErr) {
@@ -729,10 +674,6 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
                             "Failed to parse indexing-service instance descriptor for " + child, parseErr);
                 }
             }
-            // Fire both callbacks so legacy listeners (addresses only) and new
-            // listeners (full descriptors) are both informed.
-            notifyIndexingServicesChanged(addresses);
-            notifyIndexingServiceInstancesChanged(result);
             return result;
         } catch (KeeperException | InterruptedException | IOException err) {
             handleSessionExpiredError(err);

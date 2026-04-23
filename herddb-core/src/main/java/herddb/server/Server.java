@@ -440,11 +440,6 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                     metadataStorageManager.addServiceDiscoveryListener(
                             new herddb.metadata.ServiceDiscoveryListener() {
                                 @Override
-                                public void onIndexingServicesChanged(List<String> currentAddresses) {
-                                    // handled by ServerMain for IndexingServiceClient
-                                }
-
-                                @Override
                                 public void onFileServersChanged(List<String> currentAddresses) {
                                     LOGGER.log(Level.INFO, "Remote file servers changed via ZK: {0}",
                                             currentAddresses);
@@ -547,9 +542,6 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         if (useZKDiscovery) {
             metadataStorageManager.addServiceDiscoveryListener(
                     new herddb.metadata.ServiceDiscoveryListener() {
-                        @Override
-                        public void onIndexingServicesChanged(List<String> currentAddresses) {
-                        }
                         @Override
                         public void onFileServersChanged(List<String> currentAddresses) {
                             LOGGER.log(Level.INFO, "Remote file servers changed via ZK (shared-storage): {0}",

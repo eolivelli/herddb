@@ -24,6 +24,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.fail;
 import herddb.log.LogSequenceNumber;
+import herddb.metadata.IndexingServiceInstanceDescriptor;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
@@ -68,22 +69,27 @@ public class IndexingServiceClientDynamicTest {
         }
     }
 
+    private static IndexingServiceInstanceDescriptor primary(String address, int instanceId) {
+        return IndexingServiceInstanceDescriptor.primary(address, address, instanceId);
+    }
+
     @Test
     public void testDynamicServerUpdates() throws Exception {
         String addr1 = service1.getAddress();
         String addr2 = service2.getAddress();
 
         // Start with only server1
-        client = new IndexingServiceClient(Collections.singletonList(addr1));
+        client = new IndexingServiceClient(
+                Collections.singletonList(primary(addr1, 0)), 30);
         assertEquals(1, client.getServers().size());
         assertEquals(addr1, client.getServers().get(0));
 
         // Add server2
-        client.updateServers(Arrays.asList(addr1, addr2));
+        client.updateInstances(Arrays.asList(primary(addr1, 0), primary(addr2, 1)));
         assertEquals(2, client.getServers().size());
 
         // Remove server1, keep only server2
-        client.updateServers(Collections.singletonList(addr2));
+        client.updateInstances(Collections.singletonList(primary(addr2, 1)));
         assertEquals(1, client.getServers().size());
         assertEquals(addr2, client.getServers().get(0));
 
@@ -95,11 +101,12 @@ public class IndexingServiceClientDynamicTest {
     public void testUpdateServersEmptyListKeepsCurrent() throws Exception {
         String addr1 = service1.getAddress();
 
-        client = new IndexingServiceClient(Collections.singletonList(addr1));
+        client = new IndexingServiceClient(
+                Collections.singletonList(primary(addr1, 0)), 30);
         assertEquals(1, client.getServers().size());
 
         // Empty list should be ignored
-        client.updateServers(Collections.emptyList());
+        client.updateInstances(Collections.<IndexingServiceInstanceDescriptor>emptyList());
 
         // Server list should be unchanged
         assertEquals(1, client.getServers().size());
@@ -111,7 +118,7 @@ public class IndexingServiceClientDynamicTest {
 
     @Test
     public void testSearchThrowsWithEmptyServerList() {
-        client = new IndexingServiceClient(Collections.emptyList());
+        client = new IndexingServiceClient(Collections.<IndexingServiceInstanceDescriptor>emptyList(), 30);
 
         try {
             client.search("herd", "testtable", "testindex", new float[]{1.0f, 2.0f, 3.0f}, 10);
@@ -123,7 +130,7 @@ public class IndexingServiceClientDynamicTest {
 
     @Test
     public void testGetIndexStatusThrowsWithEmptyServerList() {
-        client = new IndexingServiceClient(Collections.emptyList());
+        client = new IndexingServiceClient(Collections.<IndexingServiceInstanceDescriptor>emptyList(), 30);
 
         try {
             client.getIndexStatus("herd", "testtable", "testindex");
@@ -135,7 +142,7 @@ public class IndexingServiceClientDynamicTest {
 
     @Test
     public void testWaitForCatchUpReturnsFalseWithEmptyServerList() throws Exception {
-        client = new IndexingServiceClient(Collections.emptyList());
+        client = new IndexingServiceClient(Collections.<IndexingServiceInstanceDescriptor>emptyList(), 30);
 
         boolean result = client.waitForCatchUp("herd", new LogSequenceNumber(1, 0), 5000);
         assertFalse("waitForCatchUp should return false when no servers are available", result);

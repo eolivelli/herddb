@@ -249,18 +249,19 @@ public class ServerMain implements AutoCloseable {
                     .collect(Collectors.toList());
             LOGGER.log(Level.INFO, "Configuring IndexingService client with static servers: {0}, timeout: {1}s",
                     new Object[]{serverList, timeout});
-            remoteVectorIndexService = new IndexingServiceClient(serverList, timeout);
+            remoteVectorIndexService = IndexingServiceClient.fromAddresses(serverList, timeout);
             server.getManager().setRemoteVectorIndexService(remoteVectorIndexService);
         } else {
             // Try ZK-based discovery
             try {
-                List<String> discovered = server.getMetadataStorageManager().listIndexingServices();
+                List<herddb.metadata.IndexingServiceInstanceDescriptor> discovered =
+                        server.getMetadataStorageManager().listIndexingServiceInstances();
                 if (!discovered.isEmpty()
                         || server.getMetadataStorageManager() instanceof herddb.cluster.ZookeeperMetadataStorageManager) {
                     long timeout = config.getLong(
                             ServerConfiguration.PROPERTY_INDEXING_SERVICE_TIMEOUT,
                             ServerConfiguration.PROPERTY_INDEXING_SERVICE_TIMEOUT_DEFAULT);
-                    LOGGER.log(Level.INFO, "Configuring IndexingService client with ZK discovery, initial servers: {0}",
+                    LOGGER.log(Level.INFO, "Configuring IndexingService client with ZK discovery, initial instances: {0}",
                             discovered);
                     IndexingServiceClient client = new IndexingServiceClient(discovered, timeout);
                     remoteVectorIndexService = client;
@@ -269,10 +270,11 @@ public class ServerMain implements AutoCloseable {
                     server.getMetadataStorageManager().addServiceDiscoveryListener(
                             new herddb.metadata.ServiceDiscoveryListener() {
                                 @Override
-                                public void onIndexingServicesChanged(List<String> currentAddresses) {
-                                    LOGGER.log(Level.INFO, "IndexingService servers changed via ZK: {0}",
-                                            currentAddresses);
-                                    client.updateServers(currentAddresses);
+                                public void onIndexingServiceInstancesChanged(
+                                        List<herddb.metadata.IndexingServiceInstanceDescriptor> currentInstances) {
+                                    LOGGER.log(Level.INFO, "IndexingService instances changed via ZK: {0}",
+                                            currentInstances);
+                                    client.updateInstances(currentInstances);
                                 }
 
                                 @Override
@@ -281,12 +283,13 @@ public class ServerMain implements AutoCloseable {
                                 }
                             });
                     // Re-query after listener registration to close the race window
-                    // between the initial listIndexingServices() (which sets a one-shot
-                    // ZK watcher) and addServiceDiscoveryListener().
+                    // between the initial listIndexingServiceInstances() (which
+                    // sets a one-shot ZK watcher) and addServiceDiscoveryListener().
                     try {
-                        List<String> currentServers = server.getMetadataStorageManager().listIndexingServices();
-                        if (!currentServers.isEmpty()) {
-                            client.updateServers(currentServers);
+                        List<herddb.metadata.IndexingServiceInstanceDescriptor> currentInstances =
+                                server.getMetadataStorageManager().listIndexingServiceInstances();
+                        if (!currentInstances.isEmpty()) {
+                            client.updateInstances(currentInstances);
                         }
                     } catch (Exception re) {
                         LOGGER.log(Level.WARNING,

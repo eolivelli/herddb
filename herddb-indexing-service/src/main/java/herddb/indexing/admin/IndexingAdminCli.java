@@ -186,21 +186,35 @@ public final class IndexingAdminCli {
         String zkPath = cli.getOptionValue("zk-path", "/herddb");
         int sessionTimeout = Integer.parseInt(cli.getOptionValue("zk-session-timeout-ms", "10000"));
 
-        List<String> instances = ZkInstanceDiscovery.listInstances(zk, zkPath, sessionTimeout);
+        List<IndexingServiceInstanceDescriptor> instances =
+                ZkInstanceDiscovery.listInstances(zk, zkPath, sessionTimeout);
 
         if (cli.hasOption("json")) {
+            List<Map<String, Object>> rows = new ArrayList<>();
+            for (IndexingServiceInstanceDescriptor d : instances) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("serviceId", d.getServiceId());
+                row.put("address", d.getAddress());
+                row.put("role", d.getRole());
+                row.put("instanceId", d.getInstanceId());
+                row.put("shadowOf", d.getShadowOf());
+                rows.add(row);
+            }
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("zookeeper", zk);
             payload.put("zk_path", zkPath);
-            payload.put("instances", instances);
+            payload.put("instances", rows);
             out.println(JsonWriter.toJson(payload));
         } else {
             if (instances.isEmpty()) {
                 out.println("(no indexing service instances registered at " + zkPath + ")");
             } else {
-                out.println("Registered indexing services (" + instances.size() + "):");
-                for (String inst : instances) {
-                    out.println("  " + inst);
+                out.printf(Locale.ROOT, "%-32s %-24s %-10s %-12s %-12s%n",
+                        "SERVICE_ID", "ADDRESS", "ROLE", "INSTANCE_ID", "SHADOW_OF");
+                for (IndexingServiceInstanceDescriptor d : instances) {
+                    out.printf(Locale.ROOT, "%-32s %-24s %-10s %-12d %-12d%n",
+                            d.getServiceId(), d.getAddress(), d.getRole(),
+                            d.getInstanceId(), d.getShadowOf());
                 }
             }
         }
@@ -608,7 +622,7 @@ public final class IndexingAdminCli {
         Integer filterOf = cli.hasOption("of") ? Integer.parseInt(cli.getOptionValue("of")) : null;
 
         List<IndexingServiceInstanceDescriptor> all =
-                ZkInstanceDiscovery.listInstanceDescriptors(zk, zkPath, sessionTimeout);
+                ZkInstanceDiscovery.listInstances(zk, zkPath, sessionTimeout);
         List<IndexingServiceInstanceDescriptor> shadows = new ArrayList<>();
         for (IndexingServiceInstanceDescriptor d : all) {
             if (!d.isShadow()) {

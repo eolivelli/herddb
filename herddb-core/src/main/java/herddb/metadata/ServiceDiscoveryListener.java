@@ -27,19 +27,10 @@ import java.util.List;
  */
 public interface ServiceDiscoveryListener {
     /**
-     * Legacy address-only callback. Kept for backwards compatibility; new
-     * listeners should override
-     * {@link #onIndexingServiceInstancesChanged(List)} instead, which also
-     * conveys role/instanceId/shadowOf metadata needed for shadow-aware
-     * query routing. Default implementation is a no-op so that listeners can
-     * implement only the richer callback.
-     */
-    default void onIndexingServicesChanged(List<String> currentAddresses) {
-    }
-
-    /**
      * Full indexing-service discovery callback. Fires whenever the set of
      * registered indexing-service instances (primaries + shadows) changes.
+     * Default is no-op so callers interested only in file-server discovery
+     * can skip it.
      */
     default void onIndexingServiceInstancesChanged(List<IndexingServiceInstanceDescriptor> currentInstances) {
     }

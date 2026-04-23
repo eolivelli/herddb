@@ -176,11 +176,6 @@ public class IndexingServer implements AutoCloseable {
                         metadataStorageManager.addServiceDiscoveryListener(
                                 new ServiceDiscoveryListener() {
                                     @Override
-                                    public void onIndexingServicesChanged(List<String> currentAddresses) {
-                                        // not relevant here
-                                    }
-
-                                    @Override
                                     public void onFileServersChanged(List<String> currentAddresses) {
                                         LOGGER.log(Level.INFO,
                                                 "Remote file servers for indexing changed via ZK: {0}",

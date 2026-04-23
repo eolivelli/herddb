@@ -88,7 +88,7 @@ public class IndexingServiceClientShadowPoolTest {
         FakeServer shadowServer = start(notReadyShadow);
         FakeServer primaryServer = start(primary);
 
-        client = new IndexingServiceClient(Arrays.asList(), 5);
+        client = IndexingServiceClient.fromAddresses(Arrays.asList(), 5);
         client.updateInstances(Arrays.asList(
                 IndexingServiceInstanceDescriptor.shadow("s0", shadowServer.address(), 0),
                 IndexingServiceInstanceDescriptor.primary("p0", primaryServer.address(), 0)
@@ -118,7 +118,7 @@ public class IndexingServiceClientShadowPoolTest {
                         .build());
         FakeServer srv = start(p);
 
-        client = new IndexingServiceClient(Arrays.asList(), 5);
+        client = IndexingServiceClient.fromAddresses(Arrays.asList(), 5);
         client.updateInstances(Arrays.asList(
                 IndexingServiceInstanceDescriptor.primary("p0", srv.address(), 0)
         ));
@@ -141,7 +141,7 @@ public class IndexingServiceClientShadowPoolTest {
         FakeServer f1 = start(s1);
         FakeServer f2 = start(s2);
 
-        client = new IndexingServiceClient(Arrays.asList(), 5);
+        client = IndexingServiceClient.fromAddresses(Arrays.asList(), 5);
         client.updateInstances(Arrays.asList(
                 IndexingServiceInstanceDescriptor.shadow("s0a", f1.address(), 0),
                 IndexingServiceInstanceDescriptor.shadow("s0b", f2.address(), 0)
@@ -174,7 +174,7 @@ public class IndexingServiceClientShadowPoolTest {
         FakeServer fp1 = start(p1);
         FakeServer fs1 = start(s1);
 
-        client = new IndexingServiceClient(Arrays.asList(), 5);
+        client = IndexingServiceClient.fromAddresses(Arrays.asList(), 5);
         client.updateInstances(Arrays.asList(
                 IndexingServiceInstanceDescriptor.primary("p0", fp0.address(), 0),
                 IndexingServiceInstanceDescriptor.shadow("s0", fs0.address(), 0),

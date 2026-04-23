@@ -132,7 +132,7 @@ public class MultiInstanceFileShardingTest {
             applyEntries(engines, table, index, numRecords);
 
             // Create a client that fans out to all instances
-            try (IndexingServiceClient client = new IndexingServiceClient(addresses)) {
+            try (IndexingServiceClient client = IndexingServiceClient.fromAddresses(addresses, 30)) {
                 // Search with a high limit to get all records
                 float[] queryVec = new float[]{1.0f, 2.0f, 3.0f};
                 List<Map.Entry<Bytes, Float>> results = client.search(
@@ -215,7 +215,7 @@ public class MultiInstanceFileShardingTest {
 
             applyEntries(engines, table, index, numRecords);
 
-            try (IndexingServiceClient client = new IndexingServiceClient(addresses)) {
+            try (IndexingServiceClient client = IndexingServiceClient.fromAddresses(addresses, 30)) {
                 // Verify all records are found via fan-out search
                 float[] queryVec = new float[]{1.0f, 2.0f, 3.0f};
                 List<Map.Entry<Bytes, Float>> results = client.search(

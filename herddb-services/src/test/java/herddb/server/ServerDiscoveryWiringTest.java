@@ -23,6 +23,7 @@ package herddb.server;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import herddb.cluster.ZookeeperMetadataStorageManager;
+import herddb.metadata.IndexingServiceInstanceDescriptor;
 import herddb.metadata.ServiceDiscoveryListener;
 import herddb.utils.ZKTestEnv;
 import java.util.List;
@@ -61,16 +62,17 @@ public class ServerDiscoveryWiringTest {
             manager.start();
 
             // Register an indexing service
-            manager.registerIndexingService("svc1", "localhost:9850");
+            manager.registerIndexingServiceInstance(
+                    IndexingServiceInstanceDescriptor.primary("svc1", "localhost:9850", 0));
 
             // Verify discovery
-            List<String> services = manager.listIndexingServices();
+            List<IndexingServiceInstanceDescriptor> services = manager.listIndexingServiceInstances();
             assertEquals(1, services.size());
-            assertEquals("localhost:9850", services.get(0));
+            assertEquals("localhost:9850", services.get(0).getAddress());
 
             // Unregister
-            manager.unregisterIndexingService("svc1");
-            assertTrue(manager.listIndexingServices().isEmpty());
+            manager.unregisterIndexingServiceInstance("svc1");
+            assertTrue(manager.listIndexingServiceInstances().isEmpty());
         }
     }
 
@@ -98,12 +100,13 @@ public class ServerDiscoveryWiringTest {
             manager.start();
 
             CountDownLatch latch = new CountDownLatch(1);
-            List<String> receivedAddresses = new CopyOnWriteArrayList<>();
+            List<IndexingServiceInstanceDescriptor> received = new CopyOnWriteArrayList<>();
 
             manager.addServiceDiscoveryListener(new ServiceDiscoveryListener() {
                 @Override
-                public void onIndexingServicesChanged(List<String> currentAddresses) {
-                    receivedAddresses.addAll(currentAddresses);
+                public void onIndexingServiceInstancesChanged(
+                        List<IndexingServiceInstanceDescriptor> current) {
+                    received.addAll(current);
                     latch.countDown();
                 }
 
@@ -113,13 +116,14 @@ public class ServerDiscoveryWiringTest {
             });
 
             // Install the watch by listing first
-            manager.listIndexingServices();
+            manager.listIndexingServiceInstances();
 
             // Register — this triggers the watcher
-            manager.registerIndexingService("svc1", "localhost:9850");
+            manager.registerIndexingServiceInstance(
+                    IndexingServiceInstanceDescriptor.primary("svc1", "localhost:9850", 0));
 
             assertTrue("Listener should be notified within 10s", latch.await(10, TimeUnit.SECONDS));
-            assertTrue(receivedAddresses.contains("localhost:9850"));
+            assertTrue(received.stream().anyMatch(d -> "localhost:9850".equals(d.getAddress())));
         }
     }
 }
