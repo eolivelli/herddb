@@ -29,6 +29,7 @@ import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
 import herddb.utils.Bytes;
+import herddb.utils.VectorSearchRequestContext;
 import herddb.utils.VisibleByteArrayOutputStream;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
@@ -69,11 +70,16 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinWorkerThread;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -315,6 +321,28 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /** Prevents concurrent three-phase checkpoints from interleaving and losing data. */
     private final ReentrantLock checkpointLock = new ReentrantLock();
+
+    // -------------------------------------------------------------------------
+    // Parallel search (issue #245)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Degree of intra-query parallelism for {@link #searchInternal}. When
+     * {@code >= 2}, each on-disk segment and each in-memory shard is searched
+     * on a worker thread from {@link #searchExecutor}; results are merged on
+     * the calling thread. When {@code <= 1}, the entire search runs on the
+     * caller (preserves the original serial behaviour).
+     */
+    private final int searchParallelism;
+
+    /**
+     * Pool used to fan out segment/shard searches. {@code null} iff
+     * {@link #searchParallelism} {@code <= 1}.
+     */
+    private final ExecutorService searchExecutor;
+
+    /** Monotonically increasing counter for naming search worker threads. */
+    private static final AtomicInteger SEARCH_WORKER_SEQ = new AtomicInteger();
 
     // -------------------------------------------------------------------------
     // Background compaction thread
@@ -690,6 +718,34 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                  VectorMemoryBudget memoryBudget,
                                  long maxLiveBytesPerCheckpoint,
                                  long segmentPageCacheMaxBytes) {
+        this(indexName, tableName, tableSpaceUUID, vectorColumnName, indexUUID, tmpDirectory,
+                dataStorageManager, memoryManager, m, beamWidth, neighborOverflow, alpha,
+                fusedPQ, maxSegmentSize, maxLiveGraphSize, compactionIntervalMs,
+                similarityFunction, maxVectorMemoryBytes, memoryBudget,
+                maxLiveBytesPerCheckpoint, segmentPageCacheMaxBytes, 1);
+    }
+
+    /**
+     * Constructor that additionally accepts a degree of intra-query parallelism
+     * for vector search (issue #245). When {@code searchParallelism >= 2}, the
+     * store owns a fixed-size executor that fans out segment and shard
+     * searches across worker threads; the executor is shut down in
+     * {@link #close()}. Values {@code <= 1} keep the original serial
+     * behaviour and do not allocate any pool.
+     */
+    public PersistentVectorStore(String indexName, String tableName, String tableSpaceUUID,
+                                 String vectorColumnName, String indexUUID, Path tmpDirectory,
+                                 DataStorageManager dataStorageManager,
+                                 MemoryManager memoryManager,
+                                 int m, int beamWidth, float neighborOverflow, float alpha,
+                                 boolean fusedPQ, long maxSegmentSize, int maxLiveGraphSize,
+                                 long compactionIntervalMs,
+                                 VectorSimilarityFunction similarityFunction,
+                                 long maxVectorMemoryBytes,
+                                 VectorMemoryBudget memoryBudget,
+                                 long maxLiveBytesPerCheckpoint,
+                                 long segmentPageCacheMaxBytes,
+                                 int searchParallelism) {
         super(vectorColumnName);
         this.indexName = indexName;
         this.tableName = tableName;
@@ -717,6 +773,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // constructor still validates the value for backward compatibility.
         if (segmentPageCacheMaxBytes < 0) {
             throw new IllegalArgumentException("segmentPageCacheMaxBytes must be >= 0");
+        }
+        this.searchParallelism = Math.max(1, searchParallelism);
+        if (this.searchParallelism >= 2) {
+            final int parallelism = this.searchParallelism;
+            final String idx = indexName;
+            this.searchExecutor = Executors.newFixedThreadPool(parallelism, r -> {
+                Thread t = new Thread(r, "vector-search-" + idx + "-"
+                        + SEARCH_WORKER_SEQ.incrementAndGet());
+                t.setDaemon(true);
+                return t;
+            });
+        } else {
+            this.searchExecutor = null;
         }
     }
 
@@ -1125,6 +1194,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
         segments = new java.util.concurrent.CopyOnWriteArrayList<>();
 
+        if (searchExecutor != null) {
+            searchExecutor.shutdown();
+            try {
+                if (!searchExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                    searchExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                searchExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+
         LOGGER.log(Level.INFO, "PersistentVectorStore {0} closed", indexName);
     }
 
@@ -1293,86 +1374,173 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     private List<Map.Entry<Bytes, Float>> searchInternal(VectorFloat<?> qv, int topK) {
-        List<Map.Entry<Bytes, Float>> results = new ArrayList<>();
-
         // Overquery each source to improve recall when merging across segments.
         // Each source returns more candidates; the final merge picks the true topK.
-        int perSourceK = topK * VectorSegment.OVERQUERY_FACTOR;
+        final int perSourceK = topK * VectorSegment.OVERQUERY_FACTOR;
 
-        // Search all on-disk segments
-        List<VectorSegment> currentSegments = this.segments;
-        for (VectorSegment seg : currentSegments) {
-            seg.search(qv, perSourceK, similarityFunction, results);
+        // Capture the request-scoped context (if any) so worker threads can
+        // attribute their readFileRange events back to the originating request.
+        final VectorSearchRequestContext ctx = VectorSearchRequestContext.current();
+
+        List<Callable<List<Map.Entry<Bytes, Float>>>> tasks = new ArrayList<>();
+
+        // Phase 1: on-disk segments.
+        final List<VectorSegment> currentSegments = this.segments;
+        for (final VectorSegment seg : currentSegments) {
+            tasks.add(wrapInContext(ctx, () -> {
+                List<Map.Entry<Bytes, Float>> local = new ArrayList<>(perSourceK);
+                seg.search(qv, perSourceK, similarityFunction, local);
+                return local;
+            }));
         }
 
-        // Search all live in-memory shards
-        for (LiveGraphShard shard : liveShards) {
+        // Phase 2: live in-memory shards (no pending-deletes filtering).
+        for (final LiveGraphShard shard : liveShards) {
             if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
-                int k = Math.min(perSourceK, shard.nodeToPk.size());
-                ImmutableGraphIndex graph = shard.builder.getGraph();
-                SearchResult result = GraphSearcher.search(
-                        qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
-                for (SearchResult.NodeScore ns : result.getNodes()) {
-                    Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
-                    if (pk != null) {
-                        results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
-                    }
-                }
+                tasks.add(wrapInContext(ctx, () -> searchLiveShard(shard, qv, perSourceK, null)));
             }
         }
 
-        // Search frozen shards (during Phase B of checkpoint) and deferred shards.
-        // Both are cleaned up by Phase C under the write lock, so we must hold the read lock
-        // to prevent concurrent vectorStorage.remove() (called in Phase C) from clearing vectors
-        // while GraphSearcher accesses them via shard.mravv. Without this lock, there is a race
-        // where vectorStorage.remove() nulls a vector slot while jvector's scorer is calling
-        // getVector() on it, leading to NullPointerException (issue #129).
+        List<List<Map.Entry<Bytes, Float>>> partials;
+
+        // Phase 3: frozen + deferred shards. Both are cleaned up by Phase C
+        // under the write lock, so we must hold the read lock to prevent
+        // concurrent vectorStorage.remove() (called in Phase C) from clearing
+        // vectors while GraphSearcher accesses them via shard.mravv. Without
+        // this lock, there is a race where vectorStorage.remove() nulls a
+        // vector slot while jvector's scorer is calling getVector() on it,
+        // leading to NullPointerException (issue #129). The lock is held
+        // while invokeSearchTasks blocks on task completion: worker threads
+        // can join as additional readers because ReentrantReadWriteLock
+        // allows multiple concurrent read holders.
         stateLock.readLock().lock();
         try {
+            final Set<Bytes> pending = pendingCheckpointDeletes;
             List<LiveGraphShard> frozen = frozenShards;
             if (frozen != null) {
-                Set<Bytes> pending = pendingCheckpointDeletes;
-                for (LiveGraphShard shard : frozen) {
+                for (final LiveGraphShard shard : frozen) {
                     if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
-                        int k = Math.min(perSourceK, shard.nodeToPk.size());
-                        ImmutableGraphIndex graph = shard.builder.getGraph();
-                        SearchResult result = GraphSearcher.search(
-                                qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
-                        for (SearchResult.NodeScore ns : result.getNodes()) {
-                            Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
-                            if (pk != null && (pending == null || !pending.contains(pk))) {
-                                results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
-                            }
-                        }
+                        tasks.add(wrapInContext(ctx,
+                                () -> searchLiveShard(shard, qv, perSourceK, pending)));
+                    }
+                }
+            }
+            List<LiveGraphShard> deferred = deferredShards;
+            if (deferred != null) {
+                for (final LiveGraphShard shard : deferred) {
+                    if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
+                        tasks.add(wrapInContext(ctx,
+                                () -> searchLiveShard(shard, qv, perSourceK, pending)));
                     }
                 }
             }
 
-            List<LiveGraphShard> deferred = deferredShards;
-            if (deferred != null) {
-                Set<Bytes> pending = pendingCheckpointDeletes;
-                for (LiveGraphShard shard : deferred) {
-                    if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
-                        int k = Math.min(perSourceK, shard.nodeToPk.size());
-                        ImmutableGraphIndex graph = shard.builder.getGraph();
-                        SearchResult result = GraphSearcher.search(
-                                qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
-                        for (SearchResult.NodeScore ns : result.getNodes()) {
-                            Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
-                            if (pk != null && (pending == null || !pending.contains(pk))) {
-                                results.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
-                            }
-                        }
-                    }
-                }
-            }
+            partials = invokeSearchTasks(tasks);
         } finally {
             stateLock.readLock().unlock();
         }
 
-        // Merge and sort by score descending, take top-K
-        results.sort((a, b) -> Float.compare(b.getValue(), a.getValue()));
-        return results.size() <= topK ? results : results.subList(0, topK);
+        // Serial merge (intentional — see issue #245). Sort all partial
+        // results by score descending and take top-K.
+        List<Map.Entry<Bytes, Float>> merged = new ArrayList<>();
+        for (List<Map.Entry<Bytes, Float>> p : partials) {
+            merged.addAll(p);
+        }
+        merged.sort((a, b) -> Float.compare(b.getValue(), a.getValue()));
+        return merged.size() <= topK ? merged : merged.subList(0, topK);
+    }
+
+    /**
+     * Searches a single live graph shard and returns its partial results.
+     * Shared by the live, frozen, and deferred phases of
+     * {@link #searchInternal}; {@code pendingDeletes} is {@code null} for the
+     * live-shard phase and the store's pending-deletes set when scanning
+     * frozen/deferred shards during a checkpoint.
+     */
+    private List<Map.Entry<Bytes, Float>> searchLiveShard(LiveGraphShard shard, VectorFloat<?> qv,
+                                                          int perSourceK, Set<Bytes> pendingDeletes) {
+        int k = Math.min(perSourceK, shard.nodeToPk.size());
+        ImmutableGraphIndex graph = shard.builder.getGraph();
+        SearchResult result = GraphSearcher.search(
+                qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
+        List<Map.Entry<Bytes, Float>> out = new ArrayList<>(result.getNodes().length);
+        for (SearchResult.NodeScore ns : result.getNodes()) {
+            Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
+            if (pk != null && (pendingDeletes == null || !pendingDeletes.contains(pk))) {
+                out.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Wraps a search task so it binds the initiator's
+     * {@link VectorSearchRequestContext} on the worker thread for the
+     * duration of one call, then clears it. Null-safe when no context is
+     * active on the calling thread.
+     */
+    private Callable<List<Map.Entry<Bytes, Float>>> wrapInContext(
+            VectorSearchRequestContext ctx,
+            Callable<List<Map.Entry<Bytes, Float>>> inner) {
+        if (ctx == null) {
+            return inner;
+        }
+        return () -> {
+            VectorSearchRequestContext.bind(ctx);
+            try {
+                return inner.call();
+            } finally {
+                VectorSearchRequestContext.end();
+            }
+        };
+    }
+
+    /**
+     * Runs all search tasks, returning their results in the order they were
+     * submitted. Runs inline on the caller thread when no executor is
+     * configured, when only one task was produced, or when running on a
+     * worker thread that would otherwise try to reenter its own pool. Any
+     * checked/unchecked exception from a task is surfaced as a
+     * {@link RuntimeException} — matching the existing serial behaviour
+     * where segment search errors bubble up as runtime exceptions.
+     */
+    private List<List<Map.Entry<Bytes, Float>>> invokeSearchTasks(
+            List<Callable<List<Map.Entry<Bytes, Float>>>> tasks) {
+        List<List<Map.Entry<Bytes, Float>>> out = new ArrayList<>(tasks.size());
+        if (searchExecutor == null || tasks.size() <= 1) {
+            for (Callable<List<Map.Entry<Bytes, Float>>> task : tasks) {
+                try {
+                    out.add(task.call());
+                } catch (RuntimeException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new RuntimeException("vector search task failed", e);
+                }
+            }
+            return out;
+        }
+        List<Future<List<Map.Entry<Bytes, Float>>>> futures;
+        try {
+            futures = searchExecutor.invokeAll(tasks);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("vector search interrupted", e);
+        }
+        for (Future<List<Map.Entry<Bytes, Float>>> f : futures) {
+            try {
+                out.add(f.get());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("vector search interrupted", e);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException) {
+                    throw (RuntimeException) cause;
+                }
+                throw new RuntimeException("vector search task failed", cause);
+            }
+        }
+        return out;
     }
 
     // -------------------------------------------------------------------------

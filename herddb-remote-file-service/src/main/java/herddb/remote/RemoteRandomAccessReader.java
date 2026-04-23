@@ -20,6 +20,7 @@
 
 package herddb.remote;
 
+import herddb.utils.VectorSearchRequestContext;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.netty.buffer.ByteBuf;

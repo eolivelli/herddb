@@ -25,6 +25,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
+import herddb.utils.VectorSearchRequestContext;
 import org.junit.After;
 import org.junit.Test;
 

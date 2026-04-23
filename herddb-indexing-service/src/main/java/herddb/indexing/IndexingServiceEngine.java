@@ -429,17 +429,25 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final long vectorMemLimit = maxVectorMemoryBytes;
             final VectorMemoryBudget budget = this;
             final long finalSegmentPageCacheMaxBytes = segmentPageCacheMaxBytes;
+            int configuredSearchParallelism = config.getInt(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_SEARCH_PARALLELISM,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_SEARCH_PARALLELISM_DEFAULT);
+            final int resolvedSearchParallelism = configuredSearchParallelism > 0
+                    ? configuredSearchParallelism
+                    : Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
+            LOGGER.log(Level.INFO, "vector search parallelism: {0}", resolvedSearchParallelism);
             vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir, indexProperties) -> {
                 var similarityFunction = PersistentVectorStore.parseSimilarityFunction(
                         indexProperties != null ? indexProperties.get(VectorIndexManager.PROP_SIMILARITY) : null);
+                String autoIndexUUID = indexName + "_" + tableName + "_" + System.nanoTime();
                 PersistentVectorStore store = new PersistentVectorStore(
                         indexName, tableName, tableSpaceUUID, vectorColumnName,
-                        tmpDir, dsm, mm,
+                        autoIndexUUID, tmpDir, dsm, mm,
                         m, beamWidth, neighborOverflow, alpha,
                         fusedPQ, maxSegmentSize, maxLiveGraphSize,
                         compactionInterval,
                         similarityFunction, vectorMemLimit, budget, maxLiveBytesPerCheckpoint,
-                        finalSegmentPageCacheMaxBytes);
+                        finalSegmentPageCacheMaxBytes, resolvedSearchParallelism);
                 try {
                     store.start();
                 } catch (Exception e) {
