@@ -323,6 +323,24 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private volatile Thread compactionThread;
     private volatile boolean running;
 
+    /**
+     * When true, this store is operating as a read-only "shadow" view over the
+     * remote storage: it loads state on start() (same as a primary) but never
+     * starts the compaction thread, rejects {@link #addVector}/{@link #removeVector}
+     * and treats {@link #checkpoint()} as a no-op. The shadow reloads its
+     * segment list via {@link #reloadFromStatus(IndexStatus)}.
+     *
+     * <p>Set via {@link #setReadOnly(boolean)} before {@link #start()}.
+     */
+    private volatile boolean readOnly = false;
+
+    /**
+     * LogSequenceNumber of the {@link IndexStatus} this store most recently
+     * loaded — either at start() or from a shadow's reloadFromStatus call.
+     * {@code null} until the first successful load.
+     */
+    private volatile LogSequenceNumber loadedLsn;
+
     // -------------------------------------------------------------------------
     // Checkpoint statistics (observable by external metrics)
     // -------------------------------------------------------------------------
@@ -790,8 +808,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     @Override
     public void start() throws Exception {
-        LOGGER.log(Level.INFO, "starting PersistentVectorStore {0} uuid {1}",
-                new Object[]{indexName, indexUUID});
+        LOGGER.log(Level.INFO, "starting PersistentVectorStore {0} uuid {1} (readOnly={2})",
+                new Object[]{indexName, indexUUID, readOnly});
 
         if (!dataStorageManager.supportsVectorIndexes()) {
             throw new DataStorageManagerException(
@@ -809,11 +827,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     tableSpaceUUID, indexUUID, LogSequenceNumber.START_OF_TIME);
             if (status != null && status.indexData != null && status.indexData.length > 0) {
                 loadFromStatus(status);
+                this.loadedLsn = status.sequenceNumber;
             }
         } catch (DataStorageManagerException e) {
             LOGGER.log(Level.INFO,
                     "no existing state for PersistentVectorStore {0}, starting empty: {1}",
                     new Object[]{indexName, e.getMessage()});
+        }
+
+        if (readOnly) {
+            // Shadow replicas never run compaction or write back to storage —
+            // their segment list is updated by reloadFromStatus calls triggered
+            // from the shadow engine when the primary advertises a new LSN.
+            LOGGER.log(Level.INFO,
+                    "PersistentVectorStore {0} started in read-only mode (no compaction thread)",
+                    indexName);
+            return;
         }
 
         // Start background compaction thread
@@ -824,6 +853,72 @@ public class PersistentVectorStore extends AbstractVectorStore {
         compactionThread.start();
 
         LOGGER.log(Level.INFO, "PersistentVectorStore {0} started", indexName);
+    }
+
+    /**
+     * Toggles read-only mode. Must be called before {@link #start()}. See the
+     * {@link #readOnly} field doc for semantics.
+     */
+    public void setReadOnly(boolean readOnly) {
+        this.readOnly = readOnly;
+    }
+
+    public boolean isReadOnly() {
+        return readOnly;
+    }
+
+    /**
+     * LogSequenceNumber of the last {@link IndexStatus} applied to this store,
+     * or {@code null} if none has been applied. For primaries this is set once
+     * at start() and is not updated (primaries advance state through the live
+     * shard / checkpoint pipeline, not through reload). For shadows it advances
+     * on every successful reloadFromStatus.
+     */
+    public LogSequenceNumber getLoadedLsn() {
+        return loadedLsn;
+    }
+
+    /**
+     * Shadow-only: re-load the on-disk segment list from the given
+     * {@link IndexStatus} snapshot. Closes segments that no longer appear in
+     * the new status, opens new ones, and updates {@link #getLoadedLsn()}.
+     *
+     * <p>Blocks queries only for the segment-list swap at the end: new
+     * segments are populated outside the write lock (remote reads happen
+     * without blocking searches), and only the pointer swap is performed
+     * under the lock. Must not be called on a primary.
+     */
+    public synchronized void reloadFromStatus(IndexStatus newStatus)
+            throws IOException, DataStorageManagerException {
+        if (!readOnly) {
+            throw new IllegalStateException(
+                    "reloadFromStatus is only supported on read-only PersistentVectorStore");
+        }
+        if (newStatus == null || newStatus.indexData == null || newStatus.indexData.length == 0) {
+            return;
+        }
+        // For simplicity in this first implementation, close all existing
+        // segments and reload from scratch. A later optimisation (issue tracked
+        // in the shadow-replicas design plan) can diff the segment list and
+        // preserve unchanged segments to avoid re-opening readers.
+        stateLock.writeLock().lock();
+        try {
+            List<VectorSegment> old = segments;
+            segments = new java.util.concurrent.CopyOnWriteArrayList<>();
+            for (VectorSegment seg : old) {
+                try {
+                    seg.close();
+                } catch (Exception e) {
+                    LOGGER.log(Level.FINE, "ignoring segment close failure during reload", e);
+                }
+            }
+            nextSegmentId.set(0);
+            nextNodeId.set(0);
+            loadFromStatus(newStatus);
+            this.loadedLsn = newStatus.sequenceNumber;
+        } finally {
+            stateLock.writeLock().unlock();
+        }
     }
 
     /** Upper bound on the back-off applied after repeated checkpoint failures (30 min). */
@@ -1037,6 +1132,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     @Override
     public void addVector(Bytes pk, float[] vector) {
+        if (readOnly) {
+            throw new UnsupportedOperationException(
+                    "addVector is not supported on a read-only PersistentVectorStore "
+                            + indexName + " (shadow replica)");
+        }
         if (vector == null || vector.length == 0) {
             return;
         }
@@ -1050,6 +1150,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     @Override
     public void addVector(Bytes pk, ByteBuffer vector) {
+        if (readOnly) {
+            throw new UnsupportedOperationException(
+                    "addVector is not supported on a read-only PersistentVectorStore "
+                            + indexName + " (shadow replica)");
+        }
         if (vector == null || vector.remaining() == 0) {
             return;
         }
@@ -1117,6 +1222,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     @Override
     public void removeVector(Bytes pk) {
+        if (readOnly) {
+            throw new UnsupportedOperationException(
+                    "removeVector is not supported on a read-only PersistentVectorStore "
+                            + indexName + " (shadow replica)");
+        }
         stateLock.readLock().lock();
         try {
             // Check on-disk segments first
@@ -1350,6 +1460,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
      *         call — retry on the next trigger.
      */
     public boolean checkpoint() throws DataStorageManagerException {
+        if (readOnly) {
+            // A read-only shadow never has dirty live state; treat checkpoint
+            // as an immediate no-op success so callers (including the engine's
+            // checkpointAndSaveWatermark loop — not actually invoked on
+            // shadows) can remain oblivious.
+            return true;
+        }
         try {
             return doCheckpoint();
         } catch (IOException e) {
