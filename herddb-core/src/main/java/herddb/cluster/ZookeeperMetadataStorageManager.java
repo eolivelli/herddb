@@ -22,6 +22,8 @@ package herddb.cluster;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import herddb.log.LogNotAvailableException;
 import herddb.log.LogSequenceNumber;
+import herddb.metadata.IndexingServiceCheckpointState;
+import herddb.metadata.IndexingServiceInstanceDescriptor;
 import herddb.metadata.MetadataStorageManager;
 import herddb.metadata.MetadataStorageManagerException;
 import herddb.model.DDLException;
@@ -68,6 +70,8 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
     private final String tableSpacesReplicasPath;
     private final String nodesPath;
     private final String indexingServicesPath;
+    private final String indexingServicesInstancesPath;
+    private final String indexingServicesStatePath;
     private final String fileServersPath;
     private final String checkpointsPath;
     private volatile boolean started;
@@ -75,9 +79,14 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
     // Checkpoint LSN watchers for shared-storage read replicas
     private final ConcurrentHashMap<String, Consumer<LogSequenceNumber>> checkpointWatchers = new ConcurrentHashMap<>();
 
+    // Watchers for indexing-service per-primary checkpoint-state znodes, keyed by instanceId.
+    private final ConcurrentHashMap<Integer, Consumer<IndexingServiceCheckpointState>>
+            indexingServiceCheckpointWatchers = new ConcurrentHashMap<>();
+
     // For re-registration after session expiry
     private volatile String registeredIndexingServiceId;
     private volatile String registeredIndexingServiceAddress;
+    private volatile IndexingServiceInstanceDescriptor registeredIndexingServiceDescriptor;
     private volatile String registeredFileServerId;
     private volatile String registeredFileServerAddress;
 
@@ -97,8 +106,9 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
     private final Watcher indexingServicesWatcher = (WatchedEvent event) -> {
         if (event.getType() == Watcher.Event.EventType.NodeChildrenChanged) {
             try {
-                List<String> addresses = listIndexingServices();
-                notifyIndexingServicesChanged(addresses);
+                // listIndexingServiceInstances re-arms the watch and emits both the
+                // legacy address-only callback and the new descriptor callback.
+                listIndexingServiceInstances();
             } catch (MetadataStorageManagerException e) {
                 LOGGER.log(Level.WARNING, "Error refreshing indexing services list", e);
             }
@@ -157,8 +167,15 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
         this.zooKeeper = zk;
         LOGGER.info("Connected to ZK " + zk);
 
-        // Re-register services after session expiry
-        if (registeredIndexingServiceId != null) {
+        // Re-register services after session expiry. Prefer the descriptor-based
+        // registration when available (role/instanceId/shadowOf preserved).
+        if (registeredIndexingServiceDescriptor != null) {
+            try {
+                registerIndexingServiceInstance(registeredIndexingServiceDescriptor);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Failed to re-register indexing service instance after session expiry", e);
+            }
+        } else if (registeredIndexingServiceId != null) {
             try {
                 registerIndexingService(registeredIndexingServiceId, registeredIndexingServiceAddress);
             } catch (Exception e) {
@@ -194,6 +211,8 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
         this.tableSpacesReplicasPath = basePath + "/replicas";  // replicas/TABLESPACEUUID
         this.nodesPath = basePath + "/nodes";
         this.indexingServicesPath = basePath + "/indexingServices";
+        this.indexingServicesInstancesPath = indexingServicesPath + "/instances";
+        this.indexingServicesStatePath = indexingServicesPath + "/state";
         this.fileServersPath = basePath + "/fileServers";
         this.checkpointsPath = basePath + "/checkpoints"; // checkpoints/TABLESPACEUUID
     }
@@ -243,6 +262,14 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
         }
         try {
             zooKeeper.create(indexingServicesPath, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        } catch (KeeperException.NodeExistsException ok) {
+        }
+        try {
+            zooKeeper.create(indexingServicesInstancesPath, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        } catch (KeeperException.NodeExistsException ok) {
+        }
+        try {
+            zooKeeper.create(indexingServicesStatePath, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
         } catch (KeeperException.NodeExistsException ok) {
         }
         try {
@@ -541,8 +568,35 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
                 ensureZooKeeper().delete(ledgersPath + "/" + child, -1);
             }
             {
+                // Delete children of indexing-services/instances (ephemeral, but
+                // also handles leftovers from prior sessions) and state (persistent).
+                try {
+                    List<String> instanceChildren =
+                            ensureZooKeeper().getChildren(indexingServicesInstancesPath, false);
+                    for (String child : instanceChildren) {
+                        ensureZooKeeper().delete(indexingServicesInstancesPath + "/" + child, -1);
+                    }
+                } catch (KeeperException.NoNodeException ok) {
+                    // path absent on legacy clusters — nothing to clean
+                }
+                try {
+                    List<String> stateChildren =
+                            ensureZooKeeper().getChildren(indexingServicesStatePath, false);
+                    for (String child : stateChildren) {
+                        ensureZooKeeper().delete(indexingServicesStatePath + "/" + child, -1);
+                    }
+                } catch (KeeperException.NoNodeException ok) {
+                    // path absent on legacy clusters — nothing to clean
+                }
+                // Finally, also delete any stray direct children under indexingServicesPath
+                // (legacy flat registrations or the "instances" / "state" subnodes
+                // themselves on a full wipe). We preserve the subnodes on a normal
+                // clear because ensureRoot() re-creates them.
                 List<String> indexingChildren = ensureZooKeeper().getChildren(indexingServicesPath, false);
                 for (String child : indexingChildren) {
+                    if ("instances".equals(child) || "state".equals(child)) {
+                        continue;
+                    }
                     ensureZooKeeper().delete(indexingServicesPath + "/" + child, -1);
                 }
             }
@@ -588,17 +642,42 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
 
     @Override
     public void registerIndexingService(String serviceId, String address) throws MetadataStorageManagerException {
+        // Legacy shim: callers that only know the address register as a primary
+        // with instanceId=0. New code should use registerIndexingServiceInstance.
+        registerIndexingServiceInstance(
+                IndexingServiceInstanceDescriptor.primary(serviceId, address, 0));
+    }
+
+    @Override
+    public void unregisterIndexingService(String serviceId) throws MetadataStorageManagerException {
+        unregisterIndexingServiceInstance(serviceId);
+    }
+
+    @Override
+    public List<String> listIndexingServices() throws MetadataStorageManagerException {
+        List<IndexingServiceInstanceDescriptor> instances = listIndexingServiceInstances();
+        List<String> addresses = new ArrayList<>(instances.size());
+        for (IndexingServiceInstanceDescriptor d : instances) {
+            addresses.add(d.getAddress());
+        }
+        return addresses;
+    }
+
+    @Override
+    public void registerIndexingServiceInstance(IndexingServiceInstanceDescriptor descriptor)
+            throws MetadataStorageManagerException {
         try {
-            String path = indexingServicesPath + "/" + serviceId;
-            byte[] data = address.getBytes(StandardCharsets.UTF_8);
+            String path = indexingServicesInstancesPath + "/" + descriptor.getServiceId();
+            byte[] data = descriptor.serialize();
             try {
                 ensureZooKeeper().create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
             } catch (KeeperException.NodeExistsException ok) {
                 ensureZooKeeper().setData(path, data, -1);
             }
-            this.registeredIndexingServiceId = serviceId;
-            this.registeredIndexingServiceAddress = address;
-            LOGGER.log(Level.INFO, "Registered indexing service: {0} -> {1}", new Object[]{serviceId, address});
+            this.registeredIndexingServiceDescriptor = descriptor;
+            this.registeredIndexingServiceId = descriptor.getServiceId();
+            this.registeredIndexingServiceAddress = descriptor.getAddress();
+            LOGGER.log(Level.INFO, "Registered indexing service instance: {0}", descriptor);
         } catch (KeeperException | InterruptedException | IOException err) {
             handleSessionExpiredError(err);
             throw new MetadataStorageManagerException(err);
@@ -606,12 +685,13 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
     }
 
     @Override
-    public void unregisterIndexingService(String serviceId) throws MetadataStorageManagerException {
+    public void unregisterIndexingServiceInstance(String serviceId) throws MetadataStorageManagerException {
         try {
-            ensureZooKeeper().delete(indexingServicesPath + "/" + serviceId, -1);
+            ensureZooKeeper().delete(indexingServicesInstancesPath + "/" + serviceId, -1);
+            this.registeredIndexingServiceDescriptor = null;
             this.registeredIndexingServiceId = null;
             this.registeredIndexingServiceAddress = null;
-            LOGGER.log(Level.INFO, "Unregistered indexing service: {0}", serviceId);
+            LOGGER.log(Level.INFO, "Unregistered indexing service instance: {0}", serviceId);
         } catch (KeeperException.NoNodeException ok) {
             // already gone
         } catch (KeeperException | InterruptedException | IOException err) {
@@ -621,15 +701,118 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
     }
 
     @Override
-    public List<String> listIndexingServices() throws MetadataStorageManagerException {
+    public List<IndexingServiceInstanceDescriptor> listIndexingServiceInstances()
+            throws MetadataStorageManagerException {
         try {
-            List<String> children = ensureZooKeeper().getChildren(indexingServicesPath, indexingServicesWatcher);
-            List<String> addresses = new ArrayList<>();
-            for (String child : children) {
-                byte[] data = ensureZooKeeper().getData(indexingServicesPath + "/" + child, false, null);
-                addresses.add(new String(data, StandardCharsets.UTF_8));
+            List<String> children;
+            try {
+                children = ensureZooKeeper().getChildren(indexingServicesInstancesPath, indexingServicesWatcher);
+            } catch (KeeperException.NoNodeException absent) {
+                // Path has not yet been created (fresh cluster before start()
+                // formatted the tree). Nothing to return; no watch to install.
+                return Collections.emptyList();
             }
-            return addresses;
+            List<IndexingServiceInstanceDescriptor> result = new ArrayList<>(children.size());
+            List<String> addresses = new ArrayList<>(children.size());
+            for (String child : children) {
+                try {
+                    byte[] data = ensureZooKeeper().getData(
+                            indexingServicesInstancesPath + "/" + child, false, null);
+                    IndexingServiceInstanceDescriptor descriptor =
+                            IndexingServiceInstanceDescriptor.deserialize(data);
+                    result.add(descriptor);
+                    addresses.add(descriptor.getAddress());
+                } catch (KeeperException.NoNodeException gone) {
+                    // node disappeared between getChildren and getData — skip.
+                } catch (IOException parseErr) {
+                    LOGGER.log(Level.WARNING,
+                            "Failed to parse indexing-service instance descriptor for " + child, parseErr);
+                }
+            }
+            // Fire both callbacks so legacy listeners (addresses only) and new
+            // listeners (full descriptors) are both informed.
+            notifyIndexingServicesChanged(addresses);
+            notifyIndexingServiceInstancesChanged(result);
+            return result;
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public void publishIndexingServiceCheckpointState(IndexingServiceCheckpointState state)
+            throws MetadataStorageManagerException {
+        try {
+            String path = indexingServicesStatePath + "/" + state.getInstanceId();
+            byte[] data = state.serialize();
+            try {
+                ensureZooKeeper().create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            } catch (KeeperException.NodeExistsException ok) {
+                ensureZooKeeper().setData(path, data, -1);
+            }
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public IndexingServiceCheckpointState getIndexingServiceCheckpointState(int instanceId)
+            throws MetadataStorageManagerException {
+        try {
+            String path = indexingServicesStatePath + "/" + instanceId;
+            byte[] data;
+            try {
+                data = ensureZooKeeper().getData(path, false, null);
+            } catch (KeeperException.NoNodeException absent) {
+                return null;
+            }
+            return IndexingServiceCheckpointState.deserialize(data);
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    @Override
+    public void watchIndexingServiceCheckpointState(
+            int instanceId, Consumer<IndexingServiceCheckpointState> callback)
+            throws MetadataStorageManagerException {
+        indexingServiceCheckpointWatchers.put(instanceId, callback);
+        installIndexingServiceStateWatch(instanceId);
+    }
+
+    private void installIndexingServiceStateWatch(int instanceId) throws MetadataStorageManagerException {
+        try {
+            String path = indexingServicesStatePath + "/" + instanceId;
+            Watcher w = event -> {
+                // One-shot watch — re-arm and re-deliver the current state on
+                // NodeCreated, NodeDataChanged. On NodeDeleted we still re-arm
+                // via getData(..., true, null) below which will install an exists
+                // watch.
+                try {
+                    installIndexingServiceStateWatch(instanceId);
+                    IndexingServiceCheckpointState latest = getIndexingServiceCheckpointState(instanceId);
+                    if (latest != null) {
+                        Consumer<IndexingServiceCheckpointState> cb =
+                                indexingServiceCheckpointWatchers.get(instanceId);
+                        if (cb != null) {
+                            cb.accept(latest);
+                        }
+                    }
+                } catch (MetadataStorageManagerException e) {
+                    LOGGER.log(Level.WARNING,
+                            "Error handling indexing-service state watch for instance " + instanceId, e);
+                }
+            };
+            try {
+                ensureZooKeeper().getData(path, w, null);
+            } catch (KeeperException.NoNodeException absent) {
+                // No state published yet — install an exists watch that will
+                // fire when the primary first publishes.
+                ensureZooKeeper().exists(path, w);
+            }
         } catch (KeeperException | InterruptedException | IOException err) {
             handleSessionExpiredError(err);
             throw new MetadataStorageManagerException(err);

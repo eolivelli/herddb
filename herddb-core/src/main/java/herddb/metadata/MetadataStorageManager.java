@@ -149,6 +149,65 @@ public abstract class MetadataStorageManager implements AutoCloseable {
         return Collections.emptyList();
     }
 
+    // -------------------------------------------------------------------------
+    // Role-aware indexing-service registration (shadows + primaries) and
+    // checkpoint-state publication (primary -> shadows). Non-ZK implementations
+    // are no-ops.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Registers an indexing-service instance with its full descriptor (role,
+     * instanceId, shadowOf, address). Implementations should create an
+     * ephemeral znode / equivalent so the entry is cleaned up automatically
+     * when the process disconnects.
+     */
+    public void registerIndexingServiceInstance(IndexingServiceInstanceDescriptor descriptor)
+            throws MetadataStorageManagerException {
+    }
+
+    /**
+     * Removes the registration created by
+     * {@link #registerIndexingServiceInstance(IndexingServiceInstanceDescriptor)}.
+     */
+    public void unregisterIndexingServiceInstance(String serviceId) throws MetadataStorageManagerException {
+    }
+
+    /**
+     * Enumerates all registered indexing-service instances (primaries + shadows).
+     */
+    public List<IndexingServiceInstanceDescriptor> listIndexingServiceInstances()
+            throws MetadataStorageManagerException {
+        return Collections.emptyList();
+    }
+
+    /**
+     * Called by a primary after each successful checkpoint to publish its
+     * current durable LSN so that shadow replicas can reload from remote
+     * storage.
+     */
+    public void publishIndexingServiceCheckpointState(IndexingServiceCheckpointState state)
+            throws MetadataStorageManagerException {
+    }
+
+    /**
+     * Reads the latest checkpoint state published by the primary for the given
+     * {@code instanceId}, or {@code null} if none has been published yet.
+     */
+    public IndexingServiceCheckpointState getIndexingServiceCheckpointState(int instanceId)
+            throws MetadataStorageManagerException {
+        return null;
+    }
+
+    /**
+     * Installs a listener that fires whenever a primary publishes a new
+     * checkpoint state for the given {@code instanceId}. The watch is
+     * persistent and re-registers automatically. Default is no-op.
+     */
+    public void watchIndexingServiceCheckpointState(
+            int instanceId, Consumer<IndexingServiceCheckpointState> callback)
+            throws MetadataStorageManagerException {
+    }
+
     public void registerFileServer(String serviceId, String address) throws MetadataStorageManagerException {
     }
 
@@ -172,7 +231,17 @@ public abstract class MetadataStorageManager implements AutoCloseable {
             try {
                 l.onIndexingServicesChanged(addresses);
             } catch (Exception e) {
-                // log but don't propagate
+                // listener is best-effort; never propagate out of the notify path
+            }
+        }
+    }
+
+    protected final void notifyIndexingServiceInstancesChanged(List<IndexingServiceInstanceDescriptor> instances) {
+        for (ServiceDiscoveryListener l : serviceDiscoveryListeners) {
+            try {
+                l.onIndexingServiceInstancesChanged(instances);
+            } catch (Exception e) {
+                // listener is best-effort; never propagate out of the notify path
             }
         }
     }

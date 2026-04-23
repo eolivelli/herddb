@@ -26,6 +26,23 @@ import java.util.List;
  * Listener for dynamic service discovery changes.
  */
 public interface ServiceDiscoveryListener {
-    void onIndexingServicesChanged(List<String> currentAddresses);
+    /**
+     * Legacy address-only callback. Kept for backwards compatibility; new
+     * listeners should override
+     * {@link #onIndexingServiceInstancesChanged(List)} instead, which also
+     * conveys role/instanceId/shadowOf metadata needed for shadow-aware
+     * query routing. Default implementation is a no-op so that listeners can
+     * implement only the richer callback.
+     */
+    default void onIndexingServicesChanged(List<String> currentAddresses) {
+    }
+
+    /**
+     * Full indexing-service discovery callback. Fires whenever the set of
+     * registered indexing-service instances (primaries + shadows) changes.
+     */
+    default void onIndexingServiceInstancesChanged(List<IndexingServiceInstanceDescriptor> currentInstances) {
+    }
+
     void onFileServersChanged(List<String> currentAddresses);
 }

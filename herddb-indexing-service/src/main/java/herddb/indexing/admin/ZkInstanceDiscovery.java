@@ -21,6 +21,7 @@
 package herddb.indexing.admin;
 
 import herddb.cluster.ZookeeperMetadataStorageManager;
+import herddb.metadata.IndexingServiceInstanceDescriptor;
 import herddb.metadata.MetadataStorageManagerException;
 import java.util.List;
 
@@ -36,6 +37,7 @@ public final class ZkInstanceDiscovery {
     private ZkInstanceDiscovery() {
     }
 
+    /** Legacy address-only listing (primary+shadow addresses, no role info). */
     public static List<String> listInstances(String zkAddress, String basePath) throws MetadataStorageManagerException {
         return listInstances(zkAddress, basePath, DEFAULT_SESSION_TIMEOUT_MS);
     }
@@ -46,6 +48,29 @@ public final class ZkInstanceDiscovery {
         try {
             mgr.start();
             return mgr.listIndexingServices();
+        } finally {
+            try {
+                mgr.close();
+            } catch (MetadataStorageManagerException ignore) {
+                // best effort
+            }
+        }
+    }
+
+    /** Full listing with role/instanceId/shadowOf metadata. */
+    public static List<IndexingServiceInstanceDescriptor> listInstanceDescriptors(
+            String zkAddress, String basePath) throws MetadataStorageManagerException {
+        return listInstanceDescriptors(zkAddress, basePath, DEFAULT_SESSION_TIMEOUT_MS);
+    }
+
+    public static List<IndexingServiceInstanceDescriptor> listInstanceDescriptors(
+            String zkAddress, String basePath, int sessionTimeoutMs)
+            throws MetadataStorageManagerException {
+        ZookeeperMetadataStorageManager mgr = new ZookeeperMetadataStorageManager(
+                zkAddress, sessionTimeoutMs, basePath);
+        try {
+            mgr.start();
+            return mgr.listIndexingServiceInstances();
         } finally {
             try {
                 mgr.close();
