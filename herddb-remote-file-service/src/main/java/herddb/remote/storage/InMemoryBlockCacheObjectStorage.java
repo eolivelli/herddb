@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Decorator that holds a bounded in-heap cache of whole multipart blocks in front of an inner
@@ -53,8 +54,18 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
 
     private final ObjectStorage inner;
     private final Cache<BlockKey, ByteBuf> cache;
-    private final ConcurrentHashMap<BlockKey, CompletableFuture<ByteBuf>> inFlight = new ConcurrentHashMap<>();
+    // Primary-per-key dedup. Only the marker Void — the actual ByteBuf flows
+    // through the cache, never through this map, so followers cannot slice a
+    // ByteBuf whose refcount has already been dropped by the primary's finally.
+    private final ConcurrentHashMap<BlockKey, CompletableFuture<Void>> inFlight = new ConcurrentHashMap<>();
     private final long maxBytes;
+    // Hit/miss counters maintained manually because the fast path uses
+    // asMap().computeIfPresent — Caffeine documents that "no stats are
+    // modified by non-computing operations invoked on the asMap view", so
+    // recordStats() alone would leave hitCount/missCount at zero. Eviction
+    // counters still come from Caffeine (the removal listener path is unchanged).
+    private final AtomicLong hits = new AtomicLong();
+    private final AtomicLong misses = new AtomicLong();
 
     public InMemoryBlockCacheObjectStorage(ObjectStorage inner, long maxBytes) {
         this.inner = Objects.requireNonNull(inner, "inner");
@@ -73,6 +84,14 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
                         value.release();
                     }
                 })
+                // Force maintenance (and therefore the removal listener) to run on
+                // the calling thread instead of Caffeine's default ForkJoinPool.
+                // Async maintenance can leave evicted pooled ByteBufs with refCnt > 0
+                // long after the eviction was requested; with a direct executor every
+                // eviction / invalidate call fully releases the buffer before it
+                // returns. This matches the refcount discipline the cache consumers
+                // rely on and keeps {@code close()} deterministic.
+                .executor(Runnable::run)
                 .recordStats()
                 .build();
     }
@@ -81,9 +100,25 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
         return maxBytes;
     }
 
-    /** Current Caffeine stats snapshot. Safe to call from gauge samplers. */
+    /**
+     * Current cache stats snapshot. Safe to call from gauge samplers.
+     * <p>
+     * {@code hitCount}/{@code missCount} come from the manual counters updated
+     * on every {@code readRange}; {@code evictionCount}/{@code evictionWeight}
+     * come from Caffeine's own recordStats tracking. Load counters are always
+     * zero because this cache populates via {@code cache.put(...)} from an
+     * async loader, not via Caffeine's computing methods.
+     */
     public CacheStats stats() {
-        return cache.stats();
+        CacheStats caffeine = cache.stats();
+        return CacheStats.of(
+                hits.get(),
+                misses.get(),
+                0L,
+                0L,
+                0L,
+                caffeine.evictionCount(),
+                caffeine.evictionWeight());
     }
 
     /** Approximate number of cached blocks. */
@@ -129,57 +164,124 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
         int offsetInBlock = (int) (offset % blockSize);
         BlockKey key = new BlockKey(path, blockIndex);
 
-        ByteBuf cached = cache.getIfPresent(key);
-        if (cached != null) {
-            return CompletableFuture.completedFuture(slice(cached, offsetInBlock, length));
-        }
-
-        CompletableFuture<ByteBuf> pending = new CompletableFuture<>();
-        // Register the slice dependent BEFORE issuing the inner read, so that if
-        // inner.readRange completes synchronously the wrapping happens inside
-        // pending.complete — see CachingObjectStorage.loadAndCache for the same race.
-        CompletableFuture<ReadResult> resultFuture = pending.thenApply(buf -> slice(buf, offsetInBlock, length));
-
-        CompletableFuture<ByteBuf> existing = inFlight.putIfAbsent(key, pending);
-        if (existing != null) {
-            return existing.thenApply(buf -> slice(buf, offsetInBlock, length));
-        }
-
-        long blockStartOffset = blockIndex * (long) blockSize;
-        inner.readRange(path, blockStartOffset, blockSize, blockSize).whenComplete((result, err) -> {
-            if (err != null) {
-                try {
-                    pending.completeExceptionally(err);
-                } finally {
-                    inFlight.remove(key, pending);
-                }
-                return;
-            }
-            if (result.status() != ReadResult.Status.FOUND) {
-                try {
-                    pending.complete(null);
-                } finally {
-                    inFlight.remove(key, pending);
-                }
-                return;
-            }
-            ByteBuf buf = result.byteBuf();
-            // +1 for the cache's ownership; +1 to keep buf alive across pending.complete
-            // so all dependents (the original caller + any in-flight followers) can
-            // retainedSlice while the buf is still referenced. The original `result`'s
-            // refcount is dropped right after.
-            buf.retain(2);
-            cache.put(key, buf);
+        // Fast path: (get + retain) must be atomic under Caffeine's per-entry
+        // lock, otherwise the removal listener can race with the retainedSlice
+        // below — a concurrent eviction drops the shared entry's refCnt to 0
+        // and the next retain throws IllegalReferenceCountException, killing
+        // the worker thread (see issue #241). Mirrors SegmentBlockCache.
+        ByteBuf retained = cache.asMap().computeIfPresent(key, (k, v) -> {
+            v.retain();
+            return v;
+        });
+        if (retained != null) {
+            hits.incrementAndGet();
             try {
-                pending.complete(buf);
+                return CompletableFuture.completedFuture(slice(retained, offsetInBlock, length));
             } finally {
-                inFlight.remove(key, pending);
-                buf.release();   // alive-for-followers retain
-                result.release(); // original ReadResult's refcount
+                // Drop the hit-retain; the returned ReadResult's slice carries its own.
+                retained.release();
+            }
+        }
+        misses.incrementAndGet();
+
+        // Miss path: dedup via in-flight map so only one inner.readRange per
+        // key is in flight. Followers wait for the primary to signal "cache
+        // is populated" and then take a fresh atomic retain via
+        // {@code asMap().computeIfPresent} — they do NOT slice the primary's
+        // ByteBuf directly, because that ByteBuf can be released between
+        // pending.complete() and the follower's callback running (issue #241).
+        // The signal value is a Void marker — not the ByteBuf — so the
+        // follower's refcount discipline goes through the cache, which is
+        // the only safe source of a retainable reference.
+        CompletableFuture<Void> pending = new CompletableFuture<>();
+        CompletableFuture<Void> existing = inFlight.putIfAbsent(key, pending);
+        if (existing != null) {
+            return existing.thenCompose(ignored ->
+                    sliceFromCacheOrReload(path, offset, length, blockSize, key, offsetInBlock));
+        }
+
+        return loadAndPublish(path, offset, length, blockSize, key, offsetInBlock,
+                blockIndex, pending);
+    }
+
+    /**
+     * Follower fast-path after the primary signalled. Takes an atomic retain
+     * from the cache; if the entry was evicted in between (rare), reloads
+     * directly via the inner storage rather than re-entering the dedup path —
+     * recursing through {@link #readRange} risks an unbounded synchronous
+     * chain when the signalling thenCompose fires on an already-complete
+     * future.
+     */
+    private CompletableFuture<ReadResult> sliceFromCacheOrReload(
+            String path, long offset, int length, int blockSize,
+            BlockKey key, int offsetInBlock) {
+        ByteBuf retained = cache.asMap().computeIfPresent(key, (k, v) -> {
+            v.retain();
+            return v;
+        });
+        if (retained != null) {
+            hits.incrementAndGet();
+            try {
+                return CompletableFuture.completedFuture(slice(retained, offsetInBlock, length));
+            } finally {
+                retained.release();
+            }
+        }
+        // Rare: entry evicted between the primary's cache.put and here.
+        // Duplicate the inner read (bypassing the in-flight map) rather than
+        // recursing; correctness beats strict dedup in this corner case.
+        misses.incrementAndGet();
+        return loadAndPublish(path, offset, length, blockSize, key, offsetInBlock,
+                offset / blockSize, /* pending = */ null);
+    }
+
+    /**
+     * Issues a fresh {@code inner.readRange}, publishes the result into the
+     * cache, signals the optional {@code pending} future, and returns the
+     * caller's sliced ReadResult.
+     */
+    private CompletableFuture<ReadResult> loadAndPublish(String path, long offset, int length,
+            int blockSize, BlockKey key, int offsetInBlock, long blockIndex,
+            CompletableFuture<Void> pending) {
+        long blockStartOffset = blockIndex * (long) blockSize;
+        CompletableFuture<ReadResult> out = new CompletableFuture<>();
+        inner.readRange(path, blockStartOffset, blockSize, blockSize).whenComplete((result, err) -> {
+            try {
+                if (err != null) {
+                    out.completeExceptionally(err);
+                    return;
+                }
+                if (result.status() != ReadResult.Status.FOUND) {
+                    out.complete(ReadResult.notFound());
+                    return;
+                }
+                ByteBuf buf = result.byteBuf();
+                // +1 for the cache's ownership (released by the removal
+                // listener on eviction). slice(buf, ...) then takes its own
+                // retainedSlice. After result.release() drops the inner
+                // ReadResult's original ref, the final state is
+                // refCnt = (cache) + (caller's slice) = 2.
+                buf.retain();
+                cache.put(key, buf);
+                try {
+                    out.complete(slice(buf, offsetInBlock, length));
+                } finally {
+                    result.release();
+                }
+            } catch (RuntimeException e) {
+                out.completeExceptionally(e);
+            } finally {
+                if (pending != null) {
+                    // Remove the in-flight placeholder BEFORE signalling
+                    // followers so a follower's thenCompose, which fires
+                    // synchronously on this thread, cannot re-read a stale
+                    // in-flight entry pointing at an already-complete pending.
+                    inFlight.remove(key, pending);
+                    pending.complete(null);
+                }
             }
         });
-
-        return resultFuture;
+        return out;
     }
 
     @Override
@@ -221,6 +323,12 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
     @Override
     public void close() throws Exception {
         cache.invalidateAll();
+        // Force pending maintenance so the removal listener fires on every
+        // still-cached entry before we return — otherwise Caffeine may
+        // process removals asynchronously, leaving pooled ByteBufs with
+        // refCnt > 0 after close(). Mirrors SegmentBlockCache's close-path
+        // idiom.
+        cache.cleanUp();
         inner.close();
     }
 
