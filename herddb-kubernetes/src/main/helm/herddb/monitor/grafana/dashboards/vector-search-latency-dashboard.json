@@ -1679,6 +1679,156 @@
       "showTitle": true,
       "title": "Vector Cache Correlation",
       "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 500,
+          "legend": {"alignAsTable": true, "avg": true, "current": true, "max": true, "min": false, "rightSide": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "indexing_search_latency{instance=~\"$instance\",success=\"true\",quantile=\"0.95\"} and on(instance) (indexing_shadow_ready == 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "shadow p95 [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "indexing_search_latency{instance=~\"$instance\",success=\"true\",quantile=\"0.95\"} unless on(instance) indexing_shadow_ready",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "primary p95 [{{instance}}]",
+              "refId": "B"
+            },
+            {
+              "expr": "indexing_search_latency{instance=~\"$instance\",success=\"true\",quantile=\"0.99\"} and on(instance) (indexing_shadow_ready == 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "shadow p99 [{{instance}}]",
+              "refId": "C"
+            },
+            {
+              "expr": "indexing_search_latency{instance=~\"$instance\",success=\"true\",quantile=\"0.99\"} unless on(instance) indexing_shadow_ready",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "primary p99 [{{instance}}]",
+              "refId": "D"
+            }
+          ],
+          "title": "Search Latency — Primary vs Shadow (p95/p99)",
+          "description": "Splits the indexing_search_latency series by whether the endpoint has the indexing_shadow_ready gauge registered (i.e. it is a shadow replica). A persistent gap where shadows are slower than primaries usually means the shared segment page cache is cold on the shadow.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "µs", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 501,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 2,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "sum by (instance) (rate(indexing_search_requests{instance=~\"$instance\"}[1m])) and on(instance) (indexing_shadow_ready == 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "shadow op/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "sum by (instance) (rate(indexing_search_requests{instance=~\"$instance\"}[1m])) unless on(instance) indexing_shadow_ready",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "primary op/s [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "title": "Search Rate — Primary vs Shadow",
+          "description": "Shows how the HerdDB client's per-pool round-robin is distributing search load between primary and shadow endpoints. With N shadows per primary the expected distribution is approximately 1:N between primary and the shadows of that instanceId.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Shadow Replicas — Search Latency & Rate",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 510,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(indexing_shadow_not_ready_responses{instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "NOT_READY/s [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Shadow NOT_READY Responses (1m rate)",
+          "description": "Every non-zero sample here represents one RPC the HerdDB client had to retry against another endpoint in the same pool. Sustained non-zero values mean a shadow is stuck without a ready snapshot.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 511,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 2,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "indexing_shadow_lag_entries{instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "lag entries [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Shadow Lag (entries behind primary)",
+          "description": "primary_advertised_offset − loaded_offset within the same ledgerId. -1 means unknown (no primary state observed, or LSN crossed a ledger boundary). A lag that grows indefinitely indicates a stuck reload path.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Shadow Replicas — Fallback & Staleness",
+      "titleSize": "h6"
     }
   ],
   "schemaVersion": 14,

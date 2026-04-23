@@ -4037,6 +4037,221 @@
       "showTitle": true,
       "title": "Shared Segment Block Cache (issue #196)",
       "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 500,
+          "span": 3,
+          "targets": [
+            {
+              "expr": "indexing_shadow_ready{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": "0.5",
+          "title": "Shadow Ready",
+          "type": "singlestat",
+          "valueName": "current",
+          "colorBackground": true,
+          "colors": [
+            "#d44a3a",
+            "#d44a3a",
+            "#299c46"
+          ],
+          "valueMaps": [
+            {"value": "0", "text": "NOT_READY", "op": "="},
+            {"value": "1", "text": "READY", "op": "="}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 501,
+          "legend": {"avg": false, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 3,
+          "targets": [
+            {
+              "expr": "indexing_shadow_reload_count{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "reloads [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Shadow Reload Count (cumulative)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "decimals": 0, "min": 0, "show": true},
+            {"format": "short", "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 502,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 2,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(indexing_shadow_reload_count{job=\"indexing-service\",instance=~\"$instance\"}[5m]) * 60",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "reloads/min [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Shadow Reload Rate (5m average, per minute)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Shadow Replicas — Readiness & Reload Activity",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "fill": 2,
+          "id": 510,
+          "legend": {"alignAsTable": true, "avg": true, "current": true, "max": true, "min": false, "rightSide": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "indexing_shadow_loaded_ledger_id{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "loaded ledger [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "indexing_shadow_loaded_offset{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "loaded offset [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "title": "Shadow Loaded LSN (ledger + offset)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 2,
+          "id": 511,
+          "legend": {"alignAsTable": true, "avg": true, "current": true, "max": true, "min": false, "rightSide": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 2,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "indexing_shadow_lag_entries{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "lag entries [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Shadow Lag (entries behind primary's advertised LSN)",
+          "description": "primary_advertised_offset − loaded_offset when both LSNs share the same ledgerId. -1 means lag is unknown (either no primary state observed yet or the LSN crossed a ledger boundary).",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "logBase": 1, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Shadow Replicas — Catch-up Progress",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 520,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "rate(indexing_shadow_not_ready_responses{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "NOT_READY/s [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "NOT_READY RPC Responses (1m rate)",
+          "description": "FAILED_PRECONDITION 'shadow_not_ready:<shadowOf>' gate on Search/GetIndexStatus/ListIndexes/DescribeIndex/ListPrimaryKeys. A non-zero rate means the HerdDB client is being asked to fall back to another endpoint in the pool.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 521,
+          "legend": {"avg": false, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "(time() * 1000) - indexing_shadow_last_reload_timestamp_ms{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "age ms [{{instance}}]",
+              "refId": "A"
+            }
+          ],
+          "title": "Time Since Last Shadow Reload",
+          "description": "Wall-clock milliseconds since the most recent successful reloadFromStatus. A steadily-rising value means the shadow is no longer being notified of primary checkpoints (ZK watcher stuck or primary idle).",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ms", "logBase": 1, "min": 0, "show": true},
+            {"format": "short", "logBase": 1, "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Shadow Replicas — Gate & Staleness",
+      "titleSize": "h6"
     }
   ],
   "schemaVersion": 14,

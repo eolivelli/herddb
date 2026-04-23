@@ -1665,6 +1665,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 return l != null ? l.offset : -1L;
             }
         });
+        shadow.registerGauge("last_reload_timestamp_ms", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return shadowLastReloadTimestampMs;
+            }
+        });
         // lag_entries: primary_advertised_offset - loaded_offset when same
         // ledger, else -1 to signal "unknown across ledgers".
         shadow.registerGauge("lag_entries", new Gauge<Long>() {
