@@ -29,11 +29,14 @@ import herddb.indexing.proto.SearchRequest;
 import herddb.indexing.proto.SearchResponse;
 import herddb.indexing.proto.SearchResult;
 import herddb.log.LogSequenceNumber;
+import herddb.metadata.IndexingServiceInstanceDescriptor;
 import herddb.server.DynamicServiceClient;
 import herddb.utils.Bytes;
 import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -46,10 +49,13 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -82,14 +88,93 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
      */
     private final CountDownLatch serversReadyLatch = new CountDownLatch(1);
 
-    private static class ServerSnapshot {
-        final List<String> servers;
-        final Map<String, ManagedChannel> channels;
+    /**
+     * A single gRPC endpoint: an address + open channel, plus the role and
+     * effective instanceId needed to group it into a pool.
+     */
+    static final class Endpoint {
+        final String address;
+        final ManagedChannel channel;
+        final String role;
+        final int effectiveInstanceId;
 
-        ServerSnapshot(List<String> servers, Map<String, ManagedChannel> channels) {
+        Endpoint(String address, ManagedChannel channel, String role, int effectiveInstanceId) {
+            this.address = address;
+            this.channel = channel;
+            this.role = role;
+            this.effectiveInstanceId = effectiveInstanceId;
+        }
+    }
+
+    /**
+     * A shadow pool: the primary for a given effective instanceId plus its
+     * shadow replicas. Search picks one endpoint per pool; on NOT_READY or
+     * retryable failure the client falls back to another endpoint in the
+     * same pool.
+     */
+    static final class Pool {
+        final int effectiveInstanceId;
+        final List<Endpoint> endpoints;
+        final AtomicInteger rrCursor;
+
+        Pool(int effectiveInstanceId, List<Endpoint> endpoints) {
+            this.effectiveInstanceId = effectiveInstanceId;
+            this.endpoints = Collections.unmodifiableList(new ArrayList<>(endpoints));
+            // Seed the round-robin cursor at a random offset so a cold-start
+            // burst does not always hit the first endpoint.
+            this.rrCursor = new AtomicInteger(
+                    endpoints.isEmpty() ? 0 : ThreadLocalRandom.current().nextInt(endpoints.size()));
+        }
+    }
+
+    private static class ServerSnapshot {
+        /** Legacy flat server list (addresses only). */
+        final List<String> servers;
+        /** Legacy channels by address — kept so getMinProcessedLsn-style iteration works unchanged. */
+        final Map<String, ManagedChannel> channels;
+        /** One pool per effective instanceId; iteration order is deterministic (sorted). */
+        final List<Pool> pools;
+
+        ServerSnapshot(List<String> servers, Map<String, ManagedChannel> channels, List<Pool> pools) {
             this.servers = Collections.unmodifiableList(new ArrayList<>(servers));
             this.channels = Collections.unmodifiableMap(new HashMap<>(channels));
+            this.pools = Collections.unmodifiableList(new ArrayList<>(pools));
         }
+    }
+
+    /**
+     * FAILED_PRECONDITION with this description prefix signals the
+     * HerdDB-side client that the endpoint is a shadow replica that has not
+     * yet completed its first reload (see {@code IndexingServiceImpl}).
+     */
+    private static final String SHADOW_NOT_READY_DESCRIPTION_PREFIX = "shadow_not_ready:";
+
+    private static boolean isShadowNotReady(Throwable t) {
+        while (t != null) {
+            if (t instanceof StatusRuntimeException) {
+                Status st = ((StatusRuntimeException) t).getStatus();
+                if (st.getCode() == Status.Code.FAILED_PRECONDITION
+                        && st.getDescription() != null
+                        && st.getDescription().startsWith(SHADOW_NOT_READY_DESCRIPTION_PREFIX)) {
+                    return true;
+                }
+                return false;
+            }
+            t = t.getCause();
+        }
+        return false;
+    }
+
+    private static boolean isRetryableTransportFailure(Throwable t) {
+        while (t != null) {
+            if (t instanceof StatusRuntimeException) {
+                Status st = ((StatusRuntimeException) t).getStatus();
+                return st.getCode() == Status.Code.UNAVAILABLE
+                        || st.getCode() == Status.Code.DEADLINE_EXCEEDED;
+            }
+            t = t.getCause();
+        }
+        return false;
     }
 
     public IndexingServiceClient(List<String> servers, long timeoutSeconds) {
@@ -103,10 +188,27 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         for (String server : servers) {
             channels.put(server, buildChannel(server));
         }
-        this.snapshot = new ServerSnapshot(servers, channels);
+        this.snapshot = new ServerSnapshot(servers, channels, buildLegacyPools(servers, channels));
         if (!servers.isEmpty()) {
             this.serversReadyLatch.countDown();
         }
+    }
+
+    /**
+     * Builds pools from a flat address list. When only addresses are known
+     * (legacy constructor path) each address is assigned to its own pool with
+     * a unique effective instanceId — this preserves the pre-shadow
+     * fan-out-to-all-instances behaviour.
+     */
+    private static List<Pool> buildLegacyPools(List<String> servers, Map<String, ManagedChannel> channels) {
+        List<Pool> pools = new ArrayList<>(servers.size());
+        for (int i = 0; i < servers.size(); i++) {
+            String addr = servers.get(i);
+            Endpoint ep = new Endpoint(addr, channels.get(addr),
+                    IndexingServiceInstanceDescriptor.ROLE_PRIMARY, i);
+            pools.add(new Pool(i, java.util.Collections.singletonList(ep)));
+        }
+        return pools;
     }
 
     public IndexingServiceClient(List<String> servers) {
@@ -157,34 +259,91 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
             }
         }
 
-        this.snapshot = new ServerSnapshot(newServers, newChannels);
+        this.snapshot = new ServerSnapshot(newServers, newChannels,
+                buildLegacyPools(newServers, newChannels));
         serversReadyLatch.countDown();
 
         LOGGER.log(Level.INFO, "Updated indexing service servers: {0} (added: {1}, removed: {2})",
                 new Object[]{newServers, added, removed});
 
-        // Gracefully shutdown removed channels in background
-        if (!removed.isEmpty()) {
-            List<ManagedChannel> toShutdown = new ArrayList<>();
-            for (String server : removed) {
-                ManagedChannel ch = current.channels.get(server);
-                if (ch != null) {
-                    toShutdown.add(ch);
+        shutdownRemovedChannels(current, removed);
+    }
+
+    /**
+     * Shadow-aware counterpart of {@link #updateServers(List)}. Groups
+     * instances by effective instanceId (a shadow shares its {@code shadowOf}
+     * primary's pool). Search fans out once per pool and falls back within a
+     * pool on NOT_READY or a retryable gRPC status.
+     */
+    public synchronized void updateInstances(List<IndexingServiceInstanceDescriptor> newInstances) {
+        if (newInstances == null || newInstances.isEmpty()) {
+            LOGGER.log(Level.WARNING, "updateInstances called with empty list, keeping current servers");
+            return;
+        }
+
+        ServerSnapshot current = this.snapshot;
+
+        // Build the fresh address list + channels (reuse where possible).
+        List<String> addresses = new ArrayList<>(newInstances.size());
+        Map<String, ManagedChannel> newChannels = new HashMap<>();
+        for (IndexingServiceInstanceDescriptor d : newInstances) {
+            addresses.add(d.getAddress());
+            ManagedChannel existing = current.channels.get(d.getAddress());
+            if (existing != null) {
+                newChannels.put(d.getAddress(), existing);
+            } else if (!newChannels.containsKey(d.getAddress())) {
+                newChannels.put(d.getAddress(), buildChannel(d.getAddress()));
+            }
+        }
+
+        // Group by effective instanceId.
+        TreeMap<Integer, List<Endpoint>> byInstance = new TreeMap<>();
+        for (IndexingServiceInstanceDescriptor d : newInstances) {
+            int effective = d.effectiveInstanceId();
+            ManagedChannel ch = newChannels.get(d.getAddress());
+            byInstance.computeIfAbsent(effective, k -> new ArrayList<>())
+                    .add(new Endpoint(d.getAddress(), ch, d.getRole(), effective));
+        }
+        List<Pool> pools = new ArrayList<>(byInstance.size());
+        for (Map.Entry<Integer, List<Endpoint>> e : byInstance.entrySet()) {
+            pools.add(new Pool(e.getKey(), e.getValue()));
+        }
+
+        Set<String> removed = new LinkedHashSet<>(current.channels.keySet());
+        removed.removeAll(new HashSet<>(addresses));
+
+        this.snapshot = new ServerSnapshot(addresses, newChannels, pools);
+        serversReadyLatch.countDown();
+
+        LOGGER.log(Level.INFO, "Updated indexing service instances: {0} pools, {1} endpoints",
+                new Object[]{pools.size(), addresses.size()});
+
+        shutdownRemovedChannels(current, removed);
+    }
+
+    private void shutdownRemovedChannels(ServerSnapshot current, Set<String> removed) {
+        if (removed.isEmpty()) {
+            return;
+        }
+        List<ManagedChannel> toShutdown = new ArrayList<>();
+        for (String server : removed) {
+            ManagedChannel ch = current.channels.get(server);
+            if (ch != null) {
+                toShutdown.add(ch);
+            }
+        }
+        Thread shutdownThread = new Thread(() -> {
+            for (ManagedChannel ch : toShutdown) {
+                try {
+                    ch.shutdown().awaitTermination(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    ch.shutdownNow();
                 }
             }
-            Thread shutdownThread = new Thread(() -> {
-                for (ManagedChannel ch : toShutdown) {
-                    try {
-                        ch.shutdown().awaitTermination(10, TimeUnit.SECONDS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        ch.shutdownNow();
-                    }
-                }
-            }, "indexing-channel-shutdown");
-            shutdownThread.setDaemon(true);
-            shutdownThread.start();
-        }
+        }, "indexing-channel-shutdown");
+        shutdownThread.setDaemon(true);
+        shutdownThread.start();
     }
 
     /**
@@ -205,18 +364,19 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
                                                   float[] vector, int limit) {
         ServerSnapshot s = this.snapshot;
 
-        if (s.servers.isEmpty()) {
+        if (s.pools.isEmpty()) {
             throw new RuntimeException("No indexing service instances available");
         }
         if (limit <= 0) {
             throw new IllegalArgumentException("search limit must be positive, got " + limit);
         }
 
-        boolean multiInstance = s.servers.size() > 1;
-        boolean returnScore = multiInstance; // always request scores when merging multiple instances
+        boolean multiPool = s.pools.size() > 1;
+        boolean returnScore = multiPool; // always request scores when merging multiple pools
 
-        LOGGER.log(Level.FINE, "client search: tablespace={0}, table={1}, index={2}, limit={3}, vectorDim={4}, instances={5}",
-                new Object[]{tablespace, table, index, limit, vector.length, s.servers.size()});
+        LOGGER.log(Level.FINE,
+                "client search: tablespace={0}, table={1}, index={2}, limit={3}, vectorDim={4}, pools={5}, endpoints={6}",
+                new Object[]{tablespace, table, index, limit, vector.length, s.pools.size(), s.servers.size()});
         long start = System.nanoTime();
 
         SearchRequest.Builder requestBuilder = SearchRequest.newBuilder()
@@ -230,75 +390,129 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
         }
         SearchRequest request = requestBuilder.build();
 
-        if (!multiInstance) {
-            // Single instance: blocking fast-path
-            ManagedChannel channel = s.channels.values().iterator().next();
+        if (!multiPool && s.pools.get(0).endpoints.size() == 1) {
+            // Single endpoint in a single pool: blocking fast-path.
+            Endpoint only = s.pools.get(0).endpoints.get(0);
             IndexingServiceGrpc.IndexingServiceBlockingStub stub =
-                    IndexingServiceGrpc.newBlockingStub(channel)
+                    IndexingServiceGrpc.newBlockingStub(only.channel)
                             .withDeadlineAfter(timeoutSeconds, TimeUnit.SECONDS);
             SearchResponse response = stub.search(request);
             List<Map.Entry<Bytes, Float>> results = toEntryList(response);
             long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-            LOGGER.log(Level.FINE, "client search completed (single instance): index={0}, {1} results in {2} ms",
+            LOGGER.log(Level.FINE, "client search completed (single endpoint): index={0}, {1} results in {2} ms",
                     new Object[]{index, results.size(), elapsedMs});
             return results;
         }
 
-        // Multiple instances: parallel fan-out with fail-fast and bounded top-K merge.
-        // Dispatch ALL RPCs up front so per-call gRPC deadlines run concurrently.
-        List<Map.Entry<String, ListenableFuture<SearchResponse>>> inflight =
-                new ArrayList<>(s.channels.size());
-        for (Map.Entry<String, ManagedChannel> entry : s.channels.entrySet()) {
-            IndexingServiceGrpc.IndexingServiceFutureStub stub =
-                    IndexingServiceGrpc.newFutureStub(entry.getValue())
-                            .withDeadlineAfter(timeoutSeconds, TimeUnit.SECONDS);
-            inflight.add(new AbstractMap.SimpleImmutableEntry<>(entry.getKey(), stub.search(request)));
+        // Per-pool fan-out. For each pool we dispatch ONE RPC (round-robin
+        // starting point), await it, and on NOT_READY / retryable failure we
+        // retry against a different endpoint in the same pool. If every
+        // endpoint in a pool fails, the whole search fails.
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        List<Map.Entry<String, ListenableFuture<SearchResponse>>> inflight = new ArrayList<>(s.pools.size());
+        // Endpoints already dispatched per pool so we don't retry the same one.
+        List<Set<String>> attempted = new ArrayList<>(s.pools.size());
+        for (int i = 0; i < s.pools.size(); i++) {
+            Pool p = s.pools.get(i);
+            Endpoint ep = pickEndpoint(p, Collections.emptySet());
+            attempted.add(new HashSet<>(Collections.singletonList(ep.address)));
+            inflight.add(dispatchSearch(ep, request, deadlineNanos));
         }
 
-        // Bounded min-heap: peek() returns the weakest (smallest-score) entry currently
-        // held, so it is the one to evict when a better candidate arrives. After the
-        // loop we drain and sort descending for the final response.
-        //
-        // The heap grows dynamically, so initial capacity is just an optimization.
-        // Cap it to a reasonable value to avoid giant up-front allocations when
-        // callers pass very large limits (e.g. the outer expansion loop of
-        // VectorIndexManager.searchStream doubling the budget on each pass).
         int initialCapacity = Math.max(1, Math.min(limit, 1024));
         PriorityQueue<Map.Entry<Bytes, Float>> topK =
                 new PriorityQueue<>(initialCapacity, Comparator.comparing(Map.Entry::getValue));
 
-        try {
-            for (Map.Entry<String, ListenableFuture<SearchResponse>> f : inflight) {
-                SearchResponse response = f.getValue().get(timeoutSeconds, TimeUnit.SECONDS);
-                for (Map.Entry<Bytes, Float> e : toEntryList(response)) {
-                    if (topK.size() < limit) {
-                        topK.offer(e);
-                    } else if (e.getValue() > topK.peek().getValue()) {
-                        topK.poll();
-                        topK.offer(e);
+        for (int i = 0; i < inflight.size(); i++) {
+            Pool pool = s.pools.get(i);
+            SearchResponse response;
+            while (true) {
+                Map.Entry<String, ListenableFuture<SearchResponse>> f = inflight.get(i);
+                long remaining = deadlineNanos - System.nanoTime();
+                if (remaining <= 0) {
+                    cancelAll(inflight);
+                    throw new RuntimeException("Search timed out waiting for indexing-service pool "
+                            + pool.effectiveInstanceId + " after " + timeoutSeconds + "s");
+                }
+                try {
+                    response = f.getValue().get(remaining, TimeUnit.NANOSECONDS);
+                    break;
+                } catch (ExecutionException ee) {
+                    Throwable cause = ee.getCause();
+                    if (isShadowNotReady(cause) || isRetryableTransportFailure(cause)) {
+                        Endpoint fallback = pickEndpoint(pool, attempted.get(i));
+                        if (fallback == null) {
+                            cancelAll(inflight);
+                            throw new RuntimeException("Search failed on indexing-service pool "
+                                    + pool.effectiveInstanceId + " (all "
+                                    + pool.endpoints.size() + " endpoints exhausted, last from "
+                                    + f.getKey() + ")", cause);
+                        }
+                        LOGGER.log(Level.FINE,
+                                "Search on pool {0} fell back from {1} to {2} after {3}",
+                                new Object[]{pool.effectiveInstanceId, f.getKey(), fallback.address,
+                                        cause == null ? "null" : cause.getMessage()});
+                        attempted.get(i).add(fallback.address);
+                        inflight.set(i, dispatchSearch(fallback, request, deadlineNanos));
+                        continue;
                     }
+                    cancelAll(inflight);
+                    throw new RuntimeException("Search failed on indexing-service pool "
+                            + pool.effectiveInstanceId + " (" + f.getKey() + ") — " + cause, cause);
+                } catch (TimeoutException te) {
+                    cancelAll(inflight);
+                    throw new RuntimeException("Search timed out waiting for indexing-service pool "
+                            + pool.effectiveInstanceId + " after " + timeoutSeconds + "s", te);
+                } catch (InterruptedException ie) {
+                    cancelAll(inflight);
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Search interrupted while waiting for indexing-service pools", ie);
                 }
             }
-        } catch (ExecutionException e) {
-            cancelAll(inflight);
-            throw new RuntimeException("Search failed on indexing-service instance: "
-                    + failingAddress(inflight) + " — " + e.getCause(), e.getCause());
-        } catch (TimeoutException e) {
-            cancelAll(inflight);
-            throw new RuntimeException("Search timed out waiting for indexing-service instances after "
-                    + timeoutSeconds + "s", e);
-        } catch (InterruptedException e) {
-            cancelAll(inflight);
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Search interrupted while waiting for indexing-service instances", e);
+            for (Map.Entry<Bytes, Float> e : toEntryList(response)) {
+                if (topK.size() < limit) {
+                    topK.offer(e);
+                } else if (e.getValue() > topK.peek().getValue()) {
+                    topK.poll();
+                    topK.offer(e);
+                }
+            }
         }
 
         List<Map.Entry<Bytes, Float>> out = new ArrayList<>(topK);
         out.sort(Comparator.<Map.Entry<Bytes, Float>, Float>comparing(Map.Entry::getValue).reversed());
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
-        LOGGER.log(Level.FINE, "client search completed (multi-instance fan-out): index={0}, {1} results in {2} ms",
+        LOGGER.log(Level.FINE, "client search completed (multi-pool fan-out): index={0}, {1} results in {2} ms",
                 new Object[]{index, out.size(), elapsedMs});
         return out;
+    }
+
+    /** Round-robin endpoint picker, skipping addresses already attempted. */
+    private static Endpoint pickEndpoint(Pool pool, Set<String> skipAddresses) {
+        int n = pool.endpoints.size();
+        if (n == 0) {
+            return null;
+        }
+        for (int i = 0; i < n; i++) {
+            int idx = Math.floorMod(pool.rrCursor.getAndIncrement(), n);
+            Endpoint ep = pool.endpoints.get(idx);
+            if (!skipAddresses.contains(ep.address)) {
+                return ep;
+            }
+        }
+        return null;
+    }
+
+    private Map.Entry<String, ListenableFuture<SearchResponse>> dispatchSearch(
+            Endpoint ep, SearchRequest request, long deadlineNanos) {
+        long remaining = deadlineNanos - System.nanoTime();
+        if (remaining <= 0) {
+            remaining = 1;
+        }
+        IndexingServiceGrpc.IndexingServiceFutureStub stub =
+                IndexingServiceGrpc.newFutureStub(ep.channel)
+                        .withDeadlineAfter(remaining, TimeUnit.NANOSECONDS);
+        return new AbstractMap.SimpleImmutableEntry<>(ep.address, stub.search(request));
     }
 
     private static void cancelAll(List<Map.Entry<String, ListenableFuture<SearchResponse>>> futures) {
@@ -336,7 +550,8 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
             throw new RuntimeException("No indexing service instances available");
         }
 
-        // Query the first available instance
+        // Query the first available instance that is ready (skip NOT_READY
+        // shadows transparently).
         for (Map.Entry<String, ManagedChannel> entry : s.channels.entrySet()) {
             try {
                 IndexingServiceGrpc.IndexingServiceBlockingStub stub =
@@ -352,7 +567,11 @@ public class IndexingServiceClient implements RemoteVectorIndexService, DynamicS
                         resp.getLastLsnLedger(), resp.getLastLsnOffset(),
                         resp.getStatus());
             } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "GetIndexStatus failed on instance " + entry.getKey(), e);
+                if (isShadowNotReady(e)) {
+                    LOGGER.log(Level.FINE, "GetIndexStatus: skipping NOT_READY shadow {0}", entry.getKey());
+                } else {
+                    LOGGER.log(Level.WARNING, "GetIndexStatus failed on instance " + entry.getKey(), e);
+                }
             }
         }
         throw new RuntimeException("All IndexingService instances failed for GetIndexStatus");
