@@ -170,7 +170,7 @@ public class MultiInstanceBookKeeperShardingTest {
             for (EmbeddedIndexingService eis : services) {
                 addresses.add(eis.getAddress());
             }
-            try (IndexingServiceClient client = new IndexingServiceClient(addresses)) {
+            try (IndexingServiceClient client = IndexingServiceClient.fromAddresses(addresses, 30)) {
                 List<Map.Entry<Bytes, Float>> mergedResults = client.search(
                         "default", "mytable", "vidx",
                         new float[]{1.0f, 2.0f, 3.0f}, numRecords);
@@ -338,7 +338,7 @@ public class MultiInstanceBookKeeperShardingTest {
             for (EmbeddedIndexingService eis : services) {
                 addresses.add(eis.getAddress());
             }
-            try (IndexingServiceClient client = new IndexingServiceClient(addresses)) {
+            try (IndexingServiceClient client = IndexingServiceClient.fromAddresses(addresses, 30)) {
                 List<Map.Entry<Bytes, Float>> results = client.search(
                         "default", "mytable", "vidx",
                         new float[]{1.0f, 2.0f, 3.0f}, numRecords);

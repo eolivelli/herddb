@@ -102,7 +102,7 @@ public class IndexingServiceClientPredicateFanOutTest {
         FakeIndexingServer b = start(implB);
         FakeIndexingServer c = start(implC);
 
-        client = new IndexingServiceClient(
+        client = IndexingServiceClient.fromAddresses(
                 Arrays.asList(a.address(), b.address(), c.address()), 10);
 
         // Simulate VectorANNScanOp: ask for 5 matches where "predicate" is
@@ -152,7 +152,7 @@ public class IndexingServiceClientPredicateFanOutTest {
         FakeIndexingServer a = start(implA);
         FakeIndexingServer b = start(implB);
 
-        client = new IndexingServiceClient(Arrays.asList(a.address(), b.address()), 10);
+        client = IndexingServiceClient.fromAddresses(Arrays.asList(a.address(), b.address()), 10);
 
         // Simulate predicate "pk is odd" → 26 matches across {1,3,5,...,51}
         // Ask for LIMIT 10.
@@ -198,7 +198,7 @@ public class IndexingServiceClientPredicateFanOutTest {
         FakeIndexingServer a = start(implA);
         FakeIndexingServer b = start(implB);
 
-        client = new IndexingServiceClient(Arrays.asList(a.address(), b.address()), 10);
+        client = IndexingServiceClient.fromAddresses(Arrays.asList(a.address(), b.address()), 10);
 
         // Use factor=1.0, floor=16, so initial budget=16 and the first RPC
         // succeeds. The caller drains exactly the first batch, then the
@@ -250,7 +250,7 @@ public class IndexingServiceClientPredicateFanOutTest {
         LimitedResponseImpl impl = new LimitedResponseImpl(seed);
         FakeIndexingServer only = start(impl);
 
-        client = new IndexingServiceClient(Collections.singletonList(only.address()), 10);
+        client = IndexingServiceClient.fromAddresses(Collections.singletonList(only.address()), 10);
 
         int drained = 0;
         try (VectorIndexManager.SearchIterator it =

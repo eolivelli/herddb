@@ -240,8 +240,8 @@ public class IndexingServiceWithS3E2ETest {
             indexingServer = new IndexingServer("localhost", 0, engine, indexingConfig);
             indexingServer.start();
             engine.start();
-            indexingClient = new IndexingServiceClient(
-                    Collections.singletonList(indexingServer.getAddress()));
+            indexingClient = IndexingServiceClient.fromAddresses(
+                    Collections.singletonList(indexingServer.getAddress()), 30);
             mainServer.getManager().setRemoteVectorIndexService(indexingClient);
         }
 

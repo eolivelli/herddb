@@ -26,6 +26,14 @@ import java.util.List;
  * Listener for dynamic service discovery changes.
  */
 public interface ServiceDiscoveryListener {
-    void onIndexingServicesChanged(List<String> currentAddresses);
+    /**
+     * Full indexing-service discovery callback. Fires whenever the set of
+     * registered indexing-service instances (primaries + shadows) changes.
+     * Default is no-op so callers interested only in file-server discovery
+     * can skip it.
+     */
+    default void onIndexingServiceInstancesChanged(List<IndexingServiceInstanceDescriptor> currentInstances) {
+    }
+
     void onFileServersChanged(List<String> currentAddresses);
 }

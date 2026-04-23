@@ -141,7 +141,8 @@ public class FollowerReadsVectorIndexTest {
                         engine.start();
 
                         // Verify indexing service is registered
-                        List<String> services = server1.getMetadataStorageManager().listIndexingServices();
+                        List<herddb.metadata.IndexingServiceInstanceDescriptor> services =
+                                server1.getMetadataStorageManager().listIndexingServiceInstances();
                         assertFalse("Indexing service should be discoverable via ZK", services.isEmpty());
 
                         // Wire indexing client to both servers

@@ -186,6 +186,32 @@ public final class IndexingServerConfiguration {
     public static final String PROPERTY_NUM_INSTANCES = "indexing.cluster.numInstances";
     public static final int PROPERTY_NUM_INSTANCES_DEFAULT = 1;
 
+    /**
+     * Role of this indexing-service process.
+     *
+     * <ul>
+     *   <li>{@link #ROLE_PRIMARY} (default) — tails the commit log, owns a
+     *       subset of shards, writes checkpoints to storage.</li>
+     *   <li>{@link #ROLE_SHADOW} — read-only replica tied to a specific
+     *       primary (see {@link #PROPERTY_SHADOW_OF}). Serves queries from
+     *       on-disk segments loaded from the shared remote storage; does
+     *       not tail the log and rejects writes. Requires
+     *       {@code indexing.storage.type=remote}.</li>
+     * </ul>
+     */
+    public static final String PROPERTY_ROLE = "indexing.role";
+    public static final String PROPERTY_ROLE_DEFAULT = "primary";
+    public static final String ROLE_PRIMARY = "primary";
+    public static final String ROLE_SHADOW = "shadow";
+
+    /**
+     * When {@link #PROPERTY_ROLE} is {@code shadow}, the {@code instanceId} of
+     * the primary this replica shadows. Must be in
+     * {@code [0, indexing.cluster.numInstances - 1]}. Ignored for primaries.
+     */
+    public static final String PROPERTY_SHADOW_OF = "indexing.shadow.of";
+    public static final int PROPERTY_SHADOW_OF_UNSET = -1;
+
     // Log tailing mode
     public static final String PROPERTY_LOG_TYPE = "indexing.log.type";
     public static final String PROPERTY_LOG_TYPE_DEFAULT = "file";
@@ -298,6 +324,49 @@ public final class IndexingServerConfiguration {
             this.properties.setProperty(key, value + "");
         }
         return this;
+    }
+
+    /**
+     * Validates {@link #PROPERTY_ROLE} and {@link #PROPERTY_SHADOW_OF} and any
+     * cross-dependency with other properties. Called from the server bootstrap
+     * so that misconfigured shadows fail fast with a clear message instead of
+     * later, with a less informative error from the storage layer.
+     *
+     * @throws IllegalArgumentException if the combination is invalid
+     */
+    public void validateRoleAndShadow() {
+        final String role = getString(PROPERTY_ROLE, PROPERTY_ROLE_DEFAULT);
+        if (!ROLE_PRIMARY.equals(role) && !ROLE_SHADOW.equals(role)) {
+            throw new IllegalArgumentException(
+                    PROPERTY_ROLE + " must be '" + ROLE_PRIMARY + "' or '"
+                            + ROLE_SHADOW + "', got: '" + role + "'");
+        }
+        final int numInstances = getInt(PROPERTY_NUM_INSTANCES, PROPERTY_NUM_INSTANCES_DEFAULT);
+        if (ROLE_SHADOW.equals(role)) {
+            final int shadowOf = getInt(PROPERTY_SHADOW_OF, PROPERTY_SHADOW_OF_UNSET);
+            if (shadowOf == PROPERTY_SHADOW_OF_UNSET) {
+                throw new IllegalArgumentException(
+                        PROPERTY_SHADOW_OF + " must be set when "
+                                + PROPERTY_ROLE + "=" + ROLE_SHADOW);
+            }
+            if (shadowOf < 0 || shadowOf >= numInstances) {
+                throw new IllegalArgumentException(
+                        PROPERTY_SHADOW_OF + "=" + shadowOf
+                                + " is out of range [0, " + (numInstances - 1) + "] for "
+                                + PROPERTY_NUM_INSTANCES + "=" + numInstances);
+            }
+            final String storageType = getString(PROPERTY_STORAGE_TYPE, PROPERTY_STORAGE_TYPE_DEFAULT);
+            if (!"remote".equals(storageType)) {
+                throw new IllegalArgumentException(
+                        PROPERTY_ROLE + "=" + ROLE_SHADOW + " requires "
+                                + PROPERTY_STORAGE_TYPE + "=remote, got: '" + storageType + "'");
+            }
+        }
+    }
+
+    /** Returns {@code true} when {@link #PROPERTY_ROLE} is {@link #ROLE_SHADOW}. */
+    public boolean isShadow() {
+        return ROLE_SHADOW.equals(getString(PROPERTY_ROLE, PROPERTY_ROLE_DEFAULT));
     }
 
     @Override

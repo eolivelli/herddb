@@ -21,13 +21,14 @@
 package herddb.indexing.admin;
 
 import herddb.cluster.ZookeeperMetadataStorageManager;
+import herddb.metadata.IndexingServiceInstanceDescriptor;
 import herddb.metadata.MetadataStorageManagerException;
 import java.util.List;
 
 /**
  * One-shot helper that connects to ZooKeeper, reads the list of registered
  * indexing service instances, and disconnects. Used by the
- * {@code indexing-admin list-instances} CLI command.
+ * {@code indexing-admin list-instances} / {@code list-shadows} CLI commands.
  */
 public final class ZkInstanceDiscovery {
 
@@ -36,16 +37,19 @@ public final class ZkInstanceDiscovery {
     private ZkInstanceDiscovery() {
     }
 
-    public static List<String> listInstances(String zkAddress, String basePath) throws MetadataStorageManagerException {
+    public static List<IndexingServiceInstanceDescriptor> listInstances(
+            String zkAddress, String basePath) throws MetadataStorageManagerException {
         return listInstances(zkAddress, basePath, DEFAULT_SESSION_TIMEOUT_MS);
     }
 
-    public static List<String> listInstances(String zkAddress, String basePath,
-                                               int sessionTimeoutMs) throws MetadataStorageManagerException {
-        ZookeeperMetadataStorageManager mgr = new ZookeeperMetadataStorageManager(zkAddress, sessionTimeoutMs, basePath);
+    public static List<IndexingServiceInstanceDescriptor> listInstances(
+            String zkAddress, String basePath, int sessionTimeoutMs)
+            throws MetadataStorageManagerException {
+        ZookeeperMetadataStorageManager mgr = new ZookeeperMetadataStorageManager(
+                zkAddress, sessionTimeoutMs, basePath);
         try {
             mgr.start();
-            return mgr.listIndexingServices();
+            return mgr.listIndexingServiceInstances();
         } finally {
             try {
                 mgr.close();

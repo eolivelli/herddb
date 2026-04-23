@@ -26,6 +26,7 @@ import herddb.auth.oidc.grpc.JwtAuthServerInterceptor;
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
 import herddb.mem.MemoryDataStorageManager;
+import herddb.metadata.IndexingServiceInstanceDescriptor;
 import herddb.metadata.MetadataStorageManager;
 import herddb.metadata.ServiceDiscoveryListener;
 import herddb.server.RemoteFileClient;
@@ -175,11 +176,6 @@ public class IndexingServer implements AutoCloseable {
                         metadataStorageManager.addServiceDiscoveryListener(
                                 new ServiceDiscoveryListener() {
                                     @Override
-                                    public void onIndexingServicesChanged(List<String> currentAddresses) {
-                                        // not relevant here
-                                    }
-
-                                    @Override
                                     public void onFileServersChanged(List<String> currentAddresses) {
                                         LOGGER.log(Level.INFO,
                                                 "Remote file servers for indexing changed via ZK: {0}",
@@ -231,6 +227,21 @@ public class IndexingServer implements AutoCloseable {
                     this.remoteDataStorageManager = (RemoteFileStorageManager) dsm;
                     this.remoteMetaDir = metaDir;
 
+                    // Shadows operate strictly from remote storage. Swap the
+                    // writable RemoteFileDataStorageManager we just built for
+                    // a pure read-only DSM backed by the same client and
+                    // metadata manager — keeps the file-server discovery and
+                    // hydrate-from-S3 plumbing unchanged while forbidding any
+                    // accidental writes. The writable DSM was fully
+                    // constructed and wired above so that the metadata dir
+                    // gets created and the SharedCheckpointMetadata instance
+                    // is ready; we discard it after building the replica DSM.
+                    if (config.isShadow()) {
+                        DataStorageManager replica = factory.createReadReplicaDataStorageManager(
+                                client, shared, remoteTmpDir, Integer.MAX_VALUE);
+                        return replica;
+                    }
+
                     return dsm;
                 } catch (java.io.IOException e) {
                     throw new RuntimeException(
@@ -244,6 +255,10 @@ public class IndexingServer implements AutoCloseable {
     }
 
     public void start() throws IOException {
+        // Fail fast on bad role/shadow combinations before we touch any heavy
+        // I/O or storage subsystem.
+        config.validateRoleAndShadow();
+
         // Build and set MemoryManager and DataStorageManager on the engine
         MemoryManager memoryManager = buildMemoryManager();
         engine.setMemoryManager(memoryManager);
@@ -318,7 +333,7 @@ public class IndexingServer implements AutoCloseable {
         if (metadataStorageManager != null) {
             registeredServiceId = host + ":" + server.getPort();
             try {
-                metadataStorageManager.registerIndexingService(registeredServiceId, registeredServiceId);
+                metadataStorageManager.registerIndexingServiceInstance(buildInstanceDescriptor());
                 LOGGER.log(Level.INFO, "Registered indexing service in metadata store: {0}", registeredServiceId);
             } catch (Exception e) {
                 LOGGER.log(Level.SEVERE, "Failed to register indexing service", e);
@@ -450,12 +465,25 @@ public class IndexingServer implements AutoCloseable {
         }
     }
 
+    private IndexingServiceInstanceDescriptor buildInstanceDescriptor() {
+        final String role = config.getString(IndexingServerConfiguration.PROPERTY_ROLE,
+                IndexingServerConfiguration.PROPERTY_ROLE_DEFAULT);
+        final int instanceId = config.getInt(IndexingServerConfiguration.PROPERTY_INSTANCE_ID,
+                IndexingServerConfiguration.PROPERTY_INSTANCE_ID_DEFAULT);
+        if (IndexingServerConfiguration.ROLE_SHADOW.equals(role)) {
+            final int shadowOf = config.getInt(IndexingServerConfiguration.PROPERTY_SHADOW_OF,
+                    IndexingServerConfiguration.PROPERTY_SHADOW_OF_UNSET);
+            return IndexingServiceInstanceDescriptor.shadow(registeredServiceId, registeredServiceId, shadowOf);
+        }
+        return IndexingServiceInstanceDescriptor.primary(registeredServiceId, registeredServiceId, instanceId);
+    }
+
     public void stop() throws InterruptedException {
         if (metadataStorageManager != null && registeredServiceId != null) {
             String id = registeredServiceId;
             registeredServiceId = null;
             try {
-                metadataStorageManager.unregisterIndexingService(id);
+                metadataStorageManager.unregisterIndexingServiceInstance(id);
                 LOGGER.log(Level.INFO, "Unregistered indexing service: {0}", id);
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Failed to unregister indexing service", e);

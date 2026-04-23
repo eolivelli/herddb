@@ -88,4 +88,16 @@ public interface RemoteFileServiceFactory {
             Path dataDirectory,
             Path tmpDirectory,
             int swapThreshold);
+
+    /**
+     * Creates a strictly read-only data storage manager for indexing-service
+     * shadow replicas. Unlike the promotable variant, this one never transitions
+     * to writable and throws {@link UnsupportedOperationException} on any
+     * write call.
+     */
+    DataStorageManager createReadReplicaDataStorageManager(
+            RemoteFileClient client,
+            SharedCheckpointMetadata metadata,
+            Path tmpDirectory,
+            int swapThreshold);
 }

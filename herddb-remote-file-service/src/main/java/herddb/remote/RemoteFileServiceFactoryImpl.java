@@ -118,4 +118,16 @@ public class RemoteFileServiceFactoryImpl implements RemoteFileServiceFactory {
                 readReplica, concreteClient, concreteMetadata,
                 dataDirectory, tmpDirectory, swapThreshold);
     }
+
+    @Override
+    public DataStorageManager createReadReplicaDataStorageManager(
+            RemoteFileClient client,
+            SharedCheckpointMetadata metadata,
+            Path tmpDirectory,
+            int swapThreshold) {
+        RemoteFileServiceClient concreteClient = (RemoteFileServiceClient) client;
+        SharedCheckpointMetadataManager concreteMetadata = (SharedCheckpointMetadataManager) metadata;
+        return new ReadReplicaDataStorageManager(
+                concreteClient, concreteMetadata, tmpDirectory, swapThreshold);
+    }
 }

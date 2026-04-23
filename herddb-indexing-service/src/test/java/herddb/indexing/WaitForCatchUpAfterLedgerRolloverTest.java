@@ -130,7 +130,7 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
 
             // waitForCatchUp with phantom LSN should return false (timeout)
             // because the tailer is at (1, 5) and can never reach (2, -1) — different ledger
-            try (IndexingServiceClient client = new IndexingServiceClient(
+            try (IndexingServiceClient client = IndexingServiceClient.fromAddresses(
                     java.util.Arrays.asList(eis.getAddress()), 2)) {
                 // Use short gRPC timeout (2s) so the poll loop iterates quickly
                 boolean caughtUp = client.waitForCatchUp("tablespace1", phantomLsn, 5000);

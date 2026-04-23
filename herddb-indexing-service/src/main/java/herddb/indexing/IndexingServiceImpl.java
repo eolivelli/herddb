@@ -29,6 +29,8 @@ import herddb.indexing.proto.GetIndexStatusRequest;
 import herddb.indexing.proto.GetIndexStatusResponse;
 import herddb.indexing.proto.GetInstanceInfoRequest;
 import herddb.indexing.proto.GetInstanceInfoResponse;
+import herddb.indexing.proto.GetShadowStatusRequest;
+import herddb.indexing.proto.GetShadowStatusResponse;
 import herddb.indexing.proto.IndexDescriptor;
 import herddb.indexing.proto.IndexingServiceGrpc;
 import herddb.indexing.proto.ListIndexesRequest;
@@ -38,6 +40,8 @@ import herddb.indexing.proto.PrimaryKeysChunk;
 import herddb.indexing.proto.SearchRequest;
 import herddb.indexing.proto.SearchResponse;
 import herddb.indexing.proto.SearchResult;
+import herddb.indexing.proto.WaitForCheckpointRequest;
+import herddb.indexing.proto.WaitForCheckpointResponse;
 import herddb.log.LogSequenceNumber;
 import herddb.remote.VectorSearchRequestContext;
 import herddb.utils.Bytes;
@@ -73,6 +77,7 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
     private final Counter searchBytes;
     private final Counter statusRequests;
     private final Counter statusErrors;
+    private final Counter shadowNotReadyResponses;
 
     // Per-request readFileRange metrics — populated from VectorSearchRequestContext
     // at the end of every search(). Allow attributing network I/O to an
@@ -95,6 +100,7 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
         this.searchBytes = scope.getCounter("search_bytes");
         this.statusRequests = scope.getCounter("status_requests");
         this.statusErrors = scope.getCounter("status_errors");
+        this.shadowNotReadyResponses = scope.getCounter("shadow_not_ready_responses");
         this.searchReadFileRangeCalls = scope.getCounter("search_readfilerange_calls");
         this.searchReadFileRangeBytes = scope.getCounter("search_readfilerange_bytes");
         this.searchReadFileRangeWaitNanos = scope.getCounter("search_readfilerange_wait_nanos");
@@ -108,8 +114,33 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
         this.searchCacheMissesPerRequest = scope.getOpStatsLogger("search_cache_misses_per_request");
     }
 
+    /**
+     * Short-circuits a query RPC with FAILED_PRECONDITION when this instance
+     * is a shadow replica that has not yet completed its first successful
+     * reload. The description is machine-parseable
+     * ({@code shadow_not_ready:<shadowOf>}) so the HerdDB-side
+     * {@link IndexingServiceClient} can recognise it and fall back to another
+     * endpoint in the same pool.
+     *
+     * @return {@code true} iff the caller should abort the RPC (a NOT_READY
+     *         response has been sent via {@code responseObserver})
+     */
+    private boolean abortIfShadowNotReady(StreamObserver<?> responseObserver) {
+        if (engine.isConfiguredAsShadow() && !engine.isShadowReady()) {
+            shadowNotReadyResponses.inc();
+            responseObserver.onError(Status.FAILED_PRECONDITION
+                    .withDescription("shadow_not_ready:" + engine.getShadowOfOrMinusOne())
+                    .asRuntimeException());
+            return true;
+        }
+        return false;
+    }
+
     @Override
     public void search(SearchRequest request, StreamObserver<SearchResponse> responseObserver) {
+        if (abortIfShadowNotReady(responseObserver)) {
+            return;
+        }
         searchRequests.inc();
         long start = System.nanoTime();
         VectorSearchRequestContext ctx = VectorSearchRequestContext.begin();
@@ -193,6 +224,9 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
 
     @Override
     public void getIndexStatus(GetIndexStatusRequest request, StreamObserver<GetIndexStatusResponse> responseObserver) {
+        if (abortIfShadowNotReady(responseObserver)) {
+            return;
+        }
         statusRequests.inc();
         try {
             IndexingServiceEngine.IndexStatusInfo info = engine.getIndexStatus(
@@ -222,6 +256,9 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
 
     @Override
     public void listIndexes(ListIndexesRequest request, StreamObserver<ListIndexesResponse> responseObserver) {
+        if (abortIfShadowNotReady(responseObserver)) {
+            return;
+        }
         try {
             List<IndexingServiceEngine.IndexDescriptor> indexes = engine.listIndexes();
             ListIndexesResponse.Builder builder = ListIndexesResponse.newBuilder();
@@ -247,6 +284,9 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
 
     @Override
     public void describeIndex(DescribeIndexRequest request, StreamObserver<DescribeIndexResponse> responseObserver) {
+        if (abortIfShadowNotReady(responseObserver)) {
+            return;
+        }
         try {
             IndexingServiceEngine.IndexDetails details = engine.describeIndex(
                     request.getTablespace(),
@@ -304,6 +344,9 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
     @Override
     public void listPrimaryKeys(ListPrimaryKeysRequest request,
                                  StreamObserver<PrimaryKeysChunk> responseObserver) {
+        if (abortIfShadowNotReady(responseObserver)) {
+            return;
+        }
         try {
             int chunkSize = request.getChunkSize() > 0 ? request.getChunkSize() : DEFAULT_PK_CHUNK_SIZE;
             if (chunkSize > MAX_PK_CHUNK_SIZE) {
@@ -414,6 +457,11 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     ? cfg.getInt(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES,
                             IndexingServerConfiguration.PROPERTY_NUM_INSTANCES_DEFAULT)
                     : 1;
+            String role = cfg != null
+                    ? cfg.getString(IndexingServerConfiguration.PROPERTY_ROLE,
+                            IndexingServerConfiguration.PROPERTY_ROLE_DEFAULT)
+                    : IndexingServerConfiguration.ROLE_PRIMARY;
+            int shadowOf = engine.getShadowOfOrMinusOne();
             GetInstanceInfoResponse response = GetInstanceInfoResponse.newBuilder()
                     .setInstanceId(nullToEmpty(engine.getInstanceIdLabel()))
                     .setGrpcHost(nullToEmpty(grpcHost))
@@ -425,6 +473,8 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setTablespaceUuid(nullToEmpty(engine.getTableSpaceUUID()))
                     .setInstanceOrdinal(instanceOrdinal)
                     .setNumInstances(numInstances)
+                    .setRole(role)
+                    .setShadowOf(engine.isConfiguredAsShadow() ? shadowOf : -1)
                     .build();
             responseObserver.onNext(response);
             responseObserver.onCompleted();
@@ -439,5 +489,98 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
 
     private static String nullToEmpty(String s) {
         return s == null ? "" : s;
+    }
+
+    @Override
+    public void getShadowStatus(GetShadowStatusRequest request,
+                                 StreamObserver<GetShadowStatusResponse> responseObserver) {
+        // Diagnostic — never gated by the NOT_READY shadow check.
+        try {
+            LogSequenceNumber loaded = engine.getShadowLoadedLsn();
+            LogSequenceNumber advertised = engine.getPrimaryAdvertisedLsn();
+            GetShadowStatusResponse.Builder b = GetShadowStatusResponse.newBuilder()
+                    .setIsShadow(engine.isConfiguredAsShadow())
+                    .setShadowOf(engine.isConfiguredAsShadow() ? engine.getShadowOfOrMinusOne() : -1)
+                    .setReady(engine.isConfiguredAsShadow() ? engine.isShadowReady() : true)
+                    .setLoadedLedgerId(loaded != null ? loaded.ledgerId : -1L)
+                    .setLoadedOffset(loaded != null ? loaded.offset : -1L)
+                    .setPrimaryAdvertisedLedgerId(advertised != null ? advertised.ledgerId : -1L)
+                    .setPrimaryAdvertisedOffset(advertised != null ? advertised.offset : -1L)
+                    .setLastReloadTimestampMs(engine.getShadowLastReloadTimestampMs())
+                    .setReloadCount(engine.getShadowReloadCount());
+            responseObserver.onNext(b.build());
+            responseObserver.onCompleted();
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.SEVERE, "GetShadowStatus failed", e);
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(e.getMessage())
+                    .withCause(e)
+                    .asRuntimeException());
+        }
+    }
+
+    @Override
+    public void waitForCheckpoint(WaitForCheckpointRequest request,
+                                   StreamObserver<WaitForCheckpointResponse> responseObserver) {
+        // Signal-based polling every 200ms; honours both the gRPC deadline and
+        // the explicit timeout_ms. Always diagnostic — not gated by NOT_READY.
+        long requestTimeoutMs = request.getTimeoutMs();
+        long deadlineMs = requestTimeoutMs > 0
+                ? System.currentTimeMillis() + requestTimeoutMs
+                : Long.MAX_VALUE;
+        LogSequenceNumber target = new LogSequenceNumber(
+                request.getTargetLedgerId(), request.getTargetOffset());
+        try {
+            while (true) {
+                LogSequenceNumber current = currentLoadedLsnForRequest(request);
+                if (current != null && (current.equals(target) || current.after(target))) {
+                    responseObserver.onNext(buildWaitResponse(current, true));
+                    responseObserver.onCompleted();
+                    return;
+                }
+                long now = System.currentTimeMillis();
+                if (now >= deadlineMs) {
+                    responseObserver.onNext(buildWaitResponse(
+                            current == null ? LogSequenceNumber.START_OF_TIME : current, false));
+                    responseObserver.onCompleted();
+                    return;
+                }
+                long sleepMs = Math.min(200L, deadlineMs - now);
+                try {
+                    Thread.sleep(sleepMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    responseObserver.onError(Status.CANCELLED
+                            .withDescription("interrupted").asRuntimeException());
+                    return;
+                }
+            }
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.SEVERE, "WaitForCheckpoint failed", e);
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(e.getMessage())
+                    .withCause(e)
+                    .asRuntimeException());
+        }
+    }
+
+    /**
+     * Returns the LSN to compare against the target for WaitForCheckpoint:
+     * for shadows it's the shadow's loaded LSN (the point on disk the shadow
+     * is currently serving); for primaries it's the engine's lastProcessedLsn.
+     */
+    private LogSequenceNumber currentLoadedLsnForRequest(WaitForCheckpointRequest request) {
+        if (engine.isConfiguredAsShadow()) {
+            return engine.getShadowLoadedLsn();
+        }
+        return engine.getLastProcessedLsn();
+    }
+
+    private static WaitForCheckpointResponse buildWaitResponse(LogSequenceNumber cur, boolean reached) {
+        return WaitForCheckpointResponse.newBuilder()
+                .setCurrentLedgerId(cur.ledgerId)
+                .setCurrentOffset(cur.offset)
+                .setReached(reached)
+                .build();
     }
 }

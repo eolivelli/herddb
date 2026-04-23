@@ -62,23 +62,28 @@ public class ZKServiceDiscoveryTest {
                 testEnv.getAddress(), testEnv.getTimeout(), testEnv.getPath())) {
             manager.start();
 
-            assertTrue(manager.listIndexingServices().isEmpty());
+            assertTrue(manager.listIndexingServiceInstances().isEmpty());
 
-            manager.registerIndexingService("svc1", "localhost:9850");
-            List<String> services = manager.listIndexingServices();
+            manager.registerIndexingServiceInstance(
+                    herddb.metadata.IndexingServiceInstanceDescriptor.primary(
+                            "svc1", "localhost:9850", 0));
+            List<herddb.metadata.IndexingServiceInstanceDescriptor> services =
+                    manager.listIndexingServiceInstances();
             assertEquals(1, services.size());
-            assertEquals("localhost:9850", services.get(0));
+            assertEquals("localhost:9850", services.get(0).getAddress());
 
-            manager.registerIndexingService("svc2", "localhost:9851");
-            services = manager.listIndexingServices();
+            manager.registerIndexingServiceInstance(
+                    herddb.metadata.IndexingServiceInstanceDescriptor.primary(
+                            "svc2", "localhost:9851", 1));
+            services = manager.listIndexingServiceInstances();
             assertEquals(2, services.size());
-            assertTrue(services.contains("localhost:9850"));
-            assertTrue(services.contains("localhost:9851"));
+            assertTrue(services.stream().anyMatch(d -> "localhost:9850".equals(d.getAddress())));
+            assertTrue(services.stream().anyMatch(d -> "localhost:9851".equals(d.getAddress())));
 
-            manager.unregisterIndexingService("svc1");
-            services = manager.listIndexingServices();
+            manager.unregisterIndexingServiceInstance("svc1");
+            services = manager.listIndexingServiceInstances();
             assertEquals(1, services.size());
-            assertEquals("localhost:9851", services.get(0));
+            assertEquals("localhost:9851", services.get(0).getAddress());
         }
     }
 
@@ -107,12 +112,14 @@ public class ZKServiceDiscoveryTest {
             manager.start();
 
             CountDownLatch latch = new CountDownLatch(1);
-            List<String> receivedAddresses = new CopyOnWriteArrayList<>();
+            List<herddb.metadata.IndexingServiceInstanceDescriptor> received =
+                    new CopyOnWriteArrayList<>();
 
             manager.addServiceDiscoveryListener(new ServiceDiscoveryListener() {
                 @Override
-                public void onIndexingServicesChanged(List<String> currentAddresses) {
-                    receivedAddresses.addAll(currentAddresses);
+                public void onIndexingServiceInstancesChanged(
+                        List<herddb.metadata.IndexingServiceInstanceDescriptor> current) {
+                    received.addAll(current);
                     latch.countDown();
                 }
                 @Override
@@ -121,13 +128,15 @@ public class ZKServiceDiscoveryTest {
             });
 
             // First call installs the watch
-            manager.listIndexingServices();
+            manager.listIndexingServiceInstances();
 
             // This should trigger the watcher
-            manager.registerIndexingService("svc1", "localhost:9850");
+            manager.registerIndexingServiceInstance(
+                    herddb.metadata.IndexingServiceInstanceDescriptor.primary(
+                            "svc1", "localhost:9850", 0));
 
             assertTrue("Listener should be notified", latch.await(10, TimeUnit.SECONDS));
-            assertTrue(receivedAddresses.contains("localhost:9850"));
+            assertTrue(received.stream().anyMatch(d -> "localhost:9850".equals(d.getAddress())));
         }
     }
 
@@ -137,13 +146,15 @@ public class ZKServiceDiscoveryTest {
         ZookeeperMetadataStorageManager manager1 = new ZookeeperMetadataStorageManager(
                 testEnv.getAddress(), testEnv.getTimeout(), testEnv.getPath());
         manager1.start();
-        manager1.registerIndexingService("svc1", "localhost:9850");
+        manager1.registerIndexingServiceInstance(
+                herddb.metadata.IndexingServiceInstanceDescriptor.primary(
+                        "svc1", "localhost:9850", 0));
 
         // Manager 2 sees it
         try (ZookeeperMetadataStorageManager manager2 = new ZookeeperMetadataStorageManager(
                 testEnv.getAddress(), testEnv.getTimeout(), testEnv.getPath())) {
             manager2.start();
-            assertEquals(1, manager2.listIndexingServices().size());
+            assertEquals(1, manager2.listIndexingServiceInstances().size());
 
             // Close manager1 - ephemeral node should disappear
             manager1.close();
@@ -151,8 +162,8 @@ public class ZKServiceDiscoveryTest {
             // Wait for ZK to detect session close
             Thread.sleep(2000);
 
-            List<String> services = manager2.listIndexingServices();
-            assertTrue("Ephemeral node should be gone after close", services.isEmpty());
+            assertTrue("Ephemeral node should be gone after close",
+                    manager2.listIndexingServiceInstances().isEmpty());
         }
     }
 }

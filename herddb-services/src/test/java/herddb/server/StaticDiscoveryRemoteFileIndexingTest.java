@@ -119,8 +119,8 @@ public class StaticDiscoveryRemoteFileIndexingTest {
                         engine.start();
 
                         // Wire IndexingServiceClient to the server
-                        IndexingServiceClient client = new IndexingServiceClient(
-                                Arrays.asList(indexingServer.getAddress()));
+                        IndexingServiceClient client = IndexingServiceClient.fromAddresses(
+                                Arrays.asList(indexingServer.getAddress()), 30);
                         server.getManager().setRemoteVectorIndexService(client);
 
                         try {

@@ -60,7 +60,7 @@ public class IndexingServiceOidcTest {
 
                 OidcConfiguration cfg = new OidcConfiguration(idp.getIssuerUrl()).discover();
                 OidcTokenProvider tp = new OidcTokenProvider(cfg, "index-client", "secret", null);
-                IndexingServiceClient client = new IndexingServiceClient(
+                IndexingServiceClient client = IndexingServiceClient.fromAddresses(
                         Arrays.asList(svc.getAddress()),
                         30,
                         new JwtAuthClientInterceptor(() -> {
@@ -90,8 +90,8 @@ public class IndexingServiceOidcTest {
                     oidcConfig(idp))) {
                 svc.start();
 
-                IndexingServiceClient client = new IndexingServiceClient(
-                        Arrays.asList(svc.getAddress()));
+                IndexingServiceClient client = IndexingServiceClient.fromAddresses(
+                        Arrays.asList(svc.getAddress()), 30);
                 try {
                     client.getIndexStatus("default", "t", "i");
                     fail("expected UNAUTHENTICATED");
@@ -113,7 +113,7 @@ public class IndexingServiceOidcTest {
                     oidcConfig(idp))) {
                 svc.start();
 
-                IndexingServiceClient client = new IndexingServiceClient(
+                IndexingServiceClient client = IndexingServiceClient.fromAddresses(
                         Arrays.asList(svc.getAddress()),
                         30,
                         new JwtAuthClientInterceptor(() -> "invalid.jwt.here"));

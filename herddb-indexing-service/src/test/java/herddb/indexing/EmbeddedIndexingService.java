@@ -112,7 +112,7 @@ public class EmbeddedIndexingService implements AutoCloseable {
     }
 
     public IndexingServiceClient createClient() {
-        return new IndexingServiceClient(Arrays.asList(getAddress()));
+        return IndexingServiceClient.fromAddresses(Arrays.asList(getAddress()), 30);
     }
 
     @Override
