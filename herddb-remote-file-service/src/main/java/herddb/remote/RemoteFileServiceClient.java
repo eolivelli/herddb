@@ -39,6 +39,7 @@ import herddb.remote.proto.WriteFileRequest;
 import herddb.remote.proto.WriteFileResponse;
 import herddb.server.RemoteFileClient;
 import io.grpc.ClientInterceptor;
+import io.grpc.Context;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
@@ -62,6 +63,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
@@ -210,6 +212,27 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                 .withMaxOutboundMessageSize(CHANNEL_MAX_MESSAGE_SIZE);
     }
 
+    /**
+     * Runs {@code action} under {@link Context#ROOT} so any gRPC stub built and
+     * invoked inside it does not inherit a deadline from the caller's current
+     * {@link Context}. gRPC resolves the effective deadline as the minimum of
+     * the stub deadline set via {@code .withDeadlineAfter(...)} and the
+     * propagated context deadline — without detaching, an incoming 600 s search
+     * RPC on the Indexing Service would clamp every downstream readFileRange
+     * call to whatever remained on that context, causing
+     * {@code DEADLINE_EXCEEDED: context timed out} on large segment loads
+     * (issue #242). Detaching gives each client call the full
+     * {@code clientTimeoutSeconds} budget configured on the stub.
+     */
+    private static <T> T runDetached(Supplier<T> action) {
+        Context previous = Context.ROOT.attach();
+        try {
+            return action.get();
+        } finally {
+            Context.ROOT.detach(previous);
+        }
+    }
+
     @Override
     public synchronized void updateServers(List<String> newServers) {
         if (newServers.isEmpty()) {
@@ -344,38 +367,40 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
     private CompletableFuture<Long> writeFileAsync(String path, ByteString content) {
         // Writes are not idempotent — no retry
-        CompletableFuture<Long> future = new CompletableFuture<>();
-        RemoteFileServiceGrpc.RemoteFileServiceStub stub;
-        try {
-            stub = writeStubForPath(path);
-        } catch (Exception e) {
-            future.completeExceptionally(e);
+        return runDetached(() -> {
+            CompletableFuture<Long> future = new CompletableFuture<>();
+            RemoteFileServiceGrpc.RemoteFileServiceStub stub;
+            try {
+                stub = writeStubForPath(path);
+            } catch (Exception e) {
+                future.completeExceptionally(e);
+                return future;
+            }
+            stub.writeFile(
+                    WriteFileRequest.newBuilder()
+                            .setPath(path)
+                            .setContent(content)
+                            .build(),
+                    new StreamObserver<WriteFileResponse>() {
+                        private long writtenSize;
+
+                        @Override
+                        public void onNext(WriteFileResponse response) {
+                            writtenSize = response.getWrittenSize();
+                        }
+
+                        @Override
+                        public void onError(Throwable t) {
+                            future.completeExceptionally(t);
+                        }
+
+                        @Override
+                        public void onCompleted() {
+                            future.complete(writtenSize);
+                        }
+                    });
             return future;
-        }
-        stub.writeFile(
-                WriteFileRequest.newBuilder()
-                        .setPath(path)
-                        .setContent(content)
-                        .build(),
-                new StreamObserver<WriteFileResponse>() {
-                    private long writtenSize;
-
-                    @Override
-                    public void onNext(WriteFileResponse response) {
-                        writtenSize = response.getWrittenSize();
-                    }
-
-                    @Override
-                    public void onError(Throwable t) {
-                        future.completeExceptionally(t);
-                    }
-
-                    @Override
-                    public void onCompleted() {
-                        future.complete(writtenSize);
-                    }
-                });
-        return future;
+        });
     }
 
     public CompletableFuture<byte[]> readFileAsync(String path) {
@@ -383,30 +408,32 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     private CompletableFuture<byte[]> doReadFileAsync(String path) {
-        CompletableFuture<byte[]> future = new CompletableFuture<>();
-        readStubForPath(path).readFile(
-                ReadFileRequest.newBuilder().setPath(path).build(),
-                new StreamObserver<ReadFileResponse>() {
-                    private byte[] result;
+        return runDetached(() -> {
+            CompletableFuture<byte[]> future = new CompletableFuture<>();
+            readStubForPath(path).readFile(
+                    ReadFileRequest.newBuilder().setPath(path).build(),
+                    new StreamObserver<ReadFileResponse>() {
+                        private byte[] result;
 
-                    @Override
-                    public void onNext(ReadFileResponse response) {
-                        if (response.getFound()) {
-                            result = response.getContent().toByteArray();
+                        @Override
+                        public void onNext(ReadFileResponse response) {
+                            if (response.getFound()) {
+                                result = response.getContent().toByteArray();
+                            }
                         }
-                    }
 
-                    @Override
-                    public void onError(Throwable t) {
-                        future.completeExceptionally(t);
-                    }
+                        @Override
+                        public void onError(Throwable t) {
+                            future.completeExceptionally(t);
+                        }
 
-                    @Override
-                    public void onCompleted() {
-                        future.complete(result);
-                    }
-                });
-        return future;
+                        @Override
+                        public void onCompleted() {
+                            future.complete(result);
+                        }
+                    });
+            return future;
+        });
     }
 
     /**
@@ -418,41 +445,43 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     private CompletableFuture<ByteBuf> doReadFileAsByteBufAsync(String path) {
-        CompletableFuture<ByteBuf> future = new CompletableFuture<>();
-        readStubForPath(path).readFile(
-                ReadFileRequest.newBuilder().setPath(path).build(),
-                new StreamObserver<ReadFileResponse>() {
-                    private ByteBuf result;
+        return runDetached(() -> {
+            CompletableFuture<ByteBuf> future = new CompletableFuture<>();
+            readStubForPath(path).readFile(
+                    ReadFileRequest.newBuilder().setPath(path).build(),
+                    new StreamObserver<ReadFileResponse>() {
+                        private ByteBuf result;
 
-                    @Override
-                    public void onNext(ReadFileResponse response) {
-                        if (response.getFound()) {
-                            ByteString content = response.getContent();
-                            int size = content.size();
-                            ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(size);
-                            // Single copy from the protobuf LiteralByteString into the
-                            // pooled direct buffer; matches doReadFileRangeAsByteBufAsync.
-                            content.copyTo(buf.nioBuffer(0, size));
-                            buf.writerIndex(size);
-                            result = buf;
+                        @Override
+                        public void onNext(ReadFileResponse response) {
+                            if (response.getFound()) {
+                                ByteString content = response.getContent();
+                                int size = content.size();
+                                ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(size);
+                                // Single copy from the protobuf LiteralByteString into the
+                                // pooled direct buffer; matches doReadFileRangeAsByteBufAsync.
+                                content.copyTo(buf.nioBuffer(0, size));
+                                buf.writerIndex(size);
+                                result = buf;
+                            }
                         }
-                    }
 
-                    @Override
-                    public void onError(Throwable t) {
-                        if (result != null) {
-                            result.release();
-                            result = null;
+                        @Override
+                        public void onError(Throwable t) {
+                            if (result != null) {
+                                result.release();
+                                result = null;
+                            }
+                            future.completeExceptionally(t);
                         }
-                        future.completeExceptionally(t);
-                    }
 
-                    @Override
-                    public void onCompleted() {
-                        future.complete(result);
-                    }
-                });
-        return future;
+                        @Override
+                        public void onCompleted() {
+                            future.complete(result);
+                        }
+                    });
+            return future;
+        });
     }
 
     public CompletableFuture<Boolean> deleteFileAsync(String path) {
@@ -460,28 +489,30 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     private CompletableFuture<Boolean> doDeleteFileAsync(String path) {
-        CompletableFuture<Boolean> future = new CompletableFuture<>();
-        writeStubForPath(path).deleteFile(
-                DeleteFileRequest.newBuilder().setPath(path).build(),
-                new StreamObserver<DeleteFileResponse>() {
-                    private boolean deleted;
+        return runDetached(() -> {
+            CompletableFuture<Boolean> future = new CompletableFuture<>();
+            writeStubForPath(path).deleteFile(
+                    DeleteFileRequest.newBuilder().setPath(path).build(),
+                    new StreamObserver<DeleteFileResponse>() {
+                        private boolean deleted;
 
-                    @Override
-                    public void onNext(DeleteFileResponse response) {
-                        deleted = response.getDeleted();
-                    }
+                        @Override
+                        public void onNext(DeleteFileResponse response) {
+                            deleted = response.getDeleted();
+                        }
 
-                    @Override
-                    public void onError(Throwable t) {
-                        future.completeExceptionally(t);
-                    }
+                        @Override
+                        public void onError(Throwable t) {
+                            future.completeExceptionally(t);
+                        }
 
-                    @Override
-                    public void onCompleted() {
-                        future.complete(deleted);
-                    }
-                });
-        return future;
+                        @Override
+                        public void onCompleted() {
+                            future.complete(deleted);
+                        }
+                    });
+            return future;
+        });
     }
 
     public CompletableFuture<List<String>> listFilesAsync(String prefix) {
@@ -489,42 +520,44 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     private CompletableFuture<List<String>> doListFilesAsync(String prefix) {
-        ServerSnapshot s = this.snapshot;
-        List<CompletableFuture<List<String>>> futures = new ArrayList<>();
-        for (String server : s.readChannels.keySet()) {
-            RemoteFileServiceGrpc.RemoteFileServiceStub stub = readStubForServer(server);
-            CompletableFuture<List<String>> serverFuture = new CompletableFuture<>();
-            List<String> paths = Collections.synchronizedList(new ArrayList<>());
-            stub.listFiles(
-                    ListFilesRequest.newBuilder().setPrefix(prefix).build(),
-                    new StreamObserver<ListFilesEntry>() {
-                        @Override
-                        public void onNext(ListFilesEntry entry) {
-                            paths.add(entry.getPath());
-                        }
+        return runDetached(() -> {
+            ServerSnapshot s = this.snapshot;
+            List<CompletableFuture<List<String>>> futures = new ArrayList<>();
+            for (String server : s.readChannels.keySet()) {
+                RemoteFileServiceGrpc.RemoteFileServiceStub stub = readStubForServer(server);
+                CompletableFuture<List<String>> serverFuture = new CompletableFuture<>();
+                List<String> paths = Collections.synchronizedList(new ArrayList<>());
+                stub.listFiles(
+                        ListFilesRequest.newBuilder().setPrefix(prefix).build(),
+                        new StreamObserver<ListFilesEntry>() {
+                            @Override
+                            public void onNext(ListFilesEntry entry) {
+                                paths.add(entry.getPath());
+                            }
 
-                        @Override
-                        public void onError(Throwable t) {
-                            serverFuture.completeExceptionally(t);
-                        }
+                            @Override
+                            public void onError(Throwable t) {
+                                serverFuture.completeExceptionally(t);
+                            }
 
-                        @Override
-                        public void onCompleted() {
-                            serverFuture.complete(paths);
+                            @Override
+                            public void onCompleted() {
+                                serverFuture.complete(paths);
+                            }
+                        });
+                futures.add(serverFuture);
+            }
+            return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .thenApply(v -> {
+                        // Deduplicate: multiple servers may return the same logical path
+                        // for different blocks of the same multipart file
+                        LinkedHashSet<String> seen = new LinkedHashSet<>();
+                        for (CompletableFuture<List<String>> f : futures) {
+                            seen.addAll(f.join());
                         }
+                        return new ArrayList<>(seen);
                     });
-            futures.add(serverFuture);
-        }
-        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                .thenApply(v -> {
-                    // Deduplicate: multiple servers may return the same logical path
-                    // for different blocks of the same multipart file
-                    LinkedHashSet<String> seen = new LinkedHashSet<>();
-                    for (CompletableFuture<List<String>> f : futures) {
-                        seen.addAll(f.join());
-                    }
-                    return new ArrayList<>(seen);
-                });
+        });
     }
 
     /**
@@ -532,29 +565,31 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
      * Routes via consistent hash of {@code path#block{blockIndex}}.
      */
     public CompletableFuture<Void> writeFileBlockAsync(String path, long blockIndex, byte[] content) {
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        writeStubForBlock(path, blockIndex).writeFileBlock(
-                WriteFileBlockRequest.newBuilder()
-                        .setPath(path)
-                        .setBlockIndex(blockIndex)
-                        .setContent(UnsafeByteOperations.unsafeWrap(content))
-                        .build(),
-                new StreamObserver<WriteFileBlockResponse>() {
-                    @Override
-                    public void onNext(WriteFileBlockResponse response) {
-                    }
+        return runDetached(() -> {
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            writeStubForBlock(path, blockIndex).writeFileBlock(
+                    WriteFileBlockRequest.newBuilder()
+                            .setPath(path)
+                            .setBlockIndex(blockIndex)
+                            .setContent(UnsafeByteOperations.unsafeWrap(content))
+                            .build(),
+                    new StreamObserver<WriteFileBlockResponse>() {
+                        @Override
+                        public void onNext(WriteFileBlockResponse response) {
+                        }
 
-                    @Override
-                    public void onError(Throwable t) {
-                        future.completeExceptionally(t);
-                    }
+                        @Override
+                        public void onError(Throwable t) {
+                            future.completeExceptionally(t);
+                        }
 
-                    @Override
-                    public void onCompleted() {
-                        future.complete(null);
-                    }
-                });
-        return future;
+                        @Override
+                        public void onCompleted() {
+                            future.complete(null);
+                        }
+                    });
+            return future;
+        });
     }
 
     /**
@@ -567,29 +602,31 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                 ? UnsafeByteOperations.unsafeWrap(content.array(),
                         content.arrayOffset() + content.readerIndex(), content.readableBytes())
                 : UnsafeByteOperations.unsafeWrap(content.nioBuffer());
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        writeStubForBlock(path, blockIndex).writeFileBlock(
-                WriteFileBlockRequest.newBuilder()
-                        .setPath(path)
-                        .setBlockIndex(blockIndex)
-                        .setContent(bs)
-                        .build(),
-                new StreamObserver<WriteFileBlockResponse>() {
-                    @Override
-                    public void onNext(WriteFileBlockResponse response) {
-                    }
+        return runDetached(() -> {
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            writeStubForBlock(path, blockIndex).writeFileBlock(
+                    WriteFileBlockRequest.newBuilder()
+                            .setPath(path)
+                            .setBlockIndex(blockIndex)
+                            .setContent(bs)
+                            .build(),
+                    new StreamObserver<WriteFileBlockResponse>() {
+                        @Override
+                        public void onNext(WriteFileBlockResponse response) {
+                        }
 
-                    @Override
-                    public void onError(Throwable t) {
-                        future.completeExceptionally(t);
-                    }
+                        @Override
+                        public void onError(Throwable t) {
+                            future.completeExceptionally(t);
+                        }
 
-                    @Override
-                    public void onCompleted() {
-                        future.complete(null);
-                    }
-                });
-        return future;
+                        @Override
+                        public void onCompleted() {
+                            future.complete(null);
+                        }
+                    });
+            return future;
+        });
     }
 
     /**
@@ -628,7 +665,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     private CompletableFuture<byte[]> doReadFileRangeAsync(String path, long offset, int length, int blockSize) {
-        return retryAsync(() -> {
+        return retryAsync(() -> runDetached(() -> {
             long blockIndex = offset / blockSize;
             CompletableFuture<byte[]> future = new CompletableFuture<>();
             readStubForBlock(path, blockIndex).readFileRange(
@@ -670,7 +707,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                         }
                     });
             return future;
-        }, "readFileRange", path, 0);
+        }), "readFileRange", path, 0);
     }
 
     /**
@@ -727,7 +764,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
     private CompletableFuture<ByteBuf> doReadFileRangeAsByteBufAsync(String path, long offset,
                                                                     int length, int blockSize) {
-        return retryAsync(() -> {
+        return retryAsync(() -> runDetached(() -> {
             long blockIndex = offset / blockSize;
             CompletableFuture<ByteBuf> future = new CompletableFuture<>();
             readStubForBlock(path, blockIndex).readFileRange(
@@ -791,7 +828,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                         }
                     });
             return future;
-        }, "readFileRange", path, 0);
+        }), "readFileRange", path, 0);
     }
 
     /**
@@ -837,41 +874,43 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     private CompletableFuture<Integer> doDeleteByPrefixAsync(String prefix) {
-        ServerSnapshot s = this.snapshot;
-        List<CompletableFuture<Integer>> futures = new ArrayList<>();
-        for (String server : s.writeChannels.keySet()) {
-            RemoteFileServiceGrpc.RemoteFileServiceStub stub = writeStubForServer(server);
-            CompletableFuture<Integer> serverFuture = new CompletableFuture<>();
-            stub.deleteByPrefix(
-                    DeleteByPrefixRequest.newBuilder().setPrefix(prefix).build(),
-                    new StreamObserver<DeleteByPrefixResponse>() {
-                        private int count;
+        return runDetached(() -> {
+            ServerSnapshot s = this.snapshot;
+            List<CompletableFuture<Integer>> futures = new ArrayList<>();
+            for (String server : s.writeChannels.keySet()) {
+                RemoteFileServiceGrpc.RemoteFileServiceStub stub = writeStubForServer(server);
+                CompletableFuture<Integer> serverFuture = new CompletableFuture<>();
+                stub.deleteByPrefix(
+                        DeleteByPrefixRequest.newBuilder().setPrefix(prefix).build(),
+                        new StreamObserver<DeleteByPrefixResponse>() {
+                            private int count;
 
-                        @Override
-                        public void onNext(DeleteByPrefixResponse response) {
-                            count = response.getDeletedCount();
-                        }
+                            @Override
+                            public void onNext(DeleteByPrefixResponse response) {
+                                count = response.getDeletedCount();
+                            }
 
-                        @Override
-                        public void onError(Throwable t) {
-                            serverFuture.completeExceptionally(t);
-                        }
+                            @Override
+                            public void onError(Throwable t) {
+                                serverFuture.completeExceptionally(t);
+                            }
 
-                        @Override
-                        public void onCompleted() {
-                            serverFuture.complete(count);
+                            @Override
+                            public void onCompleted() {
+                                serverFuture.complete(count);
+                            }
+                        });
+                futures.add(serverFuture);
+            }
+            return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .thenApply(v -> {
+                        int total = 0;
+                        for (CompletableFuture<Integer> f : futures) {
+                            total += f.join();
                         }
+                        return total;
                     });
-            futures.add(serverFuture);
-        }
-        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                .thenApply(v -> {
-                    int total = 0;
-                    for (CompletableFuture<Integer> f : futures) {
-                        total += f.join();
-                    }
-                    return total;
-                });
+        });
     }
 
     // --- Synchronous APIs (wrappers around async) ---
