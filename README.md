@@ -29,7 +29,6 @@ components:
 | Apache BookKeeper | Distributed, replicated, low-latency commit log | `4.17.3` | https://bookkeeper.apache.org |
 | Apache ZooKeeper | Cluster metadata, tablespace leader election, instance discovery | `3.9.3` | https://zookeeper.apache.org |
 | Apache Calcite | SQL parser and cost-based query planner | `1.40.0` | https://calcite.apache.org |
-| AWS SDK for Java v2 | S3 / S3-compatible object storage client | `2.42.34` | https://aws.amazon.com/sdk-for-java/ |
 
 All of these are battle-tested in production at other projects; this
 repository glues them together rather than re-implementing them.
