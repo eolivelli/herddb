@@ -1832,6 +1832,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             for (int j = i + 1; j < futures.size(); j++) {
                                 futures.get(j).cancel(true);
                             }
+                        } catch (java.util.concurrent.CancellationException ce) {
+                            // A later future was cancelled after an earlier failure in
+                            // this loop. If firstFailure is already set we keep the real
+                            // cause; only record CancellationException as a last-resort
+                            // fallback (e.g. if the executor itself was shut down).
+                            // Without this branch, CancellationException would propagate
+                            // out of futures.get(i).get() and mask the real root cause
+                            // (see issue #234).
+                            if (firstFailure == null) {
+                                firstFailure = ce;
+                            }
                         } catch (InterruptedException ie) {
                             Thread.currentThread().interrupt();
                             if (firstFailure == null) {
@@ -2195,6 +2206,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     }
                     for (int j = i + 1; j < futures.size(); j++) {
                         futures.get(j).cancel(true);
+                    }
+                } catch (java.util.concurrent.CancellationException ce) {
+                    // Subsequent future was cancelled after an earlier failure; keep
+                    // firstFailure pointing at the real cause. See issue #234.
+                    if (firstFailure == null) {
+                        firstFailure = ce;
                     }
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
