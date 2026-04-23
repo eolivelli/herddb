@@ -25,9 +25,12 @@ import herddb.indexing.proto.DescribeIndexResponse;
 import herddb.indexing.proto.GetEngineStatsResponse;
 import herddb.indexing.proto.GetIndexStatusResponse;
 import herddb.indexing.proto.GetInstanceInfoResponse;
+import herddb.indexing.proto.GetShadowStatusResponse;
 import herddb.indexing.proto.IndexDescriptor;
 import herddb.indexing.proto.ListIndexesResponse;
 import herddb.indexing.proto.PrimaryKeysChunk;
+import herddb.indexing.proto.WaitForCheckpointResponse;
+import herddb.metadata.IndexingServiceInstanceDescriptor;
 import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -76,6 +79,9 @@ public final class IndexingAdminCli {
     static final String COMMAND_LIST_PKS = "list-pks";
     static final String COMMAND_ENGINE_STATS = "engine-stats";
     static final String COMMAND_INSTANCE_INFO = "instance-info";
+    static final String COMMAND_LIST_SHADOWS = "list-shadows";
+    static final String COMMAND_SHADOW_STATUS = "shadow-status";
+    static final String COMMAND_WAIT_SHADOW = "wait-shadow";
 
     private final PrintStream out;
     private final PrintStream err;
@@ -117,6 +123,12 @@ public final class IndexingAdminCli {
                     return runEngineStats(rest);
                 case COMMAND_INSTANCE_INFO:
                     return runInstanceInfo(rest);
+                case COMMAND_LIST_SHADOWS:
+                    return runListShadows(rest);
+                case COMMAND_SHADOW_STATUS:
+                    return runShadowStatus(rest);
+                case COMMAND_WAIT_SHADOW:
+                    return runWaitShadow(rest);
                 default:
                     err.println("Unknown command: " + command);
                     printUsage();
@@ -145,6 +157,9 @@ public final class IndexingAdminCli {
         out.println("  list-pks         Stream the list of primary keys for an index");
         out.println("  engine-stats     Tailer / apply / memory stats of one instance");
         out.println("  instance-info    Config / identity / heap snapshot of one instance");
+        out.println("  list-shadows     Read ZooKeeper and print registered shadow replicas");
+        out.println("  shadow-status    Print shadow-replica catch-up state of one instance");
+        out.println("  wait-shadow      Block until an instance has caught up to a target LSN");
         out.println();
         out.println("Run 'indexing-admin <command> --help' for command-specific flags.");
     }
@@ -565,5 +580,143 @@ public final class IndexingAdminCli {
             out[i * 2 + 1] = hex[b & 0x0f];
         }
         return new String(out);
+    }
+
+    // -----------------------------------------------------------------
+    // Shadow-replica commands (step 8)
+    // -----------------------------------------------------------------
+
+    private int runListShadows(String[] args) throws Exception {
+        Options opts = new Options();
+        addCommonOptions(opts);
+        opts.addOption(Option.builder().longOpt("zookeeper").hasArg().argName("HOST:PORT")
+                .desc("ZooKeeper connect string (required)").required().build());
+        opts.addOption(Option.builder().longOpt("zk-path").hasArg().argName("PATH")
+                .desc("ZooKeeper base path (default /herddb)").build());
+        opts.addOption(Option.builder().longOpt("zk-session-timeout-ms").hasArg().argName("MS")
+                .desc("ZooKeeper session timeout (default 10000)").build());
+        opts.addOption(Option.builder().longOpt("of").hasArg().argName("INSTANCE_ID")
+                .desc("Optional filter: only shadows of this primary instanceId").build());
+
+        CommandLine cli = parse(opts, args, COMMAND_LIST_SHADOWS);
+        if (cli == null) {
+            return 0;
+        }
+        String zk = cli.getOptionValue("zookeeper");
+        String zkPath = cli.getOptionValue("zk-path", "/herddb");
+        int sessionTimeout = Integer.parseInt(cli.getOptionValue("zk-session-timeout-ms", "10000"));
+        Integer filterOf = cli.hasOption("of") ? Integer.parseInt(cli.getOptionValue("of")) : null;
+
+        List<IndexingServiceInstanceDescriptor> all =
+                ZkInstanceDiscovery.listInstanceDescriptors(zk, zkPath, sessionTimeout);
+        List<IndexingServiceInstanceDescriptor> shadows = new ArrayList<>();
+        for (IndexingServiceInstanceDescriptor d : all) {
+            if (!d.isShadow()) {
+                continue;
+            }
+            if (filterOf != null && d.getShadowOf() != filterOf.intValue()) {
+                continue;
+            }
+            shadows.add(d);
+        }
+
+        if (cli.hasOption("json")) {
+            List<Map<String, Object>> rows = new ArrayList<>();
+            for (IndexingServiceInstanceDescriptor d : shadows) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("serviceId", d.getServiceId());
+                row.put("address", d.getAddress());
+                row.put("role", d.getRole());
+                row.put("shadowOf", d.getShadowOf());
+                rows.add(row);
+            }
+            out.println(JsonWriter.toJson(rows));
+        } else {
+            if (shadows.isEmpty()) {
+                out.println("(no shadow replicas registered"
+                        + (filterOf != null ? " for primary " + filterOf : "") + ")");
+            } else {
+                out.printf(Locale.ROOT, "%-32s %-24s %-12s%n", "SERVICE_ID", "ADDRESS", "SHADOW_OF");
+                for (IndexingServiceInstanceDescriptor d : shadows) {
+                    out.printf(Locale.ROOT, "%-32s %-24s %-12d%n",
+                            d.getServiceId(), d.getAddress(), d.getShadowOf());
+                }
+            }
+        }
+        return 0;
+    }
+
+    private int runShadowStatus(String[] args) throws Exception {
+        Options opts = new Options();
+        addCommonOptions(opts);
+        addServerOption(opts);
+        CommandLine cli = parse(opts, args, COMMAND_SHADOW_STATUS);
+        if (cli == null) {
+            return 0;
+        }
+        try (IndexingAdminClient client = buildClient(cli)) {
+            GetShadowStatusResponse resp = client.getShadowStatus();
+            if (cli.hasOption("json")) {
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("is_shadow", resp.getIsShadow());
+                payload.put("shadow_of", resp.getShadowOf());
+                payload.put("ready", resp.getReady());
+                payload.put("loaded_ledger_id", resp.getLoadedLedgerId());
+                payload.put("loaded_offset", resp.getLoadedOffset());
+                payload.put("primary_advertised_ledger_id", resp.getPrimaryAdvertisedLedgerId());
+                payload.put("primary_advertised_offset", resp.getPrimaryAdvertisedOffset());
+                payload.put("last_reload_timestamp_ms", resp.getLastReloadTimestampMs());
+                payload.put("reload_count", resp.getReloadCount());
+                out.println(JsonWriter.toJson(payload));
+            } else {
+                out.println("is_shadow=" + resp.getIsShadow());
+                out.println("shadow_of=" + resp.getShadowOf());
+                out.println("ready=" + resp.getReady());
+                out.println("loaded_lsn=(" + resp.getLoadedLedgerId() + "," + resp.getLoadedOffset() + ")");
+                out.println("primary_advertised_lsn=(" + resp.getPrimaryAdvertisedLedgerId()
+                        + "," + resp.getPrimaryAdvertisedOffset() + ")");
+                out.println("reload_count=" + resp.getReloadCount());
+                out.println("last_reload_timestamp_ms=" + resp.getLastReloadTimestampMs());
+            }
+        }
+        return 0;
+    }
+
+    private int runWaitShadow(String[] args) throws Exception {
+        Options opts = new Options();
+        addCommonOptions(opts);
+        addServerOption(opts);
+        addIndexOptions(opts);
+        opts.addOption(Option.builder().longOpt("target-ledger-id").hasArg().argName("N")
+                .desc("Target LogSequenceNumber ledger id (required)").required().build());
+        opts.addOption(Option.builder().longOpt("target-offset").hasArg().argName("N")
+                .desc("Target LogSequenceNumber offset (required)").required().build());
+        opts.addOption(Option.builder().longOpt("timeout-ms").hasArg().argName("MS")
+                .desc("Server-side timeout in milliseconds (default 30000)").build());
+        CommandLine cli = parse(opts, args, COMMAND_WAIT_SHADOW);
+        if (cli == null) {
+            return 0;
+        }
+        long targetLedgerId = Long.parseLong(cli.getOptionValue("target-ledger-id"));
+        long targetOffset = Long.parseLong(cli.getOptionValue("target-offset"));
+        long timeoutMs = Long.parseLong(cli.getOptionValue("timeout-ms", "30000"));
+        try (IndexingAdminClient client = buildClient(cli)) {
+            WaitForCheckpointResponse resp = client.waitForCheckpoint(
+                    cli.getOptionValue("tablespace"),
+                    cli.getOptionValue("table"),
+                    cli.getOptionValue("index"),
+                    targetLedgerId, targetOffset, timeoutMs);
+            if (cli.hasOption("json")) {
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("current_ledger_id", resp.getCurrentLedgerId());
+                payload.put("current_offset", resp.getCurrentOffset());
+                payload.put("reached", resp.getReached());
+                out.println(JsonWriter.toJson(payload));
+            } else {
+                out.println("current_lsn=(" + resp.getCurrentLedgerId() + "," + resp.getCurrentOffset()
+                        + ") reached=" + resp.getReached());
+            }
+            return resp.getReached() ? 0 : 1;
+        }
     }
 }

@@ -28,11 +28,15 @@ import herddb.indexing.proto.GetIndexStatusRequest;
 import herddb.indexing.proto.GetIndexStatusResponse;
 import herddb.indexing.proto.GetInstanceInfoRequest;
 import herddb.indexing.proto.GetInstanceInfoResponse;
+import herddb.indexing.proto.GetShadowStatusRequest;
+import herddb.indexing.proto.GetShadowStatusResponse;
 import herddb.indexing.proto.IndexingServiceGrpc;
 import herddb.indexing.proto.ListIndexesRequest;
 import herddb.indexing.proto.ListIndexesResponse;
 import herddb.indexing.proto.ListPrimaryKeysRequest;
 import herddb.indexing.proto.PrimaryKeysChunk;
+import herddb.indexing.proto.WaitForCheckpointRequest;
+import herddb.indexing.proto.WaitForCheckpointResponse;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import java.io.Closeable;
@@ -105,6 +109,27 @@ public final class IndexingAdminClient implements Closeable {
 
     public GetInstanceInfoResponse getInstanceInfo() {
         return stub().getInstanceInfo(GetInstanceInfoRequest.newBuilder().build());
+    }
+
+    public GetShadowStatusResponse getShadowStatus() {
+        return stub().getShadowStatus(GetShadowStatusRequest.newBuilder().build());
+    }
+
+    public WaitForCheckpointResponse waitForCheckpoint(String tablespace, String table, String index,
+                                                       long targetLedgerId, long targetOffset,
+                                                       long waitTimeoutMs) {
+        // The gRPC deadline is padded with the caller's wait budget so the
+        // call does not time out before the server-side poll loop returns.
+        long deadlineSecs = timeoutSeconds + Math.max(1, waitTimeoutMs / 1000L);
+        return stub.withDeadlineAfter(deadlineSecs, TimeUnit.SECONDS)
+                .waitForCheckpoint(WaitForCheckpointRequest.newBuilder()
+                        .setTablespace(tablespace == null ? "" : tablespace)
+                        .setTable(table == null ? "" : table)
+                        .setIndex(index == null ? "" : index)
+                        .setTargetLedgerId(targetLedgerId)
+                        .setTargetOffset(targetOffset)
+                        .setTimeoutMs(waitTimeoutMs)
+                        .build());
     }
 
     @Override
