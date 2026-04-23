@@ -2290,13 +2290,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 } catch (IOException e) {
                     LOGGER.log(Level.WARNING, "error deleting temp file for " + indexName, e);
                 }
-                try {
-                    if (shard.builder != null) {
-                        shard.builder.close();
-                    }
-                } catch (IOException e) {
-                    LOGGER.log(Level.WARNING, "error closing shard builder for " + indexName, e);
-                }
+                // Intentionally do NOT close shard.builder here. The builder is
+                // still referenced by `frozenShards` and is being iterated by
+                // concurrent searches (searchInternal reads frozen shards while
+                // Phase B runs). Closing it now would race with those searches
+                // and crash with NPE/use-after-free on the jvector graph view
+                // (issue #235). Phase C closes every snapshotShard builder
+                // atomically under stateLock.writeLock(), which is the safe
+                // point because no search holds the read lock at that moment.
             }
         } finally {
             writingGraphActive.decrementAndGet();
