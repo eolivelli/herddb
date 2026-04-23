@@ -66,7 +66,7 @@ flowchart LR
 
   subgraph "HerdDB servers"
     Leader["Server<br/>(tablespace leader)"]
-    Replica["Server<br/>(follower replica)"]
+    Replica["Server<br/>(read-only replica,<br/>no WAL tailing)"]
   end
 
   subgraph "Indexing service"
@@ -82,12 +82,12 @@ flowchart LR
   end
 
   CLI -->|SQL + DML + vector search| Leader
+  CLI -. read-only SQL .-> Replica
   Leader -. vector search (LB) .-> ISvcP
   Leader -. vector search (LB) .-> ISvcS1
   Leader -. vector search (LB) .-> ISvcS2
 
   Leader -->|append| BK
-  Replica -->|tail| BK
   ISvcP -->|tail WAL| BK
 
   Leader --> RFS
@@ -98,7 +98,7 @@ flowchart LR
   RFS --> OBJ
 
   Leader -. elect / heartbeat .-> ZK
-  Replica -. discover .-> ZK
+  Replica -. watch checkpoint state .-> ZK
   Leader -. discover indexing instances .-> ZK
   ISvcP -. publish IndexStatus .-> ZK
   ISvcS1 -. watch .-> ZK
@@ -112,9 +112,10 @@ The rest of this section zooms in on individual layers.
 ### 1. Replicated commit log (BookKeeper)
 
 The tablespace leader appends every DML and DDL to a BookKeeper ledger.
-Followers — and the indexing service — tail the same ledger
-independently, so a single logical WAL feeds both the SQL replica tier
-and the vector indexing tier.
+In the vector-search deployment profile the **indexing service primary**
+tails this ledger to materialise vector indexes on its own schedule —
+the SQL read-only replicas described in §2 do **not** tail the WAL;
+they read committed data from shared storage instead.
 
 ```mermaid
 flowchart LR
@@ -124,14 +125,11 @@ flowchart LR
     B2[(Bookie 2)]
     B3[(Bookie 3)]
   end
-  Replica["HerdDB follower"]
-  ISvc["Indexing service<br/>(primary + shadows)"]
+  ISvc["Indexing service primary<br/>(tails WAL → vector index)"]
 
   Leader -->|fsynced add| B1
   Leader -->|fsynced add| B2
   Leader -->|fsynced add| B3
-  B1 -. tail .-> Replica
-  B2 -. tail .-> Replica
   B1 -. tail .-> ISvc
   B2 -. tail .-> ISvc
 ```
@@ -141,39 +139,58 @@ Ensemble, write-quorum and ack-quorum are tuned per deployment
 durability and low write latency without requiring shared block
 storage.
 
+In the classic HerdDB deployment profile (see §5) WAL-tailing
+follower replicas also subscribe to this ledger; that mode is not
+the recommended topology for vector-search workloads.
+
 Details: [CHECKPOINT.md §2](./CHECKPOINT.md) describes how checkpoints
 interact with the WAL and how commit-log truncation is coordinated.
 
-### 2. Tablespace leader / follower replication
+### 2. Read-only replicas on shared storage (vector-search profile)
 
-Data is grouped into **tablespaces**. Each tablespace has exactly one
-leader at any point in time and any number of follower replicas,
-elected via ZooKeeper.
+In the vector-search deployment profile, SQL read scalability is
+provided by **read-only replicas** that do *not* tail the commit log.
+The leader checkpoints committed pages to the Remote File Service;
+replicas read the same pages directly from shared storage and therefore
+stay stateless — they can be scaled out horizontally, added and
+removed freely, and they never need to replay a WAL.
 
 ```mermaid
 flowchart LR
-  ZK[("ZooKeeper<br/>leader election")]
+  ZK[("ZooKeeper<br/>leader election<br/>+ checkpoint state")]
   subgraph Tablespace["Tablespace 'default'"]
-    L["Leader"]
-    F1["Follower 1"]
-    F2["Follower 2"]
+    L["Leader<br/>(writes WAL,<br/>checkpoints pages)"]
+    R1["Read-only replica 1"]
+    R2["Read-only replica 2"]
   end
+  RFS["Remote File Service<br/>(shared pages)"]
+
+  L -->|write pages at checkpoint| RFS
+  R1 -. read pages .-> RFS
+  R2 -. read pages .-> RFS
+
   L <-->|heartbeat / lease| ZK
-  F1 <-->|watch| ZK
-  F2 <-->|watch| ZK
+  L -. publish durable LSN .-> ZK
+  R1 -. watch checkpoint state .-> ZK
+  R2 -. watch checkpoint state .-> ZK
 ```
+
+Because replicas source their data from the shared file server,
+they lag the leader by at most one checkpoint interval — the same
+bound that applies to indexing-service shadows (§4). Point-in-time
+read-your-writes consistency is **not** provided on these replicas.
 
 **Two distinct read-scaling tiers — don't conflate them:**
 
-- **Server follower replicas** exist primarily for **durability and
-  fast failover**. They can serve SQL reads, but the client is
-  responsible for picking which replica to hit; there is no built-in
-  automatic fan-out of SQL reads across followers.
-- **Indexing-service shadow replicas** (§4 below) are the tier that
-  **does** transparently scale **vector-search read throughput**:
-  the HerdDB server load-balances each search query across
-  `{primary, shadow1, shadow2, …}` for the target index on behalf
-  of the JDBC client.
+- **SQL read-only replicas** transparently scale *plain SQL* reads
+  across the cluster by sharing pages through the file-server tier.
+- **Indexing-service shadow replicas** (§4 below) transparently scale
+  *vector-search* read throughput. The HerdDB server load-balances
+  each search query across `{primary, shadow1, shadow2, …}` for the
+  target index on behalf of the JDBC client.
+
+For the classic WAL-tailing follower model used in non-vector
+deployments, see §5.
 
 ### 3. Shared object storage + file-server cache tier
 
@@ -283,6 +300,49 @@ configuration fails fast at boot.
 Details: [VECTOR.md](./VECTOR.md) (architecture, SQL, shard
 lifecycle), [VECTOR_SEARCH_METRICS.md](./VECTOR_SEARCH_METRICS.md)
 (observability).
+
+### 5. Classic HerdDB replication (WAL-tailing followers)
+
+The original HerdDB replication model is still supported, and is the
+right choice for non-vector workloads where an indexing service would
+just be dead weight. In this profile each tablespace has a leader and
+one or more **follower replicas** that tail the same BookKeeper ledger
+the leader writes to, applying every entry locally and keeping a
+fully-materialised copy of the tablespace on their own storage.
+
+```mermaid
+flowchart LR
+  ZK[("ZooKeeper<br/>leader election")]
+  Leader["Leader<br/>(writes WAL)"]
+  BK[("BookKeeper WAL")]
+  F1["Follower 1<br/>(tails WAL,<br/>applies locally)"]
+  F2["Follower 2<br/>(tails WAL,<br/>applies locally)"]
+
+  Leader -->|append| BK
+  BK -. tail .-> F1
+  BK -. tail .-> F2
+
+  Leader <-->|lease| ZK
+  F1 <-->|watch| ZK
+  F2 <-->|watch| ZK
+```
+
+Trade-offs vs §2:
+
+- No dependency on shared object storage or a file-server tier —
+  followers keep their own pages, so the deployment works with only
+  local disks plus BookKeeper + ZooKeeper.
+- Followers can be promoted to leader on failover; they hold the
+  full WAL position, not a checkpoint snapshot.
+- Does not scale *horizontally* the way §2 does: each added follower
+  replays the full WAL and pays its own storage cost.
+- There is no vector-indexing service in this profile; the `VECTOR`
+  SQL features are not available.
+
+This is the replication model documented extensively in the upstream
+HerdDB project and in [CHECKPOINT.md](./CHECKPOINT.md). It is *not*
+the recommended topology for vector-search workloads — use §2 + §4
+for those.
 
 ## Documentation index
 
