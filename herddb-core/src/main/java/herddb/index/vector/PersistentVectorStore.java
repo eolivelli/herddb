@@ -1672,8 +1672,49 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     int allocateCompactionNodeIds(int count) {
-        int start = nextNodeId.getAndAdd(count);
-        return start;
+        // The bump of nextNodeId must be atomic with a rotation of the active
+        // live shard. Without rotation, the next addVector call would allocate
+        // nodeId = nextNodeId (post-bump) but compute
+        // local = nodeId - active.startNodeId on the OLD shard, opening a
+        // `count`-wide gap in the shard's local ordinal space. Phase B would
+        // then iterate the shard's graph and call pqv.get(ordinal) with an
+        // ordinal far beyond the PQ training-set size, throwing
+        // IndexOutOfBoundsException (issue #255).
+        //
+        // We hold stateLock.writeLock() to exclude addVector (which holds the
+        // read lock). This method is called from VectorIndexCompactor.rebuildSegment
+        // which does NOT hold checkpointLock or stateLock, so the lock order is
+        // deadlock-free.
+        stateLock.writeLock().lock();
+        try {
+            int start = nextNodeId.getAndAdd(count);
+            List<LiveGraphShard> shards = this.liveShards;
+            if (dimension != 0 && shards != null && !shards.isEmpty()
+                    && shards.get(shards.size() - 1).nodeToPk.size() > 0) {
+                int sealedSize = shards.get(shards.size() - 1).nodeToPk.size();
+                // createEmptyLiveShard reads nextNodeId.get() AFTER the bump,
+                // so the new shard's startNodeId equals the post-bump value
+                // and future ingest produces local = 0, 1, 2, ... contiguously.
+                LiveGraphShard fresh = createEmptyLiveShard(
+                        dimension, beamWidth, neighborOverflow, alpha,
+                        nextNodeId.get());
+                List<LiveGraphShard> newList = new ArrayList<>(shards);
+                newList.add(fresh);
+                synchronized (this) {
+                    this.liveShards = newList;
+                }
+                LOGGER.log(Level.INFO,
+                        "vector store {0}: rotated live graph shard before "
+                                + "compaction nodeId reservation, now {1} shards "
+                                + "({2} vectors in sealed shard, reserved range "
+                                + "[{3},{4}))",
+                        new Object[]{indexName, newList.size(), sealedSize,
+                                start, start + count});
+            }
+            return start;
+        } finally {
+            stateLock.writeLock().unlock();
+        }
     }
 
     void releaseCompactionNodeIds(int startNodeId, int count) {
