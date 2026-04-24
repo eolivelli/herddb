@@ -24,14 +24,20 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.util.ReferenceCountUtil;
 import io.netty.util.ResourceLeakDetector;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -360,5 +366,301 @@ public class RemoteFileServiceClientByteBufTest {
 
         byte[] read = client.readFile(path);
         assertArrayEquals(content, read);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #246 — in-flight read-byte budget
+    // ---------------------------------------------------------------------
+
+    /**
+     * Default construction exposes the documented default byte budget
+     * ({@link RemoteFileServiceClient#DEFAULT_CLIENT_MAX_INFLIGHT_READ_BYTES}).
+     */
+    @Test
+    public void testInflightReadBytes_defaultConfig() {
+        assertEquals("default max inflight read bytes",
+                RemoteFileServiceClient.DEFAULT_CLIENT_MAX_INFLIGHT_READ_BYTES,
+                client.maxInflightReadBytes());
+        assertEquals("all bytes available at steady state",
+                RemoteFileServiceClient.DEFAULT_CLIENT_MAX_INFLIGHT_READ_BYTES,
+                client.availableInflightReadBytes());
+    }
+
+    /**
+     * A custom {@code remote.file.client.max.inflight.read.bytes} config
+     * value is honoured, and {@code availableInflightReadBytes()} starts
+     * equal to the cap before any read is issued.
+     */
+    @Test
+    public void testInflightReadBytes_customConfig() throws Exception {
+        long customBytes = 16L * 1024 * 1024; // 16 MiB
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES, customBytes);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            assertEquals("configured cap is applied", customBytes, tuned.maxInflightReadBytes());
+            assertEquals("all bytes available at idle",
+                    customBytes, tuned.availableInflightReadBytes());
+        }
+    }
+
+    /** A non-positive byte budget is rejected at construction. */
+    @Test
+    public void testInflightReadBytes_zeroConfigRejected() {
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES, 0L);
+        try {
+            new RemoteFileServiceClient(
+                    Arrays.asList("localhost:" + server.getPort()), cfg).close();
+            fail("expected IllegalArgumentException for non-positive byte budget");
+        } catch (IllegalArgumentException expected) {
+            assertTrue("message names the property",
+                    expected.getMessage().contains(
+                            RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES));
+        }
+    }
+
+    /**
+     * A byte budget below {@code blockSize} is rejected: a single full-block
+     * read would immediately deadlock.
+     */
+    @Test
+    public void testInflightReadBytes_belowBlockSizeRejected() {
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, 4096);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES, 2048L);
+        try {
+            new RemoteFileServiceClient(
+                    Arrays.asList("localhost:" + server.getPort()), cfg).close();
+            fail("expected IllegalArgumentException when budget < blockSize");
+        } catch (IllegalArgumentException expected) {
+            assertTrue("message names the properties",
+                    expected.getMessage().contains(
+                            RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES));
+        }
+    }
+
+    /**
+     * After a successful {@code readFileAsByteBufAsync} the byte reservation
+     * is released — a subsequent call sees the full budget again.
+     */
+    @Test
+    public void testInflightReadBytes_releasedAfterReadFile() throws Exception {
+        String path = "test/permits/readFile.bin";
+        client.writeFile(path, "payload".getBytes(StandardCharsets.UTF_8));
+
+        long before = client.availableInflightReadBytes();
+        ByteBuf buf = client.readFileAsByteBufAsync(path).get();
+        assertNotNull(buf);
+        try {
+            long after = client.availableInflightReadBytes();
+            assertEquals("reservation is released on onCompleted", before, after);
+        } finally {
+            buf.release();
+        }
+    }
+
+    /**
+     * After a successful {@code readFileRangeAsByteBufAsync} against a
+     * multipart file the byte reservation is released. Exercises the hot
+     * path that issue #246 targets.
+     */
+    @Test
+    public void testInflightReadBytes_releasedAfterReadFileRange() throws Exception {
+        String path = "test/permits/readFileRange.bin";
+        int blockSize = 4096;
+        byte[] content = new byte[blockSize * 2];
+        for (int i = 0; i < content.length; i++) {
+            content[i] = (byte) (i % 256);
+        }
+        client.writeMultipartFile(path, new ByteArrayInputStream(content), blockSize);
+
+        long before = client.availableInflightReadBytes();
+        ByteBuf buf = client.readFileRangeAsByteBufAsync(path, 0, blockSize, blockSize).get();
+        assertNotNull(buf);
+        try {
+            long after = client.availableInflightReadBytes();
+            assertEquals("reservation is released on onCompleted", before, after);
+        } finally {
+            ReferenceCountUtil.safeRelease(buf);
+        }
+    }
+
+    /**
+     * A reasonably concurrent burst of {@code readFileRange} calls must
+     * never reveal a negative budget and must return the full cap by the
+     * time every call settles. This is the end-to-end smoke test that the
+     * acquire/release are balanced even under parallelism.
+     */
+    @Test
+    public void testInflightReadBytes_concurrentBurstReturnsReservations() throws Exception {
+        String path = "test/permits/concurrent.bin";
+        int blockSize = 4096;
+        byte[] content = new byte[blockSize * 8];
+        for (int i = 0; i < content.length; i++) {
+            content[i] = (byte) i;
+        }
+        client.writeMultipartFile(path, new ByteArrayInputStream(content), blockSize);
+
+        long max = client.maxInflightReadBytes();
+        int burst = 32;
+        @SuppressWarnings("unchecked")
+        CompletableFuture<ByteBuf>[] futures = new CompletableFuture[burst];
+        for (int i = 0; i < burst; i++) {
+            futures[i] = client.readFileRangeAsByteBufAsync(path, 0, blockSize, blockSize);
+        }
+        for (CompletableFuture<ByteBuf> f : futures) {
+            ByteBuf b = f.get(30, TimeUnit.SECONDS);
+            if (b != null) {
+                ReferenceCountUtil.safeRelease(b);
+            }
+            assertTrue("available bytes must never exceed cap",
+                    client.availableInflightReadBytes() <= max);
+            assertTrue("available bytes must never go negative",
+                    client.availableInflightReadBytes() >= 0);
+        }
+        assertEquals("all bytes returned at the end of the burst",
+                max, client.availableInflightReadBytes());
+    }
+
+    /**
+     * A small byte cap that still admits one full-block read restores the
+     * budget after the read settles.
+     */
+    @Test
+    public void testInflightReadBytes_smallBudgetRoundTrip() throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        // 4 MiB budget — exactly one default block. Any smaller and the
+        // constructor refuses (see testInflightReadBytes_belowBlockSizeRejected).
+        long budget = RemoteFileServiceClient.DEFAULT_BLOCK_SIZE;
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES, budget);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            String path = "test/permits/single.bin";
+            tuned.writeFile(path, "one".getBytes(StandardCharsets.UTF_8));
+            assertEquals(budget, tuned.availableInflightReadBytes());
+            ByteBuf buf = tuned.readFileAsByteBufAsync(path).get();
+            assertNotNull(buf);
+            buf.release();
+            assertEquals("budget restored after single read completes",
+                    budget, tuned.availableInflightReadBytes());
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #246 — error-path coverage for the in-flight budget release
+    // ---------------------------------------------------------------------
+
+    /**
+     * File-not-found on {@code readFileAsByteBufAsync} completes normally
+     * with {@code null} (no error) — the reservation must still be
+     * released. Without proper release, repeated not-found polls would
+     * starve the budget.
+     */
+    @Test
+    public void testInflightReadBytes_releasedAfterReadFileNotFound() throws Exception {
+        long before = client.availableInflightReadBytes();
+        ByteBuf buf = client.readFileAsByteBufAsync("test/permits/missing.bin").get();
+        assertNull("missing file returns null", buf);
+        assertEquals("reservation released on onCompleted(null)",
+                before, client.availableInflightReadBytes());
+    }
+
+    /**
+     * File-not-found on {@code readFileRangeAsByteBufAsync} also completes
+     * normally with {@code null}; exercise the hot path's release.
+     */
+    @Test
+    public void testInflightReadBytes_releasedAfterReadFileRangeNotFound() throws Exception {
+        long before = client.availableInflightReadBytes();
+        ByteBuf buf = client.readFileRangeAsByteBufAsync(
+                "test/permits/missing-range.bin", 0, 4096,
+                RemoteFileServiceClient.DEFAULT_BLOCK_SIZE).get();
+        assertNull("missing multipart file returns null", buf);
+        assertEquals("reservation released on onCompleted(null)",
+                before, client.availableInflightReadBytes());
+    }
+
+    /**
+     * When the remote file service is unreachable the retry loop eventually
+     * gives up — each attempt must release its reservation so the budget
+     * returns to the configured cap.
+     */
+    @Test
+    public void testInflightReadBytes_releasedAfterBackendUnreachable() throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_RETRIES, 1);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_TIMEOUT, 2L);
+        // Point at a port where nothing is listening.
+        try (RemoteFileServiceClient broken = new RemoteFileServiceClient(
+                Arrays.asList("localhost:1"), cfg)) {
+            long before = broken.availableInflightReadBytes();
+            try {
+                broken.readFileRangeAsByteBufAsync("some/path", 0, 4096,
+                        RemoteFileServiceClient.DEFAULT_BLOCK_SIZE)
+                        .get(60, TimeUnit.SECONDS);
+                fail("expected the read to fail against an unreachable backend");
+            } catch (java.util.concurrent.ExecutionException expected) {
+                // propagated from onError
+            }
+            assertEquals("reservation restored after retries exhausted",
+                    before, broken.availableInflightReadBytes());
+        }
+    }
+
+    /**
+     * Mixed burst of hits and misses: permits must net to zero in-flight
+     * regardless of which branch each RPC takes.
+     */
+    @Test
+    public void testInflightReadBytes_concurrentMixedOutcomesReleaseReservations()
+            throws Exception {
+        String presentPath = "test/permits/mixed-present.bin";
+        int blockSize = 4096;
+        byte[] content = new byte[blockSize * 2];
+        client.writeMultipartFile(presentPath, new ByteArrayInputStream(content), blockSize);
+
+        long max = client.maxInflightReadBytes();
+        int burst = 16;
+        @SuppressWarnings("unchecked")
+        CompletableFuture<ByteBuf>[] futures = new CompletableFuture[burst];
+        for (int i = 0; i < burst; i++) {
+            // Half the calls target a non-existent file (server answers not-found
+            // normally), the other half hit the real multipart file.
+            String target = (i % 2 == 0) ? presentPath : "test/permits/mixed-missing-" + i;
+            futures[i] = client.readFileRangeAsByteBufAsync(target, 0, blockSize, blockSize);
+        }
+        for (CompletableFuture<ByteBuf> f : futures) {
+            ByteBuf b = f.get(30, TimeUnit.SECONDS);
+            if (b != null) {
+                ReferenceCountUtil.safeRelease(b);
+            }
+        }
+        assertEquals("every reservation released regardless of hit/miss",
+                max, client.availableInflightReadBytes());
+    }
+
+    /**
+     * Error paths must not just net out across the aggregate — each
+     * individual RPC must release its reservation before the next starts,
+     * or a tiny budget would deadlock after the first failure. Uses a
+     * budget just big enough for one read to prove release-on-failure is
+     * immediate.
+     */
+    @Test
+    public void testInflightReadBytes_smallBudgetSurvivesRepeatedNotFound() throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        long budget = RemoteFileServiceClient.DEFAULT_BLOCK_SIZE;
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES, budget);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            for (int i = 0; i < 5; i++) {
+                ByteBuf buf = tuned.readFileAsByteBufAsync(
+                        "test/permits/absent-" + i).get(30, TimeUnit.SECONDS);
+                assertNull(buf);
+                assertEquals("budget restored after each not-found",
+                        budget, tuned.availableInflightReadBytes());
+            }
+        }
     }
 }

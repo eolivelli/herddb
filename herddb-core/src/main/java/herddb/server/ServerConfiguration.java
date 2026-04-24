@@ -94,6 +94,25 @@ public final class ServerConfiguration {
     public static final int PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT = 10;
 
     /**
+     * Maximum number of bytes across in-flight {@code readFile}/{@code readFileRange}
+     * gRPC calls that may be staged into a pooled direct
+     * {@link io.netty.buffer.ByteBuf} at once. Each call reserves bytes equal
+     * to its requested payload length before allocation; the cap bounds peak
+     * {@code Netty PoolArena} growth during cache-miss query bursts and
+     * checkpoint loads (see issue #246) independently of request size —
+     * 16 KiB {@code RemoteRandomAccessReader} reads and 4 MiB multipart
+     * chunks each debit the budget in proportion to their actual direct-memory
+     * pressure. Default 256 MiB leaves ample headroom under typical
+     * {@code -XX:MaxDirectMemorySize} budgets. Lower this on
+     * memory-constrained pods; raise it only when the Netty arena has enough
+     * room.
+     */
+    public static final String PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES =
+            "remote.file.client.max.inflight.read.bytes";
+    public static final long PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES_DEFAULT =
+            256L * 1024 * 1024;
+
+    /**
      * Maximum number of block uploads that a single {@code writePage} invocation
      * may keep in flight when splitting a page into multipart blocks for
      * {@link herddb.remote.RemoteFileDataStorageManager}. Larger values speed up

@@ -34,6 +34,8 @@ data:
     {{- .Files.Get "monitor/grafana/dashboards/indexing-service-dashboard.json" | nindent 4 }}
   jvm-dashboard.json: |
     {{- .Files.Get "monitor/grafana/dashboards/jvm-dashboard.json" | nindent 4 }}
+  jvm-unified-dashboard.json: |
+    {{- .Files.Get "monitor/grafana/dashboards/jvm-unified-dashboard.json" | nindent 4 }}
   remote-file-service-dashboard.json: |
     {{- .Files.Get "monitor/grafana/dashboards/remote-file-service-dashboard.json" | nindent 4 }}
   vector-search-latency-dashboard.json: |
