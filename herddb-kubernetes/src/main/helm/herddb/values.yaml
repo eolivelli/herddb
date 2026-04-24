@@ -196,6 +196,15 @@ indexingService:
   storageMode: file
   # See server.javaOpts / server.javaOptsExtra above for the replace-vs-append
   # semantics. Prefer javaOptsExtra unless you really want to replace.
+  #
+  # Direct-memory budget under storageMode=remote:
+  #   -XX:MaxDirectMemorySize must accommodate:
+  #     - SegmentBlockCache (default: -Xmx/4, all pooled direct ByteBufs)
+  #     - Phase C checkpoint peak (Netty PoolArena growth from readFileRange
+  #       chunks; capped by remote.file.client.max.inflight.read.bytes)
+  #     - steady-state gRPC transport (~256 MiB)
+  #   Bench-validated baseline: MaxDirectMemorySize=10g for -Xmx=24g with
+  #   remote.file.client.max.inflight.read.bytes=256 MiB (issue #246).
   javaOpts: ""
   javaOptsExtra: ""
   # Optional: override /opt/herddb/conf/logging.properties inside the pod.

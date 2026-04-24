@@ -20,6 +20,8 @@
 
 package herddb.server;
 
+import org.apache.bookkeeper.stats.StatsLogger;
+
 /**
  * Minimal blocking file-service client contract, lifted into herddb-core so
  * modules that cannot take a compile-time dependency on
@@ -38,4 +40,16 @@ public interface RemoteFileClient extends DynamicServiceClient {
      * does not exist.
      */
     byte[] readFile(String path);
+
+    /**
+     * Registers client-side Prometheus gauges on the given {@link StatsLogger}
+     * scope. Callers pass the scope they want the metric names to live under
+     * (e.g. {@code statsLogger.scope("remote_file_client")}). Implementations
+     * that have no metrics of interest may leave this as a no-op.
+     *
+     * <p>Idempotent on the same scope: safe to call once per client.
+     */
+    default void registerMetrics(StatsLogger statsLogger) {
+        // default no-op — implementations override
+    }
 }

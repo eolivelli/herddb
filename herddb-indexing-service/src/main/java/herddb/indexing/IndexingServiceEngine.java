@@ -425,6 +425,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         .setSegmentBlockCache(segmentBlockCache, readerStats);
             }
             registerSegmentBlockCacheMetrics(segmentBlockCache);
+            if (dataStorageManager instanceof RemoteFileDataStorageManager && this.statsLogger != null) {
+                ((RemoteFileDataStorageManager) dataStorageManager).getClient()
+                        .registerMetrics(this.statsLogger.scope("remote_file_client"));
+            }
 
             final long vectorMemLimit = maxVectorMemoryBytes;
             final VectorMemoryBudget budget = this;
@@ -1618,6 +1622,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         this.statsLogger = statsLogger;
         registerTailerMetrics();
         registerShadowMetrics();
+        // Netty direct-memory counters (issue #246) so the unified JVM
+        // dashboard can show pool-arena growth for the IS alongside the
+        // main server and the remote file service. The gauges carry
+        // their own netty_ prefix — pass the root logger, not a scope.
+        if (statsLogger != null) {
+            herddb.core.stats.NettyMemoryMetrics.register(statsLogger);
+        }
     }
 
     /**

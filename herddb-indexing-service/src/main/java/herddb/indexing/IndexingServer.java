@@ -169,6 +169,9 @@ public class IndexingServer implements AutoCloseable {
                 clientConfig.put(IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
                         config.getInt(IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES,
                                 IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT));
+                clientConfig.put(IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES,
+                        config.getLong(IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES,
+                                IndexingServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES_DEFAULT));
                 try {
                     RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
                     RemoteFileClient client = factory.createClient(servers, clientConfig);

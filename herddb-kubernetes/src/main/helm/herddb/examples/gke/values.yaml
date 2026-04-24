@@ -271,16 +271,21 @@ indexingService:
   nodeSelector:
     cloud.google.com/machine-family: "c3"
     topology.kubernetes.io/zone: "europe-west4-a"
-  # 24 g heap + 6 g direct + ~1 g JVM overhead = 31 g (< 32 GiB container; 1 GiB headroom).
+  # 24 g heap + 10 g direct + ~1 g JVM overhead = 35 g (< 36 GiB container; 1 GiB headroom).
   # Heap sized for HNSW graph segment caching — the primary IS working set.
-  # 6 g direct: needed for zero-copy ByteBuffer vectors (jvector 4.x) and concurrent
-  # gRPC streaming under load; 2 g was insufficient under heavy query traffic.
+  # 10 g direct: 3.5 GiB SegmentBlockCache (auto = heap/4 ≈ 6 GiB for this heap) + 256 MiB
+  # in-flight read reservation (remote.file.client.max.inflight.read.bytes below) + 4 GiB
+  # Netty PoolArena transient peak for Phase C checkpoint loads and concurrent gRPC
+  # streaming + ~2 GiB headroom. 6 g was insufficient under Phase C segment-load bursts
+  # (issue #246: OOM after 7 × 583 MB segments loaded into the block cache).
   # --add-modules jdk.incubator.vector: required for Panama Vector API (jvector 4.x).
   # -Dio.netty.maxDirectMemory=0 tells Netty to respect -XX:MaxDirectMemorySize.
-  # numDirectArenas=16 spreads Netty allocations to reduce lock contention (issue #122).
+  # numDirectArenas=8 (Netty default on most core counts): 16 arenas amplified the 4 MiB
+  # PoolChunk fragmentation that triggered issue #246; 8 gives enough parallelism to
+  # mitigate issue #122 lock contention without compounding arena growth.
   # tailbatchsize=1000 caps the BK read batch per followTheLeader() call in the IS
   # tailer, cutting retained working set by 10× vs. the 10000 default (issue #180).
-  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=6g -Dio.netty.allocator.numDirectArenas=16 -Dherddb.commitlog.tailbatchsize=1000"
+  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=10g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=1000"
   storage:
     data:
       size: 20Gi
@@ -321,12 +326,22 @@ indexingService:
     #     OOM. File-server CPU was only ~9% during ingest (plenty of headroom for more
     #     flush traffic). Accepts slightly more checkpoint I/O in exchange for stability.
     indexing.memory.vector.limit: "15032385536"
+    # Caps bytes across in-flight readFile/readFileRange gRPC calls that
+    # allocate a pooled direct ByteBuf. Bytes (not request count) so the cap
+    # treats a 16 KiB RemoteRandomAccessReader block and a 4 MiB Phase-C
+    # chunk in proportion to the direct-memory pressure they impose. Default
+    # 256 MiB; set explicitly here for visibility. Lower under tighter
+    # MaxDirectMemorySize budgets, raise only if Netty PoolArena headroom
+    # is proven sufficient (see issue #246).
+    remote.file.client.max.inflight.read.bytes: "268435456"
   resources:
+    # Bumped from 32 Gi to 36 Gi alongside the -XX:MaxDirectMemorySize 6 g → 10 g bump
+    # in issue #246. Budget: 24 g heap + 10 g direct + 1 g JVM overhead = 35 g.
     requests:
-      memory: "32Gi"
+      memory: "36Gi"
       cpu: "16"
     limits:
-      memory: "32Gi"
+      memory: "36Gi"
       cpu: "16"
 
 tools:

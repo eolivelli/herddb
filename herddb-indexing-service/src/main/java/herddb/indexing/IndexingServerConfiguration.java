@@ -173,6 +173,24 @@ public final class IndexingServerConfiguration {
     public static final int PROPERTY_REMOTE_FILE_CLIENT_RETRIES_DEFAULT = 10;
 
     /**
+     * Maximum number of bytes across in-flight {@code readFile}/{@code readFileRange}
+     * gRPC calls that may be staged into a pooled direct
+     * {@link io.netty.buffer.ByteBuf} at once. Each call reserves bytes equal
+     * to its requested payload length before allocation; the cap therefore
+     * bounds peak {@code Netty PoolArena} growth during IS checkpoint Phase
+     * C and cache-miss query bursts (see issue #246) independently of
+     * request size — a 16 KiB {@code RemoteRandomAccessReader} block takes
+     * 16 KiB from the budget, a 4 MiB Phase-C chunk takes 4 MiB. Default
+     * 256 MiB leaves ample headroom under a typical 6-10 GiB
+     * {@code -XX:MaxDirectMemorySize}. Lower this on memory-constrained IS
+     * pods; raise it only when the Netty arena has enough room.
+     */
+    public static final String PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES =
+            "remote.file.client.max.inflight.read.bytes";
+    public static final long PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES_DEFAULT =
+            256L * 1024 * 1024;
+
+    /**
      * Maximum time (in milliseconds) to block at bootstrap waiting for at
      * least one remote file server to be discovered (via ZK) before giving up
      * and failing startup. Guards against a cold-cluster race where the

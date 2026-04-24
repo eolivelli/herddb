@@ -146,6 +146,11 @@ public class RemoteFileServer implements AutoCloseable {
         statsConfig.setProperty(PrometheusMetricsProvider.PROMETHEUS_STATS_HTTP_ENABLE, false);
         statsProvider.start(statsConfig);
         StatsLogger statsLogger = statsProvider.getStatsLogger("");
+        // Netty direct-memory counters (issue #246) so the unified JVM
+        // dashboard can correlate pool-arena growth against
+        // -XX:MaxDirectMemorySize for every HerdDB service. The gauges
+        // carry their own netty_ prefix — pass the root logger, not a scope.
+        herddb.core.stats.NettyMemoryMetrics.register(statsLogger);
 
         int writeExecutorThreads = Integer.parseInt(
                 config.getProperty(CONFIG_WRITE_EXECUTOR_THREADS, String.valueOf(ioThreads)));

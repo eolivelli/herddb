@@ -269,19 +269,32 @@ indexingService:
   #   streaming reads without changing the container limit (17.9 GiB < 20 GiB for gist1m).
   #   NOTE: for bigann-100M (27 segs × 583 MB = 15.7 GiB native Phase C), use GKE
   #   values with a 32 GiB IS container; k3s-local 20 GiB is sized for gist1m/sift10m.
-  # numDirectArenas=16 spreads Netty allocations to reduce lock contention (issue #122).
+  # numDirectArenas=8 (Netty default): 16 used to amplify 4 MiB PoolChunk
+  # fragmentation during Phase C checkpoint loads (issue #246); 8 still gives
+  # enough parallelism to mitigate issue #122 lock contention.
   # herddb.commitlog.tailbatchsize=1000 caps the BK read batch issued per
   # followTheLeader() call in the IS tailer. The 10000 default retains up to
   # 10K PendingReadOp objects (plus protocol payloads) per batch, which
   # drove IS heap to 91% during a bigann-200M run (issue #180). 1000 leaves
   # the steady-state throughput headroom while cutting the retained working
   # set by 10x.
-  javaOpts: "-Xms7g -Xmx7g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=6g -Dio.netty.allocator.numDirectArenas=16 -Dherddb.commitlog.tailbatchsize=1000"
+  javaOpts: "-Xms7g -Xmx7g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=6g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=1000"
   storage:
     data:
       size: 5Gi
     log:
       size: 2Gi
+  extraConfig:
+    # Caps bytes across in-flight readFile/readFileRange gRPC calls that
+    # allocate a pooled direct ByteBuf to bound peak Netty PoolArena growth
+    # during Phase C checkpoint loads (issue #246). Default 256 MiB peak
+    # in-flight direct-memory footprint, leaving ~4 GiB of the 6 GiB
+    # MaxDirectMemorySize budget for the SegmentBlockCache and steady-state
+    # gRPC transport. Bytes (not request count) so 16 KiB block reads from
+    # RemoteRandomAccessReader and 4 MiB Phase-C chunks both contribute in
+    # proportion to the direct-memory pressure they impose. Lower this
+    # (e.g. "134217728" = 128 MiB) on tighter bench profiles.
+    remote.file.client.max.inflight.read.bytes: "268435456"
   resources:
     requests:
       memory: "20Gi"
