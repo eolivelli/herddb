@@ -51,10 +51,10 @@ server:
   # uses Netty direct buffers for addEntry / readEntries payloads; 1 g was
   # tight under sustained bigann ingest.
   # 16 g heap + 2 g direct + 1 GiB JVM overhead = 19 GiB → container = 19 GiB.
-  # -Dio.netty.maxDirectMemory=0 tells Netty to respect -XX:MaxDirectMemorySize
-  # (defaults to -Xmx) rather than doubling it, preventing RSS from exceeding
-  # the container limit under heavy gRPC traffic.
-  javaOpts: "-Xms16g -Xmx16g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=2g"
+  # -Dio.netty.maxDirectMemory=2147483648 (= MaxDirectMemorySize=2g in bytes):
+  # Netty uses Unsafe.allocateMemory bypassing JVM Bits.reserveMemory, preventing
+  # phantom-reference GC delays from exhausting the direct-memory counter (issue #253).
+  javaOpts: "-Xms16g -Xmx16g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=2147483648 -XX:MaxDirectMemorySize=2g"
   storage:
     data:
       size: 5Gi
@@ -112,14 +112,14 @@ fileServer:
   # Heap reduced to 2 g: the file server's hot path is disk-cache I/O and gRPC
   # streaming; it does not need a large heap. A smaller heap leaves more RSS
   # budget for Netty direct buffers.
-  # -Dio.netty.maxDirectMemory=0 tells Netty to respect the JVM MaxDirectMemorySize
-  # (defaults to -Xmx = 2 g) instead of sizing direct memory independently.
-  # With -Xmx2g: heap (2 g) + direct (≤ 2 g) + JVM overhead ≈ 5 g → 6 GiB
-  # container limit gives ~1 GiB headroom.
+  # -Dio.netty.maxDirectMemory=3221225472 (= MaxDirectMemorySize=3g in bytes):
+  # Netty uses Unsafe.allocateMemory bypassing JVM Bits.reserveMemory, preventing
+  # phantom-reference GC delays from exhausting the direct-memory counter (issue #253).
+  # With -Xmx2g: heap (2 g) + direct (3 g) + JVM overhead ≈ 1 g → 6 GiB container.
   # Previously -Xmx4g with no MaxDirectMemorySize cap caused OOMKill when the IS
   # loaded 100+ HNSW segments concurrently (heap 4 g + direct up to 4 g > 5 GiB
   # limit; see issue #126).
-  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=3g"
+  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=3221225472 -XX:MaxDirectMemorySize=3g"
   # S3 endpoint, bucket, and credentials are auto-wired from the
   # minio section below.
   s3:
@@ -169,7 +169,7 @@ zookeeper:
   # thread stacks, GC structures) = ~1.5 g → container = 2 GiB.
   # (The previous 768Mi limit was too small: it did not account for
   # MaxDirectMemorySize=512m or JVM non-heap overhead.)
-  javaOpts: "-Xms512m -Xmx512m -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=512m"
+  javaOpts: "-Xms512m -Xmx512m -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=536870912 -XX:MaxDirectMemorySize=512m"
   storage:
     size: 2Gi
   resources:
@@ -188,7 +188,7 @@ bookkeeper:
   # 2 g heap + 1 g direct + 1 GiB JVM overhead = 4 GiB → container = 4 GiB.
   # (The previous 3 GiB limit was too small: it ignored MaxDirectMemorySize=1g,
   # leaving the bookie at OOMKill risk under sustained ingest write pressure.)
-  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
+  javaOpts: "-Xms2g -Xmx2g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=1073741824 -XX:MaxDirectMemorySize=1g"
   # Enable FINE logging for BK write processors so OperationRejectedException
   # (bookie backpressure) becomes visible. FINE is set only here in the k3s-local
   # values override, not in the baked-in logging.properties in the image.
@@ -278,7 +278,7 @@ indexingService:
   # drove IS heap to 91% during a bigann-200M run (issue #180). 1000 leaves
   # the steady-state throughput headroom while cutting the retained working
   # set by 10x.
-  javaOpts: "-Xms7g -Xmx7g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=6g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=1000"
+  javaOpts: "-Xms7g -Xmx7g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=6442450944 -XX:MaxDirectMemorySize=6g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=1000"
   storage:
     data:
       size: 5Gi
@@ -296,12 +296,11 @@ indexingService:
   # direct + Phase C arena at 6 GB, new 4 MB readFileRange buffers could not be
   # allocated in the query phase.
   #
-  # Budget check (MaxDirectMemorySize=6g):
-  #   SegmentBlockCache: 2.5 GiB direct
-  #   Phase C peak arena:  4.0 GiB (1,015 × 4 MB chunks, freed after Phase C)
-  #   Combined peak:       6.5 GiB — still > 6g! But Phase C chunks are in the
-  #                        pool freelist after Phase C completes, so new 4 MB
-  #                        readFileRange allocations reuse those freed slots.
+  # Budget check (MaxDirectMemorySize=6g; maxDirectMemory=6g > 0 so Netty uses
+  # Unsafe.allocateMemory — freed Phase C chunks are immediately subtracted from
+  # Netty's internal AtomicLong counter, no phantom-ref GC dependency; issue #253):
+  #   SegmentBlockCache: 2.5 GiB direct (live, in Netty pool)
+  #   Phase C peak arena:  4.0 GiB (1,015 × 4 MB chunks) — freed on Phase C exit
   #   Search gRPC headroom: 3.5 GiB (6g - 2.5g cache) for concurrent reads ✓
   #   Heap (7g) + direct (6g) + JVM overhead (1g) = 14g JVM + native ≤ 20g ✓
   extraConfig:
@@ -334,7 +333,7 @@ tools:
   # 6 g heap (max) + 1 g direct + 1 GiB JVM overhead = 8 GiB → container = 8 GiB.
   # (The previous 7 GiB limit ignored MaxDirectMemorySize=1g and was at risk of
   # OOMKill when the JVM expanded to its maximum heap during large dataset ingest.)
-  javaOpts: "-Xms512m -Xmx6g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=0 -XX:MaxDirectMemorySize=1g"
+  javaOpts: "-Xms512m -Xmx6g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=1073741824 -XX:MaxDirectMemorySize=1g"
   resources:
     requests:
       memory: "8Gi"
