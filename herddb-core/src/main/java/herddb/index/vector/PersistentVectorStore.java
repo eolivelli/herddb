@@ -1102,7 +1102,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * A segment or map file queued for physical deletion. Tracked in the
-     * IndexStatus (metadata v4+) so the retention protocol survives restarts
+     * IndexStatus so the retention protocol survives restarts
      * and reaper decisions are replayable.
      *
      * <p>Deletion becomes eligible when {@code System.currentTimeMillis() >=
