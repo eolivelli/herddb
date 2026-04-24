@@ -2494,7 +2494,7 @@
             }
           ],
           "thresholds": [],
-          "title": "Compaction — Graph Node Progress",
+          "title": "Checkpoint Phase B — Graph Node Progress",
           "tooltip": {"shared": true, "sort": 0, "value_type": "individual"},
           "type": "graph",
           "xaxis": {"mode": "time", "show": true},
@@ -2534,7 +2534,7 @@
             }
           ],
           "thresholds": [],
-          "title": "Compaction — Upload Bytes Progress",
+          "title": "Checkpoint Phase B — Upload Bytes Progress",
           "tooltip": {"shared": true, "sort": 0, "value_type": "individual"},
           "type": "graph",
           "xaxis": {"mode": "time", "show": true},
@@ -2574,7 +2574,7 @@
             }
           ],
           "thresholds": [],
-          "title": "Compaction — Active Phase",
+          "title": "Checkpoint Phase B — Active Phase",
           "tooltip": {"shared": true, "sort": 0, "value_type": "individual"},
           "type": "graph",
           "xaxis": {"mode": "time", "show": true},

@@ -165,8 +165,12 @@ The `IndexingServerConfiguration` class provides typed access to all IndexingSer
 | Vector fusedPQ | `indexing.vector.fusedPQ` | `true` | Default FusedPQ enable |
 | Max segment size | `indexing.vector.maxSegmentSize` | `2147483648` | Default max segment size |
 | Max live graph size | `indexing.vector.maxLiveGraphSize` | `0` | Default max live graph size (0 = auto) |
-| Compaction interval | `indexing.compaction.interval` | `60000` | Checkpoint interval in ms |
-| Compaction threads | `indexing.compaction.threads` | `2` | Background compaction threads |
+| Compaction interval | `indexing.compaction.interval` | `60000` | Checkpoint driver interval in ms (live-shard flush) |
+| Compaction threads | `indexing.compaction.threads` | `2` | Background checkpoint threads |
+| Vector compaction interval | `vector.index.compaction.intervalMs` | `300000` | Graph-merge compaction cadence (ms) |
+| Vector compaction min bytes | `vector.index.compaction.minBytes` | `268435456` | Minimum total size of compaction candidates before firing (256 MB) |
+| Vector compaction max bytes | `vector.index.compaction.maxBytes` | `1073741824` | Hard cap on bytes read per compaction run (1 GB) |
+| Vector compaction retention | `vector.index.compaction.retentionMs` | `600000` | Retention deadline for old segment files after a compaction swap (10 min) |
 | Storage type | `indexing.storage.type` | `file` | `file` (persistent) or `memory` (testing) |
 | Memory multiplier | `indexing.vector.memoryMultiplier` | `5.0` | Multiplier for memory estimation |
 | Apply parallelism | `indexing.apply.parallelism` | `auto` | Number of DML apply worker threads (default: max(1, availableProcessors/2)) |
@@ -555,6 +559,62 @@ for each segment:
 ```
 
 Segments whose size exceeds ~80% of `maxSegmentSize` are "sealed" — they are not included in future merge rounds and their metadata is preserved verbatim across checkpoints.
+
+**Version 4 — Multi-segment with generation + pendingDeletes:**
+
+Extends v3 with a monotonic IndexStatus `generation` counter (used by compaction to pick the authoritative source for a PK and by the retention reaper to gate deletion against shadow replica lag) and a per-IndexStatus `pendingDeletes` list carrying files queued for retention-aware physical deletion.
+
+```
+int  version=4
+int  dimension
+int  M
+int  beamWidth
+float neighborOverflow
+float alpha
+byte addHierarchy
+byte fusedPQ
+int  nextNodeId
+long indexStatusGeneration                  // new in v4
+int  numSegments
+for each segment:
+  int  segmentId
+  long estimatedSizeBytes
+  utf  graphFilePath
+  long graphFileSize
+  utf  mapFilePath    // "" if absent
+  long mapFileSize
+  long generation                           // new in v4
+int  numPendingDeletes                      // new in v4
+for each pending delete:
+  utf  filePath        // "<segUuid>:<graph|map>"
+  long deadlineMs      // wall-clock, System.currentTimeMillis
+  long sinceGeneration // deletion gated until all shadows ack > this
+```
+
+The loader accepts both v3 (missing fields default: `generation=0`, `pendingDeletes=[]`) and v4; the writer always emits v4. The minimum accepted version is v3 — older experimental formats have been removed.
+
+### Segment Compaction (graph merge)
+
+Large accumulations of small on-disk segments slow queries (search fans out across every segment) and leave storage tied up in tombstoned PKs until a segment fully rotates out. Segment compaction is a periodic background task that picks the smallest mergeable segments, rebuilds a single larger jvector graph from the vectors whose PKs are still authoritative, atomically swaps the merged output for the inputs in `IndexStatus`, and queues the old segment files for retention-aware deletion.
+
+**Policy.** `VectorIndexCompactor.chooseSegmentsToMerge` picks the smallest-first subset of candidates up to `vector.index.compaction.maxBytes` (default 1 GB), firing only when both a minimum count is met and the combined input size crosses `vector.index.compaction.minBytes` (default 256 MB). Compaction is throttled by `vector.index.compaction.intervalMs` (default 5 min) — independent of the checkpoint driver's `indexing.compaction.interval`.
+
+**Live-PK filter.** `VectorIndexCompactor.buildAuthorityMap` drops from the merged output:
+- vectors tombstoned inside their input segment (pkOffsets[ord] == -1);
+- vectors whose PK is present in a segment with a higher `generation` than any candidate;
+- vectors whose PK is held by a live in-memory shard.
+
+This reclaims storage held by deleted or superseded PKs — the previous design could only mask them from search results.
+
+**Shadow Retention Protocol.** Input segment files are NOT deleted immediately after the atomic swap. Each one is appended to the IndexStatus `pendingDeletes` list with `deadlineMs = now + retentionMs` (default 10 min) and `sinceGeneration = indexStatusGeneration at the moment of the swap`. A file becomes eligible for physical deletion when BOTH:
+- `System.currentTimeMillis() >= deadlineMs`, AND
+- every known shadow replica has acked a generation strictly greater than `sinceGeneration` (aggregated as `min(appliedIndexStatusGeneration)` across shadows; treated as `Long.MAX_VALUE` when no shadows are registered).
+
+`PersistentVectorStore.reapExpiredPendingDeletes(minShadowAcked)` performs one sweep, returning the number of files physically deleted. Entries whose `deadlineMs` has elapsed but whose shadow gate is not yet open remain retained until a later pass.
+
+**Concurrency.** Compaction acquires `checkpointLock` only for the final atomic swap and metadata publish — the same lock checkpoint Phase C uses — so `IndexStatus` updates stay monotonic. The heavy rebuild and write run lock-free. Deletes arriving during a rebuild are tracked in `pendingCompactionDeletes` and replayed against the merged output before it becomes visible.
+
+**Status.** The v4 metadata format, `PendingDelete` bookkeeping, the policy/authority/reaper helpers, and the config keys above have landed; the background thread, metric registration, and the jvector-level graph rebuild are scoped for a follow-up PR (see tracking issue).
 
 ---
 
@@ -957,7 +1017,7 @@ new GraphIndexBuilder(
 - **WHERE filtering is post-fetch.** All ANN candidates are fetched by PK before WHERE is tested.
 - **FusedPQ requires ≥ 256 vectors.** Smaller indexes use the simpler OnHeapGraphIndex format without quantization.
 - **Single sort key only.** Multi-column ORDER BY and joins fall through to brute-force full table scan.
-- **Deleted vectors accumulate between checkpoints.** Vectors stay in `VectorStorage` and graph node lists until the next Phase B cleanup; only their ordinals/PKs are masked from results.
+- **Deleted vectors accumulate between checkpoints.** Vectors stay in `VectorStorage` and graph node lists until the next Phase B cleanup; only their ordinals/PKs are masked from results. The Segment Compaction section above describes the follow-up work that reclaims these.
 - **Search is sequential across segments.** No segment-level parallelism within a single `search()` call.
 
 ---

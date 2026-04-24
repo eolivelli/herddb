@@ -1,0 +1,99 @@
+/*
+ Licensed to Diennea S.r.l. under one
+ or more contributor license agreements. See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership. Diennea S.r.l. licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
+
+ http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied.  See the License for the
+ specific language governing permissions and limitations
+ under the License.
+*/
+
+package herddb.index.vector;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import java.util.ArrayList;
+import java.util.List;
+import org.junit.Test;
+
+/**
+ * Policy tests for {@link VectorIndexCompactor#chooseSegmentsToMerge}.
+ */
+public class VectorIndexCompactorChooseTest {
+
+    private static VectorSegment seg(int id, long sizeBytes) {
+        VectorSegment s = new VectorSegment(id);
+        s.estimatedSizeBytes = sizeBytes;
+        return s;
+    }
+
+    @Test
+    public void belowMinCountYieldsEmpty() {
+        List<VectorSegment> cand = new ArrayList<>();
+        cand.add(seg(1, 200L * 1024 * 1024));
+        cand.add(seg(2, 200L * 1024 * 1024));
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 4, /*minBytes*/ 10, /*maxBytes*/ Long.MAX_VALUE);
+        assertTrue(picked.isEmpty());
+    }
+
+    @Test
+    public void belowMinBytesYieldsEmpty() {
+        List<VectorSegment> cand = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            cand.add(seg(i, 1024L)); // 10 KB total
+        }
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 2, /*minBytes*/ 1L * 1024 * 1024, /*maxBytes*/ Long.MAX_VALUE);
+        assertTrue(picked.isEmpty());
+    }
+
+    @Test
+    public void picksSmallestFirstUnderByteCap() {
+        List<VectorSegment> cand = new ArrayList<>();
+        cand.add(seg(1, 500L * 1024 * 1024));
+        cand.add(seg(2, 100L * 1024 * 1024));
+        cand.add(seg(3, 50L * 1024 * 1024));
+        cand.add(seg(4, 2000L * 1024 * 1024));
+        // Cap = 250 MB: we should pick 3 (50) + 2 (100) = 150 MB; 1 (500) would overflow.
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, /*minCount*/ 2, /*minBytes*/ 1L, /*maxBytes*/ 250L * 1024 * 1024);
+        assertEquals(2, picked.size());
+        assertEquals(3, picked.get(0).segmentId);
+        assertEquals(2, picked.get(1).segmentId);
+    }
+
+    @Test
+    public void maxBytesCapHonouredWhenAllFit() {
+        List<VectorSegment> cand = new ArrayList<>();
+        cand.add(seg(1, 100L));
+        cand.add(seg(2, 100L));
+        cand.add(seg(3, 100L));
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                cand, 2, 1L, Long.MAX_VALUE);
+        assertEquals(3, picked.size());
+    }
+
+    @Test
+    public void emptyInputReturnsEmpty() {
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                new ArrayList<>(), 1, 1L, Long.MAX_VALUE);
+        assertTrue(picked.isEmpty());
+    }
+
+    @Test
+    public void nullInputReturnsEmpty() {
+        List<VectorSegment> picked = VectorIndexCompactor.chooseSegmentsToMerge(
+                null, 1, 1L, Long.MAX_VALUE);
+        assertTrue(picked.isEmpty());
+    }
+}

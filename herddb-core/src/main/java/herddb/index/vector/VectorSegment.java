@@ -77,6 +77,16 @@ class VectorSegment implements Closeable {
     long estimatedSizeBytes;
     volatile boolean dirty;
 
+    /**
+     * IndexStatus generation in which this segment was produced.
+     * Monotonically increasing across checkpoints and compaction swaps.
+     * Used by compaction to identify the authoritative segment for a PK
+     * (latest wins) and by the retention reaper to decide when a
+     * tombstoned segment file is safe to delete across shadow replicas.
+     * Defaults to 0 when loading v3 metadata (no generation field).
+     */
+    long generation;
+
     // Compact ordinal-to-PK cache: all PKs packed in one byte[],
     // with parallel offset/length arrays indexed by ordinal.
     byte[] pkData;

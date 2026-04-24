@@ -231,8 +231,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /** Buffer size for in-memory / on-disk staging of index artefacts (1 MB). */
     static final int CHUNK_SIZE = 1_048_576;
 
-    /** Metadata version — the only on-disk format is the multi-segment multipart one. */
-    private static final int METADATA_VERSION_MULTI_SEGMENT = 3;
+    /**
+     * Current metadata version written by this store.
+     * <ul>
+     *   <li>v3: multi-segment multipart format (segments only).</li>
+     *   <li>v4: adds per-segment {@code generation} and a per-IndexStatus
+     *       {@code pendingDeletes} list used by the compaction retention
+     *       protocol. The reader supports both v3 (generation=0,
+     *       pendingDeletes=empty) and v4.</li>
+     * </ul>
+     */
+    private static final int METADATA_VERSION_MULTI_SEGMENT = 4;
+
+    /** Lowest metadata version still accepted by the reader. */
+    private static final int METADATA_VERSION_MIN_SUPPORTED = 3;
 
     // -------------------------------------------------------------------------
     // Configuration
@@ -315,6 +327,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /** Counter for assigning unique segment IDs. */
     private final AtomicInteger nextSegmentId = new AtomicInteger(0);
+
+    /**
+     * Monotonically increasing IndexStatus generation. Each successful
+     * call to {@link #persistIndexStatusMultiSegment} bumps this counter
+     * and stamps every newly-produced segment with the new value.
+     * Loaded from the latest persisted metadata (max segment generation)
+     * at startup so generations remain monotonic across restarts.
+     */
+    private final AtomicLong currentIndexStatusGeneration = new AtomicLong(0);
+
+    /**
+     * Files queued for physical deletion by the compaction retention
+     * protocol. Persisted in the IndexStatus (v4+) so the decision survives
+     * restarts. The reaper removes entries once both the wall-clock
+     * deadline has passed AND all known shadow replicas have acked a
+     * generation &gt; {@code sinceGeneration}.
+     */
+    private final java.util.concurrent.CopyOnWriteArrayList<PendingDelete> pendingDeletes =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
 
     /** Protects state swaps during checkpoint. */
     private final ReentrantReadWriteLock stateLock = new ReentrantReadWriteLock();
@@ -462,6 +493,91 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final AtomicInteger deferralEvents = new AtomicInteger();
     private final AtomicLong currentDeferredVectors = new AtomicLong();
     private final AtomicLong totalDeferredVectors = new AtomicLong();
+
+    /** Current IndexStatus generation; 0 if no checkpoint has ever been persisted. */
+    public long getCurrentIndexStatusGeneration() {
+        return currentIndexStatusGeneration.get();
+    }
+
+    /** Snapshot of the pendingDeletes list (defensive copy). */
+    public List<PendingDelete> getPendingDeletesSnapshot() {
+        return new ArrayList<>(pendingDeletes);
+    }
+
+    /**
+     * Encodes the identity of a multipart segment file into the opaque
+     * {@code filePath} stored in a {@link PendingDelete}. The tableSpace
+     * is always this store's {@code tableSpaceUUID}, so we only need to
+     * encode the segment uuid and file type.
+     */
+    static String encodeMultipartPath(String segUuid, String fileType) {
+        return segUuid + ":" + fileType;
+    }
+
+    /**
+     * Queues the two multipart files backing a segment (graph + map)
+     * for retention-aware deletion. Called by the compaction swap step
+     * for every input segment that the merged output replaces.
+     */
+    void queueSegmentPendingDelete(VectorSegment seg, long retentionMs) {
+        long deadlineMs = System.currentTimeMillis() + retentionMs;
+        long sinceGen = currentIndexStatusGeneration.get();
+        String segUuid = indexUUID + "_seg" + seg.segmentId;
+        pendingDeletes.add(new PendingDelete(
+                encodeMultipartPath(segUuid, "graph"), deadlineMs, sinceGen));
+        if (seg.mapFilePath != null) {
+            pendingDeletes.add(new PendingDelete(
+                    encodeMultipartPath(segUuid, "map"), deadlineMs, sinceGen));
+        }
+    }
+
+    /**
+     * Runs one pass of the retention reaper. Moves every
+     * {@link PendingDelete} whose deadline has passed AND whose
+     * {@code sinceGeneration} is &le; the supplied shadow-acked
+     * generation to the physical-delete stage, then drops it from the
+     * in-memory {@code pendingDeletes} list.
+     *
+     * <p>Callers that have no shadow replicas should pass
+     * {@link Long#MAX_VALUE} so the shadow gate never blocks reclaim —
+     * retention then depends solely on the wall-clock deadline.
+     *
+     * @return number of files successfully deleted in this pass.
+     */
+    public int reapExpiredPendingDeletes(long minShadowAckedGeneration) {
+        long nowMs = System.currentTimeMillis();
+        VectorIndexCompactor.Partition partition = VectorIndexCompactor.partitionReapable(
+                pendingDeletes, nowMs, minShadowAckedGeneration);
+        if (partition.reapable.isEmpty()) {
+            return 0;
+        }
+        int deleted = 0;
+        for (PendingDelete pd : partition.reapable) {
+            int sep = pd.filePath.lastIndexOf(':');
+            if (sep <= 0 || sep >= pd.filePath.length() - 1) {
+                LOGGER.log(Level.WARNING,
+                        "reaper {0}: malformed pendingDelete entry {1}, dropping",
+                        new Object[]{indexName, pd.filePath});
+                continue;
+            }
+            String segUuid = pd.filePath.substring(0, sep);
+            String fileType = pd.filePath.substring(sep + 1);
+            try {
+                dataStorageManager.deleteMultipartIndexFile(tableSpaceUUID, segUuid, fileType);
+                deleted++;
+            } catch (DataStorageManagerException e) {
+                LOGGER.log(Level.WARNING,
+                        "reaper " + indexName + ": failed to delete " + segUuid + "/" + fileType,
+                        e);
+                // Leave the entry in pendingDeletes so a later reap cycle retries.
+                partition.retained.add(pd);
+            }
+        }
+        // Swap the pendingDeletes list atomically: only retained entries survive.
+        pendingDeletes.clear();
+        pendingDeletes.addAll(partition.retained);
+        return deleted;
+    }
 
     public long getTotalRolledBackPages() {
         return totalRolledBackPages.get();
@@ -864,6 +980,27 @@ public class PersistentVectorStore extends AbstractVectorStore {
             this.mapFilePath = mapFilePath;
             this.mapFileSize = mapFileSize;
             this.estimatedSizeBytes = estimatedSizeBytes;
+        }
+    }
+
+    /**
+     * A segment or map file queued for physical deletion. Tracked in the
+     * IndexStatus (metadata v4+) so the retention protocol survives restarts
+     * and reaper decisions are replayable.
+     *
+     * <p>Deletion becomes eligible when {@code System.currentTimeMillis() >=
+     * deadlineMs} AND {@code sinceGeneration <=
+     * min(shadowAckedGeneration)} (or no shadows are known).
+     */
+    static final class PendingDelete {
+        final String filePath;
+        final long deadlineMs;
+        final long sinceGeneration;
+
+        PendingDelete(String filePath, long deadlineMs, long sinceGeneration) {
+            this.filePath = filePath;
+            this.deadlineMs = deadlineMs;
+            this.sinceGeneration = sinceGeneration;
         }
     }
 
@@ -1910,6 +2047,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         List<VectorSegment> preloadedSegments = new ArrayList<>();
         try {
             if (newSegmentResults != null) {
+                // persistIndexStatusMultiSegment has just bumped
+                // currentIndexStatusGeneration and stamped the new segment
+                // metadata with the fresh value. Read it here and apply
+                // it to the in-memory VectorSegments so subsequent segment
+                // authority comparisons match the persisted state.
+                long freshGeneration = currentIndexStatusGeneration.get();
                 for (SegmentWriteResult swr : newSegmentResults) {
                     VectorSegment seg = new VectorSegment(swr.segmentId);
                     seg.estimatedSizeBytes = swr.estimatedSizeBytes;
@@ -1917,6 +2060,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     seg.graphFileSize = swr.graphFileSize;
                     seg.mapFilePath = swr.mapFilePath;
                     seg.mapFileSize = swr.mapFileSize;
+                    seg.generation = freshGeneration;
                     Path reloadMapFile = readMultipartMapDataToTempFile(seg);
                     loadFusedPQSegment(seg, reloadMapFile, snapshotDimension, nextNodeId.get());
                     preloadedSegments.add(seg);
@@ -2725,11 +2869,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         ByteBuffer metaBuf = ByteBuffer.wrap(status.indexData);
 
         int version = metaBuf.getInt();
-        if (version != METADATA_VERSION_MULTI_SEGMENT) {
+        if (version < METADATA_VERSION_MIN_SUPPORTED || version > METADATA_VERSION_MULTI_SEGMENT) {
             LOGGER.log(Level.SEVERE,
-                    "unsupported vector index metadata version {0} for {1} (only v{2} is supported),"
+                    "unsupported vector index metadata version {0} for {1} (supported: v{2}..v{3}),"
                             + " starting empty — old experimental formats have been removed",
-                    new Object[]{version, indexName, METADATA_VERSION_MULTI_SEGMENT});
+                    new Object[]{version, indexName,
+                            METADATA_VERSION_MIN_SUPPORTED, METADATA_VERSION_MULTI_SEGMENT});
             return;
         }
 
@@ -2746,28 +2891,42 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.dimension = dim;
         newPageId.set(status.newPageId);
 
-        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha, version);
     }
 
     private void loadMultiSegmentFormat(ByteBuffer metaBuf, int dim, int savedNextNodeId,
-                                         int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
+                                         int savedBeamWidth, float savedNeighborOverflow, float savedAlpha,
+                                         int version)
             throws IOException, DataStorageManagerException {
         java.io.DataInputStream dis = new java.io.DataInputStream(
                 new java.io.ByteArrayInputStream(metaBuf.array(), metaBuf.position(),
                         metaBuf.remaining()));
+        long loadedGeneration;
         int numSegments;
         try {
+            if (version >= 4) {
+                loadedGeneration = dis.readLong();
+            } else {
+                loadedGeneration = 0L;
+            }
             numSegments = dis.readInt();
         } catch (IOException e) {
             throw new DataStorageManagerException("Failed to read segment count", e);
         }
 
+        currentIndexStatusGeneration.set(loadedGeneration);
+
         if (dim == 0 || numSegments == 0) {
-            LOGGER.log(Level.INFO, "vector store {0} is empty (multi-segment), no load needed", indexName);
+            if (version >= 4) {
+                loadPendingDeletes(dis);
+            }
+            LOGGER.log(Level.INFO, "vector store {0} is empty (multi-segment v{1}), no load needed",
+                    new Object[]{indexName, version});
             return;
         }
 
         int maxSegId = -1;
+        long maxGeneration = loadedGeneration;
         for (int s = 0; s < numSegments; s++) {
             int segId;
             long estimatedSize;
@@ -2775,6 +2934,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             long graphFileSize;
             String mapFilePath;
             long mapFileSize;
+            long generation;
             try {
                 segId = dis.readInt();
                 estimatedSize = dis.readLong();
@@ -2782,6 +2942,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 graphFileSize = dis.readLong();
                 mapFilePath = dis.readUTF();
                 mapFileSize = dis.readLong();
+                generation = (version >= 4) ? dis.readLong() : 0L;
             } catch (IOException e) {
                 throw new DataStorageManagerException("Failed to read segment metadata", e);
             }
@@ -2792,6 +2953,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             seg.graphFileSize = graphFileSize;
             seg.mapFilePath = mapFilePath.isEmpty() ? null : mapFilePath;
             seg.mapFileSize = mapFileSize;
+            seg.generation = generation;
 
             Path mapFile = readMultipartMapDataToTempFile(seg);
             loadFusedPQSegment(seg, mapFile, dim, savedNextNodeId);
@@ -2800,8 +2962,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
             if (segId > maxSegId) {
                 maxSegId = segId;
             }
+            if (generation > maxGeneration) {
+                maxGeneration = generation;
+            }
         }
         nextSegmentId.set(maxSegId + 1);
+        currentIndexStatusGeneration.set(Math.max(currentIndexStatusGeneration.get(), maxGeneration));
+
+        if (version >= 4) {
+            loadPendingDeletes(dis);
+        }
 
         int maxOrd = -1;
         for (VectorSegment seg : segments) {
@@ -2814,8 +2984,37 @@ public class PersistentVectorStore extends AbstractVectorStore {
         initEmptyLiveShards(dim, savedBeamWidth, savedNeighborOverflow, savedAlpha);
 
         LOGGER.log(Level.INFO,
-                "loaded vector store {0} (multi-segment): {1} segments, dimension {2}",
-                new Object[]{indexName, numSegments, dim});
+                "loaded vector store {0} (multi-segment v{1}): {2} segments, dimension {3}, "
+                        + "generation {4}, pendingDeletes {5}",
+                new Object[]{indexName, version, numSegments, dim,
+                        currentIndexStatusGeneration.get(), pendingDeletes.size()});
+    }
+
+    /**
+     * Reads the pendingDeletes list from the tail of a v4+ metadata stream.
+     * Appends entries into {@link #pendingDeletes}. A v3 metadata stream
+     * never calls this helper.
+     */
+    private void loadPendingDeletes(java.io.DataInputStream dis) throws DataStorageManagerException {
+        int pendingCount;
+        try {
+            pendingCount = dis.readInt();
+        } catch (IOException e) {
+            throw new DataStorageManagerException("Failed to read pendingDeletes count", e);
+        }
+        for (int i = 0; i < pendingCount; i++) {
+            String filePath;
+            long deadlineMs;
+            long sinceGeneration;
+            try {
+                filePath = dis.readUTF();
+                deadlineMs = dis.readLong();
+                sinceGeneration = dis.readLong();
+            } catch (IOException e) {
+                throw new DataStorageManagerException("Failed to read pendingDeletes entry", e);
+            }
+            pendingDeletes.add(new PendingDelete(filePath, deadlineMs, sinceGeneration));
+        }
     }
 
     /**
@@ -3163,6 +3362,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
         int totalSegments = sealedSegments.size() + mergeableSegments.size() + newSegmentResults.size();
         Set<Long> activePages = new HashSet<>();
 
+        // Allocate the next generation; freshly-written segments get stamped with it.
+        // Existing (sealed/mergeable) segments keep their stored generation.
+        long newGeneration = currentIndexStatusGeneration.get() + 1;
+
         VisibleByteArrayOutputStream baos = new VisibleByteArrayOutputStream(256);
         try (java.io.DataOutputStream dos = new java.io.DataOutputStream(baos)) {
             dos.writeInt(METADATA_VERSION_MULTI_SEGMENT);
@@ -3174,22 +3377,31 @@ public class PersistentVectorStore extends AbstractVectorStore {
             dos.writeByte(ADD_HIERARCHY ? 1 : 0);
             dos.writeByte(1); // fusedPQ
             dos.writeInt(nextNodeId.get());
+            dos.writeLong(newGeneration);
             dos.writeInt(totalSegments);
 
             for (VectorSegment seg : sealedSegments) {
                 writeSegmentMeta(dos, seg.segmentId, seg.estimatedSizeBytes,
                         seg.graphFilePath, seg.graphFileSize,
-                        seg.mapFilePath, seg.mapFileSize);
+                        seg.mapFilePath, seg.mapFileSize, seg.generation);
             }
             for (VectorSegment seg : mergeableSegments) {
                 writeSegmentMeta(dos, seg.segmentId, seg.estimatedSizeBytes,
                         seg.graphFilePath, seg.graphFileSize,
-                        seg.mapFilePath, seg.mapFileSize);
+                        seg.mapFilePath, seg.mapFileSize, seg.generation);
             }
             for (SegmentWriteResult swr : newSegmentResults) {
                 writeSegmentMeta(dos, swr.segmentId, swr.estimatedSizeBytes,
                         swr.graphFilePath, swr.graphFileSize,
-                        swr.mapFilePath, swr.mapFileSize);
+                        swr.mapFilePath, swr.mapFileSize, newGeneration);
+            }
+
+            List<PendingDelete> snapshotPending = new ArrayList<>(pendingDeletes);
+            dos.writeInt(snapshotPending.size());
+            for (PendingDelete pd : snapshotPending) {
+                dos.writeUTF(pd.filePath);
+                dos.writeLong(pd.deadlineMs);
+                dos.writeLong(pd.sinceGeneration);
             }
         } catch (IOException e) {
             throw new DataStorageManagerException("Failed to serialize index metadata", e);
@@ -3200,19 +3412,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 newPageId.get(), activePages, baos.toByteArray());
 
         dataStorageManager.indexCheckpoint(tableSpaceUUID, indexUUID, indexStatus, false);
+
+        currentIndexStatusGeneration.set(newGeneration);
     }
 
     private static void writeSegmentMeta(
             java.io.DataOutputStream dos,
             int segmentId, long estimatedSizeBytes,
             String graphFilePath, long graphFileSize,
-            String mapFilePath, long mapFileSize) throws IOException {
+            String mapFilePath, long mapFileSize,
+            long generation) throws IOException {
         dos.writeInt(segmentId);
         dos.writeLong(estimatedSizeBytes);
         dos.writeUTF(graphFilePath);
         dos.writeLong(graphFileSize);
         dos.writeUTF(mapFilePath != null ? mapFilePath : "");
         dos.writeLong(mapFileSize);
+        dos.writeLong(generation);
     }
 
     // -------------------------------------------------------------------------
