@@ -121,12 +121,44 @@ public final class IndexingServerConfiguration {
             "indexing.vector.segmentPageCacheMaxBytes";
     public static final long PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES_DEFAULT = 0; // 0 = compute as 1/4 of heap
 
-    // Compaction
+    // Compaction (checkpoint driver — existing)
     public static final String PROPERTY_COMPACTION_INTERVAL = "indexing.compaction.interval";
     public static final long PROPERTY_COMPACTION_INTERVAL_DEFAULT = 60000L;
 
     public static final String PROPERTY_COMPACTION_THREADS = "indexing.compaction.threads";
     public static final int PROPERTY_COMPACTION_THREADS_DEFAULT = 2;
+
+    // Vector-index graph-merge compaction — picks N small/mergeable on-disk
+    // segments, rebuilds one larger jvector graph from the live vectors,
+    // atomically swaps the new segment in, and queues the old files for
+    // retention-aware deletion. Runs on a dedicated background thread,
+    // independent of the checkpoint driver above.
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_INTERVAL_MS =
+            "vector.index.compaction.intervalMs";
+    public static final long PROPERTY_VECTOR_INDEX_COMPACTION_INTERVAL_MS_DEFAULT = 5L * 60_000L;
+
+    /** Minimum total bytes across candidate segments before a compaction run will fire. */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_MIN_BYTES =
+            "vector.index.compaction.minBytes";
+    public static final long PROPERTY_VECTOR_INDEX_COMPACTION_MIN_BYTES_DEFAULT =
+            256L * 1024 * 1024; // 256 MB
+
+    /** Hard cap on total bytes a single compaction run may read, bounding disk pressure. */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_MAX_BYTES =
+            "vector.index.compaction.maxBytes";
+    public static final long PROPERTY_VECTOR_INDEX_COMPACTION_MAX_BYTES_DEFAULT =
+            1024L * 1024 * 1024; // 1 GB
+
+    /**
+     * How long old segment files remain on-disk after a compaction swap
+     * before the reaper may physically delete them. Also gated by
+     * {@code shadowAckedGeneration}: reclaim waits for the later of the
+     * two signals.
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_RETENTION_MS =
+            "vector.index.compaction.retentionMs";
+    public static final long PROPERTY_VECTOR_INDEX_COMPACTION_RETENTION_MS_DEFAULT =
+            10L * 60_000L; // 10 min
 
     // Apply parallelism
     public static final String PROPERTY_APPLY_PARALLELISM = "indexing.apply.parallelism";
