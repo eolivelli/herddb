@@ -1714,9 +1714,16 @@
               "intervalFactor": 2,
               "legendFormat": "ondisk {{__name__}}",
               "refId": "B"
+            },
+            {
+              "expr": "{__name__=~\".*vidx_.*_next_node_id\", instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "next_node_id {{__name__}}",
+              "refId": "C"
             }
           ],
-          "title": "Live vs On-Disk Nodes",
+          "title": "Live vs On-Disk Nodes (+ global next_node_id)",
           "tooltip": {
             "shared": true,
             "sort": 0,

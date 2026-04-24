@@ -126,6 +126,10 @@ message DescribeIndexResponse {
     int64 compaction_nodes_total = 22;
     int64 upload_bytes_done = 23;
     int64 upload_bytes_total = 24;
+    // Global monotonic node-id counter (issue #256). int64 so it cannot
+    // silently wrap after 2^31 ids are burned by ingest + compaction
+    // reservations on a long-running cluster.
+    int64 next_node_id = 25;
 }
 
 message ListPrimaryKeysRequest {

@@ -997,6 +997,62 @@
               "show": true
             }
           ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "Global monotonic node-id counter (issue #256). Watch the derivative to see burn rate; with int64 the absolute value cannot silently overflow.",
+          "fill": 1,
+          "id": 256,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_next_node_id\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Global next_node_id counter",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
         }
       ],
       "showTitle": false,

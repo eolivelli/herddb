@@ -23,10 +23,12 @@ import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 
 /**
- * {@link RandomAccessVectorValues} implementation backed by a {@link VectorStorage}.
+ * {@link RandomAccessVectorValues} implementation backed by a per-shard
+ * {@link VectorStorage}. Each {@link VectorStorage} is owned by a single
+ * {@code LiveGraphShard} and indexed by the shard's local ordinal
+ * {@code [0, shardSize)} — no offset arithmetic is needed.
  *
- * <p>{@link #getVector(int)} is a single lock-free array lookup — no Integer boxing,
- * no hash computation, no ConcurrentHashMap segment traversal.
+ * <p>{@link #getVector(int)} is a single lock-free array lookup.
  *
  * <p>{@code isValueShared()} returns {@code false}: each slot holds an independent
  * {@code VectorFloat<?>} object, so callers need not copy before storing the reference.
@@ -39,32 +41,20 @@ class VectorStorageRandomAccessVectorValues implements RandomAccessVectorValues 
     private final VectorStorage storage;
     private final int dimension;
     private final int size;
-    /**
-     * Offset added to the localNodeId before looking up in storage.
-     * For shard-local graphs this equals {@code LiveGraphShard.startNodeId},
-     * so that {@code getVector(localId)} returns the vector at global nodeId
-     * {@code localId + offset}.  Zero for any non-shard use (pool building, etc.).
-     */
-    private final int offset;
 
     VectorStorageRandomAccessVectorValues(VectorStorage storage, int dimension) {
-        this(storage, dimension, -1, 0);
+        this(storage, dimension, -1);
     }
 
     VectorStorageRandomAccessVectorValues(VectorStorage storage, int dimension, int size) {
-        this(storage, dimension, size, 0);
-    }
-
-    VectorStorageRandomAccessVectorValues(VectorStorage storage, int dimension, int size, int offset) {
         this.storage = storage;
         this.dimension = dimension;
         this.size = size;
-        this.offset = offset;
     }
 
     @Override
     public VectorFloat<?> getVector(int localNodeId) {
-        return storage.get(localNodeId + offset);
+        return storage.get(localNodeId);
     }
 
     @Override

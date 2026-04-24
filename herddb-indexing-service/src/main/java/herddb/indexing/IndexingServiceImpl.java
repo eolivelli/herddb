@@ -329,7 +329,8 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setCompactionNodesDone(details.compactionNodesDone)
                     .setCompactionNodesTotal(details.compactionNodesTotal)
                     .setUploadBytesDone(details.uploadBytesDone)
-                    .setUploadBytesTotal(details.uploadBytesTotal);
+                    .setUploadBytesTotal(details.uploadBytesTotal)
+                    .setNextNodeId(details.nextNodeId);
             responseObserver.onNext(builder.build());
             responseObserver.onCompleted();
         } catch (RuntimeException e) {

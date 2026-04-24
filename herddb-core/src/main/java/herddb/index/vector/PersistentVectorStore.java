@@ -275,11 +275,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /** All live graph shards. The LAST element is the active (unsealed) shard. */
     private volatile List<LiveGraphShard> liveShards = new ArrayList<>();
 
-    /** Monotonically increasing node-ID counter. */
-    private final AtomicInteger nextNodeId = new AtomicInteger(0);
-
-    /** Global lock-free vector storage shared by all live shards. */
-    private VectorStorage vectorStorage = new VectorStorage(0);
+    /**
+     * Monotonically increasing global node-id counter. Widened to {@code long}
+     * so it cannot silently wrap after {@code 2^31} ids are burned by ingest +
+     * compaction reservations (issue #256). Each {@link LiveGraphShard} owns
+     * its own per-shard {@link VectorStorage} keyed by a local ordinal, so
+     * the global id here never reaches a {@code VectorStorage} backing array.
+     */
+    private final AtomicLong nextNodeId = new AtomicLong(0);
 
     /** Page-ID counter. */
     private final AtomicLong newPageId = new AtomicLong(1);
@@ -1055,27 +1058,47 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * The active shard (last in the list) accepts new inserts; sealed shards are read-only.
      */
     static class LiveGraphShard {
+        /**
+         * Primary-key to <em>local ordinal</em>. Keys are bounded by
+         * {@code computeEffectiveMaxLiveGraphSize()} so they always fit in
+         * an {@code int}.
+         */
         final ConcurrentHashMap<Bytes, Integer> pkToNode;
+        /**
+         * Local ordinal to primary-key. Counterpart of {@link #pkToNode}.
+         */
         final ConcurrentHashMap<Integer, Bytes> nodeToPk;
         final RandomAccessVectorValues mravv;
         final GraphIndexBuilder builder;
         final AtomicInteger vectorCount = new AtomicInteger(0);
         /**
-         * Global nodeId of the first node added to this shard's builder.
-         * The builder uses local nodeIds {@code [0, vectorCount)}.
-         * To convert: {@code localNodeId = globalNodeId - startNodeId}.
+         * Per-shard lock-free vector storage, indexed by <em>local ordinal</em>
+         * {@code [0, vectorCount)}. Owned by this shard; dropped when the
+         * shard is checkpointed out (Phase C) so its int-indexed backing
+         * array never grows past the configured shard cap even as the
+         * global {@code nextNodeId} counter progresses (issue #256).
          */
-        final int startNodeId;
+        final VectorStorage vectorStorage;
+        /**
+         * Global nodeId of the first node added to this shard (i.e.
+         * {@code PersistentVectorStore.nextNodeId.get()} at the moment
+         * the shard was created). Retained for observability and for the
+         * local-ordinal computation {@code (int)(globalNodeId - startNodeId)}
+         * at insert time.
+         */
+        final long startNodeId;
 
         LiveGraphShard(ConcurrentHashMap<Bytes, Integer> pkToNode,
                        ConcurrentHashMap<Integer, Bytes> nodeToPk,
                        RandomAccessVectorValues mravv,
                        GraphIndexBuilder builder,
-                       int startNodeId) {
+                       VectorStorage vectorStorage,
+                       long startNodeId) {
             this.pkToNode = pkToNode;
             this.nodeToPk = nodeToPk;
             this.mravv = mravv;
             this.builder = builder;
+            this.vectorStorage = vectorStorage;
             this.startNodeId = startNodeId;
         }
     }
@@ -1142,7 +1165,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         dataStorageManager.initIndex(tableSpaceUUID, indexUUID);
-        vectorStorage = new VectorStorage(computeEffectiveMaxLiveGraphSize());
 
         // Try to load existing state
         try {
@@ -1671,7 +1693,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return nextSegmentId.getAndIncrement();
     }
 
-    int allocateCompactionNodeIds(int count) {
+    long allocateCompactionNodeIds(int count) {
         // The bump of nextNodeId must be atomic with a rotation of the active
         // live shard. Without rotation, the next addVector call would allocate
         // nodeId = nextNodeId (post-bump) but compute
@@ -1687,39 +1709,53 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // deadlock-free.
         stateLock.writeLock().lock();
         try {
-            int start = nextNodeId.getAndAdd(count);
+            long start = nextNodeId.getAndAdd(count);
             List<LiveGraphShard> shards = this.liveShards;
-            if (dimension != 0 && shards != null && !shards.isEmpty()
-                    && shards.get(shards.size() - 1).nodeToPk.size() > 0) {
-                int sealedSize = shards.get(shards.size() - 1).nodeToPk.size();
-                // createEmptyLiveShard reads nextNodeId.get() AFTER the bump,
-                // so the new shard's startNodeId equals the post-bump value
-                // and future ingest produces local = 0, 1, 2, ... contiguously.
-                LiveGraphShard fresh = createEmptyLiveShard(
-                        dimension, beamWidth, neighborOverflow, alpha,
-                        nextNodeId.get());
-                List<LiveGraphShard> newList = new ArrayList<>(shards);
-                newList.add(fresh);
-                synchronized (this) {
-                    this.liveShards = newList;
+            if (dimension != 0 && shards != null && !shards.isEmpty()) {
+                LiveGraphShard activeShard = shards.get(shards.size() - 1);
+                int sealedSize = activeShard.nodeToPk.size();
+                // Rotate whenever the bump would leave the active shard's
+                // startNodeId stale — this covers both the non-empty case
+                // (PR #257 / issue #255) AND the empty case (an active
+                // shard that was created before this bump would otherwise
+                // see the next ingest compute
+                //   local = postBumpNextNodeId - oldStartNodeId
+                // which is exactly the bump-wide gap we are trying to avoid).
+                // createEmptyLiveShard reads nextNodeId.get() AFTER the bump
+                // so the replacement shard's startNodeId equals the post-bump
+                // value and future ingest produces local = 0, 1, 2, ...
+                // contiguously.
+                if (sealedSize > 0 || activeShard.startNodeId != nextNodeId.get()) {
+                    LiveGraphShard fresh = createEmptyLiveShard(
+                            dimension, beamWidth, neighborOverflow, alpha,
+                            nextNodeId.get());
+                    List<LiveGraphShard> newList;
+                    if (sealedSize > 0) {
+                        // Preserve the non-empty shard as sealed and append
+                        // the fresh one — matches the issue-#255 behaviour.
+                        newList = new ArrayList<>(shards);
+                        newList.add(fresh);
+                    } else {
+                        // Replace the stale empty shard so we do not leak
+                        // empty shards across every compaction reservation.
+                        newList = new ArrayList<>(shards.subList(0, shards.size() - 1));
+                        newList.add(fresh);
+                    }
+                    synchronized (this) {
+                        this.liveShards = newList;
+                    }
+                    LOGGER.log(Level.INFO,
+                            "vector store {0}: rotated live graph shard before "
+                                    + "compaction nodeId reservation, now {1} shards "
+                                    + "({2} vectors in sealed shard, reserved range "
+                                    + "[{3},{4}))",
+                            new Object[]{indexName, newList.size(), sealedSize,
+                                    start, start + count});
                 }
-                LOGGER.log(Level.INFO,
-                        "vector store {0}: rotated live graph shard before "
-                                + "compaction nodeId reservation, now {1} shards "
-                                + "({2} vectors in sealed shard, reserved range "
-                                + "[{3},{4}))",
-                        new Object[]{indexName, newList.size(), sealedSize,
-                                start, start + count});
             }
             return start;
         } finally {
             stateLock.writeLock().unlock();
-        }
-    }
-
-    void releaseCompactionNodeIds(int startNodeId, int count) {
-        for (int i = 0; i < count; i++) {
-            vectorStorage.remove(startNodeId + i);
         }
     }
 
@@ -1729,10 +1765,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     VectorSimilarityFunction compactionSimilarity() {
         return similarityFunction;
-    }
-
-    VectorStorage compactionVectorStorage() {
-        return vectorStorage;
     }
 
     SegmentWriteResult writeSyntheticShard(LiveGraphShard syntheticShard,
@@ -2002,17 +2034,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
             // Check if rotation is needed BEFORE allocating the nodeId so that
             // the new shard's startNodeId (= nextNodeId.get() at creation time)
-            // matches the first nodeId assigned to it, keeping localId >= 0.
+            // matches the first nodeId assigned to it, keeping localOrd >= 0.
             if (active.nodeToPk.size() >= computeEffectiveMaxLiveGraphSize()) {
                 active = rotateLiveShard();
             }
 
-            int nodeId = nextNodeId.getAndIncrement();
-            vectorStorage.set(nodeId, vec);
+            long globalNodeId = nextNodeId.getAndIncrement();
+            // Per-shard span is bounded by computeEffectiveMaxLiveGraphSize(),
+            // so the cast always fits. Math.toIntExact turns a violated
+            // invariant into a loud ArithmeticException instead of silently
+            // wrapping (issue #256).
+            int localOrd = Math.toIntExact(globalNodeId - active.startNodeId);
+            active.vectorStorage.set(localOrd, vec);
             active.vectorCount.incrementAndGet();
-            active.pkToNode.put(pk, nodeId);
-            active.nodeToPk.put(nodeId, pk);
-            active.builder.addGraphNode(nodeId - active.startNodeId, vec);
+            active.pkToNode.put(pk, localOrd);
+            active.nodeToPk.put(localOrd, pk);
+            active.builder.addGraphNode(localOrd, vec);
             dirty.set(true);
         } finally {
             stateLock.readLock().unlock();
@@ -2052,14 +2089,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
             // Check all live shards
             for (LiveGraphShard shard : liveShards) {
-                Integer nodeId = shard.pkToNode.remove(pk);
-                if (nodeId != null) {
-                    shard.nodeToPk.remove(nodeId);
+                Integer localOrd = shard.pkToNode.remove(pk);
+                if (localOrd != null) {
+                    shard.nodeToPk.remove(localOrd);
                     dirty.set(true);
                     if (shard.builder != null) {
-                        shard.builder.markNodeDeleted(nodeId - shard.startNodeId);
+                        shard.builder.markNodeDeleted(localOrd);
                     } else {
-                        vectorStorage.remove(nodeId);
+                        shard.vectorStorage.remove(localOrd);
                         shard.vectorCount.decrementAndGet();
                     }
                     break;
@@ -2128,13 +2165,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         // Phase 3: frozen + deferred shards. Both are cleaned up by Phase C
         // under the write lock, so we must hold the read lock to prevent
-        // concurrent vectorStorage.remove() (called in Phase C) from clearing
-        // vectors while GraphSearcher accesses them via shard.mravv. Without
-        // this lock, there is a race where vectorStorage.remove() nulls a
-        // vector slot while jvector's scorer is calling getVector() on it,
-        // leading to NullPointerException (issue #129). The lock is held
-        // while invokeSearchTasks blocks on task completion: worker threads
-        // can join as additional readers because ReentrantReadWriteLock
+        // Phase C from dropping the shards (and their per-shard VectorStorage
+        // references) while GraphSearcher is still accessing them via
+        // shard.mravv. Without this lock, a race would let the shard become
+        // unreachable while jvector's scorer is calling getVector() on its
+        // storage, leading to NullPointerException (issue #129). The lock
+        // is held while invokeSearchTasks blocks on task completion: worker
+        // threads can join as additional readers because ReentrantReadWriteLock
         // allows multiple concurrent read holders.
         stateLock.readLock().lock();
         try {
@@ -2188,7 +2225,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 qv, k, shard.mravv, similarityFunction, graph, Bits.ALL);
         List<Map.Entry<Bytes, Float>> out = new ArrayList<>(result.getNodes().length);
         for (SearchResult.NodeScore ns : result.getNodes()) {
-            Bytes pk = shard.nodeToPk.get(ns.node + shard.startNodeId);
+            Bytes pk = shard.nodeToPk.get(ns.node);
             if (pk != null && (pendingDeletes == null || !pendingDeletes.contains(pk))) {
                 out.add(new AbstractMap.SimpleImmutableEntry<>(pk, ns.score));
             }
@@ -2722,7 +2759,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     maxOrd = seg.maxOrdinal;
                 }
             }
-            this.nextNodeId.set(Math.max(maxOrd + 1, nextNodeId.get()));
+            this.nextNodeId.set(Math.max((long) maxOrd + 1L, nextNodeId.get()));
 
             int totalNodes = (int) onDiskNodeToPkSize() + totalLiveSize();
             LOGGER.log(Level.INFO,
@@ -2730,17 +2767,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             + "{3} new live inserts during checkpoint",
                     new Object[]{indexName, totalNodes, newSegments.size(), totalLiveSize()});
 
-            // Release vectorStorage slots for checkpointed nodeIds
-            if (snapshotShards != null) {
-                for (LiveGraphShard shard : snapshotShards) {
-                    for (Integer nodeId : shard.nodeToPk.keySet()) {
-                        vectorStorage.remove(nodeId);
-                    }
-                }
-            }
-
-            // Shrink the backing array if most slots were freed
-            vectorStorage.compact(nextNodeId.get());
+            // No vectorStorage cleanup needed: each shard owns its own per-shard
+            // VectorStorage (issue #256). Dropping the reference to the old shards
+            // via the `this.frozenShards = null` assignment below allows the GC
+            // to reclaim the backing arrays without any per-slot bookkeeping.
 
             // Rejoin deferred shards before clearing so the next checkpoint cycle processes them.
             List<LiveGraphShard> deferred = this.deferredShards;
@@ -3022,17 +3052,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
-     * Zero-copy view over vectorStorage for a single live shard.
-     * Maps ordinal i (0-based within shard) to vectorStorage.get(startNodeId + i).
+     * Zero-copy view over a single shard's per-shard {@link VectorStorage}.
+     * Maps ordinal i (0-based within shard) directly to {@code storage.get(i)}.
      * Implements RandomAccessVectorValues for use with PQ training and OnDiskGraphIndexWriter.
      */
-    private final class VectorStorageShardView implements io.github.jbellis.jvector.graph.RandomAccessVectorValues {
-        private final int startNodeId;
+    private static final class VectorStorageShardView implements io.github.jbellis.jvector.graph.RandomAccessVectorValues {
+        private final VectorStorage storage;
         private final int size;
         private final int dimension;
 
-        VectorStorageShardView(int startNodeId, int size, int dimension) {
-            this.startNodeId = startNodeId;
+        VectorStorageShardView(VectorStorage storage, int size, int dimension) {
+            this.storage = storage;
             this.size = size;
             this.dimension = dimension;
         }
@@ -3049,7 +3079,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         @Override
         public VectorFloat<?> getVector(int i) {
-            return vectorStorage.get(startNodeId + i);
+            return storage.get(i);
         }
 
         @Override
@@ -3064,15 +3094,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
-     * Builds a ConcurrentHashMap from shard-relative ordinal (0-based) to PK.
-     * For each entry in the shard's nodeToPk, computes ordinal as (nodeId - shard.startNodeId).
+     * Returns the shard's {@code nodeToPk} map — already keyed by the
+     * shard-relative local ordinal after the issue-#256 refactor.
      */
     private ConcurrentHashMap<Integer, Bytes> buildOrdinalToPk(LiveGraphShard shard) {
-        ConcurrentHashMap<Integer, Bytes> result = new ConcurrentHashMap<>(shard.nodeToPk.size());
-        for (Map.Entry<Integer, Bytes> e : shard.nodeToPk.entrySet()) {
-            result.put(e.getKey() - shard.startNodeId, e.getValue());
-        }
-        return result;
+        return shard.nodeToPk;
     }
 
     /**
@@ -3100,9 +3126,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         writingGraphActive.incrementAndGet();
         try {
-            // Create a zero-copy view over vectorStorage for this shard's ordinals
+            // Create a zero-copy view over this shard's per-shard VectorStorage.
             VectorStorageShardView shardView = new VectorStorageShardView(
-                    shard.startNodeId, shardSize, snapshotDimension);
+                    shard.vectorStorage, shardSize, snapshotDimension);
 
             // Get the shard's already-built OnHeapGraphIndex (no rebuild!)
             OnHeapGraphIndex shardGraph = (OnHeapGraphIndex) shard.builder.getGraph();
@@ -3396,37 +3422,44 @@ public class PersistentVectorStore extends AbstractVectorStore {
             List<LiveGraphShard> currentShards = this.liveShards;
             LiveGraphShard lastSnapshot = snapshotShards.get(snapshotShards.size() - 1);
 
+            // After the issue-#256 refactor each shard owns its own per-shard
+            // VectorStorage keyed by a LOCAL ordinal, so we can preserve
+            // Phase B inserts simply by concatenating {snapshotShards,
+            // currentShards} into the new liveShards list — no cross-shard
+            // replay, no globalNodeId → local-ordinal remapping, and no risk
+            // of overflowing lastSnapshot's cap by piling vectors into it.
+            // `lastSnapshot` reference is retained only for the log below.
             for (LiveGraphShard currentShard : currentShards) {
-                for (Map.Entry<Integer, Bytes> e : currentShard.nodeToPk.entrySet()) {
-                    int nodeId = e.getKey();
-                    VectorFloat<?> vec = vectorStorage.get(nodeId);
-                    Bytes pk = e.getValue();
-                    if (vec != null) {
-                        lastSnapshot.pkToNode.put(pk, nodeId);
-                        lastSnapshot.nodeToPk.put(nodeId, pk);
-                        lastSnapshot.vectorCount.incrementAndGet();
-                        if (lastSnapshot.builder != null) {
-                            try {
-                                lastSnapshot.builder.addGraphNode(nodeId - lastSnapshot.startNodeId, vec);
-                            } catch (Exception ex) {
-                                LOGGER.log(Level.WARNING, "Failed to re-add node during recovery", ex);
-                            }
-                        }
-                    }
-                }
-                if (currentShard.builder != null) {
+                // jvector builders for currentShards remain open (initEmptyLiveShards
+                // at Phase A entry leaves the fresh shards' builders live),
+                // so nothing to close here. snapshotShards' builders are also
+                // still open — writeShardAsFusedPQSegment deliberately does
+                // not close them during Phase B (see its finally block).
+                if (currentShard.nodeToPk.isEmpty() && currentShard.builder != null) {
                     try {
                         currentShard.builder.close();
                     } catch (IOException e) {
-                        // ignore
+                        // ignore: empty-shard cleanup only
                     }
                 }
             }
+            // Tolerate an unused lastSnapshot reference when logging is disabled.
+            if (LOGGER.isLoggable(Level.FINE)) {
+                LOGGER.log(Level.FINE,
+                        "checkpoint {0}: Phase B recovery concatenating {1} snapshot + {2} current shards (last snapshot startNodeId={3})",
+                        new Object[]{indexName, snapshotShards.size(), currentShards.size(),
+                                lastSnapshot.startNodeId});
+            }
 
-            this.liveShards = new ArrayList<>(snapshotShards);
+            List<LiveGraphShard> rebuilt = new ArrayList<>(snapshotShards.size() + currentShards.size());
+            rebuilt.addAll(snapshotShards);
+            for (LiveGraphShard cur : currentShards) {
+                if (!cur.nodeToPk.isEmpty()) {
+                    rebuilt.add(cur);
+                }
+            }
+            this.liveShards = rebuilt;
             // Restore deferred shards so they rejoin the live set intact.
-            // The existing merge of Phase B new vectors into lastSnapshot is unaffected —
-            // initEmptyLiveShards put only a fresh empty shard in this.liveShards during Phase A.
             List<LiveGraphShard> deferred = this.deferredShards;
             if (deferred != null) {
                 this.liveShards.addAll(deferred);
@@ -3471,7 +3504,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
         /* boolean savedAddHierarchy = */ metaBuf.get();
         /* boolean savedFusedPQ = */ metaBuf.get();
 
-        int savedNextNodeId = metaBuf.getInt();
+        // nextNodeId is serialised as int64 after issue #256 — the in-place
+        // v3 rewrite breaks backward-compatibility on purpose.
+        long savedNextNodeId = metaBuf.getLong();
 
         this.dimension = dim;
         newPageId.set(status.newPageId);
@@ -3479,7 +3514,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
     }
 
-    private void loadMultiSegmentFormat(ByteBuffer metaBuf, int dim, int savedNextNodeId,
+    private void loadMultiSegmentFormat(ByteBuffer metaBuf, int dim, long savedNextNodeId,
                                          int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
             throws IOException, DataStorageManagerException {
         java.io.DataInputStream dis = new java.io.DataInputStream(
@@ -3554,7 +3589,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 maxOrd = seg.maxOrdinal;
             }
         }
-        this.nextNodeId.set(maxOrd + 1);
+        // Prefer the persisted long nextNodeId when it is ahead of the
+        // reconstructed maxOrd — this preserves the global monotonic
+        // counter across restarts (issue #256).
+        this.nextNodeId.set(Math.max((long) maxOrd + 1L, savedNextNodeId));
 
         initEmptyLiveShards(dim, savedBeamWidth, savedNeighborOverflow, savedAlpha);
 
@@ -3597,7 +3635,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * through a {@link ReaderSupplier} backed by the storage manager's
      * multipart API — no resident copy on disk.
      */
-    private void loadFusedPQSegment(VectorSegment seg, Path mapFile, int dim, int savedNextNodeId)
+    private void loadFusedPQSegment(VectorSegment seg, Path mapFile, int dim, long savedNextNodeId)
             throws IOException, DataStorageManagerException {
         if (seg.graphFilePath == null) {
             throw new IllegalStateException(
@@ -3950,7 +3988,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
             dos.writeFloat(alpha);
             dos.writeByte(ADD_HIERARCHY ? 1 : 0);
             dos.writeByte(1); // fusedPQ
-            dos.writeInt(nextNodeId.get());
+            // nextNodeId widened to int64 after issue #256. Format version
+            // stays at v3 — the loader refuses unknown versions, so mixing
+            // old + new clients on the same checkpoint directory fails loud
+            // at load time rather than silently truncating the counter.
+            dos.writeLong(nextNodeId.get());
             dos.writeLong(newGeneration);
             dos.writeInt(totalSegments);
 
@@ -4249,19 +4291,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * Creates an empty live shard with an explicit {@code startNodeId}.
      * Use this when the global nodeId space has already been remapped (e.g., simple checkpoint rebuild).
      */
-    private LiveGraphShard createEmptyLiveShard(int dim, int bw, float no, float a, int startNodeId) {
+    private LiveGraphShard createEmptyLiveShard(int dim, int bw, float no, float a, long startNodeId) {
         int cap = computeEffectiveMaxLiveGraphSize();  // preallocate to avoid rehashing during inserts (issue #122)
         ConcurrentHashMap<Bytes, Integer> p2n = new ConcurrentHashMap<>(cap);
         ConcurrentHashMap<Integer, Bytes> n2p = new ConcurrentHashMap<>(cap);
+        // Per-shard VectorStorage — sized to the shard cap so the int-indexed
+        // backing array is bounded independent of nextNodeId (issue #256).
+        VectorStorage storage = new VectorStorage(cap);
         VectorStorageRandomAccessVectorValues ravv =
-                new VectorStorageRandomAccessVectorValues(vectorStorage, dim, -1, startNodeId);
+                new VectorStorageRandomAccessVectorValues(storage, dim);
         BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(ravv, similarityFunction);
         // Pass cap as initialCapacity so the jvector base-layer DenseIntMap is pre-sized
         // for the shard and concurrent addGraphNode avoids the spine-grow lock (issue #223).
         GraphIndexBuilder b = new GraphIndexBuilder(
                 bsp, dim, List.of(m), bw, no, a, ADD_HIERARCHY, REFINE_FINAL_GRAPH,
                 PhysicalCoreExecutor.pool(), ForkJoinPool.commonPool(), cap);
-        return new LiveGraphShard(p2n, n2p, ravv, b, startNodeId);
+        return new LiveGraphShard(p2n, n2p, ravv, b, storage, startNodeId);
     }
 
     /**
@@ -4451,7 +4496,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
         nextNodeId.set(0);
         nextSegmentId.set(0);
         dimension = 0;
-        vectorStorage = new VectorStorage(computeEffectiveMaxLiveGraphSize());
     }
 
     // -------------------------------------------------------------------------
@@ -4491,6 +4535,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public int getOnDiskNodeCount() {
         return (int) onDiskNodeToPkSize();
+    }
+
+    /**
+     * Returns the current value of the global monotonic node-id counter.
+     * Exposed for telemetry — dashboards can watch the burn rate and
+     * alert long before the {@code long} space is exhausted (issue #256).
+     */
+    public long getNextNodeId() {
+        return nextNodeId.get();
     }
 
     /**
@@ -4666,6 +4719,30 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public int getLiveVectorCapDuringCheckpoint() {
         return liveVectorCapDuringCheckpoint;
+    }
+
+    /**
+     * Test-only hook: fast-forward the global node-id counter past a
+     * configured threshold so unit tests can exercise the {@code long}
+     * overflow path without ingesting {@code 2^31} vectors (issue #256).
+     * Must be called before any {@code addVector} in the test so the
+     * first live shard's {@code startNodeId} adopts the seeded value.
+     */
+    public void seedNextNodeIdForTest(long value) {
+        nextNodeId.set(value);
+    }
+
+    /**
+     * Test-only hook: returns the active live shard (last in the list),
+     * so tests can assert per-shard storage bounds. {@code null} if no
+     * shard has been initialised yet.
+     */
+    public LiveGraphShard activeLiveShardForTest() {
+        List<LiveGraphShard> shards = this.liveShards;
+        if (shards == null || shards.isEmpty()) {
+            return null;
+        }
+        return shards.get(shards.size() - 1);
     }
 
     // -------------------------------------------------------------------------

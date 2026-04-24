@@ -24,11 +24,16 @@ import io.github.jbellis.jvector.vector.types.VectorFloat;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /**
- * Global lock-free vector storage for all live graph shards in a VectorIndexManager.
+ * Per-shard lock-free vector storage. Each {@code LiveGraphShard} owns one instance,
+ * indexed by the shard's local ordinal {@code [0, shardCap)}. The global node-id
+ * lives on {@link java.util.concurrent.atomic.AtomicLong} counters elsewhere; this
+ * class never sees it, so the {@code int}-indexed backing array is naturally bounded
+ * by the configured per-shard cap and cannot overflow as global ingest progresses
+ * (issue #256).
  *
  * <p>Replaces {@code ConcurrentHashMap<Integer, VectorFloat<?>>} (which required Integer
  * autoboxing, hash computation, and volatile segment traversal on every getVector() call)
- * with a direct array lookup indexed by the globally-sequential nodeId.
+ * with a direct array lookup.
  *
  * <p>Thread safety:
  * <ul>
@@ -43,16 +48,16 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
  *       was in progress).  Growth itself is serialized by {@link #growAndSet}, which
  *       bumps {@code growSeq} to odd before the copy and back to even after the publish.
  *       Growth is rare (O(log N) over the store's lifetime), so retries are bounded.</li>
- *   <li>{@link #remove(int)} is synchronized so that its {@code array.set(nodeId, null)}
+ *   <li>{@link #remove(int)} is synchronized so that its {@code array.set(ordinal, null)}
  *       excludes a concurrent {@link #growAndSet} copy loop: without the lock, a grow
  *       running in parallel with remove could snapshot the not-yet-nulled slot into the
  *       new array, leaking the reference.</li>
  * </ul>
  *
- * <p>Write-before-read ordering guarantee: callers must call {@code set(nodeId, vec)} before
- * passing {@code nodeId} to {@code GraphIndexBuilder.addGraphNode()}.  The atomic element
- * write in {@code set} (combined with the volatile array-reference read in {@code get})
- * establishes happens-before with any subsequent read, satisfying JLS 17.4.4.
+ * <p>Write-before-read ordering guarantee: callers must call {@code set(ordinal, vec)}
+ * before passing {@code ordinal} to {@code GraphIndexBuilder.addGraphNode()}. The atomic
+ * element write in {@code set} (combined with the volatile array-reference read in
+ * {@code get}) establishes happens-before with any subsequent read, satisfying JLS 17.4.4.
  */
 @SuppressFBWarnings({"UG_SYNC_SET_UNSYNC_GET", "VO_VOLATILE_INCREMENT"})
 class VectorStorage {

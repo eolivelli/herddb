@@ -1601,6 +1601,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             d.compactionNodesTotal = pvs.getCompactionNodesTotal();
             d.uploadBytesDone = pvs.getUploadBytesDone();
             d.uploadBytesTotal = pvs.getUploadBytesTotal();
+            d.nextNodeId = pvs.getNextNodeId();
             if (!"idle".equals(d.compactionPhase)) {
                 d.status = d.compactionPhase;
             }
@@ -1898,6 +1899,19 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 @Override
                 public Integer getSample() {
                     return pvs.getOnDiskNodeCount();
+                }
+            });
+            // Global monotonic node-id counter (issue #256). Exposed as a
+            // gauge so dashboards can track the burn rate and alert long
+            // before the long space is exhausted.
+            indexStats.registerGauge("next_node_id", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getNextNodeId();
                 }
             });
             indexStats.registerGauge("segment_count", new Gauge<Integer>() {
@@ -2680,5 +2694,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         public long compactionNodesTotal;
         public long uploadBytesDone;
         public long uploadBytesTotal;
+        // Global monotonic node-id counter (issue #256). Widened to long end-to-end;
+        // surfaced so clients and dashboards can observe the burn rate.
+        public long nextNodeId;
     }
 }
