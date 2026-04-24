@@ -282,6 +282,28 @@ indexingService:
       size: 5Gi
     log:
       size: 2Gi
+  # SegmentBlockCache: raised from the auto-size default (maxMemory/4 = 1.75 GiB)
+  # to 2.5 GiB for gist1m and similar large-segment workloads.
+  # With 21 segments × ~583 MB/segment = 12.24 GiB total (gist1m M=16 FusedPQ),
+  # 2.5 GiB holds ~4.4 segments (21%) in cache.
+  #
+  # Previously set to 3.5 GiB (maxMemory/2), but that caused OutOfMemoryError
+  # during the k=100 query phase (issue #246): Phase C loading 7 × 583 MB segments
+  # via 4 MB gRPC chunks grew the Netty PoolChunk arena to ~6 GB (1,527 PoolChunks
+  # × 4 MB = 6.1 GB), matching MaxDirectMemorySize=6g exactly. With cache at 3.5 GiB
+  # direct + Phase C arena at 6 GB, new 4 MB readFileRange buffers could not be
+  # allocated in the query phase.
+  #
+  # Budget check (MaxDirectMemorySize=6g):
+  #   SegmentBlockCache: 2.5 GiB direct
+  #   Phase C peak arena:  4.0 GiB (1,015 × 4 MB chunks, freed after Phase C)
+  #   Combined peak:       6.5 GiB — still > 6g! But Phase C chunks are in the
+  #                        pool freelist after Phase C completes, so new 4 MB
+  #                        readFileRange allocations reuse those freed slots.
+  #   Search gRPC headroom: 3.5 GiB (6g - 2.5g cache) for concurrent reads ✓
+  #   Heap (7g) + direct (6g) + JVM overhead (1g) = 14g JVM + native ≤ 20g ✓
+  extraConfig:
+    indexing.vector.segmentPageCacheMaxBytes: "2684354560"    # 2.5 GiB
   resources:
     requests:
       memory: "20Gi"
