@@ -47,11 +47,12 @@ class IngestionWorkerTest {
     @Test
     void testFlushBatchSuccess() throws Exception {
         FakePreparedStatement ps = new FakePreparedStatement();
+        ps.batchUpdateCounts = new int[]{1};
         FakeConnection conn = new FakeConnection();
 
         IngestionWorker worker = createTestWorker();
         long startNanos = System.nanoTime();
-        long latencyNanos = worker.testFlushBatch(ps, conn, startNanos);
+        long latencyNanos = worker.testFlushBatch(ps, conn, 1, startNanos);
 
         assertTrue(ps.batchExecuted, "Batch should have been executed");
         assertTrue(conn.committed, "Connection should have been committed");
@@ -71,7 +72,7 @@ class IngestionWorkerTest {
         long startNanos = System.nanoTime();
 
         ExecutionException ex = assertThrows(ExecutionException.class,
-                () -> worker.testFlushBatch(ps, conn, startNanos));
+                () -> worker.testFlushBatch(ps, conn, 1, startNanos));
         assertTrue(ex.getCause() instanceof RuntimeException);
         assertEquals("Batch execution failed", ex.getCause().getMessage());
     }
@@ -82,6 +83,7 @@ class IngestionWorkerTest {
     @Test
     void testFlushBatchCommitFailure() {
         FakePreparedStatement ps = new FakePreparedStatement();
+        ps.batchUpdateCounts = new int[]{1};
         FakeConnection conn = new FakeConnection();
         conn.failOnCommit = true;
 
@@ -89,7 +91,7 @@ class IngestionWorkerTest {
         long startNanos = System.nanoTime();
 
         SQLException ex = assertThrows(SQLException.class,
-                () -> worker.testFlushBatch(ps, conn, startNanos));
+                () -> worker.testFlushBatch(ps, conn, 1, startNanos));
         assertEquals("Commit failed", ex.getMessage());
     }
 
@@ -106,7 +108,7 @@ class IngestionWorkerTest {
         long startNanos = System.nanoTime();
 
         ExecutionException ex = assertThrows(ExecutionException.class,
-                () -> worker.testFlushBatch(ps, conn, startNanos));
+                () -> worker.testFlushBatch(ps, conn, 1, startNanos));
         assertTrue(ex.getCause() instanceof InterruptedException);
     }
 
@@ -116,17 +118,69 @@ class IngestionWorkerTest {
     @Test
     void testFlushBatchLatencyMeasurement() throws Exception {
         FakePreparedStatement ps = new FakePreparedStatement();
+        ps.batchUpdateCounts = new int[]{1};
         FakeConnection conn = new FakeConnection();
 
         IngestionWorker worker = createTestWorker();
         long startNanos = System.nanoTime();
-        long latencyNanos = worker.testFlushBatch(ps, conn, startNanos);
+        long latencyNanos = worker.testFlushBatch(ps, conn, 1, startNanos);
         long endNanos = System.nanoTime();
 
         // Latency should be between start and end times, and positive
         assertTrue(latencyNanos > 0, "Latency should be positive");
         assertTrue(latencyNanos <= endNanos - startNanos + 1_000_000,
                 "Latency should be less than total elapsed time (plus 1ms margin)");
+    }
+
+    /**
+     * Issue #251: when {@code executeBatchAsync().get()} returns an
+     * {@code int[]} whose sum is less than the submitted batch size, the
+     * server silently dropped some inserts. {@code flushBatch} must throw a
+     * {@link IngestionWorker.BatchPartialSuccessException} <em>before</em>
+     * calling {@code commit()} so the bench's {@code rowsCommitted} counter
+     * never over-counts.
+     */
+    @Test
+    void flushBatchThrowsOnPartialSuccess() {
+        FakePreparedStatement ps = new FakePreparedStatement();
+        // server reports 3 of 4 rows inserted (one row silently dropped)
+        ps.batchUpdateCounts = new int[]{1, 1, 0, 1};
+        FakeConnection conn = new FakeConnection();
+
+        IngestionWorker worker = createTestWorker();
+
+        IngestionWorker.BatchPartialSuccessException ex = assertThrows(
+                IngestionWorker.BatchPartialSuccessException.class,
+                () -> worker.testFlushBatch(ps, conn, 4, System.nanoTime()));
+        assertTrue(ex.getMessage().contains("Server confirmed 3 of 4 row inserts"),
+                "diagnostic should report inserted-vs-expected counts; got: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("[1, 1, 0, 1]"),
+                "diagnostic should include raw updateCounts array; got: " + ex.getMessage());
+        assertEquals(false, conn.committed, "must NOT commit when server reported partial success");
+        assertTrue(conn.rollbackCount >= 1, "must rollback the partial batch on the connection");
+    }
+
+    /**
+     * Issue #251 (defensive): the JDBC spec allows {@code SUCCESS_NO_INFO}
+     * (-2) as an update count. HerdDB itself returns 1 for INSERT, but the
+     * bench should not flake on a future driver upgrade that emits the
+     * generic value — {@link java.sql.Statement#SUCCESS_NO_INFO} counts as
+     * one row inserted.
+     */
+    @Test
+    void flushBatchAcceptsSuccessNoInfo() throws Exception {
+        FakePreparedStatement ps = new FakePreparedStatement();
+        ps.batchUpdateCounts = new int[]{
+                java.sql.Statement.SUCCESS_NO_INFO,
+                1,
+                java.sql.Statement.SUCCESS_NO_INFO};
+        FakeConnection conn = new FakeConnection();
+
+        IngestionWorker worker = createTestWorker();
+        long latency = worker.testFlushBatch(ps, conn, 3, System.nanoTime());
+
+        assertTrue(latency > 0);
+        assertTrue(conn.committed, "SUCCESS_NO_INFO is treated as one row, no partial-success exception");
     }
 
     private IngestionWorker createTestWorker() {
@@ -165,6 +219,7 @@ class IngestionWorkerTest {
     @Test
     void testCommitRetrySucceedsAfterTransient() throws Exception {
         FakePreparedStatement ps = new FakePreparedStatement();
+        ps.batchUpdateCounts = new int[]{1, 1};
         FakeConnection conn = new FakeConnection();
         conn.commitFailsRemaining = 2; // two failures then success
 
@@ -226,6 +281,7 @@ class IngestionWorkerTest {
     @Test
     void testCommitWithRetryIncrementsRowsCommitted() throws Exception {
         FakePreparedStatement ps = new FakePreparedStatement();
+        ps.batchUpdateCounts = new int[]{1, 1, 1, 1, 1, 1, 1};
         FakeConnection conn = new FakeConnection();
 
         AtomicLong commitsTotal = new AtomicLong(0);
@@ -252,6 +308,7 @@ class IngestionWorkerTest {
     @Test
     void testRowsCommittedBumpedOnceDespiteRetries() throws Exception {
         FakePreparedStatement ps = new FakePreparedStatement();
+        ps.batchUpdateCounts = new int[]{1, 1};
         FakeConnection conn = new FakeConnection();
         conn.commitFailsRemaining = 2;
 
@@ -320,6 +377,41 @@ class IngestionWorkerTest {
         assertEquals(0L, commitsRecovered.get());
     }
 
+    /**
+     * Issue #251: when {@code flushBatch} throws
+     * {@link IngestionWorker.BatchPartialSuccessException},
+     * {@code commitWithRetry} must surface it on the first attempt — replaying
+     * a batch whose rows were partially accepted by the server would PK-collide
+     * on the rows that did succeed.
+     */
+    @Test
+    void commitWithRetryDoesNotRetryPartialSuccess() {
+        FakePreparedStatement ps = new FakePreparedStatement();
+        ps.batchUpdateCounts = new int[]{1, 0, 1}; // 2 of 3 inserts confirmed
+        FakeConnection conn = new FakeConnection();
+
+        Config config = new Config();
+        config.ingestCommitRetries = 5; // plenty of retries available, none should fire
+        AtomicLong commitsTotal = new AtomicLong(0);
+        AtomicLong commitsRecovered = new AtomicLong(0);
+        AtomicLong rowsCommitted = new AtomicLong(0);
+        IngestionWorker worker = createTestWorker(config, commitsTotal, commitsRecovered, rowsCommitted);
+
+        List<IngestionWorker.PendingRow> batch = new ArrayList<>();
+        batch.add(new IngestionWorker.PendingRow(1L, new float[]{1f}));
+        batch.add(new IngestionWorker.PendingRow(2L, new float[]{2f}));
+        batch.add(new IngestionWorker.PendingRow(3L, new float[]{3f}));
+
+        IngestionWorker.BatchPartialSuccessException ex = assertThrows(
+                IngestionWorker.BatchPartialSuccessException.class,
+                () -> worker.commitWithRetry(ps, conn, batch, System.nanoTime()));
+        assertTrue(ex.getMessage().contains("Server confirmed 2 of 3"),
+                "expected partial-success diagnostic; got: " + ex.getMessage());
+        assertEquals(0L, commitsTotal.get(), "commitsTotal must NOT count a partial-success batch");
+        assertEquals(0L, rowsCommitted.get(), "rowsCommitted must NOT include any rows from a partial-success batch");
+        assertEquals(0L, commitsRecovered.get(), "no recovery happened — must not bump commitsRecovered");
+    }
+
     private enum FailMode {
         NONE, EXECUTION_EXCEPTION, INTERRUPTED
     }
@@ -331,6 +423,14 @@ class IngestionWorkerTest {
         boolean batchExecuted = false;
         int addBatchCallCount = 0;
         FailMode failMode = FailMode.NONE;
+        /**
+         * Per-row update counts returned by {@link #executeBatchAsync()}. The
+         * real HerdDB driver always returns 1 per successful INSERT, so tests
+         * default to a stub-sized one-row array; tests that exercise
+         * commit/retry paths set this to {@code int[batch.size()]} filled with
+         * 1s, and the issue #251 partial-success tests set it explicitly.
+         */
+        int[] batchUpdateCounts = new int[]{1};
 
         @Override
         public CompletableFuture<int[]> executeBatchAsync() {
@@ -345,7 +445,7 @@ class IngestionWorkerTest {
                 return future;
             }
             batchExecuted = true;
-            return CompletableFuture.completedFuture(new int[]{1});
+            return CompletableFuture.completedFuture(batchUpdateCounts);
         }
 
         @Override

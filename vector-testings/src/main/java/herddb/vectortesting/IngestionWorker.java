@@ -108,19 +108,67 @@ public class IngestionWorker implements Runnable {
     }
 
     /**
+     * Marker exception used by {@link #flushBatch} to signal that the server
+     * acknowledged the batch but reported fewer inserted rows than were
+     * submitted. Re-attempting the same batch would produce primary-key
+     * collisions on the rows that did succeed, so {@link #commitWithRetry}
+     * surfaces this immediately instead of looping.
+     *
+     * <p>Issue #251: a 100 M ingest finished with the bench's row counter at
+     * exactly 100 M but {@code COUNT(*)} returning 99,999,991. The previous
+     * code bumped {@code rowsCommitted} by {@code batch.size()} as soon as
+     * {@code conn.commit()} returned, without verifying that
+     * {@code executeBatchAsync()} actually reported one insert per submitted
+     * row. This exception is the bench's loud failure mode for that scenario.
+     */
+    static final class BatchPartialSuccessException extends SQLException {
+        private static final long serialVersionUID = 1L;
+
+        BatchPartialSuccessException(String message) {
+            super(message);
+        }
+    }
+
+    /**
      * Flush accumulated batch using executeBatchAsync and commit.
      *
      * @param ps prepared statement with accumulated batch
      * @param conn connection for commit
+     * @param expectedRows the number of rows in the batch — must equal the sum
+     *        of the per-row update counts returned by the server, otherwise the
+     *        server silently dropped some inserts and we throw
+     *        {@link BatchPartialSuccessException}.
      * @param batchStartNanos nanosecond timestamp when batch started
      * @return latency in nanoseconds (batch + commit)
-     * @throws SQLException if batch execution or commit fails
+     * @throws SQLException if batch execution or commit fails, or if the server
+     *         reports a partial-success batch ({@link BatchPartialSuccessException})
      * @throws ExecutionException if async batch execution fails
      * @throws InterruptedException if async batch execution is interrupted
      */
-    private long flushBatch(PreparedStatement ps, Connection conn, long batchStartNanos)
+    private long flushBatch(PreparedStatement ps, Connection conn, int expectedRows, long batchStartNanos)
             throws SQLException, ExecutionException, InterruptedException {
-        ps.unwrap(PreparedStatementAsync.class).executeBatchAsync().get();
+        int[] updateCounts = ps.unwrap(PreparedStatementAsync.class).executeBatchAsync().get();
+        long inserted = 0;
+        for (int n : updateCounts) {
+            // Update count of -2 (SUCCESS_NO_INFO) is treated as one row
+            // inserted; HerdDB itself returns 1 for INSERT, but we accept the
+            // JDBC convention so this guard does not flake on driver upgrades.
+            inserted += (n == java.sql.Statement.SUCCESS_NO_INFO) ? 1L : Math.max(0, n);
+        }
+        if (inserted != expectedRows) {
+            // Don't commit a partial batch and don't let commitWithRetry replay
+            // it — the rows that did succeed would collide on PK. Roll back so
+            // the connection is reusable for the worker's diagnostic exit path.
+            try {
+                conn.rollback();
+            } catch (SQLException ignored) {
+                // best-effort; the BatchPartialSuccessException below carries the real signal
+            }
+            throw new BatchPartialSuccessException(String.format(
+                    "Server confirmed %d of %d row inserts in batch (updateCounts=%s)"
+                            + " — silent partial success, refusing to over-count rowsCommitted",
+                    inserted, expectedRows, java.util.Arrays.toString(updateCounts)));
+        }
         conn.commit();
         return System.nanoTime() - batchStartNanos;
     }
@@ -128,9 +176,9 @@ public class IngestionWorker implements Runnable {
     /**
      * Package-private method for testing flushBatch behavior.
      */
-    long testFlushBatch(PreparedStatement ps, Connection conn, long batchStartNanos)
+    long testFlushBatch(PreparedStatement ps, Connection conn, int expectedRows, long batchStartNanos)
             throws SQLException, ExecutionException, InterruptedException {
-        return flushBatch(ps, conn, batchStartNanos);
+        return flushBatch(ps, conn, expectedRows, batchStartNanos);
     }
 
     /**
@@ -151,13 +199,19 @@ public class IngestionWorker implements Runnable {
         Exception lastError = null;
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             try {
-                long latencyNanos = flushBatch(ps, conn, batchStartNanos);
+                long latencyNanos = flushBatch(ps, conn, batch.size(), batchStartNanos);
                 commitsTotal.incrementAndGet();
                 rowsCommitted.addAndGet(batch.size());
                 if (attempt > 0) {
                     commitsRecovered.incrementAndGet();
                 }
                 return latencyNanos;
+            } catch (BatchPartialSuccessException e) {
+                // Don't retry — replaying the batch would PK-collide on the rows
+                // the server already accepted. Surface immediately so the bench
+                // fails fast with the diagnostic from flushBatch.
+                safelyClearBatch(ps);
+                throw e;
             } catch (SQLException | ExecutionException e) {
                 lastError = e;
                 safelyRollback(conn);

@@ -257,6 +257,45 @@ class VectorBenchTest {
         assertArrayEquals(new float[]{3.0f}, result.get(2), 0.001f);
     }
 
+    /**
+     * Issue #251: when the dataset on disk has fewer vectors than the bench
+     * was asked to ingest, the stream silently terminates early. The
+     * {@code vectorsEmitted != toIngest} guard added in
+     * {@code VectorBench.runBenchmark} relies on the count of vectors
+     * actually emitted by this iterator — this test pins down the underlying
+     * behaviour the guard depends on.
+     */
+    @Test
+    void streamBaseVectorsStopsAtEofWhenRequestExceedsFileSize(@TempDir File tmpDir) throws Exception {
+        File datasetDir = new File(tmpDir, "sift");
+        datasetDir.mkdirs();
+        File fvecsFile = new File(datasetDir, "sift_base.fvecs");
+        try (DataOutputStream dos = new DataOutputStream(new FileOutputStream(fvecsFile))) {
+            for (int i = 1; i <= 4; i++) { // only 4 vectors on disk
+                writeLittleEndianInt(dos, 2); // dim
+                writeLittleEndianFloat(dos, i);
+                writeLittleEndianFloat(dos, i);
+            }
+        }
+
+        DatasetLoader loader = new DatasetLoader(tmpDir.getAbsolutePath(),
+                DatasetLoader.DatasetPreset.SIFT1M, null);
+
+        long emitted = 0;
+        try (DatasetLoader.VectorStream stream = loader.streamBaseVectors(0, 100)) {
+            for (float[] v : stream) {
+                emitted++;
+                org.junit.jupiter.api.Assertions.assertEquals(2, v.length, "dim mismatch");
+            }
+        }
+
+        // The stream stopped at 4 (file EOF) instead of throwing for the
+        // remaining 96 — VectorBench must therefore audit this count itself,
+        // because committed-rows accounting alone would not detect the gap.
+        assertEquals(4L, emitted,
+                "stream must terminate at EOF without throwing — bench's vectorsEmitted check relies on this");
+    }
+
     @Test
     void configCheckpointTimeoutDefaultIs300() throws Exception {
         Config cfg = Config.parse(new String[]{});

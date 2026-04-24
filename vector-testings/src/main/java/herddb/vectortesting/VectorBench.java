@@ -364,9 +364,11 @@ public class VectorBench {
                 statusThread.start();
             }
 
+            long vectorsEmitted = 0;
             try (DatasetLoader.VectorStream stream = loader.streamBaseVectors(config.resumeFrom, toIngest)) {
                 for (float[] vec : stream) {
                     ingestQueue.put(vec);
+                    vectorsEmitted++;
                 }
             }
             producerDone.set(true);
@@ -386,6 +388,20 @@ public class VectorBench {
                     Throwable cause = e.getCause() != null ? e.getCause() : e;
                     throw new IllegalStateException("Ingest worker failed: " + cause.getMessage(), cause);
                 }
+            }
+
+            // Issue #251: a short dataset stream silently caps ingest at fewer
+            // rows than the user asked for. Without this check, both the
+            // assigned/committed counters and the COUNT(*) verification would
+            // agree on a smaller number — the bench would print "Verification
+            // OK" for an under-ingested table. Surface the gap up-front so the
+            // operator can fix the dataset rather than chasing phantom row loss.
+            if (vectorsEmitted != toIngest) {
+                throw new IllegalStateException(String.format(
+                        "Dataset stream emitted %d vectors but %d were requested "
+                                + "(skip=%d, target=%d) — dataset file may be shorter "
+                                + "than expected or truncated",
+                        vectorsEmitted, toIngest, config.resumeFrom, actualRows));
             }
 
             long rowsAssigned = rowId.get() - config.resumeFrom;
@@ -422,6 +438,7 @@ public class VectorBench {
             // Verify row count matches ingested records
             if (!config.skipVerify) {
                 long expectedRows = config.resumeFrom + rowsCommitted.get();
+                long rowsAssignedSnapshot = rowId.get() - config.resumeFrom;
                 long[] actualCount = {0};
                 runWithProgress(out, "verification", "=== VERIFICATION (COUNT) ===", () -> {
                     try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
@@ -432,8 +449,18 @@ public class VectorBench {
                     }
                 });
                 if (actualCount[0] != expectedRows) {
-                    throw new IllegalStateException("Row count mismatch after ingestion: expected "
-                            + expectedRows + " but table has " + actualCount[0]);
+                    // Issue #251: include every counter we have so an operator can
+                    // pinpoint where the gap appeared (producer / worker accounting /
+                    // server). Diagnostic information is irrecoverable once the bench
+                    // exits, so attach it to the exception message itself.
+                    throw new IllegalStateException(String.format(
+                            "Row count mismatch after ingestion: expected %d but table has %d "
+                                    + "(missing=%d) — bench counters: vectors_emitted=%d "
+                                    + "rows_assigned=%d rows_committed=%d commits_total=%d "
+                                    + "commits_recovered=%d resume_from=%d",
+                            expectedRows, actualCount[0], expectedRows - actualCount[0],
+                            vectorsEmitted, rowsAssignedSnapshot, rowsCommitted.get(),
+                            commitsTotal.get(), commitsRecovered.get(), config.resumeFrom));
                 }
                 out.info(String.format("Verification OK: %d rows in table", actualCount[0]));
             }
