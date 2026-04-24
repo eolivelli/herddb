@@ -223,4 +223,9 @@ message GetShadowStatusResponse {
     int64 primary_advertised_offset = 7;
     int64 last_reload_timestamp_ms = 8;
     int64 reload_count = 9;
+    // Minimum IndexStatus.generation currently loaded across every vector
+    // store this shadow holds. Leaders aggregate the min across all
+    // shadows to decide when compaction's pending-delete entries become
+    // eligible for physical deletion. 0 when no vector store is loaded.
+    int64 applied_index_status_generation = 10;
 }

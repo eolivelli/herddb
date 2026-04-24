@@ -4252,6 +4252,370 @@
       "showTitle": true,
       "title": "Shadow Replicas — Gate & Staleness",
       "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 600,
+          "legend": {"avg": false, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 3,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_active\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{instance}} {{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Compaction Active (0/1)",
+          "description": "1 while a graph-merge compaction cycle is in flight, 0 otherwise. Correlate with checkpoint activity to diagnose serialisation against Phase C.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "min": 0, "max": 1, "show": true},
+            {"format": "short", "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 601,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 5,
+          "stack": true,
+          "targets": [
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_successes_total\",job=\"indexing-service\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "success",
+              "refId": "A"
+            },
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_failures_read_io_total\",job=\"indexing-service\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "fail: read_io",
+              "refId": "B"
+            },
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_failures_write_io_total\",job=\"indexing-service\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "fail: write_io",
+              "refId": "C"
+            },
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_failures_metadata_io_total\",job=\"indexing-service\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "fail: metadata_io",
+              "refId": "D"
+            },
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_failures_corruption_total\",job=\"indexing-service\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "fail: corruption",
+              "refId": "E"
+            },
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_failures_disk_full_total\",job=\"indexing-service\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "fail: disk_full",
+              "refId": "F"
+            },
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_failures_aborted_input_gone_total\",job=\"indexing-service\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "fail: aborted_input_gone",
+              "refId": "G"
+            }
+          ],
+          "title": "Compaction Outcome Rate (5m)",
+          "description": "Stacked: successful vs failing compaction runs by reason. Any non-zero failure stream warrants investigation; repeated aborted_input_gone hints at racing checkpoint and compaction.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "min": 0, "show": true},
+            {"format": "short", "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 602,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_last_duration_ms\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "last duration ms",
+              "refId": "A"
+            }
+          ],
+          "title": "Compaction — Last Cycle Duration",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ms", "min": 0, "show": true},
+            {"format": "short", "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 603,
+          "legend": {"avg": false, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_last_bytes_read\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "bytes read",
+              "refId": "A"
+            },
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_last_bytes_written\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "bytes written",
+              "refId": "B"
+            }
+          ],
+          "title": "Compaction — Last Cycle Write Amplification",
+          "description": "Bytes read from input segments vs bytes written for the merged output. The ratio visualises how aggressively the live-PK filter reclaimed obsolete vectors.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "bytes", "min": 0, "show": true},
+            {"format": "short", "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 604,
+          "legend": {"avg": false, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 3,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_last_input_segments\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "inputs",
+              "refId": "A"
+            },
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_last_output_segments\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "outputs",
+              "refId": "B"
+            }
+          ],
+          "title": "Compaction — Contraction Ratio (segments)",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "min": 0, "show": true},
+            {"format": "short", "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 605,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 3,
+          "targets": [
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_live_pk_filtered_total\",job=\"indexing-service\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "reclaimed/s",
+              "refId": "A"
+            }
+          ],
+          "title": "Reclaimed-PK Rate (live-PK filter)",
+          "description": "Per-second rate of vectors that compaction dropped from the rebuilt output because their PK was tombstoned or superseded. Drives the recovery of disk held by deleted rows.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "min": 0, "show": true},
+            {"format": "short", "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 606,
+          "legend": {"avg": false, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 3,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_compaction_consecutive_failures\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "consec failures",
+              "refId": "A"
+            }
+          ],
+          "title": "Compaction — Consecutive Failures",
+          "description": "Rises until a run succeeds; feeds exponential backoff. Warn at >=3, alert at >=5.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "min": 0, "show": true},
+            {"format": "short", "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Vector Index Compaction (Graph Merge)",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 610,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_pending_deletes_count\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "count",
+              "refId": "A"
+            }
+          ],
+          "title": "Pending Deletes — Count",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "min": 0, "show": true},
+            {"format": "short", "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 611,
+          "legend": {"avg": false, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 4,
+          "targets": [
+            {
+              "expr": "max({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_pending_deletes_oldest_age_seconds\",job=\"indexing-service\",instance=~\"$instance\"})",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "oldest age (s)",
+              "refId": "A"
+            }
+          ],
+          "title": "Pending Deletes — Oldest Entry Age",
+          "description": "Age in seconds of the longest-held pending-delete entry. A steadily-rising value signals a stuck reap: either no shadow has acked a newer generation or the storage backend is rejecting delete calls.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "s", "min": 0, "show": true},
+            {"format": "short", "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 612,
+          "legend": {"avg": true, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 4,
+          "targets": [
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_pending_deletes_reaped_total\",job=\"indexing-service\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "reaped/s",
+              "refId": "A"
+            },
+            {
+              "expr": "rate({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_pending_deletes_reap_failures_total\",job=\"indexing-service\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "reap failures/s",
+              "refId": "B"
+            }
+          ],
+          "title": "Pending Deletes — Reap Rate vs Failures",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "min": 0, "show": true},
+            {"format": "short", "show": false}
+          ]
+        },
+        {
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 613,
+          "legend": {"avg": false, "current": true, "max": true, "min": false, "show": true, "total": false, "values": true},
+          "lines": true,
+          "linewidth": 1,
+          "span": 6,
+          "targets": [
+            {
+              "expr": "max by (instance) ({__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_applied_index_status_generation\",job=\"indexing-service\",instance=~\"$instance\"})",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "gen {{instance}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Applied IndexStatus Generation (leader vs shadows)",
+          "description": "One series per indexing-service instance. A lagging shadow shows up as a flat line below the leader; the reaper is gated on the min value, so a stuck shadow prevents reclaim until it catches up.",
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "min": 0, "show": true},
+            {"format": "short", "show": false}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Vector Index Retention (Pending Deletes)",
+      "titleSize": "h6"
     }
   ],
   "schemaVersion": 14,

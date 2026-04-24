@@ -507,7 +507,8 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setPrimaryAdvertisedLedgerId(advertised != null ? advertised.ledgerId : -1L)
                     .setPrimaryAdvertisedOffset(advertised != null ? advertised.offset : -1L)
                     .setLastReloadTimestampMs(engine.getShadowLastReloadTimestampMs())
-                    .setReloadCount(engine.getShadowReloadCount());
+                    .setReloadCount(engine.getShadowReloadCount())
+                    .setAppliedIndexStatusGeneration(engine.getMinAppliedIndexStatusGeneration());
             responseObserver.onNext(b.build());
             responseObserver.onCompleted();
         } catch (RuntimeException e) {

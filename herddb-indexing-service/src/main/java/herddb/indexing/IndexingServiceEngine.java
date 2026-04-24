@@ -392,6 +392,18 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final long compactionInterval = config.getLong(
                     IndexingServerConfiguration.PROPERTY_COMPACTION_INTERVAL,
                     IndexingServerConfiguration.PROPERTY_COMPACTION_INTERVAL_DEFAULT);
+            final long vectorCompactionIntervalMs = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_INTERVAL_MS,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_INTERVAL_MS_DEFAULT);
+            final long vectorCompactionMinBytes = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MIN_BYTES,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MIN_BYTES_DEFAULT);
+            final long vectorCompactionMaxBytes = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_BYTES,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_BYTES_DEFAULT);
+            final long vectorCompactionRetentionMs = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_RETENTION_MS,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_RETENTION_MS_DEFAULT);
             final long maxLiveBytesPerCheckpoint = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT,
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT);
@@ -452,6 +464,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         compactionInterval,
                         similarityFunction, vectorMemLimit, budget, maxLiveBytesPerCheckpoint,
                         finalSegmentPageCacheMaxBytes, resolvedSearchParallelism);
+                store.configureCompaction(
+                        vectorCompactionIntervalMs,
+                        vectorCompactionMinBytes,
+                        vectorCompactionMaxBytes,
+                        /*minCount*/ 4,
+                        vectorCompactionRetentionMs);
                 try {
                     store.start();
                 } catch (Exception e) {
@@ -1436,6 +1454,31 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         return shadowReloadCount.get();
     }
 
+    /**
+     * Minimum {@code IndexStatus.generation} currently loaded across
+     * every vector store this engine holds. Used by the retention
+     * protocol: shadow instances expose this value via
+     * {@code GetShadowStatus}; primaries aggregate the min across all
+     * shadows to gate physical deletion of compacted-out segment files.
+     *
+     * <p>Returns 0 when no vector store is loaded yet — matches the
+     * startup default and prevents premature deletion.
+     */
+    public long getMinAppliedIndexStatusGeneration() {
+        long min = Long.MAX_VALUE;
+        boolean any = false;
+        for (AbstractVectorStore store : vectorStores.values()) {
+            if (store instanceof PersistentVectorStore) {
+                long g = ((PersistentVectorStore) store).getCurrentIndexStatusGeneration();
+                if (g < min) {
+                    min = g;
+                }
+                any = true;
+            }
+        }
+        return any ? min : 0L;
+    }
+
 
     public List<Map.Entry<Bytes, Float>> search(String tablespace, String table, String index,
                                                   float[] vector, int limit) {
@@ -2205,8 +2248,111 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     return pvs.getEstimatedSizeBytes();
                 }
             });
+            registerVectorIndexCompactionMetrics(indexStats, pvs);
             pvs.setSegmentSizeStats(indexStats.getOpStatsLogger("segment_size_bytes"));
         }
+    }
+
+    /**
+     * Registers all graph-merge compaction and retention-reaper metrics
+     * for one {@link PersistentVectorStore}. Named to match the plan in
+     * VECTOR.md so the Grafana dashboard panels line up one-to-one.
+     */
+    private void registerVectorIndexCompactionMetrics(StatsLogger indexStats,
+                                                      PersistentVectorStore pvs) {
+        registerLongCounter(indexStats, "compaction_runs_total",
+                pvs::getCompactionRunsTotal);
+        registerLongCounter(indexStats, "compaction_successes_total",
+                pvs::getCompactionSuccessesTotal);
+        registerLongCounter(indexStats, "compaction_failures_read_io_total",
+                pvs::getCompactionFailuresReadIoTotal);
+        registerLongCounter(indexStats, "compaction_failures_write_io_total",
+                pvs::getCompactionFailuresWriteIoTotal);
+        registerLongCounter(indexStats, "compaction_failures_metadata_io_total",
+                pvs::getCompactionFailuresMetadataIoTotal);
+        registerLongCounter(indexStats, "compaction_failures_corruption_total",
+                pvs::getCompactionFailuresCorruptionTotal);
+        registerLongCounter(indexStats, "compaction_failures_disk_full_total",
+                pvs::getCompactionFailuresDiskFullTotal);
+        registerLongCounter(indexStats, "compaction_failures_aborted_input_gone_total",
+                pvs::getCompactionFailuresAbortedInputGoneTotal);
+        registerLongCounter(indexStats, "compaction_live_pk_filtered_total",
+                pvs::getCompactionLivePkFilteredTotal);
+        registerLongCounter(indexStats, "pending_deletes_reaped_total",
+                pvs::getPendingDeletesReapedTotal);
+        registerLongCounter(indexStats, "pending_deletes_reap_failures_total",
+                pvs::getPendingDeletesReapFailuresTotal);
+        registerLongGauge(indexStats, "compaction_last_duration_ms",
+                pvs::getCompactionLastDurationMs);
+        registerLongGauge(indexStats, "compaction_last_bytes_read",
+                pvs::getCompactionLastBytesRead);
+        registerLongGauge(indexStats, "compaction_last_bytes_written",
+                pvs::getCompactionLastBytesWritten);
+        registerLongGauge(indexStats, "compaction_last_input_segments",
+                pvs::getCompactionLastInputSegments);
+        registerLongGauge(indexStats, "compaction_last_output_segments",
+                pvs::getCompactionLastOutputSegments);
+        registerLongGauge(indexStats, "compaction_consecutive_failures",
+                pvs::getCompactionConsecutiveFailures);
+        registerIntGauge(indexStats, "compaction_active",
+                pvs::getCompactionActive);
+        registerIntGauge(indexStats, "pending_deletes_count",
+                () -> pvs.getPendingDeletesSnapshot().size());
+        registerLongGauge(indexStats, "pending_deletes_bytes", () -> {
+            // Approximate: pendingDeletes record paths, not byte sizes.
+            // Report 0 for now; the reaper already emits an accurate
+            // "reaped bytes" metric via pending_deletes_reaped_total
+            // paired with compaction_last_bytes_read.
+            return 0L;
+        });
+        registerLongGauge(indexStats, "pending_deletes_oldest_age_seconds", () -> {
+            long now = System.currentTimeMillis();
+            long oldest = Long.MAX_VALUE;
+            boolean any = false;
+            for (PersistentVectorStore.PendingDelete pd : pvs.getPendingDeletesSnapshot()) {
+                long age = now - (pd.deadlineMs - 0);  // pd.deadlineMs = createdAt+retention
+                if (age < oldest) {
+                    oldest = age;
+                    any = true;
+                }
+            }
+            return any ? Math.max(0L, oldest / 1000L) : 0L;
+        });
+        registerLongGauge(indexStats, "applied_index_status_generation",
+                pvs::getCurrentIndexStatusGeneration);
+    }
+
+    private static void registerLongCounter(StatsLogger scope, String name,
+                                            java.util.function.LongSupplier supplier) {
+        scope.registerGauge(name, new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return supplier.getAsLong();
+            }
+        });
+    }
+
+    private static void registerLongGauge(StatsLogger scope, String name,
+                                          java.util.function.LongSupplier supplier) {
+        registerLongCounter(scope, name, supplier);
+    }
+
+    private static void registerIntGauge(StatsLogger scope, String name,
+                                         java.util.function.IntSupplier supplier) {
+        scope.registerGauge(name, new Gauge<Integer>() {
+            @Override
+            public Integer getDefaultValue() {
+                return 0;
+            }
+            @Override
+            public Integer getSample() {
+                return supplier.getAsInt();
+            }
+        });
     }
 
     /**

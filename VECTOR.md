@@ -548,33 +548,7 @@ float alpha
 byte addHierarchy
 byte fusedPQ
 int  nextNodeId
-int  numSegments
-for each segment:
-  int  segmentId
-  long estimatedSizeBytes
-  int  numGraphChunks
-  long[] graphPageIds
-  int  numMapChunks
-  long[] mapPageIds
-```
-
-Segments whose size exceeds ~80% of `maxSegmentSize` are "sealed" — they are not included in future merge rounds and their metadata is preserved verbatim across checkpoints.
-
-**Version 4 — Multi-segment with generation + pendingDeletes:**
-
-Extends v3 with a monotonic IndexStatus `generation` counter (used by compaction to pick the authoritative source for a PK and by the retention reaper to gate deletion against shadow replica lag) and a per-IndexStatus `pendingDeletes` list carrying files queued for retention-aware physical deletion.
-
-```
-int  version=4
-int  dimension
-int  M
-int  beamWidth
-float neighborOverflow
-float alpha
-byte addHierarchy
-byte fusedPQ
-int  nextNodeId
-long indexStatusGeneration                  // new in v4
+long indexStatusGeneration
 int  numSegments
 for each segment:
   int  segmentId
@@ -583,15 +557,17 @@ for each segment:
   long graphFileSize
   utf  mapFilePath    // "" if absent
   long mapFileSize
-  long generation                           // new in v4
-int  numPendingDeletes                      // new in v4
+  long generation
+int  numPendingDeletes
 for each pending delete:
   utf  filePath        // "<segUuid>:<graph|map>"
   long deadlineMs      // wall-clock, System.currentTimeMillis
   long sinceGeneration // deletion gated until all shadows ack > this
 ```
 
-The loader accepts both v3 (missing fields default: `generation=0`, `pendingDeletes=[]`) and v4; the writer always emits v4. The minimum accepted version is v3 — older experimental formats have been removed.
+`indexStatusGeneration` is a monotonic counter bumped on every metadata publish. Each segment is stamped with the generation that produced it: the compactor uses these stamps to pick the authoritative source for a PK, and the retention reaper uses them to gate deletion against shadow replica lag.
+
+Segments whose size exceeds ~80% of `maxSegmentSize` are "sealed" — they are preserved verbatim across checkpoints and are only rewritten by graph-merge compaction.
 
 ### Segment Compaction (graph merge)
 
@@ -614,7 +590,9 @@ This reclaims storage held by deleted or superseded PKs — the previous design 
 
 **Concurrency.** Compaction acquires `checkpointLock` only for the final atomic swap and metadata publish — the same lock checkpoint Phase C uses — so `IndexStatus` updates stay monotonic. The heavy rebuild and write run lock-free. Deletes arriving during a rebuild are tracked in `pendingCompactionDeletes` and replayed against the merged output before it becomes visible.
 
-**Status.** The v4 metadata format, `PendingDelete` bookkeeping, the policy/authority/reaper helpers, and the config keys above have landed; the background thread, metric registration, and the jvector-level graph rebuild are scoped for a follow-up PR (see tracking issue).
+**Background thread.** `PersistentVectorStore` runs a dedicated `vectorIndexCompactionThread` (separate from the checkpoint driver) that wakes every `vector.index.compaction.intervalMs` and invokes `VectorIndexCompactor.runCompactionIfNeeded(...)`. The thread is started only on primaries — shadow replicas never compact.
+
+**Shadow acknowledgement.** Shadow replicas expose their loaded generation via the `GetShadowStatus` RPC; `IndexingServiceEngine` aggregates `min(appliedIndexStatusGeneration)` across all registered shadows. The leader passes that minimum to `reapExpiredPendingDeletes` before every physical delete pass.
 
 ---
 

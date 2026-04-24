@@ -232,19 +232,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
     static final int CHUNK_SIZE = 1_048_576;
 
     /**
-     * Current metadata version written by this store.
-     * <ul>
-     *   <li>v3: multi-segment multipart format (segments only).</li>
-     *   <li>v4: adds per-segment {@code generation} and a per-IndexStatus
-     *       {@code pendingDeletes} list used by the compaction retention
-     *       protocol. The reader supports both v3 (generation=0,
-     *       pendingDeletes=empty) and v4.</li>
-     * </ul>
+     * Multi-segment multipart metadata format. Carries per-segment
+     * {@code generation}, a per-IndexStatus monotonic generation
+     * counter, and a {@code pendingDeletes} list driving the
+     * graph-merge compaction retention protocol.
      */
-    private static final int METADATA_VERSION_MULTI_SEGMENT = 4;
-
-    /** Lowest metadata version still accepted by the reader. */
-    private static final int METADATA_VERSION_MIN_SUPPORTED = 3;
+    private static final int METADATA_VERSION_MULTI_SEGMENT = 3;
 
     // -------------------------------------------------------------------------
     // Configuration
@@ -339,13 +332,61 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Files queued for physical deletion by the compaction retention
-     * protocol. Persisted in the IndexStatus (v4+) so the decision survives
+     * protocol. Persisted in the IndexStatus so the decision survives
      * restarts. The reaper removes entries once both the wall-clock
      * deadline has passed AND all known shadow replicas have acked a
      * generation &gt; {@code sinceGeneration}.
      */
     private final java.util.concurrent.CopyOnWriteArrayList<PendingDelete> pendingDeletes =
             new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /**
+     * PKs deleted while a compaction is in flight. Installed by the
+     * compaction loop before it starts reading input segments; every
+     * {@link #removeVector} call appends to this set so the swap step
+     * can replay the deletes against the freshly-built merged output
+     * before it becomes visible.
+     */
+    private volatile Set<Bytes> pendingCompactionDeletes;
+
+    // -------------------------------------------------------------------------
+    // Compaction state
+    // -------------------------------------------------------------------------
+
+    /** Serialises compaction cycles. One run at a time. */
+    private final ReentrantLock compactionLock = new ReentrantLock();
+
+    /** Background thread driving {@link #runCompactionCycle(long)}. */
+    private volatile Thread vectorIndexCompactionThread;
+    private final Object vectorIndexCompactionWakeup = new Object();
+    private volatile boolean vectorIndexCompactionWakeupPending;
+
+    /** Compaction policy knobs — defaults match IndexingServerConfiguration. */
+    private volatile long vectorIndexCompactionIntervalMs = 5L * 60_000L;
+    private volatile long vectorIndexCompactionMinBytes = 256L * 1024 * 1024;
+    private volatile long vectorIndexCompactionMaxBytes = 1024L * 1024 * 1024;
+    private volatile int vectorIndexCompactionMinCount = 4;
+    private volatile long vectorIndexCompactionRetentionMs = 10L * 60_000L;
+
+    // Compaction metrics
+    final AtomicLong compactionRunsTotal = new AtomicLong();
+    final AtomicLong compactionSuccessesTotal = new AtomicLong();
+    final AtomicLong compactionFailuresReadIoTotal = new AtomicLong();
+    final AtomicLong compactionFailuresWriteIoTotal = new AtomicLong();
+    final AtomicLong compactionFailuresMetadataIoTotal = new AtomicLong();
+    final AtomicLong compactionFailuresCorruptionTotal = new AtomicLong();
+    final AtomicLong compactionFailuresDiskFullTotal = new AtomicLong();
+    final AtomicLong compactionFailuresAbortedInputGoneTotal = new AtomicLong();
+    final AtomicLong compactionLastDurationMs = new AtomicLong();
+    final AtomicLong compactionLastBytesRead = new AtomicLong();
+    final AtomicLong compactionLastBytesWritten = new AtomicLong();
+    final AtomicLong compactionLastInputSegments = new AtomicLong();
+    final AtomicLong compactionLastOutputSegments = new AtomicLong();
+    final AtomicLong compactionLivePkFilteredTotal = new AtomicLong();
+    final AtomicInteger compactionActive = new AtomicInteger();
+    final AtomicLong compactionConsecutiveFailures = new AtomicLong();
+    final AtomicLong pendingDeletesReapedTotal = new AtomicLong();
+    final AtomicLong pendingDeletesReapFailuresTotal = new AtomicLong();
 
     /** Protects state swaps during checkpoint. */
     private final ReentrantReadWriteLock stateLock = new ReentrantReadWriteLock();
@@ -499,6 +540,80 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return currentIndexStatusGeneration.get();
     }
 
+    // Metric accessors (used by IndexingServiceEngine's per-store
+    // Prometheus gauge registration).
+    public long getCompactionRunsTotal() {
+        return compactionRunsTotal.get();
+    }
+
+    public long getCompactionSuccessesTotal() {
+        return compactionSuccessesTotal.get();
+    }
+
+    public long getCompactionFailuresReadIoTotal() {
+        return compactionFailuresReadIoTotal.get();
+    }
+
+    public long getCompactionFailuresWriteIoTotal() {
+        return compactionFailuresWriteIoTotal.get();
+    }
+
+    public long getCompactionFailuresMetadataIoTotal() {
+        return compactionFailuresMetadataIoTotal.get();
+    }
+
+    public long getCompactionFailuresCorruptionTotal() {
+        return compactionFailuresCorruptionTotal.get();
+    }
+
+    public long getCompactionFailuresDiskFullTotal() {
+        return compactionFailuresDiskFullTotal.get();
+    }
+
+    public long getCompactionFailuresAbortedInputGoneTotal() {
+        return compactionFailuresAbortedInputGoneTotal.get();
+    }
+
+    public long getCompactionLivePkFilteredTotal() {
+        return compactionLivePkFilteredTotal.get();
+    }
+
+    public long getCompactionLastDurationMs() {
+        return compactionLastDurationMs.get();
+    }
+
+    public long getCompactionLastBytesRead() {
+        return compactionLastBytesRead.get();
+    }
+
+    public long getCompactionLastBytesWritten() {
+        return compactionLastBytesWritten.get();
+    }
+
+    public long getCompactionLastInputSegments() {
+        return compactionLastInputSegments.get();
+    }
+
+    public long getCompactionLastOutputSegments() {
+        return compactionLastOutputSegments.get();
+    }
+
+    public long getCompactionConsecutiveFailures() {
+        return compactionConsecutiveFailures.get();
+    }
+
+    public int getCompactionActive() {
+        return compactionActive.get();
+    }
+
+    public long getPendingDeletesReapedTotal() {
+        return pendingDeletesReapedTotal.get();
+    }
+
+    public long getPendingDeletesReapFailuresTotal() {
+        return pendingDeletesReapFailuresTotal.get();
+    }
+
     /** Snapshot of the pendingDeletes list (defensive copy). */
     public List<PendingDelete> getPendingDeletesSnapshot() {
         return new ArrayList<>(pendingDeletes);
@@ -565,10 +680,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
             try {
                 dataStorageManager.deleteMultipartIndexFile(tableSpaceUUID, segUuid, fileType);
                 deleted++;
+                pendingDeletesReapedTotal.incrementAndGet();
             } catch (DataStorageManagerException e) {
                 LOGGER.log(Level.WARNING,
                         "reaper " + indexName + ": failed to delete " + segUuid + "/" + fileType,
                         e);
+                pendingDeletesReapFailuresTotal.incrementAndGet();
                 // Leave the entry in pendingDeletes so a later reap cycle retries.
                 partition.retained.add(pd);
             }
@@ -964,7 +1081,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /** Holds the result of writing a single segment's multipart files during checkpoint. */
-    private static class SegmentWriteResult {
+    static class SegmentWriteResult {
         final int segmentId;
         final String graphFilePath;
         final long graphFileSize;
@@ -992,12 +1109,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * deadlineMs} AND {@code sinceGeneration <=
      * min(shadowAckedGeneration)} (or no shadows are known).
      */
-    static final class PendingDelete {
-        final String filePath;
-        final long deadlineMs;
-        final long sinceGeneration;
+    public static final class PendingDelete {
+        public final String filePath;
+        public final long deadlineMs;
+        public final long sinceGeneration;
 
-        PendingDelete(String filePath, long deadlineMs, long sinceGeneration) {
+        public PendingDelete(String filePath, long deadlineMs, long sinceGeneration) {
             this.filePath = filePath;
             this.deadlineMs = deadlineMs;
             this.sinceGeneration = sinceGeneration;
@@ -1051,14 +1168,44 @@ public class PersistentVectorStore extends AbstractVectorStore {
             return;
         }
 
-        // Start background compaction thread
+        // Start background checkpoint-driver thread
         running = true;
         compactionThread = new Thread(this::compactionLoop,
                 "persistent-vector-store-compaction-" + indexName);
         compactionThread.setDaemon(true);
         compactionThread.start();
 
+        // Start background graph-merge compaction thread (separate cadence,
+        // separate responsibilities from the checkpoint driver).
+        vectorIndexCompactionThread = new Thread(this::vectorIndexCompactionLoop,
+                "persistent-vector-store-vidxcompaction-" + indexName);
+        vectorIndexCompactionThread.setDaemon(true);
+        vectorIndexCompactionThread.start();
+
         LOGGER.log(Level.INFO, "PersistentVectorStore {0} started", indexName);
+    }
+
+    /**
+     * Applies the compaction policy knobs from configuration. Must be
+     * called before {@link #start()} for the values to influence the
+     * first compaction cycle, but can also be called at any time to
+     * re-tune a running store.
+     */
+    public void configureCompaction(long intervalMs, long minBytes, long maxBytes,
+                                    int minCount, long retentionMs) {
+        this.vectorIndexCompactionIntervalMs = intervalMs;
+        this.vectorIndexCompactionMinBytes = minBytes;
+        this.vectorIndexCompactionMaxBytes = maxBytes;
+        this.vectorIndexCompactionMinCount = minCount;
+        this.vectorIndexCompactionRetentionMs = retentionMs;
+    }
+
+    /** Wakes the compaction thread. Called by tests and the retention reaper. */
+    public void wakeVectorIndexCompaction() {
+        synchronized (vectorIndexCompactionWakeup) {
+            vectorIndexCompactionWakeupPending = true;
+            vectorIndexCompactionWakeup.notifyAll();
+        }
     }
 
     /**
@@ -1204,6 +1351,387 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
     }
 
+    /**
+     * Dedicated driver for graph-merge compaction (issue — vector-index
+     * compaction). Runs on its own cadence, independent of the
+     * checkpoint driver above: we do NOT want a tight checkpoint loop
+     * to also trigger a heavyweight segment rewrite every time.
+     */
+    private void vectorIndexCompactionLoop() {
+        while (running) {
+            long sleepMs = vectorIndexCompactionIntervalMs;
+            long failures = compactionConsecutiveFailures.get();
+            if (failures > 0) {
+                long backoff = computeBackoffMs(vectorIndexCompactionIntervalMs,
+                        failures, MAX_BACKOFF_MS);
+                sleepMs = saturatedAdd(sleepMs, backoff);
+            }
+            try {
+                synchronized (vectorIndexCompactionWakeup) {
+                    if (!vectorIndexCompactionWakeupPending) {
+                        vectorIndexCompactionWakeup.wait(sleepMs);
+                    }
+                    vectorIndexCompactionWakeupPending = false;
+                }
+            } catch (InterruptedException e) {
+                if (!running) {
+                    return;
+                }
+                Thread.interrupted();
+            }
+            if (!running) {
+                return;
+            }
+            try {
+                runCompactionCycle();
+            } catch (InterruptedException e) {
+                if (!running) {
+                    return;
+                }
+            } catch (RuntimeException e) {
+                // Safety net: the cycle itself logs specific failure
+                // reasons, but we must not let the thread die.
+                LOGGER.log(Level.SEVERE,
+                        "vector store " + indexName + ": unexpected compaction failure", e);
+                compactionConsecutiveFailures.incrementAndGet();
+            }
+        }
+    }
+
+    /**
+     * Runs at most one compaction cycle. Silently skips when the lock
+     * is busy (tests may invoke synchronously) or when the policy says
+     * no candidates are large enough / numerous enough.
+     */
+    public void runCompactionCycle() throws InterruptedException {
+        if (!compactionLock.tryLock()) {
+            return; // a cycle is already running
+        }
+        try {
+            long cycleStart = System.currentTimeMillis();
+            compactionRunsTotal.incrementAndGet();
+
+            List<VectorSegment> snapshot = new ArrayList<>(segments);
+            List<VectorSegment> candidates = VectorIndexCompactor.chooseSegmentsToMerge(
+                    snapshot,
+                    vectorIndexCompactionMinCount,
+                    vectorIndexCompactionMinBytes,
+                    vectorIndexCompactionMaxBytes);
+            if (candidates.isEmpty()) {
+                return;
+            }
+
+            LOGGER.log(Level.INFO,
+                    "vector store {0}: starting graph-merge compaction ({1} candidate segments)",
+                    new Object[]{indexName, candidates.size()});
+
+            compactionActive.set(1);
+            this.pendingCompactionDeletes =
+                    java.util.concurrent.ConcurrentHashMap.newKeySet();
+            Set<Bytes> liveShardPkSnapshot = new java.util.HashSet<>();
+            for (LiveGraphShard shard : liveShards) {
+                liveShardPkSnapshot.addAll(shard.pkToNode.keySet());
+            }
+            Map<Bytes, Integer> authority = VectorIndexCompactor.buildAuthorityMap(
+                    candidates, snapshot, liveShardPkSnapshot);
+
+            long bytesRead = 0;
+            long vectorsWritten = 0;
+            long vectorsFiltered = 0;
+            VectorIndexCompactor.RebuildResult rebuild = null;
+            try {
+                rebuild = VectorIndexCompactor.rebuildSegment(this, candidates, authority);
+                if (rebuild == null) {
+                    // Nothing survived the filter — everything in these inputs
+                    // is tombstoned or superseded. Skip the rebuild; just
+                    // swap the inputs out and queue them for retention.
+                    atomicSwapCompactionResult(candidates, null, 0L);
+                    compactionSuccessesTotal.incrementAndGet();
+                    compactionConsecutiveFailures.set(0);
+                    long emptyCycleMs = System.currentTimeMillis() - cycleStart;
+                    compactionLastDurationMs.set(emptyCycleMs);
+                    compactionLastBytesRead.set(candidates.stream()
+                            .mapToLong(s -> s.estimatedSizeBytes).sum());
+                    compactionLastBytesWritten.set(0);
+                    compactionLastInputSegments.set(candidates.size());
+                    compactionLastOutputSegments.set(0);
+                    compactionLivePkFilteredTotal.addAndGet(countDeadPks(candidates, authority));
+                    LOGGER.log(Level.INFO,
+                            "vector store {0}: empty-result compaction in {1} ms — "
+                                    + "swapped out {2} fully-obsolete segments",
+                            new Object[]{indexName, emptyCycleMs, candidates.size()});
+                    return;
+                }
+
+                bytesRead = candidates.stream().mapToLong(s -> s.estimatedSizeBytes).sum();
+                vectorsWritten = rebuild.vectorCount;
+                vectorsFiltered = rebuild.filteredCount;
+
+                // Apply deletes that arrived during the rebuild.
+                Set<Bytes> lateDeletes = this.pendingCompactionDeletes;
+                if (lateDeletes != null) {
+                    for (Bytes pk : lateDeletes) {
+                        rebuild.mergedSegment.deletePk(pk);
+                    }
+                }
+
+                atomicSwapCompactionResult(candidates, rebuild.mergedSegment,
+                        rebuild.bytesWritten);
+
+                compactionSuccessesTotal.incrementAndGet();
+                compactionConsecutiveFailures.set(0);
+                long durationMs = System.currentTimeMillis() - cycleStart;
+                compactionLastDurationMs.set(durationMs);
+                compactionLastBytesRead.set(bytesRead);
+                compactionLastBytesWritten.set(rebuild.bytesWritten);
+                compactionLastInputSegments.set(candidates.size());
+                compactionLastOutputSegments.set(1);
+                compactionLivePkFilteredTotal.addAndGet(vectorsFiltered);
+
+                LOGGER.log(Level.INFO,
+                        "vector store {0}: compaction complete in {1} ms — "
+                                + "{2} inputs ({3} bytes) -> 1 output ({4} bytes, "
+                                + "{5} vectors kept, {6} filtered)",
+                        new Object[]{indexName, durationMs, candidates.size(), bytesRead,
+                                rebuild.bytesWritten, vectorsWritten, vectorsFiltered});
+            } catch (VectorIndexCompactor.CompactionException e) {
+                recordCompactionFailure(e.reason);
+                LOGGER.log(Level.WARNING,
+                        "vector store " + indexName + ": compaction failed ("
+                                + e.reason + ")", e);
+                // Clean up orphaned output files if any were written.
+                if (rebuild != null && rebuild.orphanPaths != null) {
+                    long now = System.currentTimeMillis();
+                    long sinceGen = currentIndexStatusGeneration.get();
+                    for (String[] orphan : rebuild.orphanPaths) {
+                        pendingDeletes.add(new PendingDelete(
+                                encodeMultipartPath(orphan[0], orphan[1]),
+                                now, sinceGen));
+                    }
+                }
+            } catch (IOException e) {
+                recordCompactionFailure(VectorIndexCompactor.FailureReason.WRITE_IO);
+                LOGGER.log(Level.WARNING,
+                        "vector store " + indexName + ": compaction I/O failure", e);
+            } catch (DataStorageManagerException e) {
+                recordCompactionFailure(VectorIndexCompactor.FailureReason.METADATA_IO);
+                LOGGER.log(Level.WARNING,
+                        "vector store " + indexName + ": compaction metadata failure", e);
+            }
+        } finally {
+            compactionActive.set(0);
+            this.pendingCompactionDeletes = null;
+            compactionLock.unlock();
+        }
+    }
+
+    private static long countDeadPks(List<VectorSegment> candidates, Map<Bytes, Integer> authority) {
+        long total = 0;
+        for (VectorSegment seg : candidates) {
+            int[] offsets = seg.pkOffsets;
+            int[] lengths = seg.pkLengths;
+            byte[] data = seg.pkData;
+            if (offsets == null) {
+                continue;
+            }
+            for (int ord = 0; ord < offsets.length; ord++) {
+                if (offsets[ord] < 0) {
+                    total++;
+                    continue;
+                }
+                Bytes pk = Bytes.from_array(data, offsets[ord], lengths[ord]);
+                Integer owner = authority.get(pk);
+                if (owner == null || owner != seg.segmentId) {
+                    total++;
+                }
+            }
+        }
+        return total;
+    }
+
+    private void recordCompactionFailure(VectorIndexCompactor.FailureReason reason) {
+        compactionConsecutiveFailures.incrementAndGet();
+        switch (reason) {
+            case READ_IO:
+                compactionFailuresReadIoTotal.incrementAndGet();
+                break;
+            case WRITE_IO:
+                compactionFailuresWriteIoTotal.incrementAndGet();
+                break;
+            case METADATA_IO:
+                compactionFailuresMetadataIoTotal.incrementAndGet();
+                break;
+            case CORRUPTION:
+                compactionFailuresCorruptionTotal.incrementAndGet();
+                break;
+            case DISK_FULL:
+                compactionFailuresDiskFullTotal.incrementAndGet();
+                break;
+            case ABORTED_INPUT_GONE:
+                compactionFailuresAbortedInputGoneTotal.incrementAndGet();
+                break;
+            default:
+                break;
+        }
+    }
+
+    /**
+     * Atomic segment-list swap + IndexStatus publish for a completed
+     * compaction run. Validates that every input is still present in
+     * {@code segments} — if a concurrent checkpoint has moved an input
+     * under us, aborts with {@code ABORTED_INPUT_GONE} instead of
+     * silently dropping data.
+     */
+    private void atomicSwapCompactionResult(List<VectorSegment> inputs,
+                                            VectorSegment mergedOutput,
+                                            long bytesWritten)
+            throws VectorIndexCompactor.CompactionException, DataStorageManagerException {
+        checkpointLock.lock();
+        try {
+            stateLock.writeLock().lock();
+            try {
+                // Validate every input is still in the segment list.
+                List<VectorSegment> current = segments;
+                Set<Integer> currentIds = new java.util.HashSet<>();
+                for (VectorSegment s : current) {
+                    currentIds.add(s.segmentId);
+                }
+                for (VectorSegment in : inputs) {
+                    if (!currentIds.contains(in.segmentId)) {
+                        throw new VectorIndexCompactor.CompactionException(
+                                VectorIndexCompactor.FailureReason.ABORTED_INPUT_GONE,
+                                "input segment " + in.segmentId + " disappeared from segment list");
+                    }
+                }
+
+                // Build new segment list.
+                List<VectorSegment> newSegments =
+                        new java.util.concurrent.CopyOnWriteArrayList<>();
+                Set<Integer> inputIds = new java.util.HashSet<>();
+                for (VectorSegment in : inputs) {
+                    inputIds.add(in.segmentId);
+                }
+                for (VectorSegment s : current) {
+                    if (!inputIds.contains(s.segmentId)) {
+                        newSegments.add(s);
+                    }
+                }
+                if (mergedOutput != null) {
+                    // Fresh generation will be assigned by
+                    // persistIndexStatusMultiSegment; we set it now so
+                    // the in-memory state matches what we persist.
+                    mergedOutput.generation = currentIndexStatusGeneration.get() + 1;
+                    newSegments.add(mergedOutput);
+                }
+
+                // Queue inputs for retention-aware deletion.
+                for (VectorSegment in : inputs) {
+                    queueSegmentPendingDelete(in, vectorIndexCompactionRetentionMs);
+                }
+
+                // Publish the new IndexStatus. Compaction reuses
+                // persistIndexStatusMultiSegment by passing sealed=all
+                // kept segments and newSegmentResults=empty (the merged
+                // output is already a VectorSegment, not a
+                // SegmentWriteResult).
+                List<VectorSegment> allSealedForPersist = new ArrayList<>(newSegments);
+                persistIndexStatusMultiSegment(
+                        allSealedForPersist,
+                        java.util.Collections.emptyList(),
+                        java.util.Collections.emptyList(),
+                        LogSequenceNumber.START_OF_TIME);
+
+                this.segments = newSegments;
+                dirty.set(dirty.get() || totalLiveSize() > 0);
+            } finally {
+                stateLock.writeLock().unlock();
+            }
+            // Close the inputs OUTSIDE the write lock: the searchers that
+            // held a reference dropped it when we swapped `segments`.
+            for (VectorSegment in : inputs) {
+                try {
+                    in.close();
+                } catch (RuntimeException e) {
+                    // Narrow catch would be ideal but seg.close() can
+                    // surface BLink close failures and we must not let
+                    // the swap fail afterwards.
+                    LOGGER.log(Level.FINE,
+                            "vector store " + indexName
+                                    + ": ignoring close failure for compacted input segment",
+                            e);
+                }
+            }
+        } finally {
+            checkpointLock.unlock();
+        }
+    }
+
+    // Package-private accessors for VectorIndexCompactor
+    int newSegmentId() {
+        return nextSegmentId.getAndIncrement();
+    }
+
+    int allocateCompactionNodeIds(int count) {
+        int start = nextNodeId.getAndAdd(count);
+        return start;
+    }
+
+    void releaseCompactionNodeIds(int startNodeId, int count) {
+        for (int i = 0; i < count; i++) {
+            vectorStorage.remove(startNodeId + i);
+        }
+    }
+
+    int compactionDimension() {
+        return dimension;
+    }
+
+    VectorSimilarityFunction compactionSimilarity() {
+        return similarityFunction;
+    }
+
+    VectorStorage compactionVectorStorage() {
+        return vectorStorage;
+    }
+
+    SegmentWriteResult writeSyntheticShard(LiveGraphShard syntheticShard,
+                                           int segmentId,
+                                           int dim) throws IOException, DataStorageManagerException {
+        return writeShardAsFusedPQSegment(syntheticShard, segmentId, dim);
+    }
+
+    VectorSegment preloadCompactedSegment(SegmentWriteResult swr) throws IOException, DataStorageManagerException {
+        VectorSegment seg = new VectorSegment(swr.segmentId);
+        seg.estimatedSizeBytes = swr.estimatedSizeBytes;
+        seg.graphFilePath = swr.graphFilePath;
+        seg.graphFileSize = swr.graphFileSize;
+        seg.mapFilePath = swr.mapFilePath;
+        seg.mapFileSize = swr.mapFileSize;
+        Path mapFile = readMultipartMapDataToTempFile(seg);
+        loadFusedPQSegment(seg, mapFile, dimension, nextNodeId.get());
+        return seg;
+    }
+
+    String indexUUID() {
+        return indexUUID;
+    }
+
+    int graphBuilderM() {
+        return m;
+    }
+
+    int graphBuilderBeamWidth() {
+        return beamWidth;
+    }
+
+    float graphBuilderNeighborOverflow() {
+        return neighborOverflow;
+    }
+
+    float graphBuilderAlpha() {
+        return alpha;
+    }
+
     private static long saturatedAdd(long a, long b) {
         long r = a + b;
         if (((a ^ r) & (b ^ r)) < 0) {
@@ -1291,6 +1819,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
         if (ct != null) {
             ct.interrupt();
             ct.join(10000);
+        }
+        Thread vct = vectorIndexCompactionThread;
+        if (vct != null) {
+            synchronized (vectorIndexCompactionWakeup) {
+                vectorIndexCompactionWakeupPending = true;
+                vectorIndexCompactionWakeup.notifyAll();
+            }
+            vct.interrupt();
+            vct.join(10000);
+            vectorIndexCompactionThread = null;
         }
 
         for (LiveGraphShard shard : liveShards) {
@@ -1463,6 +2001,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
             Set<Bytes> pending = pendingCheckpointDeletes;
             if (pending != null) {
                 pending.add(pk);
+            }
+            // Track delete for in-flight compaction: if we are rebuilding
+            // segments right now, the merged output must see this delete
+            // before it is published.
+            Set<Bytes> pendingCompact = pendingCompactionDeletes;
+            if (pendingCompact != null) {
+                pendingCompact.add(pk);
             }
             // Check all live shards
             for (LiveGraphShard shard : liveShards) {
@@ -2869,12 +3414,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         ByteBuffer metaBuf = ByteBuffer.wrap(status.indexData);
 
         int version = metaBuf.getInt();
-        if (version < METADATA_VERSION_MIN_SUPPORTED || version > METADATA_VERSION_MULTI_SEGMENT) {
+        if (version != METADATA_VERSION_MULTI_SEGMENT) {
             LOGGER.log(Level.SEVERE,
-                    "unsupported vector index metadata version {0} for {1} (supported: v{2}..v{3}),"
+                    "unsupported vector index metadata version {0} for {1} (only v{2} is supported),"
                             + " starting empty — old experimental formats have been removed",
-                    new Object[]{version, indexName,
-                            METADATA_VERSION_MIN_SUPPORTED, METADATA_VERSION_MULTI_SEGMENT});
+                    new Object[]{version, indexName, METADATA_VERSION_MULTI_SEGMENT});
             return;
         }
 
@@ -2891,12 +3435,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.dimension = dim;
         newPageId.set(status.newPageId);
 
-        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha, version);
+        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
     }
 
     private void loadMultiSegmentFormat(ByteBuffer metaBuf, int dim, int savedNextNodeId,
-                                         int savedBeamWidth, float savedNeighborOverflow, float savedAlpha,
-                                         int version)
+                                         int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
             throws IOException, DataStorageManagerException {
         java.io.DataInputStream dis = new java.io.DataInputStream(
                 new java.io.ByteArrayInputStream(metaBuf.array(), metaBuf.position(),
@@ -2904,11 +3447,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         long loadedGeneration;
         int numSegments;
         try {
-            if (version >= 4) {
-                loadedGeneration = dis.readLong();
-            } else {
-                loadedGeneration = 0L;
-            }
+            loadedGeneration = dis.readLong();
             numSegments = dis.readInt();
         } catch (IOException e) {
             throw new DataStorageManagerException("Failed to read segment count", e);
@@ -2917,11 +3456,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
         currentIndexStatusGeneration.set(loadedGeneration);
 
         if (dim == 0 || numSegments == 0) {
-            if (version >= 4) {
-                loadPendingDeletes(dis);
-            }
-            LOGGER.log(Level.INFO, "vector store {0} is empty (multi-segment v{1}), no load needed",
-                    new Object[]{indexName, version});
+            loadPendingDeletes(dis);
+            LOGGER.log(Level.INFO, "vector store {0} is empty (multi-segment), no load needed", indexName);
             return;
         }
 
@@ -2942,7 +3478,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 graphFileSize = dis.readLong();
                 mapFilePath = dis.readUTF();
                 mapFileSize = dis.readLong();
-                generation = (version >= 4) ? dis.readLong() : 0L;
+                generation = dis.readLong();
             } catch (IOException e) {
                 throw new DataStorageManagerException("Failed to read segment metadata", e);
             }
@@ -2969,9 +3505,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         nextSegmentId.set(maxSegId + 1);
         currentIndexStatusGeneration.set(Math.max(currentIndexStatusGeneration.get(), maxGeneration));
 
-        if (version >= 4) {
-            loadPendingDeletes(dis);
-        }
+        loadPendingDeletes(dis);
 
         int maxOrd = -1;
         for (VectorSegment seg : segments) {
@@ -2984,16 +3518,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
         initEmptyLiveShards(dim, savedBeamWidth, savedNeighborOverflow, savedAlpha);
 
         LOGGER.log(Level.INFO,
-                "loaded vector store {0} (multi-segment v{1}): {2} segments, dimension {3}, "
-                        + "generation {4}, pendingDeletes {5}",
-                new Object[]{indexName, version, numSegments, dim,
+                "loaded vector store {0} (multi-segment): {1} segments, dimension {2}, "
+                        + "generation {3}, pendingDeletes {4}",
+                new Object[]{indexName, numSegments, dim,
                         currentIndexStatusGeneration.get(), pendingDeletes.size()});
     }
 
     /**
-     * Reads the pendingDeletes list from the tail of a v4+ metadata stream.
-     * Appends entries into {@link #pendingDeletes}. A v3 metadata stream
-     * never calls this helper.
+     * Reads the pendingDeletes list from the tail of the metadata stream.
+     * Appends entries into {@link #pendingDeletes}.
      */
     private void loadPendingDeletes(java.io.DataInputStream dis) throws DataStorageManagerException {
         int pendingCount;
