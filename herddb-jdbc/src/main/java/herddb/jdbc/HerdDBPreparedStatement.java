@@ -635,24 +635,35 @@ public class HerdDBPreparedStatement extends HerdDBStatement implements Prepared
             return res;
         }
 
+        // Issue #251: snapshot and clear `this.batch` synchronously on the
+        // calling thread, mirroring the synchronous executeBatch() pattern.
+        // The previous implementation cleared the batch inside the async
+        // whenComplete callback, racing with the caller's next addBatch:
+        // res.complete() unblocked .get() before batch.clear() had run, and a
+        // fast caller (the VectorBench ingestion worker) re-populated
+        // this.batch with the next batch's rows in that window. The delayed
+        // clear then wiped them, silently dropping rows from the next
+        // executeBatch — observed as a 9-row gap in a 100M ingest.
+        final List<List<Object>> snapshot = new ArrayList<>(this.batch);
+        this.batch.clear();
+
         parent.getConnection().executeUpdatesAsync(
                 parent.getTableSpace(), sql,
-                tx, false, true, this.batch)
+                tx, false, true, snapshot)
                 .whenComplete((dmsresults, error) -> {
                     if (error != null) {
                         res.completeExceptionally(SQLExceptionUtils.wrapException(error));
-                    } else {
-                        int[] results = new int[batch.size()];
-                        int i = 0;
-                        for (DMLResult dmlresult : dmsresults) {
-                            results[i++] = (int) dmlresult.updateCount;
-                            parent.bindToTransaction(dmlresult.transactionId);
-                            lastUpdateCount += dmlresult.updateCount;
-                            lastKey = dmlresult.key;
-                        }
-                        res.complete(results);
+                        return;
                     }
-                    batch.clear();
+                    int[] results = new int[snapshot.size()];
+                    int i = 0;
+                    for (DMLResult dmlresult : dmsresults) {
+                        results[i++] = (int) dmlresult.updateCount;
+                        parent.bindToTransaction(dmlresult.transactionId);
+                        lastUpdateCount += dmlresult.updateCount;
+                        lastKey = dmlresult.key;
+                    }
+                    res.complete(results);
                 });
 
         return res;
