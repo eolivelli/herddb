@@ -2080,42 +2080,85 @@ public class PersistentVectorStore extends AbstractVectorStore {
             waitForMemoryPressureRelief();
         }
 
-        stateLock.readLock().lock();
-        try {
-            if (dimension == 0) {
-                initBuilderForDimension(dim);
-            }
-            if (dim != dimension) {
-                LOGGER.log(Level.WARNING,
-                        "vector dimension mismatch on insert: expected {0} but got {1}, skipping",
-                        new Object[]{dimension, dim});
-                return;
-            }
+        // Phase 1 — structural checks: decide whether init or rotation is needed
+        // using cheap volatile reads BEFORE taking any lock.  Both fields are
+        // volatile so the reads are safe without a lock; we double-check under
+        // the write lock inside initBuilderForDimension / rotateLiveShard.
+        // Building the candidate shard (expensive jvector GraphIndexBuilder
+        // initialisation) also happens outside any lock so that concurrent ingest
+        // threads do not block one another during shard construction (issue #282).
+        if (dimension == 0) {
+            // First-ever insert: build the candidate outside any lock, publish
+            // under write lock. Only one shard is created even under contention
+            // because of the dimension==0 double-check inside the write lock.
+            LiveGraphShard candidate = createEmptyLiveShard(dim, beamWidth, neighborOverflow, alpha);
+            initBuilderForDimension(dim, candidate);
+        }
 
-            List<LiveGraphShard> shards = this.liveShards;
-            LiveGraphShard active = shards.get(shards.size() - 1);
-
-            // Check if rotation is needed BEFORE allocating the nodeId so that
-            // the new shard's startNodeId (= nextNodeId.get() at creation time)
-            // matches the first nodeId assigned to it, keeping localOrd >= 0.
-            if (active.nodeToPk.size() >= computeEffectiveMaxLiveGraphSize()) {
-                active = rotateLiveShard();
+        List<LiveGraphShard> snapShards = this.liveShards;
+        if (!snapShards.isEmpty()) {
+            LiveGraphShard snapActive = snapShards.get(snapShards.size() - 1);
+            if (snapActive.nodeToPk.size() >= computeEffectiveMaxLiveGraphSize()) {
+                // Rotation needed: build the candidate outside any lock, then
+                // publish under the write lock.  Under burst concurrency up to K
+                // threads may build a candidate; K-1 are discarded by the
+                // double-check inside rotateLiveShard (issue #282).
+                LiveGraphShard candidate = createEmptyLiveShard(
+                        dimension, beamWidth, neighborOverflow, alpha);
+                rotateLiveShard(candidate);
             }
+        }
 
-            long globalNodeId = nextNodeId.getAndIncrement();
-            // Per-shard span is bounded by computeEffectiveMaxLiveGraphSize(),
-            // so the cast always fits. Math.toIntExact turns a violated
-            // invariant into a loud ArithmeticException instead of silently
-            // wrapping (issue #256).
-            int localOrd = Math.toIntExact(globalNodeId - active.startNodeId);
-            active.vectorStorage.set(localOrd, vec);
-            active.vectorCount.incrementAndGet();
-            active.pkToNode.put(pk, localOrd);
-            active.nodeToPk.put(localOrd, pk);
-            active.builder.addGraphNode(localOrd, vec);
-            dirty.set(true);
-        } finally {
-            stateLock.readLock().unlock();
+        // Phase 2 — insert under the read lock.  stateLock.writeLock() is
+        // exclusive with readLock so once we hold the read lock, no checkpoint
+        // or rotation can swap liveShards out from under us.
+        //
+        // We loop at most twice: on the first attempt the active shard is
+        // normally non-full (Phase 1 handled it).  In the rare case that
+        // another thread filled the freshly-rotated shard between our Phase-1
+        // check and acquiring the read lock we rotate once more and retry.
+        // The loop terminates because every iteration either inserts (done) or
+        // triggers exactly one more rotation (continue).
+        while (true) {
+            stateLock.readLock().lock();
+            try {
+                if (dim != dimension) {
+                    LOGGER.log(Level.WARNING,
+                            "vector dimension mismatch on insert: expected {0} but got {1}, skipping",
+                            new Object[]{dimension, dim});
+                    return;
+                }
+
+                List<LiveGraphShard> shards = this.liveShards;
+                LiveGraphShard active = shards.get(shards.size() - 1);
+
+                if (active.nodeToPk.size() < computeEffectiveMaxLiveGraphSize()) {
+                    long globalNodeId = nextNodeId.getAndIncrement();
+                    // Per-shard span is bounded by computeEffectiveMaxLiveGraphSize(),
+                    // so the cast always fits. Math.toIntExact turns a violated
+                    // invariant into a loud ArithmeticException instead of silently
+                    // wrapping (issue #256).
+                    int localOrd = Math.toIntExact(globalNodeId - active.startNodeId);
+                    active.vectorStorage.set(localOrd, vec);
+                    active.vectorCount.incrementAndGet();
+                    active.pkToNode.put(pk, localOrd);
+                    active.nodeToPk.put(localOrd, pk);
+                    active.builder.addGraphNode(localOrd, vec);
+                    dirty.set(true);
+                    return; // inserted successfully — done
+                }
+                // Active shard is still full (another thread filled it between
+                // Phase-1 and now). Fall through to rotate outside the read
+                // lock, then loop back.
+            } finally {
+                stateLock.readLock().unlock();
+            }
+            // Release the read lock before acquiring the write lock inside
+            // rotateLiveShard (ReentrantReadWriteLock does not support
+            // read-to-write upgrade).
+            LiveGraphShard candidate = createEmptyLiveShard(
+                    dimension, beamWidth, neighborOverflow, alpha);
+            rotateLiveShard(candidate);
         }
     }
 
@@ -4422,36 +4465,31 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
-     * Rotates the live graph shard if the active shard has reached the max size.
+     * Publishes {@code candidate} as the new active live shard if the current
+     * active shard is still full.
      *
-     * <p>The expensive allocation ({@link #createEmptyLiveShard} — two preallocated
-     * {@link java.util.concurrent.ConcurrentHashMap}s plus a jvector
-     * {@code GraphIndexBuilder}) runs <em>outside</em> the instance monitor so that
-     * concurrent ingest threads do not block waiting for shard construction.  Only
-     * the publish (volatile swap of {@link #liveShards}) happens under the monitor.
+     * <p>The caller is responsible for building {@code candidate} <em>outside</em>
+     * any lock (jvector {@link GraphIndexBuilder} initialisation is the dominant
+     * cost).  Only the publish — a volatile swap of {@link #liveShards} — happens
+     * under {@code stateLock.writeLock()}, which keeps the write-lock critical
+     * section small (issue #282).
      *
      * <p>Under burst contention up to K threads may concurrently build a candidate
-     * shard; K-1 are discarded after the double-check.  That trades a small amount
-     * of wasted allocation at rotation time for eliminating the monitor hold while
-     * the builder is initialized.
+     * shard; K-1 are discarded by the double-check inside the write lock.  That
+     * trades a small amount of wasted allocation at rotation time for eliminating
+     * the long hold while the builder is initialised.
+     *
+     * @param candidate a freshly built (empty) live shard
      */
-    private LiveGraphShard rotateLiveShard() {
-        List<LiveGraphShard> snap = this.liveShards;
-        LiveGraphShard active = snap.get(snap.size() - 1);
+    private void rotateLiveShard(LiveGraphShard candidate) {
         int cap = computeEffectiveMaxLiveGraphSize();
-        if (active.nodeToPk.size() < cap) {
-            return active;
-        }
-        // Allocate outside the monitor: jvector GraphIndexBuilder setup is the
-        // dominant cost in this method (see issue: lock profile hotspot).
-        LiveGraphShard candidate = createEmptyLiveShard(
-                dimension, beamWidth, neighborOverflow, alpha);
-        synchronized (this) {
+        stateLock.writeLock().lock();
+        try {
             List<LiveGraphShard> cur = this.liveShards;
             LiveGraphShard curActive = cur.get(cur.size() - 1);
             if (curActive.nodeToPk.size() < cap) {
                 // Another thread won the race and already published a new shard.
-                return curActive;
+                return;
             }
             List<LiveGraphShard> newList = new ArrayList<>(cur);
             newList.add(candidate);
@@ -4459,7 +4497,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
             LOGGER.log(Level.INFO,
                     "vector store {0}: rotated live graph shard, now {1} shards ({2} vectors in sealed shard)",
                     new Object[]{indexName, newList.size(), curActive.nodeToPk.size()});
-            return candidate;
+        } finally {
+            stateLock.writeLock().unlock();
         }
     }
 
@@ -4468,11 +4507,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.liveShards = new ArrayList<>(Collections.singletonList(shard));
     }
 
-    private synchronized void initBuilderForDimension(int dim) {
-        if (this.dimension == 0) {
-            LiveGraphShard shard = createEmptyLiveShard(dim, beamWidth, neighborOverflow, alpha);
-            this.liveShards = new ArrayList<>(Collections.singletonList(shard));
-            this.dimension = dim;
+    /**
+     * Initialises the first live shard if the store has not yet seen any
+     * vectors.  The caller must build {@code candidate} outside any lock;
+     * only the publish (volatile swap of {@link #liveShards} and assignment
+     * of {@link #dimension}) happens under {@code stateLock.writeLock()},
+     * keeping the write-lock critical section small (issue #282).
+     *
+     * @param dim       the vector dimension detected from the first insert
+     * @param candidate a freshly built (empty) live shard for {@code dim}
+     */
+    private void initBuilderForDimension(int dim, LiveGraphShard candidate) {
+        stateLock.writeLock().lock();
+        try {
+            if (this.dimension == 0) {
+                this.liveShards = new ArrayList<>(Collections.singletonList(candidate));
+                this.dimension = dim;
+            }
+        } finally {
+            stateLock.writeLock().unlock();
         }
     }
 
@@ -4855,6 +4908,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
             return null;
         }
         return shards.get(shards.size() - 1);
+    }
+
+    /**
+     * Test-only hook: returns a snapshot of all live shards so that tests
+     * can assert shard count and per-shard invariants at rotation boundaries.
+     */
+    public List<LiveGraphShard> allLiveShardsForTest() {
+        return new ArrayList<>(this.liveShards);
     }
 
     // -------------------------------------------------------------------------
