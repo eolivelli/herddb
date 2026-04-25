@@ -588,7 +588,8 @@ public class VectorBench {
             System.out.printf("=== QUERY RESULTS ===%n");
             System.out.printf("Queries: %d | Wall time: %.1fs | Throughput: %.0f qps%n",
                     queriesRun, querySecs, queryThroughput);
-            System.out.printf("Threads: %d | Top-K: %d%n", config.queryThreads, config.topK);
+            System.out.printf("Threads: %d | Top-K: %d | Max ops/s: %s%n", config.queryThreads, config.topK,
+                    config.queryMaxOpsPerSecond > 0 ? config.queryMaxOpsPerSecond : "unlimited");
             queryLatency.print("QUERY LATENCY");
         }
 
@@ -702,6 +703,7 @@ public class VectorBench {
             f.put("throughput_qps", round0(queryThroughput));
             f.put("threads", config.queryThreads);
             f.put("top_k", config.topK);
+            f.put("query_max_ops", config.queryMaxOpsPerSecond > 0 ? config.queryMaxOpsPerSecond : 0);
             f.put("latency_mean_ms", round2(queryLatency.meanNanos() / 1e6));
             f.put("latency_p50_ms", round2(queryLatency.p50Nanos() / 1e6));
             f.put("latency_p95_ms", round2(queryLatency.p95Nanos() / 1e6));

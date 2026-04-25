@@ -123,6 +123,24 @@ class VectorBenchTest {
     }
 
     @Test
+    void configToStringIncludesQueryMaxOps() throws Exception {
+        Config cfg = Config.parse(new String[]{"--query-max-ops", "42"});
+        String s = cfg.toString();
+        org.junit.jupiter.api.Assertions.assertTrue(
+                s.contains("queryMaxOpsPerSecond=42"),
+                "toString() must include queryMaxOpsPerSecond; got: " + s);
+    }
+
+    @Test
+    void configToStringShowsUnlimitedWhenQueryMaxOpsIsZero() throws Exception {
+        Config cfg = Config.parse(new String[]{"--query-max-ops", "0"});
+        String s = cfg.toString();
+        org.junit.jupiter.api.Assertions.assertTrue(
+                s.contains("queryMaxOpsPerSecond=unlimited"),
+                "toString() must show 'unlimited' when queryMaxOpsPerSecond=0; got: " + s);
+    }
+
+    @Test
     void buildCreateVectorIndexSqlDefaultIncludesNumShardsFour() throws Exception {
         Config cfg = Config.parse(new String[]{});
 
