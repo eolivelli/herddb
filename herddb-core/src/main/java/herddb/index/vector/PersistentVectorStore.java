@@ -217,16 +217,35 @@ public class PersistentVectorStore extends AbstractVectorStore {
             Math.max(2, Integer.getInteger(
                     "herddb.vectorindex.segmentMergeBatch", 4));
 
+    /**
+     * Parallelism for the JVM-wide checkpoint pool. Configurable via the
+     * {@code herddb.vectorindex.checkpointThreads} system property. Default
+     * is {@code max(1, availableProcessors() / 2)}.
+     */
+    private static final int CHECKPOINT_POOL_SIZE = Math.max(1,
+            Integer.getInteger("herddb.vectorindex.checkpointThreads",
+                    Math.max(1, Runtime.getRuntime().availableProcessors() / 2)));
+
     /** Dedicated ForkJoinPool for checkpoint graph building. */
-    private static final ForkJoinPool CHECKPOINT_POOL = new ForkJoinPool(
-            Math.max(1, Runtime.getRuntime().availableProcessors() / 2),
-            pool -> {
-                ForkJoinWorkerThread t = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
-                t.setDaemon(true);
-                t.setName("persistent-vector-store-checkpoint-" + t.getPoolIndex());
-                return t;
-            },
-            null, false);
+    private static final ForkJoinPool CHECKPOINT_POOL = createCheckpointPool();
+
+    private static ForkJoinPool createCheckpointPool() {
+        int defaultSize = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
+        LOGGER.log(Level.INFO,
+                "PersistentVectorStore checkpoint pool: parallelism={0} "
+                        + "(system property herddb.vectorindex.checkpointThreads, "
+                        + "default max(1, availableProcessors()/2)={1})",
+                new Object[]{CHECKPOINT_POOL_SIZE, defaultSize});
+        return new ForkJoinPool(
+                CHECKPOINT_POOL_SIZE,
+                pool -> {
+                    ForkJoinWorkerThread t = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
+                    t.setDaemon(true);
+                    t.setName("persistent-vector-store-checkpoint-" + t.getPoolIndex());
+                    return t;
+                },
+                null, false);
+    }
 
     /** Buffer size for in-memory / on-disk staging of index artefacts (1 MB). */
     static final int CHUNK_SIZE = 1_048_576;

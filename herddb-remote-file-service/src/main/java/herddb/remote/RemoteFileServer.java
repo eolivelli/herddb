@@ -33,6 +33,7 @@ import io.grpc.Server;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import io.grpc.netty.shaded.io.netty.channel.nio.NioEventLoopGroup;
 import io.grpc.netty.shaded.io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Path;
@@ -90,6 +91,13 @@ public class RemoteFileServer implements AutoCloseable {
     public static final String CONFIG_READ_EXECUTOR_THREADS = "fileserver.read.executor.threads";
     /** Config key: thread count for the dedicated write-lane executor (issue #100). */
     public static final String CONFIG_WRITE_EXECUTOR_THREADS = "fileserver.write.executor.threads";
+    /** Config key: thread count for the Netty gRPC worker event loop. Defaults to {@code ioThreads}. */
+    public static final String CONFIG_NETTY_WORKER_THREADS = "fileserver.netty.worker.threads";
+    /**
+     * Config key: thread count for the metadata executor (directory ops on local
+     * storage, disk-cache index writer). Defaults to {@code ioThreads}.
+     */
+    public static final String CONFIG_METADATA_EXECUTOR_THREADS = "fileserver.metadata.executor.threads";
 
     private final String host;
     private final int port;
@@ -136,7 +144,9 @@ public class RemoteFileServer implements AutoCloseable {
             t.setDaemon(true);
             return t;
         };
-        metadataExecutor = Executors.newFixedThreadPool(ioThreads, threadFactory);
+        int metadataExecutorThreads = Integer.parseInt(
+                config.getProperty(CONFIG_METADATA_EXECUTOR_THREADS, String.valueOf(ioThreads)));
+        metadataExecutor = Executors.newFixedThreadPool(metadataExecutorThreads, threadFactory);
 
         int readExecutorThreads = Integer.parseInt(
                 config.getProperty(CONFIG_READ_EXECUTOR_THREADS, String.valueOf(ioThreads)));
@@ -164,8 +174,9 @@ public class RemoteFileServer implements AutoCloseable {
             objectStorage = new LocalObjectStorage(dataDirectory, metadataExecutor, statsLogger);
         }
 
-        // Wrap with in-heap block cache if enabled. Sits in front of the inner storage
-        // (local or S3+disk-cache) so hot graph blocks never re-touch disk/S3.
+        // Wrap with the direct-memory block cache if enabled. Sits in front of the
+        // inner storage (local or S3+disk-cache) so hot graph blocks never re-touch
+        // disk/S3. Values are pooled direct ByteBufs — only keys live on heap.
         boolean blockCacheEnabled = Boolean.parseBoolean(
                 config.getProperty(CONFIG_BLOCK_CACHE_ENABLED, "true"));
         InMemoryBlockCacheObjectStorage blockCache = null;
@@ -176,10 +187,10 @@ public class RemoteFileServer implements AutoCloseable {
             blockCache = new InMemoryBlockCacheObjectStorage(objectStorage, blockCacheMaxBytes);
             objectStorage = blockCache;
             LOGGER.log(Level.INFO,
-                    "In-heap block cache enabled: maxBytes={0} ({1} MB)",
+                    "block cache enabled: maxBytes={0} ({1} MB)",
                     new Object[]{blockCacheMaxBytes, blockCacheMaxBytes / (1024 * 1024)});
         } else {
-            LOGGER.log(Level.INFO, "In-heap block cache disabled");
+            LOGGER.log(Level.INFO, "block cache disabled");
         }
         if (blockCache != null) {
             registerBlockCacheGauges(statsLogger, blockCache);
@@ -188,9 +199,16 @@ public class RemoteFileServer implements AutoCloseable {
         int ioRatio = Integer.getInteger("herddb.fileserver.netty.ioRatio", DEFAULT_IO_RATIO);
         this.blockSize = Integer.parseInt(config.getProperty("block.size",
                 String.valueOf(DEFAULT_BLOCK_SIZE)));
+        int nettyWorkerThreads = Integer.parseInt(
+                config.getProperty(CONFIG_NETTY_WORKER_THREADS, String.valueOf(ioThreads)));
         bossGroup = new NioEventLoopGroup(1);
-        workerGroup = new NioEventLoopGroup(ioThreads);
+        workerGroup = new NioEventLoopGroup(nettyWorkerThreads);
         workerGroup.setIoRatio(ioRatio);
+        LOGGER.log(Level.INFO,
+                "RemoteFileServer thread pools: ioThreads(default)={0}, "
+                        + "nettyWorker={1}, metadataExecutor={2}, readExecutor={3}, writeExecutor={4}",
+                new Object[]{ioThreads, nettyWorkerThreads, metadataExecutorThreads,
+                        readExecutorThreads, writeExecutorThreads});
 
         RemoteFileServiceImpl serviceImpl = new RemoteFileServiceImpl(
                 objectStorage, statsLogger, readExecutor, writeExecutor);
@@ -408,14 +426,33 @@ public class RemoteFileServer implements AutoCloseable {
         }
     }
 
-    /** Default in-heap block-cache budget: 1/4 of the JVM max heap. */
+    /**
+     * Default block-cache budget: 1/4 of Netty's max direct memory because the
+     * cache stores pooled direct ByteBufs (see InMemoryBlockCacheObjectStorage).
+     * Falls back to JVM max heap when {@link PlatformDependent#maxDirectMemory()}
+     * is unavailable (returns -1).
+     */
     static long defaultBlockCacheMaxBytes() {
-        long max = Runtime.getRuntime().maxMemory();
-        if (max == Long.MAX_VALUE) {
-            // -Xmx unset: fall back to total memory so we don't allocate everything in sight.
-            max = Runtime.getRuntime().totalMemory();
+        long maxDirect = PlatformDependent.maxDirectMemory();
+        long source;
+        String sourceLabel;
+        if (maxDirect > 0) {
+            source = maxDirect;
+            sourceLabel = "Netty maxDirectMemory";
+        } else {
+            long heap = Runtime.getRuntime().maxMemory();
+            if (heap == Long.MAX_VALUE) {
+                // -Xmx unset: fall back to total memory so we don't allocate everything in sight.
+                heap = Runtime.getRuntime().totalMemory();
+            }
+            source = heap;
+            sourceLabel = "JVM maxMemory (fallback)";
         }
-        return Math.max(1, max / 4);
+        long budget = Math.max(1, source / 4);
+        LOGGER.log(Level.INFO,
+                "block-cache auto-size: {0} bytes ({1} MB) = 1/4 of {2} ({3} bytes)",
+                new Object[]{budget, budget / (1024 * 1024), sourceLabel, source});
+        return budget;
     }
 
     private static void registerBlockCacheGauges(StatsLogger root, InMemoryBlockCacheObjectStorage cache) {

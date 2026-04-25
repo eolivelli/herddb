@@ -113,8 +113,13 @@ public class RemoteFileServerMain {
         int port = Integer.parseInt(configuration.getProperty("port", "9846"));
         String bindHost = configuration.getProperty("bind.host", "0.0.0.0");
         String dataDir = configuration.getProperty("data.dir", "fileserver_" + port);
+        int defaultIoThreads = Runtime.getRuntime().availableProcessors();
         int ioThreads = Integer.parseInt(configuration.getProperty("io.threads",
-                String.valueOf(Runtime.getRuntime().availableProcessors())));
+                String.valueOf(defaultIoThreads)));
+        LOG.info("io.threads=" + ioThreads + " (default availableProcessors()=" + defaultIoThreads
+                + "); fallback for fileserver.netty.worker.threads, "
+                + "fileserver.metadata.executor.threads, fileserver.read.executor.threads, "
+                + "fileserver.write.executor.threads when those are unset");
 
         // Per-port PID file so multiple instances can coexist on the same host
         System.setProperty("pidfile", "file-server-" + port + ".java.pid");

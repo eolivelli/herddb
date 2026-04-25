@@ -119,7 +119,8 @@ public final class IndexingServerConfiguration {
 
     public static final String PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES =
             "indexing.vector.segmentPageCacheMaxBytes";
-    public static final long PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES_DEFAULT = 0; // 0 = compute as 1/4 of heap
+    // 0 = auto-size as 1/4 of Netty maxDirectMemory (heap fallback when unavailable)
+    public static final long PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES_DEFAULT = 0;
 
     // Compaction (checkpoint driver — existing)
     public static final String PROPERTY_COMPACTION_INTERVAL = "indexing.compaction.interval";

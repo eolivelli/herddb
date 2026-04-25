@@ -48,6 +48,7 @@ import herddb.storage.DataStorageManager;
 import herddb.storage.IndexStatus;
 import herddb.utils.Bytes;
 import herddb.utils.XXHash64Utils;
+import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -413,10 +414,23 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES,
                     IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES_DEFAULT);
             // A value of 0 (default) means "auto-size": budget the cache at 1/4 of
-            // the JVM max heap. This matches the documented behaviour of the config
-            // property and the historical SharedSegmentPageCache default.
+            // Netty's max direct memory because the cache stores pooled direct
+            // ByteBufs (see SegmentBlockCache). Falls back to JVM max heap when
+            // PlatformDependent.maxDirectMemory() is unavailable (returns -1).
             if (segmentPageCacheMaxBytes == 0) {
-                segmentPageCacheMaxBytes = Runtime.getRuntime().maxMemory() / 4;
+                long maxDirect = PlatformDependent.maxDirectMemory();
+                long source = maxDirect > 0 ? maxDirect : Runtime.getRuntime().maxMemory();
+                String sourceLabel = maxDirect > 0 ? "Netty maxDirectMemory" : "JVM maxMemory (fallback)";
+                segmentPageCacheMaxBytes = source / 4;
+                LOGGER.log(Level.INFO,
+                        "vector index segmentPageCacheMaxBytes auto-sized to {0} bytes "
+                                + "({1} MB) = 1/4 of {2} ({3} bytes)",
+                        new Object[]{
+                                segmentPageCacheMaxBytes,
+                                segmentPageCacheMaxBytes / (1024 * 1024),
+                                sourceLabel,
+                                source
+                        });
             }
             this.segmentBlockCache = segmentPageCacheMaxBytes > 0
                     ? new SegmentBlockCache(segmentPageCacheMaxBytes)
