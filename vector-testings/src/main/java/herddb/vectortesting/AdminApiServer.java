@@ -42,8 +42,12 @@ import org.eclipse.jetty.servlet.ServletHolder;
  * <ul>
  *   <li>{@code GET /ingestion/config}</li>
  *   <li>{@code POST /ingestion/config/ingest-max-ops}</li>
+ *   <li>{@code GET /ingestion/config/ingest-threads}</li>
+ *   <li>{@code POST /ingestion/config/ingest-threads}</li>
  *   <li>{@code GET /query/config}</li>
  *   <li>{@code POST /query/config/query-max-ops}</li>
+ *   <li>{@code GET /query/config/query-threads}</li>
+ *   <li>{@code POST /query/config/query-threads}</li>
  *   <li>{@code GET /status}</li>
  * </ul>
  */
@@ -128,7 +132,13 @@ public class AdminApiServer {
             String path = pathOf(req);
             switch (path) {
                 case "/ingestion/config" -> writeJson(resp, HttpServletResponse.SC_OK, ingestionConfig());
+                case "/ingestion/config/ingest-threads" ->
+                        writeJson(resp, HttpServletResponse.SC_OK,
+                                Map.of("ingest-threads", runtime.config().ingestThreads));
                 case "/query/config" -> writeJson(resp, HttpServletResponse.SC_OK, queryConfig());
+                case "/query/config/query-threads" ->
+                        writeJson(resp, HttpServletResponse.SC_OK,
+                                Map.of("query-threads", runtime.config().queryThreads));
                 case "/status" -> writeJson(resp, HttpServletResponse.SC_OK, runtime.getStatusSupplier().get());
                 default -> writeError(resp, HttpServletResponse.SC_NOT_FOUND, "no such endpoint: GET " + path);
             }
@@ -145,9 +155,19 @@ public class AdminApiServer {
                         runtime.setIngestMaxOps(value);
                         writeJson(resp, HttpServletResponse.SC_OK, ingestionConfig());
                     }
+                    case "/ingestion/config/ingest-threads" -> {
+                        int value = readIntValue(req);
+                        runtime.setIngestThreads(value);
+                        writeJson(resp, HttpServletResponse.SC_OK, ingestionConfig());
+                    }
                     case "/query/config/query-max-ops" -> {
                         int value = readIntValue(req);
                         runtime.setQueryMaxOps(value);
+                        writeJson(resp, HttpServletResponse.SC_OK, queryConfig());
+                    }
+                    case "/query/config/query-threads" -> {
+                        int value = readIntValue(req);
+                        runtime.setQueryThreads(value);
                         writeJson(resp, HttpServletResponse.SC_OK, queryConfig());
                     }
                     case "/query/config/top-k" -> {
@@ -162,6 +182,10 @@ public class AdminApiServer {
                 }
             } catch (IllegalArgumentException e) {
                 writeError(resp, HttpServletResponse.SC_BAD_REQUEST, e.getMessage());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                writeError(resp, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
+                        "request interrupted: " + e.getMessage());
             }
         }
 
