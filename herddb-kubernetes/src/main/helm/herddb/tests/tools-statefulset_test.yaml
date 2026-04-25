@@ -59,6 +59,26 @@ tests:
             name: VECTORBENCH_DATASET_DIR
             value: /opt/herddb/vector-datasets
 
+  - it: should set VECTORBENCH_ADMIN_PORT to 8080 by default
+    template: templates/tools-statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: VECTORBENCH_ADMIN_PORT
+            value: "8080"
+
+  - it: should honour a custom tools.adminPort value
+    template: templates/tools-statefulset.yaml
+    set:
+      tools.adminPort: "9090"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: VECTORBENCH_ADMIN_PORT
+            value: "9090"
+
   - it: should mount the tools scripts configmap
     template: templates/tools-statefulset.yaml
     asserts:
