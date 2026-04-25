@@ -660,24 +660,24 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
                             @Override
                             public void onError(Throwable t) {
-                                try {
-                                    if (result != null) {
-                                        result.release();
-                                        result = null;
-                                    }
-                                    future.completeExceptionally(t);
-                                } finally {
-                                    releaseOnce.run();
+                                if (result != null) {
+                                    result.release();
+                                    result = null;
                                 }
+                                // Release permits before completing the future so that any thread
+                                // unblocked by future.completeExceptionally() observes the
+                                // restored budget immediately (issue #268).
+                                releaseOnce.run();
+                                future.completeExceptionally(t);
                             }
 
                             @Override
                             public void onCompleted() {
-                                try {
-                                    future.complete(result);
-                                } finally {
-                                    releaseOnce.run();
-                                }
+                                // Release permits before completing the future so that any thread
+                                // unblocked by future.complete() observes the restored budget
+                                // immediately (issue #268).
+                                releaseOnce.run();
+                                future.complete(result);
                             }
                         });
             } catch (RuntimeException e) {
@@ -1031,30 +1031,33 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
                             @Override
                             public void onError(Throwable t) {
-                                try {
-                                    if (result != null) {
-                                        ReferenceCountUtil.safeRelease(result);
-                                        result = null;
-                                    }
-                                    future.completeExceptionally(t);
-                                } finally {
-                                    releaseOnce.run();
+                                if (result != null) {
+                                    ReferenceCountUtil.safeRelease(result);
+                                    result = null;
                                 }
+                                // Release permits before completing the future so that any thread
+                                // unblocked by future.completeExceptionally() observes the
+                                // restored budget immediately (issue #268).
+                                releaseOnce.run();
+                                future.completeExceptionally(t);
                             }
 
                             @Override
                             public void onCompleted() {
-                                try {
-                                    if (!future.isDone()) {
-                                        future.complete(result);
-                                    } else if (result != null) {
-                                        // Future already failed in onNext — release the buffer we
-                                        // would have returned so it does not leak.
+                                if (future.isDone()) {
+                                    // Future already failed in onNext — release the buffer we
+                                    // would have returned so it does not leak.
+                                    if (result != null) {
                                         ReferenceCountUtil.safeRelease(result);
                                         result = null;
                                     }
-                                } finally {
-                                    releaseOnce.run();
+                                }
+                                // Release permits before completing the future so that any thread
+                                // unblocked by future.complete() observes the restored budget
+                                // immediately (issue #268).
+                                releaseOnce.run();
+                                if (!future.isDone()) {
+                                    future.complete(result);
                                 }
                             }
                         });
