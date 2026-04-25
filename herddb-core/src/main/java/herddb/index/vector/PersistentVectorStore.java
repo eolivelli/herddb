@@ -218,6 +218,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     "herddb.vectorindex.segmentMergeBatch", 4));
 
     /**
+     * How many segments may be written between PQ codebook re-trainings for the
+     * same index. After the first training, the codebook is reused for up to
+     * {@code pqCodebookRetrainingInterval - 1} further segment writes. Set to
+     * {@code 0} to disable caching and always retrain (original behaviour).
+     *
+     * <p>Default: 100. Suitable for stationary-distribution workloads (bigann,
+     * sift, gist). Reduce for highly non-stationary datasets. Configurable via
+     * system property {@code herddb.vectorindex.pqCodebookRetrainingInterval}.
+     */
+    public static volatile int pqCodebookRetrainingInterval =
+            Math.max(0, Integer.getInteger(
+                    "herddb.vectorindex.pqCodebookRetrainingInterval", 100));
+
+    /**
      * Parallelism for the JVM-wide checkpoint pool. Configurable via the
      * {@code herddb.vectorindex.checkpointThreads} system property. Default
      * is {@code max(1, availableProcessors() / 2)}.
@@ -409,6 +423,31 @@ public class PersistentVectorStore extends AbstractVectorStore {
     final AtomicLong compactionConsecutiveFailures = new AtomicLong();
     final AtomicLong pendingDeletesReapedTotal = new AtomicLong();
     final AtomicLong pendingDeletesReapFailuresTotal = new AtomicLong();
+
+    // -------------------------------------------------------------------------
+    // PQ codebook cache (issue #281)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Most recently trained PQ codebook for this index. {@code null} until the
+     * first FusedPQ-eligible segment is written. Protected by {@code volatile};
+     * a benign race at the retraining boundary may produce at most one extra
+     * training, which does not affect correctness.
+     */
+    private volatile ProductQuantization cachedPQ;
+
+    /**
+     * Number of FusedPQ segments written since the last PQ codebook training.
+     * Compared against {@link #pqCodebookRetrainingInterval} in
+     * {@link #getOrTrainPQ}.
+     */
+    private final AtomicInteger pqSegmentsSinceTraining = new AtomicInteger(0);
+
+    /**
+     * Total number of PQ codebook trainings performed for this index.
+     * Package-private to allow direct access from same-package tests.
+     */
+    final AtomicInteger pqTrainingsTotal = new AtomicInteger(0);
 
     /** Protects state swaps during checkpoint. */
     private final ReentrantReadWriteLock stateLock = new ReentrantReadWriteLock();
@@ -634,6 +673,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public long getPendingDeletesReapFailuresTotal() {
         return pendingDeletesReapFailuresTotal.get();
+    }
+
+    /** Total PQ codebook trainings for this index (see {@link #pqCodebookRetrainingInterval}). */
+    public int getPqTrainingsTotal() {
+        return pqTrainingsTotal.get();
     }
 
     /** Snapshot of the pendingDeletes list (defensive copy). */
@@ -3121,6 +3165,51 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Returns a PQ codebook to use for encoding a FusedPQ segment.
+     *
+     * <p>When {@link #pqCodebookRetrainingInterval} is {@code > 0} and a
+     * compatible codebook is cached (same dimension, fewer than
+     * {@code pqCodebookRetrainingInterval} segments written since the last
+     * training), the cached codebook is returned immediately. Otherwise a new
+     * codebook is trained via K-Means, stored in {@link #cachedPQ}, the counter
+     * is reset, and the newly trained codebook is returned.
+     *
+     * <p>Concurrent calls from parallel Phase B shard writers are safe: a benign
+     * race at the retraining boundary may trigger one extra training, which does
+     * not affect correctness.
+     *
+     * @param ravv        vectors to train on (only consulted when training is required)
+     * @param pqSubspaces number of PQ subspaces ({@code M})
+     * @return the PQ codebook to use; always non-null
+     */
+    private ProductQuantization getOrTrainPQ(RandomAccessVectorValues ravv, int pqSubspaces) {
+        int interval = pqCodebookRetrainingInterval;
+        if (interval > 0) {
+            ProductQuantization existing = this.cachedPQ;
+            if (existing != null
+                    && existing.getOriginalDimension() == ravv.dimension()
+                    && pqSegmentsSinceTraining.get() < interval) {
+                pqSegmentsSinceTraining.incrementAndGet();
+                LOGGER.log(Level.FINE,
+                        "checkpoint {0}: reusing cached PQ codebook "
+                                + "(segments since training: {1}/{2})",
+                        new Object[]{indexName, pqSegmentsSinceTraining.get(), interval});
+                return existing;
+            }
+        }
+        LOGGER.log(Level.INFO,
+                "checkpoint {0}: training PQ codebook "
+                        + "(training #{1}, segments since last: {2})",
+                new Object[]{indexName, pqTrainingsTotal.get() + 1,
+                        pqSegmentsSinceTraining.get()});
+        ProductQuantization pq = ProductQuantization.compute(ravv, pqSubspaces, 256, true);
+        pqTrainingsTotal.incrementAndGet();
+        this.cachedPQ = pq;
+        pqSegmentsSinceTraining.set(1);
+        return pq;
+    }
+
+    /**
      * Serializes a single live shard's already-built OnHeapGraphIndex to FusedPQ format.
      * The shard's builder must already have been cleaned up (shard.builder.cleanup() called).
      *
@@ -3152,13 +3241,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // Get the shard's already-built OnHeapGraphIndex (no rebuild!)
             OnHeapGraphIndex shardGraph = (OnHeapGraphIndex) shard.builder.getGraph();
 
-            // Compute PQ over just this shard's vectors (50K vs 900K pooled = 18× fewer elements)
+            // Determine whether FusedPQ is used for this shard.
+            // Small shards (< MIN_VECTORS_FOR_FUSED_PQ) do not write the FusedPQ
+            // feature, so PQ training is skipped entirely for them (it was
+            // computed but unused in the original code — issue #281).
             int pqSubspaces = Math.max(1, snapshotDimension / 4);
             boolean useFusedPQForShard = shardSize >= MIN_VECTORS_FOR_FUSED_PQ;
-            int pqClusters = useFusedPQForShard ? 256 : Math.min(256, shardSize);
-            ProductQuantization pq = ProductQuantization.compute(
-                    shardView, pqSubspaces, pqClusters, true);
-            PQVectors pqv = pq.encodeAll(shardView, PhysicalCoreExecutor.pool());
+            // For FusedPQ-eligible shards, reuse the cached codebook when possible
+            // instead of re-running K-Means from scratch (issue #281).
+            ProductQuantization pq = useFusedPQForShard
+                    ? getOrTrainPQ(shardView, pqSubspaces) : null;
+            PQVectors pqv = (pq != null) ? pq.encodeAll(shardView, PhysicalCoreExecutor.pool()) : null;
 
             // Write graph + features to temp file, streaming via suppliers
             Path tempFile = Files.createTempFile(
