@@ -19,6 +19,14 @@ implementation → local validation → PR submission → CI monitoring → clea
 
 You write real production code and real tests. You never take shortcuts.
 
+## GitHub repository
+
+**All issues and pull requests for this agent live in `https://github.com/eolivelli/herddb`.**
+Every `gh issue` / `gh pr` invocation must target `eolivelli/herddb` (use
+`--repo eolivelli/herddb` whenever the command supports it). Never read or
+write issues/PRs from any other repository — including upstream forks or
+unrelated mirrors.
+
 ## Input
 
 You accept an issue number `N` (bare integer, e.g. `267`) or a full GitHub
@@ -33,7 +41,7 @@ Run the following in parallel:
 
 ```
 gh auth status
-gh issue view <N> --json number,title,body,labels,comments \
+gh issue view <N> --repo eolivelli/herddb --json number,title,body,labels,comments \
   --jq '{number,title,body,labels: [.labels[].name],comments: [.comments[].body]}'
 git -C /home/eolivelli/dev/herddb fetch origin master --quiet
 ```
@@ -49,6 +57,8 @@ BRANCH=issue-<N>-<SLUG>
 WORKTREE=/home/eolivelli/dev/herddb-issue-<N>
 MAVEN_REPO=/home/eolivelli/dev/repo-issue-<N>
 PRIMARY_REPO=/home/eolivelli/dev/herddb
+JVECTOR_DIR=/home/eolivelli/dev/jvector-issue-<N>
+JVECTOR_REPO=https://github.com/eolivelli/jvector
 ```
 
 Example: issue #267 titled "Flaky test: herddb.server.hammer.MultipleConcurrentUpdatesTest"
@@ -83,6 +93,26 @@ Run in sequence:
    git -C $WORKTREE rev-parse --abbrev-ref HEAD
    ```
    Must print `$BRANCH`. Stop if it doesn't.
+
+5. **Build jvector into the isolated Maven repo.** HerdDB depends on a
+   custom fork of jvector (`https://github.com/eolivelli/jvector`) whose
+   artifacts are not always available on Maven Central, so it must be
+   built and installed locally **before** any HerdDB Maven build, otherwise
+   dependency resolution will fail.
+
+   Stop and report on any failure — do not proceed to Phase B if jvector
+   does not install cleanly.
+
+   ```
+   git clone --depth 1 $JVECTOR_REPO $JVECTOR_DIR
+   mvn -f $JVECTOR_DIR/pom.xml \
+       -Dmaven.repo.local=$MAVEN_REPO \
+       -DskipTests \
+       clean install
+   ```
+
+   If a different branch/tag is required by an issue, check out that ref
+   inside `$JVECTOR_DIR` before running `mvn install`.
 
 ---
 
@@ -287,7 +317,7 @@ the user.
 **Trigger**: user says "clean up", "delete the worktree", or the PR is
 confirmed merged:
 ```
-gh pr view <N> --json state --jq .state
+gh pr view <N> --repo eolivelli/herddb --json state --jq .state
 ```
 Returns `"MERGED"`.
 
@@ -296,10 +326,11 @@ Run in sequence:
 git -C $PRIMARY_REPO worktree remove $WORKTREE --force
 git -C $PRIMARY_REPO branch -D $BRANCH
 rm -rf $MAVEN_REPO
+rm -rf $JVECTOR_DIR
 ```
 
 Report:
-> "Cleaned up worktree `$WORKTREE`, branch `$BRANCH`, and Maven repo `$MAVEN_REPO` for issue #<N>."
+> "Cleaned up worktree `$WORKTREE`, branch `$BRANCH`, Maven repo `$MAVEN_REPO`, and jvector clone `$JVECTOR_DIR` for issue #<N>."
 
 Do NOT clean up automatically after merge — always wait for explicit user
 confirmation or request.
@@ -328,3 +359,8 @@ confirmation or request.
   (or a confirmed merged PR state).
 - **One PR per issue.** If a worktree / branch for this issue already exists,
   report it and stop rather than creating a second one.
+- **Always target `eolivelli/herddb`** for every `gh issue` / `gh pr`
+  command (`--repo eolivelli/herddb`). Never operate on a different repo.
+- **Build jvector first.** The `eolivelli/jvector` fork must be cloned and
+  `mvn install`'d into `$MAVEN_REPO` during Phase A; HerdDB builds will
+  fail to resolve dependencies otherwise.
