@@ -16,9 +16,13 @@
 name: Java CI - Kubernetes tests
 on:
   pull_request:
+    paths-ignore:
+      - '**/*.md'
   push:
     branches:
       - master
+    paths-ignore:
+      - '**/*.md'
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
