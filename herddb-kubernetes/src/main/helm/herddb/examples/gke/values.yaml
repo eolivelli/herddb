@@ -288,7 +288,7 @@ indexingService:
   # mitigate issue #122 lock contention without compounding arena growth.
   # tailbatchsize=1000 caps the BK read batch per followTheLeader() call in the IS
   # tailer, cutting retained working set by 10× vs. the 10000 default (issue #180).
-  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=10737418240 -XX:MaxDirectMemorySize=10g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=1000"
+  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=10737418240 -XX:MaxDirectMemorySize=10g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=10000"
   storage:
     data:
       size: 20Gi
@@ -340,6 +340,8 @@ indexingService:
   resources:
     # Bumped from 32 Gi to 36 Gi alongside the -XX:MaxDirectMemorySize 6 g → 10 g bump
     # in issue #246. Budget: 24 g heap + 10 g direct + 1 g JVM overhead = 35 g.
+    # 2 replicas × 16 CPUs: each IS handles 4 of the 8 index shards (~250 M vectors/IS
+    # for the bigann 500 M longevity run).
     requests:
       memory: "36Gi"
       cpu: "16"
