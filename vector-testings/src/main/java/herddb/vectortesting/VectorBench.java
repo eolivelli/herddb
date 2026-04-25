@@ -34,10 +34,13 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 public class VectorBench {
 
@@ -250,12 +253,27 @@ public class VectorBench {
             // swaps the limiter inside BenchRuntime; workers re-read the
             // supplier per batch so the swap takes effect on the next acquire.
 
-            ExecutorService ingestPool = Executors.newFixedThreadPool(config.ingestThreads);
+            // Use a growable pool so POST /ingestion/config/ingest-threads can
+            // spawn additional workers at runtime. SynchronousQueue ensures each
+            // submitted task gets its own thread immediately (no hidden queuing
+            // that would delay new workers). The upper bound of MAX_INGEST_THREADS
+            // prevents runaway thread creation from a misconfigured admin call.
+            ExecutorService ingestPool = new ThreadPoolExecutor(
+                    config.ingestThreads, BenchRuntime.MAX_INGEST_THREADS,
+                    60L, TimeUnit.SECONDS, new SynchronousQueue<>());
+
+            // Factory captures all shared state so setIngestThreads can spawn
+            // additional workers with the same queue and accumulators.
+            Supplier<Runnable> ingestWorkerFactory = () -> new IngestionWorker(
+                    config, ingestQueue, producerDone, rowId,
+                    ingestMetrics, ingestStatus, ingestStart, commitsTotal, commitsRecovered, rowsCommitted,
+                    runtime::ingestRateLimiter, runtime);
+
+            runtime.setIngestContext(ingestQueue, ingestPool, ingestWorkerFactory);
+
             List<Future<?>> ingestFutures = new ArrayList<>(config.ingestThreads);
             for (int t = 0; t < config.ingestThreads; t++) {
-                ingestFutures.add(ingestPool.submit(new IngestionWorker(config, ingestQueue, producerDone, rowId,
-                        ingestMetrics, ingestStatus, ingestStart, commitsTotal, commitsRecovered, rowsCommitted,
-                        runtime::ingestRateLimiter)));
+                ingestFutures.add(ingestPool.submit(ingestWorkerFactory.get()));
             }
 
             // Feed the admin /status endpoint with a live snapshot of ingestion progress.
@@ -372,11 +390,16 @@ public class VectorBench {
                 }
             }
             producerDone.set(true);
-            for (int t = 0; t < config.ingestThreads; t++) {
+            // Inject one poison pill per live worker. Reading activeIngestWorkers
+            // here (rather than config.ingestThreads) accounts for any thread-count
+            // change made via POST /ingestion/config/ingest-threads during the run.
+            int liveWorkers = runtime.activeIngestWorkers.get();
+            for (int t = 0; t < liveWorkers; t++) {
                 ingestQueue.put(new float[0]); // poison pills
             }
             ingestPool.shutdown();
             ingestPool.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+            runtime.clearIngestContext();
 
             // awaitTermination ignores task-level exceptions, so a worker that died
             // mid-flush leaves its partial batch silently uncommitted unless we

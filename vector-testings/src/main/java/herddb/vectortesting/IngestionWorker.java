@@ -65,6 +65,14 @@ public class IngestionWorker implements Runnable {
      * limiting" (test-only path).
      */
     private final Supplier<RateLimiter> ingestRateLimiter;
+    /**
+     * Optional runtime reference for tracking the live worker count.
+     * When non-null, {@link BenchRuntime#activeIngestWorkers} is incremented
+     * at worker start and decremented at worker exit (in a {@code finally}
+     * block). May be {@code null} in unit tests that construct the worker
+     * directly without a full {@link BenchRuntime}.
+     */
+    private final BenchRuntime runtime;
 
     /**
      * Base of the exponential back-off between commit retries, in milliseconds.
@@ -73,10 +81,27 @@ public class IngestionWorker implements Runnable {
      */
     long backoffBaseMillis = 10_000L;
 
+    /**
+     * Constructs an {@code IngestionWorker} without a {@link BenchRuntime} reference.
+     * Used in unit tests that do not need live thread-count tracking.
+     */
     public IngestionWorker(Config config, BlockingQueue<float[]> queue, AtomicBoolean done, AtomicLong rowId,
                            MetricsCollector metrics, AtomicReference<String> statusLine, long ingestStartNanos,
                            AtomicLong commitsTotal, AtomicLong commitsRecovered, AtomicLong rowsCommitted,
                            Supplier<RateLimiter> ingestRateLimiter) {
+        this(config, queue, done, rowId, metrics, statusLine, ingestStartNanos,
+                commitsTotal, commitsRecovered, rowsCommitted, ingestRateLimiter, null);
+    }
+
+    /**
+     * Constructs an {@code IngestionWorker} with an optional {@link BenchRuntime}
+     * for live thread-count tracking. Pass {@code null} for {@code runtime} when
+     * constructing workers in unit tests that do not need this feature.
+     */
+    public IngestionWorker(Config config, BlockingQueue<float[]> queue, AtomicBoolean done, AtomicLong rowId,
+                           MetricsCollector metrics, AtomicReference<String> statusLine, long ingestStartNanos,
+                           AtomicLong commitsTotal, AtomicLong commitsRecovered, AtomicLong rowsCommitted,
+                           Supplier<RateLimiter> ingestRateLimiter, BenchRuntime runtime) {
         this.config = config;
         this.queue = queue;
         this.done = done;
@@ -88,6 +113,7 @@ public class IngestionWorker implements Runnable {
         this.commitsRecovered = commitsRecovered;
         this.rowsCommitted = rowsCommitted;
         this.ingestRateLimiter = ingestRateLimiter;
+        this.runtime = runtime;
     }
 
     private static String formatEta(double seconds) {
@@ -264,6 +290,9 @@ public class IngestionWorker implements Runnable {
 
     @Override
     public void run() {
+        if (runtime != null) {
+            runtime.activeIngestWorkers.incrementAndGet();
+        }
         String sql = "INSERT INTO " + config.tableName + "(id, vec) VALUES(?, ?)";
         try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password)) {
             conn.setAutoCommit(false);
@@ -352,6 +381,10 @@ public class IngestionWorker implements Runnable {
             // Propagate: awaitTermination ignores task exceptions, so swallowing here
             // would silently drop the uncommitted pendingBatch.
             throw new RuntimeException("Ingestion worker failed", e);
+        } finally {
+            if (runtime != null) {
+                runtime.activeIngestWorkers.decrementAndGet();
+            }
         }
     }
 }
