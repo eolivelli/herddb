@@ -470,6 +470,7 @@ public class Config {
                 + (similarity != null ? " (override)" : " (dataset default)")
                 + (resumeFrom > 0 ? ", resumeFrom=" + resumeFrom : "")
                 + ", ingestMaxOpsPerSecond=" + (ingestMaxOpsPerSecond > 0 ? ingestMaxOpsPerSecond : "unlimited")
+                + ", queryMaxOpsPerSecond=" + (queryMaxOpsPerSecond > 0 ? queryMaxOpsPerSecond : "unlimited")
                 + ", ingestCommitRetries=" + ingestCommitRetries
                 + ", indexBeforeIngest=" + indexBeforeIngest
                 + ", skipIngest=" + skipIngest

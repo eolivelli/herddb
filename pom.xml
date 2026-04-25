@@ -645,6 +645,10 @@
 				<!-- JSON files do not support license comment headers -->
 				<exclude>**/*.json</exclude>
 
+				<!-- Editor swap/session files (e.g. Vim .swp/.swo) have no room for headers -->
+				<exclude>**/*.swp</exclude>
+				<exclude>**/*.swo</exclude>
+
 				<!-- Plain-text word lists (one word per line, no room for headers) -->
 				<exclude>**/src/main/resources/wordlists/*.txt</exclude>
                         </excludes>
