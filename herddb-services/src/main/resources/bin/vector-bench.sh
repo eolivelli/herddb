@@ -54,4 +54,13 @@ if [ -n "$HERDDB_JDBC_URL" ]; then
     fi
 fi
 
-exec $JAVA $JAVA_HEAP -jar "$JAR" "${EXTRA_ARGS[@]}" "$@"
+# Honor VECTORBENCH_ADMIN_PORT env var (set by the Helm chart via tools.adminPort).
+# Passes the port as the vectorbench.admin.port system property so the embedded
+# Jetty admin API binds on the configured port.  Leave unset to use the Java-side
+# default (8080).
+ADMIN_PORT_PROP=""
+if [ -n "$VECTORBENCH_ADMIN_PORT" ]; then
+    ADMIN_PORT_PROP="-Dvectorbench.admin.port=${VECTORBENCH_ADMIN_PORT}"
+fi
+
+exec $JAVA $JAVA_HEAP $ADMIN_PORT_PROP -jar "$JAR" "${EXTRA_ARGS[@]}" "$@"

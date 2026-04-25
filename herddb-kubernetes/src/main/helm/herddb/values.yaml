@@ -232,6 +232,11 @@ tools:
   enabled: true
   # JVM options for the CLI (defaults to lightweight settings)
   javaOpts: ""
+  # Port for the embedded VectorBench admin HTTP API (GET /status,
+  # POST /ingestion/config/ingest-max-ops, etc.).  Passed to the JVM
+  # as -Dvectorbench.admin.port=<N> via VECTORBENCH_ADMIN_PORT env var.
+  # Set to "0" or a negative value to disable the admin API.
+  adminPort: "8080"
   # PodDisruptionBudget — prevents voluntary node evictions (e.g. GKE Autopilot
   # scale-down) from killing the tools pod mid-benchmark. Enabled by default
   # when tools is enabled. Set to false only for short-lived / disposable runs.
