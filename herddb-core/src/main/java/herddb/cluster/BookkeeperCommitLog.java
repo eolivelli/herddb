@@ -172,27 +172,58 @@ public class BookkeeperCommitLog extends CommitLog {
                 if (closed) {
                     throw new LogNotAvailableException("tablespace " + tableSpaceName + " is closed or closing");
                 }
+                // Bound each attempt to the remaining budget (min 1 s, max 30 s) so the
+                // future cannot block the calling thread indefinitely. FutureUtils.result()
+                // has no built-in timeout; a hung BK cluster would stall recovery forever.
+                // On timeout we treat the attempt like BKNotEnoughBookiesException and retry
+                // within the bookkeeperClusterReadyWaitTime window.
+                long remaining = maxTime - System.currentTimeMillis();
+                long attemptMs = Math.max(1_000L, Math.min(30_000L, remaining));
+                CompletableFuture<WriteHandle> createFuture = bookKeeper
+                        .newCreateLedgerOp()
+                        .withEnsembleSize(actualEnsembleSize)
+                        .withWriteQuorumSize(actualWriteQuorumSize)
+                        .withAckQuorumSize(actualAckQuorumSize)
+                        .withDigestType(DigestType.CRC32C)
+                        .withPassword(SHARED_SECRET.getBytes(StandardCharsets.UTF_8))
+                        .withCustomMetadata(metadata)
+                        .execute();
                 try {
-                    return FutureUtils.result(bookKeeper.
-                            newCreateLedgerOp()
-                            .withEnsembleSize(actualEnsembleSize)
-                            .withWriteQuorumSize(actualWriteQuorumSize)
-                            .withAckQuorumSize(actualAckQuorumSize)
-                            .withDigestType(DigestType.CRC32C)
-                            .withPassword(SHARED_SECRET.getBytes(StandardCharsets.UTF_8))
-                            .withCustomMetadata(metadata)
-                            .execute(), BKException.HANDLER);
-                } catch (BKNotEnoughBookiesException clusterNotReady) {
-                    lastError = clusterNotReady;
+                    return createFuture.get(attemptMs, TimeUnit.MILLISECONDS);
+                } catch (TimeoutException te) {
+                    createFuture.cancel(false);
                     // no stacktrace, it is only noise
-                    LOGGER.log(Level.INFO, "{0} BK cluster not ready (BKNotEnoughBookiesException) while creating a ledger (" + actualEnsembleSize + "/" + actualWriteQuorumSize + "/" + actualAckQuorumSize + ")",
-                            new Object[]{tableSpaceDescription()});
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException ex) {
-                        Thread.currentThread().interrupt();
-                        throw new LogNotAvailableException(ex);
+                    LOGGER.log(Level.INFO,
+                            "{0} timed out after {1} ms creating a ledger (" + actualEnsembleSize + "/"
+                                    + actualWriteQuorumSize + "/" + actualAckQuorumSize + "), will retry",
+                            new Object[]{tableSpaceDescription(), attemptMs});
+                    lastError = new BKNotEnoughBookiesException();
+                    // The timeout itself already served as the wait; skip the extra sleep
+                    // and jump directly to the while-condition check.
+                    continue;
+                } catch (ExecutionException ee) {
+                    Throwable cause = ee.getCause();
+                    if (cause instanceof BKNotEnoughBookiesException) {
+                        lastError = (BKNotEnoughBookiesException) cause;
+                        // no stacktrace, it is only noise
+                        LOGGER.log(Level.INFO,
+                                "{0} BK cluster not ready (BKNotEnoughBookiesException) while creating a ledger ("
+                                        + actualEnsembleSize + "/" + actualWriteQuorumSize + "/" + actualAckQuorumSize + ")",
+                                new Object[]{tableSpaceDescription()});
+                    } else if (cause instanceof BKException) {
+                        throw (BKException) cause;
+                    } else {
+                        throw new LogNotAvailableException(cause != null ? cause : ee);
                     }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new LogNotAvailableException(ie);
+                }
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    throw new LogNotAvailableException(ex);
                 }
             }
             if (lastError == null) {
@@ -887,14 +918,30 @@ public class BookkeeperCommitLog extends CommitLog {
 
     private void closeCurrentWriter(boolean waitForPendingAdds) throws LogNotAvailableException {
         if (writer != null) {
+            // Capture the write-error flag before nulling the writer reference so
+            // we can decide below whether a close failure is fatal or ignorable.
+            boolean hadWriteError = writer.errorOccurredDuringWrite;
             try {
                 if (waitForPendingAdds) {
                     writer.waitForAllPendingWrites();
                 }
                 writer.close();
             } catch (LogNotAvailableException err) {
-                signalLogFailed();
-                throw err;
+                if (hadWriteError) {
+                    // The ledger already had write errors (e.g. addEntryTimeoutSec fired
+                    // while the bookie was paused).  The BK client may have internally
+                    // sealed/closed the write handle as part of its timeout handling, so
+                    // out.closeAsync() fails immediately.  This is harmless: the ledger is
+                    // effectively sealed and no new entries are being written to it
+                    // (errorOccurredDuringWrite=true keeps isWritable()==false).  Log the
+                    // error and let openNewLedger() proceed to create a fresh, healthy ledger.
+                    LOGGER.log(Level.INFO,
+                            "{0} ignoring error closing an already-errored ledger (will open a new one): {1}",
+                            new Object[]{tableSpaceDescription(), err.toString()});
+                } else {
+                    signalLogFailed();
+                    throw err;
+                }
             } finally {
                 writer = null;
             }
