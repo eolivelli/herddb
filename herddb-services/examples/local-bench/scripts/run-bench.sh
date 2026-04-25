@@ -65,6 +65,13 @@ echo ""
 # Default to a modest VectorBench heap but let callers override via env.
 export VECTORBENCH_HEAP="${VECTORBENCH_HEAP:--Xms1g -Xmx2g}"
 
+# Point dataset cache at $HERDDB_TESTS_HOME so re-runs skip the FTP download.
+# The vector-bench jar also honours $VECTORBENCH_DATASET_DIR; prefer whatever
+# the caller already set, falling back to $HERDDB_TESTS_HOME when available.
+if [[ -z "${VECTORBENCH_DATASET_DIR:-}" && -n "${HERDDB_TESTS_HOME:-}" ]]; then
+    export VECTORBENCH_DATASET_DIR="$HERDDB_TESTS_HOME"
+fi
+
 set +e
 "$CLUSTER_DIR/bin/vector-bench.sh" --no-progress "$@" 2>&1 | tee -a "$RUN_LOG"
 status=${PIPESTATUS[0]}
