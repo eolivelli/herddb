@@ -127,6 +127,17 @@ public class MultipleConcurrentUpdatesTest {
             server.start();
             server.waitForStandaloneBoot();
             ClientConfiguration clientConfiguration = new ClientConfiguration(folder.newFolder().toPath());
+            /*
+             * Set the client request timeout to 600 s — twice the server-side
+             * CHECKPOINT_LOCK_READ_TIMEOUT (300 s). Phase C of a checkpoint holds the
+             * checkpoint write lock while doing disk I/O (keyToPage.checkpoint +
+             * tableCheckpoint). On a loaded CI runner this can approach 300 s, causing
+             * the default 300 s client timeout to fire before the server's own tryLock
+             * expires, producing a spurious TimeoutException. Setting the client timeout
+             * to CHECKPOINT_LOCK_WRITE_TIMEOUT (600 s) ensures the client never gives up
+             * before the server's read-lock side does. See issue #267.
+             */
+            clientConfiguration.set(ClientConfiguration.PROPERTY_TIMEOUT, 600_000);
             try (HDBClient client = new HDBClient(clientConfiguration);
                  HDBConnection connection = client.openConnection()) {
                 client.setClientSideMetadataProvider(new StaticClientSideMetadataProvider(server));
@@ -216,7 +227,10 @@ public class MultipleConcurrentUpdatesTest {
                         ));
                     }
                     for (Future f : futures) {
-                        f.get();
+                        // 600 s matches the client timeout set above; prevents an infinite
+                        // hang in case a future becomes truly stuck (e.g. thread pool
+                        // exhaustion or undetected deadlock). Mirrors DirectMultipleConcurrentUpdatesSuite.
+                        f.get(600, TimeUnit.SECONDS);
                     }
 
                     System.out.println("stats::updates:" + updates);
