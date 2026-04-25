@@ -233,6 +233,14 @@ public class BookKeeperCommitLogTest {
         final String name = TableSpace.DEFAULT;
         final String nodeid = "nodeid";
         ServerConfiguration serverConfiguration = newServerConfigurationWithAutoPort();
+        // Short per-bookie and quorum write timeouts so the paused-bookie failure is
+        // detected in a few seconds rather than the 30-60 s production defaults.
+        // After resumeBookie() the bookie accepts requests immediately (suspendProcessing
+        // only pauses request handling, leaving the channel intact), so 3 s is plenty
+        // for recovery writes on the new ledger.
+        serverConfiguration.set("bookkeeper.addEntryTimeoutSec", "3");
+        serverConfiguration.set("bookkeeper.addEntryQuorumTimeoutSec", "5");
+        serverConfiguration.set(ServerConfiguration.PROPERTY_BOOKKEEPER_WAIT_CLUSTER_READY_TIMEOUT, 15_000);
         try (ZookeeperMetadataStorageManager man = new ZookeeperMetadataStorageManager(testEnv.getAddress(),
                 testEnv.getTimeout(), testEnv.getPath());
                 BookkeeperCommitLogManager logManager = new BookkeeperCommitLogManager(man, serverConfiguration, NullStatsLogger.INSTANCE)) {
@@ -291,6 +299,11 @@ public class BookKeeperCommitLogTest {
         final String name = TableSpace.DEFAULT;
         final String nodeid = "nodeid";
         ServerConfiguration serverConfiguration = newServerConfigurationWithAutoPort();
+        // Short per-bookie and quorum write timeouts so the paused-bookie failure is
+        // detected in a few seconds rather than the 30-60 s production defaults.
+        serverConfiguration.set("bookkeeper.addEntryTimeoutSec", "3");
+        serverConfiguration.set("bookkeeper.addEntryQuorumTimeoutSec", "5");
+        serverConfiguration.set(ServerConfiguration.PROPERTY_BOOKKEEPER_WAIT_CLUSTER_READY_TIMEOUT, 15_000);
         try (ZookeeperMetadataStorageManager man = new ZookeeperMetadataStorageManager(testEnv.getAddress(),
                 testEnv.getTimeout(), testEnv.getPath());
                 BookkeeperCommitLogManager logManager = new BookkeeperCommitLogManager(man, serverConfiguration, NullStatsLogger.INSTANCE)) {
