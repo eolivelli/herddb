@@ -918,27 +918,33 @@ public class BookkeeperCommitLog extends CommitLog {
 
     private void closeCurrentWriter(boolean waitForPendingAdds) throws LogNotAvailableException {
         if (writer != null) {
-            // Capture the write-error flag before nulling the writer reference so
-            // we can decide below whether a close failure is fatal or ignorable.
+            // Capture error state before nulling the writer reference so we can decide
+            // below whether a close failure is ignorable or fatal.
             boolean hadWriteError = writer.errorOccurredDuringWrite;
+            // Fencing (BKLedgerFencedException) is always fatal: another leader has taken
+            // over the tablespace and this node must stop writing permanently.  We must NOT
+            // ignore a close failure in that case, otherwise openNewLedger() would create a
+            // fresh ledger on the fenced node, causing a split-brain.
+            boolean wasFenced = hadWriteError && containsFencingError(writer.writeError.get());
             try {
                 if (waitForPendingAdds) {
                     writer.waitForAllPendingWrites();
                 }
                 writer.close();
             } catch (LogNotAvailableException err) {
-                if (hadWriteError) {
-                    // The ledger already had write errors (e.g. addEntryTimeoutSec fired
+                if (hadWriteError && !wasFenced) {
+                    // The ledger had transient write errors (e.g. addEntryTimeoutSec fired
                     // while the bookie was paused).  The BK client may have internally
-                    // sealed/closed the write handle as part of its timeout handling, so
-                    // out.closeAsync() fails immediately.  This is harmless: the ledger is
-                    // effectively sealed and no new entries are being written to it
+                    // sealed/closed the write handle as part of its timeout handling, making
+                    // out.closeAsync() fail immediately.  This is harmless: the ledger is
+                    // effectively sealed and no new entries can reach it
                     // (errorOccurredDuringWrite=true keeps isWritable()==false).  Log the
                     // error and let openNewLedger() proceed to create a fresh, healthy ledger.
                     LOGGER.log(Level.INFO,
                             "{0} ignoring error closing an already-errored ledger (will open a new one): {1}",
                             new Object[]{tableSpaceDescription(), err.toString()});
                 } else {
+                    // Fatal condition (fencing) or error on a healthy ledger: propagate.
                     signalLogFailed();
                     throw err;
                 }
@@ -946,6 +952,21 @@ public class BookkeeperCommitLog extends CommitLog {
                 writer = null;
             }
         }
+    }
+
+    /**
+     * Returns {@code true} if {@code t} or any exception in its cause chain is a
+     * {@link BKException.BKLedgerFencedException}.  Fencing means another leader has
+     * taken over the tablespace; this node must not open a new ledger (split-brain).
+     */
+    private static boolean containsFencingError(Throwable t) {
+        while (t != null) {
+            if (t instanceof BKException.BKLedgerFencedException) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
     }
 
     @Override
