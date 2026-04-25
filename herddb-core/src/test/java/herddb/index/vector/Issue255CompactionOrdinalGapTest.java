@@ -109,27 +109,28 @@ public class Issue255CompactionOrdinalGapTest {
             // The reservation size mirrors what real compactions consume on the
             // failing benchmark workload (hundreds of thousands of nodeIds).
             int reservation = 200_000;
-            int reservedStart = store.allocateCompactionNodeIds(reservation);
-            try {
-                // After the fix, the next ingest must land on a fresh shard
-                // whose startNodeId == reservedStart + reservation. Without the
-                // fix it would land on the OLD shard with a 200K-wide gap.
-                for (int i = 0; i < 10; i++) {
-                    store.addVector(Bytes.from_int(1_000_000 + i), vec(rng, dim));
-                }
-
-                // Phase B builds a FusedPQ segment per live shard. Without the
-                // fix the active shard's local ordinal space would be
-                // {0..9, 200000..200009} but PQ would only train on 20 vectors,
-                // so writer.write → FusedPQ.writeInline → pqv.get(200000) →
-                // IndexOutOfBoundsException. With the fix, both shards are
-                // contiguous (sealed: 0..9, fresh: 0..9) so the checkpoint
-                // succeeds.
-                assertTrue("checkpoint must succeed after compaction nodeId reservation",
-                        store.checkpoint());
-            } finally {
-                store.releaseCompactionNodeIds(reservedStart, reservation);
+            long reservedStart = store.allocateCompactionNodeIds(reservation);
+            assertTrue("reservation returns a long nodeId (issue #256)",
+                    reservedStart >= 0L);
+            // After the fix, the next ingest must land on a fresh shard
+            // whose startNodeId == reservedStart + reservation. Without the
+            // fix it would land on the OLD shard with a 200K-wide gap.
+            for (int i = 0; i < 10; i++) {
+                store.addVector(Bytes.from_int(1_000_000 + i), vec(rng, dim));
             }
+
+            // Phase B builds a FusedPQ segment per live shard. Without the
+            // fix the active shard's local ordinal space would be
+            // {0..9, 200000..200009} but PQ would only train on 20 vectors,
+            // so writer.write → FusedPQ.writeInline → pqv.get(200000) →
+            // IndexOutOfBoundsException. With the fix, both shards are
+            // contiguous (sealed: 0..9, fresh: 0..9) so the checkpoint
+            // succeeds.
+            assertTrue("checkpoint must succeed after compaction nodeId reservation",
+                    store.checkpoint());
+            // After issue #256 the synthetic shard owns its own VectorStorage,
+            // so there is no store-side release step — the storage is reclaimed
+            // by the GC when VectorIndexCompactor's local reference goes away.
 
             // All inserted vectors must be searchable.
             int found = 0;

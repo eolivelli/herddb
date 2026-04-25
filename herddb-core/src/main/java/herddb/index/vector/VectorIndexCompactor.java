@@ -70,6 +70,21 @@ final class VectorIndexCompactor {
     private VectorIndexCompactor() {
     }
 
+    /**
+     * Test-only observer invoked once per {@code rebuildSegment} call with
+     * the synthetic {@link PersistentVectorStore.LiveGraphShard} that was
+     * constructed for the compaction output. Tests can install a
+     * {@link java.util.function.Consumer} that stashes the reference into
+     * a {@link java.lang.ref.WeakReference} to prove the shard (and its
+     * per-shard {@link VectorStorage}) is reclaimable after
+     * {@code rebuildSegment} returns (issue #256).
+     *
+     * <p>Must remain {@code null} in production. Reset by tests in a
+     * {@code @After} to avoid leaking an observer across test cases.
+     */
+    static volatile java.util.function.Consumer<PersistentVectorStore.LiveGraphShard>
+            syntheticShardObserverForTest;
+
     /** Reasons a compaction run can fail; carried through to metrics. */
     enum FailureReason {
         READ_IO,
@@ -367,15 +382,20 @@ final class VectorIndexCompactor {
             return null;
         }
 
-        // Reserve a contiguous nodeId range in the shared vectorStorage.
-        int startNodeId = store.allocateCompactionNodeIds(keptCount);
+        // Reserve a contiguous global nodeId range + force a live-shard
+        // rotation (issue #255). The synthetic shard uses its own per-shard
+        // VectorStorage keyed by a local ordinal 0..keptCount (issue #256),
+        // so no coordination with the live shards' storage is needed.
+        long startNodeId = store.allocateCompactionNodeIds(keptCount);
 
-        // Build a synthetic LiveGraphShard anchored at startNodeId.
+        // Build a synthetic LiveGraphShard anchored at startNodeId with its
+        // own isolated VectorStorage of exactly the size we need.
         ConcurrentHashMap<Bytes, Integer> pkToNode = new ConcurrentHashMap<>(keptCount);
         ConcurrentHashMap<Integer, Bytes> nodeToPk = new ConcurrentHashMap<>(keptCount);
+        VectorStorage syntheticStorage = new VectorStorage(keptCount);
         VectorStorageRandomAccessVectorValues ravv =
                 new VectorStorageRandomAccessVectorValues(
-                        store.compactionVectorStorage(), dim, keptCount, startNodeId);
+                        syntheticStorage, dim, keptCount);
         BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(
                 ravv, store.compactionSimilarity());
         GraphIndexBuilder builder = new GraphIndexBuilder(
@@ -392,13 +412,18 @@ final class VectorIndexCompactor {
 
         AtomicInteger localOrdCounter = new AtomicInteger(0);
         PersistentVectorStore.LiveGraphShard synthetic = new PersistentVectorStore.LiveGraphShard(
-                pkToNode, nodeToPk, ravv, builder, startNodeId);
+                pkToNode, nodeToPk, ravv, builder, syntheticStorage, startNodeId);
+        java.util.function.Consumer<PersistentVectorStore.LiveGraphShard> observer =
+                syntheticShardObserverForTest;
+        if (observer != null) {
+            observer.accept(synthetic);
+        }
 
         boolean success = false;
         VectorSegment mergedSegment = null;
         try {
             populateSyntheticShard(store, candidates, authority, synthetic,
-                    localOrdCounter, startNodeId);
+                    localOrdCounter);
 
             // Cleanup the builder (diversifies edges / refines).
             try {
@@ -439,7 +464,9 @@ final class VectorIndexCompactor {
             } catch (IOException e) {
                 LOGGER.log(Level.FINE, "ignoring builder close failure in compaction", e);
             }
-            store.releaseCompactionNodeIds(startNodeId, keptCount);
+            // No store-side release needed: the synthetic shard owns its own
+            // VectorStorage (issue #256), so it is reclaimed by the GC when
+            // this method returns.
             if (!success && mergedSegment != null) {
                 try {
                     mergedSegment.close();
@@ -459,8 +486,7 @@ final class VectorIndexCompactor {
             List<VectorSegment> candidates,
             Map<Bytes, Integer> authority,
             PersistentVectorStore.LiveGraphShard syntheticShard,
-            AtomicInteger localOrdCounter,
-            int startNodeId) throws CompactionException {
+            AtomicInteger localOrdCounter) throws CompactionException {
 
         for (VectorSegment seg : candidates) {
             OnDiskGraphIndex odg = seg.onDiskGraph;
@@ -506,10 +532,11 @@ final class VectorIndexCompactor {
                                 "null vector for authoritative PK in segment " + seg.segmentId);
                     }
                     int localOrd = localOrdCounter.getAndIncrement();
-                    int globalNodeId = startNodeId + localOrd;
-                    store.compactionVectorStorage().set(globalNodeId, vec);
-                    syntheticShard.pkToNode.put(pk, globalNodeId);
-                    syntheticShard.nodeToPk.put(globalNodeId, pk);
+                    // Per-shard storage keyed by local ordinal (issue #256).
+                    // No global nodeId arithmetic leaves this call site.
+                    syntheticShard.vectorStorage.set(localOrd, vec);
+                    syntheticShard.pkToNode.put(pk, localOrd);
+                    syntheticShard.nodeToPk.put(localOrd, pk);
                     syntheticShard.vectorCount.incrementAndGet();
                     try {
                         syntheticShard.builder.addGraphNode(localOrd, vec);
