@@ -54,6 +54,7 @@ public class ApplicationConfigV2 extends ResourceConfig {
         register(HealthResource.class);
         register(TablespacesResource.class);
         register(ServerInfoResource.class);
+        register(TablesResource.class);
         register(new ServerLocatorBinder());
     }
 

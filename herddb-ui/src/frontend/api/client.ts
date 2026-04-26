@@ -44,6 +44,57 @@ export interface TablespaceDTO {
     maxLeaderInactivityTime: number;
 }
 
+export interface TableSummaryDTO {
+    tablespace: string;
+    name: string;
+    uuid: string;
+    systemTable: boolean;
+    tableSize: number;
+    loadedPages: number;
+    loadedPagesCount: number;
+    unloadedPagesCount: number;
+    dirtyPages: number;
+    dirtyRecords: number;
+    maxLogicalPageSize: number;
+    keysMemory: number;
+    buffersMemory: number;
+    dirtyMemory: number;
+}
+
+export interface ColumnDTO {
+    name: string;
+    ordinalPosition: number;
+    nullable: boolean;
+    dataType: string;
+    typeName: string;
+    autoIncrement: boolean;
+    defaultValue: string | null;
+}
+
+export interface IndexSummaryDTO {
+    name: string;
+    uuid: string;
+    type: string;
+    unique: boolean;
+    columns: string[];
+}
+
+export interface ForeignKeyDTO {
+    name: string;
+    parentTable: string;
+    childColumns: string[];
+    parentColumns: string[];
+    onDeleteAction: string | null;
+    onUpdateAction: string | null;
+}
+
+export interface TableDetailDTO {
+    summary: TableSummaryDTO;
+    columns: ColumnDTO[];
+    indexes: IndexSummaryDTO[];
+    foreignKeys: ForeignKeyDTO[];
+}
+
 /**
  * Builds a fully qualified URL for the v2 REST API. In production the
  * SPA is served at `/ui/` so `apiUrl('/health')` resolves to
@@ -85,5 +136,15 @@ export const HerdDbApi = {
     },
     getTablespace(name: string): Promise<TablespaceDTO> {
         return request<TablespaceDTO>(`/tablespaces/${encodeURIComponent(name)}`);
+    },
+    listTables(tablespace: string): Promise<TableSummaryDTO[]> {
+        return request<TableSummaryDTO[]>(
+            `/tablespaces/${encodeURIComponent(tablespace)}/tables`,
+        );
+    },
+    getTable(tablespace: string, name: string): Promise<TableDetailDTO> {
+        return request<TableDetailDTO>(
+            `/tablespaces/${encodeURIComponent(tablespace)}/tables/${encodeURIComponent(name)}`,
+        );
     },
 };

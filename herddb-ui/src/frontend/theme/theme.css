@@ -187,6 +187,41 @@ body {
     background: rgba(56, 189, 248, 0.04);
 }
 
+.herd-table a {
+    color: var(--herd-accent);
+    text-decoration: none;
+}
+
+.herd-table a:hover {
+    text-decoration: underline;
+}
+
+.herd-table code {
+    font-family: var(--herd-mono);
+    font-size: 0.85em;
+    color: var(--herd-text);
+}
+
+.herd-badge {
+    display: inline-block;
+    margin-left: 0.5rem;
+    padding: 0 0.35rem;
+    border-radius: 0.2rem;
+    background: rgba(148, 163, 184, 0.15);
+    color: var(--herd-muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.herd-page h2 {
+    margin-top: 1.75rem;
+    font-size: 1.1rem;
+    color: var(--herd-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
 .herd-footer {
     padding: 0.75rem 1.25rem;
     color: var(--herd-muted);

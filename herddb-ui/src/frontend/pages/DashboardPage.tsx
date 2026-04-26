@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { Link } from 'react-router-dom';
 import { useTablespaces } from '../contexts/TablespaceContext';
 
 export function DashboardPage() {
@@ -34,6 +35,12 @@ export function DashboardPage() {
                 <>
                     <p>
                         Selected tablespace: <strong>{selected}</strong>
+                        {' · '}
+                        <Link
+                            to={`/tablespaces/${encodeURIComponent(selected)}/tables`}
+                        >
+                            Browse tables
+                        </Link>
                     </p>
                     <p>
                         {tablespaces.length} tablespace
@@ -41,10 +48,6 @@ export function DashboardPage() {
                     </p>
                 </>
             )}
-            <p className="herd-page__hint">
-                Tables, indexes, and indexing-service views are coming in
-                later phases.
-            </p>
         </section>
     );
 }

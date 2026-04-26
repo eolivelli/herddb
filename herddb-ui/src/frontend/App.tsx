@@ -16,11 +16,13 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { Route, Routes } from 'react-router-dom';
+import { Navigate, Route, Routes } from 'react-router-dom';
 import { Header } from './components/Header';
 import { TablespaceProvider } from './contexts/TablespaceContext';
 import { DashboardPage } from './pages/DashboardPage';
 import { PlaceholderPage } from './pages/PlaceholderPage';
+import { TableDetailPage } from './pages/TableDetailPage';
+import { TablesPage } from './pages/TablesPage';
 import { TablespacesPage } from './pages/TablespacesPage';
 
 export default function App() {
@@ -32,13 +34,12 @@ export default function App() {
                     <Route path="/" element={<DashboardPage />} />
                     <Route path="/tablespaces" element={<TablespacesPage />} />
                     <Route
-                        path="/tablespaces/:name"
-                        element={
-                            <PlaceholderPage
-                                title="Tablespace detail"
-                                phase="phase 3 (tables view)"
-                            />
-                        }
+                        path="/tablespaces/:tablespace/tables"
+                        element={<TablesPage />}
+                    />
+                    <Route
+                        path="/tablespaces/:tablespace/tables/:name"
+                        element={<TableDetailPage />}
                     />
                     <Route
                         path="/indexing-services"
@@ -51,17 +52,12 @@ export default function App() {
                     />
                     <Route
                         path="*"
-                        element={
-                            <PlaceholderPage
-                                title="Not found"
-                                phase="—"
-                            />
-                        }
+                        element={<Navigate to="/" replace />}
                     />
                 </Routes>
             </main>
             <footer className="herd-footer">
-                HerdDB Web UI · v2 phase 2 skeleton
+                HerdDB Web UI · v2
             </footer>
         </TablespaceProvider>
     );
