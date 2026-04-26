@@ -113,6 +113,7 @@ public class HealthResourceHttpSmokeTest extends JerseyTest {
         resourceConfig.register(TablespacesResource.class);
         resourceConfig.register(ServerInfoResource.class);
         resourceConfig.register(TablesResource.class);
+        resourceConfig.register(IndexesResource.class);
         resourceConfig.register(new AbstractBinder() {
             @Override
             protected void configure() {

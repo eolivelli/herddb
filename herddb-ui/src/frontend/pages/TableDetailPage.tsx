@@ -137,6 +137,21 @@ export function TableDetailPage({
                         </tbody>
                     </table>
 
+                    <h2>Layout</h2>
+                    <p>
+                        <Link
+                            to={`/tablespaces/${encodeURIComponent(tablespace)}/tables/${encodeURIComponent(name)}/data-pages`}
+                        >
+                            Data pages
+                        </Link>
+                        {' · '}
+                        <Link
+                            to={`/tablespaces/${encodeURIComponent(tablespace)}/tables/${encodeURIComponent(name)}/primary-index`}
+                        >
+                            Primary index
+                        </Link>
+                    </p>
+
                     <h2>Indexes</h2>
                     {data.indexes.length === 0 ? (
                         <p className="herd-page__hint">No indexes.</p>
@@ -154,7 +169,11 @@ export function TableDetailPage({
                                 {data.indexes.map((idx) => (
                                     <tr key={idx.uuid}>
                                         <td>
-                                            <code>{idx.name}</code>
+                                            <Link
+                                                to={`/tablespaces/${encodeURIComponent(tablespace)}/tables/${encodeURIComponent(name)}/indexes/${encodeURIComponent(idx.name)}`}
+                                            >
+                                                <code>{idx.name}</code>
+                                            </Link>
                                         </td>
                                         <td>{idx.type}</td>
                                         <td>{idx.unique ? 'yes' : 'no'}</td>

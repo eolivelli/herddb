@@ -318,6 +318,50 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
         return getTree().getUsedMemory();
     }
 
+    /**
+     * Read-only snapshot of the primary key index tree, used by the Web UI
+     * v2 backend to render a "primary index" summary panel.
+     *
+     * <p>The snapshot does not force a checkpoint: it only reports the
+     * counters already maintained by the in-memory tree (number of keys,
+     * number of nodes currently in memory and total memory occupancy).
+     */
+    public PrimaryIndexSnapshot snapshotInfo() {
+        BLink<Bytes, Long> tree = getTree();
+        return new PrimaryIndexSnapshot(
+                tree.size(),
+                tree.nodes(),
+                tree.getUsedMemory());
+    }
+
+    /**
+     * Immutable view returned by {@link #snapshotInfo()}.
+     */
+    public static final class PrimaryIndexSnapshot {
+
+        private final long entries;
+        private final int loadedNodes;
+        private final long usedMemoryBytes;
+
+        public PrimaryIndexSnapshot(long entries, int loadedNodes, long usedMemoryBytes) {
+            this.entries = entries;
+            this.loadedNodes = loadedNodes;
+            this.usedMemoryBytes = usedMemoryBytes;
+        }
+
+        public long getEntries() {
+            return entries;
+        }
+
+        public int getLoadedNodes() {
+            return loadedNodes;
+        }
+
+        public long getUsedMemoryBytes() {
+            return usedMemoryBytes;
+        }
+    }
+
     @Override
     public boolean requireLoadAtStartup() {
         return false;

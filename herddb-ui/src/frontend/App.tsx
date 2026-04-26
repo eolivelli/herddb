@@ -20,7 +20,10 @@ import { Navigate, Route, Routes } from 'react-router-dom';
 import { Header } from './components/Header';
 import { TablespaceProvider } from './contexts/TablespaceContext';
 import { DashboardPage } from './pages/DashboardPage';
+import { DataPagesPage } from './pages/DataPagesPage';
+import { IndexDetailPage } from './pages/IndexDetailPage';
 import { PlaceholderPage } from './pages/PlaceholderPage';
+import { PrimaryIndexPage } from './pages/PrimaryIndexPage';
 import { TableDetailPage } from './pages/TableDetailPage';
 import { TablesPage } from './pages/TablesPage';
 import { TablespacesPage } from './pages/TablespacesPage';
@@ -40,6 +43,18 @@ export default function App() {
                     <Route
                         path="/tablespaces/:tablespace/tables/:name"
                         element={<TableDetailPage />}
+                    />
+                    <Route
+                        path="/tablespaces/:tablespace/tables/:name/data-pages"
+                        element={<DataPagesPage />}
+                    />
+                    <Route
+                        path="/tablespaces/:tablespace/tables/:name/primary-index"
+                        element={<PrimaryIndexPage />}
+                    />
+                    <Route
+                        path="/tablespaces/:tablespace/tables/:name/indexes/:index"
+                        element={<IndexDetailPage />}
                     />
                     <Route
                         path="/indexing-services"

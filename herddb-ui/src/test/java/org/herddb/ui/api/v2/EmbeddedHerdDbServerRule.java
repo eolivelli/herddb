@@ -38,8 +38,27 @@ import org.junit.rules.TemporaryFolder;
 public final class EmbeddedHerdDbServerRule extends ExternalResource {
 
     private final TemporaryFolder tempFolder = new TemporaryFolder();
+    private final String mode;
     private Path baseDir;
     private Server server;
+
+    /**
+     * Default flavour: starts the server in {@code local} mode (no
+     * network listener, in-memory storage). Suitable for tests that only
+     * exercise the SQL surface of the v2 REST endpoints.
+     */
+    public EmbeddedHerdDbServerRule() {
+        this(ServerConfiguration.PROPERTY_MODE_LOCAL);
+    }
+
+    /**
+     * Explicit-mode constructor. Pass
+     * {@link ServerConfiguration#PROPERTY_MODE_STANDALONE} when the test
+     * needs the file-backed storage (and therefore the B-Link PK index).
+     */
+    public EmbeddedHerdDbServerRule(String mode) {
+        this.mode = mode;
+    }
 
     @Override
     protected void before() throws Throwable {
@@ -50,8 +69,7 @@ public final class EmbeddedHerdDbServerRule extends ExternalResource {
         ServerConfiguration config = new ServerConfiguration(baseDir)
                 .set(ServerConfiguration.PROPERTY_PORT,
                         ServerConfiguration.PROPERTY_PORT_AUTODISCOVERY)
-                .set(ServerConfiguration.PROPERTY_MODE,
-                        ServerConfiguration.PROPERTY_MODE_LOCAL);
+                .set(ServerConfiguration.PROPERTY_MODE, mode);
 
         server = new Server(config);
         server.start();

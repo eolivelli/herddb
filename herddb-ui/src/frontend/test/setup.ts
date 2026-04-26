@@ -17,3 +17,23 @@
  * under the License.
  */
 import '@testing-library/jest-dom/vitest';
+
+// jsdom does not implement ResizeObserver, which @visx/responsive's
+// ParentSize component instantiates on mount. Provide a tiny no-op
+// fallback so visualisation components can render in unit tests.
+class MockResizeObserver {
+    observe(): void {
+        /* no-op */
+    }
+    unobserve(): void {
+        /* no-op */
+    }
+    disconnect(): void {
+        /* no-op */
+    }
+}
+
+if (typeof globalThis.ResizeObserver === 'undefined') {
+    globalThis.ResizeObserver =
+        MockResizeObserver as unknown as typeof ResizeObserver;
+}

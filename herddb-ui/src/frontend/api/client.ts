@@ -95,6 +95,42 @@ export interface TableDetailDTO {
     foreignKeys: ForeignKeyDTO[];
 }
 
+export interface DataPageInfoDTO {
+    pageId: number;
+    sizeBytes: number;
+    averageRecordSize: number;
+    dirtBytes: number;
+    loaded: boolean;
+}
+
+export interface PageLayoutDTO {
+    totalPages: number;
+    loadedPages: number;
+    totalSizeBytes: number;
+    totalDirtBytes: number;
+    pages: DataPageInfoDTO[];
+}
+
+export interface PrimaryIndexDTO {
+    type: string;
+    entries: number;
+    loadedNodes: number;
+    usedMemoryBytes: number;
+}
+
+export interface BrinBlockDTO {
+    blockId: number;
+    pageId: number;
+    entries: number;
+    loaded: boolean;
+    dirty: boolean;
+}
+
+export interface IndexDetailDTO {
+    summary: IndexSummaryDTO;
+    blocks: BrinBlockDTO[];
+}
+
 /**
  * Builds a fully qualified URL for the v2 REST API. In production the
  * SPA is served at `/ui/` so `apiUrl('/health')` resolves to
@@ -145,6 +181,25 @@ export const HerdDbApi = {
     getTable(tablespace: string, name: string): Promise<TableDetailDTO> {
         return request<TableDetailDTO>(
             `/tablespaces/${encodeURIComponent(tablespace)}/tables/${encodeURIComponent(name)}`,
+        );
+    },
+    getDataPages(tablespace: string, table: string): Promise<PageLayoutDTO> {
+        return request<PageLayoutDTO>(
+            `/tablespaces/${encodeURIComponent(tablespace)}/tables/${encodeURIComponent(table)}/data-pages`,
+        );
+    },
+    getPrimaryIndex(tablespace: string, table: string): Promise<PrimaryIndexDTO> {
+        return request<PrimaryIndexDTO>(
+            `/tablespaces/${encodeURIComponent(tablespace)}/tables/${encodeURIComponent(table)}/primary-index`,
+        );
+    },
+    getIndexDetail(
+        tablespace: string,
+        table: string,
+        index: string,
+    ): Promise<IndexDetailDTO> {
+        return request<IndexDetailDTO>(
+            `/tablespaces/${encodeURIComponent(tablespace)}/tables/${encodeURIComponent(table)}/indexes/${encodeURIComponent(index)}`,
         );
     },
 };

@@ -522,4 +522,15 @@ public class BRINIndexManager extends AbstractIndexManager {
         return data.getNumBlocks();
     }
 
+    /**
+     * Read-only snapshot of the BRIN block layout, used by the Web UI v2
+     * backend to render a "BRIN blocks" view. Delegates to
+     * {@link BlockRangeIndex#snapshotBlocks()}.
+     */
+    public java.util.List<BlockRangeIndex.BlockSnapshot> snapshotBlocks() {
+        return data == null
+                ? java.util.Collections.emptyList()
+                : data.snapshotBlocks();
+    }
+
 }

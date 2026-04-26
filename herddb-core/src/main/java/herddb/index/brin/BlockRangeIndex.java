@@ -832,6 +832,70 @@ public final class BlockRangeIndex<K extends Comparable<K> & SizeAwareObject, V 
     }
 
     /**
+     * Read-only snapshot of every block currently registered in the index,
+     * used by the Web UI v2 backend to render a "BRIN blocks" treemap.
+     *
+     * <p>The snapshot does not force a checkpoint: it simply walks the
+     * live block map and reports the block id, on-storage page id,
+     * record-count and loaded/dirty flags for each block. Concurrent
+     * structural changes (block merges/splits) may or may not appear,
+     * which is acceptable for the visualisation use case.
+     */
+    public List<BlockSnapshot> snapshotBlocks() {
+        List<BlockSnapshot> out = new ArrayList<>(blocks.size());
+        for (Block<K, V> block : blocks.values()) {
+            out.add(new BlockSnapshot(
+                    block.key.blockId,
+                    block.pageId,
+                    block.size,
+                    block.loaded,
+                    block.dirty));
+        }
+        return out;
+    }
+
+    /**
+     * Immutable view of a single block, returned by
+     * {@link #snapshotBlocks()}.
+     */
+    public static final class BlockSnapshot {
+
+        private final long blockId;
+        private final long pageId;
+        private final long entries;
+        private final boolean loaded;
+        private final boolean dirty;
+
+        public BlockSnapshot(long blockId, long pageId, long entries, boolean loaded, boolean dirty) {
+            this.blockId = blockId;
+            this.pageId = pageId;
+            this.entries = entries;
+            this.loaded = loaded;
+            this.dirty = dirty;
+        }
+
+        public long getBlockId() {
+            return blockId;
+        }
+
+        public long getPageId() {
+            return pageId;
+        }
+
+        public long getEntries() {
+            return entries;
+        }
+
+        public boolean isLoaded() {
+            return loaded;
+        }
+
+        public boolean isDirty() {
+            return dirty;
+        }
+    }
+
+    /**
      * Collects the current in-memory pageId from every block. This captures pages
      * that may have been created by concurrent block evictions after the last
      * {@link #checkpoint()} captured block metadata.

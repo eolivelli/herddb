@@ -4839,6 +4839,43 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         return stats;
     }
 
+    /**
+     * Read-only snapshot of the active data pages of this table.
+     *
+     * <p>Used by the Web UI v2 backend to render a "data-pages heatmap"
+     * without taking any lock that would interfere with checkpoints or
+     * normal DML. Each entry reports the page id, its on-storage size,
+     * the average record size, the accumulated dirty-bytes counter and
+     * whether the page is currently resident in the in-memory page
+     * cache.
+     *
+     * <p>Snapshot semantics: the iteration runs against
+     * {@link PageSet#getActivePagesView() the live unmodifiable view of
+     * the active page map}, which is backed by a
+     * {@link java.util.concurrent.ConcurrentHashMap} and therefore
+     * weakly consistent. Pages added or removed concurrently may or may
+     * not appear; this is acceptable for the visualisation use case.
+     *
+     * @return a defensive list, ordered by ascending page id; never
+     *         {@code null}.
+     */
+    public java.util.List<DataPageLayoutInfo> snapshotPagesLayout() {
+        java.util.Map<Long, PageSet.DataPageMetaData> active = pageSet.getActivePagesView();
+        java.util.Set<Long> loadedIds = new java.util.HashSet<>(pages.keySet());
+        java.util.List<DataPageLayoutInfo> out = new java.util.ArrayList<>(active.size());
+        for (java.util.Map.Entry<Long, PageSet.DataPageMetaData> entry : active.entrySet()) {
+            PageSet.DataPageMetaData meta = entry.getValue();
+            out.add(new DataPageLayoutInfo(
+                    entry.getKey(),
+                    meta.getSize(),
+                    meta.getAverageRecordSize(),
+                    meta.getDirtBytes(),
+                    loadedIds.contains(entry.getKey())));
+        }
+        out.sort(java.util.Comparator.comparingLong(DataPageLayoutInfo::getPageId));
+        return out;
+    }
+
     @Override
     public long getNextPrimaryKeyValue() {
         return nextPrimaryKeyValue.get();
