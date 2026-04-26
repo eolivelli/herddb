@@ -29,7 +29,7 @@
 #   --zip <path>                 Path to the herddb-services-*.zip to install.
 #                                Default: auto-discover from herddb-services/target.
 #   --server-heap <size>         -Xms/-Xmx for the server JVM (default: 15g).
-#   --indexing-heap <size>       -Xms/-Xmx for the indexing-service JVM (default: 40g).
+#   --indexing-heap <size>       -Xms/-Xmx for the indexing-service JVM (default: 30g).
 #   --indexing-rebuild-threads N Threads for vector index rebuild (default: 8).
 #   --reuse                      Do not wipe $CLUSTER_DIR if it already exists;
 #                                just (re-)start the services.
@@ -52,7 +52,7 @@ source "$SCRIPT_DIR/scripts/common.sh"
 
 ZIP=""
 SERVER_HEAP="15g"
-INDEXING_HEAP="40g"
+INDEXING_HEAP="30g"
 INDEXING_REBUILD_THREADS="8"
 REUSE=false
 
@@ -151,11 +151,13 @@ fi
 # ── Start the server ─────────────────────────────────────────────────────────
 section "Starting HerdDB server (heap=${SERVER_HEAP})"
 export JAVA_OPTS="-XX:+UseG1GC -Duser.language=en -Xmx${SERVER_HEAP} -Xms${SERVER_HEAP} \
--Dio.netty.maxDirectMemory=0 -Djava.net.preferIPv4Stack=true \
--XX:MaxDirectMemorySize=1g -XX:+DisableExplicitGC -Djava.awt.headless=true \
+-Djava.net.preferIPv4Stack=true \
+-XX:MaxDirectMemorySize=4g -Dio.netty.maxDirectMemory=4294967296 \
+-XX:+DisableExplicitGC -Djava.awt.headless=true \
 -Djava.util.logging.config.file=conf/logging.properties \
 --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError \
 -XX:HeapDumpPath=$CLUSTER_DIR/server-heapdump.hprof \
+-Dherddb.file.requirefsync=false \
 -Djava.io.tmpdir=$CLUSTER_DIR/tmp"
 bin/service server start
 
@@ -166,10 +168,12 @@ section "Starting indexing service (heap=${INDEXING_HEAP}, rebuild-threads=${IND
 export JAVA_OPTS="-XX:+UseG1GC -Duser.language=en \
 -Dherddb.vectorindex.rebuild.threads=${INDEXING_REBUILD_THREADS} \
 -Djava.net.preferIPv4Stack=true -Xmx${INDEXING_HEAP} -Xms${INDEXING_HEAP} \
+-XX:MaxDirectMemorySize=2g -Dio.netty.maxDirectMemory=4294967296 \
 -Djava.awt.headless=true \
 -Djava.util.logging.config.file=conf/logging.properties \
 -XX:+HeapDumpOnOutOfMemoryError \
 -XX:HeapDumpPath=$CLUSTER_DIR/indexingservice-heapdump.hprof \
+-Dherddb.file.requirefsync=false \
 --add-modules jdk.incubator.vector -Djava.io.tmpdir=$CLUSTER_DIR/tmp"
 bin/service indexing-service start
 
