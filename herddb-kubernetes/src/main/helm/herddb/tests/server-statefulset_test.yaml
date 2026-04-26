@@ -44,12 +44,24 @@ tests:
             containerPort: 9845
             protocol: TCP
 
-  - it: should have two volumeClaimTemplates (data and commitlog)
+  - it: should have two volumeClaimTemplates (data and commitlog) when storageMode is local
     template: templates/server-statefulset.yaml
+    set:
+      server.storageMode: local
     asserts:
       - lengthEqual:
           path: spec.volumeClaimTemplates
           count: 2
+
+  - it: should have one volumeClaimTemplate (data only) when storageMode is remote
+    template: templates/server-statefulset.yaml
+    asserts:
+      - lengthEqual:
+          path: spec.volumeClaimTemplates
+          count: 1
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: data
 
   - it: should mount the server config file
     template: templates/server-statefulset.yaml
@@ -70,10 +82,21 @@ tests:
             name: data
             mountPath: /opt/herddb/data
 
-  - it: should mount commitlog PVC at /opt/herddb/commitlog
+  - it: should mount commitlog PVC at /opt/herddb/commitlog when storageMode is local
     template: templates/server-statefulset.yaml
+    set:
+      server.storageMode: local
     asserts:
       - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: commitlog
+            mountPath: /opt/herddb/commitlog
+
+  - it: should not mount commitlog volumeMount when storageMode is remote
+    template: templates/server-statefulset.yaml
+    asserts:
+      - notContains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
             name: commitlog
