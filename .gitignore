@@ -1,6 +1,10 @@
 # Maven
 **/target/
 
+# Node / npm (herddb-ui frontend toolchain)
+**/node_modules/
+herddb-ui/dist/
+
 # Surefire
 **/.surefire-*
 

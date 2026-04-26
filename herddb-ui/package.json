@@ -1,0 +1,10 @@
+{
+  "name": "herddb-ui",
+  "version": "0.0.0",
+  "private": true,
+  "description": "HerdDB Web UI (v2) — placeholder; real frontend introduced in phase 2.",
+  "scripts": {
+    "build": "echo \"[herddb-ui] phase-0 placeholder build — real Vite build added in phase 2\" && mkdir -p target/web-build && echo placeholder > target/web-build/PHASE0.txt",
+    "test": "echo \"[herddb-ui] phase-0 placeholder test — real Vitest suite added in phase 2\""
+  }
+}
