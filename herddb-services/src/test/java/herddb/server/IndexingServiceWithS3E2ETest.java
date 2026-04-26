@@ -39,9 +39,11 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 import org.junit.After;
 import org.junit.Before;
@@ -328,25 +330,37 @@ public class IndexingServiceWithS3E2ETest {
     }
 
     private static void waitForIndexing(Server server, HDBConnection con,
-                                        long timeoutMs) throws Exception {
-        // Force a flush of the client's write buffer and let the indexing
-        // service drain it. Simplest pattern in the existing suite: a short
-        // polling sleep loop with a search-result check. We don't have
-        // getLastLSN via the public JDBC API, so we poll.
+                                        int expectedCount, long timeoutMs) throws Exception {
+        // Wait until the indexing service has applied at least `expectedCount`
+        // distinct primary keys. Returning as soon as ANY row is observable is
+        // a race: the subsequent assertions may then run while the remaining
+        // inserts are still mid-flight in the indexing service's apply
+        // pipeline, yielding flaky "expected:<X> but was:<Y>" failures
+        // (issue #296). We don't have getLastLSN via the public JDBC API, so
+        // we poll on the search result set instead.
         long deadline = System.currentTimeMillis() + timeoutMs;
+        Set<Integer> lastIds = Collections.emptySet();
         while (System.currentTimeMillis() < deadline) {
             try (ScanResultSet scan = con.executeScan(TableSpace.DEFAULT,
                     "SELECT id FROM t1 ORDER BY ann_of(vec, "
-                            + "CAST(? AS FLOAT ARRAY)) DESC LIMIT 1",
+                            + "CAST(? AS FLOAT ARRAY)) DESC LIMIT " + expectedCount,
                     false, Arrays.asList((Object) new float[]{1, 0, 0, 0}),
                     0, 10, 10, false)) {
-                if (!scan.consume().isEmpty()) {
+                List<Map<String, Object>> rows = scan.consume();
+                Set<Integer> ids = new HashSet<>();
+                for (Map<String, Object> row : rows) {
+                    ids.add(((Number) row.get("id")).intValue());
+                }
+                lastIds = ids;
+                if (ids.size() >= expectedCount) {
                     return;
                 }
             }
             Thread.sleep(50);
         }
-        throw new AssertionError("indexing service did not catch up within " + timeoutMs + "ms");
+        throw new AssertionError("indexing service did not catch up within "
+                + timeoutMs + "ms; expected " + expectedCount
+                + " distinct ids, last observed=" + lastIds);
     }
 
     // -------------------------------------------------------------------------
@@ -360,7 +374,7 @@ public class IndexingServiceWithS3E2ETest {
              HDBConnection con = hdbClient.openConnection()) {
             createTableAndIndex(con);
             insertOrthogonalBasis(con);
-            waitForIndexing(t.server, con, 5000);
+            waitForIndexing(t.server, con, 4, 5000);
 
             // Query aimed at Y-axis → should return id=2.
             assertEquals(2, annTop1(con, new float[]{0, 1, 0, 0}));
@@ -376,7 +390,7 @@ public class IndexingServiceWithS3E2ETest {
              HDBConnection con = hdbClient.openConnection()) {
             createTableAndIndex(con);
             insertOrthogonalBasis(con);
-            waitForIndexing(t.server, con, 5000);
+            waitForIndexing(t.server, con, 4, 5000);
 
             // Checkpoint the main server — this flushes both table data AND
             // the vector index through RemoteFileDataStorageManager to S3.
@@ -400,13 +414,15 @@ public class IndexingServiceWithS3E2ETest {
              HDBConnection con = hdbClient.openConnection()) {
             createTableAndIndex(con);
             insertOrthogonalBasis(con);
-            waitForIndexing(t.server, con, 5000);
+            waitForIndexing(t.server, con, 4, 5000);
 
             t.stopIndexing();
             // Ephemeral-pod simulation: wipe ALL local indexing state.
             wipeIndexingLocalState(t);
             t.startIndexing(t.server);
-            waitForIndexing(t.server, con, 10000);
+            // Give the post-restart commit-log replay extra headroom: the
+            // service has to re-apply every insert from scratch.
+            waitForIndexing(t.server, con, 4, 15000);
 
             // All 4 vectors must still be searchable after the crash+replay.
             assertEquals(1, annTop1(con, new float[]{1, 0, 0, 0}));
@@ -576,7 +592,7 @@ public class IndexingServiceWithS3E2ETest {
              HDBConnection con = hdbClient.openConnection()) {
             createTableAndIndex(con);
             insertOrthogonalBasis(con);
-            waitForIndexing(t.server, con, 5000);
+            waitForIndexing(t.server, con, 4, 5000);
             t.server.getManager().checkpoint();
             // Give the vector-store compaction loop a moment to settle.
             Thread.sleep(500);
