@@ -44,11 +44,18 @@
     </properties>
 
     <dependencies>
+        <!--
+            herddb-core gives the v2 backend in-process access to a running
+            Server / DBManager so REST endpoints can issue
+            executeSimpleQuery() against the sys* tables and read internal
+            statistics. The new UI does NOT use JDBC.
+        -->
         <dependency>
             <groupId>${project.groupId}</groupId>
-            <artifactId>herddb-jdbc</artifactId>
+            <artifactId>herddb-core</artifactId>
             <version>${project.version}</version>
         </dependency>
+
         <dependency>
             <groupId>javax</groupId>
             <artifactId>javaee-web-api</artifactId>
@@ -64,6 +71,53 @@
             <groupId>org.glassfish.jersey.media</groupId>
             <artifactId>jersey-media-json-jackson</artifactId>
             <version>${libs.jersey}</version>
+        </dependency>
+        <!--
+            HK2 dependency injection — used by ApplicationConfigV2 to bind
+            ServerLocator from the ServletContext. Compile scope because
+            the AbstractBinder / Factory types are referenced from main
+            sources.
+        -->
+        <dependency>
+            <groupId>org.glassfish.jersey.inject</groupId>
+            <artifactId>jersey-hk2</artifactId>
+            <version>${libs.jersey}</version>
+        </dependency>
+
+        <!-- Test dependencies -->
+        <dependency>
+            <groupId>org.glassfish.jersey.test-framework</groupId>
+            <artifactId>jersey-test-framework-core</artifactId>
+            <version>${libs.jersey}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.glassfish.jersey.test-framework.providers</groupId>
+            <artifactId>jersey-test-framework-provider-jetty</artifactId>
+            <version>${libs.jersey}</version>
+            <scope>test</scope>
+        </dependency>
+        <!--
+            Jersey 2.26 ships providers (DataSourceProvider, JAXB) that
+            reference packages removed from the JDK in Java 11+
+            (javax.activation, javax.xml.bind). On Java 17 these
+            unavailable classes cause every request through the
+            JerseyTest container to fail with HTTP 500 noise. Adding the
+            stand-alone API jars in test scope restores the classes
+            without affecting production (production runs inside Jetty
+            with Jackson only).
+        -->
+        <dependency>
+            <groupId>javax.activation</groupId>
+            <artifactId>javax.activation-api</artifactId>
+            <version>1.2.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>javax.xml.bind</groupId>
+            <artifactId>jaxb-api</artifactId>
+            <version>2.3.1</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 
