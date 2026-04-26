@@ -25,15 +25,23 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 EXAMPLE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Base directory for durable artefacts (cluster install + reports).
+# Base directory for durable artefacts (reports, datasets, profiles, issue drafts).
 # Mirrors the convention of herddb-services/test-start-server.sh.
 BASEDIR="${HERDDB_TESTS_HOME:-$EXAMPLE_DIR/workspace}"
 mkdir -p "$BASEDIR"
 BASEDIR="$(cd "$BASEDIR" && pwd)"
 
-# The local HerdDB "cluster" lives under $HERDDB_TESTS_HOME/cluster,
-# following the user-facing contract documented in README.md.
-CLUSTER_DIR="$BASEDIR/cluster"
+# The local HerdDB "cluster" (server + indexing-service binaries and data) lives
+# under $HERDDB_SERVER_HOME when that variable is set — use this to point at a
+# disk with plenty of space for database files, commit logs, and heap dumps.
+# Falls back to $HERDDB_TESTS_HOME/cluster (or workspace/cluster) so that
+# existing single-disk setups keep working without any configuration change.
+if [[ -n "${HERDDB_SERVER_HOME:-}" ]]; then
+    mkdir -p "$HERDDB_SERVER_HOME"
+    CLUSTER_DIR="$(cd "$HERDDB_SERVER_HOME" && pwd)"
+else
+    CLUSTER_DIR="$BASEDIR/cluster"
+fi
 
 # Reports (run logs, diagnostics, heap dumps, issue drafts) go under
 # $HERDDB_TESTS_HOME/reports so they survive teardown and stay outside the

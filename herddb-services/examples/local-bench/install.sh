@@ -20,7 +20,7 @@
 # Install and start a local HerdDB "cluster" — a single herddb-server in
 # standalone mode plus a herddb-indexing-service, sharing the commit log on
 # disk — mirroring test-start-server.sh but driven out of a stable directory
-# under $HERDDB_TESTS_HOME/cluster so the bench scripts can find it.
+# so the bench scripts can find it.
 #
 # Usage:
 #   ./install.sh [OPTIONS]
@@ -35,8 +35,14 @@
 #                                just (re-)start the services.
 #   --help                       Show this help and exit.
 #
-# The cluster is installed under $HERDDB_TESTS_HOME/cluster. Previous state
-# is wiped unless --reuse is passed.
+# Directory layout:
+#   Services (server, indexing-service binaries, dbdata, commit logs, heap dumps)
+#   are installed under $HERDDB_SERVER_HOME when that env var is set, allowing
+#   them to live on a disk with plenty of space.  Falls back to
+#   $HERDDB_TESTS_HOME/cluster (or workspace/cluster) when HERDDB_SERVER_HOME
+#   is not set — preserving backward compatibility.
+#   Reports, datasets and profiles always go under $HERDDB_TESTS_HOME.
+#   Previous service state is wiped unless --reuse is passed.
 #
 set -euo pipefail
 
@@ -80,8 +86,12 @@ if [[ -z "$ZIP" || ! -f "$ZIP" ]]; then
 fi
 
 section "Installing HerdDB from $ZIP"
-echo "  cluster dir : $CLUSTER_DIR"
-echo "  reports dir : $REPORTS_DIR"
+if [[ -n "${HERDDB_SERVER_HOME:-}" ]]; then
+    echo "  cluster dir : $CLUSTER_DIR  (from \$HERDDB_SERVER_HOME)"
+else
+    echo "  cluster dir : $CLUSTER_DIR  (from \$HERDDB_TESTS_HOME/cluster fallback)"
+fi
+echo "  reports dir : $REPORTS_DIR  (from \$HERDDB_TESTS_HOME)"
 
 if [[ -d "$CLUSTER_DIR" ]]; then
     if $REUSE; then

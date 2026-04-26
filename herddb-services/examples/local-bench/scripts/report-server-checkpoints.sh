@@ -48,9 +48,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-REPORTS_DIR="${HERDDB_TESTS_HOME:-$(dirname "$SCRIPT_DIR")/reports}"
-mkdir -p "$REPORTS_DIR"
-timestamp() { date +%Y%m%d-%H%M%S; }
+# shellcheck source=common.sh
+source "$SCRIPT_DIR/common.sh"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 LOGS_DIR=""
