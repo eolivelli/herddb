@@ -31,7 +31,24 @@ JVECTOR_JAVA_OPTS="--add-modules jdk.incubator.vector -XX:CompileCommandFile=con
 # JAVA_OPTS_EXTRA / JDK_JAVA_OPTIONS_EXTRA: appended to the final value, so
 # deployments (e.g. the Helm chart's server.javaOptsExtra) can ADD flags
 # on top of the defaults without having to re-specify the baseline.
-JDK_JAVA_OPTIONS="${JDK_JAVA_OPTIONS:---add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.rmi/sun.rmi.transport=ALL-UNNAMED --enable-native-access=ALL-UNNAMED} ${JDK_JAVA_OPTIONS_EXTRA:-}"
+#
+# --add-opens=java.base/java.nio=ALL-UNNAMED + -Dio.netty.tryReflectionSetAccessible=true
+# are required so that Netty's PlatformDependent can reflectively install its own
+# off-heap memory accounting and avoid the JVM's Bits.reserveMemory direct-buffer
+# limit on JDK 9+. Without these flags Netty falls back to ByteBuffer.allocateDirect
+# and every direct allocation (pooled and unpooled) is bounded by -XX:MaxDirectMemorySize,
+# which causes OutOfMemoryError under heavy ingestion.
+#
+# --sun-misc-unsafe-memory-access=allow re-enables sun.misc.Unsafe memory-access
+# methods on JDK 24+ (where the default is "warn" and may become "deny" on
+# JDK 26+). Netty 4.1.120 and 4.1.121 disabled their internal Unsafe usage by
+# default to silence the JEP 498 warnings, which made
+# PlatformDependent.useDirectBufferNoCleaner() return false and forced every
+# direct allocation back through Bits.reserveMemory — defeating
+# -Dio.netty.maxDirectMemory.  This flag restores the no-cleaner pooled path
+# until we upgrade to Netty 4.1.122+ (where the default was reverted) or 4.2.x
+# (FFM-based and Unsafe-free).
+JDK_JAVA_OPTIONS="${JDK_JAVA_OPTIONS:---add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.rmi/sun.rmi.transport=ALL-UNNAMED --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow -Dio.netty.tryReflectionSetAccessible=true} ${JDK_JAVA_OPTIONS_EXTRA:-}"
 JAVA_OPTS="${JAVA_OPTS:--XX:+UseG1GC -Duser.language=en -Xmx4g -Xms4g -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=1g -Dio.netty.maxDirectMemory=0 -XX:+DisableExplicitGC -Djava.awt.headless=true -Djava.util.logging.config.file=conf/logging.properties} $JVECTOR_JAVA_OPTS ${JAVA_OPTS_EXTRA:-}"
 # Export so the settings reach child java processes started by launcher
 # scripts that rely on the JDK picking JDK_JAVA_OPTIONS up automatically
