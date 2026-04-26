@@ -1252,7 +1252,22 @@ public class BookkeeperCommitLog extends CommitLog {
             }
 
         } catch (BKClientClosedException err) {
+            // The BK client connection was lost (e.g. a transient ZK session
+            // interruption).  Reset the stale ledger handle so ensureOpenReader
+            // re-opens it from fresh ZooKeeper metadata on the next iteration.
+            // Without the reset, the same stale handle is reused on every
+            // iteration: ensureOpenReader calls tryReadLastAddConfirmed() on it,
+            // that immediately throws BKClientClosedException again, and the
+            // FollowerThread spins in a tight busy-loop that never applies any
+            // log entries.  The 100 ms sleep prevents hammering the BK client
+            // before it has a chance to reconnect.
             LOGGER.log(Level.FINE, "stop following " + tableSpaceDescription(), err);
+            fContext.resetCurrentLedger();
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
         } catch (org.apache.bookkeeper.client.api.BKException err) {
             LOGGER.log(Level.SEVERE, tableSpaceDescription() + " internal BK error", err);
             fContext.resetCurrentLedger();
