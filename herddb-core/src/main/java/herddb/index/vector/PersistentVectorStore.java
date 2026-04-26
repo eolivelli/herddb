@@ -338,8 +338,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     private volatile List<LiveGraphShard> deferredShards;
 
-    /** PKs deleted during Phase B. */
-    private volatile Set<Bytes> pendingCheckpointDeletes;
+    /**
+     * PKs deleted during Phase B.
+     *
+     * <p>Backed by a {@link PagedPkSet} (BLink-paged storage with the existing
+     * {@link MemoryManager} page replacement policy) so memory stays bounded
+     * even when sustained delete traffic arrives during a multi-minute
+     * checkpoint cycle (issue #290).
+     */
+    private volatile PagedPkSet pendingCheckpointDeletes;
 
     /** Max live vectors allowed during Phase B before back-pressure kicks in. */
     private volatile int liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
@@ -382,8 +389,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * {@link #removeVector} call appends to this set so the swap step
      * can replay the deletes against the freshly-built merged output
      * before it becomes visible.
+     *
+     * <p>Backed by a {@link PagedPkSet} (BLink-paged storage with the
+     * existing {@link MemoryManager} page replacement policy) so memory
+     * stays bounded even when sustained delete traffic arrives during a
+     * multi-minute compaction cycle (issue #290).
      */
-    private volatile Set<Bytes> pendingCompactionDeletes;
+    private volatile PagedPkSet pendingCompactionDeletes;
 
     // -------------------------------------------------------------------------
     // Compaction state
@@ -1494,7 +1506,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
         try {
             long cycleStart = System.currentTimeMillis();
-            compactionRunsTotal.incrementAndGet();
+            long cycleId = compactionRunsTotal.incrementAndGet();
 
             List<VectorSegment> snapshot = new ArrayList<>(segments);
             List<VectorSegment> candidates = VectorIndexCompactor.chooseSegmentsToMerge(
@@ -1511,106 +1523,149 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     new Object[]{indexName, candidates.size()});
 
             compactionActive.set(1);
-            this.pendingCompactionDeletes =
-                    java.util.concurrent.ConcurrentHashMap.newKeySet();
-            Set<Bytes> liveShardPkSnapshot = new java.util.HashSet<>();
-            for (LiveGraphShard shard : liveShards) {
-                liveShardPkSnapshot.addAll(shard.pkToNode.keySet());
-            }
-            Map<Bytes, Integer> authority = VectorIndexCompactor.buildAuthorityMap(
-                    candidates, snapshot, liveShardPkSnapshot);
 
-            long bytesRead = 0;
-            long vectorsWritten = 0;
-            long vectorsFiltered = 0;
-            VectorIndexCompactor.RebuildResult rebuild = null;
+            // Allocate the BLink-backed pendingCompactionDeletes set + the
+            // BLink-backed authority map (issue #290): both replace the prior
+            // unbounded HashMap/HashSet structures so memory stays bounded by
+            // the index page replacement policy.
+            PagedPkSet pendingDeletes = createTempPagedPkSet("cmpdel_" + cycleId);
+            this.pendingCompactionDeletes = pendingDeletes;
+            CompactionAuthorityMap authority = createTempCompactionAuthorityMap(cycleId);
+
             try {
-                rebuild = VectorIndexCompactor.rebuildSegment(this, candidates, authority);
-                if (rebuild == null) {
-                    // Nothing survived the filter — everything in these inputs
-                    // is tombstoned or superseded. Skip the rebuild; just
-                    // swap the inputs out and queue them for retention.
-                    atomicSwapCompactionResult(candidates, null, 0L);
+                // Stream live-shard PKs into the authority map (only updates
+                // entries already in it — see VectorIndexCompactor). We pass
+                // a flat Iterable<Bytes> view rather than materialising a
+                // HashSet of every live PK, keeping live-shard memory bounded
+                // for catch-up workloads with very large live shards.
+                Iterable<Bytes> liveShardPks = collectLiveShardPksLazy();
+                VectorIndexCompactor.buildAuthorityMap(
+                        authority, candidates, snapshot, liveShardPks);
+
+                long bytesRead = 0;
+                long vectorsWritten = 0;
+                long vectorsFiltered = 0;
+                VectorIndexCompactor.RebuildResult rebuild = null;
+                try {
+                    rebuild = VectorIndexCompactor.rebuildSegment(this, candidates, authority);
+                    if (rebuild == null) {
+                        // Nothing survived the filter — everything in these inputs
+                        // is tombstoned or superseded. Skip the rebuild; just
+                        // swap the inputs out and queue them for retention.
+                        atomicSwapCompactionResult(candidates, null, 0L);
+                        compactionSuccessesTotal.incrementAndGet();
+                        compactionConsecutiveFailures.set(0);
+                        long emptyCycleMs = System.currentTimeMillis() - cycleStart;
+                        compactionLastDurationMs.set(emptyCycleMs);
+                        compactionLastBytesRead.set(candidates.stream()
+                                .mapToLong(s -> s.estimatedSizeBytes).sum());
+                        compactionLastBytesWritten.set(0);
+                        compactionLastInputSegments.set(candidates.size());
+                        compactionLastOutputSegments.set(0);
+                        compactionLivePkFilteredTotal.addAndGet(countDeadPks(candidates, authority));
+                        LOGGER.log(Level.INFO,
+                                "vector store {0}: empty-result compaction in {1} ms — "
+                                        + "swapped out {2} fully-obsolete segments",
+                                new Object[]{indexName, emptyCycleMs, candidates.size()});
+                        return;
+                    }
+
+                    bytesRead = candidates.stream().mapToLong(s -> s.estimatedSizeBytes).sum();
+                    vectorsWritten = rebuild.vectorCount;
+                    vectorsFiltered = rebuild.filteredCount;
+
+                    // Apply deletes that arrived during the rebuild. We capture
+                    // the local reference defensively — the field could be
+                    // cleared by a concurrent shutdown.
+                    PagedPkSet lateDeletes = this.pendingCompactionDeletes;
+                    if (lateDeletes != null) {
+                        VectorSegment merged = rebuild.mergedSegment;
+                        lateDeletes.forEach(merged::deletePk);
+                    }
+
+                    atomicSwapCompactionResult(candidates, rebuild.mergedSegment,
+                            rebuild.bytesWritten);
+
                     compactionSuccessesTotal.incrementAndGet();
                     compactionConsecutiveFailures.set(0);
-                    long emptyCycleMs = System.currentTimeMillis() - cycleStart;
-                    compactionLastDurationMs.set(emptyCycleMs);
-                    compactionLastBytesRead.set(candidates.stream()
-                            .mapToLong(s -> s.estimatedSizeBytes).sum());
-                    compactionLastBytesWritten.set(0);
+                    long durationMs = System.currentTimeMillis() - cycleStart;
+                    compactionLastDurationMs.set(durationMs);
+                    compactionLastBytesRead.set(bytesRead);
+                    compactionLastBytesWritten.set(rebuild.bytesWritten);
                     compactionLastInputSegments.set(candidates.size());
-                    compactionLastOutputSegments.set(0);
-                    compactionLivePkFilteredTotal.addAndGet(countDeadPks(candidates, authority));
+                    compactionLastOutputSegments.set(1);
+                    compactionLivePkFilteredTotal.addAndGet(vectorsFiltered);
+
                     LOGGER.log(Level.INFO,
-                            "vector store {0}: empty-result compaction in {1} ms — "
-                                    + "swapped out {2} fully-obsolete segments",
-                            new Object[]{indexName, emptyCycleMs, candidates.size()});
-                    return;
-                }
-
-                bytesRead = candidates.stream().mapToLong(s -> s.estimatedSizeBytes).sum();
-                vectorsWritten = rebuild.vectorCount;
-                vectorsFiltered = rebuild.filteredCount;
-
-                // Apply deletes that arrived during the rebuild.
-                Set<Bytes> lateDeletes = this.pendingCompactionDeletes;
-                if (lateDeletes != null) {
-                    for (Bytes pk : lateDeletes) {
-                        rebuild.mergedSegment.deletePk(pk);
+                            "vector store {0}: compaction complete in {1} ms — "
+                                    + "{2} inputs ({3} bytes) -> 1 output ({4} bytes, "
+                                    + "{5} vectors kept, {6} filtered)",
+                            new Object[]{indexName, durationMs, candidates.size(), bytesRead,
+                                    rebuild.bytesWritten, vectorsWritten, vectorsFiltered});
+                } catch (VectorIndexCompactor.CompactionException e) {
+                    recordCompactionFailure(e.reason);
+                    LOGGER.log(Level.WARNING,
+                            "vector store " + indexName + ": compaction failed ("
+                                    + e.reason + ")", e);
+                    // Clean up orphaned output files if any were written.
+                    if (rebuild != null && rebuild.orphanPaths != null) {
+                        long now = System.currentTimeMillis();
+                        long sinceGen = currentIndexStatusGeneration.get();
+                        for (String[] orphan : rebuild.orphanPaths) {
+                            this.pendingDeletes.add(new PendingDelete(
+                                    encodeMultipartPath(orphan[0], orphan[1]),
+                                    now, sinceGen));
+                        }
                     }
+                } catch (IOException e) {
+                    recordCompactionFailure(VectorIndexCompactor.FailureReason.WRITE_IO);
+                    LOGGER.log(Level.WARNING,
+                            "vector store " + indexName + ": compaction I/O failure", e);
+                } catch (DataStorageManagerException e) {
+                    recordCompactionFailure(VectorIndexCompactor.FailureReason.METADATA_IO);
+                    LOGGER.log(Level.WARNING,
+                            "vector store " + indexName + ": compaction metadata failure", e);
                 }
-
-                atomicSwapCompactionResult(candidates, rebuild.mergedSegment,
-                        rebuild.bytesWritten);
-
-                compactionSuccessesTotal.incrementAndGet();
-                compactionConsecutiveFailures.set(0);
-                long durationMs = System.currentTimeMillis() - cycleStart;
-                compactionLastDurationMs.set(durationMs);
-                compactionLastBytesRead.set(bytesRead);
-                compactionLastBytesWritten.set(rebuild.bytesWritten);
-                compactionLastInputSegments.set(candidates.size());
-                compactionLastOutputSegments.set(1);
-                compactionLivePkFilteredTotal.addAndGet(vectorsFiltered);
-
-                LOGGER.log(Level.INFO,
-                        "vector store {0}: compaction complete in {1} ms — "
-                                + "{2} inputs ({3} bytes) -> 1 output ({4} bytes, "
-                                + "{5} vectors kept, {6} filtered)",
-                        new Object[]{indexName, durationMs, candidates.size(), bytesRead,
-                                rebuild.bytesWritten, vectorsWritten, vectorsFiltered});
-            } catch (VectorIndexCompactor.CompactionException e) {
-                recordCompactionFailure(e.reason);
-                LOGGER.log(Level.WARNING,
-                        "vector store " + indexName + ": compaction failed ("
-                                + e.reason + ")", e);
-                // Clean up orphaned output files if any were written.
-                if (rebuild != null && rebuild.orphanPaths != null) {
-                    long now = System.currentTimeMillis();
-                    long sinceGen = currentIndexStatusGeneration.get();
-                    for (String[] orphan : rebuild.orphanPaths) {
-                        pendingDeletes.add(new PendingDelete(
-                                encodeMultipartPath(orphan[0], orphan[1]),
-                                now, sinceGen));
-                    }
+            } finally {
+                // Drop the temporary BLink storages regardless of outcome so
+                // we don't leak pages across cycles.
+                this.pendingCompactionDeletes = null;
+                try {
+                    pendingDeletes.close();
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING,
+                            "vector store " + indexName
+                                    + ": failed to close pendingCompactionDeletes set", e);
                 }
-            } catch (IOException e) {
-                recordCompactionFailure(VectorIndexCompactor.FailureReason.WRITE_IO);
-                LOGGER.log(Level.WARNING,
-                        "vector store " + indexName + ": compaction I/O failure", e);
-            } catch (DataStorageManagerException e) {
-                recordCompactionFailure(VectorIndexCompactor.FailureReason.METADATA_IO);
-                LOGGER.log(Level.WARNING,
-                        "vector store " + indexName + ": compaction metadata failure", e);
+                try {
+                    authority.close();
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING,
+                            "vector store " + indexName
+                                    + ": failed to close compaction authority map", e);
+                }
             }
         } finally {
             compactionActive.set(0);
-            this.pendingCompactionDeletes = null;
             compactionLock.unlock();
         }
     }
 
-    private static long countDeadPks(List<VectorSegment> candidates, Map<Bytes, Integer> authority) {
+    /**
+     * Returns an {@link Iterable} that streams primary keys from every live
+     * shard at iteration time. Unlike materialising a {@code HashSet} of all
+     * live-shard PKs up-front, this lets the caller (the compaction authority
+     * map population step) probe them one-by-one without holding all of them
+     * in heap simultaneously, which matters for catch-up workloads where the
+     * combined live shards can hold millions of PKs (issue #290).
+     */
+    private Iterable<Bytes> collectLiveShardPksLazy() {
+        return () -> liveShards.stream()
+                .flatMap(shard -> shard.pkToNode.keySet().stream())
+                .iterator();
+    }
+
+    private static long countDeadPks(List<VectorSegment> candidates, CompactionAuthorityMap authority) {
         long total = 0;
         for (VectorSegment seg : candidates) {
             int[] offsets = seg.pkOffsets;
@@ -1625,7 +1680,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     continue;
                 }
                 Bytes pk = Bytes.from_array(data, offsets[ord], lengths[ord]);
-                Integer owner = authority.get(pk);
+                Integer owner = authority.getSegmentId(pk);
                 if (owner == null || owner != seg.segmentId) {
                     total++;
                 }
@@ -1993,7 +2048,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             this.deferredShards = null;
             currentDeferredVectors.set(0);
         }
-        this.pendingCheckpointDeletes = null;
+        closePendingCheckpointDeletesQuietly();
         this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
         CountDownLatch latch = this.checkpointPhaseComplete;
         if (latch != null) {
@@ -2182,14 +2237,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
             }
             // Track delete for Phase B awareness
-            Set<Bytes> pending = pendingCheckpointDeletes;
+            PagedPkSet pending = pendingCheckpointDeletes;
             if (pending != null) {
                 pending.add(pk);
             }
             // Track delete for in-flight compaction: if we are rebuilding
             // segments right now, the merged output must see this delete
             // before it is published.
-            Set<Bytes> pendingCompact = pendingCompactionDeletes;
+            PagedPkSet pendingCompact = pendingCompactionDeletes;
             if (pendingCompact != null) {
                 pendingCompact.add(pk);
             }
@@ -2281,7 +2336,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // allows multiple concurrent read holders.
         stateLock.readLock().lock();
         try {
-            final Set<Bytes> pending = pendingCheckpointDeletes;
+            final PagedPkSet pending = pendingCheckpointDeletes;
             List<LiveGraphShard> frozen = frozenShards;
             if (frozen != null) {
                 for (final LiveGraphShard shard : frozen) {
@@ -2324,7 +2379,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * frozen/deferred shards during a checkpoint.
      */
     private List<Map.Entry<Bytes, Float>> searchLiveShard(LiveGraphShard shard, VectorFloat<?> qv,
-                                                          int perSourceK, Set<Bytes> pendingDeletes) {
+                                                          int perSourceK, PagedPkSet pendingDeletes) {
         int k = Math.min(perSourceK, shard.nodeToPk.size());
         ImmutableGraphIndex graph = shard.builder.getGraph();
         SearchResult result = GraphSearcher.search(
@@ -2699,7 +2754,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
             demoteSmallestSealedSegments(sealedSegments, mergeableSegments);
 
             this.frozenShards = snapshotShards;
-            this.pendingCheckpointDeletes = ConcurrentHashMap.newKeySet();
+            // Use a BLink-paged PK set so memory stays bounded even when
+            // sustained delete traffic arrives during a multi-minute Phase B
+            // (issue #290). The total-checkpoint counter is monotonic across
+            // the store's lifetime, so the temp store name never collides
+            // with a leftover from a crashed cycle.
+            this.pendingCheckpointDeletes = createTempPagedPkSet(
+                    "ckpdel_" + totalCheckpointCount.get());
             this.checkpointPhaseComplete = new CountDownLatch(1);
             int totalSnapshotSize = 0;
             for (LiveGraphShard shard : snapshotShards) {
@@ -2846,15 +2907,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // Add newly written segments from this checkpoint
             newSegments.addAll(preloadedSegments);
 
-            Set<Bytes> pending = this.pendingCheckpointDeletes;
+            PagedPkSet pending = this.pendingCheckpointDeletes;
             if (pending != null) {
-                for (Bytes pk : pending) {
+                pending.forEach(pk -> {
                     for (VectorSegment seg : newSegments) {
                         if (seg.deletePk(pk)) {
-                            break;
+                            return;
                         }
                     }
-                }
+                });
             }
 
             this.segments = newSegments;
@@ -2889,7 +2950,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             this.frozenShards = null;
             this.deferredShards = null;
             currentDeferredVectors.set(0);  // Deferred shards have been restored to live set
-            this.pendingCheckpointDeletes = null;
+            closePendingCheckpointDeletesQuietly();
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
             dirty.set(totalLiveSize() > 0);
 
@@ -3648,7 +3709,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             this.frozenShards = null;
             this.deferredShards = null;
             currentDeferredVectors.set(0);  // Deferred shards have been restored to live set
-            this.pendingCheckpointDeletes = null;
+            closePendingCheckpointDeletesQuietly();
             this.liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
             dirty.set(true);
         } finally {
@@ -4271,6 +4332,105 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     // -------------------------------------------------------------------------
+    // Temporary BLink factories for compaction & checkpoint memory bounding
+    // (issue #290).
+    //
+    // The compaction authority map and the pendingCompactionDeletes /
+    // pendingCheckpointDeletes sets all share the same problem: they may
+    // accumulate hundreds of millions of PKs during a long-running cycle and
+    // exhaust the JVM heap if held in unbounded HashMaps. Backing them with
+    // BLink<Bytes, Long> reuses the same paged-storage / page-replacement
+    // policy we already use for seg.onDiskPkToNode, so memory stays bounded
+    // by the index page budget.
+    //
+    // Each temporary index is created with a unique name (cycle-id qualified
+    // by the caller) and dropped via TempBlinkHandle.drop() in a finally
+    // block. The provisional name uses the {@code _tmp_} infix so that
+    // operator-side cleanup tooling can identify orphans left behind by
+    // ungraceful JVM exits.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Creates a fresh BLink-backed compaction authority map for the supplied
+     * cycle id. The returned wrapper owns the BLink and its temp storage; it
+     * <strong>must</strong> be closed in a {@code finally} block so the temp
+     * pages are dropped.
+     */
+    CompactionAuthorityMap createTempCompactionAuthorityMap(long cycleId) {
+        String storeName = indexUUID + "_tmp_cmpaut_" + cycleId;
+        try {
+            dataStorageManager.initIndex(tableSpaceUUID, storeName);
+        } catch (DataStorageManagerException e) {
+            throw new RuntimeException("Failed to init compaction authority BLink storage "
+                    + storeName + " for vector store " + indexName, e);
+        }
+        BLink<Bytes, Long> blink = new BLink<>(
+                memoryManager.getMaxLogicalPageSize(),
+                BytesLongSizeEvaluator.INSTANCE,
+                memoryManager.getIndexPageReplacementPolicy(),
+                new BytesLongStorage(storeName));
+        return new CompactionAuthorityMap(blink, () -> dropTempIndexQuietly(storeName));
+    }
+
+    /**
+     * Closes and clears the {@link #pendingCheckpointDeletes} field, swallowing
+     * any close failures (best-effort cleanup so a checkpoint never fails just
+     * because the temp PK set could not be released).
+     */
+    private void closePendingCheckpointDeletesQuietly() {
+        PagedPkSet set = this.pendingCheckpointDeletes;
+        this.pendingCheckpointDeletes = null;
+        if (set != null) {
+            try {
+                set.close();
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING,
+                        "vector store " + indexName
+                                + ": failed to close pendingCheckpointDeletes set", e);
+            }
+        }
+    }
+
+    /**
+     * Creates a fresh BLink-backed PK set with the given purpose tag (used to
+     * build a unique temp store name). The returned wrapper owns the BLink
+     * and its temp storage; it <strong>must</strong> be closed in a
+     * {@code finally} block so the temp pages are dropped. Callers
+     * disambiguate concurrent or back-to-back instances by adding a
+     * monotonically increasing token to the {@code purposeTag}.
+     */
+    PagedPkSet createTempPagedPkSet(String purposeTag) {
+        String storeName = indexUUID + "_tmp_pkset_" + purposeTag;
+        try {
+            dataStorageManager.initIndex(tableSpaceUUID, storeName);
+        } catch (DataStorageManagerException e) {
+            throw new RuntimeException("Failed to init paged PK set BLink storage "
+                    + storeName + " for vector store " + indexName, e);
+        }
+        BLink<Bytes, Long> blink = new BLink<>(
+                memoryManager.getMaxLogicalPageSize(),
+                BytesLongSizeEvaluator.INSTANCE,
+                memoryManager.getIndexPageReplacementPolicy(),
+                new BytesLongStorage(storeName));
+        return new PagedPkSet(blink, () -> dropTempIndexQuietly(storeName));
+    }
+
+    /**
+     * Best-effort drop of a temporary index. Failures are logged but never
+     * propagated — the temp index leaking pages is preferable to letting a
+     * cleanup failure abort the surrounding operation.
+     */
+    private void dropTempIndexQuietly(String storeName) {
+        try {
+            dataStorageManager.dropIndex(tableSpaceUUID, storeName);
+        } catch (DataStorageManagerException e) {
+            LOGGER.log(Level.WARNING,
+                    "vector store " + indexName
+                            + ": failed to drop temp BLink storage " + storeName, e);
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // BLink data storage implementations
     // -------------------------------------------------------------------------
 
@@ -4672,7 +4832,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         }
         frozenShards = null;
-        pendingCheckpointDeletes = null;
+        closePendingCheckpointDeletesQuietly();
         liveVectorCapDuringCheckpoint = Integer.MAX_VALUE;
         CountDownLatch latch = this.checkpointPhaseComplete;
         if (latch != null) {

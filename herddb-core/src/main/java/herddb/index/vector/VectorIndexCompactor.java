@@ -29,9 +29,9 @@ import io.github.jbellis.jvector.vector.types.VectorFloat;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -181,76 +181,110 @@ final class VectorIndexCompactor {
     }
 
     /**
-     * Builds the PK authority map used by the live-PK filter. For every
-     * primary key observed across the input candidates, all later
-     * segments (segments with a strictly greater {@code generation}
-     * than the max candidate generation), and any live-shard index, the
-     * map records the highest-generation source.
+     * Populates the supplied {@link CompactionAuthorityMap} with the per-PK
+     * authority decisions used by the live-PK filter during a compaction
+     * cycle.
      *
-     * <p>During the rebuild the caller re-inserts a (PK, vector) pair
-     * iff the authority map's value for that PK resolves back to the
-     * same input candidate. Tombstoned or superseded vectors are
-     * silently dropped, reclaiming their storage.
+     * <p>The authority map is intentionally <em>candidate-only</em>: it stores
+     * one entry per primary key that appears in any of the {@code candidates},
+     * recording the highest-generation source of that PK across:
      *
-     * <p>{@code liveShardPks} is the set of PKs currently resident in
-     * any live shard; live shards are always the newest source, so
-     * their PKs dominate every segment.
+     * <ul>
+     *   <li>the candidates themselves (initial seed),</li>
+     *   <li>any non-candidate segment with strictly greater generation than
+     *       the max candidate generation that has the PK in its
+     *       {@code onDiskPkToNode} BLink,</li>
+     *   <li>the live in-memory shards, which always dominate (recorded with
+     *       {@link #LIVE_SHARD_SEGMENT_ID}).</li>
+     * </ul>
      *
-     * @return map {@code PK -> authoritative segment id}; a synthetic
-     *     segment id of {@link #LIVE_SHARD_SEGMENT_ID} marks PKs owned
-     *     by a live shard.
+     * <p>PKs that exist in newer segments or live shards but are <strong>not</strong>
+     * present in any candidate are deliberately omitted — they are irrelevant
+     * to the rebuild ({@link #populateSyntheticShard} only consults the map
+     * for candidate PKs). This is the key memory optimisation behind issue #290:
+     * the authority map is bounded by the candidate PK count (≈ tens of
+     * thousands per cycle) instead of the total PK count across all segments
+     * (which can reach hundreds of millions). Combined with the BLink-backed
+     * paged storage of {@code CompactionAuthorityMap}, total compaction
+     * heap pressure stops growing with the size of the index.
+     *
+     * <p>Older non-candidate segments are not consulted: candidates cover their
+     * own generation by construction and the merged output replaces them.
+     *
+     * <p>During the rebuild the caller re-inserts a (PK, vector) pair iff
+     * {@link CompactionAuthorityMap#getSegmentId} returns the candidate's own
+     * segment id. Tombstoned or superseded vectors are silently dropped,
+     * reclaiming their storage.
      */
-    static Map<Bytes, Integer> buildAuthorityMap(
+    static void buildAuthorityMap(
+            CompactionAuthorityMap authority,
             List<VectorSegment> candidates,
             List<VectorSegment> allSegments,
             Iterable<Bytes> liveShardPks) {
 
-        Map<Bytes, Long> winnerGeneration = new HashMap<>();
-        Map<Bytes, Integer> winnerSegment = new HashMap<>();
-
-        // Scan candidates first — their generation is the baseline.
+        // Step 1: seed the authority map with candidate PKs. This is the only
+        // bulk insertion we perform; its size is bounded by sum(candidate.size).
         for (VectorSegment seg : candidates) {
-            visitSegmentPks(seg, winnerGeneration, winnerSegment);
+            insertSegmentPks(seg, authority);
         }
 
-        // Scan segments that are newer than any candidate. Older or
-        // equal-generation segments are irrelevant for the authority
-        // decision — candidates already cover their own generation and
-        // the merged output will replace them.
+        // Step 2: walk newer non-candidate segments and update the authority
+        // entries for any PK that ALSO appears in a candidate. We avoid
+        // materialising newer-segment PKs into the BLink: each candidate PK
+        // is looked up against each newer segment's onDiskPkToNode BLink (the
+        // same paged structure already used by deletePk), and only on a hit
+        // do we update the authority map. This is O(|candidate PKs| × |newer
+        // segments|) BLink searches in the worst case, which is far cheaper
+        // than the previous O(|all PKs|) HashMap inserts and — crucially —
+        // does not materialise any per-PK Bytes object outside the inner
+        // BLink lookups.
         long maxCandidateGeneration = 0L;
+        Set<Integer> candidateIds = new HashSet<>(candidates.size() * 2);
         for (VectorSegment seg : candidates) {
             if (seg.generation > maxCandidateGeneration) {
                 maxCandidateGeneration = seg.generation;
             }
+            candidateIds.add(seg.segmentId);
         }
+        List<VectorSegment> newerSegments = new ArrayList<>();
         for (VectorSegment seg : allSegments) {
-            if (seg.generation > maxCandidateGeneration && !candidates.contains(seg)) {
-                visitSegmentPks(seg, winnerGeneration, winnerSegment);
+            if (seg.generation > maxCandidateGeneration && !candidateIds.contains(seg.segmentId)) {
+                newerSegments.add(seg);
+            }
+        }
+        // Sort newer segments by generation descending: the first hit during
+        // the lookup loop is the authoritative one, and we can short-circuit.
+        newerSegments.sort(Comparator.comparingLong((VectorSegment s) -> s.generation).reversed());
+
+        if (!newerSegments.isEmpty()) {
+            for (VectorSegment cand : candidates) {
+                checkSupersessionForCandidate(cand, newerSegments, authority);
             }
         }
 
-        // Live shards always dominate — they hold the newest state.
+        // Step 3: live shards always dominate any PK they hold. Walk the
+        // live-shard PK iterator once and update only entries that are
+        // already in the authority map.
         if (liveShardPks != null) {
             for (Bytes pk : liveShardPks) {
-                winnerGeneration.put(pk, Long.MAX_VALUE);
-                winnerSegment.put(pk, LIVE_SHARD_SEGMENT_ID);
+                if (authority.getSegmentId(pk) != null) {
+                    authority.updateIfHigherGeneration(pk,
+                            CompactionAuthorityMap.LIVE_SHARD_GENERATION_MARKER,
+                            LIVE_SHARD_SEGMENT_ID);
+                }
             }
         }
-
-        return winnerSegment;
     }
 
     /**
-     * Synthetic segment id returned by {@link #buildAuthorityMap} when
-     * the authoritative source for a PK is a live in-memory shard.
+     * Synthetic segment id returned by {@link CompactionAuthorityMap#getSegmentId}
+     * when the authoritative source for a PK is a live in-memory shard.
      * Any real {@link VectorSegment} id is non-negative; this sentinel
      * is {@code -1} so callers can check with {@code ownerId < 0}.
      */
     static final int LIVE_SHARD_SEGMENT_ID = -1;
 
-    private static void visitSegmentPks(VectorSegment seg,
-                                        Map<Bytes, Long> winnerGeneration,
-                                        Map<Bytes, Integer> winnerSegment) {
+    private static void insertSegmentPks(VectorSegment seg, CompactionAuthorityMap authority) {
         int[] offsets = seg.pkOffsets;
         int[] lengths = seg.pkLengths;
         byte[] data = seg.pkData;
@@ -258,16 +292,52 @@ final class VectorIndexCompactor {
             return;
         }
         long gen = seg.generation;
+        int segmentId = seg.segmentId;
         for (int ord = 0; ord < offsets.length; ord++) {
             int off = offsets[ord];
             if (off < 0) {
                 continue; // tombstoned — not a candidate for re-insert.
             }
             Bytes pk = Bytes.from_array(data, off, lengths[ord]);
-            Long existing = winnerGeneration.get(pk);
-            if (existing == null || gen > existing) {
-                winnerGeneration.put(pk, gen);
-                winnerSegment.put(pk, seg.segmentId);
+            authority.updateIfHigherGeneration(pk, gen, segmentId);
+        }
+    }
+
+    /**
+     * For each authoritative candidate PK in {@code cand}, looks the PK up
+     * in every newer segment's {@code onDiskPkToNode} BLink and, on the first
+     * hit (newer segments are sorted highest-generation-first), updates the
+     * authority map to record that newer segment as the winner.
+     *
+     * <p>This is the BLink-driven supersession check that replaces the
+     * previous bulk PK iteration over non-candidate segments.
+     */
+    private static void checkSupersessionForCandidate(VectorSegment cand,
+                                                      List<VectorSegment> newerSegmentsDesc,
+                                                      CompactionAuthorityMap authority) {
+        int[] offsets = cand.pkOffsets;
+        int[] lengths = cand.pkLengths;
+        byte[] data = cand.pkData;
+        if (offsets == null || data == null || lengths == null) {
+            return;
+        }
+        for (int ord = 0; ord < offsets.length; ord++) {
+            int off = offsets[ord];
+            if (off < 0) {
+                continue;
+            }
+            Bytes pk = Bytes.from_array(data, off, lengths[ord]);
+            for (VectorSegment newerSeg : newerSegmentsDesc) {
+                herddb.index.blink.BLink<Bytes, Long> p2n = newerSeg.onDiskPkToNode;
+                if (p2n == null) {
+                    continue;
+                }
+                if (p2n.search(pk) != null) {
+                    // Found the authoritative newer segment — update and
+                    // short-circuit since later segments have lower generation.
+                    authority.updateIfHigherGeneration(pk, newerSeg.generation, newerSeg.segmentId);
+                    break;
+                }
             }
         }
     }
@@ -340,7 +410,7 @@ final class VectorIndexCompactor {
     static RebuildResult rebuildSegment(
             PersistentVectorStore store,
             List<VectorSegment> candidates,
-            Map<Bytes, Integer> authority)
+            CompactionAuthorityMap authority)
             throws CompactionException, IOException, DataStorageManagerException {
 
         int dim = store.compactionDimension();
@@ -368,7 +438,7 @@ final class VectorIndexCompactor {
                     continue;
                 }
                 Bytes pk = Bytes.from_array(data, off, lengths[ord]);
-                Integer owner = authority.get(pk);
+                Integer owner = authority.getSegmentId(pk);
                 if (owner == null || owner != seg.segmentId) {
                     filteredCount++;
                 } else {
@@ -484,7 +554,7 @@ final class VectorIndexCompactor {
     private static void populateSyntheticShard(
             PersistentVectorStore store,
             List<VectorSegment> candidates,
-            Map<Bytes, Integer> authority,
+            CompactionAuthorityMap authority,
             PersistentVectorStore.LiveGraphShard syntheticShard,
             AtomicInteger localOrdCounter) throws CompactionException {
 
@@ -515,7 +585,7 @@ final class VectorIndexCompactor {
                         continue;
                     }
                     Bytes pk = Bytes.from_array(data, off, lengths[ord]);
-                    Integer owner = authority.get(pk);
+                    Integer owner = authority.getSegmentId(pk);
                     if (owner == null || owner != seg.segmentId) {
                         continue;
                     }
