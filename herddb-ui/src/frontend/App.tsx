@@ -22,7 +22,7 @@ import { TablespaceProvider } from './contexts/TablespaceContext';
 import { DashboardPage } from './pages/DashboardPage';
 import { DataPagesPage } from './pages/DataPagesPage';
 import { IndexDetailPage } from './pages/IndexDetailPage';
-import { PlaceholderPage } from './pages/PlaceholderPage';
+import { IndexingServicesPage } from './pages/IndexingServicesPage';
 import { PrimaryIndexPage } from './pages/PrimaryIndexPage';
 import { TableDetailPage } from './pages/TableDetailPage';
 import { TablesPage } from './pages/TablesPage';
@@ -58,12 +58,7 @@ export default function App() {
                     />
                     <Route
                         path="/indexing-services"
-                        element={
-                            <PlaceholderPage
-                                title="Indexing services"
-                                phase="phase 5 (indexing services view)"
-                            />
-                        }
+                        element={<IndexingServicesPage />}
                     />
                     <Route
                         path="*"

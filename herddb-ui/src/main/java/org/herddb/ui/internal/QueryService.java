@@ -45,7 +45,7 @@ import java.util.Map;
  * Column keys are lower-cased to match the convention used by the {@code sys*}
  * table managers.
  */
-public final class QueryService {
+public class QueryService {
 
     private static final int DEFAULT_MAX_ROWS = 10_000;
 

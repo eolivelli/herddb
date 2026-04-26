@@ -131,6 +131,27 @@ export interface IndexDetailDTO {
     blocks: BrinBlockDTO[];
 }
 
+export interface IndexingServiceIndexDTO {
+    tablespace: string;
+    tableName: string;
+    indexName: string;
+    indexType: string;
+    indexUuid: string;
+    status: string | null;
+    vectorCount: number;
+    segmentCount: number;
+    lastLsnLedger: number;
+    lastLsnOffset: number;
+    rawProperties: string | null;
+    error: string | null;
+}
+
+export interface IndexingServicesOverviewDTO {
+    totalIndexes: number;
+    totalVectorCount: number;
+    indexes: IndexingServiceIndexDTO[];
+}
+
 /**
  * Builds a fully qualified URL for the v2 REST API. In production the
  * SPA is served at `/ui/` so `apiUrl('/health')` resolves to
@@ -200,6 +221,14 @@ export const HerdDbApi = {
     ): Promise<IndexDetailDTO> {
         return request<IndexDetailDTO>(
             `/tablespaces/${encodeURIComponent(tablespace)}/tables/${encodeURIComponent(table)}/indexes/${encodeURIComponent(index)}`,
+        );
+    },
+    listIndexingServices(): Promise<IndexingServicesOverviewDTO> {
+        return request<IndexingServicesOverviewDTO>('/indexing-services');
+    },
+    getIndexingService(name: string): Promise<IndexingServiceIndexDTO> {
+        return request<IndexingServiceIndexDTO>(
+            `/indexing-services/${encodeURIComponent(name)}`,
         );
     },
 };
