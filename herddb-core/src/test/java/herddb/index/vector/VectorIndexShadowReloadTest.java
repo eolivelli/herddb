@@ -81,7 +81,7 @@ public class VectorIndexShadowReloadTest {
                 Long.MAX_VALUE,
                 io.github.jbellis.jvector.vector.VectorSimilarityFunction.COSINE,
                 Long.MAX_VALUE);
-        leader.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, 0);
+        leader.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, Integer.MAX_VALUE, 0);
         leader.start();
 
         try {
@@ -139,7 +139,7 @@ public class VectorIndexShadowReloadTest {
                 Long.MAX_VALUE,
                 io.github.jbellis.jvector.vector.VectorSimilarityFunction.COSINE,
                 Long.MAX_VALUE);
-        leader.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, 0);
+        leader.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, Integer.MAX_VALUE, 0);
         leader.start();
 
         PersistentVectorStore shadow = new PersistentVectorStore(

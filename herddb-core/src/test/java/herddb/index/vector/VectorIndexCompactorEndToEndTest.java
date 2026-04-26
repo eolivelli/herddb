@@ -79,6 +79,7 @@ public class VectorIndexCompactorEndToEndTest {
                 /*minBytes*/ 1L,
                 /*maxBytes*/ Long.MAX_VALUE,
                 /*minCount*/ 4,
+                /*maxCount*/ Integer.MAX_VALUE,
                 /*retentionMs*/ 0);
         return store;
     }

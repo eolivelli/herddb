@@ -143,12 +143,17 @@ final class VectorIndexCompactor {
      *   <li>a minimum total-size threshold ({@code minTotalBytes});</li>
      *   <li>a hard per-run byte cap ({@code maxTotalBytes}) to bound
      *       temporary write amplification;</li>
+     *   <li>a count-based secondary trigger ({@code maxCount}): if the
+     *       picked set reaches {@code maxCount} segments the byte
+     *       threshold is waived and compaction fires regardless — this
+     *       prevents unbounded segment accumulation when many small shards
+     *       are produced during tailing catch-up (issue #285);</li>
      *   <li>smallest-first ordering to maximise the contraction ratio
      *       and avoid rewriting already-large segments.</li>
      * </ul>
      *
-     * <p>Returns an empty list when either the count or size thresholds
-     * are not met, signalling that compaction should not fire yet.
+     * <p>Returns an empty list when neither the byte threshold nor the
+     * count trigger is satisfied.
      *
      * <p>Package-private for unit tests.
      */
@@ -156,7 +161,8 @@ final class VectorIndexCompactor {
             List<VectorSegment> candidates,
             int minCount,
             long minTotalBytes,
-            long maxTotalBytes) {
+            long maxTotalBytes,
+            int maxCount) {
         if (candidates == null || candidates.size() < minCount) {
             return new ArrayList<>();
         }
@@ -174,10 +180,19 @@ final class VectorIndexCompactor {
             total += seg.estimatedSizeBytes;
         }
 
-        if (picked.size() < minCount || total < minTotalBytes) {
-            return new ArrayList<>();
+        // Standard byte-threshold trigger.
+        if (picked.size() >= minCount && total >= minTotalBytes) {
+            return picked;
         }
-        return picked;
+        // Count-based trigger (issue #285): fire even if the byte threshold
+        // is not met when too many segments have accumulated.  This guards
+        // against the scenario where every segment is individually small
+        // (e.g. catch-up with tiny shards) and the sum never reaches
+        // minTotalBytes despite hundreds of segments building up.
+        if (picked.size() >= maxCount) {
+            return picked;
+        }
+        return new ArrayList<>();
     }
 
     /**
