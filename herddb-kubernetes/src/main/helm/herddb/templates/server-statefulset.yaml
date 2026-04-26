@@ -114,8 +114,10 @@ spec:
             {{- end }}
             - name: data
               mountPath: /opt/herddb/data
+            {{- if eq .Values.server.storageMode "local" }}
             - name: commitlog
               mountPath: /opt/herddb/commitlog
+            {{- end }}
       volumes:
         - name: server-config
           configMap:
@@ -131,6 +133,7 @@ spec:
         resources:
           requests:
             storage: {{ .Values.server.storage.data.size }}
+    {{- if eq .Values.server.storageMode "local" }}
     - metadata:
         name: commitlog
       spec:
@@ -141,3 +144,4 @@ spec:
         resources:
           requests:
             storage: {{ .Values.server.storage.commitlog.size }}
+    {{- end }}

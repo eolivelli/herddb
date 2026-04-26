@@ -46,6 +46,10 @@ server:
     data:
       size: 10Gi
       storageClass: ""
+    # commitlog PVC is only provisioned when storageMode: local.
+    # When storageMode: remote (the default), HerdDB uses BookKeeper as its
+    # write-ahead log and the local commitlog directory is not written to,
+    # so no PVC is created.
     commitlog:
       size: 5Gi
       storageClass: ""
