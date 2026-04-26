@@ -269,6 +269,7 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                         .setIndex(nullToEmpty(d.getIndex()))
                         .setVectorCount(d.getVectorCount())
                         .setStatus(nullToEmpty(d.getStatus()))
+                        .setSegmentCount(d.getSegmentCount())
                         .build());
             }
             responseObserver.onNext(builder.build());

@@ -95,7 +95,7 @@ public class Issue282ConcurrentRotationTest {
                 /*fusedPQ=*/true, /*maxSegmentSize=*/2_000_000_000L,
                 /*maxLiveGraphSize=*/shardCap,
                 Long.MAX_VALUE);
-        store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, 0);
+        store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, Integer.MAX_VALUE, 0);
         return store;
     }
 

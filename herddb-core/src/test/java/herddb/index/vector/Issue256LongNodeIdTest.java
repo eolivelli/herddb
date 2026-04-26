@@ -72,7 +72,7 @@ public class Issue256LongNodeIdTest {
                 tmpDir, dsm, mm,
                 16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
                 Long.MAX_VALUE);
-        store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, 0);
+        store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, Integer.MAX_VALUE, 0);
         return store;
     }
 
@@ -186,7 +186,7 @@ public class Issue256LongNodeIdTest {
                 Long.MAX_VALUE,
                 io.github.jbellis.jvector.vector.VectorSimilarityFunction.COSINE,
                 Long.MAX_VALUE, null, 0, 0)) {
-            store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, 0);
+            store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, Integer.MAX_VALUE, 0);
             store.start();
             store.seedNextNodeIdForTest(seeded);
 
@@ -209,7 +209,7 @@ public class Issue256LongNodeIdTest {
                 Long.MAX_VALUE,
                 io.github.jbellis.jvector.vector.VectorSimilarityFunction.COSINE,
                 Long.MAX_VALUE, null, 0, 0)) {
-            reloaded.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, 0);
+            reloaded.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, Integer.MAX_VALUE, 0);
             reloaded.start();
             long reloadedCounter = reloaded.getNextNodeId();
             assertTrue("reloaded nextNodeId must be > Integer.MAX_VALUE (saw "

@@ -113,7 +113,7 @@ public class CompactionAuthorityMapCleanupTest {
                 16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
                 Long.MAX_VALUE);
         // Aggressive compaction policy: any segment count >= 4 with any size triggers a cycle.
-        store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, 0);
+        store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 4, Integer.MAX_VALUE, 0);
         return store;
     }
 
@@ -210,7 +210,7 @@ public class CompactionAuthorityMapCleanupTest {
             // Raise the min-segment-count threshold above any segment count
             // we'll reach so the cycle returns early.
             store.start();
-            store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 1000, 0);
+            store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 1000, Integer.MAX_VALUE, 0);
 
             // No segments at all => candidates.isEmpty() => early return.
             int initBefore = dsm.initCallsCmpaut.get();

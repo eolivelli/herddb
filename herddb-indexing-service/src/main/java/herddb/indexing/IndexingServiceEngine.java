@@ -405,6 +405,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final long vectorCompactionRetentionMs = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_RETENTION_MS,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_RETENTION_MS_DEFAULT);
+            final int vectorCompactionMaxCount = config.getInt(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_COUNT,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_COUNT_DEFAULT);
             final long maxLiveBytesPerCheckpoint = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT,
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT);
@@ -483,6 +486,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         vectorCompactionMinBytes,
                         vectorCompactionMaxBytes,
                         /*minCount*/ 4,
+                        vectorCompactionMaxCount,
                         vectorCompactionRetentionMs);
                 try {
                     store.start();
@@ -1571,7 +1575,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             AbstractVectorStore store = vectorStores.get(storeKey(idx.table, idx.name));
             long vectorCount = store != null ? store.size() : 0;
             String status = store != null ? "tailing" : "missing";
-            out.add(new IndexDescriptor(idx.tablespace, idx.table, idx.name, vectorCount, status));
+            int segmentCount = (store instanceof PersistentVectorStore)
+                    ? ((PersistentVectorStore) store).getSegmentCount()
+                    : (store != null ? 1 : 0);
+            out.add(new IndexDescriptor(idx.tablespace, idx.table, idx.name, vectorCount, status, segmentCount));
         }
         return out;
     }
@@ -2642,13 +2649,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         private final String index;
         private final long vectorCount;
         private final String status;
+        private final int segmentCount;
 
-        public IndexDescriptor(String tablespace, String table, String index, long vectorCount, String status) {
+        public IndexDescriptor(String tablespace, String table, String index,
+                               long vectorCount, String status, int segmentCount) {
             this.tablespace = tablespace;
             this.table = table;
             this.index = index;
             this.vectorCount = vectorCount;
             this.status = status;
+            this.segmentCount = segmentCount;
         }
 
         public String getTablespace() {
@@ -2669,6 +2679,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
         public String getStatus() {
             return status;
+        }
+
+        public int getSegmentCount() {
+            return segmentCount;
         }
     }
 

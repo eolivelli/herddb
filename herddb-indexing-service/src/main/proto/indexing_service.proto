@@ -83,6 +83,9 @@ message IndexDescriptor {
     string index = 3;
     int64 vector_count = 4;
     string status = 5;
+    // Number of on-disk segments held by the vector index.
+    // Populated from PersistentVectorStore.getSegmentCount() (issue #285).
+    int32 segment_count = 6;
 }
 
 message ListIndexesRequest {

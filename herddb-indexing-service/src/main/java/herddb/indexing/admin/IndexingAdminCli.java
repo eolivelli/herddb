@@ -242,12 +242,12 @@ public final class IndexingAdminCli {
                 if (response.getIndexesCount() == 0) {
                     out.println("(no indexes loaded on this instance)");
                 } else {
-                    out.printf(Locale.ROOT, "%-20s %-20s %-20s %12s %-10s%n",
-                            "TABLESPACE", "TABLE", "INDEX", "VECTORS", "STATUS");
+                    out.printf(Locale.ROOT, "%-20s %-20s %-20s %12s %8s %-10s%n",
+                            "TABLESPACE", "TABLE", "INDEX", "VECTORS", "SEGMENTS", "STATUS");
                     for (IndexDescriptor d : response.getIndexesList()) {
-                        out.printf(Locale.ROOT, "%-20s %-20s %-20s %12d %-10s%n",
+                        out.printf(Locale.ROOT, "%-20s %-20s %-20s %12d %8d %-10s%n",
                                 d.getTablespace(), d.getTable(), d.getIndex(),
-                                d.getVectorCount(), d.getStatus());
+                                d.getVectorCount(), d.getSegmentCount(), d.getStatus());
                     }
                 }
             }
@@ -482,6 +482,7 @@ public final class IndexingAdminCli {
         m.put("table", d.getTable());
         m.put("index", d.getIndex());
         m.put("vector_count", d.getVectorCount());
+        m.put("segment_count", d.getSegmentCount());
         m.put("status", d.getStatus());
         return m;
     }

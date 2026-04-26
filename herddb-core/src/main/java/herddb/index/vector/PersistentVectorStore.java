@@ -414,7 +414,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private volatile long vectorIndexCompactionMinBytes = 256L * 1024 * 1024;
     private volatile long vectorIndexCompactionMaxBytes = 1024L * 1024 * 1024;
     private volatile int vectorIndexCompactionMinCount = 4;
+    /**
+     * Count-based compaction trigger (issue #285): fire compaction when the
+     * segment count reaches this ceiling, even if the total-byte threshold
+     * has not been met.  Prevents unbounded segment accumulation during
+     * tailing catch-up when each checkpoint produces many small segments.
+     */
+    private volatile int vectorIndexCompactionMaxCount = 200;
     private volatile long vectorIndexCompactionRetentionMs = 10L * 60_000L;
+
+    /**
+     * Log a WARNING during Phase A when the total on-disk segment count
+     * exceeds this threshold, making runaway accumulation visible without
+     * having to parse checkpoint log lines.
+     */
+    static final int COMPACTION_SEGMENT_COUNT_WARN_THRESHOLD = 50;
 
     // Compaction metrics
     final AtomicLong compactionRunsTotal = new AtomicLong();
@@ -1289,11 +1303,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * re-tune a running store.
      */
     public void configureCompaction(long intervalMs, long minBytes, long maxBytes,
-                                    int minCount, long retentionMs) {
+                                    int minCount, int maxCount, long retentionMs) {
         this.vectorIndexCompactionIntervalMs = intervalMs;
         this.vectorIndexCompactionMinBytes = minBytes;
         this.vectorIndexCompactionMaxBytes = maxBytes;
         this.vectorIndexCompactionMinCount = minCount;
+        this.vectorIndexCompactionMaxCount = maxCount;
         this.vectorIndexCompactionRetentionMs = retentionMs;
     }
 
@@ -1513,8 +1528,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     snapshot,
                     vectorIndexCompactionMinCount,
                     vectorIndexCompactionMinBytes,
-                    vectorIndexCompactionMaxBytes);
+                    vectorIndexCompactionMaxBytes,
+                    vectorIndexCompactionMaxCount);
             if (candidates.isEmpty()) {
+                if (snapshot.size() >= COMPACTION_SEGMENT_COUNT_WARN_THRESHOLD) {
+                    LOGGER.log(Level.WARNING,
+                            "vector store {0}: {1} segments accumulated but neither byte "
+                                    + "threshold ({2} bytes) nor count trigger ({3} segments) "
+                                    + "fired; consider lowering vector.index.compaction.minBytes "
+                                    + "or vector.index.compaction.maxCount",
+                            new Object[]{indexName, snapshot.size(),
+                                    vectorIndexCompactionMinBytes,
+                                    vectorIndexCompactionMaxCount});
+                }
                 return;
             }
 
@@ -2752,6 +2778,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // demote the smallest sealed segments back to the mergeable pool so
             // the upcoming Phase B compacts them into larger segments.
             demoteSmallestSealedSegments(sealedSegments, mergeableSegments);
+
+            // Warn when the total on-disk segment count is unusually high.
+            // This makes runaway accumulation (issue #285) visible in the logs
+            // without needing to inspect checkpoint detail lines.
+            int totalOnDiskSegments = sealedSegments.size() + mergeableSegments.size();
+            if (totalOnDiskSegments > COMPACTION_SEGMENT_COUNT_WARN_THRESHOLD) {
+                LOGGER.log(Level.WARNING,
+                        "checkpoint {0} Phase A: high on-disk segment count: {1} segments "
+                                + "({2} sealed + {3} mergeable); graph-merge compaction "
+                                + "may not be keeping up",
+                        new Object[]{indexName, totalOnDiskSegments,
+                                sealedSegments.size(), mergeableSegments.size()});
+            }
 
             this.frozenShards = snapshotShards;
             // Use a BLink-paged PK set so memory stays bounded even when

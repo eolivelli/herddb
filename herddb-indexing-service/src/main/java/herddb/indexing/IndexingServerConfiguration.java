@@ -151,6 +151,18 @@ public final class IndexingServerConfiguration {
             1024L * 1024 * 1024; // 1 GB
 
     /**
+     * Count-based compaction trigger (issue #285): fire compaction when the
+     * on-disk segment count reaches this ceiling, even if the total byte
+     * threshold ({@link #PROPERTY_VECTOR_INDEX_COMPACTION_MIN_BYTES}) has not
+     * been met. Prevents unbounded segment accumulation during tailing
+     * catch-up when each checkpoint produces many small segments.
+     * Set to {@code Integer.MAX_VALUE} to disable the count trigger entirely.
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_MAX_COUNT =
+            "vector.index.compaction.maxCount";
+    public static final int PROPERTY_VECTOR_INDEX_COMPACTION_MAX_COUNT_DEFAULT = 200;
+
+    /**
      * How long old segment files remain on-disk after a compaction swap
      * before the reaper may physically delete them. Also gated by
      * {@code shadowAckedGeneration}: reclaim waits for the later of the
