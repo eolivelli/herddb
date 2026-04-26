@@ -137,6 +137,8 @@
                         <exclude>**/node_modules/**</exclude>
                         <exclude>package-lock.json</exclude>
                         <exclude>**/package-lock.json</exclude>
+                        <!-- TypeScript incremental build cache -->
+                        <exclude>**/*.tsbuildinfo</exclude>
                     </excludes>
                 </configuration>
             </plugin>
@@ -205,7 +207,21 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-war-plugin</artifactId>
                 <version>3.2.3</version>
-
+                <configuration>
+                    <!--
+                        Overlay the Vite-built SPA (target/web-build/spa)
+                        on top of src/main/webapp (which only carries
+                        WEB-INF/web.xml). frontend-maven-plugin runs
+                        `npm run build` during generate-resources, so the
+                        target/web-build/spa directory exists by the time
+                        war:war runs.
+                    -->
+                    <webResources>
+                        <resource>
+                            <directory>${project.build.directory}/web-build/spa</directory>
+                        </resource>
+                    </webResources>
+                </configuration>
                 <executions>
                     <execution>
                         <id>create-war-no-libs</id>
@@ -216,6 +232,11 @@
                             <packagingExcludes>WEB-INF/lib/*.jar,WEB-INF/classes/**/*</packagingExcludes>
                             <attachClasses>true</attachClasses>
                             <classifier>war-no-libs</classifier>
+                            <webResources>
+                                <resource>
+                                    <directory>${project.build.directory}/web-build/spa</directory>
+                                </resource>
+                            </webResources>
                         </configuration>
                     </execution>
                 </executions>

@@ -1,0 +1,195 @@
+/*
+ * Licensed to Diennea S.r.l. under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. Diennea S.r.l. licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+:root {
+    --herd-bg: #0f172a;
+    --herd-panel: #1e293b;
+    --herd-text: #e2e8f0;
+    --herd-muted: #94a3b8;
+    --herd-accent: #38bdf8;
+    --herd-accent-strong: #0ea5e9;
+    --herd-error: #ef4444;
+    --herd-border: #334155;
+    --herd-success: #4ade80;
+    --herd-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+        'Liberation Mono', 'Courier New', monospace;
+}
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+    height: 100%;
+    margin: 0;
+}
+
+body {
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    background: var(--herd-bg);
+    color: var(--herd-text);
+    line-height: 1.45;
+}
+
+#root {
+    display: flex;
+    flex-direction: column;
+}
+
+.herd-header {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    padding: 0.75rem 1.25rem;
+    background: var(--herd-panel);
+    border-bottom: 1px solid var(--herd-border);
+}
+
+.herd-header__brand {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    font-size: 1.1rem;
+}
+
+.herd-header__brand-tag {
+    color: var(--herd-muted);
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.herd-header__nav {
+    display: flex;
+    gap: 1rem;
+    margin-right: auto;
+}
+
+.herd-header__nav a {
+    color: var(--herd-muted);
+    text-decoration: none;
+    padding: 0.25rem 0.5rem;
+    border-radius: 0.25rem;
+}
+
+.herd-header__nav a.active,
+.herd-header__nav a:hover {
+    color: var(--herd-text);
+    background: rgba(56, 189, 248, 0.1);
+}
+
+.herd-header__meta {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    font-size: 0.9rem;
+    color: var(--herd-muted);
+}
+
+.herd-header__node {
+    font-family: var(--herd-mono);
+}
+
+.herd-selector {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.herd-selector__label {
+    color: var(--herd-muted);
+    font-size: 0.85rem;
+}
+
+.herd-selector select {
+    background: var(--herd-bg);
+    color: var(--herd-text);
+    border: 1px solid var(--herd-border);
+    border-radius: 0.25rem;
+    padding: 0.25rem 0.5rem;
+    font-family: var(--herd-mono);
+}
+
+.herd-selector--loading,
+.herd-selector--error {
+    font-size: 0.85rem;
+}
+
+.herd-selector--error {
+    color: var(--herd-error);
+}
+
+.herd-main {
+    flex: 1;
+    padding: 1.5rem;
+    max-width: 1280px;
+    width: 100%;
+    margin: 0 auto;
+}
+
+.herd-page h1 {
+    margin-top: 0;
+    font-size: 1.5rem;
+}
+
+.herd-page__hint {
+    color: var(--herd-muted);
+    font-size: 0.9rem;
+}
+
+.herd-error {
+    color: var(--herd-error);
+}
+
+.herd-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 1rem;
+}
+
+.herd-table th,
+.herd-table td {
+    text-align: left;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--herd-border);
+}
+
+.herd-table th {
+    color: var(--herd-muted);
+    font-weight: 600;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.herd-table tr:hover td {
+    background: rgba(56, 189, 248, 0.04);
+}
+
+.herd-footer {
+    padding: 0.75rem 1.25rem;
+    color: var(--herd-muted);
+    font-size: 0.8rem;
+    border-top: 1px solid var(--herd-border);
+}

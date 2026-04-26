@@ -53,6 +53,7 @@ public class ApplicationConfigV2 extends ResourceConfig {
         register(JacksonFeature.class);
         register(HealthResource.class);
         register(TablespacesResource.class);
+        register(ServerInfoResource.class);
         register(new ServerLocatorBinder());
     }
 

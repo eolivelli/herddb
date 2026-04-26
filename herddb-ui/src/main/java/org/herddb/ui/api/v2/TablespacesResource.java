@@ -28,7 +28,9 @@ import java.util.List;
 import java.util.Map;
 import javax.inject.Inject;
 import javax.ws.rs.GET;
+import javax.ws.rs.NotFoundException;
 import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
 import javax.ws.rs.Produces;
 import javax.ws.rs.WebApplicationException;
 import javax.ws.rs.core.MediaType;
@@ -92,6 +94,28 @@ public class TablespacesResource {
             out.add(toDto(row));
         }
         return out;
+    }
+
+    @GET
+    @Path("{name}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public TablespaceDTO get(@PathParam("name") String name) {
+        if (name == null || name.isEmpty()) {
+            throw new WebApplicationException(
+                    "tablespace name cannot be empty",
+                    Response.Status.BAD_REQUEST);
+        }
+        // Reuse list() and filter in Java; the systablespaces virtual table
+        // is small (one row per tablespace) so this is cheap and avoids the
+        // SQL-injection surface that would come with embedding the path
+        // segment into the WHERE clause.
+        List<TablespaceDTO> all = list();
+        for (TablespaceDTO ts : all) {
+            if (name.equals(ts.getName())) {
+                return ts;
+            }
+        }
+        throw new NotFoundException("No tablespace named '" + name + "'");
     }
 
     private static TablespaceDTO toDto(Map<String, Object> row) {

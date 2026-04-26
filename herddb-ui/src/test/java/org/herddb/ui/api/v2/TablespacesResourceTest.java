@@ -20,11 +20,15 @@
 
 package org.herddb.ui.api.v2;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import herddb.model.TableSpace;
 import java.util.List;
+import javax.ws.rs.NotFoundException;
+import javax.ws.rs.WebApplicationException;
 import org.herddb.ui.dto.TablespaceDTO;
 import org.herddb.ui.internal.QueryService;
 import org.junit.Rule;
@@ -69,5 +73,35 @@ public class TablespacesResourceTest {
         assertTrue(
                 "expectedReplicaCount must be >= 1, got " + defaultTs.getExpectedReplicaCount(),
                 defaultTs.getExpectedReplicaCount() >= 1);
+    }
+
+    @Test
+    public void getReturnsSingleTablespaceByName() {
+        TablespacesResource resource = new TablespacesResource(
+                new QueryService(serverRule.getServer()));
+
+        TablespaceDTO ts = resource.get(TableSpace.DEFAULT);
+
+        assertNotNull("get(name) must not return null", ts);
+        assertEquals(TableSpace.DEFAULT, ts.getName());
+    }
+
+    @Test
+    public void getReturns404ForUnknownName() {
+        TablespacesResource resource = new TablespacesResource(
+                new QueryService(serverRule.getServer()));
+
+        assertThrows(NotFoundException.class, () -> resource.get("does-not-exist"));
+    }
+
+    @Test
+    public void getRejectsBlankName() {
+        TablespacesResource resource = new TablespacesResource(
+                new QueryService(serverRule.getServer()));
+
+        WebApplicationException ex = assertThrows(
+                WebApplicationException.class,
+                () -> resource.get(""));
+        assertEquals(400, ex.getResponse().getStatus());
     }
 }

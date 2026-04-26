@@ -111,6 +111,7 @@ public class HealthResourceHttpSmokeTest extends JerseyTest {
         resourceConfig.register(JacksonFeature.class);
         resourceConfig.register(HealthResource.class);
         resourceConfig.register(TablespacesResource.class);
+        resourceConfig.register(ServerInfoResource.class);
         resourceConfig.register(new AbstractBinder() {
             @Override
             protected void configure() {
@@ -150,6 +151,28 @@ public class HealthResourceHttpSmokeTest extends JerseyTest {
             assertTrue(
                     "response body must contain the default tablespace name, got: " + json,
                     json.contains("\"name\":\"herd\""));
+        } finally {
+            response.close();
+        }
+    }
+
+    @Test
+    public void serverInfoEndpointReturnsNodeIdAndMode() {
+        WebTarget target = target("server-info");
+        Response response = target.request(MediaType.APPLICATION_JSON).get();
+        try {
+            assertEquals(200, response.getStatus());
+            String json = response.readEntity(String.class);
+            assertNotNull(json);
+            assertTrue(
+                    "response body must contain the node id, got: " + json,
+                    json.contains("\"nodeId\":\"" + embeddedServer.getNodeId() + "\""));
+            assertTrue(
+                    "response body must contain mode local, got: " + json,
+                    json.contains("\"mode\":\"local\""));
+            assertTrue(
+                    "response body must contain default tablespace herd, got: " + json,
+                    json.contains("\"defaultTablespace\":\"herd\""));
         } finally {
             response.close();
         }

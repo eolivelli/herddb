@@ -2,9 +2,30 @@
   "name": "herddb-ui",
   "version": "0.0.0",
   "private": true,
-  "description": "HerdDB Web UI (v2) — placeholder; real frontend introduced in phase 2.",
+  "description": "HerdDB Web UI v2 — React + TypeScript SPA built with Vite.",
+  "type": "module",
   "scripts": {
-    "build": "echo \"[herddb-ui] phase-0 placeholder build — real Vite build added in phase 2\" && mkdir -p target/web-build && echo placeholder > target/web-build/PHASE0.txt",
-    "test": "echo \"[herddb-ui] phase-0 placeholder test — real Vitest suite added in phase 2\""
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "lint": "tsc -b --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.27.0"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.5.0",
+    "@testing-library/react": "^16.0.1",
+    "@testing-library/user-event": "^14.5.2",
+    "@types/react": "^18.3.10",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "jsdom": "^25.0.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.7",
+    "vitest": "^2.1.1"
   }
 }
