@@ -3213,9 +3213,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * <p>When {@link #pqCodebookRetrainingInterval} is {@code > 0} and a
      * compatible codebook is cached (same dimension, fewer than
      * {@code pqCodebookRetrainingInterval} segments written since the last
-     * training), the cached codebook is returned immediately. Otherwise a new
-     * codebook is trained via K-Means, stored in {@link #cachedPQ}, the counter
-     * is reset, and the newly trained codebook is returned.
+     * training), the cached codebook is returned immediately.
+     *
+     * <p>When retraining is needed and a cached codebook with a matching dimension
+     * exists, {@link ProductQuantization#refine(RandomAccessVectorValues)} is used
+     * instead of a full {@link ProductQuantization#compute} call.  {@code refine}
+     * warm-starts from the existing centroids and runs a single Lloyd's iteration,
+     * which is sufficient when the vector distribution changes slowly between
+     * retraining intervals (typical for streaming ingestion workloads).  This
+     * reduces K-Means iteration count from {@link ProductQuantization#K_MEANS_ITERATIONS}
+     * (default 6) to 1, cutting per-retraining CPU and allocation cost by ~6×.
+     *
+     * <p>When no cached codebook exists (first training or dimension change), a full
+     * K-Means run with K-Means++ initialisation is used.
      *
      * <p>Concurrent calls from parallel Phase B shard writers are safe: a benign
      * race at the retraining boundary may trigger one extra training, which does
@@ -3240,12 +3250,28 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 return existing;
             }
         }
-        LOGGER.log(Level.INFO,
-                "checkpoint {0}: training PQ codebook "
-                        + "(training #{1}, segments since last: {2})",
-                new Object[]{indexName, pqTrainingsTotal.get() + 1,
-                        pqSegmentsSinceTraining.get()});
-        ProductQuantization pq = ProductQuantization.compute(ravv, pqSubspaces, 256, true);
+        ProductQuantization existing = this.cachedPQ;
+        ProductQuantization pq;
+        if (existing != null && existing.getOriginalDimension() == ravv.dimension()) {
+            // Warm-start from the cached codebook: 1 Lloyd's iteration instead of
+            // K_MEANS_ITERATIONS full iterations with K-Means++ initialisation.
+            // Distribution drift over pqCodebookRetrainingInterval segments is small,
+            // so one refinement step keeps the codebook accurate at ~1/6 of the cost.
+            LOGGER.log(Level.INFO,
+                    "checkpoint {0}: refining PQ codebook "
+                            + "(training #{1}, segments since last: {2})",
+                    new Object[]{indexName, pqTrainingsTotal.get() + 1,
+                            pqSegmentsSinceTraining.get()});
+            pq = existing.refine(ravv);
+        } else {
+            // No cached codebook (first training or dimension change): full K-Means.
+            LOGGER.log(Level.INFO,
+                    "checkpoint {0}: training PQ codebook from scratch "
+                            + "(training #{1}, segments since last: {2})",
+                    new Object[]{indexName, pqTrainingsTotal.get() + 1,
+                            pqSegmentsSinceTraining.get()});
+            pq = ProductQuantization.compute(ravv, pqSubspaces, 256, true);
+        }
         pqTrainingsTotal.incrementAndGet();
         this.cachedPQ = pq;
         pqSegmentsSinceTraining.set(1);
