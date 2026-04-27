@@ -43,6 +43,19 @@ else
     CLUSTER_DIR="$BASEDIR/cluster"
 fi
 
+# Optional: relocate the commit log onto a different drive by setting
+# HERDDB_SERVER_COMMIT_LOG to an absolute path. When set, both the server
+# (server.log.dir) and the indexing-service (log.dir) write/tail commit-log
+# files at that path instead of the default $CLUSTER_DIR/dbdata/txlog. Useful
+# when the commit log should live on a faster or larger drive than the rest
+# of the cluster data. When unset, the commit log stays under $CLUSTER_DIR.
+if [[ -n "${HERDDB_SERVER_COMMIT_LOG:-}" ]]; then
+    mkdir -p "$HERDDB_SERVER_COMMIT_LOG"
+    COMMIT_LOG_DIR="$(cd "$HERDDB_SERVER_COMMIT_LOG" && pwd)"
+else
+    COMMIT_LOG_DIR=""
+fi
+
 # Reports (run logs, diagnostics, heap dumps, issue drafts) go under
 # $HERDDB_TESTS_HOME/reports so they survive teardown and stay outside the
 # cluster install.

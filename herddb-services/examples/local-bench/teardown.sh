@@ -17,14 +17,17 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# Stop the local HerdDB cluster and remove $CLUSTER_DIR.
+# Stop the local HerdDB cluster and remove $CLUSTER_DIR.  When the commit
+# log lives outside the cluster dir (i.e. $HERDDB_SERVER_COMMIT_LOG is set)
+# that directory is also wiped, unless --keep-dir is passed.
 #
 # Usage:
 #   ./teardown.sh [--keep-dir]
 #
 # Options:
-#   --keep-dir   Stop services but do NOT delete $CLUSTER_DIR (useful when
-#                you want to inspect data on disk).
+#   --keep-dir   Stop services but do NOT delete $CLUSTER_DIR or the
+#                external commit-log dir (useful when you want to inspect
+#                data on disk).
 #
 set -euo pipefail
 
@@ -55,6 +58,17 @@ section "Stopping HerdDB server"
 if ! $KEEP_DIR; then
     section "Removing $CLUSTER_DIR"
     rm -rf "$CLUSTER_DIR"
+    # If the commit log was relocated outside the cluster dir via
+    # $HERDDB_SERVER_COMMIT_LOG, it survived the rm above.  Wipe it too
+    # so the next install starts from a clean slate.
+    if [[ -n "$COMMIT_LOG_DIR" && -d "$COMMIT_LOG_DIR" ]]; then
+        section "Removing external commit-log dir $COMMIT_LOG_DIR"
+        rm -rf "${COMMIT_LOG_DIR:?}"/*
+        rmdir "$COMMIT_LOG_DIR" 2>/dev/null || true
+    fi
 else
     echo "--keep-dir set, leaving $CLUSTER_DIR in place."
+    if [[ -n "$COMMIT_LOG_DIR" ]]; then
+        echo "                also leaving external commit-log dir $COMMIT_LOG_DIR in place."
+    fi
 fi
