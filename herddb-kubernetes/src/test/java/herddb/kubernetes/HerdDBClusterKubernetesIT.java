@@ -386,15 +386,17 @@ public class HerdDBClusterKubernetesIT {
                 && !sysnodesOut.contains("0 rows"));
 
         // ---- Assert systablespaces has a leader ----------------------------------
+        // The default tablespace in HerdDB is named "herd" (TableSpace.DEFAULT),
+        // NOT "default". Filter on that exact name.
         LOG.info("Querying systablespaces to verify leader is set...");
         String systablespacesOut = HerdDBKubernetesIT.execSql(k3s, toolsPod,
                 "SELECT tablespace_name, leader FROM systablespaces "
-                + "WHERE tablespace_name='default'");
+                + "WHERE tablespace_name='herd'");
         LOG.info("systablespaces output: " + systablespacesOut);
-        // The leader column must be non-null — presence of "default" in the output
+        // The leader column must be non-null — presence of "herd" in the output
         // proves the tablespace is registered and has a leader.
-        assertTrue("systablespaces must contain the default tablespace with a leader",
-                systablespacesOut.contains("default"));
+        assertTrue("systablespaces must contain the default 'herd' tablespace with a leader",
+                systablespacesOut.contains("herd"));
 
         // ---- Round-trip DML through the discovered leader ----------------------
         HerdDBKubernetesIT.execSql(k3s, toolsPod,
