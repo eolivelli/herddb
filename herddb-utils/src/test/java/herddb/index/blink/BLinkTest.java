@@ -701,4 +701,69 @@ public class BLinkTest {
 
     }
 
+    @Test
+    public void testSnapshotNodesReturnsPerNodeMetadata() throws Exception {
+        try (BLink<Sized<Long>, Long> blink = new BLink<>(1024L, new LongSizeEvaluator(),
+                new RandomPageReplacementPolicy(10), new DummyBLinkIndexDataStorage<>())) {
+
+            // Insert until the tree splits so we get at least 2 nodes.
+            long l = 0;
+            while (blink.nodes() < 2) {
+                blink.insert(Sized.valueOf(l), l);
+                l++;
+            }
+
+            List<BLink.NodeInfo> snapshot = blink.snapshotNodes(Integer.MAX_VALUE);
+
+            assertNotNull(snapshot);
+            assertEquals(blink.nodes(), snapshot.size());
+
+            // Sorted by ascending nodeId.
+            long previousId = Long.MIN_VALUE;
+            int leafCount = 0;
+            int loadedCount = 0;
+            long totalKeys = 0;
+            for (BLink.NodeInfo info : snapshot) {
+                assertTrue("nodeId must be ascending", info.getNodeId() > previousId);
+                previousId = info.getNodeId();
+                assertTrue("sizeBytes must be positive, got " + info.getSizeBytes(),
+                        info.getSizeBytes() > 0);
+                assertTrue("keys must be >= 0, got " + info.getKeys(),
+                        info.getKeys() >= 0);
+                if (info.isLeaf()) {
+                    leafCount++;
+                    totalKeys += info.getKeys();
+                }
+                if (info.isLoaded()) {
+                    loadedCount++;
+                }
+            }
+            assertTrue("at least one leaf node must be present", leafCount >= 1);
+            assertTrue("at least one node must be loaded after inserts", loadedCount >= 1);
+            assertEquals("sum of leaf keys must equal tree size",
+                    blink.size(), totalKeys);
+        }
+    }
+
+    @Test
+    public void testSnapshotNodesIsTruncatedWhenLimitIsLower() throws Exception {
+        try (BLink<Sized<Long>, Long> blink = new BLink<>(1024L, new LongSizeEvaluator(),
+                new RandomPageReplacementPolicy(10), new DummyBLinkIndexDataStorage<>())) {
+
+            long l = 0;
+            while (blink.nodes() < 3) {
+                blink.insert(Sized.valueOf(l), l);
+                l++;
+            }
+
+            int total = blink.nodes();
+            List<BLink.NodeInfo> truncated = blink.snapshotNodes(2);
+            assertEquals(2, truncated.size());
+            assertTrue("truncated list must be a strict prefix", truncated.size() < total);
+
+            List<BLink.NodeInfo> unlimited = blink.snapshotNodes(0);
+            assertEquals(total, unlimited.size());
+        }
+    }
+
 }

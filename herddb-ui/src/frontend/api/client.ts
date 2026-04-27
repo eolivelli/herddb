@@ -111,11 +111,40 @@ export interface PageLayoutDTO {
     pages: DataPageInfoDTO[];
 }
 
+export interface BLinkNodeDTO {
+    /** Stable in-memory identifier of the node within the BLink tree. */
+    nodeId: number;
+    /** Page id used by the underlying storage, or {@code -1} for never-flushed nodes. */
+    storeId: number;
+    /** {@code true} for leaf nodes (key → value), false for inner separator nodes. */
+    leaf: boolean;
+    /** Number of entries currently stored in the node. */
+    keys: number;
+    /** Estimated in-memory size of the node, in bytes. */
+    sizeBytes: number;
+    /** {@code true} if the node's data is currently resident in memory. */
+    loaded: boolean;
+    /** {@code true} if the node has uncheckpointed changes. */
+    dirty: boolean;
+}
+
 export interface PrimaryIndexDTO {
     type: string;
     entries: number;
     loadedNodes: number;
+    /** Total number of BLink nodes (loaded + on-disk only). */
+    totalNodes: number;
     usedMemoryBytes: number;
+    /**
+     * Per-node layout (one entry per BLink node, both on-disk and
+     * in-memory). Empty for non-BLink primary indexes.
+     */
+    nodes: BLinkNodeDTO[];
+    /**
+     * {@code true} when the tree has more nodes than the per-snapshot cap
+     * and {@code nodes} was clipped.
+     */
+    truncated: boolean;
 }
 
 export interface BrinBlockDTO {

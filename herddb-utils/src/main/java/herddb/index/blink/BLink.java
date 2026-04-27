@@ -465,6 +465,121 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
         return nodes.size();
     }
 
+    /**
+     * Returns a weakly-consistent, read-only snapshot of every node currently
+     * tracked by this tree (both nodes resident in memory and nodes that only
+     * exist on disk).
+     *
+     * <p>This is intended for visualisation / monitoring use cases (e.g. the
+     * Web UI v2 backend). It does <em>not</em> acquire any lock, so concurrent
+     * mutations may produce slightly inconsistent reads of {@code keys},
+     * {@code sizeBytes}, {@code storeId}, {@code loaded} or {@code dirty}; the
+     * iteration itself is safe because {@link #nodes} is a
+     * {@link ConcurrentHashMap}, which provides weakly-consistent iterators.
+     * Callers must <strong>not</strong> use the returned values for anything
+     * correctness-sensitive.
+     *
+     * <p>If {@code limit} is positive and the tree contains more nodes than
+     * that, the result is truncated to the first {@code limit} nodes (ordered
+     * by {@code nodeId}). Use {@link Integer#MAX_VALUE} or a non-positive value
+     * for "no limit".
+     *
+     * @param limit maximum number of nodes to include, or {@code <= 0} for no
+     *              limit
+     * @return immutable list of node info, ordered by ascending {@code nodeId}
+     */
+    public List<NodeInfo> snapshotNodes(int limit) {
+        List<NodeInfo> out = new ArrayList<>(nodes.size());
+        for (Node<K, V> node : nodes.values()) {
+            out.add(new NodeInfo(
+                    node.pageId,
+                    node.storeId,
+                    node.leaf,
+                    node.keys,
+                    node.size,
+                    node.loaded,
+                    node.dirty));
+        }
+        out.sort((a, b) -> Long.compare(a.nodeId, b.nodeId));
+        if (limit > 0 && out.size() > limit) {
+            out = new ArrayList<>(out.subList(0, limit));
+        }
+        return Collections.unmodifiableList(out);
+    }
+
+    /**
+     * Immutable per-node snapshot returned by {@link #snapshotNodes(int)}.
+     *
+     * <p>Field semantics:
+     * <ul>
+     *   <li>{@code nodeId} — stable in-memory identifier of the node within
+     *       the tree (the key in the internal nodes map).</li>
+     *   <li>{@code storeId} — page id used by the underlying
+     *       {@link BLinkIndexDataStorage}, or
+     *       {@link BLinkIndexDataStorage#NEW_PAGE} for nodes that have never
+     *       been flushed.</li>
+     *   <li>{@code leaf} — {@code true} for leaf nodes (key → value), false
+     *       for inner separator nodes.</li>
+     *   <li>{@code keys} — number of entries currently stored in the node
+     *       (separators for inner nodes, key/value pairs for leaves).</li>
+     *   <li>{@code sizeBytes} — estimated memory occupancy of the node
+     *       (matches what is accounted in {@link #getUsedMemory()}).</li>
+     *   <li>{@code loaded} — {@code true} if the node's data is currently
+     *       resident in memory; {@code false} if it lives only on disk.</li>
+     *   <li>{@code dirty} — {@code true} if the node has uncheckpointed
+     *       changes.</li>
+     * </ul>
+     */
+    public static final class NodeInfo {
+
+        private final long nodeId;
+        private final long storeId;
+        private final boolean leaf;
+        private final int keys;
+        private final long sizeBytes;
+        private final boolean loaded;
+        private final boolean dirty;
+
+        public NodeInfo(long nodeId, long storeId, boolean leaf, int keys,
+                        long sizeBytes, boolean loaded, boolean dirty) {
+            this.nodeId = nodeId;
+            this.storeId = storeId;
+            this.leaf = leaf;
+            this.keys = keys;
+            this.sizeBytes = sizeBytes;
+            this.loaded = loaded;
+            this.dirty = dirty;
+        }
+
+        public long getNodeId() {
+            return nodeId;
+        }
+
+        public long getStoreId() {
+            return storeId;
+        }
+
+        public boolean isLeaf() {
+            return leaf;
+        }
+
+        public int getKeys() {
+            return keys;
+        }
+
+        public long getSizeBytes() {
+            return sizeBytes;
+        }
+
+        public boolean isLoaded() {
+            return loaded;
+        }
+
+        public boolean isDirty() {
+            return dirty;
+        }
+    }
+
     /* ******************** */
     /* *** PAGE LOADING *** */
     /* ******************** */
