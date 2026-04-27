@@ -93,6 +93,14 @@ export function IndexDetailPage({
                             </tr>
                         </tbody>
                     </table>
+                    {data.statusProperties && data.statusProperties.trim() !== '{}' && (
+                        <>
+                            <h2>Runtime status</h2>
+                            <pre className="herd-code">
+                                <code>{data.statusProperties}</code>
+                            </pre>
+                        </>
+                    )}
                     {data.blocks.length > 0 ? (
                         <>
                             <h2>Block layout</h2>

@@ -34,26 +34,29 @@ const detail: IndexDetailDTO = {
         { blockId: 1, pageId: 100, entries: 25, loaded: true, dirty: false },
         { blockId: 2, pageId: 101, entries: 25, loaded: false, dirty: false },
     ],
+    statusProperties: '{"numBlocks":2}',
 };
+
+function renderDetail(d: IndexDetailDTO) {
+    return render(
+        <MemoryRouter
+            initialEntries={[
+                '/tablespaces/herd/tables/t/indexes/t_amount_idx',
+            ]}
+        >
+            <Routes>
+                <Route
+                    path="/tablespaces/:tablespace/tables/:name/indexes/:index"
+                    element={<IndexDetailPage loader={async () => d} />}
+                />
+            </Routes>
+        </MemoryRouter>,
+    );
+}
 
 describe('IndexDetailPage', () => {
     it('renders summary, block count and the BRIN visualisation', async () => {
-        render(
-            <MemoryRouter
-                initialEntries={[
-                    '/tablespaces/herd/tables/t/indexes/t_amount_idx',
-                ]}
-            >
-                <Routes>
-                    <Route
-                        path="/tablespaces/:tablespace/tables/:name/indexes/:index"
-                        element={
-                            <IndexDetailPage loader={async () => detail} />
-                        }
-                    />
-                </Routes>
-            </MemoryRouter>,
-        );
+        renderDetail(detail);
 
         expect(
             await screen.findByRole('heading', {
@@ -65,5 +68,26 @@ describe('IndexDetailPage', () => {
         expect(
             screen.getByRole('heading', { name: 'Block layout' }),
         ).toBeInTheDocument();
+    });
+
+    it('shows the Runtime status section when statusProperties is present', async () => {
+        renderDetail(detail);
+
+        expect(
+            await screen.findByRole('heading', { name: 'Runtime status' }),
+        ).toBeInTheDocument();
+        expect(screen.getByText('{"numBlocks":2}')).toBeInTheDocument();
+    });
+
+    it('omits the Runtime status section when statusProperties is null', async () => {
+        renderDetail({ ...detail, statusProperties: null });
+
+        // Wait for the page to load (heading must appear)
+        await screen.findByRole('heading', {
+            name: /Index — herd\.t\.t_amount_idx/i,
+        });
+        expect(
+            screen.queryByRole('heading', { name: 'Runtime status' }),
+        ).not.toBeInTheDocument();
     });
 });

@@ -236,7 +236,34 @@ public class TableResource {
         } else {
             out.setBlocks(java.util.List.of());
         }
+
+        // Populate statusProperties from sysindexstatus so the UI can show
+        // runtime properties (numBlocks for BRIN, vector counts, etc.).
+        out.setStatusProperties(loadIndexStatusProperties(tablespace, tableName, indexName));
+
         return out;
+    }
+
+    /**
+     * Queries {@code sysindexstatus} for the given index and returns the raw
+     * JSON {@code properties} string, or {@code null} if no row is found.
+     */
+    private String loadIndexStatusProperties(
+            String tablespace, String tableName, String indexName) {
+        try {
+            List<Map<String, Object>> rows = queryService.selectRows(
+                    tablespace, "SELECT * FROM sysindexstatus");
+            for (Map<String, Object> row : rows) {
+                if (tableName.equalsIgnoreCase(asString(row.get("table_name")))
+                        && indexName.equalsIgnoreCase(asString(row.get("index_name")))) {
+                    return asString(row.get("properties"));
+                }
+            }
+        } catch (DataScannerException e) {
+            // Non-fatal: log status is best-effort; the rest of the DTO is
+            // already populated.  Return null so the UI omits the section.
+        }
+        return null;
     }
 
     // -----------------------------------------------------------------------

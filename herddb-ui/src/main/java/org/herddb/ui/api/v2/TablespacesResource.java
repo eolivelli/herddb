@@ -22,6 +22,7 @@ package org.herddb.ui.api.v2;
 
 import herddb.model.DataScannerException;
 import herddb.model.TableSpace;
+import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -35,6 +36,8 @@ import javax.ws.rs.Produces;
 import javax.ws.rs.WebApplicationException;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
+import org.herddb.ui.dto.IndexStatusDTO;
+import org.herddb.ui.dto.LogStatusDTO;
 import org.herddb.ui.dto.TablespaceDTO;
 import org.herddb.ui.internal.QueryService;
 import org.herddb.ui.internal.ServerLocator;
@@ -96,6 +99,66 @@ public class TablespacesResource {
         return out;
     }
 
+    /**
+     * Returns the commit-log write head and last checkpoint status for the
+     * named tablespace by querying its {@code syslogstatus} virtual table.
+     *
+     * <p>Checkpoint fields in the returned DTO are {@code null} when no
+     * checkpoint has been taken yet (fresh tablespace or local/in-memory mode).
+     */
+    @GET
+    @Path("{name}/log-status")
+    @Produces(MediaType.APPLICATION_JSON)
+    public LogStatusDTO getLogStatus(@PathParam("name") String name) {
+        if (name == null || name.isEmpty()) {
+            throw new WebApplicationException(
+                    "tablespace name cannot be empty",
+                    Response.Status.BAD_REQUEST);
+        }
+        List<Map<String, Object>> rows;
+        try {
+            rows = queryService.selectRows(name, "SELECT * FROM syslogstatus");
+        } catch (DataScannerException e) {
+            throw new WebApplicationException(
+                    "Failed to read syslogstatus for tablespace '" + name + "': " + e.getMessage(),
+                    e,
+                    Response.Status.INTERNAL_SERVER_ERROR);
+        }
+        if (rows.isEmpty()) {
+            throw new NotFoundException("No log status found for tablespace '" + name + "'");
+        }
+        return toLogStatusDto(rows.get(0));
+    }
+
+    /**
+     * Returns runtime status for every index in the named tablespace by
+     * querying its {@code sysindexstatus} virtual table.
+     */
+    @GET
+    @Path("{name}/indexes")
+    @Produces(MediaType.APPLICATION_JSON)
+    public List<IndexStatusDTO> listIndexes(@PathParam("name") String name) {
+        if (name == null || name.isEmpty()) {
+            throw new WebApplicationException(
+                    "tablespace name cannot be empty",
+                    Response.Status.BAD_REQUEST);
+        }
+        List<Map<String, Object>> rows;
+        try {
+            rows = queryService.selectRows(name, "SELECT * FROM sysindexstatus");
+        } catch (DataScannerException e) {
+            throw new WebApplicationException(
+                    "Failed to read sysindexstatus for tablespace '" + name + "': " + e.getMessage(),
+                    e,
+                    Response.Status.INTERNAL_SERVER_ERROR);
+        }
+        List<IndexStatusDTO> out = new ArrayList<>(rows.size());
+        for (Map<String, Object> row : rows) {
+            out.add(toIndexStatusDto(row));
+        }
+        return out;
+    }
+
     @GET
     @Path("{name}")
     @Produces(MediaType.APPLICATION_JSON)
@@ -116,6 +179,41 @@ public class TablespacesResource {
             }
         }
         throw new NotFoundException("No tablespace named '" + name + "'");
+    }
+
+    private static LogStatusDTO toLogStatusDto(Map<String, Object> row) {
+        LogStatusDTO dto = new LogStatusDTO();
+        dto.setTablespaceUuid(asString(row.get("tablespace_uuid")));
+        dto.setTablespace(asString(row.get("tablespace_name")));
+        dto.setNodeId(asString(row.get("nodeid")));
+        dto.setLedger(asLongOrNull(row.get("ledger")));
+        dto.setOffset(asLongOrNull(row.get("offset")));
+        dto.setStatus(asString(row.get("status")));
+        dto.setCheckpointLedger(asLongOrNull(row.get("checkpoint_ledger")));
+        dto.setCheckpointOffset(asLongOrNull(row.get("checkpoint_offset")));
+        Object cpTs = row.get("checkpoint_timestamp");
+        if (cpTs instanceof Timestamp) {
+            dto.setCheckpointTimestamp(((Timestamp) cpTs).getTime());
+        } else if (cpTs instanceof Number) {
+            dto.setCheckpointTimestamp(((Number) cpTs).longValue());
+        }
+        dto.setCheckpointDurationMs(asLongOrNull(row.get("checkpoint_duration_ms")));
+        Object dirty = row.get("dirty_ledgers_count");
+        if (dirty instanceof Number) {
+            dto.setDirtyLedgersCount(((Number) dirty).intValue());
+        }
+        return dto;
+    }
+
+    private static IndexStatusDTO toIndexStatusDto(Map<String, Object> row) {
+        IndexStatusDTO dto = new IndexStatusDTO();
+        dto.setTablespace(asString(row.get("tablespace")));
+        dto.setTableName(asString(row.get("table_name")));
+        dto.setIndexName(asString(row.get("index_name")));
+        dto.setIndexType(asString(row.get("index_type")));
+        dto.setIndexUuid(asString(row.get("index_uuid")));
+        dto.setProperties(asString(row.get("properties")));
+        return dto;
     }
 
     private static TablespaceDTO toDto(Map<String, Object> row) {
@@ -149,6 +247,16 @@ public class TablespacesResource {
     private static long asLong(Object value) {
         if (value == null) {
             return 0L;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        return Long.parseLong(value.toString());
+    }
+
+    private static Long asLongOrNull(Object value) {
+        if (value == null) {
+            return null;
         }
         if (value instanceof Number) {
             return ((Number) value).longValue();

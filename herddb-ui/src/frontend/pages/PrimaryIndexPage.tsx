@@ -81,10 +81,6 @@ export function PrimaryIndexPage({
                     </tbody>
                 </table>
             )}
-            <p className="herd-page__hint">
-                Per-node enumeration of the B-Link tree requires forcing a
-                checkpoint and is intentionally deferred to a follow-up.
-            </p>
         </section>
     );
 }

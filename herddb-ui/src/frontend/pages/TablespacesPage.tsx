@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { Link } from 'react-router-dom';
 import { useTablespaces } from '../contexts/TablespaceContext';
 
 export function TablespacesPage() {
@@ -44,7 +45,13 @@ export function TablespacesPage() {
                     <tbody>
                         {tablespaces.map((ts) => (
                             <tr key={ts.name}>
-                                <td>{ts.name}</td>
+                                <td>
+                                    <Link
+                                        to={`/tablespaces/${encodeURIComponent(ts.name ?? '')}`}
+                                    >
+                                        {ts.name}
+                                    </Link>
+                                </td>
                                 <td>
                                     <code>{ts.uuid}</code>
                                 </td>

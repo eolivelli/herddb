@@ -29,11 +29,16 @@ import java.util.List;
  * <p>For BRIN indexes the {@code blocks} list is populated; for other
  * index types it is left empty (the {@link IndexSummaryDTO summary} is
  * always present).
+ *
+ * <p>The {@code statusProperties} field carries the raw JSON string from the
+ * {@code sysindexstatus.properties} column (e.g. {@code {"numBlocks":3}} for
+ * BRIN indexes). It is {@code null} when no status row was found.
  */
 public final class IndexDetailDTO {
 
     private IndexSummaryDTO summary;
     private List<BrinBlockDTO> blocks;
+    private String statusProperties;
 
     public IndexDetailDTO() {
     }
@@ -52,6 +57,14 @@ public final class IndexDetailDTO {
 
     public void setBlocks(List<BrinBlockDTO> blocks) {
         this.blocks = blocks;
+    }
+
+    public String getStatusProperties() {
+        return statusProperties;
+    }
+
+    public void setStatusProperties(String statusProperties) {
+        this.statusProperties = statusProperties;
     }
 
     /**
