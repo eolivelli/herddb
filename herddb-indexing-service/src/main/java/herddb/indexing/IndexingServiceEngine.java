@@ -151,6 +151,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      */
     private volatile SegmentBlockCache segmentBlockCache;
 
+    /**
+     * Bytes to read sequentially from the start of each segment's graph file
+     * after Phase C, before saving the watermark (issue #322).
+     * Read from {@link IndexingServerConfiguration#PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES}
+     * at {@link #start()}, with the JVM system property
+     * {@link IndexingServerConfiguration#SYSPROP_VECTOR_SEGMENT_CACHE_WARMUP_BYTES}
+     * as the fallback default when the properties file key is absent.
+     * A value of {@code 0} disables warmup.
+     */
+    private long warmupBytesPerSegment;
+
     private ExecutorService[] applyWorkers;
     private int applyParallelism;
     private volatile Throwable asyncError;
@@ -458,6 +469,19 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 ((RemoteFileDataStorageManager) dataStorageManager).getClient()
                         .registerMetrics(this.statsLogger.scope("remote_file_client"));
             }
+
+            // Resolve the post-Phase-C cache warmup byte budget (issue #322).
+            // Priority: properties-file key > JVM system property > hard-coded default.
+            long syspropWarmupBytes = Long.getLong(
+                    IndexingServerConfiguration.SYSPROP_VECTOR_SEGMENT_CACHE_WARMUP_BYTES,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES_DEFAULT);
+            this.warmupBytesPerSegment = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES,
+                    syspropWarmupBytes);
+            LOGGER.log(Level.INFO,
+                    "vector index segmentCacheWarmupBytes: {0} ({1})",
+                    new Object[]{warmupBytesPerSegment,
+                            warmupBytesPerSegment > 0 ? "enabled" : "disabled"});
 
             final long vectorMemLimit = maxVectorMemoryBytes;
             final VectorMemoryBudget budget = this;
@@ -1191,6 +1215,19 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             }
             if (!allCheckpointsDurable) {
                 return;
+            }
+            // Pre-warm the SegmentBlockCache before unblocking WAITFORINDEXES
+            // (issue #322): read the entry-point neighbourhood of each segment
+            // so the first query batch finds hot cache blocks rather than
+            // issuing cold gRPC streaming reads against the file server.
+            // Warmup is best-effort — failures are logged and never abort the
+            // watermark save.  A warmupBytesPerSegment of 0 disables this.
+            if (warmupBytesPerSegment > 0) {
+                for (AbstractVectorStore store : vectorStores.values()) {
+                    if (store instanceof PersistentVectorStore) {
+                        ((PersistentVectorStore) store).warmUpBlockCache(warmupBytesPerSegment);
+                    }
+                }
             }
             // Only now — all stores have durably persisted state covering
             // checkpointLsn — is it safe to publish the watermark.

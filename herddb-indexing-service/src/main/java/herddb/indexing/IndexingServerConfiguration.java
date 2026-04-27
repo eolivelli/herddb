@@ -122,6 +122,40 @@ public final class IndexingServerConfiguration {
     // 0 = auto-size as 1/4 of Netty maxDirectMemory (heap fallback when unavailable)
     public static final long PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES_DEFAULT = 0;
 
+    /**
+     * Number of bytes to read sequentially from the beginning of each segment's
+     * graph file after Phase C of a checkpoint, before saving the watermark (and
+     * therefore before {@code EXECUTE WAITFORINDEXES} unblocks). Populating the
+     * {@link herddb.remote.SegmentBlockCache} with the entry-point neighbourhood
+     * eliminates the 4–7 s cold-start latency observed when the first query batch
+     * must stream every block from the remote file server (issue #322).
+     *
+     * <p>The effective value is resolved in priority order:
+     * <ol>
+     *   <li>This config key ({@code indexing.vector.segmentCacheWarmupBytes}) in the
+     *       indexing-service properties file.</li>
+     *   <li>The JVM system property
+     *       {@code herddb.vectorindex.segmentCacheWarmupBytes}.</li>
+     *   <li>The hard-coded default of 32 MiB.</li>
+     * </ol>
+     *
+     * <p>Set to {@code 0} to disable warmup entirely (e.g. when running in
+     * in-memory or local-file mode where there is no remote gRPC overhead).
+     * The warmup is best-effort: a per-segment I/O failure is logged as a
+     * WARNING and does not abort the watermark save.
+     */
+    public static final String PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES =
+            "indexing.vector.segmentCacheWarmupBytes";
+    /**
+     * System property name that provides the JVM-level default for
+     * {@link #PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES}. A value set in the
+     * properties file always wins over this system property.
+     */
+    public static final String SYSPROP_VECTOR_SEGMENT_CACHE_WARMUP_BYTES =
+            "herddb.vectorindex.segmentCacheWarmupBytes";
+    /** Hard-coded fallback: 32 MiB per segment. */
+    public static final long PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES_DEFAULT = 32L * 1024 * 1024;
+
     // Compaction (checkpoint driver — existing)
     public static final String PROPERTY_COMPACTION_INTERVAL = "indexing.compaction.interval";
     public static final long PROPERTY_COMPACTION_INTERVAL_DEFAULT = 60000L;

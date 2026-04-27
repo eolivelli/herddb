@@ -2594,6 +2594,86 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
     }
 
+    /**
+     * Pre-warms the block cache by sequentially reading the first
+     * {@code warmupBytesPerSegment} bytes from each loaded segment's graph
+     * file. Called from the engine after a successful checkpoint and before
+     * the watermark is saved, so that the first queries after
+     * {@code EXECUTE WAITFORINDEXES} find the entry-point neighbourhood
+     * already in cache rather than having to stream it cold via gRPC
+     * (issue #322).
+     *
+     * <p>A value of {@code 0} or negative is a no-op. Individual segment
+     * failures are logged as WARNING and skipped; the warmup is best-effort
+     * and never aborts the watermark save.
+     *
+     * <p>In local-file or in-memory storage modes the {@code
+     * onDiskReaderSupplier} of each segment is a heap-backed reader that does
+     * not use the {@link herddb.remote.SegmentBlockCache}; the read still
+     * completes without error, it just has no caching effect.
+     *
+     * @param warmupBytesPerSegment maximum bytes to read from the start of
+     *                              each segment's graph file; capped to the
+     *                              actual file size
+     */
+    public void warmUpBlockCache(long warmupBytesPerSegment) {
+        if (warmupBytesPerSegment <= 0) {
+            return;
+        }
+        List<VectorSegment> currentSegments = this.segments;
+        if (currentSegments == null || currentSegments.isEmpty()) {
+            return;
+        }
+        long startMs = System.currentTimeMillis();
+        LOGGER.log(Level.INFO,
+                "warmUpBlockCache {0}: warming {1} segments, up to {2} bytes each",
+                new Object[]{indexName, currentSegments.size(), warmupBytesPerSegment});
+        // Fixed-size scratch buffer reused across full-size iterations.
+        // The RandomAccessReader interface exposes readFully(byte[]) which reads
+        // exactly dest.length bytes, so we use a 64 KiB buffer for full chunks
+        // and allocate a smaller array only for the tail of each segment.
+        final int chunkSize = 65536;
+        byte[] fullChunk = new byte[chunkSize];
+        int warmedSegments = 0;
+        long totalBytesRead = 0;
+        for (VectorSegment seg : currentSegments) {
+            io.github.jbellis.jvector.disk.ReaderSupplier rs = seg.onDiskReaderSupplier;
+            if (rs == null || seg.graphFileSize <= 0) {
+                // No remote reader available (local-file or not yet loaded).
+                continue;
+            }
+            long bytesToRead = Math.min(warmupBytesPerSegment, seg.graphFileSize);
+            try (io.github.jbellis.jvector.disk.RandomAccessReader reader = rs.get()) {
+                reader.seek(0);
+                long remaining = bytesToRead;
+                while (remaining >= chunkSize) {
+                    reader.readFully(fullChunk);
+                    remaining -= chunkSize;
+                    totalBytesRead += chunkSize;
+                }
+                if (remaining > 0) {
+                    byte[] tail = new byte[(int) remaining];
+                    reader.readFully(tail);
+                    totalBytesRead += remaining;
+                }
+                warmedSegments++;
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING,
+                        "warmUpBlockCache {0}: I/O error warming segment {1}: {2}",
+                        new Object[]{indexName, seg.segmentId, e.getMessage()});
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING,
+                        "warmUpBlockCache " + indexName + ": unexpected error warming segment "
+                                + seg.segmentId, e);
+            }
+        }
+        long elapsedMs = System.currentTimeMillis() - startMs;
+        LOGGER.log(Level.INFO,
+                "warmUpBlockCache {0}: warmed {1}/{2} segments, {3} bytes in {4} ms",
+                new Object[]{indexName, warmedSegments, currentSegments.size(),
+                        totalBytesRead, elapsedMs});
+    }
+
     private boolean doCheckpoint() throws IOException, DataStorageManagerException {
         if (!checkpointLock.tryLock()) {
             LOGGER.log(Level.INFO, "checkpoint {0}: skipped (another checkpoint in progress)", indexName);
