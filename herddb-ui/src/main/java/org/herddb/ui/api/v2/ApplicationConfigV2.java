@@ -55,7 +55,7 @@ public class ApplicationConfigV2 extends ResourceConfig {
         register(TablespacesResource.class);
         register(ServerInfoResource.class);
         register(TablesResource.class);
-        register(IndexesResource.class);
+        register(TableResource.class);
         register(IndexingServicesResource.class);
         register(new ServerLocatorBinder());
     }
