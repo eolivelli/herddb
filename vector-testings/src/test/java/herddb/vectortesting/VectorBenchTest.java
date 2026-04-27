@@ -380,6 +380,42 @@ class VectorBenchTest {
         assertEquals(Config.OutputFormat.JSON, cfg.outputFormat);
     }
 
+    // -----------------------------------------------------------------------
+    // buildVectorIndexExistsSql tests
+    // -----------------------------------------------------------------------
+
+    @Test
+    void buildVectorIndexExistsSqlQueriesSysindexes() {
+        String sql = VectorBench.buildVectorIndexExistsSql();
+        org.junit.jupiter.api.Assertions.assertTrue(
+                sql.contains("sysindexes"),
+                "SQL must query sysindexes; got: " + sql);
+    }
+
+    @Test
+    void buildVectorIndexExistsSqlFiltersOnIndexName() {
+        String sql = VectorBench.buildVectorIndexExistsSql();
+        org.junit.jupiter.api.Assertions.assertTrue(
+                sql.contains("index_name='vidx'"),
+                "SQL must filter by index_name='vidx'; got: " + sql);
+    }
+
+    @Test
+    void buildVectorIndexExistsSqlFiltersOnVectorType() {
+        String sql = VectorBench.buildVectorIndexExistsSql();
+        org.junit.jupiter.api.Assertions.assertTrue(
+                sql.contains("index_type='vector'"),
+                "SQL must filter by index_type='vector'; got: " + sql);
+    }
+
+    @Test
+    void buildVectorIndexExistsSqlUsesPositionalParameterForTableName() {
+        String sql = VectorBench.buildVectorIndexExistsSql();
+        org.junit.jupiter.api.Assertions.assertTrue(
+                sql.contains("table_name=?"),
+                "SQL must use a positional parameter (?) for table_name; got: " + sql);
+    }
+
     private static void writeLittleEndianInt(DataOutputStream dos, int value) throws Exception {
         byte[] buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array();
         dos.write(buf);
