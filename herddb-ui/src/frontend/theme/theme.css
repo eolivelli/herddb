@@ -111,6 +111,21 @@ body {
     font-family: var(--herd-mono);
 }
 
+.herd-header__refresh-btn {
+    background: transparent;
+    border: 1px solid var(--herd-border);
+    border-radius: 0.25rem;
+    color: var(--herd-muted);
+    cursor: pointer;
+    font-size: 0.85rem;
+    padding: 0.2rem 0.6rem;
+}
+
+.herd-header__refresh-btn:hover {
+    border-color: var(--herd-accent);
+    color: var(--herd-accent);
+}
+
 .herd-selector {
     display: inline-flex;
     align-items: center;
