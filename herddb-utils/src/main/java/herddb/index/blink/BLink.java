@@ -623,6 +623,66 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
      * @param to   exclusive
      * @return
      */
+    /**
+     * Returns the entry with the smallest key in the tree, in the natural
+     * ordering induced by {@code K.compareTo}, or {@code null} if the tree
+     * is empty. Runs in O(log n) by descending to the leftmost leaf via
+     * {@code anchor.first} and reading its first entry.
+     *
+     * <p>Used by callers that need a fast {@code MIN(pk)} answer without
+     * draining a full scan.</p>
+     */
+    public Entry<K, V> getFirstEntry() {
+        Node<K, V> n;
+        lock_anchor(READ_LOCK);
+        n = anchor.first;
+        unlock_anchor(READ_LOCK);
+        lock(n, READ_LOCK);
+        try {
+            return n.first_leaf_entry();
+        } catch (IOException ex) {
+            throw new UncheckedIOException("failed to read first entry", ex);
+        } finally {
+            unlock(n, READ_LOCK);
+        }
+    }
+
+    /**
+     * Returns the entry with the largest key in the tree, in the natural
+     * ordering induced by {@code K.compareTo}, or {@code null} if the tree
+     * is empty. Runs in O(log n) by descending to the rightmost leaf via
+     * {@code locate_leaf(positiveInfinity)} and then reading the leaf's
+     * last entry.
+     *
+     * <p>The locate-leaf phase already implements the BLink {@code move-right}
+     * protocol so a leaf split that happens during the descent does not
+     * leave us on a stale node — we will be moved to the new rightmost
+     * leaf before returning.</p>
+     *
+     * <p>Used by callers that need a fast {@code MAX(pk)} answer without
+     * draining a full scan.</p>
+     */
+    public Entry<K, V> getLastEntry() {
+        Node<K, V> n;
+        @SuppressWarnings("unchecked")
+        Deque<ResultCouple<K, V>> descent = DummyDeque.INSTANCE;
+        try {
+            // positiveInfinity is greater than every real key, so locate_leaf
+            // will land on the rightmost leaf (the one whose rightsep is
+            // positiveInfinity, i.e. the last in the leaf chain).
+            n = locate_leaf(positiveInfinity, READ_LOCK, descent);
+        } catch (IOException ex) {
+            throw new UncheckedIOException("failed to locate rightmost leaf", ex);
+        }
+        try {
+            return n.last_leaf_entry();
+        } catch (IOException ex) {
+            throw new UncheckedIOException("failed to read last entry", ex);
+        } finally {
+            unlock(n, READ_LOCK);
+        }
+    }
+
     public Stream<Entry<K, V>> scan(K from, K to) {
 
         Node<K, V> n;
@@ -2184,6 +2244,53 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
             } finally {
                 loadLock.unlock();
 
+                if (loadLock.unload != null) {
+                    loadLock.unload();
+                }
+            }
+        }
+
+        /**
+         * Returns a defensive copy of the leaf's first entry, or {@code null}
+         * if the leaf has no entries. Caller must already hold a read lock
+         * on this node (the lock is preserved across the load/unload of the
+         * leaf's page contents).
+         */
+        @SuppressWarnings("unchecked")
+        Entry<X, Y> first_leaf_entry() throws IOException {
+            final LockAndUnload<X, Y> loadLock = loadAndLock(true);
+            try {
+                Entry<X, Object> e = map.firstEntry();
+                if (e == null) {
+                    return null;
+                }
+                /* Cast to Y: is a leaf */
+                return new SimpleImmutableEntry<>(e.getKey(), (Y) e.getValue());
+            } finally {
+                loadLock.unlock();
+                if (loadLock.unload != null) {
+                    loadLock.unload();
+                }
+            }
+        }
+
+        /**
+         * Returns a defensive copy of the leaf's last entry, or {@code null}
+         * if the leaf has no entries. Caller must already hold a read lock
+         * on this node.
+         */
+        @SuppressWarnings("unchecked")
+        Entry<X, Y> last_leaf_entry() throws IOException {
+            final LockAndUnload<X, Y> loadLock = loadAndLock(true);
+            try {
+                Entry<X, Object> e = map.lastEntry();
+                if (e == null) {
+                    return null;
+                }
+                /* Cast to Y: is a leaf */
+                return new SimpleImmutableEntry<>(e.getKey(), (Y) e.getValue());
+            } finally {
+                loadLock.unlock();
                 if (loadLock.unload != null) {
                     loadLock.unload();
                 }

@@ -107,7 +107,7 @@ public class Config {
         opts.addOption(null, "client-timeout", true, "Client request timeout in seconds (default: 7200)");
         opts.addOption(null, "index-before-ingest", false, "Create vector index before ingestion instead of after");
         opts.addOption(null, "resume-from", true,
-                "Skip first N vectors and start row IDs from N, or 'auto' to query COUNT(*) from the table (default: 0)");
+                "Skip first N vectors and start row IDs from N, or 'auto' to query MAX(id)+1 from the table (default: 0)");
         opts.addOption(null, "ingest-max-ops", true, "Max ingestion ops/s across all threads, 0=unlimited (default: 100000)");
         opts.addOption(null, "query-max-ops", true, "Max query ops/s across all threads, 0=unlimited (default: 10)");
         opts.addOption(null, "ingest-commit-retries", true,

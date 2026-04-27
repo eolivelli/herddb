@@ -96,6 +96,12 @@ public class AggregateOp implements PlannerOp {
             return fastCount;
         }
 
+        StatementExecutionResult fastMinMax = tryFastMinMax(tableSpaceManager, transactionContext,
+                lockRequired, forWrite);
+        if (fastMinMax != null) {
+            return fastMinMax;
+        }
+
         StatementExecutionResult input = this.input.execute(tableSpaceManager, transactionContext, context, lockRequired, forWrite);
         ScanResult downstreamScanResult = (ScanResult) input;
         final DataScanner inputScanner = downstreamScanResult.dataScanner;
@@ -151,6 +157,87 @@ public class AggregateOp implements PlannerOp {
         RecordSetFactory recordSetFactory = tableSpaceManager.getDbmanager().getRecordSetFactory();
         MaterializedRecordSet results = recordSetFactory.createFixedSizeRecordSet(1, fieldnames, columns);
         results.add(new Tuple(fieldnames, new Object[]{count}));
+        results.writeFinished();
+        SimpleDataScanner scanner = new SimpleDataScanner(null, results);
+        return new ScanResult(transactionContext.transactionId, scanner);
+    }
+
+    /**
+     * Short-circuit for {@code SELECT MIN(col) FROM t} and
+     * {@code SELECT MAX(col) FROM t} in autocommit, where {@code col} is
+     * either the table's single-column primary key or a column covered by
+     * a BRIN secondary index. Answers the query directly from the index
+     * without materialising any data row. Returns {@code null} when the
+     * pattern does not match, in which case the caller falls back to the
+     * regular aggregate path.
+     *
+     * <p>The gate set mirrors {@link #tryFastCountStar} for visibility
+     * reasons — uncommitted inserts/deletes inside an explicit transaction
+     * are not yet reflected in the index, so the fast-path only fires in
+     * autocommit. See issue #307.
+     */
+    private StatementExecutionResult tryFastMinMax(
+            TableSpaceManager tableSpaceManager,
+            TransactionContext transactionContext,
+            boolean lockRequired, boolean forWrite
+    ) throws StatementExecutionException {
+        if (transactionContext.transactionId > 0) {
+            return null;
+        }
+        if (lockRequired || forWrite) {
+            return null;
+        }
+        if (aggtypes.length != 1) {
+            return null;
+        }
+        boolean isMax = "MAX".equalsIgnoreCase(aggtypes[0]);
+        boolean isMin = "MIN".equalsIgnoreCase(aggtypes[0]);
+        if (!isMax && !isMin) {
+            return null;
+        }
+        List<Integer> argList = argLists.get(0);
+        if (argList.size() != 1) {
+            return null;
+        }
+        if (!groupedFiledsIndexes.isEmpty()) {
+            return null;
+        }
+        if (!(input instanceof SimpleScanOp)) {
+            return null;
+        }
+        ScanStatement stmt = ((SimpleScanOp) input).getStatement();
+        if (stmt.getPredicate() != null
+                || stmt.getComparator() != null
+                || stmt.getLimits() != null) {
+            return null;
+        }
+        herddb.model.Column[] scanSchema = stmt.getSchema();
+        int colIndex = argList.get(0);
+        if (colIndex < 0 || colIndex >= scanSchema.length) {
+            return null;
+        }
+        String columnName = scanSchema[colIndex].name;
+        if (columnName == null) {
+            return null;
+        }
+
+        // Try the primary-key fast-path first; if the aggregated column
+        // is not the single-column PK, try the BRIN secondary-index path.
+        TableSpaceManager.FastMinMaxResult result =
+                tableSpaceManager.fastMinMaxPrimaryKeyNoTransaction(
+                        stmt.getTable(), columnName, isMax);
+        if (!result.isApplied()) {
+            result = tableSpaceManager.fastMinMaxBrinNoTransaction(
+                    stmt.getTable(), columnName, isMax);
+        }
+        if (!result.isApplied()) {
+            return null;
+        }
+
+        Object value = result.getValue();
+        RecordSetFactory recordSetFactory = tableSpaceManager.getDbmanager().getRecordSetFactory();
+        MaterializedRecordSet results = recordSetFactory.createFixedSizeRecordSet(1, fieldnames, columns);
+        results.add(new Tuple(fieldnames, new Object[]{value}));
         results.writeFinished();
         SimpleDataScanner scanner = new SimpleDataScanner(null, results);
         return new ScanResult(transactionContext.transactionId, scanner);

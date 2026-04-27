@@ -101,4 +101,29 @@ public interface KeyToPageIndex extends AutoCloseable {
 
     boolean isSortedAscending(int[] pkTypes);
 
+    /**
+     * Returns the byte-wise smallest key in the index, or {@code null} if the
+     * index is empty. Implementations should run in O(log n) when possible.
+     *
+     * <p>Note: the returned bytes are byte-wise sorted. Callers that need
+     * the natural-order MIN of a numeric column where the byte order does
+     * not match the natural order (see {@link #isSortedAscending(int[])})
+     * must not rely on this single value alone.</p>
+     */
+    default Bytes getMinKey() {
+        throw new UnsupportedOperationException(
+                "getMinKey not implemented by " + getClass().getName());
+    }
+
+    /**
+     * Returns the byte-wise largest key in the index, or {@code null} if the
+     * index is empty. Implementations should run in O(log n) when possible.
+     *
+     * <p>Same byte-vs-natural caveat as {@link #getMinKey()}.</p>
+     */
+    default Bytes getMaxKey() {
+        throw new UnsupportedOperationException(
+                "getMaxKey not implemented by " + getClass().getName());
+    }
+
 }

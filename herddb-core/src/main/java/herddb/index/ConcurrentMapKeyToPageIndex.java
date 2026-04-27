@@ -143,6 +143,31 @@ public class ConcurrentMapKeyToPageIndex implements KeyToPageIndex {
     }
 
     @Override
+    public Bytes getMinKey() {
+        // ConcurrentHashMap is unordered; this in-memory impl is only used
+        // by MemoryDataStorageManager (tests / inline mode), so an O(n) min
+        // is acceptable.
+        Bytes result = null;
+        for (Bytes k : map.keySet()) {
+            if (result == null || k.compareTo(result) < 0) {
+                result = k;
+            }
+        }
+        return result;
+    }
+
+    @Override
+    public Bytes getMaxKey() {
+        Bytes result = null;
+        for (Bytes k : map.keySet()) {
+            if (result == null || k.compareTo(result) > 0) {
+                result = k;
+            }
+        }
+        return result;
+    }
+
+    @Override
     public Stream<Map.Entry<Bytes, Long>> scanner(IndexOperation operation, StatementEvaluationContext context, TableContext tableContext, herddb.core.AbstractIndexManager index) throws DataStorageManagerException {
 
         if (operation instanceof PrimaryIndexSeek) {
