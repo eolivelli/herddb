@@ -629,8 +629,9 @@
 				<!-- Travis stuff -->
 				<exclude>.travis/*</exclude>
 
-				<!-- Markdown documentation files -->
+				<!-- Markdown documentation files (both .md and .MD) -->
 				<exclude>**/*.md</exclude>
+				<exclude>**/*.MD</exclude>
 
 				<!-- Kubernetes/Helm charts -->
 				<exclude>kubernetes/**/*</exclude>
