@@ -302,4 +302,72 @@ public class ServerBasedDiscoveryTest {
             }
         }
     }
+
+    // -------------------------------------------------------------------------
+    // qualifyHostname unit tests
+    // -------------------------------------------------------------------------
+
+    /**
+     * A short hostname is qualified by appending the domain portion of the
+     * known FQDN — the primary use case for Kubernetes StatefulSet pods.
+     */
+    @Test
+    public void qualifyHostname_shortNameGetsQualified() {
+        assertEquals(
+                "server-0.headless-svc.namespace.svc.cluster.local",
+                ServerBasedClientSideMetadataProvider.qualifyHostname(
+                        "server-0",
+                        "server-0.headless-svc.namespace.svc.cluster.local"));
+    }
+
+    /**
+     * A short hostname for a DIFFERENT pod in the same cluster is correctly
+     * qualified using the domain suffix extracted from the bootstrap FQDN.
+     */
+    @Test
+    public void qualifyHostname_differentPodGetsQualified() {
+        assertEquals(
+                "server-1.headless-svc.namespace.svc.cluster.local",
+                ServerBasedClientSideMetadataProvider.qualifyHostname(
+                        "server-1",
+                        "server-0.headless-svc.namespace.svc.cluster.local"));
+    }
+
+    /**
+     * An already-qualified FQDN is returned unchanged even if the bootstrap
+     * host is also an FQDN.
+     */
+    @Test
+    public void qualifyHostname_fqdnPassedThrough() {
+        assertEquals(
+                "already.qualified.host.example.com",
+                ServerBasedClientSideMetadataProvider.qualifyHostname(
+                        "already.qualified.host.example.com",
+                        "bootstrap.headless-svc.namespace.svc.cluster.local"));
+    }
+
+    /**
+     * When the bootstrap host is itself a short name (no dots), the discovered
+     * hostname is returned unchanged — there is no domain to borrow.
+     */
+    @Test
+    public void qualifyHostname_shortBootstrapNoOp() {
+        assertEquals(
+                "server-0",
+                ServerBasedClientSideMetadataProvider.qualifyHostname(
+                        "server-0",
+                        "bootstrap-short"));
+    }
+
+    /**
+     * A plain IP address (has dots) is returned unchanged.
+     */
+    @Test
+    public void qualifyHostname_ipAddressPassedThrough() {
+        assertEquals(
+                "10.42.0.5",
+                ServerBasedClientSideMetadataProvider.qualifyHostname(
+                        "10.42.0.5",
+                        "bootstrap.headless-svc.namespace.svc.cluster.local"));
+    }
 }

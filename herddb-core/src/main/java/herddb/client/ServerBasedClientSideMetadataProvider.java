@@ -239,6 +239,14 @@ public final class ServerBasedClientSideMetadataProvider implements ClientSideMe
                                 ? Integer.parseInt(address.substring(colon + 1))
                                 : ClientConfiguration.PROPERTY_SERVER_PORT_DEFAULT;
 
+                        // Qualify short hostnames using the bootstrap server's domain suffix.
+                        // In Kubernetes, InetAddress.getLocalHost().getHostName() returns the
+                        // pod's short name (e.g. "server-0"), but DNS requires the full
+                        // StatefulSet FQDN ("server-0.headless-svc.namespace.svc.cluster.local").
+                        // If the bootstrap host is an FQDN (has dots) and the discovered host
+                        // is a short name, append the same domain suffix to qualify it.
+                        host = qualifyHostname(host, server.getHost());
+
                         ServerHostData hostData = new ServerHostData(host, port, "", ssl, new HashMap<>());
                         nodeHostData.put(nodeId, hostData);
                         discoveredNodes.add(hostData);
@@ -339,5 +347,46 @@ public final class ServerBasedClientSideMetadataProvider implements ClientSideMe
         if (!value.isEmpty()) {
             target.set(key, value);
         }
+    }
+
+    /**
+     * Qualifies a short hostname by appending the domain suffix from the
+     * bootstrap host, when appropriate.
+     *
+     * <p>In Kubernetes StatefulSet deployments, a server's
+     * {@code InetAddress.getLocalHost().getHostName()} returns only the pod's
+     * short name (e.g. {@code server-0}), but DNS resolution across pods
+     * requires the full headless-service FQDN
+     * ({@code server-0.headless-svc.namespace.svc.cluster.local}).  The server
+     * stores its short name in {@code sysnodes.address}; without qualification,
+     * the client cannot resolve that name from another pod.
+     *
+     * <p>If {@code discoveredHost} contains no dots (i.e. it is a short name)
+     * and {@code knownFqdn} is an actual FQDN (has at least one dot), this
+     * method appends the domain suffix of {@code knownFqdn} to
+     * {@code discoveredHost}.  The resulting qualified name can be resolved
+     * from any pod in the same namespace.
+     *
+     * <p>If {@code discoveredHost} already has dots, or {@code knownFqdn} has
+     * no dots, the original {@code discoveredHost} is returned unchanged.
+     *
+     * <p>Package-private for testing.
+     *
+     * @param discoveredHost hostname from {@code sysnodes.address} (may be short)
+     * @param knownFqdn      host the bootstrap client actually connected to
+     * @return a qualified hostname suitable for direct TCP connection
+     */
+    static String qualifyHostname(String discoveredHost, String knownFqdn) {
+        // Already an FQDN — nothing to do.
+        if (discoveredHost.contains(".")) {
+            return discoveredHost;
+        }
+        // No domain to borrow from.
+        int dotIdx = knownFqdn.indexOf('.');
+        if (dotIdx < 0) {
+            return discoveredHost;
+        }
+        // Append the domain portion of the known FQDN (including the leading dot).
+        return discoveredHost + knownFqdn.substring(dotIdx);
     }
 }
