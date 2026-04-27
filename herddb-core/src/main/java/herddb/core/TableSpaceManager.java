@@ -29,6 +29,7 @@ import herddb.client.ClientSideMetadataProviderException;
 import herddb.client.HDBClient;
 import herddb.client.HDBConnection;
 import herddb.client.HDBException;
+import herddb.codec.RecordSerializer;
 import herddb.core.AbstractTableManager.TableCheckpoint;
 import herddb.core.stats.TableManagerStats;
 import herddb.core.stats.TableSpaceManagerStats;
@@ -50,6 +51,7 @@ import herddb.core.system.SystablestatsTableManager;
 import herddb.core.system.SystransactionsTableManager;
 import herddb.data.consistency.TableChecksum;
 import herddb.data.consistency.TableDataChecksum;
+import herddb.index.KeyToPageIndex;
 import herddb.index.MemoryHashIndexManager;
 import herddb.index.brin.BRINIndexManager;
 import herddb.index.vector.VectorIndexManager;
@@ -120,6 +122,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -849,6 +852,246 @@ public class TableSpaceManager {
                     + ". created temporary in transaction " + tableManager.getCreatedInTransaction());
         }
         return tableManager.getKeyToPageIndex().size();
+    }
+
+    /**
+     * Result wrapper for the {@code MIN}/{@code MAX} fast-paths. The
+     * {@link #applied} flag distinguishes "fast-path doesn't apply, run
+     * the slow aggregate path" from "fast-path applied, value is
+     * {@link #value} (which may legitimately be {@code null} for an empty
+     * table)".
+     */
+    public static final class FastMinMaxResult {
+
+        private static final FastMinMaxResult NOT_APPLIED = new FastMinMaxResult(false, null);
+
+        private final boolean applied;
+        private final Object value;
+
+        private FastMinMaxResult(boolean applied, Object value) {
+            this.applied = applied;
+            this.value = value;
+        }
+
+        public static FastMinMaxResult notApplied() {
+            return NOT_APPLIED;
+        }
+
+        public static FastMinMaxResult of(Object value) {
+            return new FastMinMaxResult(true, value);
+        }
+
+        public boolean isApplied() {
+            return applied;
+        }
+
+        public Object getValue() {
+            return value;
+        }
+    }
+
+    /**
+     * Fast-path {@code MIN(pkColumn)} / {@code MAX(pkColumn)} for an
+     * unconditioned aggregate over a table whose primary key is a single
+     * column. The value is decoded from the primary-key index directly,
+     * so the query never reads a data page.
+     *
+     * <p>Two cost regimes:
+     * <ul>
+     *   <li>For column types where the byte-wise sort matches the natural
+     *       sort (currently STRING / BYTEARRAY — see
+     *       {@link KeyToPageIndex#isSortedAscending(int[])}), uses
+     *       {@link KeyToPageIndex#getMinKey()} / {@link KeyToPageIndex#getMaxKey()},
+     *       which is O(log n) on the BLink-backed implementations.</li>
+     *   <li>For numeric column types where two's-complement byte order
+     *       does not match natural order (e.g. mixed-sign INTEGER), the
+     *       index keys are streamed and decoded one by one — O(n_keys)
+     *       in CPU but with zero data-page IO. For a 350M-row INT-PK
+     *       table this still drops {@code MAX(id)} from minutes to a few
+     *       seconds.</li>
+     * </ul>
+     *
+     * <p>Returns {@link FastMinMaxResult#notApplied()} when: the PK is
+     * composite, the requested column is not the PK, the index
+     * implementation does not support the byte-extreme API, or any other
+     * structural condition prevents using the index. Callers in that case
+     * fall back to the regular aggregate path.
+     *
+     * <p>Returns {@link FastMinMaxResult#of(Object)} (possibly with a
+     * {@code null} value if the table is empty) when the fast path
+     * applies and produced a valid answer.
+     */
+    public FastMinMaxResult fastMinMaxPrimaryKeyNoTransaction(String table, String column, boolean max)
+            throws StatementExecutionException {
+        AbstractTableManager tableManager = tables.get(table);
+        if (tableManager == null) {
+            throw new TableDoesNotExistException("no table " + table + " in tablespace " + tableSpaceName);
+        }
+        if (tableManager.getCreatedInTransaction() > 0) {
+            throw new TableDoesNotExistException("no table " + table + " in tablespace " + tableSpaceName
+                    + ". created temporary in transaction " + tableManager.getCreatedInTransaction());
+        }
+        Table tableDef = tableManager.getTable();
+        if (tableDef.primaryKey.length != 1) {
+            // composite PK: byte order is per-column-prefix and the
+            // aggregate is over a single column, so the byte-extreme of
+            // the composite key is not the natural extreme of the
+            // requested column. Bail out.
+            return FastMinMaxResult.notApplied();
+        }
+        if (!tableDef.primaryKey[0].equalsIgnoreCase(column)) {
+            return FastMinMaxResult.notApplied();
+        }
+        Column pkCol = tableDef.getColumn(tableDef.primaryKey[0]);
+        if (pkCol == null) {
+            return FastMinMaxResult.notApplied();
+        }
+        int pkType = pkCol.type;
+        KeyToPageIndex idx = tableManager.getKeyToPageIndex();
+        if (idx.size() == 0) {
+            // empty table → SQL MIN/MAX is NULL
+            return FastMinMaxResult.of(null);
+        }
+        try {
+            if (isByteSortableType(pkType)) {
+                // For byte-sortable types the byte-extreme key IS the
+                // natural-extreme. Use the index's getMin/MaxKey API,
+                // which is O(log n) on BLink-backed implementations and
+                // O(n) on the unsorted in-memory map. Either way no row
+                // data is loaded.
+                Bytes extreme = max ? idx.getMaxKey() : idx.getMinKey();
+                if (extreme == null) {
+                    return FastMinMaxResult.of(null);
+                }
+                return FastMinMaxResult.of(RecordSerializer.deserialize(extreme, pkType));
+            }
+            // Numeric / non-byte-sortable PK: stream all keys and decode
+            // each, picking the natural-order extreme. O(n_keys) CPU and
+            // *no data-page IO*.
+            Object value = decodeExtremeFromKeyStream(idx, pkType, max);
+            return FastMinMaxResult.of(value);
+        } catch (UnsupportedOperationException err) {
+            // The index implementation didn't override the byte-extreme
+            // API. Caller will fall back to the slow aggregate path.
+            return FastMinMaxResult.notApplied();
+        }
+    }
+
+    /**
+     * Fast-path {@code MIN(col)} / {@code MAX(col)} for a column covered
+     * by a single-column BRIN secondary index. Currently only fires for
+     * byte-sortable column types (STRING / BYTEARRAY) — for numeric
+     * BRIN-indexed columns the caller falls back to the regular scan,
+     * because the BRIN's byte-wise key ordering does not match natural
+     * order for two's-complement numerics.
+     *
+     * <p>Returns {@link FastMinMaxResult#notApplied()} when the fast-path
+     * does not apply.
+     */
+    public FastMinMaxResult fastMinMaxBrinNoTransaction(String table, String column, boolean max)
+            throws StatementExecutionException {
+        AbstractTableManager tableManager = tables.get(table);
+        if (tableManager == null) {
+            throw new TableDoesNotExistException("no table " + table + " in tablespace " + tableSpaceName);
+        }
+        if (tableManager.getCreatedInTransaction() > 0) {
+            throw new TableDoesNotExistException("no table " + table + " in tablespace " + tableSpaceName
+                    + ". created temporary in transaction " + tableManager.getCreatedInTransaction());
+        }
+        Map<String, AbstractIndexManager> indexes = getIndexesOnTable(table);
+        if (indexes == null || indexes.isEmpty()) {
+            return FastMinMaxResult.notApplied();
+        }
+        Table tableDef = tableManager.getTable();
+        Column col = tableDef.getColumn(column);
+        if (col == null) {
+            return FastMinMaxResult.notApplied();
+        }
+        int colType = col.type;
+        if (!isByteSortableType(colType)) {
+            // BRIN orders keys byte-wise; for numeric types we'd need a
+            // full key scan with decode (not supported here yet).
+            return FastMinMaxResult.notApplied();
+        }
+        // Find a BRIN index whose first/only indexed column equals `column`.
+        BRINIndexManager brinManager = null;
+        for (AbstractIndexManager im : indexes.values()) {
+            Index def = im.getIndex();
+            if (!Index.TYPE_BRIN.equals(def.type)) {
+                continue;
+            }
+            if (def.columnNames == null || def.columnNames.length != 1) {
+                continue;
+            }
+            if (!def.columnNames[0].equalsIgnoreCase(column)) {
+                continue;
+            }
+            if (im instanceof BRINIndexManager) {
+                brinManager = (BRINIndexManager) im;
+                break;
+            }
+        }
+        if (brinManager == null) {
+            return FastMinMaxResult.notApplied();
+        }
+        Bytes extreme = max ? brinManager.getMaxIndexedKey() : brinManager.getMinIndexedKey();
+        if (extreme == null) {
+            return FastMinMaxResult.of(null);
+        }
+        return FastMinMaxResult.of(RecordSerializer.deserialize(extreme, colType));
+    }
+
+    /**
+     * Streams every key currently in the primary-key index, decodes each
+     * to the given column type, and returns the natural-order min or max.
+     * Used by {@link #fastMinMaxPrimaryKeyNoTransaction} for column types
+     * whose byte order does not match natural order (e.g. mixed-sign
+     * INTEGER / LONG / TIMESTAMP / DOUBLE).
+     *
+     * <p>This still avoids data-page IO entirely — only the BLink leaf
+     * pages are touched.
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static Object decodeExtremeFromKeyStream(KeyToPageIndex idx, int pkType, boolean max)
+            throws StatementExecutionException {
+        Comparable best = null;
+        try (Stream<Map.Entry<Bytes, Long>> stream = idx.scanner(null, null, null, null)) {
+            Iterator<Map.Entry<Bytes, Long>> it = stream.iterator();
+            while (it.hasNext()) {
+                Bytes keyBytes = it.next().getKey();
+                Object decoded = RecordSerializer.deserialize(keyBytes, pkType);
+                if (!(decoded instanceof Comparable)) {
+                    // No natural order for this type — bail out, caller
+                    // will run the slow aggregate path.
+                    return null;
+                }
+                Comparable cmp = (Comparable) decoded;
+                if (best == null) {
+                    best = cmp;
+                } else if (max) {
+                    if (cmp.compareTo(best) > 0) {
+                        best = cmp;
+                    }
+                } else if (cmp.compareTo(best) < 0) {
+                    best = cmp;
+                }
+            }
+        } catch (DataStorageManagerException err) {
+            throw new StatementExecutionException(err);
+        }
+        return best;
+    }
+
+    private static boolean isByteSortableType(int type) {
+        switch (type) {
+            case ColumnTypes.STRING:
+            case ColumnTypes.NOTNULL_STRING:
+            case ColumnTypes.BYTEARRAY:
+            case ColumnTypes.NOTNULL_BYTEARRAY:
+                return true;
+            default:
+                return false;
+        }
     }
 
     private void downloadTableSpaceData() throws MetadataStorageManagerException, DataStorageManagerException, LogNotAvailableException {

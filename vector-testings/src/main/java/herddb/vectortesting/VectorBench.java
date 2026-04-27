@@ -218,14 +218,37 @@ public class VectorBench {
         // Phase 4: Ingestion
         if (!config.skipIngest) {
             if (config.resumeFromAuto) {
+                // Issue #307: resolve resumption from MAX(id)+1, NOT
+                // COUNT(*). COUNT(*) under-counts whenever the prior run
+                // left PK gaps (a rolled-back batch advances the row-id
+                // counter without committing rows), and resuming at
+                // COUNT(*) then deterministically replays a PK that
+                // already exists, so every INSERT hits
+                // DuplicatePrimaryKeyException. MAX(id)+1 is provably
+                // larger than every committed PK and the index reflects
+                // committed-only state, so it is exact.
+                //
+                // The server-side fast-path on the primary-key index
+                // (see TableSpaceManager.fastMinMaxPrimaryKeyNoTransaction)
+                // makes this query O(log n) for byte-sortable PK types,
+                // and "scan the index keys, no data pages" for numeric
+                // PKs — fast enough to run at startup even on 10⁹-row
+                // tables.
                 try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
                      Statement stmt = conn.createStatement();
-                     java.sql.ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM " + config.tableName)) {
+                     java.sql.ResultSet rs = stmt.executeQuery("SELECT MAX(id) FROM " + config.tableName)) {
                     rs.next();
-                    config.resumeFrom = rs.getLong(1);
+                    long maxId = rs.getLong(1);
+                    if (rs.wasNull()) {
+                        // empty table → start from scratch
+                        config.resumeFrom = 0L;
+                    } else {
+                        // resume one past the highest committed PK
+                        config.resumeFrom = maxId + 1L;
+                    }
                 }
                 out.info("resume-from=auto resolved to " + config.resumeFrom
-                        + " rows (from SELECT COUNT(*) on " + config.tableName + ")");
+                        + " rows (from SELECT MAX(id)+1 on " + config.tableName + ")");
             }
             long toIngest = actualRows - config.resumeFrom;
             if (toIngest <= 0) {

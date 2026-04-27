@@ -243,6 +243,18 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
     }
 
     @Override
+    public Bytes getMinKey() {
+        Entry<Bytes, Long> e = getTree().getFirstEntry();
+        return e == null ? null : e.getKey();
+    }
+
+    @Override
+    public Bytes getMaxKey() {
+        Entry<Bytes, Long> e = getTree().getLastEntry();
+        return e == null ? null : e.getKey();
+    }
+
+    @Override
     public Stream<Entry<Bytes, Long>> scanner(
             IndexOperation operation, StatementEvaluationContext context,
             TableContext tableContext, AbstractIndexManager index

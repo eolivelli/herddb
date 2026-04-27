@@ -523,6 +523,26 @@ public class BRINIndexManager extends AbstractIndexManager {
     }
 
     /**
+     * Smallest indexed key currently in this BRIN, or {@code null} if the
+     * index has no entries. Backs the server-side {@code MIN(col)} fast-path
+     * for columns covered by a BRIN index. See
+     * {@link BlockRangeIndex#getMinKey()} for cost characteristics.
+     */
+    public Bytes getMinIndexedKey() {
+        return data == null ? null : data.getMinKey();
+    }
+
+    /**
+     * Largest indexed key currently in this BRIN, or {@code null} if the
+     * index has no entries. Backs the server-side {@code MAX(col)} fast-path
+     * for columns covered by a BRIN index. See
+     * {@link BlockRangeIndex#getMaxKey()} for cost characteristics.
+     */
+    public Bytes getMaxIndexedKey() {
+        return data == null ? null : data.getMaxKey();
+    }
+
+    /**
      * Read-only snapshot of the BRIN block layout, used by the Web UI v2
      * backend to render a "BRIN blocks" view. Delegates to
      * {@link BlockRangeIndex#snapshotBlocks()}.

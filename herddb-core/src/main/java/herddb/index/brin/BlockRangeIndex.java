@@ -832,6 +832,62 @@ public final class BlockRangeIndex<K extends Comparable<K> & SizeAwareObject, V 
     }
 
     /**
+     * Returns the byte-wise smallest indexed key currently held in the BRIN,
+     * or {@code null} if the index has no entries. Runs in O(log n) by
+     * looking at the head block (smallest start key) and reading its first
+     * indexed key.
+     *
+     * <p>Per-block contents are stored in a sorted {@code NavigableMap}, so
+     * the head block's {@code firstKey()} is the global minimum.</p>
+     */
+    public K getMinKey() {
+        // Walk blocks in sort order until we find one with values. The very
+        // first block ("HEAD_KEY") may legitimately be empty after deletes.
+        for (Block<K, V> block : blocks.values()) {
+            block.lock.lock();
+            Page.Metadata unload = null;
+            try {
+                unload = block.ensureBlockLoadedWithoutUnload();
+                if (block.values != null && !block.values.isEmpty()) {
+                    return block.values.firstKey();
+                }
+            } finally {
+                block.lock.unlock();
+                if (unload != null) {
+                    unload.owner.unload(unload.pageId);
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Returns the byte-wise largest indexed key currently held in the BRIN,
+     * or {@code null} if the index has no entries. Runs in O(log n) by
+     * scanning blocks from largest start key downwards (the trailing block
+     * could be empty after deletes) and returning the first non-empty
+     * block's {@code lastKey()}.
+     */
+    public K getMaxKey() {
+        for (Block<K, V> block : blocks.descendingMap().values()) {
+            block.lock.lock();
+            Page.Metadata unload = null;
+            try {
+                unload = block.ensureBlockLoadedWithoutUnload();
+                if (block.values != null && !block.values.isEmpty()) {
+                    return block.values.lastKey();
+                }
+            } finally {
+                block.lock.unlock();
+                if (unload != null) {
+                    unload.owner.unload(unload.pageId);
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
      * Read-only snapshot of every block currently registered in the index,
      * used by the Web UI v2 backend to render a "BRIN blocks" treemap.
      *
