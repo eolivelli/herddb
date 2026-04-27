@@ -91,6 +91,9 @@ ZooKeeper connection address (first ZK pod via headless service).
 {{/*
 JDBC URL for the tools pod.
 Uses a direct server connection to the first server pod (FQDN).
+The client auto-discovers cluster topology via the sysnodes / systablespaces
+system tables (ServerBasedClientSideMetadataProvider), so no ZooKeeper
+address is needed in the JDBC URL even when server.mode=cluster.
 */}}
 {{- define "herddb.jdbcUrl" -}}
 {{- printf "jdbc:herddb:server:%s-server-0.%s-server.%s.svc.cluster.local:%d"

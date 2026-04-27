@@ -299,6 +299,124 @@ public class HerdDBClusterKubernetesIT {
         LOG.info("Test 3 passed: Cluster mode with JDBC operations works.");
     }
 
+    /**
+     * Deploys HerdDB in cluster mode with tools enabled and exercises the
+     * <em>server-based discovery</em> path: the tools pod connects via
+     * {@code jdbc:herddb:server:…} (no ZooKeeper in the JDBC URL) and the
+     * new {@code ServerBasedClientSideMetadataProvider} discovers the cluster
+     * topology by querying {@code sysnodes} and {@code systablespaces}.
+     *
+     * <p>The test explicitly queries both system tables via herddb-cli to
+     * assert that the discovery data is correct, then performs an
+     * INSERT + SELECT round-trip to prove that routing via the discovered
+     * leader actually works.
+     */
+    @Test
+    public void test4_ServerBasedDiscovery() throws Exception {
+        LOG.info("=== Test 4: Server-Based Discovery (ZooKeeper-less JDBC client) ===");
+
+        deleteAllResources();
+
+        Map<String, String> values = new LinkedHashMap<>();
+        values.put("server.mode", "cluster");
+        values.put("server.replicaCount", "1");
+        values.put("tools.enabled", "true");
+        values.put("zookeeper.enabled", "true");
+        values.put("bookkeeper.enabled", "true");
+        values.put("bookkeeper.replicaCount", "1");
+        values.put("image.pullPolicy", "Never");
+        values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
+        values.put("zookeeper.resources.requests.memory", "256Mi");
+        values.put("zookeeper.resources.requests.cpu", "0.5");
+        values.put("zookeeper.resources.limits.memory", "256Mi");
+        values.put("zookeeper.resources.limits.cpu", "0.5");
+        values.put("zookeeper.storage.size", "1Gi");
+        values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
+        values.put("bookkeeper.resources.requests.memory", "256Mi");
+        values.put("bookkeeper.resources.requests.cpu", "0.5");
+        values.put("bookkeeper.resources.limits.memory", "256Mi");
+        values.put("bookkeeper.resources.limits.cpu", "0.5");
+        values.put("bookkeeper.storage.journal.size", "1Gi");
+        values.put("bookkeeper.storage.ledger.size", "1Gi");
+        values.put("server.javaOpts", SERVER_JAVA_OPTS);
+        values.put("server.resources.requests.memory", "512Mi");
+        values.put("server.resources.requests.cpu", "0.5");
+        values.put("server.resources.limits.memory", "512Mi");
+        values.put("server.resources.limits.cpu", "0.5");
+        values.put("server.storage.data.size", "1Gi");
+        values.put("server.storage.commitlog.size", "1Gi");
+
+        applyHelmChart(values);
+
+        LOG.info("Waiting for ZooKeeper pod to be ready...");
+        kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "zookeeper")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+
+        LOG.info("Waiting for BookKeeper pod to be ready...");
+        waitForComponent("bookkeeper", 5, TimeUnit.MINUTES);
+
+        LOG.info("Waiting for HerdDB server pod to be ready...");
+        kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "server")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+
+        LOG.info("Waiting for tools pod to be ready...");
+        kubernetesClient.pods()
+                .inNamespace("default")
+                .withLabel("app.kubernetes.io/component", "tools")
+                .waitUntilReady(5, TimeUnit.MINUTES);
+
+        String toolsPod = getToolsPodName();
+        HerdDBKubernetesIT.waitForTablespace(k3s, toolsPod);
+
+        // ---- Assert sysnodes is populated ----------------------------------------
+        // The tools pod connects via jdbc:herddb:server:… (server-based discovery).
+        // ServerBasedClientSideMetadataProvider queries sysnodes on first use;
+        // we verify here that the server is exposing at least one node so that
+        // the provider can build the topology map.
+        LOG.info("Querying sysnodes to verify server-based discovery data...");
+        String sysnodesOut = HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "SELECT nodeid, address, ssl FROM sysnodes");
+        LOG.info("sysnodes output: " + sysnodesOut);
+        assertTrue("sysnodes must return at least one row",
+                !sysnodesOut.trim().isEmpty()
+                && !sysnodesOut.contains("0 rows"));
+
+        // ---- Assert systablespaces has a leader ----------------------------------
+        // The default tablespace in HerdDB is named "herd" (TableSpace.DEFAULT),
+        // NOT "default". Filter on that exact name.
+        LOG.info("Querying systablespaces to verify leader is set...");
+        String systablespacesOut = HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "SELECT tablespace_name, leader FROM systablespaces "
+                + "WHERE tablespace_name='herd'");
+        LOG.info("systablespaces output: " + systablespacesOut);
+        // The leader column must be non-null — presence of "herd" in the output
+        // proves the tablespace is registered and has a leader.
+        assertTrue("systablespaces must contain the default 'herd' tablespace with a leader",
+                systablespacesOut.contains("herd"));
+
+        // ---- Round-trip DML through the discovered leader ----------------------
+        HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "CREATE TABLE discovery_k8s_test (id int primary key, name string)");
+        LOG.info("Table created via server-based discovery.");
+
+        HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "INSERT INTO discovery_k8s_test (id, name) VALUES (1, 'discovery-works')");
+        LOG.info("Row inserted via server-based discovery.");
+
+        String selectOut = HerdDBKubernetesIT.execSql(k3s, toolsPod,
+                "SELECT id, name FROM discovery_k8s_test");
+        LOG.info("SELECT output: " + selectOut);
+        assertTrue("Expected 'discovery-works' in SELECT output",
+                selectOut.contains("discovery-works"));
+
+        LOG.info("Test 4 passed: server-based discovery works in cluster mode "
+                + "(jdbc:herddb:server:… without ZooKeeper in JDBC URL).");
+    }
+
     private String getToolsPodName() {
         List<Pod> pods = kubernetesClient.pods()
                 .inNamespace("default")

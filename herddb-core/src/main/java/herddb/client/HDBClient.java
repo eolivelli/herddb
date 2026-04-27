@@ -106,11 +106,18 @@ public class HDBClient implements AutoCloseable {
         networkGroup = buildNetworkGroup(connectRemoteServers);
         switch (mode) {
             case ClientConfiguration.PROPERTY_MODE_LOCAL:
-            case ClientConfiguration.PROPERTY_MODE_STANDALONE:
                 this.clientSideMetadataProvider = new StaticClientSideMetadataProvider(
                         configuration.getString(ClientConfiguration.PROPERTY_SERVER_ADDRESS, ClientConfiguration.PROPERTY_SERVER_ADDRESS_DEFAULT),
                         configuration.getInt(ClientConfiguration.PROPERTY_SERVER_PORT, ClientConfiguration.PROPERTY_SERVER_PORT_DEFAULT),
                         configuration.getBoolean(ClientConfiguration.PROPERTY_SERVER_SSL, ClientConfiguration.PROPERTY_SERVER_SSL_DEFAULT)
+                );
+                break;
+            case ClientConfiguration.PROPERTY_MODE_STANDALONE:
+                this.clientSideMetadataProvider = new ServerBasedClientSideMetadataProvider(
+                        configuration.getString(ClientConfiguration.PROPERTY_SERVER_ADDRESS, ClientConfiguration.PROPERTY_SERVER_ADDRESS_DEFAULT),
+                        configuration.getInt(ClientConfiguration.PROPERTY_SERVER_PORT, ClientConfiguration.PROPERTY_SERVER_PORT_DEFAULT),
+                        configuration.getBoolean(ClientConfiguration.PROPERTY_SERVER_SSL, ClientConfiguration.PROPERTY_SERVER_SSL_DEFAULT),
+                        configuration
                 );
                 break;
             case ClientConfiguration.PROPERTY_MODE_CLUSTER:
