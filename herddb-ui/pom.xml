@@ -159,7 +159,15 @@
                 <configuration>
                     <nodeVersion>${frontend.node.version}</nodeVersion>
                     <npmVersion>${frontend.npm.version}</npmVersion>
-                    <installDirectory>${project.build.directory}/node-toolchain</installDirectory>
+                    <!--
+                        Install the Node/npm toolchain outside target/ so it
+                        survives `mvn clean` and can be cached by CI.
+                        In GitHub Actions the cache key is based on the
+                        herddb-ui/pom.xml hash (see .github/workflows/ci.yml),
+                        so bumping nodeVersion or npmVersion automatically
+                        busts the cache and triggers a fresh download.
+                    -->
+                    <installDirectory>${user.home}/.cache/frontend-maven-plugin</installDirectory>
                 </configuration>
                 <executions>
                     <execution>

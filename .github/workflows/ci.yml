@@ -39,21 +39,23 @@ jobs:
         with:
           java-version: '25'
           distribution: 'oracle'
-      - name: 'Set up Node.js 20'
-        # The herddb-ui module's frontend-maven-plugin will still download
-        # its own pinned Node toolchain into target/node-toolchain (so the
-        # local dev experience matches CI), but having a system Node on
-        # PATH speeds up first-time runs and gives us a fallback if the
-        # pinned download is flaky.
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
       - name: 'Cache Maven packages'
         uses: actions/cache@v4
         with:
           path: ~/.m2
           key: 'cache'
           restore-keys: 'cache'
+      - name: 'Cache Node toolchain'
+        # frontend-maven-plugin installs Node/npm to ~/.cache/frontend-maven-plugin
+        # (outside target/ so it is not wiped by mvn clean). Caching that
+        # directory avoids re-downloading the Node tarball on every CI run.
+        # The key includes the pom.xml hash so bumping nodeVersion or npmVersion
+        # automatically busts the cache.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/frontend-maven-plugin
+          key: node-toolchain-${{ runner.os }}-${{ hashFiles('herddb-ui/pom.xml') }}
+          restore-keys: node-toolchain-${{ runner.os }}-
       - name: 'Checkout jvector'
         uses: actions/checkout@v4
         with:
@@ -156,18 +158,23 @@ jobs:
         with:
           java-version: '25'
           distribution: 'oracle'
-      - name: 'Set up Node.js 20'
-        # Required by the herddb-ui module — the test phase runs
-        # `vitest run` via frontend-maven-plugin.
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
       - name: 'Cache Maven packages'
         uses: actions/cache@v4
         with:
           path: ~/.m2
           key: 'cache'
           restore-keys: 'cache'
+      - name: 'Cache Node toolchain'
+        # frontend-maven-plugin installs Node/npm to ~/.cache/frontend-maven-plugin
+        # (outside target/ so it is not wiped by mvn clean). Caching that
+        # directory avoids re-downloading the Node tarball on every CI run.
+        # The key includes the pom.xml hash so bumping nodeVersion or npmVersion
+        # automatically busts the cache.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/frontend-maven-plugin
+          key: node-toolchain-${{ runner.os }}-${{ hashFiles('herddb-ui/pom.xml') }}
+          restore-keys: node-toolchain-${{ runner.os }}-
       - name: 'Download build artifacts'
         uses: actions/download-artifact@v4
         with:
@@ -267,16 +274,6 @@ jobs:
         with:
           java-version: '25'
           distribution: 'oracle'
-      - name: 'Set up Node.js 20'
-        # herddb-services depends on the herddb-ui WAR; even though
-        # frontend-maven-plugin only runs in the herddb-ui module, the
-        # full reactor build executed here picks up the pre-built
-        # artifact via download-artifact and never invokes Node directly.
-        # We still install Node defensively so that `mvn verify` will not
-        # block if any future test reaches into the SPA tooling.
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
       - name: 'Cache Maven packages'
         uses: actions/cache@v4
         with:
