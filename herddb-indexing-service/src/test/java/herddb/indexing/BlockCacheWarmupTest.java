@@ -59,9 +59,9 @@ import org.junit.rules.TemporaryFolder;
  * <ol>
  *   <li>{@link PersistentVectorStore#warmUpBlockCache} is a no-op when
  *       {@code warmupBytes == 0}.</li>
- *   <li>{@link PersistentVectorStore#warmUpBlockCache} reads the expected
- *       number of bytes from every loaded segment's reader when
- *       {@code warmupBytes > 0}.</li>
+ *   <li>{@link PersistentVectorStore#warmUpBlockCache} issues reads starting
+ *       from the HNSW entry node via BFS on Layer 0, and the byte counter
+ *       increases when {@code warmupBytes > 0}.</li>
  *   <li>The {@link IndexingServiceEngine} respects the config key
  *       {@link IndexingServerConfiguration#PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES}
  *       and saves the watermark after warmup completes.</li>
@@ -350,9 +350,11 @@ public class BlockCacheWarmupTest {
     }
 
     /**
-     * {@code warmUpBlockCache(N)} caps reads to {@code N} bytes per segment.
-     * With a tiny N (1 byte) the warmup still completes without error, and the
-     * bytes-read counter is in the range {@code [1, segmentCount]}.
+     * {@code warmUpBlockCache(N)} caps BFS node visits to approximately
+     * {@code N / approxBytesPerNode} per segment. With a 1-byte budget the
+     * BFS visits exactly 1 node (the entry node) and reads only a handful of
+     * bytes (one {@code readInt} for the neighbor count plus the neighbor-ID
+     * array) — far less than a full traversal of all nodes.
      */
     @Test
     public void testWarmupRespectsLimit() throws Exception {
@@ -375,18 +377,18 @@ public class BlockCacheWarmupTest {
             }
             store.checkpoint();
 
-            // Full warmup (baseline — get total segment bytes).
+            // Full warmup (baseline — visits all nodes via BFS).
             dsm.totalBytesRead.set(0);
             store.warmUpBlockCache(Long.MAX_VALUE);
             long fullWarmupBytes = dsm.totalBytesRead.get();
             assertTrue("full warmup must read something", fullWarmupBytes > 0);
 
-            // Limited warmup: 1 byte per segment → much less than the full file.
+            // 1-byte budget → nodeLimit = max(1, 1/approxBytesPerNode) = 1 (entry node only).
+            // Reads just readInt + neighbor-ID array: a few dozen bytes, strictly
+            // less than a full BFS over all nodes.
             dsm.totalBytesRead.set(0);
             store.warmUpBlockCache(1);
             long limitedBytes = dsm.totalBytesRead.get();
-            // 1 byte → rounds up to the smallest readable unit (65 536 B chunk);
-            // the important assertion is that it is strictly less than the full read.
             assertTrue("limited warmup must read less than full warmup",
                     limitedBytes < fullWarmupBytes);
         } finally {
