@@ -25,6 +25,23 @@
     <display-name>HerdDB Web UI v2</display-name>
 
     <!--
+        SPA fallback filter: forwards deep React Router URLs (e.g.
+        /tablespaces/herd/tables/foo/data-pages) to /index.html on a browser
+        refresh or direct link, so that React Router can handle them
+        client-side.  API paths (/api/*) and static assets (paths with a
+        file extension) are passed straight through the filter chain.
+        See org.herddb.ui.filter.SpaFallbackFilter for details.
+    -->
+    <filter>
+        <filter-name>SpaFallbackFilter</filter-name>
+        <filter-class>org.herddb.ui.filter.SpaFallbackFilter</filter-class>
+    </filter>
+    <filter-mapping>
+        <filter-name>SpaFallbackFilter</filter-name>
+        <url-pattern>/*</url-pattern>
+    </filter-mapping>
+
+    <!--
         JAX-RS application registering all v2 REST resources under /api/v2.
         See org.herddb.ui.api.v2.ApplicationConfigV2 for the resource list.
     -->

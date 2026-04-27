@@ -70,6 +70,14 @@ export function Header({ serverInfoLoader = HerdDbApi.serverInfo }: HeaderProps)
                           ? `Node ${serverInfo.nodeId} · ${serverInfo.mode}`
                           : 'Server: loading…'}
                 </span>
+                <button
+                    className="herd-header__refresh-btn"
+                    title="Reload current page"
+                    aria-label="Refresh"
+                    onClick={() => window.location.reload()}
+                >
+                    ⟳ Refresh
+                </button>
             </div>
         </header>
     );
