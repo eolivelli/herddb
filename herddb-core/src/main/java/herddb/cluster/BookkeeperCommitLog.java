@@ -534,8 +534,15 @@ public class BookkeeperCommitLog extends CommitLog {
         LOGGER.log(Level.SEVERE, "bookkeeper async failure on tablespace " + tableSpaceDescription()
                 + " while writing entry " + edit, cause);
         if (cause instanceof BKException.BKLedgerClosedException) {
-            LOGGER.log(Level.SEVERE, "ledger has been closed, need to open a new ledger for tablespace "
-                    + tableSpaceDescription(), cause);
+            // BKLedgerClosedException on a write callback means the ledger was sealed by
+            // an external agent (e.g. full recovery open by another node).  A server-initiated
+            // close always drains pending adds before sealing, so it never produces a
+            // BKLedgerClosedException on the write path.  Treat this as a permanent failure:
+            // creating a new ledger here would allow writes to proceed on a potentially
+            // split-brained log.
+            LOGGER.log(Level.SEVERE, "ledger has been closed externally for tablespace "
+                    + tableSpaceDescription() + " — marking log as failed", cause);
+            signalLogFailed();
         } else if (cause instanceof BKException.BKLedgerFencedException) {
             LOGGER.log(Level.SEVERE, "this server was fenced for tablespace " + tableSpaceDescription() + " !", cause);
             signalLogFailed();
@@ -560,12 +567,17 @@ public class BookkeeperCommitLog extends CommitLog {
             if (!startWritingCalled) {
                 throw new LogNotAvailableException("this log has is not allowed to write");
             }
-            // Guard: if the current writer's write error is a non-BKException (e.g. a
-            // RuntimeException from the JVM-local transport), we cannot safely rotate to
-            // a new ledger.  The bookie's state is unknown and an external agent may have
-            // fenced us in the meantime.  Creating a new ledger here would silently clear
-            // the `failed` flag and allow writes to proceed on a potentially split-brained
-            // log.  Abort instead so the tablespace activator can perform a clean recovery.
+            // Guard: if the current writer's write error indicates an unsafe rotation, abort.
+            // Three categories of write errors make rotation unsafe:
+            //   1. Non-BKException (e.g. RuntimeException from the JVM-local transport): the
+            //      bookie's state is unknown; an external agent may have fenced us.
+            //   2. BKLedgerClosedException: the ledger was sealed by an external agent (a
+            //      server-initiated close always drains pending adds first and never produces
+            //      this error on a write callback).
+            //   3. BKLedgerFencedException: another leader has taken over the tablespace.
+            // In all three cases creating a new ledger would silently reset `failed=false`
+            // and allow writes to proceed on a potentially split-brained log.  Abort so the
+            // tablespace activator can perform a clean recovery.
             // Note: unwrap one layer of CompletionException / LogNotAvailableException
             // (same as handleBookKeeperFailure) before checking the exception type.
             if (writer != null && writer.errorOccurredDuringWrite) {
@@ -578,11 +590,14 @@ public class BookkeeperCommitLog extends CommitLog {
                     if (unwrapped instanceof LogNotAvailableException && unwrapped.getCause() != null) {
                         unwrapped = unwrapped.getCause();
                     }
-                    if (!(unwrapped instanceof BKException)) {
+                    if (!(unwrapped instanceof BKException)
+                            || unwrapped instanceof BKException.BKLedgerClosedException
+                            || unwrapped instanceof BKException.BKLedgerFencedException) {
                         signalLogFailed();
                         throw new LogNotAvailableException(tableSpaceDescription()
-                                + ": aborting ledger rotation — previous ledger had a non-BK"
-                                + " write error, ledger state is unknown: " + prevError);
+                                + ": aborting ledger rotation — previous ledger had a write error"
+                                + " indicating external fencing or closure, ledger state is"
+                                + " unknown: " + prevError);
                     }
                 }
             }
@@ -998,13 +1013,13 @@ public class BookkeeperCommitLog extends CommitLog {
                 writer.close();
             } catch (LogNotAvailableException err) {
                 if (hadWriteError && !wasFenced && !containsFencingError(err)) {
-                    // The ledger had a transient BK write error (e.g. BKLedgerClosedException
-                    // when addEntryTimeoutSec fired while the bookie was paused).  The BK
-                    // client may have internally sealed the write handle as part of its
-                    // timeout handling, making out.closeAsync() fail immediately.  This is
-                    // harmless: the ledger is effectively sealed and no new entries can reach
-                    // it (errorOccurredDuringWrite=true keeps isWritable()==false).  Log the
-                    // error and let openNewLedger() proceed to create a fresh, healthy ledger.
+                    // The ledger had a transient BK write error (e.g. BKNotEnoughBookiesException
+                    // during a brief bookie outage).  The BK client may have internally sealed
+                    // the write handle as part of its error handling, making out.closeAsync()
+                    // fail immediately.  This is harmless: the ledger is effectively sealed and
+                    // no new entries can reach it (errorOccurredDuringWrite=true keeps
+                    // isWritable()==false).  Log the error and let openNewLedger() proceed to
+                    // create a fresh, healthy ledger.
                     //
                     // Safety: we also check !containsFencingError(err) here.  In some BK
                     // versions / configurations closeAsync() itself can throw
@@ -1012,9 +1027,10 @@ public class BookkeeperCommitLog extends CommitLog {
                     // by another node).  That would mean another leader has taken over and we
                     // must stop immediately to prevent split-brain — do not swallow it.
                     //
-                    // Non-BK write errors (RuntimeException etc.) are blocked upstream in
-                    // openNewLedger() and never reach this branch, so we only ever get here
-                    // for recoverable BKLedgerClosedException writes.
+                    // Note: BKLedgerClosedException and BKLedgerFencedException write-callback
+                    // errors are now blocked upstream in openNewLedger() (they indicate external
+                    // fencing/closure and make rotation unsafe), so we only ever reach this
+                    // branch for other transient BK write errors.
                     LOGGER.log(Level.INFO,
                             "{0} ignoring error closing an already-errored ledger (will open a new one): {1}",
                             new Object[]{tableSpaceDescription(), err.toString()});
