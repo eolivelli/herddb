@@ -24,32 +24,28 @@ import herddb.model.DataScannerException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.ws.rs.GET;
-import javax.ws.rs.NotFoundException;
 import javax.ws.rs.Path;
 import javax.ws.rs.PathParam;
 import javax.ws.rs.Produces;
 import javax.ws.rs.WebApplicationException;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
-import org.herddb.ui.dto.ColumnDTO;
-import org.herddb.ui.dto.ForeignKeyDTO;
-import org.herddb.ui.dto.IndexSummaryDTO;
-import org.herddb.ui.dto.TableDetailDTO;
 import org.herddb.ui.dto.TableSummaryDTO;
 import org.herddb.ui.internal.QueryService;
 import org.herddb.ui.internal.ServerLocator;
 
 /**
- * REST endpoints for tables and their immediate metadata
- * (columns, indexes, foreign keys).
+ * REST endpoint for the table collection inside a tablespace.
  *
  * <p>Mounted at {@code /api/v2/tablespaces/{tablespace}/tables}.
+ * Individual table metadata (columns, indexes, foreign keys, storage layout)
+ * is served by {@link TableResource} at the more specific path
+ * {@code /api/v2/tablespaces/{tablespace}/tables/{table}}.
  */
 @Path("tablespaces/{tablespace}/tables")
 public class TablesResource {
@@ -110,149 +106,7 @@ public class TablesResource {
         }
     }
 
-    @GET
-    @Path("{name}")
-    @Produces(MediaType.APPLICATION_JSON)
-    public TableDetailDTO get(
-            @PathParam("tablespace") String tablespace,
-            @PathParam("name") String name) {
-        validateIdentifier("tablespace", tablespace);
-        validateIdentifier("name", name);
-        try {
-            TableSummaryDTO summary = list(tablespace).stream()
-                    .filter(s -> name.equalsIgnoreCase(s.getName()))
-                    .findFirst()
-                    .orElseThrow(() -> new NotFoundException(
-                            "No table '" + name + "' in tablespace '" + tablespace + "'"));
-
-            List<ColumnDTO> columns = loadColumns(tablespace, name);
-            List<IndexSummaryDTO> indexes = loadIndexes(tablespace, name);
-            List<ForeignKeyDTO> foreignKeys = loadForeignKeys(tablespace, name);
-
-            TableDetailDTO detail = new TableDetailDTO();
-            detail.setSummary(summary);
-            detail.setColumns(columns);
-            detail.setIndexes(indexes);
-            detail.setForeignKeys(foreignKeys);
-            return detail;
-        } catch (DataScannerException e) {
-            throw new WebApplicationException(
-                    "Failed to read table " + tablespace + "." + name + ": " + e.getMessage(),
-                    e,
-                    Response.Status.INTERNAL_SERVER_ERROR);
-        }
-    }
-
     // -- helpers --------------------------------------------------------
-
-    private List<ColumnDTO> loadColumns(String tablespace, String table)
-            throws DataScannerException {
-        // syscolumns has no tablespace column; filter by table name in
-        // Java to keep the SQL trivial. The set is small (one row per
-        // column).
-        List<Map<String, Object>> rows = queryService.selectRows(
-                tablespace, "SELECT * FROM syscolumns");
-        List<ColumnDTO> out = new ArrayList<>();
-        for (Map<String, Object> row : rows) {
-            if (!table.equalsIgnoreCase(asString(row.get("table_name")))) {
-                continue;
-            }
-            ColumnDTO dto = new ColumnDTO();
-            dto.setName(asString(row.get("column_name")));
-            dto.setOrdinalPosition(asInt(row.get("ordinal_position")));
-            dto.setNullable(asInt(row.get("is_nullable")) != 0);
-            dto.setDataType(asString(row.get("data_type")));
-            dto.setTypeName(asString(row.get("type_name")));
-            dto.setAutoIncrement(asInt(row.get("auto_increment")) != 0);
-            dto.setDefaultValue(asString(row.get("default_value")));
-            out.add(dto);
-        }
-        out.sort(Comparator.comparingInt(ColumnDTO::getOrdinalPosition));
-        return out;
-    }
-
-    private List<IndexSummaryDTO> loadIndexes(String tablespace, String table)
-            throws DataScannerException {
-        List<Map<String, Object>> indexRows = queryService.selectRows(
-                tablespace, "SELECT * FROM sysindexes");
-        List<Map<String, Object>> indexCols = queryService.selectRows(
-                tablespace, "SELECT * FROM sysindexcolumns");
-
-        // group columns by index uuid (uuid is unique; index_name may
-        // collide across tables) so we can attach them to the right index.
-        Map<String, List<Map<String, Object>>> colsByUuid = new HashMap<>();
-        for (Map<String, Object> row : indexCols) {
-            colsByUuid
-                    .computeIfAbsent(asString(row.get("index_uuid")), k -> new ArrayList<>())
-                    .add(row);
-        }
-
-        List<IndexSummaryDTO> out = new ArrayList<>();
-        for (Map<String, Object> idx : indexRows) {
-            if (!table.equalsIgnoreCase(asString(idx.get("table_name")))) {
-                continue;
-            }
-            String uuid = asString(idx.get("index_uuid"));
-            List<Map<String, Object>> cols = colsByUuid.getOrDefault(uuid, List.of());
-            cols = new ArrayList<>(cols);
-            cols.sort(Comparator.comparingInt(c -> asInt(c.get("ordinal_position"))));
-            List<String> columnNames = new ArrayList<>(cols.size());
-            for (Map<String, Object> c : cols) {
-                columnNames.add(asString(c.get("column_name")));
-            }
-            IndexSummaryDTO dto = new IndexSummaryDTO();
-            dto.setName(asString(idx.get("index_name")));
-            dto.setUuid(uuid);
-            dto.setType(asString(idx.get("index_type")));
-            dto.setUnique(asInt(idx.get("unique")) != 0);
-            dto.setColumns(columnNames);
-            out.add(dto);
-        }
-        out.sort(Comparator.comparing(
-                IndexSummaryDTO::getName,
-                Comparator.nullsLast(String::compareToIgnoreCase)));
-        return out;
-    }
-
-    private List<ForeignKeyDTO> loadForeignKeys(String tablespace, String table)
-            throws DataScannerException {
-        List<Map<String, Object>> rows = queryService.selectRows(
-                tablespace, "SELECT * FROM sysforeignkeys");
-
-        // Each row in sysforeignkeys describes a single column pair; group
-        // the rows belonging to the same constraint together.
-        Map<String, List<Map<String, Object>>> grouped = new LinkedHashMap<>();
-        for (Map<String, Object> row : rows) {
-            if (!table.equalsIgnoreCase(asString(row.get("child_table_name")))) {
-                continue;
-            }
-            String name = asString(row.get("child_table_cons_name"));
-            grouped.computeIfAbsent(name == null ? "" : name, k -> new ArrayList<>())
-                    .add(row);
-        }
-
-        List<ForeignKeyDTO> out = new ArrayList<>();
-        for (Map.Entry<String, List<Map<String, Object>>> entry : grouped.entrySet()) {
-            List<Map<String, Object>> fkRows = new ArrayList<>(entry.getValue());
-            fkRows.sort(Comparator.comparingInt(r -> asInt(r.get("ordinal_position"))));
-            ForeignKeyDTO dto = new ForeignKeyDTO();
-            dto.setName(entry.getKey());
-            Map<String, Object> first = fkRows.get(0);
-            dto.setParentTable(asString(first.get("parent_table_name")));
-            dto.setOnDeleteAction(asString(first.get("on_delete_action")));
-            dto.setOnUpdateAction(asString(first.get("on_update_action")));
-            List<String> childColumns = new ArrayList<>(fkRows.size());
-            List<String> parentColumns = new ArrayList<>(fkRows.size());
-            for (Map<String, Object> row : fkRows) {
-                childColumns.add(asString(row.get("child_table_column_name")));
-                parentColumns.add(asString(row.get("parent_table_column_name")));
-            }
-            dto.setChildColumns(childColumns);
-            dto.setParentColumns(parentColumns);
-            out.add(dto);
-        }
-        return out;
-    }
 
     private static TableSummaryDTO toSummary(
             String tablespace,

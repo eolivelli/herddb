@@ -23,11 +23,15 @@ package org.herddb.ui.api.v2;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import herddb.core.DBManager;
+import herddb.model.TableSpace;
+import herddb.model.TransactionContext;
 import herddb.server.Server;
 import herddb.server.ServerConfiguration;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.Comparator;
 import javax.ws.rs.client.WebTarget;
 import javax.ws.rs.core.Application;
@@ -75,6 +79,15 @@ public class HealthResourceHttpSmokeTest extends JerseyTest {
         embeddedServer = new Server(config);
         embeddedServer.start();
         embeddedServer.waitForStandaloneBoot();
+
+        // Seed a user table so the table-detail smoke test can verify a
+        // non-system table is reachable via the HTTP endpoint.
+        DBManager manager = embeddedServer.getManager();
+        manager.executeSimpleStatement(
+                TableSpace.DEFAULT,
+                "CREATE TABLE smoke_t (id INTEGER PRIMARY KEY, val STRING)",
+                Collections.emptyList(), -1, false,
+                TransactionContext.NO_TRANSACTION, null);
     }
 
     @AfterClass
@@ -113,7 +126,7 @@ public class HealthResourceHttpSmokeTest extends JerseyTest {
         resourceConfig.register(TablespacesResource.class);
         resourceConfig.register(ServerInfoResource.class);
         resourceConfig.register(TablesResource.class);
-        resourceConfig.register(IndexesResource.class);
+        resourceConfig.register(TableResource.class);
         resourceConfig.register(IndexingServicesResource.class);
         resourceConfig.register(new AbstractBinder() {
             @Override
@@ -178,6 +191,39 @@ public class HealthResourceHttpSmokeTest extends JerseyTest {
                     json.contains("\"defaultTablespace\":\"herd\""));
         } finally {
             response.close();
+        }
+    }
+
+    /**
+     * Exercises the full Jetty+Jersey routing for the table-detail endpoint
+     * ({@code GET /tablespaces/{ts}/tables/{name}}) which was previously
+     * returning 404 because {@code IndexesResource} (now {@link TableResource})
+     * shadowed {@code TablesResource}'s sub-path handler without providing a
+     * {@code @GET} at the class root.
+     */
+    @Test
+    public void tableDetailEndpointReturnsMetadata() {
+        // System table "syscolumns" always exists; user table "smoke_t" was
+        // seeded in @BeforeClass — verify both are reachable.
+        for (String tableName : new String[]{"syscolumns", "smoke_t"}) {
+            WebTarget target = target("tablespaces/herd/tables/" + tableName);
+            Response response = target.request(MediaType.APPLICATION_JSON).get();
+            try {
+                assertEquals(
+                        "GET tablespaces/herd/tables/" + tableName + " must return 200",
+                        200, response.getStatus());
+                String json = response.readEntity(String.class);
+                assertNotNull(json);
+                assertTrue(
+                        "response for " + tableName + " must contain its name, got: " + json,
+                        json.toLowerCase(java.util.Locale.ROOT)
+                                .contains("\"name\":\"" + tableName.toLowerCase(java.util.Locale.ROOT) + "\""));
+                assertTrue(
+                        "response for " + tableName + " must contain a columns array, got: " + json,
+                        json.contains("\"columns\":["));
+            } finally {
+                response.close();
+            }
         }
     }
 
