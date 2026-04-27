@@ -35,6 +35,7 @@ import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.GraphSearcher;
 import io.github.jbellis.jvector.graph.ImmutableGraphIndex;
+import io.github.jbellis.jvector.graph.NodesIterator;
 import io.github.jbellis.jvector.graph.OnHeapGraphIndex;
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.SearchResult;
@@ -2591,6 +2592,133 @@ public class PersistentVectorStore extends AbstractVectorStore {
             return doCheckpoint();
         } catch (IOException e) {
             throw new DataStorageManagerException(e);
+        }
+    }
+
+    /**
+     * Pre-warms the {@link herddb.remote.SegmentBlockCache} for each loaded
+     * segment by performing a BFS traversal of Layer 0 starting from the
+     * segment's HNSW entry node. Every
+     * {@link ImmutableGraphIndex.View#getNeighborsIterator} call on Layer 0
+     * reads through the segment's {@link ReaderSupplier}, which routes through
+     * the {@link herddb.remote.SegmentBlockCache} and populates it with the
+     * blocks most likely to be accessed by subsequent search queries.
+     * Higher layers (L1+) are already in Java heap after
+     * {@link OnDiskGraphIndex#load}, so no I/O is needed for them.
+     *
+     * <p>The BFS visits at most
+     * {@code warmupBytesPerSegment / approxBytesPerNode} nodes per segment
+     * (where {@code approxBytesPerNode ≈ graphFileSize / idUpperBound}),
+     * and always at least the entry node. Starting from the entry node
+     * guarantees the most critical block is warm regardless of where the
+     * entry-node ordinal falls within the file — a sequential read from
+     * offset 0 would miss it for large segments.
+     *
+     * <p>A value of {@code 0} or negative is a no-op. Individual segment
+     * failures are logged at WARNING and skipped; the warmup is best-effort
+     * and never aborts the watermark save.
+     *
+     * <p>In local-file or in-memory storage modes the reads route through the
+     * in-memory buffer; they complete without error but have no block-cache
+     * effect.
+     *
+     * @param warmupBytesPerSegment approximate byte budget per segment; the
+     *     BFS stops when the estimated bytes consumed exceed this value
+     */
+    public void warmUpBlockCache(long warmupBytesPerSegment) {
+        if (warmupBytesPerSegment <= 0) {
+            return;
+        }
+        List<VectorSegment> currentSegments = this.segments;
+        if (currentSegments == null || currentSegments.isEmpty()) {
+            return;
+        }
+        long startMs = System.currentTimeMillis();
+        LOGGER.log(Level.INFO,
+                "warmUpBlockCache {0}: warming {1} segments, ~{2} bytes each (BFS from entry node)",
+                new Object[]{indexName, currentSegments.size(), warmupBytesPerSegment});
+        int warmedSegments = 0;
+        long totalNodesVisited = 0;
+        for (VectorSegment seg : currentSegments) {
+            OnDiskGraphIndex odg = seg.onDiskGraph;
+            if (odg == null || seg.graphFileSize <= 0) {
+                continue;
+            }
+            int idUpperBound = odg.getIdUpperBound();
+            if (idUpperBound <= 0) {
+                continue;
+            }
+            // Estimate bytes-per-node: Layer-0 data dominates file size.
+            long approxBytesPerNode = Math.max(1L, seg.graphFileSize / idUpperBound);
+            // Always warm at least the entry node regardless of budget.
+            int nodeLimit = (int) Math.min(
+                    idUpperBound,
+                    Math.max(1L, warmupBytesPerSegment / approxBytesPerNode));
+            int nodesVisited = warmUpSegmentBfs(seg, odg, nodeLimit);
+            if (nodesVisited > 0) {
+                warmedSegments++;
+                totalNodesVisited += nodesVisited;
+            }
+        }
+        long elapsedMs = System.currentTimeMillis() - startMs;
+        LOGGER.log(Level.INFO,
+                "warmUpBlockCache {0}: warmed {1}/{2} segments, {3} nodes total in {4} ms",
+                new Object[]{indexName, warmedSegments, currentSegments.size(),
+                        totalNodesVisited, elapsedMs});
+    }
+
+    /**
+     * BFS over Layer 0 of {@code seg} starting from its HNSW entry node.
+     * Every {@link ImmutableGraphIndex.View#getNeighborsIterator} call on
+     * Level 0 reads from disk through the
+     * {@link herddb.remote.SegmentBlockCache}. The traversal stops once
+     * {@code nodeLimit} distinct nodes have been visited.
+     *
+     * @return number of nodes visited (0 on error)
+     */
+    private int warmUpSegmentBfs(VectorSegment seg, OnDiskGraphIndex odg, int nodeLimit) {
+        try {
+            ImmutableGraphIndex.View view = odg.getView();
+            try {
+                ImmutableGraphIndex.NodeAtLevel entry = view.entryNode();
+                java.util.Set<Integer> visited = new java.util.HashSet<>();
+                java.util.ArrayDeque<Integer> queue = new java.util.ArrayDeque<>();
+                queue.add(entry.node);
+                visited.add(entry.node);
+                while (!queue.isEmpty() && visited.size() < nodeLimit) {
+                    int node = queue.poll();
+                    // Level-0 read: routes through RemoteRandomAccessReader → SegmentBlockCache
+                    NodesIterator neighbors = view.getNeighborsIterator(0, node);
+                    while (neighbors.hasNext() && visited.size() < nodeLimit) {
+                        int neighbor = neighbors.nextInt();
+                        if (visited.add(neighbor)) {
+                            queue.add(neighbor);
+                        }
+                    }
+                }
+                return visited.size();
+            } finally {
+                view.close();
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING,
+                    "warmUpBlockCache {0}: I/O error warming segment {1}: {2}",
+                    new Object[]{indexName, seg.segmentId, e.getMessage()});
+            return 0;
+        } catch (java.io.UncheckedIOException e) {
+            // getView() and getNeighborsIterator() wrap I/O errors as UncheckedIOException
+            LOGGER.log(Level.WARNING,
+                    "warmUpBlockCache {0}: I/O error warming segment {1}: {2}",
+                    new Object[]{indexName, seg.segmentId,
+                            e.getCause() != null ? e.getCause().getMessage() : e.getMessage()});
+            return 0;
+        } catch (Exception e) {
+            // Broad catch: warming is best-effort; any unexpected failure from an
+            // unknown ReaderSupplier implementation must not abort the watermark save.
+            LOGGER.log(Level.WARNING,
+                    "warmUpBlockCache " + indexName + ": unexpected error warming segment "
+                            + seg.segmentId, e);
+            return 0;
         }
     }
 
