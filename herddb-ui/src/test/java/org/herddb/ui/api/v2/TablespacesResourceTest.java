@@ -29,6 +29,8 @@ import herddb.model.TableSpace;
 import java.util.List;
 import javax.ws.rs.NotFoundException;
 import javax.ws.rs.WebApplicationException;
+import org.herddb.ui.dto.IndexStatusDTO;
+import org.herddb.ui.dto.LogStatusDTO;
 import org.herddb.ui.dto.TablespaceDTO;
 import org.herddb.ui.internal.QueryService;
 import org.junit.Rule;
@@ -103,5 +105,66 @@ public class TablespacesResourceTest {
                 WebApplicationException.class,
                 () -> resource.get(""));
         assertEquals(400, ex.getResponse().getStatus());
+    }
+
+    @Test
+    public void getLogStatusReturnsDataForDefaultTablespace() {
+        TablespacesResource resource = new TablespacesResource(
+                new QueryService(serverRule.getServer()));
+
+        LogStatusDTO dto = resource.getLogStatus(TableSpace.DEFAULT);
+
+        assertNotNull("log-status DTO must not be null", dto);
+        assertNotNull("tablespace field must be populated", dto.getTablespace());
+        assertFalse("tablespace field must not be blank", dto.getTablespace().isEmpty());
+        assertNotNull("status must be populated", dto.getStatus());
+        // ledger and offset are present even in local/in-memory mode.
+        // In the initial "start of time" state, ledger and offset may both be
+        // -1 (LogSequenceNumber.START_OF_TIME), so we only assert non-null.
+        assertNotNull("ledger must not be null", dto.getLedger());
+        assertNotNull("offset must not be null", dto.getOffset());
+        // checkpoint fields may be null if no checkpoint has been taken yet —
+        // that is valid in local/in-memory mode.
+    }
+
+    @Test
+    public void getLogStatusThrowsForUnknownTablespace() {
+        TablespacesResource resource = new TablespacesResource(
+                new QueryService(serverRule.getServer()));
+
+        // In direct-call tests (no Jersey), querying syslogstatus in a
+        // non-existent tablespace propagates as an unchecked RuntimeException
+        // (DataScannerException wraps the underlying NotLeaderException or
+        // similar).  We assert that *something* is thrown without tying the
+        // test to the exact type — Jersey would map it to a 5xx response in
+        // production.
+        assertThrows(RuntimeException.class,
+                () -> resource.getLogStatus("does_not_exist_ts"));
+    }
+
+    @Test
+    public void getLogStatusRejectsBlankName() {
+        TablespacesResource resource = new TablespacesResource(
+                new QueryService(serverRule.getServer()));
+
+        WebApplicationException ex = assertThrows(
+                WebApplicationException.class,
+                () -> resource.getLogStatus(""));
+        assertEquals(400, ex.getResponse().getStatus());
+    }
+
+    @Test
+    public void listIndexesReturnsEmptyListWhenNoUserIndexes() {
+        // A freshly started server has no user-created indexes; sysindexstatus
+        // only reports indexes owned by user tables, so the list must be empty.
+        TablespacesResource resource = new TablespacesResource(
+                new QueryService(serverRule.getServer()));
+
+        List<IndexStatusDTO> indexes = resource.listIndexes(TableSpace.DEFAULT);
+
+        assertNotNull("index list must not be null", indexes);
+        assertTrue(
+                "expected no user indexes on a fresh server, got " + indexes,
+                indexes.isEmpty());
     }
 }

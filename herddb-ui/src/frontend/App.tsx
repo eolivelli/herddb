@@ -26,6 +26,7 @@ import { IndexingServicesPage } from './pages/IndexingServicesPage';
 import { PrimaryIndexPage } from './pages/PrimaryIndexPage';
 import { TableDetailPage } from './pages/TableDetailPage';
 import { TablesPage } from './pages/TablesPage';
+import { TablespaceDetailPage } from './pages/TablespaceDetailPage';
 import { TablespacesPage } from './pages/TablespacesPage';
 
 export default function App() {
@@ -36,6 +37,10 @@ export default function App() {
                 <Routes>
                     <Route path="/" element={<DashboardPage />} />
                     <Route path="/tablespaces" element={<TablespacesPage />} />
+                    <Route
+                        path="/tablespaces/:tablespace"
+                        element={<TablespaceDetailPage />}
+                    />
                     <Route
                         path="/tablespaces/:tablespace/tables"
                         element={<TablesPage />}

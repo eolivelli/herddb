@@ -230,6 +230,25 @@ public class TableResourceTest {
     }
 
     @Test
+    public void indexDetailPopulatesStatusPropertiesForBrinIndex() {
+        TableResource resource = new TableResource(
+                ServerLocator.of(serverRule.getServer()));
+
+        IndexDetailDTO detail = resource.indexDetail(
+                TableSpace.DEFAULT, "child_t", "child_t_amount_idx");
+
+        assertNotNull(detail);
+        assertNotNull("statusProperties must be populated for a BRIN index",
+                detail.getStatusProperties());
+        assertFalse("statusProperties must not be blank",
+                detail.getStatusProperties().isBlank());
+        // sysindexstatus reports numBlocks for BRIN indexes
+        assertTrue(
+                "statusProperties must contain 'numBlocks', got: " + detail.getStatusProperties(),
+                detail.getStatusProperties().contains("numBlocks"));
+    }
+
+    @Test
     public void indexDetail404OnUnknownIndex() {
         TableResource resource = new TableResource(
                 ServerLocator.of(serverRule.getServer()));

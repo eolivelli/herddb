@@ -129,6 +129,33 @@ export interface BrinBlockDTO {
 export interface IndexDetailDTO {
     summary: IndexSummaryDTO;
     blocks: BrinBlockDTO[];
+    /** Raw JSON string from sysindexstatus.properties, or null if unavailable. */
+    statusProperties: string | null;
+}
+
+export interface LogStatusDTO {
+    tablespaceUuid: string | null;
+    tablespace: string | null;
+    nodeId: string | null;
+    ledger: number | null;
+    offset: number | null;
+    status: string | null;
+    checkpointLedger: number | null;
+    checkpointOffset: number | null;
+    /** Epoch-milliseconds timestamp of the last completed checkpoint, or null. */
+    checkpointTimestamp: number | null;
+    checkpointDurationMs: number | null;
+    dirtyLedgersCount: number | null;
+}
+
+export interface IndexStatusDTO {
+    tablespace: string;
+    tableName: string;
+    indexName: string;
+    indexType: string;
+    indexUuid: string;
+    /** Raw JSON properties string from sysindexstatus (type-specific). */
+    properties: string | null;
 }
 
 export interface IndexingServiceIndexDTO {
@@ -221,6 +248,16 @@ export const HerdDbApi = {
     ): Promise<IndexDetailDTO> {
         return request<IndexDetailDTO>(
             `/tablespaces/${encodeURIComponent(tablespace)}/tables/${encodeURIComponent(table)}/indexes/${encodeURIComponent(index)}`,
+        );
+    },
+    getLogStatus(tablespace: string): Promise<LogStatusDTO> {
+        return request<LogStatusDTO>(
+            `/tablespaces/${encodeURIComponent(tablespace)}/log-status`,
+        );
+    },
+    listIndexes(tablespace: string): Promise<IndexStatusDTO[]> {
+        return request<IndexStatusDTO[]>(
+            `/tablespaces/${encodeURIComponent(tablespace)}/indexes`,
         );
     },
     listIndexingServices(): Promise<IndexingServicesOverviewDTO> {
