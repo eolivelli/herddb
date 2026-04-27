@@ -19,6 +19,7 @@
 import { Link, useParams } from 'react-router-dom';
 import { HerdDbApi, type PrimaryIndexDTO } from '../api/client';
 import { useAsync } from '../components/AsyncResource';
+import { PrimaryIndexView } from '../visualizations/PrimaryIndexView';
 
 const formatter = new Intl.NumberFormat('en-US');
 const fmt = (v: number | undefined | null): string =>
@@ -58,29 +59,76 @@ export function PrimaryIndexPage({
                 </p>
             )}
             {!loading && !error && data && (
-                <table className="herd-table">
-                    <tbody>
-                        <tr>
-                            <th scope="row">Implementation</th>
-                            <td>
-                                <code>{data.type}</code>
-                            </td>
-                        </tr>
-                        <tr>
-                            <th scope="row">Entries</th>
-                            <td>{fmt(data.entries)}</td>
-                        </tr>
-                        <tr>
-                            <th scope="row">Loaded nodes</th>
-                            <td>{fmt(data.loadedNodes)}</td>
-                        </tr>
-                        <tr>
-                            <th scope="row">Memory used</th>
-                            <td>{fmt(data.usedMemoryBytes)} bytes</td>
-                        </tr>
-                    </tbody>
-                </table>
+                <PrimaryIndexBody data={data} />
             )}
         </section>
+    );
+}
+
+interface PrimaryIndexBodyProps {
+    data: PrimaryIndexDTO;
+}
+
+function PrimaryIndexBody({ data }: PrimaryIndexBodyProps) {
+    const nodes = data.nodes ?? [];
+    // Server-side authoritative total (covers the case where the per-node
+    // list was truncated). Falls back to the array length for older
+    // backends that didn't ship the field.
+    const totalNodes = data.totalNodes || nodes.length;
+    const onDiskNodes = nodes.filter((n) => !n.loaded).length;
+    const dirtyNodes = nodes.filter((n) => n.dirty).length;
+    const leafNodes = nodes.filter((n) => n.leaf).length;
+
+    return (
+        <>
+            <table className="herd-table">
+                <tbody>
+                    <tr>
+                        <th scope="row">Implementation</th>
+                        <td>
+                            <code>{data.type}</code>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Entries</th>
+                        <td>{fmt(data.entries)}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Total nodes</th>
+                        <td>{fmt(totalNodes)}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Loaded nodes</th>
+                        <td>{fmt(data.loadedNodes)}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">On-disk only</th>
+                        <td>{fmt(onDiskNodes)}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Dirty nodes</th>
+                        <td>{fmt(dirtyNodes)}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Leaf nodes</th>
+                        <td>{fmt(leafNodes)}</td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Memory used</th>
+                        <td>{fmt(data.usedMemoryBytes)} bytes</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            {data.truncated && (
+                <p className="herd-page__hint" role="status">
+                    Tree is too large — only the first {fmt(nodes.length)} of{' '}
+                    {fmt(totalNodes)} nodes are shown.
+                </p>
+            )}
+
+            <h2>Layout</h2>
+            <PrimaryIndexView nodes={nodes} />
+        </>
     );
 }

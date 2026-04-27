@@ -331,19 +331,60 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
     }
 
     /**
+     * Maximum number of {@link BLink.NodeInfo per-node entries} that
+     * {@link #snapshotInfo()} will include in its response. Larger trees are
+     * truncated; the {@link PrimaryIndexSnapshot#isTruncated() truncated} flag
+     * is set so the UI can warn the operator. Tests may override this via
+     * {@link #setSnapshotNodeLimit(int)}.
+     */
+    public static final int DEFAULT_SNAPSHOT_NODE_LIMIT = 10_000;
+
+    private static volatile int snapshotNodeLimit = DEFAULT_SNAPSHOT_NODE_LIMIT;
+
+    /**
+     * Test hook: override the per-snapshot node cap. Returns the previous
+     * value so callers can restore it.
+     */
+    public static int setSnapshotNodeLimit(int newLimit) {
+        int prev = snapshotNodeLimit;
+        snapshotNodeLimit = newLimit;
+        return prev;
+    }
+
+    /**
      * Read-only snapshot of the primary key index tree, used by the Web UI
-     * v2 backend to render a "primary index" summary panel.
+     * v2 backend to render a "primary index" summary panel and a per-node
+     * layout heatmap.
      *
      * <p>The snapshot does not force a checkpoint: it only reports the
      * counters already maintained by the in-memory tree (number of keys,
-     * number of nodes currently in memory and total memory occupancy).
+     * number of nodes currently in memory, total memory occupancy) plus a
+     * weakly-consistent per-node view (id, on-disk page, loaded/dirty flags,
+     * keys and size). Concurrent mutations may produce slightly inconsistent
+     * per-node reads — the snapshot is for visualisation only.
      */
     public PrimaryIndexSnapshot snapshotInfo() {
         BLink<Bytes, Long> tree = getTree();
+        int totalNodes = tree.nodes();
+        int limit = snapshotNodeLimit;
+        java.util.List<BLink.NodeInfo> sample = tree.snapshotNodes(limit);
+        boolean truncated = limit > 0 && totalNodes > sample.size();
+        // Count nodes currently resident in memory from the per-node sample.
+        // When truncated, this is a lower bound — same convention as the
+        // visualisation use case that requested this metric.
+        int loadedNodes = 0;
+        for (BLink.NodeInfo info : sample) {
+            if (info.isLoaded()) {
+                loadedNodes++;
+            }
+        }
         return new PrimaryIndexSnapshot(
                 tree.size(),
-                tree.nodes(),
-                tree.getUsedMemory());
+                loadedNodes,
+                tree.getUsedMemory(),
+                sample,
+                truncated,
+                totalNodes);
     }
 
     /**
@@ -354,11 +395,33 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
         private final long entries;
         private final int loadedNodes;
         private final long usedMemoryBytes;
+        private final java.util.List<BLink.NodeInfo> nodes;
+        private final boolean truncated;
+        private final int totalNodes;
 
+        /**
+         * Legacy 3-argument constructor retained for backwards compatibility
+         * with non-BLink callers (fallback branch in the UI backend, plus
+         * any external consumer that does not need per-node details). The
+         * new fields default to an empty node list, {@code truncated=false}
+         * and {@code totalNodes=loadedNodes}.
+         */
         public PrimaryIndexSnapshot(long entries, int loadedNodes, long usedMemoryBytes) {
+            this(entries, loadedNodes, usedMemoryBytes, Collections.emptyList(),
+                    false, loadedNodes);
+        }
+
+        public PrimaryIndexSnapshot(long entries, int loadedNodes, long usedMemoryBytes,
+                                    java.util.List<BLink.NodeInfo> nodes, boolean truncated,
+                                    int totalNodes) {
             this.entries = entries;
             this.loadedNodes = loadedNodes;
             this.usedMemoryBytes = usedMemoryBytes;
+            this.nodes = nodes == null
+                    ? Collections.emptyList()
+                    : Collections.unmodifiableList(new java.util.ArrayList<>(nodes));
+            this.truncated = truncated;
+            this.totalNodes = totalNodes;
         }
 
         public long getEntries() {
@@ -371,6 +434,18 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
 
         public long getUsedMemoryBytes() {
             return usedMemoryBytes;
+        }
+
+        public java.util.List<BLink.NodeInfo> getNodes() {
+            return nodes;
+        }
+
+        public boolean isTruncated() {
+            return truncated;
+        }
+
+        public int getTotalNodes() {
+            return totalNodes;
         }
     }
 

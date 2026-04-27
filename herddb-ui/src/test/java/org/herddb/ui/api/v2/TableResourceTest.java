@@ -205,8 +205,43 @@ public class TableResourceTest {
                 "loadedNodes must be > 0, got " + snapshot.getLoadedNodes(),
                 snapshot.getLoadedNodes() > 0);
         assertTrue(
+                "totalNodes must be >= loadedNodes",
+                snapshot.getTotalNodes() >= snapshot.getLoadedNodes());
+        assertTrue(
                 "usedMemoryBytes must be > 0, got " + snapshot.getUsedMemoryBytes(),
                 snapshot.getUsedMemoryBytes() > 0);
+        // Per-node layout: must be populated (issue #321).
+        assertNotNull("nodes list must be non-null", snapshot.getNodes());
+        assertFalse("nodes list must not be empty for a populated BLink index",
+                snapshot.getNodes().isEmpty());
+        int loadedFromList = 0;
+        long sumKeys = 0;
+        for (PrimaryIndexDTO.BLinkNodeDTO node : snapshot.getNodes()) {
+            assertTrue("sizeBytes must be > 0, got " + node.getSizeBytes(),
+                    node.getSizeBytes() > 0);
+            assertTrue("keys must be >= 0, got " + node.getKeys(),
+                    node.getKeys() >= 0);
+            if (node.isLoaded()) {
+                loadedFromList++;
+            }
+            if (node.isLeaf()) {
+                sumKeys += node.getKeys();
+            }
+        }
+        assertEquals(
+                "count of loaded nodes in the per-node list must match the summary",
+                snapshot.getLoadedNodes(),
+                loadedFromList);
+        assertEquals(
+                "totalNodes must equal the size of the per-node list when not truncated",
+                snapshot.getNodes().size(),
+                snapshot.getTotalNodes());
+        assertEquals(
+                "sum of leaf keys must equal the entries counter",
+                snapshot.getEntries(),
+                sumKeys);
+        assertFalse("truncated flag should be false for a small tree",
+                snapshot.isTruncated());
     }
 
     @Test

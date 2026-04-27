@@ -20,9 +20,14 @@
 
 package herddb.index;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 import herddb.core.AbstractIndexManager;
 import herddb.core.MemoryManager;
 import herddb.core.PostCheckpointAction;
+import herddb.index.blink.BLink;
 import herddb.index.blink.BLinkKeyToPageIndex;
 import herddb.log.LogSequenceNumber;
 import herddb.mem.MemoryDataStorageManager;
@@ -34,6 +39,7 @@ import herddb.utils.Bytes;
 import java.util.List;
 import java.util.Map.Entry;
 import java.util.stream.Stream;
+import org.junit.Test;
 
 /**
  * Base test suite for {@link  BLinkKeyToPageIndex}
@@ -170,6 +176,104 @@ public class BLinkKeyToPageIndexTest extends KeyToPageIndexTest {
             return delegate.isSortedAscending(pkTypes);
         }
 
+    }
+
+    /**
+     * Issue #321: {@link BLinkKeyToPageIndex#snapshotInfo()} must return a
+     * per-node layout list (not just summary counters), so the Web UI can
+     * render the BLink layout on disk and the loaded blocks.
+     */
+    @Test
+    public void snapshotInfoReportsNodesList() throws Exception {
+        // Tiny page size so the tree splits into multiple nodes after a few
+        // hundred inserts.
+        MemoryManager mem = new MemoryManager(5 * (1L << 20), 0, 10 * 4096L, 4096L);
+        try (MemoryDataStorageManager ds = new MemoryDataStorageManager()) {
+            BLinkKeyToPageIndex idx = new BLinkKeyToPageIndex("tblspc", "tbl", mem, ds);
+            try {
+                idx.init();
+                idx.start(LogSequenceNumber.START_OF_TIME, true);
+
+                final int rows = 1000;
+                for (int i = 0; i < rows; i++) {
+                    idx.put(Bytes.from_int(i), (long) i);
+                }
+
+                BLinkKeyToPageIndex.PrimaryIndexSnapshot snapshot = idx.snapshotInfo();
+                assertNotNull(snapshot);
+                assertEquals(rows, snapshot.getEntries());
+                assertNotNull("nodes list must not be null", snapshot.getNodes());
+                assertFalse("nodes list must not be empty", snapshot.getNodes().isEmpty());
+                assertFalse("truncated flag must be false for a small tree",
+                        snapshot.isTruncated());
+
+                int loadedFromList = 0;
+                long sumLeafKeys = 0;
+                for (BLink.NodeInfo info : snapshot.getNodes()) {
+                    assertTrue("sizeBytes must be positive, got " + info.getSizeBytes(),
+                            info.getSizeBytes() > 0);
+                    assertTrue("keys must be non-negative, got " + info.getKeys(),
+                            info.getKeys() >= 0);
+                    if (info.isLoaded()) {
+                        loadedFromList++;
+                    }
+                    if (info.isLeaf()) {
+                        sumLeafKeys += info.getKeys();
+                    }
+                }
+                assertEquals(
+                        "loaded count from per-node list must match summary",
+                        snapshot.getLoadedNodes(),
+                        loadedFromList);
+                assertEquals(
+                        "totalNodes must match the per-node list size when not truncated",
+                        snapshot.getNodes().size(),
+                        snapshot.getTotalNodes());
+                assertTrue(
+                        "totalNodes must be >= loadedNodes",
+                        snapshot.getTotalNodes() >= snapshot.getLoadedNodes());
+                assertEquals(
+                        "sum of leaf keys must equal entries",
+                        snapshot.getEntries(),
+                        sumLeafKeys);
+            } finally {
+                idx.close();
+            }
+        }
+    }
+
+    /**
+     * Issue #321: when the tree has more nodes than the per-snapshot cap,
+     * {@code snapshotInfo()} must return a truncated list and set the
+     * {@code truncated} flag.
+     */
+    @Test
+    public void snapshotInfoSetsTruncatedFlagWhenLimitExceeded() throws Exception {
+        MemoryManager mem = new MemoryManager(5 * (1L << 20), 0, 10 * 4096L, 4096L);
+        try (MemoryDataStorageManager ds = new MemoryDataStorageManager()) {
+            BLinkKeyToPageIndex idx = new BLinkKeyToPageIndex("tblspc", "tbl", mem, ds);
+            int previousLimit = BLinkKeyToPageIndex.setSnapshotNodeLimit(2);
+            try {
+                idx.init();
+                idx.start(LogSequenceNumber.START_OF_TIME, true);
+
+                for (int i = 0; i < 500; i++) {
+                    idx.put(Bytes.from_int(i), (long) i);
+                }
+
+                BLinkKeyToPageIndex.PrimaryIndexSnapshot snapshot = idx.snapshotInfo();
+                assertNotNull(snapshot);
+                assertEquals(2, snapshot.getNodes().size());
+                assertTrue("truncated flag must be set when nodes > limit",
+                        snapshot.isTruncated());
+                assertTrue(
+                        "totalNodes must reflect the full tree, not the truncated sample",
+                        snapshot.getTotalNodes() > snapshot.getNodes().size());
+            } finally {
+                BLinkKeyToPageIndex.setSnapshotNodeLimit(previousLimit);
+                idx.close();
+            }
+        }
     }
 
 }

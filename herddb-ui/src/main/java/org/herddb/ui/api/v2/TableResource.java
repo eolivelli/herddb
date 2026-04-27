@@ -174,11 +174,25 @@ public class TableResource {
             snapshot = ((IncrementalBLinkKeyToPageIndex) pkIndex).snapshotInfo();
         }
         if (snapshot != null) {
+            List<PrimaryIndexDTO.BLinkNodeDTO> nodes = new ArrayList<>(snapshot.getNodes().size());
+            for (herddb.index.blink.BLink.NodeInfo info : snapshot.getNodes()) {
+                nodes.add(new PrimaryIndexDTO.BLinkNodeDTO(
+                        info.getNodeId(),
+                        info.getStoreId(),
+                        info.isLeaf(),
+                        info.getKeys(),
+                        info.getSizeBytes(),
+                        info.isLoaded(),
+                        info.isDirty()));
+            }
             return new PrimaryIndexDTO(
                     "blink",
                     snapshot.getEntries(),
                     snapshot.getLoadedNodes(),
-                    snapshot.getUsedMemoryBytes());
+                    snapshot.getTotalNodes(),
+                    snapshot.getUsedMemoryBytes(),
+                    nodes,
+                    snapshot.isTruncated());
         }
         // Fall-back: report the implementing class so the UI can show
         // *something*, even for index types we do not know how to drill
