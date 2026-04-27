@@ -343,6 +343,19 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
         return getTree().getUsedMemory();
     }
 
+    /**
+     * Read-only snapshot of the underlying B-Link tree, used by the Web
+     * UI v2 backend. Same wire shape as
+     * {@link BLinkKeyToPageIndex#snapshotInfo()}.
+     */
+    public BLinkKeyToPageIndex.PrimaryIndexSnapshot snapshotInfo() {
+        BLink<Bytes, Long> t = getTree();
+        return new BLinkKeyToPageIndex.PrimaryIndexSnapshot(
+                t.size(),
+                t.nodes(),
+                t.getUsedMemory());
+    }
+
     @Override
     public boolean requireLoadAtStartup() {
         return false;

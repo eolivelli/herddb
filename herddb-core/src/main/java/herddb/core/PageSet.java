@@ -71,6 +71,30 @@ public final class PageSet {
             this.dirt.add(dirt);
         }
 
+        /**
+         * @return the size of this page on storage, in bytes
+         */
+        public long getSize() {
+            return size;
+        }
+
+        /**
+         * @return the average record size in bytes (page size divided by the
+         *         number of records at the time the metadata was created)
+         */
+        public long getAverageRecordSize() {
+            return avgRecordSize;
+        }
+
+        /**
+         * @return the accumulated dirty-bytes counter; rises as records on
+         *         this page are deleted or replaced and is reset by
+         *         checkpoints
+         */
+        public long getDirtBytes() {
+            return dirt.sum();
+        }
+
         public void serialize(ExtendedDataOutputStream output) throws IOException {
             output.writeVLong(size);
             output.writeVLong(avgRecordSize);

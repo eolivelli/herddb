@@ -320,6 +320,11 @@ public class ServerMain implements AutoCloseable {
             File webUi = new File("web/ui");
             if (webUi.isDirectory()) {
                 WebAppContext webApp = new WebAppContext(new File("web/ui").getAbsolutePath(), "/ui");
+                // Bind the running Server so the v2 REST resources
+                // (org.herddb.ui.api.v2.*) can resolve it via
+                // ServerLocator.fromServletContext(...). The attribute key
+                // matches ServerLocator.SERVLET_ATTRIBUTE.
+                webApp.setAttribute("herddb.server", server);
                 contexts.addHandler(webApp);
             } else {
                 LOGGER.info("Cannot find " + webUi.getAbsolutePath() + " directory. Web UI will not be deployed");

@@ -36,14 +36,26 @@
         <endorsed.dir>${project.build.directory}/endorsed</endorsed.dir>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
+        <!-- Frontend toolchain versions, used by frontend-maven-plugin.
+             Bumping these is the only place to change Node/npm. -->
+        <frontend-maven-plugin.version>1.15.0</frontend-maven-plugin.version>
+        <frontend.node.version>v20.11.1</frontend.node.version>
+        <frontend.npm.version>10.2.4</frontend.npm.version>
     </properties>
 
     <dependencies>
+        <!--
+            herddb-core gives the v2 backend in-process access to a running
+            Server / DBManager so REST endpoints can issue
+            executeSimpleQuery() against the sys* tables and read internal
+            statistics. The new UI does NOT use JDBC.
+        -->
         <dependency>
             <groupId>${project.groupId}</groupId>
-            <artifactId>herddb-jdbc</artifactId>
+            <artifactId>herddb-core</artifactId>
             <version>${project.version}</version>
         </dependency>
+
         <dependency>
             <groupId>javax</groupId>
             <artifactId>javaee-web-api</artifactId>
@@ -60,15 +72,156 @@
             <artifactId>jersey-media-json-jackson</artifactId>
             <version>${libs.jersey}</version>
         </dependency>
+        <!--
+            HK2 dependency injection — used by ApplicationConfigV2 to bind
+            ServerLocator from the ServletContext. Compile scope because
+            the AbstractBinder / Factory types are referenced from main
+            sources.
+        -->
+        <dependency>
+            <groupId>org.glassfish.jersey.inject</groupId>
+            <artifactId>jersey-hk2</artifactId>
+            <version>${libs.jersey}</version>
+        </dependency>
+
+        <!-- Test dependencies -->
+        <dependency>
+            <groupId>org.glassfish.jersey.test-framework</groupId>
+            <artifactId>jersey-test-framework-core</artifactId>
+            <version>${libs.jersey}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.glassfish.jersey.test-framework.providers</groupId>
+            <artifactId>jersey-test-framework-provider-jetty</artifactId>
+            <version>${libs.jersey}</version>
+            <scope>test</scope>
+        </dependency>
+        <!--
+            Jersey 2.26 ships providers (DataSourceProvider, JAXB) that
+            reference packages removed from the JDK in Java 11+
+            (javax.activation, javax.xml.bind). On Java 17 these
+            unavailable classes cause every request through the
+            JerseyTest container to fail with HTTP 500 noise. Adding the
+            stand-alone API jars in test scope restores the classes
+            without affecting production (production runs inside Jetty
+            with Jackson only).
+        -->
+        <dependency>
+            <groupId>javax.activation</groupId>
+            <artifactId>javax.activation-api</artifactId>
+            <version>1.2.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>javax.xml.bind</groupId>
+            <artifactId>jaxb-api</artifactId>
+            <version>2.3.1</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
         <plugins>
+            <!--
+                Apache RAT — extend the inherited excludes with frontend
+                build artefacts that have no room for license headers
+                (node_modules and the bundled Node toolchain under target/).
+            -->
+            <plugin>
+                <groupId>org.apache.rat</groupId>
+                <artifactId>apache-rat-plugin</artifactId>
+                <configuration>
+                    <excludes combine.children="append">
+                        <exclude>node_modules/**</exclude>
+                        <exclude>**/node_modules/**</exclude>
+                        <exclude>package-lock.json</exclude>
+                        <exclude>**/package-lock.json</exclude>
+                        <!-- TypeScript incremental build cache -->
+                        <exclude>**/*.tsbuildinfo</exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+
+            <!--
+                Frontend toolchain orchestration.
+
+                Phase 0 wires the Node + npm toolchain into the Maven build so
+                that running `mvn install` from the repository root also runs
+                `npm install` and `npm run build`. Phase 0 ships only a
+                placeholder `package.json`; the real Vite-based React + TS
+                frontend lands in phase 2.
+            -->
+            <plugin>
+                <groupId>com.github.eirslett</groupId>
+                <artifactId>frontend-maven-plugin</artifactId>
+                <version>${frontend-maven-plugin.version}</version>
+                <configuration>
+                    <nodeVersion>${frontend.node.version}</nodeVersion>
+                    <npmVersion>${frontend.npm.version}</npmVersion>
+                    <installDirectory>${project.build.directory}/node-toolchain</installDirectory>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>install-node-and-npm</id>
+                        <goals>
+                            <goal>install-node-and-npm</goal>
+                        </goals>
+                        <phase>generate-resources</phase>
+                    </execution>
+                    <execution>
+                        <id>npm-install</id>
+                        <goals>
+                            <goal>npm</goal>
+                        </goals>
+                        <phase>generate-resources</phase>
+                        <configuration>
+                            <arguments>install --no-audit --no-fund</arguments>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>npm-build</id>
+                        <goals>
+                            <goal>npm</goal>
+                        </goals>
+                        <phase>generate-resources</phase>
+                        <configuration>
+                            <arguments>run build</arguments>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>npm-test</id>
+                        <goals>
+                            <goal>npm</goal>
+                        </goals>
+                        <phase>test</phase>
+                        <configuration>
+                            <arguments>test</arguments>
+                            <skip>${skipTests}</skip>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-war-plugin</artifactId>
                 <version>3.2.3</version>
-
+                <configuration>
+                    <!--
+                        Overlay the Vite-built SPA (target/web-build/spa)
+                        on top of src/main/webapp (which only carries
+                        WEB-INF/web.xml). frontend-maven-plugin runs
+                        `npm run build` during generate-resources, so the
+                        target/web-build/spa directory exists by the time
+                        war:war runs.
+                    -->
+                    <webResources>
+                        <resource>
+                            <directory>${project.build.directory}/web-build/spa</directory>
+                        </resource>
+                    </webResources>
+                </configuration>
                 <executions>
                     <execution>
                         <id>create-war-no-libs</id>
@@ -79,6 +232,11 @@
                             <packagingExcludes>WEB-INF/lib/*.jar,WEB-INF/classes/**/*</packagingExcludes>
                             <attachClasses>true</attachClasses>
                             <classifier>war-no-libs</classifier>
+                            <webResources>
+                                <resource>
+                                    <directory>${project.build.directory}/web-build/spa</directory>
+                                </resource>
+                            </webResources>
                         </configuration>
                     </execution>
                 </executions>
