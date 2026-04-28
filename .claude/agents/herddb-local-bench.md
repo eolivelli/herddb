@@ -56,18 +56,21 @@ under `$HERDDB_TESTS_HOME/reports/`.
 - `./scripts/process-status.sh` — compact table (NAME, PID, STATUS, RSS_MB).
   Use in the supervision loop instead of `ps` / `top` to keep token usage
   down.
-- `./scripts/run-bench.sh <vector-bench args>` — run the workload via the
-  local `bin/vector-bench.sh`. The last line of stdout is
-  `RUN_LOG=<path>` — capture it. Must be launched with
-  `run_in_background: true` so the supervision loop can run in parallel.
-  The script always prepends `--no-progress` to `vector-bench.sh`, so the
-  captured `RUN_LOG` is `\n`-terminated plain-text output (no `\r` spinner
-  frames). You can and should `Read` this file during supervision to see
-  the current phase and live progress samples. If the user explicitly
-  asks for structured output, pass `--output-format json`; the log will
-  become NDJSON. `write-report.sh` still parses plain mode (`^phase=`
-  lines + SUMMARY block) — do not switch to NDJSON unless the user asks
-  for it, or `write-report.sh` will not produce a report.
+- `./scripts/run-bench.sh [--background] <vector-bench args>` — run the
+  workload via the local `bin/vector-bench.sh`. The last line of stdout
+  is `RUN_LOG=<path>` — capture it. **Always pass `--background`** so the
+  JVM runs as a local `nohup` background process fully decoupled from any
+  pipe; the script then exits 0 immediately and you enter the supervision
+  loop (see §Supervision and issue #325). A PID file is written to
+  `$REPORTS_DIR/run-<TS>.pid`. In background mode the benchmark output is
+  appended to the same `$RUN_LOG`; progress is monitored via
+  `curl -s http://localhost:8080/status` on the admin HTTP API. Without
+  `--background` the script blocks until the JVM exits, streaming output
+  through a tee pipe — do not use that mode for automated runs. If the
+  user explicitly asks for structured output, pass `--output-format json`;
+  the log will become NDJSON. `write-report.sh` still parses plain mode
+  (`^phase=` lines + SUMMARY block) — do not switch to NDJSON unless the
+  user asks for it, or `write-report.sh` will not produce a report.
 - `./scripts/collect-logs.sh [--tail N]` — copy the two service logs
   (`server.service.log`, `indexing-service.service.log`) into a
   timestamped dir under `$REPORTS_DIR` and print `LOGS_DIR=<path>`.
@@ -249,13 +252,16 @@ Rules that apply to every workload, including user-specified ones:
 3. **Health check.** Run `./scripts/check-cluster.sh`. On failure go to
    the failure path.
 
-4. **Run the workload.** Launch `./scripts/run-bench.sh …` with
-   `run_in_background: true`. Capture the background task ID. Enter the
-   supervision loop (§Supervision) until the background task finishes OR
-   the loop detects a fatal signal.
+4. **Run the workload.** Call `./scripts/run-bench.sh --background …`
+   (without `run_in_background: true` — the `--background` flag launches
+   the JVM as a local `nohup` process and the script exits immediately).
+   Capture `RUN_LOG=<path>` from the last line of stdout. Enter the
+   supervision loop (§Supervision) immediately; poll until
+   `curl -s http://localhost:8080/status` returns `phase=done` or the
+   benchmark process is gone, or the loop detects a fatal signal.
 
-   - If the bench exits 0 and supervision saw no fatal signals → capture
-     `RUN_LOG=<path>` and go to step 5.
+   - If supervision ends with `phase=done` and no fatal signals →
+     go to step 5.
    - Otherwise → go to the failure path.
 
 5. **Generate report.** Run `./scripts/write-report.sh <RUN_LOG>` and
@@ -268,15 +274,28 @@ Rules that apply to every workload, including user-specified ones:
 
 ## Supervision
 
-While `run-bench.sh` runs in the background, poll at least every 60
-seconds (minimum 30 s, maximum 90 s between polls). Each tick does:
+Once `run-bench.sh --background` has launched the JVM and returned, poll
+at least every 60 seconds (minimum 30 s, maximum 90 s between polls).
+
+The primary progress source is always the admin HTTP API:
+```
+curl -s http://localhost:8080/status
+```
+In background mode the benchmark output is appended directly to `$RUN_LOG`
+via nohup, so `Read`ing `$RUN_LOG` still works for raw output. The PID
+file at `$REPORTS_DIR/run-<TS>.pid` can be used to verify the process is
+still alive (`kill -0 $(cat <pid-file>)`).
+
+Each tick does:
 
 1. `./scripts/process-status.sh` — confirm both services still running,
    note RSS.
 2. `curl -s http://localhost:8080/status` — read VectorBench progress
    (phase, rows/total, ops_per_sec, commits, recovered_commits,
-   commit_latency).
-3. `Read` the tail of `$RUN_LOG` for new phase boundaries.
+   commit_latency). **This is the primary completion signal**: when
+   `phase=done` the benchmark has finished.
+3. `Read` the tail of `$RUN_LOG` for new phase boundaries (output is
+   appended by the nohup process).
 4. `Read` the tail of `$CLUSTER_DIR/server.service.log` and
    `$CLUSTER_DIR/indexing-service.service.log` (last 30–50 lines) and
    scan for error keywords: `OutOfMemoryError`, `SEVERE`, `Exception in
@@ -307,7 +326,7 @@ Verdict: <healthy|warning|fatal>
 Verdicts:
 - `healthy` — continue to next tick
 - `warning` — log it and continue
-- `fatal` — stop the background run-bench task, proceed to §Failure
+- `fatal` — run `./scripts/kill-bench.sh`, then proceed to §Failure
   handling. Do NOT attempt to mitigate on the running cluster.
 
 **Checkpoint timeout escalation (warning-level, non-fatal):** If a tick
@@ -330,9 +349,7 @@ You never try to recover a broken cluster. Every failure produces a
 reproducible GitHub issue. On any failure (install, health check, bench
 non-zero exit, or supervision-detected fault):
 
-1. If the bench is still running in the background, stop it (either let
-   it exit naturally if it is already in the fatal state, or run
-   `./scripts/kill-bench.sh`).
+1. If the bench is still running, stop it: `./scripts/kill-bench.sh`.
 
 2. **OOM only — collect profiles and heap dump while the JVM is still
    live.** If the fatal signal was an `OutOfMemoryError` and the
