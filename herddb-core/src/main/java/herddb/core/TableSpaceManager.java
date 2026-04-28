@@ -1207,6 +1207,22 @@ public class TableSpaceManager {
         return result;
     }
 
+    /**
+     * Snapshot of every committed vector {@link Index} on this tablespace,
+     * used by the {@code EXECUTE INDEXING_SERVICE_REBALANCE} handler to
+     * embed the schema in the resulting log entry.
+     */
+    public List<Index> getAllCommittedVectorIndexes() {
+        List<Index> result = new ArrayList<>();
+        for (AbstractIndexManager im : indexes.values()) {
+            Index idx = im.getIndex();
+            if (Index.TYPE_VECTOR.equals(idx.type)) {
+                result.add(idx);
+            }
+        }
+        return result;
+    }
+
     boolean isTransactionRunningOnTable(String name) {
         return transactions
                 .values()

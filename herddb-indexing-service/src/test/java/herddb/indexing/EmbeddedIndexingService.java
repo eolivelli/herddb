@@ -80,6 +80,16 @@ public class EmbeddedIndexingService implements AutoCloseable {
         this.metadataStorageManager = metadataStorageManager;
     }
 
+    private WatermarkStore watermarkStore;
+
+    /**
+     * Inject a watermark store before {@link #start()} — used by tests that
+     * need to verify recovery from a persisted snapshot.
+     */
+    public void setWatermarkStore(WatermarkStore watermarkStore) {
+        this.watermarkStore = watermarkStore;
+    }
+
     public void start() throws Exception {
         engine = new IndexingServiceEngine(logDirectory, dataDirectory, config);
 
@@ -91,6 +101,9 @@ public class EmbeddedIndexingService implements AutoCloseable {
             metadataStorageManager = memMeta;
         }
         engine.setMetadataStorageManager(metadataStorageManager);
+        if (watermarkStore != null) {
+            engine.setWatermarkStore(watermarkStore);
+        }
 
         // Start server first so it wires MemoryManager and DataStorageManager
         // onto the engine before the engine starts and configures its VectorStoreFactory

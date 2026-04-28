@@ -289,6 +289,25 @@ public final class IndexingServerConfiguration {
     public static final int PROPERTY_NUM_INSTANCES_DEFAULT = 1;
 
     /**
+     * When {@code true}, this primary engine boots in {@code JOINING} state:
+     * it does not load any indexes from local storage, sets the tailer to
+     * the live tail of the commit log (skipping the historical entries) and
+     * waits for the next {@code INDEXING_SERVICE_REBALANCE} log entry to
+     * acquire the schema. The Helm chart sets this on every pod; in
+     * production an engine with persistent local state ignores the flag
+     * because its watermark and S3 segments already give it everything it
+     * needs.
+     *
+     * <p>This path also activates automatically when the BookKeeper history
+     * has been trimmed and the standard START_OF_TIME replay is impossible,
+     * but for tests and for explicit operator opt-in we expose it as a
+     * property.
+     */
+    public static final String PROPERTY_BOOTSTRAP_FROM_REBALANCE =
+            "indexing.bootstrap.fromRebalance";
+    public static final boolean PROPERTY_BOOTSTRAP_FROM_REBALANCE_DEFAULT = false;
+
+    /**
      * Role of this indexing-service process.
      *
      * <ul>
@@ -469,6 +488,16 @@ public final class IndexingServerConfiguration {
     /** Returns {@code true} when {@link #PROPERTY_ROLE} is {@link #ROLE_SHADOW}. */
     public boolean isShadow() {
         return ROLE_SHADOW.equals(getString(PROPERTY_ROLE, PROPERTY_ROLE_DEFAULT));
+    }
+
+    /**
+     * Returns {@code true} when {@link #PROPERTY_BOOTSTRAP_FROM_REBALANCE}
+     * is enabled — engine bootstraps via the next REBALANCE log entry rather
+     * than replaying the commit log from {@code START_OF_TIME}.
+     */
+    public boolean isBootstrapFromRebalance() {
+        return getBoolean(PROPERTY_BOOTSTRAP_FROM_REBALANCE,
+                PROPERTY_BOOTSTRAP_FROM_REBALANCE_DEFAULT);
     }
 
     @Override

@@ -96,23 +96,24 @@ public class BlockCacheWarmupTest {
     /** In-memory watermark store that records every {@code save()} call. */
     private static final class RecordingWatermarkStore implements WatermarkStore {
 
-        private final AtomicReference<LogSequenceNumber> saved = new AtomicReference<>();
+        private final AtomicReference<WatermarkSnapshot> saved = new AtomicReference<>();
         private int saveCount;
 
         @Override
-        public synchronized LogSequenceNumber load() {
-            LogSequenceNumber v = saved.get();
-            return v != null ? v : LogSequenceNumber.START_OF_TIME;
+        public synchronized WatermarkSnapshot load() {
+            WatermarkSnapshot v = saved.get();
+            return v != null ? v : WatermarkSnapshot.START_OF_TIME;
         }
 
         @Override
-        public synchronized void save(LogSequenceNumber lsn) throws IOException {
-            saved.set(lsn);
+        public synchronized void save(WatermarkSnapshot snapshot) throws IOException {
+            saved.set(snapshot);
             saveCount++;
         }
 
         synchronized LogSequenceNumber current() {
-            return saved.get();
+            WatermarkSnapshot v = saved.get();
+            return v != null ? v.lsn : null;
         }
 
         synchronized int getSaveCount() {

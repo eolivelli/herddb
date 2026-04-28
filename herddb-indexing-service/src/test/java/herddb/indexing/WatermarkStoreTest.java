@@ -35,8 +35,8 @@ public class WatermarkStoreTest {
     @Test
     public void testLoadReturnsStartOfTimeWhenNoFile() throws IOException {
         LocalWatermarkStore store = new LocalWatermarkStore(folder.newFolder("empty").toPath());
-        LogSequenceNumber lsn = store.load();
-        assertEquals(LogSequenceNumber.START_OF_TIME, lsn);
+        WatermarkSnapshot snapshot = store.load();
+        assertEquals(WatermarkSnapshot.START_OF_TIME, snapshot);
     }
 
     @Test
@@ -44,12 +44,13 @@ public class WatermarkStoreTest {
         java.nio.file.Path dir = folder.newFolder("data").toPath();
         LocalWatermarkStore store = new LocalWatermarkStore(dir);
 
-        LogSequenceNumber saved = new LogSequenceNumber(5, 42);
+        WatermarkSnapshot saved = new WatermarkSnapshot(new LogSequenceNumber(5, 42), 4);
         store.save(saved);
 
-        LogSequenceNumber loaded = store.load();
-        assertEquals(saved.ledgerId, loaded.ledgerId);
-        assertEquals(saved.offset, loaded.offset);
+        WatermarkSnapshot loaded = store.load();
+        assertEquals(saved.lsn.ledgerId, loaded.lsn.ledgerId);
+        assertEquals(saved.lsn.offset, loaded.lsn.offset);
+        assertEquals(saved.numInstances, loaded.numInstances);
     }
 
     @Test
@@ -57,11 +58,12 @@ public class WatermarkStoreTest {
         java.nio.file.Path dir = folder.newFolder("overwrite").toPath();
         LocalWatermarkStore store = new LocalWatermarkStore(dir);
 
-        store.save(new LogSequenceNumber(1, 10));
-        store.save(new LogSequenceNumber(2, 20));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(1, 10), 2));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(2, 20), 4));
 
-        LogSequenceNumber loaded = store.load();
-        assertEquals(2, loaded.ledgerId);
-        assertEquals(20, loaded.offset);
+        WatermarkSnapshot loaded = store.load();
+        assertEquals(2, loaded.lsn.ledgerId);
+        assertEquals(20, loaded.lsn.offset);
+        assertEquals(4, loaded.numInstances);
     }
 }

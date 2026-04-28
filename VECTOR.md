@@ -140,6 +140,16 @@ All parameters are optional. Unspecified parameters use the defaults shown below
 | `fusedPQ` | boolean | `true` | Use FusedPQ on-disk format when dim ≥ 8 and vectors ≥ 256. |
 | `maxSegmentSize` | long | `2147483648` | Maximum on-disk segment size in bytes before segment rotation. |
 | `maxLiveGraphSize` | integer | `0` | Maximum vectors per live graph shard before rotation. 0 = auto (see Shard Rotation). |
+| `numShards` | integer | `1` | Number of logical hash buckets within the index (`shardId = XXHash64(pk) % numShards`). Per-index, immutable after CREATE INDEX — it controls bucket granularity, not which replica owns a bucket. |
+
+The number of indexing-service primary replicas across which an index is
+sharded — `numInstances` — is **not** an index-level property. It lives
+on the engine (initialised from the JVM property
+`indexing.cluster.numInstances` and then updated at runtime by every
+`INDEXING_SERVICE_REBALANCE` log entry the operator triggers via
+`EXECUTE INDEXING_SERVICE_REBALANCE 'tablespace', N`). See [Dynamic
+Scale-Up of Indexing Service Replicas](#dynamic-scale-up-of-indexing-service-replicas)
+for the full design.
 
 ---
 
@@ -740,6 +750,200 @@ On `start()`, the engine reads `indexing.storage.type` from configuration:
 - `indexes: HashMap<String, Index>` — current index definitions.
 
 On CREATE_INDEX: the engine calls `createVectorStoreIfNeeded()` → `factory.create()` → registers the store. On DROP_INDEX or DROP_TABLE: the corresponding store is removed and closed.
+
+---
+
+## Dynamic Scale-Up of Indexing Service Replicas
+
+The indexing service supports **online scale-up of primary replicas**
+(no scale-down). After a rebalance, EVERY existing vector index
+spreads new writes across the new owner set — no per-index
+permanence, no static-at-CREATE stamping.
+
+### Routing model
+
+For every entry the tailer applies (INSERT / UPDATE / DELETE), the
+engine decides per vector index whether this replica owns the key:
+
+```
+owner(pk, index) = (XXHash64(pk) % index.numShards) % engine.currentNumInstances
+```
+
+`numShards` is per-index, immutable, set at CREATE INDEX time — it
+controls hash-bucket granularity, NOT which replica owns a bucket.
+`engine.currentNumInstances` is engine-wide and **mutable**: every
+`INDEXING_SERVICE_REBALANCE` log entry updates it on the spot, so
+from the entry's LSN onward every routing decision uses the new
+value.
+
+INSERT / UPDATE / DELETE differ in how they handle a rebalance:
+
+- **INSERT** is filtered: only the current owner under the new
+  mapping installs the vector.
+- **UPDATE** is split: the `removeVector` half is **broadcast** to
+  every replica (so a stale copy left on the previous owner by an
+  earlier write is wiped), then the `addVector` half is filtered
+  (only the current owner installs the new value).
+- **DELETE** is **broadcast** unconditionally. After a rebalance the
+  same primary key may briefly sit on two replicas at once — its
+  original-owner copy under the old N, and a new-owner copy under
+  the new N (e.g. a re-INSERT after the rebalance). A filtered
+  DELETE would leak one of them; broadcast guarantees the key
+  disappears from everywhere. `removeVector` is a no-op on replicas
+  that never had the key.
+
+### EXECUTE INDEXING_SERVICE_REBALANCE
+
+```sql
+EXECUTE INDEXING_SERVICE_REBALANCE 'tablespace', N
+```
+
+The leader:
+
+1. Snapshots every `Table` and every vector `Index` in the tablespace
+   into an `IndexingServiceRebalanceDescriptor` carrying `epoch`,
+   `defaultNumInstances=N`, and the schema.
+2. Writes the descriptor in a new `INDEXING_SERVICE_REBALANCE` log
+   entry (`LogEntryType=15`) and fsyncs.
+3. Returns immediately. There is **no ACK protocol** — log ordering
+   is the natural barrier.
+
+Re-running with the same `N` is valid and idempotent: each replica
+re-records the descriptor for its `lastObservedRebalance` accessor
+and the routing value stays unchanged.
+
+### Operator workflow
+
+Scale-up from K to N primaries:
+
+```bash
+# 1. Bring up additional pods. Because they have no local state,
+#    they boot in JOINING mode (waiting for the next REBALANCE
+#    entry to acquire the schema).
+helm upgrade herddb herddb-kubernetes/src/main/helm/herddb/ \
+    --set indexingService.replicaCount=N
+
+# 2. Update the engine's effective numInstances on every replica
+#    (the existing K AND the new K..N-1) by writing one log entry.
+herddb-cli.sh -q "EXECUTE INDEXING_SERVICE_REBALANCE 'herd', $N"
+
+# 3. Done. New writes against EVERY existing vector index now spread
+#    across all N pods. Search continues to fan out across all
+#    replicas as before.
+```
+
+Historical on-disk data is not migrated. The original K replicas
+keep their phase-1 vectors and continue serving them on search; the
+new K..N-1 replicas start owning their share of new writes against
+EVERY existing index immediately.
+
+### Behaviour of HerdDB Followers
+
+The new entry type is meaningful only to indexing-service replicas;
+HerdDB Followers in classic cluster mode (BookKeeper + ZooKeeper
+replication) silently ignore it via the `default: break` clause in
+`TableSpaceManager.apply()`. Operators can read the current value
+live from any indexing-service replica via
+`indexing-admin engine-stats`.
+
+### Indexing-service restart after a rebalance
+
+Recovery uses two complementary mechanisms:
+
+1. **Watermark snapshot.** Every successful indexing-service
+   checkpoint persists a `WatermarkSnapshot` — last-applied
+   `LogSequenceNumber` AND the engine's effective `numInstances`
+   at that point — through the configured `WatermarkStore`
+   (`LocalWatermarkStore` for persistent local volumes,
+   `S3WatermarkStore` for ephemeral pods on shared object storage).
+   Both fields are serialised in a single object: file format `byte
+   version=1 | long ledgerId | long offset | int numInstances`
+   for the local store; checksummed
+   `version | flags | ledgerId | offset | numInstances | XXHash64`
+   on S3. On engine startup the snapshot is loaded and
+   `currentNumInstances` is set from it, so a freshly-restarted
+   engine starts ALREADY at the correct routing value — even if
+   the BookKeeper ledger that carried the most recent
+   `INDEXING_SERVICE_REBALANCE` entry has been trimmed in the
+   meantime. A snapshot value of `0` (the
+   `WatermarkSnapshot.START_OF_TIME` sentinel) means "no recovery
+   state yet"; the engine falls back to its JVM-property
+   bootstrap `indexing.cluster.numInstances`.
+2. **Log replay.** After loading the snapshot, the tailer also
+   replays the commit log from `LogSequenceNumber.START_OF_TIME`
+   so it can reprocess DDL entries (CREATE_TABLE, CREATE_INDEX,
+   ALTER_*) and rebuild the in-memory `SchemaTracker`. Any
+   `INDEXING_SERVICE_REBALANCE` entry it encounters in replay
+   updates `currentNumInstances` again — idempotent, since the
+   snapshot value is already correct.
+
+The only situation where neither mechanism is sufficient is a pod
+that has BOTH no persistent watermark AND no BK history available
+(typically a brand-new pod added during a scale-up after history
+was trimmed). That is exactly what the JOINING fallback covers:
+the engine enters `JOINING`, drops every commit-log entry, and
+waits for the next REBALANCE entry — which the operator triggers
+via the same `EXECUTE INDEXING_SERVICE_REBALANCE` SQL.
+
+### Transactions across a rebalance
+
+The engine buffers transactional entries in memory until COMMIT
+arrives; the buffered entries are then applied through the same
+INSERT/UPDATE/DELETE handlers, using the engine's CURRENT
+`numInstances` at COMMIT time. Consequence: a transaction begun
+pre-rebalance and committed post-rebalance lands every buffered
+INSERT on its post-rebalance owner — this is the user's "no change
+is lost (even with transactions open during a rebalance)"
+guarantee. ROLLBACK discards the buffered entries.
+
+### Bootstrap of joining replicas
+
+A primary replica that has no local state — typically a freshly
+added pod after a scale-up — still boots normally as long as the
+BookKeeper history (CREATE_TABLE / CREATE_INDEX entries from
+start-of-time) is intact: the tailer replays everything and the
+SchemaTracker reconstructs the full schema.
+
+When the BookKeeper first ledger has been trimmed and history replay
+is impossible, the engine falls back to a **JOINING bootstrap**:
+
+- Set `indexing.bootstrap.fromRebalance=true` (JVM property) on the
+  joining pod.
+- The engine boots in `EngineStatus.JOINING`, drops every commit-log
+  entry that is **not** an `INDEXING_SERVICE_REBALANCE`.
+- The operator runs `EXECUTE INDEXING_SERVICE_REBALANCE 'tablespace',
+  N` on the leader; the entry rides the WAL to every replica.
+- On observing the entry, the joiner installs the embedded schema
+  snapshot (Tables + vector Indexes), creates its vector stores,
+  bumps its `currentNumInstances`, transitions to
+  `EngineStatus.ACTIVE`, and starts processing subsequent log
+  entries normally.
+
+The same `EXECUTE` is therefore the trigger for both "rebalance the
+existing cluster" and "bootstrap a fresh replica that lost the
+history".
+
+### Shadow replicas across rebalance
+
+Shadows do not tail the commit log and are not affected by routing
+changes — they continue to mirror their paired primary
+(`shadowOf={primaryOrdinal}`) regardless of any REBALANCE entry. A
+shadow whose paired primary has not yet published checkpoint state at
+boot (e.g. a shadow deployed for a brand-new primary) waits gracefully
+via the existing `exists` watcher in `ZookeeperMetadataStorageManager.
+installIndexingServiceStateWatch`, and reloads automatically once the
+primary publishes its first state.
+
+### Limitations
+
+- **Scale-up only.** There is no online scale-down: removing a primary
+  would orphan the historical data its `instanceId` still owns.
+- **Historical data is not redistributed.** Old vectors stay on
+  their original owners. Search fans out across all replicas, so
+  results are complete; but the new pods don't start owning historical
+  data until a write touches it.
+- **Operator-driven.** The `EXECUTE` is a manual step; there is no
+  auto-rebalance triggered by pod-count changes.
 
 ---
 

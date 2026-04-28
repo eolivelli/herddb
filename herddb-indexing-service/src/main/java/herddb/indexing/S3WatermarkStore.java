@@ -31,15 +31,17 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * {@link WatermarkStore} that persists the last-committed checkpoint LSN on remote
- * storage (S3 via the remote file service) so that an indexing service pod with an
- * ephemeral local disk can resume from the correct position after a restart.
+ * {@link WatermarkStore} that persists the durable indexing-service checkpoint
+ * state — last applied {@link LogSequenceNumber} and effective
+ * {@code numInstances} — on remote storage (S3 via the remote file service)
+ * so that an indexing service pod with an ephemeral local disk can resume
+ * from the correct state after a restart.
  *
  * <p><b>Save contract</b>: per the {@link WatermarkStore} interface, this store is
  * only called after a matching {@code indexCheckpoint} has fully completed (all
  * pages + IndexStatus + {@code _metadata/latest.checkpoint} committed to S3). This
  * keeps S3 watermark writes bounded to ≤ 1 per checkpoint (low cost / rate), and
- * guarantees that loading the watermark on a wiped disk always points at a
+ * guarantees that loading the snapshot on a wiped disk always points at a
  * consistent set of S3 checkpoint markers.
  *
  * <p>Object layout on S3:
@@ -47,9 +49,9 @@ import java.util.logging.Logger;
  *   {tableSpace}/_indexing/{instanceId}/watermark.lsn
  * </pre>
  * The {@code instanceId} segment keeps multi-instance shards from clobbering each
- * other. Format: {@code version | flags | ledgerId | offset | XXHash64}.
+ * other. Format: {@code version | flags | ledgerId | offset | numInstances | XXHash64}.
  *
- * <p>Monotonicity: {@link #save(LogSequenceNumber)} rejects (no-op) any LSN
+ * <p>Monotonicity: {@link #save(WatermarkSnapshot)} rejects (no-op) any LSN
  * strictly before the currently-published one, so a stray concurrent writer cannot
  * regress progress.
  *
@@ -88,7 +90,7 @@ public class S3WatermarkStore implements WatermarkStore {
     }
 
     @Override
-    public LogSequenceNumber load() throws IOException {
+    public WatermarkSnapshot load() throws IOException {
         byte[] data;
         try {
             data = io.readFile(path);
@@ -99,7 +101,7 @@ public class S3WatermarkStore implements WatermarkStore {
         }
         if (data == null) {
             LOGGER.log(Level.INFO, "No watermark found at {0}, starting from beginning", path);
-            return LogSequenceNumber.START_OF_TIME;
+            return WatermarkSnapshot.START_OF_TIME;
         }
         if (data.length < 8) {
             throw new CorruptWatermarkException(
@@ -111,7 +113,7 @@ public class S3WatermarkStore implements WatermarkStore {
             throw new CorruptWatermarkException("watermark checksum mismatch at " + path, e);
         }
         try (SimpleByteArrayInputStream in = new SimpleByteArrayInputStream(data);
-             ExtendedDataInputStream din = new ExtendedDataInputStream(in)) {
+                ExtendedDataInputStream din = new ExtendedDataInputStream(in)) {
             long version = din.readVLong();
             long flags = din.readVLong();
             if (version != 1 || flags != 0) {
@@ -121,16 +123,18 @@ public class S3WatermarkStore implements WatermarkStore {
             }
             long ledgerId = din.readZLong();
             long offset = din.readZLong();
-            LogSequenceNumber lsn = new LogSequenceNumber(ledgerId, offset);
-            LOGGER.log(Level.INFO, "Loaded watermark from {0}: {1}", new Object[]{path, lsn});
-            return lsn;
+            int numInstances = din.readVInt();
+            WatermarkSnapshot snapshot = new WatermarkSnapshot(
+                    new LogSequenceNumber(ledgerId, offset), numInstances);
+            LOGGER.log(Level.INFO, "Loaded watermark from {0}: {1}", new Object[]{path, snapshot});
+            return snapshot;
         }
     }
 
     @Override
-    public void save(LogSequenceNumber lsn) throws IOException {
+    public void save(WatermarkSnapshot snapshot) throws IOException {
         // Enforce monotonicity: never move the watermark backwards.
-        LogSequenceNumber current;
+        WatermarkSnapshot current;
         try {
             current = load();
         } catch (CorruptWatermarkException e) {
@@ -138,12 +142,12 @@ public class S3WatermarkStore implements WatermarkStore {
             // the authoritative source once published (and the in-memory
             // processing state shows 'lsn' really was checkpointed).
             LOGGER.log(Level.WARNING, "Existing watermark is corrupt; overwriting: {0}", e.getMessage());
-            current = LogSequenceNumber.START_OF_TIME;
+            current = WatermarkSnapshot.START_OF_TIME;
         }
-        if (current.after(lsn)) {
+        if (current.lsn.after(snapshot.lsn)) {
             LOGGER.log(Level.WARNING,
                     "Refusing to save watermark {0}: regresses from {1}",
-                    new Object[]{lsn, current});
+                    new Object[]{snapshot, current});
             return;
         }
 
@@ -152,8 +156,9 @@ public class S3WatermarkStore implements WatermarkStore {
         try (ExtendedDataOutputStream dout = new ExtendedDataOutputStream(hashOut)) {
             dout.writeVLong(1); // version
             dout.writeVLong(0); // flags
-            dout.writeZLong(lsn.ledgerId);
-            dout.writeZLong(lsn.offset);
+            dout.writeZLong(snapshot.lsn.ledgerId);
+            dout.writeZLong(snapshot.lsn.offset);
+            dout.writeVInt(snapshot.numInstances);
             dout.writeLong(hashOut.hash());
         }
         try {
@@ -161,7 +166,7 @@ public class S3WatermarkStore implements WatermarkStore {
         } catch (RuntimeException e) {
             throw new IOException("Failed to write watermark to " + path, e);
         }
-        LOGGER.log(Level.FINE, "Saved watermark to {0}: {1}", new Object[]{path, lsn});
+        LOGGER.log(Level.FINE, "Saved watermark to {0}: {1}", new Object[]{path, snapshot});
     }
 
     /** Thrown when a stored watermark fails integrity checks. */

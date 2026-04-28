@@ -31,6 +31,7 @@ import herddb.index.vector.ReadOnlyVectorStore;
 import herddb.index.vector.VectorIndexManager;
 import herddb.index.vector.VectorMemoryBudget;
 import herddb.log.CommitLogTailing;
+import herddb.log.IndexingServiceRebalanceDescriptor;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
 import herddb.log.LogSequenceNumber;
@@ -105,7 +106,23 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private final IndexingServerConfiguration config;
 
     private final int instanceId;
-    private final int numInstances;
+    /**
+     * Bootstrap value of {@link #currentNumInstances} read from the JVM
+     * property {@code indexing.cluster.numInstances} at engine construction.
+     * Routing decisions read {@link #currentNumInstances}, which a REBALANCE
+     * log entry can update at runtime.
+     */
+    private final int bootstrapNumInstances;
+    /**
+     * Effective number of indexing-service primary instances used for routing
+     * decisions on every INSERT/UPDATE/DELETE applied by this engine. Mutable
+     * because a {@code INDEXING_SERVICE_REBALANCE} log entry updates it on
+     * the fly: existing data on the old owners stays where it is, but every
+     * subsequent write routes by the new value, so a freshly-added pod
+     * starts owning a share of NEW writes against EVERY existing vector
+     * index without any data movement.
+     */
+    private volatile int currentNumInstances;
 
     private WatermarkStore watermarkStore;
     private SchemaTracker schemaTracker;
@@ -115,6 +132,40 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     private volatile LogSequenceNumber lastProcessedLsn;
     private long entriesSinceLastCheckpoint;
+
+    /**
+     * Most recent {@link IndexingServiceRebalanceDescriptor} observed by the
+     * tailer. Drives two effects: (a) updates {@link #currentNumInstances}
+     * for routing decisions on every subsequent INSERT/UPDATE/DELETE, so a
+     * scale-up immediately spreads new writes against EVERY existing index
+     * across the new owner set without moving any historical data; and
+     * (b) supplies the schema snapshot used by the JOINING-fallback boot
+     * path when the BookKeeper history has been trimmed.
+     *
+     * <p>Lower-or-equal epochs are treated as no-ops (idempotent on log
+     * replay).
+     */
+    private volatile IndexingServiceRebalanceDescriptor lastObservedRebalance;
+    private final java.util.concurrent.atomic.AtomicLong observedRebalanceEpoch =
+            new java.util.concurrent.atomic.AtomicLong(Long.MIN_VALUE);
+
+    /**
+     * Lifecycle state of an indexing-service primary.
+     *
+     * <ul>
+     *   <li>{@link #ACTIVE} (default): the engine has loaded its schema —
+     *       either by hydrating from local/remote storage or by bootstrapping
+     *       from a {@code REBALANCE} entry — and is processing every
+     *       commit-log entry normally.</li>
+     *   <li>{@link #JOINING}: the engine has no schema yet and drops every
+     *       commit-log entry except {@code INDEXING_SERVICE_REBALANCE}. The
+     *       first REBALANCE installs the schema and transitions the engine
+     *       to {@link #ACTIVE}.</li>
+     * </ul>
+     */
+    public enum EngineStatus { ACTIVE, JOINING }
+
+    private volatile EngineStatus engineStatus = EngineStatus.ACTIVE;
 
     // Shadow-replica state (only meaningful when config.isShadow() == true).
     /** true once this shadow has completed its first successful reload. */
@@ -225,8 +276,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         this.config = config;
         this.instanceId = config.getInt(IndexingServerConfiguration.PROPERTY_INSTANCE_ID,
                 IndexingServerConfiguration.PROPERTY_INSTANCE_ID_DEFAULT);
-        this.numInstances = config.getInt(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES,
+        this.bootstrapNumInstances = config.getInt(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES,
                 IndexingServerConfiguration.PROPERTY_NUM_INSTANCES_DEFAULT);
+        this.currentNumInstances = this.bootstrapNumInstances;
     }
 
     private MetadataStorageManager buildMetadataStorageManager() {
@@ -572,16 +624,27 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             return t;
         });
 
-        // Validate instance identity
-        if (numInstances < 1) {
-            throw new IllegalArgumentException("numInstances must be >= 1, got " + numInstances);
+        // Validate instance identity. The bootstrap numInstances is a lower
+        // bound on the engine's identity range; the running value may grow
+        // when a REBALANCE entry arrives, so we accept any instanceId
+        // strictly less than the bootstrap value here. Pods with an
+        // instanceId outside that range are intended to come up with
+        // bootstrapFromRebalance=true and will be activated by the next
+        // REBALANCE entry.
+        if (bootstrapNumInstances < 1) {
+            throw new IllegalArgumentException("numInstances must be >= 1, got " + bootstrapNumInstances);
         }
-        if (instanceId < 0 || instanceId >= numInstances) {
+        if (instanceId < 0) {
+            throw new IllegalArgumentException("instanceId must be >= 0, got " + instanceId);
+        }
+        if (!config.isBootstrapFromRebalance() && instanceId >= bootstrapNumInstances) {
             throw new IllegalArgumentException(
-                    "instanceId must be in [0, " + (numInstances - 1) + "], got " + instanceId);
+                    "instanceId must be in [0, " + (bootstrapNumInstances - 1) + "], got " + instanceId
+                            + "; for a fresh joining replica set "
+                            + IndexingServerConfiguration.PROPERTY_BOOTSTRAP_FROM_REBALANCE + "=true");
         }
-        LOGGER.log(Level.INFO, "Instance identity: instanceId={0}, numInstances={1}",
-                new Object[]{instanceId, numInstances});
+        LOGGER.log(Level.INFO, "Instance identity: instanceId={0}, bootstrapNumInstances={1}",
+                new Object[]{instanceId, bootstrapNumInstances});
 
         // Boot MetadataStorageManager if not injected
         if (metadataStorageManager == null) {
@@ -643,14 +706,42 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             return;
         }
 
-        // Load the watermark now that the watermark store has been configured
-        // for this tablespace UUID.
+        // Load the watermark snapshot now that the watermark store has been
+        // configured for this tablespace UUID. The snapshot bundles the
+        // last-applied LSN AND the engine's effective numInstances at the
+        // time of the matching checkpoint — so a freshly-restarted engine
+        // re-acquires the correct routing value even if the BookKeeper
+        // ledger that carried the most recent INDEXING_SERVICE_REBALANCE
+        // entry has been trimmed in the meantime.
         if (watermarkStore == null) {
             watermarkStore = new LocalWatermarkStore(dataDirectory);
         }
-        LogSequenceNumber watermark = watermarkStore.load();
+        WatermarkSnapshot snapshot = watermarkStore.load();
+        LogSequenceNumber watermark = snapshot.lsn;
         lastProcessedLsn = watermark;
-        LOGGER.log(Level.INFO, "Loaded watermark: {0}", watermark);
+        if (snapshot.numInstances > 0) {
+            int previous = currentNumInstances;
+            currentNumInstances = snapshot.numInstances;
+            LOGGER.log(Level.INFO,
+                    "Loaded watermark snapshot: {0}; currentNumInstances {1} -> {2}",
+                    new Object[]{snapshot, previous, currentNumInstances});
+        } else {
+            LOGGER.log(Level.INFO,
+                    "Loaded watermark snapshot: {0}; keeping bootstrap currentNumInstances={1}",
+                    new Object[]{snapshot, currentNumInstances});
+        }
+
+        // JOINING fallback: a freshly added pod whose history was trimmed
+        // (or which has no local state at all) bootstraps schema from the
+        // next REBALANCE entry rather than replaying CREATE_TABLE /
+        // CREATE_INDEX from START_OF_TIME. Until that REBALANCE arrives,
+        // every other entry is dropped.
+        if (config.isBootstrapFromRebalance()) {
+            engineStatus = EngineStatus.JOINING;
+            LOGGER.log(Level.INFO,
+                    "Engine starting in JOINING state ({0}=true); will wait for next REBALANCE",
+                    IndexingServerConfiguration.PROPERTY_BOOTSTRAP_FROM_REBALANCE);
+        }
 
         // Start the commit-log tailer from START_OF_TIME — not from the
         // watermark. Rationale: the indexing service needs to reprocess DDL
@@ -772,6 +863,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     public LogSequenceNumber getLastProcessedLsn() {
         return lastProcessedLsn;
+    }
+
+    /**
+     * Test-only: drive an entry through the same path the live tailer uses,
+     * including the transaction buffer (so BEGINTRANSACTION /
+     * COMMITTRANSACTION / ROLLBACKTRANSACTION work end-to-end without
+     * having to spin up a real commit log).
+     */
+    // package-private for testing
+    void processEntryForTest(LogSequenceNumber lsn, LogEntry entry) {
+        processEntry(lsn, entry);
     }
 
     /**
@@ -990,6 +1092,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      */
     // package-private for testing
     void applyEntry(LogSequenceNumber lsn, LogEntry entry) {
+        // JOINING state: drop everything except the REBALANCE entry that
+        // bootstraps schema. See Step 7 of the scale-up plan: a freshly
+        // added pod that cannot replay history (BK ledgers trimmed) sits in
+        // JOINING until a REBALANCE arrives, at which point it acquires
+        // schema and transitions to ACTIVE.
+        if (engineStatus == EngineStatus.JOINING
+                && entry.type != LogEntryType.INDEXING_SERVICE_REBALANCE) {
+            return;
+        }
         switch (entry.type) {
             // DDL operations: update schema tracker
             case LogEntryType.CREATE_TABLE:
@@ -1033,6 +1144,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 applyDelete(entry);
                 break;
 
+            case LogEntryType.INDEXING_SERVICE_REBALANCE:
+                handleRebalanceEntry(entry);
+                break;
+
             default:
                 // NOOP, TABLE_CONSISTENCY_CHECK, etc. -- ignore
                 break;
@@ -1055,30 +1170,40 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     }
 
     /**
-     * Determines whether an INSERT for the given primary key should be accepted by this instance
-     * based on the shard assignment.
+     * Per-key ownership decision for a given vector index using this engine's
+     * current number of instances.
+     *
+     * <p>{@code numShards} is a per-index property (set at CREATE INDEX time)
+     * because it controls hash-bucket granularity within the index — it does
+     * not move data, just decides how many distinct buckets exist.
+     *
+     * <p>{@code numInstances} is engine-wide and mutable: the
+     * {@link #handleRebalanceEntry} path updates it on the fly when a
+     * {@code INDEXING_SERVICE_REBALANCE} log entry is observed. Existing
+     * data on the previous owners stays where it is, but every subsequent
+     * write routes by the new value — so a freshly-added pod starts owning
+     * a share of NEW writes against EVERY existing vector index, without
+     * any data migration.
      */
-    boolean isInsertAcceptedLocally(Bytes key, int numShards) {
-        if (numInstances <= 1) {
-            return true;
-        }
-        if (numShards <= 1) {
+    boolean isAcceptedLocally(Bytes key, Index index) {
+        int n = currentNumInstances;
+        int indexNumShards = getNumShardsForIndex(index);
+        if (n <= 1 || indexNumShards <= 1) {
             return true;
         }
         long hash = XXHash64Utils.hash(key.getBuffer(), key.getOffset(), key.getLength());
-        int shardId = Math.floorMod((int) hash, numShards);
-        return shardId % numInstances == instanceId;
+        int shardId = Math.floorMod((int) hash, indexNumShards);
+        return shardId % n == instanceId;
     }
 
-    private int getNumShardsForTable(Collection<Index> vectorIndexes) {
-        for (Index idx : vectorIndexes) {
-            String val = idx.properties.get(VectorIndexManager.PROP_NUM_SHARDS);
-            if (val != null) {
-                try {
-                    return Integer.parseInt(val);
-                } catch (NumberFormatException e) {
-                    LOGGER.log(Level.WARNING, "Invalid numShards value: {0}", val);
-                }
+    private int getNumShardsForIndex(Index index) {
+        String val = index.properties.get(VectorIndexManager.PROP_NUM_SHARDS);
+        if (val != null) {
+            try {
+                return Integer.parseInt(val);
+            } catch (NumberFormatException e) {
+                LOGGER.log(Level.WARNING, "Invalid {0} on index {1}: {2}",
+                        new Object[]{VectorIndexManager.PROP_NUM_SHARDS, index.name, val});
             }
         }
         return 1;
@@ -1090,11 +1215,6 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         if (vectorIndexes.isEmpty()) {
             return;
         }
-        // Shard filtering: skip INSERT if this instance does not own the shard
-        int numShards = getNumShardsForTable(vectorIndexes);
-        if (!isInsertAcceptedLocally(entry.key, numShards)) {
-            return;
-        }
         Table table = schemaTracker.getTable(tableName);
         if (table == null) {
             LOGGER.log(Level.WARNING, "INSERT on unknown table {0}, skipping vector indexing", tableName);
@@ -1103,6 +1223,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         Record record = new Record(entry.key, entry.value);
         DataAccessorForFullRecord accessor = new DataAccessorForFullRecord(table, record);
         for (Index idx : vectorIndexes) {
+            // Per-index ownership: indexes on the same table may have different
+            // numInstances (e.g. a pre-rebalance index with N=2 next to a
+            // post-rebalance index with N=4); each makes its own decision.
+            if (!isAcceptedLocally(entry.key, idx)) {
+                continue;
+            }
             AbstractVectorStore store = vectorStores.get(storeKey(tableName, idx.name));
             if (store == null) {
                 continue;
@@ -1131,8 +1257,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             if (store == null) {
                 continue;
             }
-            // Remove old entry, add new one
+            // Broadcast the remove: a rebalance may have left stale copies of
+            // this key on previous owners that no longer own it under the
+            // current numInstances; we have to clean them up wherever they
+            // sit. The add side is filtered: only the current owner under
+            // the new mapping installs the new vector — otherwise we'd
+            // phantom-add the key onto every replica.
             store.removeVector(entry.key);
+            if (!isAcceptedLocally(entry.key, idx)) {
+                continue;
+            }
             float[] vector = extractVector(accessor, store.getVectorColumnName());
             if (vector != null) {
                 store.addVector(entry.key, vector);
@@ -1146,12 +1280,145 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         if (vectorIndexes.isEmpty()) {
             return;
         }
+        // Broadcast: every replica calls removeVector unconditionally.
+        // After a rebalance, the same primary key may sit on TWO replicas at
+        // once — on its original owner under the old numInstances (the
+        // historical write) AND on its new owner under the new numInstances
+        // (a subsequent re-INSERT or UPDATE). A filtered DELETE would only
+        // hit one of them and leak the other; broadcast guarantees the key
+        // disappears from everywhere. removeVector is a no-op on replicas
+        // that never had the key, so the cost is a single map lookup.
         for (Index idx : vectorIndexes) {
             AbstractVectorStore store = vectorStores.get(storeKey(tableName, idx.name));
             if (store != null) {
                 store.removeVector(entry.key);
             }
         }
+    }
+
+    /**
+     * Processes an {@link LogEntryType#INDEXING_SERVICE_REBALANCE} entry.
+     * Updates {@link #currentNumInstances} from the descriptor so every
+     * subsequent routing decision uses the new value (existing data on
+     * previous owners stays put — search fans out across all replicas
+     * regardless), and bumps {@link #observedRebalanceEpoch}.
+     *
+     * <p>Lower-or-equal epochs are silently ignored to keep log replay
+     * idempotent. The JOINING fallback path (Step 7) overrides this with
+     * additional bootstrap behavior.
+     */
+    void handleRebalanceEntry(LogEntry entry) {
+        if (entry.value == null) {
+            LOGGER.log(Level.WARNING, "INDEXING_SERVICE_REBALANCE entry with null payload, ignoring");
+            return;
+        }
+        IndexingServiceRebalanceDescriptor descriptor;
+        try {
+            descriptor = IndexingServiceRebalanceDescriptor.deserialize(entry.value.to_array());
+        } catch (IOException e) {
+            LOGGER.log(Level.SEVERE,
+                    "INDEXING_SERVICE_REBALANCE entry with malformed payload: " + e.getMessage(), e);
+            return;
+        }
+        long previous = observedRebalanceEpoch.get();
+        boolean joining = engineStatus == EngineStatus.JOINING;
+        // A JOINING engine MUST process the first REBALANCE it sees regardless
+        // of epoch ordering — otherwise it has no way to acquire schema if the
+        // EXECUTE rebalance happened before the pod started. ACTIVE engines
+        // skip lower-or-equal epochs to keep replay idempotent.
+        if (!joining && descriptor.epoch <= previous) {
+            LOGGER.log(Level.FINE,
+                    "Ignoring REBALANCE epoch {0} (already observed {1})",
+                    new Object[]{descriptor.epoch, previous});
+            return;
+        }
+        if (joining) {
+            installSchemaFromDescriptor(descriptor);
+            engineStatus = EngineStatus.ACTIVE;
+            LOGGER.log(Level.INFO,
+                    "JOINING -> ACTIVE on REBALANCE epoch={0}: installed {1} tables, {2} vector indexes",
+                    new Object[]{descriptor.epoch,
+                            descriptor.tables.size(), descriptor.vectorIndexes.size()});
+        }
+        // Update the engine's effective numInstances. This is the load-bearing
+        // change of the REBALANCE entry: from this LSN onward every routing
+        // decision uses the new value. Existing data on previous owners stays
+        // where it is (search fans out across all replicas anyway), but new
+        // writes are spread across the new owner set — including freshly
+        // added pods, for EVERY existing vector index.
+        int previousN = currentNumInstances;
+        currentNumInstances = descriptor.defaultNumInstances;
+        if (previousN != currentNumInstances) {
+            LOGGER.log(Level.INFO,
+                    "currentNumInstances {0} -> {1} (REBALANCE epoch={2})",
+                    new Object[]{previousN, currentNumInstances, descriptor.epoch});
+        }
+        // Always advance the high-water mark to the OBSERVED value, even if
+        // the JOINING bootstrap accepted an older epoch — subsequent REBALANCE
+        // entries with strictly higher epochs will then be processed normally.
+        if (descriptor.epoch > previous) {
+            observedRebalanceEpoch.set(descriptor.epoch);
+        }
+        lastObservedRebalance = descriptor;
+        LOGGER.log(Level.INFO,
+                "Observed REBALANCE epoch={0} defaultNumInstances={1} tables={2} vectorIndexes={3}",
+                new Object[]{descriptor.epoch, descriptor.defaultNumInstances,
+                        descriptor.tables.size(), descriptor.vectorIndexes.size()});
+    }
+
+    /** Test- and diagnostics-only accessor for the engine's current effective numInstances. */
+    public int getCurrentNumInstances() {
+        return currentNumInstances;
+    }
+
+    /**
+     * Synthesises {@code CREATE_TABLE}/{@code CREATE_INDEX} log entries from
+     * the descriptor and feeds them to the {@link SchemaTracker}, then
+     * creates a vector store for every vector index in the snapshot. Used
+     * by the JOINING fallback to acquire schema without replaying the
+     * historical commit-log entries.
+     */
+    private void installSchemaFromDescriptor(IndexingServiceRebalanceDescriptor descriptor) {
+        for (Table t : descriptor.tables) {
+            byte[] blob = t.serialize();
+            schemaTracker.applyEntry(new LogEntry(System.currentTimeMillis(),
+                    LogEntryType.CREATE_TABLE, 0L, t.name, null,
+                    herddb.utils.Bytes.from_array(blob)));
+        }
+        for (Index ix : descriptor.vectorIndexes) {
+            byte[] blob = ix.serialize();
+            LogEntry synth = new LogEntry(System.currentTimeMillis(),
+                    LogEntryType.CREATE_INDEX, 0L, ix.table, null,
+                    herddb.utils.Bytes.from_array(blob));
+            schemaTracker.applyEntry(synth);
+            createVectorStoreIfNeeded(synth);
+        }
+    }
+
+    /** Test- and diagnostics-only accessor for the engine lifecycle state. */
+    public EngineStatus getEngineStatus() {
+        return engineStatus;
+    }
+
+    /** Forces this engine into {@link EngineStatus#JOINING}; for tests only. */
+    void forceJoiningForTest() {
+        this.engineStatus = EngineStatus.JOINING;
+    }
+
+    /**
+     * Most recently observed REBALANCE descriptor or {@code null} if none yet.
+     * Test- and diagnostics-only accessor.
+     */
+    public IndexingServiceRebalanceDescriptor getLastObservedRebalance() {
+        return lastObservedRebalance;
+    }
+
+    /**
+     * Highest REBALANCE epoch observed so far, or {@link Long#MIN_VALUE} if
+     * no REBALANCE entry has been processed.
+     */
+    public long getObservedRebalanceEpoch() {
+        return observedRebalanceEpoch.get();
     }
 
     private static float[] extractVector(DataAccessorForFullRecord accessor, String columnName) {
@@ -1230,10 +1497,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 }
             }
             // Only now — all stores have durably persisted state covering
-            // checkpointLsn — is it safe to publish the watermark.
+            // checkpointLsn — is it safe to publish the watermark snapshot.
+            // We capture the engine's current numInstances together with the
+            // LSN so a future restart re-acquires the right routing value
+            // even if the BookKeeper history that carried the most recent
+            // INDEXING_SERVICE_REBALANCE entry has been trimmed by then.
+            WatermarkSnapshot snapshotToSave =
+                    new WatermarkSnapshot(checkpointLsn, currentNumInstances);
             try {
-                watermarkStore.save(checkpointLsn);
-                LOGGER.log(Level.FINE, "Saved watermark at {0}", checkpointLsn);
+                watermarkStore.save(snapshotToSave);
+                LOGGER.log(Level.FINE, "Saved watermark snapshot {0}", snapshotToSave);
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to save watermark", e);
             }

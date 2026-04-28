@@ -30,6 +30,9 @@ import herddb.jmx.DBManagerStatsMXBean;
 import herddb.jmx.JMXUtils;
 import herddb.log.CommitLog;
 import herddb.log.CommitLogManager;
+import herddb.log.IndexingServiceRebalanceDescriptor;
+import herddb.log.LogEntry;
+import herddb.log.LogEntryFactory;
 import herddb.log.LogNotAvailableException;
 import herddb.log.LogSequenceNumber;
 import herddb.mem.MemoryMetadataStorageManager;
@@ -63,6 +66,7 @@ import herddb.model.commands.CheckpointStatement;
 import herddb.model.commands.CreateTableSpaceStatement;
 import herddb.model.commands.DropTableSpaceStatement;
 import herddb.model.commands.GetStatement;
+import herddb.model.commands.IndexingServiceRebalanceStatement;
 import herddb.model.commands.ScanStatement;
 import herddb.model.commands.TableConsistencyCheckStatement;
 import herddb.model.commands.TableSpaceConsistencyCheckStatement;
@@ -817,6 +821,42 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
                 return Futures.exception(new StatementExecutionException("WAITFORINDEXES interrupted", e));
             }
             return CompletableFuture.completedFuture(new DDLStatementExecutionResult(TransactionContext.NOTRANSACTION_ID));
+        }
+        if (statement instanceof IndexingServiceRebalanceStatement) {
+            if (transactionContext.transactionId > 0) {
+                return Futures.exception(new StatementExecutionException(
+                        "INDEXING_SERVICE_REBALANCE cannot be issued inside a transaction"));
+            }
+            IndexingServiceRebalanceStatement rb = (IndexingServiceRebalanceStatement) statement;
+            TableSpaceManager manager = tablesSpaces.get(rb.getTableSpace());
+            if (manager == null) {
+                return Futures.exception(new NotLeaderException("No such tableSpace " + rb.getTableSpace()
+                        + " here (at " + nodeId + ")"));
+            }
+            if (errorIfNotLeader && !manager.isLeader()) {
+                return Futures.exception(new NotLeaderException(
+                        "node " + nodeId + " is not leader for tableSpace " + rb.getTableSpace()));
+            }
+            try {
+                herddb.model.TableSpace prev = metadataStorageManager.describeTableSpace(rb.getTableSpace());
+                if (prev == null) {
+                    return Futures.exception(new StatementExecutionException(
+                            "tablespace " + rb.getTableSpace() + " does not exist"));
+                }
+                IndexingServiceRebalanceDescriptor descriptor = new IndexingServiceRebalanceDescriptor(
+                        System.currentTimeMillis(),
+                        rb.getNumInstances(),
+                        manager.getAllCommittedTables(),
+                        manager.getAllCommittedVectorIndexes());
+                LogEntry entry = LogEntryFactory.indexingServiceRebalance(descriptor);
+                manager.getLog().log(entry, true);
+            } catch (LogNotAvailableException | DataStorageManagerException
+                    | herddb.metadata.MetadataStorageManagerException e) {
+                return Futures.exception(new StatementExecutionException(
+                        "INDEXING_SERVICE_REBALANCE failed: " + e.getMessage(), e));
+            }
+            return CompletableFuture.completedFuture(
+                    new DDLStatementExecutionResult(TransactionContext.NOTRANSACTION_ID));
         }
         if (statement instanceof TableSpaceConsistencyCheckStatement) {
             if (transactionContext.transactionId > 0) {
