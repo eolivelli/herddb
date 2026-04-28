@@ -153,6 +153,11 @@ public class LogEntry {
                 //value contains checksum and query
                 doo.writeArray(value);
                 break;
+            case LogEntryType.INDEXING_SERVICE_REBALANCE:
+                // value contains a serialized IndexingServiceRebalanceDescriptor;
+                // tableName/key are unused.
+                doo.writeArray(value);
+                break;
             default:
                 throw new IllegalArgumentException("unsupported type " + type);
         }
@@ -215,6 +220,9 @@ public class LogEntry {
                     break;
                 case LogEntryType.TABLE_CONSISTENCY_CHECK:
                     tableName = dis.readUTF();
+                    value = dis.readBytes();
+                    break;
+                case LogEntryType.INDEXING_SERVICE_REBALANCE:
                     value = dis.readBytes();
                     break;
                 default:

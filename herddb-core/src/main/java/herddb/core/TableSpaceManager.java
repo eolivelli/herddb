@@ -1207,6 +1207,22 @@ public class TableSpaceManager {
         return result;
     }
 
+    /**
+     * Snapshot of every committed vector {@link Index} on this tablespace,
+     * used by the {@code EXECUTE INDEXING_SERVICE_REBALANCE} handler to
+     * embed the schema in the resulting log entry.
+     */
+    public List<Index> getAllCommittedVectorIndexes() {
+        List<Index> result = new ArrayList<>();
+        for (AbstractIndexManager im : indexes.values()) {
+            Index idx = im.getIndex();
+            if (Index.TYPE_VECTOR.equals(idx.type)) {
+                result.add(idx);
+            }
+        }
+        return result;
+    }
+
     boolean isTransactionRunningOnTable(String name) {
         return transactions
                 .values()
@@ -2298,7 +2314,26 @@ public class TableSpaceManager {
                         + ", there is already an index " + exists.getIndex().name + " on table " + exists.getIndex().table);
                 throw new IndexAlreadyExistsException(statement.getIndexDefinition().name);
             }
-            LogEntry entry = LogEntryFactory.createIndex(statement.getIndexDefinition(), transaction);
+            Index indexDef = statement.getIndexDefinition();
+            // Vector indexes inherit the tablespace's defaultIndexingNumInstances
+            // so the indexing service can route per-index without consulting any
+            // global runtime state. The value is permanent for the life of the
+            // index — a later rebalance only affects newly-created indexes.
+            if (Index.TYPE_VECTOR.equals(indexDef.type)) {
+                int defaultNumInstances;
+                try {
+                    TableSpace tsInfo = metadataStorageManager.describeTableSpace(tableSpaceName);
+                    defaultNumInstances = tsInfo != null
+                            ? tsInfo.defaultIndexingNumInstances
+                            : TableSpace.DEFAULT_INDEXING_NUM_INSTANCES_DEFAULT;
+                } catch (MetadataStorageManagerException ex) {
+                    throw new StatementExecutionException(
+                            "Failed to read tablespace metadata for " + tableSpaceName, ex);
+                }
+                indexDef = indexDef.withDefaultProperty(VectorIndexManager.PROP_NUM_INSTANCES,
+                        String.valueOf(defaultNumInstances));
+            }
+            LogEntry entry = LogEntryFactory.createIndex(indexDef, transaction);
             CommitLogResult pos;
             try {
                 pos = log.log(entry, entry.transactionId <= 0);

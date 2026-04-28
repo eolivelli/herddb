@@ -107,6 +107,20 @@ public class Index implements ColumnsList {
         return new Builder();
     }
 
+    /**
+     * Returns a copy of this index with the given property merged into
+     * {@link #properties}. If the property is already set, this index is
+     * returned unchanged so caller-supplied overrides are preserved.
+     */
+    public Index withDefaultProperty(String key, String value) {
+        if (properties.containsKey(key)) {
+            return this;
+        }
+        Map<String, String> merged = new HashMap<>(properties);
+        merged.put(key, value);
+        return new Index(uuid, name, table, tablespace, type, columns, unique, merged);
+    }
+
     @SuppressFBWarnings("OS_OPEN_STREAM")
     public static Index deserialize(byte[] data) {
         try {

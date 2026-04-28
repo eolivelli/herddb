@@ -94,4 +94,9 @@ public class LogEntryFactory {
                 -1, null, null, null);
     }
 
+    public static LogEntry indexingServiceRebalance(IndexingServiceRebalanceDescriptor descriptor) {
+        return new LogEntry(System.currentTimeMillis(), LogEntryType.INDEXING_SERVICE_REBALANCE,
+                0, null, null, Bytes.from_array(descriptor.serialize()));
+    }
+
 }

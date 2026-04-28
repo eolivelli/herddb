@@ -61,6 +61,7 @@ import herddb.model.commands.DropIndexStatement;
 import herddb.model.commands.DropTableSpaceStatement;
 import herddb.model.commands.DropTableStatement;
 import herddb.model.commands.GetStatement;
+import herddb.model.commands.IndexingServiceRebalanceStatement;
 import herddb.model.commands.InsertStatement;
 import herddb.model.commands.RollbackTransactionStatement;
 import herddb.model.commands.SQLPlannedOperationStatement;
@@ -1105,6 +1106,30 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
                             "WAITFORINDEXES timeout must be strictly positive, got " + timeoutSeconds);
                 }
                 return new WaitForIndexesStatement(tableSpaceName.toString(), timeoutSeconds * 1000L);
+            }
+            case "INDEXING_SERVICE_REBALANCE": {
+                int paramCount = execute.getExprList() == null ? 0 : execute.getExprList().getExpressions().size();
+                if (paramCount != 2) {
+                    throw new StatementExecutionException(
+                            "INDEXING_SERVICE_REBALANCE requires two parameters "
+                            + "(EXECUTE INDEXING_SERVICE_REBALANCE 'tableSpaceName', numInstances)");
+                }
+                Object tableSpaceName = resolveValue(execute.getExprList().getExpressions().get(0), true);
+                if (tableSpaceName == null) {
+                    throw new StatementExecutionException(
+                            "INDEXING_SERVICE_REBALANCE requires a tableSpaceName parameter");
+                }
+                Object numInstancesObj = resolveValue(execute.getExprList().getExpressions().get(1), true);
+                if (!(numInstancesObj instanceof Number)) {
+                    throw new StatementExecutionException(
+                            "INDEXING_SERVICE_REBALANCE numInstances must be a number");
+                }
+                int numInstances = ((Number) numInstancesObj).intValue();
+                if (numInstances < 1) {
+                    throw new StatementExecutionException(
+                            "INDEXING_SERVICE_REBALANCE numInstances must be >= 1, got " + numInstances);
+                }
+                return new IndexingServiceRebalanceStatement(tableSpaceName.toString(), numInstances);
             }
             case "COMMITTRANSACTION": {
                 if (execute.getExprList() == null || execute.getExprList().getExpressions().size() != 2) {

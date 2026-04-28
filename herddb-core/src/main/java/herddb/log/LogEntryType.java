@@ -41,5 +41,15 @@ public class LogEntryType {
     public static final short TRUNCATE_TABLE = 12;
     public static final short NOOP = 13;
     public static final short TABLE_CONSISTENCY_CHECK = 14;
+    /**
+     * Carries an {@link IndexingServiceRebalanceDescriptor} payload.
+     * Written by the leader when an operator runs
+     * {@code EXECUTE INDEXING_SERVICE_REBALANCE N}. Replayed by HerdDB
+     * Followers as a no-op other than the embedded
+     * {@code defaultIndexingNumInstances} update applied to the in-memory
+     * tablespace metadata. Indexing-service replicas use the entry to bootstrap
+     * schema when the BookKeeper history is no longer available.
+     */
+    public static final short INDEXING_SERVICE_REBALANCE = 15;
 
 }
