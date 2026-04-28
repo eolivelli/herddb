@@ -94,6 +94,8 @@ public class PrimaryIndexScanRangeTest {
 
             performBasicPlannerTests(manager);
 
+            // MemoryDataStorageManager uses ConcurrentMapKeyToPageIndex (HashMap-backed),
+            // which is unordered regardless of PK type.
             assertFalse(manager.getTableSpaceManager("tblspace1").getTableManager("t1").isKeyToPageSortedAscending());
         }
 
@@ -129,7 +131,7 @@ public class PrimaryIndexScanRangeTest {
             TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(id,n1,n2,name) values('b',2,5,'n1')", Collections.emptyList());
             TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(id,n1,n2,name) values('c',-3,6,'n2')", Collections.emptyList());
 
-            assertFalse(manager.getTableSpaceManager("tblspace1").getTableManager("t1").isKeyToPageSortedAscending());
+            assertTrue(manager.getTableSpaceManager("tblspace1").getTableManager("t1").isKeyToPageSortedAscending());
 
              {
                 TranslatedQuery translated = manager.getPlanner().translate(TableSpace.DEFAULT, "SELECT n1,n2 "
@@ -232,7 +234,7 @@ public class PrimaryIndexScanRangeTest {
 
             performBasicPlannerTests(manager);
 
-            assertFalse(manager.getTableSpaceManager("tblspace1").getTableManager("t1").isKeyToPageSortedAscending());
+            assertTrue(manager.getTableSpaceManager("tblspace1").getTableManager("t1").isKeyToPageSortedAscending());
 
             {
                 TranslatedQuery translated = manager.getPlanner().translate(TableSpace.DEFAULT, "SELECT n1,n2 "
@@ -1242,6 +1244,222 @@ public class PrimaryIndexScanRangeTest {
             assertFalse(scan.getComparator().isOnlyPrimaryKeyAndAscending());
             try (DataScanner scan1 = manager.scan(scan, translated.context, TransactionContext.NO_TRANSACTION)) {
                 assertEquals(3, scan1.consume().size());
+            }
+        }
+    }
+
+    @Test
+    public void scanByPKOfLongsWithNegativeValues() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+
+        String nodeId = "localhost";
+        try (DBManager manager = new DBManager("localhost", new MemoryMetadataStorageManager(),
+                new FileDataStorageManager(dataPath), new MemoryCommitLogManager(), null, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement("tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            Table table = Table
+                    .builder()
+                    .tablespace("tblspace1")
+                    .name("t1")
+                    .column("n1", ColumnTypes.LONG)
+                    .column("name", ColumnTypes.STRING)
+                    .primaryKey("n1")
+                    .build();
+
+            CreateTableStatement st2 = new CreateTableStatement(table);
+            manager.executeStatement(st2, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+
+            // include Long.MIN_VALUE/MAX_VALUE to exercise the sign-bit boundary
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(n1,name) values(?,?)",
+                    java.util.Arrays.asList(Long.MIN_VALUE, "min"));
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(n1,name) values(-1,'minus_one')", Collections.emptyList());
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(n1,name) values(0,'zero')", Collections.emptyList());
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(n1,name) values(1,'one')", Collections.emptyList());
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(n1,name) values(?,?)",
+                    java.util.Arrays.asList(Long.MAX_VALUE, "max"));
+
+            assertTrue(manager.getTableSpaceManager("tblspace1").getTableManager("t1").isKeyToPageSortedAscending());
+
+            {
+                TranslatedQuery translated = manager.getPlanner().translate(TableSpace.DEFAULT,
+                        "SELECT n1 FROM tblspace1.t1 ORDER BY n1",
+                        Collections.emptyList(), true, true, false, -1);
+                ScanStatement scan = translated.plan.mainStatement.unwrap(ScanStatement.class);
+                assertTrue(scan.getComparator().isOnlyPrimaryKeyAndAscending());
+                try (DataScanner scan1 = manager.scan(scan, translated.context, TransactionContext.NO_TRANSACTION)) {
+                    List<DataAccessor> tuples = scan1.consume();
+                    assertEquals(5, tuples.size());
+                    assertEquals(Long.MIN_VALUE, tuples.get(0).get("n1"));
+                    assertEquals(-1L, tuples.get(1).get("n1"));
+                    assertEquals(0L, tuples.get(2).get("n1"));
+                    assertEquals(1L, tuples.get(3).get("n1"));
+                    assertEquals(Long.MAX_VALUE, tuples.get(4).get("n1"));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void rangeScanByPKBetweenNegativeAndPositive() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+
+        String nodeId = "localhost";
+        try (DBManager manager = new DBManager("localhost", new MemoryMetadataStorageManager(),
+                new FileDataStorageManager(dataPath), new MemoryCommitLogManager(), null, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement("tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            Table table = Table
+                    .builder()
+                    .tablespace("tblspace1")
+                    .name("t1")
+                    .column("n1", ColumnTypes.INTEGER)
+                    .column("name", ColumnTypes.STRING)
+                    .primaryKey("n1")
+                    .build();
+
+            CreateTableStatement st2 = new CreateTableStatement(table);
+            manager.executeStatement(st2, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+
+            for (int v : new int[] {-100, -10, -5, -1, 0, 1, 5, 10, 100}) {
+                TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(n1,name) values(?,?)",
+                        java.util.Arrays.asList(v, "v" + v));
+            }
+
+            assertTrue(manager.getTableSpaceManager("tblspace1").getTableManager("t1").isKeyToPageSortedAscending());
+
+            TranslatedQuery translated = manager.getPlanner().translate(TableSpace.DEFAULT,
+                    "SELECT n1 FROM tblspace1.t1 WHERE n1 BETWEEN -10 AND 10 ORDER BY n1",
+                    Collections.emptyList(), true, true, false, -1);
+            ScanStatement scan = translated.plan.mainStatement.unwrap(ScanStatement.class);
+            assertTrue(scan.getPredicate().getIndexOperation() instanceof PrimaryIndexRangeScan);
+            assertTrue(scan.getComparator().isOnlyPrimaryKeyAndAscending());
+            try (DataScanner scan1 = manager.scan(scan, translated.context, TransactionContext.NO_TRANSACTION)) {
+                List<DataAccessor> tuples = scan1.consume();
+                assertEquals(7, tuples.size());
+                assertEquals(-10, tuples.get(0).get("n1"));
+                assertEquals(-5, tuples.get(1).get("n1"));
+                assertEquals(-1, tuples.get(2).get("n1"));
+                assertEquals(0, tuples.get(3).get("n1"));
+                assertEquals(1, tuples.get(4).get("n1"));
+                assertEquals(5, tuples.get(5).get("n1"));
+                assertEquals(10, tuples.get(6).get("n1"));
+            }
+        }
+    }
+
+    @Test
+    public void scanByPKOfTimestamps() throws Exception {
+        // Note: Bytes.toTimestamp returns null when the decoded long is negative,
+        // which makes pre-1970 timestamps unusable (pre-existing limitation).
+        // This test only exercises post-1970 values.
+        Path dataPath = folder.newFolder("data").toPath();
+
+        String nodeId = "localhost";
+        try (DBManager manager = new DBManager("localhost", new MemoryMetadataStorageManager(),
+                new FileDataStorageManager(dataPath), new MemoryCommitLogManager(), null, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement("tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            Table table = Table
+                    .builder()
+                    .tablespace("tblspace1")
+                    .name("t1")
+                    .column("ts", ColumnTypes.TIMESTAMP)
+                    .column("name", ColumnTypes.STRING)
+                    .primaryKey("ts")
+                    .build();
+
+            CreateTableStatement st2 = new CreateTableStatement(table);
+            manager.executeStatement(st2, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+
+            java.sql.Timestamp tsEarly = new java.sql.Timestamp(1_000_000L);
+            java.sql.Timestamp tsMid = new java.sql.Timestamp(2_000_000_000L);
+            java.sql.Timestamp tsLate = new java.sql.Timestamp(4_000_000_000L);
+
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(ts,name) values(?,?)",
+                    java.util.Arrays.asList(tsLate, "late"));
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(ts,name) values(?,?)",
+                    java.util.Arrays.asList(tsEarly, "early"));
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(ts,name) values(?,?)",
+                    java.util.Arrays.asList(tsMid, "mid"));
+
+            assertTrue(manager.getTableSpaceManager("tblspace1").getTableManager("t1").isKeyToPageSortedAscending());
+
+            TranslatedQuery translated = manager.getPlanner().translate(TableSpace.DEFAULT,
+                    "SELECT name FROM tblspace1.t1 ORDER BY ts",
+                    Collections.emptyList(), true, true, false, -1);
+            ScanStatement scan = translated.plan.mainStatement.unwrap(ScanStatement.class);
+            assertTrue(scan.getComparator().isOnlyPrimaryKeyAndAscending());
+            try (DataScanner scan1 = manager.scan(scan, translated.context, TransactionContext.NO_TRANSACTION)) {
+                List<DataAccessor> tuples = scan1.consume();
+                assertEquals(3, tuples.size());
+                assertEquals(RawString.of("early"), tuples.get(0).get("name"));
+                assertEquals(RawString.of("mid"), tuples.get(1).get("name"));
+                assertEquals(RawString.of("late"), tuples.get(2).get("name"));
+            }
+        }
+    }
+
+    @Test
+    public void scanByCompositePKContainingInteger() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+
+        String nodeId = "localhost";
+        try (DBManager manager = new DBManager("localhost", new MemoryMetadataStorageManager(),
+                new FileDataStorageManager(dataPath), new MemoryCommitLogManager(), null, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement("tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            Table table = Table
+                    .builder()
+                    .tablespace("tblspace1")
+                    .name("t1")
+                    .column("n1", ColumnTypes.INTEGER)
+                    .column("id", ColumnTypes.STRING)
+                    .column("name", ColumnTypes.STRING)
+                    .primaryKey("n1")
+                    .primaryKey("id")
+                    .build();
+
+            CreateTableStatement st2 = new CreateTableStatement(table);
+            manager.executeStatement(st2, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(n1,id,name) values(-5,'a','minus5_a')", Collections.emptyList());
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(n1,id,name) values(-5,'b','minus5_b')", Collections.emptyList());
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(n1,id,name) values(0,'a','zero_a')", Collections.emptyList());
+            TestUtils.executeUpdate(manager, "INSERT INTO tblspace1.t1(n1,id,name) values(7,'a','seven_a')", Collections.emptyList());
+
+            // composite PK does not advertise sorted ascending
+            assertFalse(manager.getTableSpaceManager("tblspace1").getTableManager("t1").isKeyToPageSortedAscending());
+
+            // point lookup must round-trip the negative-int component correctly
+            TranslatedQuery translated = manager.getPlanner().translate(TableSpace.DEFAULT,
+                    "SELECT name FROM tblspace1.t1 WHERE n1=-5 AND id='b'",
+                    Collections.emptyList(), true, true, false, -1);
+            ScanStatement scan = translated.plan.mainStatement.unwrap(ScanStatement.class);
+            try (DataScanner scan1 = manager.scan(scan, translated.context, TransactionContext.NO_TRANSACTION)) {
+                List<DataAccessor> tuples = scan1.consume();
+                assertEquals(1, tuples.size());
+                assertEquals(RawString.of("minus5_b"), tuples.get(0).get("name"));
+            }
+
+            // prefix scan on the leading int component must return all matching rows
+            TranslatedQuery translatedPrefix = manager.getPlanner().translate(TableSpace.DEFAULT,
+                    "SELECT id FROM tblspace1.t1 WHERE n1=-5",
+                    Collections.emptyList(), true, true, false, -1);
+            ScanStatement scanPrefix = translatedPrefix.plan.mainStatement.unwrap(ScanStatement.class);
+            try (DataScanner scan1 = manager.scan(scanPrefix, translatedPrefix.context, TransactionContext.NO_TRANSACTION)) {
+                assertEquals(2, scan1.consume().size());
             }
         }
     }

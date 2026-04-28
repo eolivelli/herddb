@@ -22,7 +22,9 @@ package herddb.utils;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import java.nio.charset.StandardCharsets;
+import java.util.Random;
 import org.junit.Test;
 
 /**
@@ -132,6 +134,103 @@ public class BytesTest {
 
         assertEquals(bytes.getLength(), next.getLength());
 
+    }
+
+    @Test
+    public void testIntRoundTrip() {
+        for (int v : new int[] {Integer.MIN_VALUE, Integer.MIN_VALUE + 1, -1_000_000, -1, 0, 1, 1_000_000,
+                Integer.MAX_VALUE - 1, Integer.MAX_VALUE}) {
+            assertEquals(v, Bytes.toInt(Bytes.intToByteArray(v), 0));
+            assertEquals(v, Bytes.from_int(v).to_int());
+        }
+    }
+
+    @Test
+    public void testLongRoundTrip() {
+        for (long v : new long[] {Long.MIN_VALUE, Long.MIN_VALUE + 1, -1_000_000_000_000L, -1L, 0L, 1L,
+                1_000_000_000_000L, Long.MAX_VALUE - 1, Long.MAX_VALUE}) {
+            assertEquals(v, Bytes.toLong(Bytes.longToByteArray(v), 0));
+            assertEquals(v, Bytes.from_long(v).to_long());
+        }
+    }
+
+    /**
+     * After {@link Bytes#intToByteArray(int)} the unsigned-lex byte order matches signed numeric
+     * order, so the BLink primary-key index naturally sorts INTEGER PKs.
+     */
+    @Test
+    public void testIntOrderPreservation() {
+        int[] curated = {Integer.MIN_VALUE, Integer.MIN_VALUE + 1, -1_000_000, -2, -1, 0, 1, 2, 1_000_000,
+                Integer.MAX_VALUE - 1, Integer.MAX_VALUE};
+        for (int i = 0; i < curated.length; i++) {
+            for (int j = 0; j < curated.length; j++) {
+                assertOrderMatches(curated[i], curated[j]);
+            }
+        }
+        Random rng = new Random(0xC0FFEE);
+        for (int n = 0; n < 1000; n++) {
+            assertOrderMatches(rng.nextInt(), rng.nextInt());
+        }
+    }
+
+    /**
+     * After {@link Bytes#longToByteArray(long)} unsigned-lex byte order matches signed numeric order.
+     */
+    @Test
+    public void testLongOrderPreservation() {
+        long[] curated = {Long.MIN_VALUE, Long.MIN_VALUE + 1, -1_000_000_000_000L, -2L, -1L, 0L, 1L, 2L,
+                1_000_000_000_000L, Long.MAX_VALUE - 1, Long.MAX_VALUE};
+        for (int i = 0; i < curated.length; i++) {
+            for (int j = 0; j < curated.length; j++) {
+                assertOrderMatches(curated[i], curated[j]);
+            }
+        }
+        Random rng = new Random(0xCAFE);
+        for (int n = 0; n < 1000; n++) {
+            assertOrderMatches(rng.nextLong(), rng.nextLong());
+        }
+    }
+
+    /**
+     * Doubles must keep the IEEE-754 bit pattern intact (not order-preserving — that's by design,
+     * see {@link Bytes#putDouble(byte[], int, double)} delegating to putRawLong).
+     */
+    @Test
+    public void testDoubleRoundTripStaysRaw() {
+        for (double v : new double[] {Double.NEGATIVE_INFINITY, -Math.PI, -1.0, -0.0, 0.0, 1.0, Math.PI,
+                Double.POSITIVE_INFINITY, Double.MAX_VALUE, Double.MIN_VALUE}) {
+            byte[] bytes = Bytes.doubleToByteArray(v);
+            assertEquals(8, bytes.length);
+            assertEquals(Double.doubleToRawLongBits(v), Bytes.toRawLong(bytes, 0));
+            assertEquals(Double.compare(v, v), Double.compare(Bytes.toDouble(bytes, 0), v));
+        }
+    }
+
+    /**
+     * Floats must keep the IEEE-754 bit pattern intact too.
+     */
+    @Test
+    public void testFloatArrayRoundTripStaysRaw() {
+        float[] in = {Float.NEGATIVE_INFINITY, -1.0f, -0.0f, 0.0f, 1.0f, Float.POSITIVE_INFINITY};
+        float[] out = Bytes.from_float_array(in).to_float_array();
+        assertEquals(in.length, out.length);
+        for (int i = 0; i < in.length; i++) {
+            assertEquals(Float.floatToRawIntBits(in[i]), Float.floatToRawIntBits(out[i]));
+        }
+    }
+
+    private static void assertOrderMatches(int a, int b) {
+        int signed = Integer.compare(a, b);
+        int lex = CompareBytesUtils.compare(Bytes.intToByteArray(a), Bytes.intToByteArray(b));
+        assertTrue("a=" + a + " b=" + b + " signed=" + signed + " lex=" + lex,
+                Integer.signum(signed) == Integer.signum(lex));
+    }
+
+    private static void assertOrderMatches(long a, long b) {
+        int signed = Long.compare(a, b);
+        int lex = CompareBytesUtils.compare(Bytes.longToByteArray(a), Bytes.longToByteArray(b));
+        assertTrue("a=" + a + " b=" + b + " signed=" + signed + " lex=" + lex,
+                Integer.signum(signed) == Integer.signum(lex));
     }
 
 }

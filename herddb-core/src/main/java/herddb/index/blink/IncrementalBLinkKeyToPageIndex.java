@@ -236,6 +236,15 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
             case ColumnTypes.NOTNULL_STRING:
             case ColumnTypes.STRING:
             case ColumnTypes.BYTEARRAY:
+            case ColumnTypes.INTEGER:
+            case ColumnTypes.NOTNULL_INTEGER:
+            case ColumnTypes.LONG:
+            case ColumnTypes.NOTNULL_LONG:
+            case ColumnTypes.TIMESTAMP:
+            case ColumnTypes.NOTNULL_TIMESTAMP:
+                // Bytes encodes int/long/timestamp with a sign-bit flip
+                // (herddb.utils.Bytes#putInt / #putLong), so unsigned-lex byte
+                // comparison matches signed numeric order.
                 return true;
             default:
                 return false;

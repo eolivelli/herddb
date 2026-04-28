@@ -42,6 +42,17 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     private static final boolean BIG_ENDIAN_NATIVE_ORDER = ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN;
 
     /**
+     * Sign-bit XOR masks used by {@link #putInt}/{@link #putLong}/{@link #toInt}/{@link #toLong}
+     * to produce an order-preserving big-endian encoding: unsigned-lex byte comparison on the
+     * encoded bytes matches signed numeric order, so int/long primary keys naturally sort.
+     * Encoders and decoders both flip the sign bit, so Java values round-trip identically.
+     * The IEEE-754 bit transport for float/double goes through the raw variants
+     * ({@link #putRawInt}/{@link #putRawLong}/{@link #toRawInt}/{@link #toRawLong}) and is unaffected.
+     */
+    private static final int INT_SIGN_FLIP_MASK = 0x80000000;
+    private static final long LONG_SIGN_FLIP_MASK = 0x8000000000000000L;
+
+    /**
      * Estimated size of a Bytes instance (excluding the data array contents).
      * <p>
      * With compressed oops (heap &lt; 32GB):
@@ -92,7 +103,7 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
 
     public static byte[] doubleToByteArray(double value) {
         byte[] res = new byte[8];
-        putLong(res, 0, Double.doubleToLongBits(value));
+        putRawLong(res, 0, Double.doubleToLongBits(value));
         return res;
     }
 
@@ -178,7 +189,7 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         byte[] res = new byte[length * 4];
         int offset = 0;
         for (float f : floatArray) {
-            putInt(res, offset, Float.floatToRawIntBits(f));
+            putRawInt(res, offset, Float.floatToRawIntBits(f));
             offset += 4;
         }
         return new Bytes(res);
@@ -202,7 +213,7 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
 
     public static Bytes from_double(double value) {
         byte[] res = new byte[8];
-        putDouble(res, 0, value);
+        putRawLong(res, 0, Double.doubleToRawLongBits(value));
         return new Bytes(res);
     }
 
@@ -288,7 +299,27 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         }
     }
 
+    /**
+     * Encodes {@code value} as 8 order-preserving big-endian bytes (sign bit flipped),
+     * so unsigned-lex comparison on the resulting bytes matches signed numeric order.
+     */
     public static void putLong(byte[] array, int index, long value) {
+        putRawLong(array, index, value ^ LONG_SIGN_FLIP_MASK);
+    }
+
+    /**
+     * Encodes {@code value} as 4 order-preserving big-endian bytes (sign bit flipped),
+     * so unsigned-lex comparison on the resulting bytes matches signed numeric order.
+     */
+    public static void putInt(byte[] array, int index, int value) {
+        putRawInt(array, index, value ^ INT_SIGN_FLIP_MASK);
+    }
+
+    /**
+     * Writes {@code value} as 8 plain big-endian bytes. Used for IEEE-754 bit
+     * transport (double); not order-preserving.
+     */
+    public static void putRawLong(byte[] array, int index, long value) {
         if (HAS_UNSAFE && UNALIGNED) {
             PlatformDependent.putLong(array, index, BIG_ENDIAN_NATIVE_ORDER ? value : Long.reverseBytes(value));
         } else {
@@ -303,7 +334,11 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         }
     }
 
-    public static void putInt(byte[] array, int index, int value) {
+    /**
+     * Writes {@code value} as 4 plain big-endian bytes. Used for IEEE-754 bit
+     * transport (float); not order-preserving.
+     */
+    public static void putRawInt(byte[] array, int index, int value) {
         if (HAS_UNSAFE && UNALIGNED) {
             PlatformDependent.putInt(array, index, BIG_ENDIAN_NATIVE_ORDER ? value : Integer.reverseBytes(value));
         } else {
@@ -323,10 +358,22 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     public static void putDouble(byte[] bytes, int offset, double val) {
-        putLong(bytes, offset, Double.doubleToRawLongBits(val));
+        putRawLong(bytes, offset, Double.doubleToRawLongBits(val));
     }
 
+    /**
+     * Decodes 8 order-preserving big-endian bytes (written by {@link #putLong})
+     * back to a {@code long}.
+     */
     public static long toLong(byte[] array, int index) {
+        return toRawLong(array, index) ^ LONG_SIGN_FLIP_MASK;
+    }
+
+    /**
+     * Reads 8 plain big-endian bytes. Used for IEEE-754 bit transport (double);
+     * pairs with {@link #putRawLong}.
+     */
+    public static long toRawLong(byte[] array, int index) {
         if (HAS_UNSAFE && UNALIGNED) {
             long v = PlatformDependent.getLong(array, index);
             return BIG_ENDIAN_NATIVE_ORDER ? v : Long.reverseBytes(v);
@@ -365,7 +412,19 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         return Long.compare(toLong(array, index), value);
     }
 
+    /**
+     * Decodes 4 order-preserving big-endian bytes (written by {@link #putInt})
+     * back to an {@code int}.
+     */
     public static int toInt(byte[] array, int index) {
+        return toRawInt(array, index) ^ INT_SIGN_FLIP_MASK;
+    }
+
+    /**
+     * Reads 4 plain big-endian bytes. Used for IEEE-754 bit transport (float);
+     * pairs with {@link #putRawInt}.
+     */
+    public static int toRawInt(byte[] array, int index) {
         if (HAS_UNSAFE && UNALIGNED) {
             int v = PlatformDependent.getInt(array, index);
             return BIG_ENDIAN_NATIVE_ORDER ? v : Integer.reverseBytes(v);
@@ -393,7 +452,7 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     public static double toDouble(byte[] bytes, int offset) {
-        return Double.longBitsToDouble(toLong(bytes, offset));
+        return Double.longBitsToDouble(toRawLong(bytes, offset));
     }
 
     public static int compare(byte[] left, byte[] right) {
