@@ -558,6 +558,211 @@ public class RebalanceChangesRoutingTest {
         }
     }
 
+    /**
+     * Restart-after-rebalance: a fresh engine recovers the cluster's
+     * post-REBALANCE numInstances from log replay alone. Production behavior
+     * mirrors this — at startup the engine sets {@code tailerStart =
+     * START_OF_TIME} (see {@link IndexingServiceEngine#start()}) and the
+     * tailer feeds every entry, including the REBALANCE entries, through
+     * {@link IndexingServiceEngine#processEntryForTest} (here we drive the
+     * same code path manually). After replay the engine's
+     * {@code currentNumInstances} must reflect the most recent REBALANCE.
+     */
+    @Test
+    public void engineRecoversCurrentNumInstancesFromLogReplay() throws Exception {
+        Path logDir = folder.newFolder("rr-log").toPath();
+        Path dataDir = folder.newFolder("rr-data").toPath();
+
+        // Phase 1: fresh engine, apply DDL + insert + REBALANCE + insert
+        // through the full processEntry pipeline.
+        Table t = table();
+        Index ix = index(8);
+        java.util.List<herddb.log.LogEntry> persistedLog = new java.util.ArrayList<>();
+        java.util.List<LogSequenceNumber> persistedLsn = new java.util.ArrayList<>();
+
+        try (EmbeddedIndexingService svc = new EmbeddedIndexingService(logDir, dataDir, 0, 2)) {
+            svc.start();
+            IndexingServiceEngine engine = svc.getEngine();
+            assertEquals(2, engine.getCurrentNumInstances());
+
+            recordAndProcess(engine, persistedLog, persistedLsn,
+                    new LogSequenceNumber(1, 1),
+                    LogEntryFactory.createTable(t, null));
+            recordAndProcess(engine, persistedLog, persistedLsn,
+                    new LogSequenceNumber(1, 2),
+                    LogEntryFactory.createIndex(ix, null));
+            for (int i = 0; i < 50; i++) {
+                Record rec = RecordSerializer.makeRecord(t, "pk", "k" + i,
+                        "vec", new float[]{i, i, i});
+                recordAndProcess(engine, persistedLog, persistedLsn,
+                        new LogSequenceNumber(1, 100 + i),
+                        LogEntryFactory.insert(t, rec.key, rec.value, null));
+            }
+            IndexingServiceRebalanceDescriptor d = new IndexingServiceRebalanceDescriptor(
+                    System.currentTimeMillis(), 4,
+                    Collections.singletonList(t),
+                    Collections.singletonList(ix));
+            recordAndProcess(engine, persistedLog, persistedLsn,
+                    new LogSequenceNumber(1, 1000),
+                    LogEntryFactory.indexingServiceRebalance(d));
+            for (int i = 50; i < 100; i++) {
+                Record rec = RecordSerializer.makeRecord(t, "pk", "k" + i,
+                        "vec", new float[]{i, i, i});
+                recordAndProcess(engine, persistedLog, persistedLsn,
+                        new LogSequenceNumber(1, 2000 + i),
+                        LogEntryFactory.insert(t, rec.key, rec.value, null));
+            }
+            engine.awaitPendingWorkForTest();
+            assertEquals(4, engine.getCurrentNumInstances());
+        }
+
+        // Phase 2: simulate restart — fresh engine, fresh data dir, replay
+        // the SAME log entries from START_OF_TIME (the production restart
+        // path). The engine starts at its bootstrap value (2) and must
+        // converge to 4 by the time it has processed every entry.
+        Path logDir2 = folder.newFolder("rr-log-restart").toPath();
+        Path dataDir2 = folder.newFolder("rr-data-restart").toPath();
+        try (EmbeddedIndexingService svc = new EmbeddedIndexingService(
+                logDir2, dataDir2, 0, 2)) {
+            svc.start();
+            IndexingServiceEngine engine = svc.getEngine();
+            assertEquals("fresh engine starts at the JVM-property bootstrap value",
+                    2, engine.getCurrentNumInstances());
+
+            for (int i = 0; i < persistedLog.size(); i++) {
+                engine.processEntryForTest(persistedLsn.get(i), persistedLog.get(i));
+            }
+            engine.awaitPendingWorkForTest();
+            assertEquals("after log replay the engine must observe the REBALANCE "
+                    + "entry and update currentNumInstances to 4",
+                    4, engine.getCurrentNumInstances());
+            // Schema was rebuilt and vector store exists
+            assertNotNull(engine.getLastObservedRebalance());
+        }
+    }
+
+    private void recordAndProcess(IndexingServiceEngine engine,
+                                   java.util.List<herddb.log.LogEntry> log,
+                                   java.util.List<LogSequenceNumber> lsns,
+                                   LogSequenceNumber lsn, herddb.log.LogEntry entry) {
+        log.add(entry);
+        lsns.add(lsn);
+        engine.processEntryForTest(lsn, entry);
+    }
+
+    /**
+     * The watermark store persists {@code numInstances} alongside the LSN at
+     * every successful checkpoint. After a restart, the engine reads the
+     * snapshot and recovers the post-rebalance routing value EVEN IF the
+     * BookKeeper history that carried the REBALANCE entry has been trimmed
+     * in the meantime.
+     */
+    @Test
+    public void watermarkSnapshotPersistsAndRestoresNumInstances() throws Exception {
+        // Use an in-memory watermark store shared between the two engine
+        // instances so we can simulate a restart with a trimmed log.
+        java.util.concurrent.atomic.AtomicReference<WatermarkSnapshot> persisted =
+                new java.util.concurrent.atomic.AtomicReference<>(WatermarkSnapshot.START_OF_TIME);
+        WatermarkStore sharedStore = new WatermarkStore() {
+            @Override
+            public WatermarkSnapshot load() {
+                return persisted.get();
+            }
+
+            @Override
+            public void save(WatermarkSnapshot snapshot) {
+                persisted.set(snapshot);
+            }
+        };
+
+        Path logDir = folder.newFolder("ws-log").toPath();
+        Path dataDir = folder.newFolder("ws-data").toPath();
+        Table t = table();
+        Index ix = index(8);
+
+        // Phase 1: engine ingests, REBALANCE arrives, checkpoint persists
+        // numInstances=4 alongside the watermark LSN.
+        try (EmbeddedIndexingService svc = new EmbeddedIndexingService(logDir, dataDir, 0, 2)) {
+            svc.setWatermarkStore(sharedStore);
+            svc.start();
+            IndexingServiceEngine engine = svc.getEngine();
+
+            engine.applyEntry(new LogSequenceNumber(1, 1),
+                    LogEntryFactory.createTable(t, null));
+            engine.applyEntry(new LogSequenceNumber(1, 2),
+                    LogEntryFactory.createIndex(ix, null));
+            for (int i = 0; i < 32; i++) {
+                Record rec = RecordSerializer.makeRecord(t, "pk", "k" + i,
+                        "vec", new float[]{i, i, i});
+                engine.applySingleEntryForTest(new LogSequenceNumber(1, 100 + i),
+                        LogEntryFactory.insert(t, rec.key, rec.value, null));
+            }
+            IndexingServiceRebalanceDescriptor d = new IndexingServiceRebalanceDescriptor(
+                    System.currentTimeMillis(), 4,
+                    Collections.singletonList(t),
+                    Collections.singletonList(ix));
+            engine.applySingleEntryForTest(new LogSequenceNumber(1, 1000),
+                    LogEntryFactory.indexingServiceRebalance(d));
+            engine.awaitPendingWorkForTest();
+            assertEquals(4, engine.getCurrentNumInstances());
+
+            engine.setLastProcessedLsnForTest(new LogSequenceNumber(1, 1100));
+            engine.forceCheckpointAndSaveWatermark();
+
+            WatermarkSnapshot saved = persisted.get();
+            assertNotNull(saved);
+            assertEquals("checkpoint must persist the post-rebalance numInstances",
+                    4, saved.numInstances);
+            assertEquals(1L, saved.lsn.ledgerId);
+        }
+
+        // Phase 2: simulate restart with the BK history TRIMMED — fresh data
+        // dir, fresh log dir (empty), but the persisted watermark snapshot
+        // survives. The engine's bootstrap numInstances is 2; without the
+        // snapshot it would stay at 2 forever (no REBALANCE in the trimmed
+        // log to fix it). With the snapshot, the engine recovers
+        // currentNumInstances=4 directly from the watermark store.
+        Path dataDir2 = folder.newFolder("ws-data-restart").toPath();
+        Path logDir2 = folder.newFolder("ws-log-restart").toPath();
+        try (EmbeddedIndexingService svc = new EmbeddedIndexingService(logDir2, dataDir2, 0, 2)) {
+            svc.setWatermarkStore(sharedStore);
+            svc.start();
+            assertEquals("engine must recover the post-rebalance numInstances "
+                    + "from the watermark store, even with no REBALANCE entry "
+                    + "available in the (trimmed) log",
+                    4, svc.getEngine().getCurrentNumInstances());
+        }
+    }
+
+    /**
+     * Backward compat with the {@code numInstances=0} sentinel: a snapshot
+     * loaded with {@code numInstances=0} (e.g. a freshly-started engine that
+     * has never been rebalanced) leaves the bootstrap value untouched.
+     */
+    @Test
+    public void watermarkSnapshotZeroNumInstancesKeepsBootstrap() throws Exception {
+        WatermarkStore zeroStore = new WatermarkStore() {
+            @Override
+            public WatermarkSnapshot load() {
+                return new WatermarkSnapshot(new LogSequenceNumber(1, 5), 0);
+            }
+
+            @Override
+            public void save(WatermarkSnapshot snapshot) {
+                // no-op
+            }
+        };
+        Path logDir = folder.newFolder("ws-zero-log").toPath();
+        Path dataDir = folder.newFolder("ws-zero-data").toPath();
+        try (EmbeddedIndexingService svc = new EmbeddedIndexingService(logDir, dataDir, 0, 3)) {
+            svc.setWatermarkStore(zeroStore);
+            svc.start();
+            assertEquals("engine must keep the JVM bootstrap value when the "
+                    + "watermark snapshot has numInstances=0",
+                    3, svc.getEngine().getCurrentNumInstances());
+        }
+    }
+
     private void processAll(java.util.List<EmbeddedIndexingService> services,
                              LogSequenceNumber lsn, herddb.log.LogEntry entry) {
         for (EmbeddedIndexingService s : services) {

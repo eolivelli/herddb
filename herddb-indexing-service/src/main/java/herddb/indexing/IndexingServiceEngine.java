@@ -706,14 +706,30 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             return;
         }
 
-        // Load the watermark now that the watermark store has been configured
-        // for this tablespace UUID.
+        // Load the watermark snapshot now that the watermark store has been
+        // configured for this tablespace UUID. The snapshot bundles the
+        // last-applied LSN AND the engine's effective numInstances at the
+        // time of the matching checkpoint — so a freshly-restarted engine
+        // re-acquires the correct routing value even if the BookKeeper
+        // ledger that carried the most recent INDEXING_SERVICE_REBALANCE
+        // entry has been trimmed in the meantime.
         if (watermarkStore == null) {
             watermarkStore = new LocalWatermarkStore(dataDirectory);
         }
-        LogSequenceNumber watermark = watermarkStore.load();
+        WatermarkSnapshot snapshot = watermarkStore.load();
+        LogSequenceNumber watermark = snapshot.lsn;
         lastProcessedLsn = watermark;
-        LOGGER.log(Level.INFO, "Loaded watermark: {0}", watermark);
+        if (snapshot.numInstances > 0) {
+            int previous = currentNumInstances;
+            currentNumInstances = snapshot.numInstances;
+            LOGGER.log(Level.INFO,
+                    "Loaded watermark snapshot: {0}; currentNumInstances {1} -> {2}",
+                    new Object[]{snapshot, previous, currentNumInstances});
+        } else {
+            LOGGER.log(Level.INFO,
+                    "Loaded watermark snapshot: {0}; keeping bootstrap currentNumInstances={1}",
+                    new Object[]{snapshot, currentNumInstances});
+        }
 
         // JOINING fallback: a freshly added pod whose history was trimmed
         // (or which has no local state at all) bootstraps schema from the
@@ -1481,10 +1497,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 }
             }
             // Only now — all stores have durably persisted state covering
-            // checkpointLsn — is it safe to publish the watermark.
+            // checkpointLsn — is it safe to publish the watermark snapshot.
+            // We capture the engine's current numInstances together with the
+            // LSN so a future restart re-acquires the right routing value
+            // even if the BookKeeper history that carried the most recent
+            // INDEXING_SERVICE_REBALANCE entry has been trimmed by then.
+            WatermarkSnapshot snapshotToSave =
+                    new WatermarkSnapshot(checkpointLsn, currentNumInstances);
             try {
-                watermarkStore.save(checkpointLsn);
-                LOGGER.log(Level.FINE, "Saved watermark at {0}", checkpointLsn);
+                watermarkStore.save(snapshotToSave);
+                LOGGER.log(Level.FINE, "Saved watermark snapshot {0}", snapshotToSave);
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to save watermark", e);
             }

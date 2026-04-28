@@ -24,30 +24,40 @@ import herddb.log.LogSequenceNumber;
 import java.io.IOException;
 
 /**
- * Persists the last processed {@link LogSequenceNumber} — the "watermark" — so that
- * the indexing service can resume commit-log tailing from the correct position after a
- * restart.
+ * Persists the durable indexing-service checkpoint state — the last processed
+ * {@link LogSequenceNumber} (the "watermark") and the engine's effective
+ * {@code numInstances} at the time of the checkpoint — so that the
+ * indexing service can resume correctly after a restart.
  *
- * <p><b>Save contract</b>: implementations must be called ONLY after a successful
- * {@code indexCheckpoint} (i.e. after all index pages and IndexStatus markers have
- * been durably persisted for the LSN being saved). Saving an LSN that is not yet
- * covered by a completed checkpoint would mean, on restart with a wiped disk, that
- * the service would skip replaying entries it never actually persisted.
+ * <p>Persisting {@code numInstances} alongside the watermark makes recovery
+ * robust against BookKeeper history trimming: even if the ledger that
+ * carried the most recent {@code INDEXING_SERVICE_REBALANCE} entry is gone
+ * by the time the engine restarts, the engine re-acquires the correct
+ * routing value from the watermark file (it was captured at the same
+ * checkpoint LSN that the watermark refers to).
+ *
+ * <p><b>Save contract</b>: implementations must be called ONLY after a
+ * successful {@code indexCheckpoint} (i.e. after all index pages and
+ * IndexStatus markers have been durably persisted for the LSN being
+ * saved). Saving an LSN that is not yet covered by a completed checkpoint
+ * would mean, on restart with a wiped disk, that the service would skip
+ * replaying entries it never actually persisted.
  *
  * @author enrico.olivelli
  */
 public interface WatermarkStore {
 
     /**
-     * Loads the last saved watermark.
+     * Loads the last saved watermark snapshot.
      *
-     * @return the saved LSN, or {@link LogSequenceNumber#START_OF_TIME} if no watermark exists
+     * @return the saved snapshot, or {@link WatermarkSnapshot#START_OF_TIME}
+     *         if no watermark exists
      */
-    LogSequenceNumber load() throws IOException;
+    WatermarkSnapshot load() throws IOException;
 
     /**
-     * Saves the watermark atomically. Must be called only after the matching checkpoint
-     * has been fully published.
+     * Saves the snapshot atomically. Must be called only after the matching
+     * checkpoint has been fully published.
      */
-    void save(LogSequenceNumber lsn) throws IOException;
+    void save(WatermarkSnapshot snapshot) throws IOException;
 }

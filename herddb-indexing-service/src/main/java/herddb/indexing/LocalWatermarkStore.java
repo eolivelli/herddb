@@ -36,6 +36,9 @@ import java.util.logging.Logger;
  * {@link WatermarkStore} that keeps the watermark on the local filesystem under
  * {@code {dataDir}/watermark.dat}. Uses atomic write (tmp file + rename) for crash safety.
  *
+ * <p>File format: {@code byte version=1 | long ledgerId | long offset |
+ * int numInstances}.
+ *
  * <p>Suitable for deployments where the indexing service has a persistent local volume.
  * For ephemeral Kubernetes pods use {@link S3WatermarkStore} instead.
  *
@@ -46,6 +49,7 @@ public class LocalWatermarkStore implements WatermarkStore {
     private static final Logger LOGGER = Logger.getLogger(LocalWatermarkStore.class.getName());
     private static final String WATERMARK_FILE = "watermark.dat";
     private static final String WATERMARK_TMP_FILE = "watermark.dat.tmp";
+    private static final byte FORMAT_VERSION = 1;
 
     private final Path dataDirectory;
 
@@ -54,33 +58,42 @@ public class LocalWatermarkStore implements WatermarkStore {
     }
 
     @Override
-    public LogSequenceNumber load() throws IOException {
+    public WatermarkSnapshot load() throws IOException {
         Path watermarkFile = dataDirectory.resolve(WATERMARK_FILE);
         if (!Files.exists(watermarkFile)) {
             LOGGER.info("No watermark file found at " + watermarkFile + ", starting from beginning");
-            return LogSequenceNumber.START_OF_TIME;
+            return WatermarkSnapshot.START_OF_TIME;
         }
         try (InputStream fis = Files.newInputStream(watermarkFile);
-             DataInputStream dis = new DataInputStream(fis)) {
+                DataInputStream dis = new DataInputStream(fis)) {
+            byte version = dis.readByte();
+            if (version != FORMAT_VERSION) {
+                throw new IOException("watermark file " + watermarkFile
+                        + " has unsupported version " + version);
+            }
             long ledgerId = dis.readLong();
             long offset = dis.readLong();
-            LogSequenceNumber lsn = new LogSequenceNumber(ledgerId, offset);
-            LOGGER.info("Loaded watermark: " + lsn);
-            return lsn;
+            int numInstances = dis.readInt();
+            WatermarkSnapshot snapshot = new WatermarkSnapshot(
+                    new LogSequenceNumber(ledgerId, offset), numInstances);
+            LOGGER.info("Loaded watermark: " + snapshot);
+            return snapshot;
         }
     }
 
     @Override
-    public void save(LogSequenceNumber lsn) throws IOException {
+    public void save(WatermarkSnapshot snapshot) throws IOException {
         Files.createDirectories(dataDirectory);
         Path tmpFile = dataDirectory.resolve(WATERMARK_TMP_FILE);
         Path watermarkFile = dataDirectory.resolve(WATERMARK_FILE);
         try (OutputStream fos = Files.newOutputStream(tmpFile);
-             DataOutputStream dos = new DataOutputStream(fos)) {
-            dos.writeLong(lsn.ledgerId);
-            dos.writeLong(lsn.offset);
+                DataOutputStream dos = new DataOutputStream(fos)) {
+            dos.writeByte(FORMAT_VERSION);
+            dos.writeLong(snapshot.lsn.ledgerId);
+            dos.writeLong(snapshot.lsn.offset);
+            dos.writeInt(snapshot.numInstances);
         }
         Files.move(tmpFile, watermarkFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        LOGGER.log(Level.FINE, "Saved watermark: {0}", lsn);
+        LOGGER.log(Level.FINE, "Saved watermark: {0}", snapshot);
     }
 }

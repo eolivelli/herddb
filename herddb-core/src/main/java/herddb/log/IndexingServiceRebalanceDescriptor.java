@@ -35,8 +35,8 @@ import java.util.List;
 /**
  * Payload of an {@link LogEntryType#INDEXING_SERVICE_REBALANCE} log entry.
  *
- * <p>Carries the new {@code defaultIndexingNumInstances} for the tablespace
- * along with a snapshot of every {@link Table} and vector {@link Index}
+ * <p>Carries the new effective {@code numInstances} for every indexing-service
+ * replica along with a snapshot of every {@link Table} and vector {@link Index}
  * present on the leader at write time. The schema snapshot is intended for
  * indexing-service replicas that boot when the BookKeeper history has been
  * trimmed and cannot replay {@code CREATE_TABLE} / {@code CREATE_INDEX}

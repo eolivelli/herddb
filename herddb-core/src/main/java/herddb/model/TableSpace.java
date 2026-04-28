@@ -68,28 +68,9 @@ public class TableSpace {
 
     public final long metadataStorageCreationTime;
 
-    /**
-     * Number of indexing-service primary instances the cluster is currently
-     * sized for. The {@code EXECUTE INDEXING_SERVICE_REBALANCE N} SQL command
-     * updates this field and writes a {@code INDEXING_SERVICE_REBALANCE} log
-     * entry that tells every indexing-service replica to switch its routing
-     * to the new value. Existing on-disk vector data is NOT moved by a
-     * rebalance — it stays on its original owner — but every subsequent
-     * INSERT/UPDATE/DELETE is routed by the new value, so a freshly-added
-     * pod immediately starts owning a share of new writes against EVERY
-     * existing vector index.
-     *
-     * <p>Defaults to {@value #DEFAULT_INDEXING_NUM_INSTANCES_DEFAULT}; older
-     * serialized payloads (version 1) deserialise to the default.
-     */
-    public final int defaultIndexingNumInstances;
-
-    public static final int DEFAULT_INDEXING_NUM_INSTANCES_DEFAULT = 1;
-
     private TableSpace(
             String uuid, String name, String leaderId, Set<String> replicas, int expectedReplicaCount,
-            long maxLeaderInactivityTime, int defaultIndexingNumInstances,
-            Object metadataStorageVersion, long metadataStorageCreationTime
+            long maxLeaderInactivityTime, Object metadataStorageVersion, long metadataStorageCreationTime
     ) {
         this.name = name;
         this.uuid = uuid;
@@ -98,7 +79,6 @@ public class TableSpace {
         this.expectedReplicaCount = expectedReplicaCount;
         this.metadataStorageVersion = metadataStorageVersion;
         this.maxLeaderInactivityTime = maxLeaderInactivityTime;
-        this.defaultIndexingNumInstances = defaultIndexingNumInstances;
         this.metadataStorageCreationTime = metadataStorageCreationTime;
     }
 
@@ -117,7 +97,7 @@ public class TableSpace {
     public static TableSpace deserialize(ExtendedDataInputStream in, Object metadataStorageVersion, long metadataStorageCreationTime) throws IOException {
         long version = in.readVLong(); // version
         long flags = in.readVLong(); // flags for future implementations
-        if ((version != 1 && version != 2) || flags != 0) {
+        if (version != 1 || flags != 0) {
             throw new IOException("corrupted tablespace file");
         }
         String uuid = in.readUTF();
@@ -130,16 +110,7 @@ public class TableSpace {
             replicas.add(in.readUTF());
         }
         long maxLeaderInactivityTime = in.readVLong();
-        // Version 2 added defaultIndexingNumInstances. Version-1 payloads
-        // produced by pre-feature nodes deserialise to the default so a
-        // post-feature node can read them without further coordination.
-        int defaultIndexingNumInstances = DEFAULT_INDEXING_NUM_INSTANCES_DEFAULT;
-        if (version >= 2) {
-            defaultIndexingNumInstances = in.readVInt();
-        }
-        return new TableSpace(uuid, name, leaderId, replicas, expectedReplicaCount,
-                maxLeaderInactivityTime, defaultIndexingNumInstances,
-                metadataStorageVersion, metadataStorageCreationTime);
+        return new TableSpace(uuid, name, leaderId, replicas, expectedReplicaCount, maxLeaderInactivityTime, metadataStorageVersion, metadataStorageCreationTime);
     }
 
     public byte[] serialize() throws IOException {
@@ -151,7 +122,7 @@ public class TableSpace {
     }
 
     public void serialize(ExtendedDataOutputStream out) throws IOException {
-        out.writeVLong(2); // version (was 1; bumped to 2 to carry defaultIndexingNumInstances)
+        out.writeVLong(1); // version
         out.writeVLong(0); // flags for future implementations
         out.writeUTF(uuid);
         out.writeUTF(name);
@@ -162,7 +133,6 @@ public class TableSpace {
             out.writeUTF(replica);
         }
         out.writeVLong(maxLeaderInactivityTime);
-        out.writeVInt(defaultIndexingNumInstances);
     }
 
     public static class Builder {
@@ -173,7 +143,6 @@ public class TableSpace {
         private String leaderId;
         private int expectedReplicaCount = 1;
         private long maxLeaderInactivityTime = 0;
-        private int defaultIndexingNumInstances = DEFAULT_INDEXING_NUM_INSTANCES_DEFAULT;
 
         private Builder() {
         }
@@ -186,7 +155,6 @@ public class TableSpace {
             this.leaderId = tableSpace.leaderId;
             this.expectedReplicaCount = tableSpace.expectedReplicaCount;
             this.maxLeaderInactivityTime = tableSpace.maxLeaderInactivityTime;
-            this.defaultIndexingNumInstances = tableSpace.defaultIndexingNumInstances;
             return this;
         }
 
@@ -207,11 +175,6 @@ public class TableSpace {
 
         public Builder maxLeaderInactivityTime(long maxLeaderInactivityTime) {
             this.maxLeaderInactivityTime = maxLeaderInactivityTime;
-            return this;
-        }
-
-        public Builder defaultIndexingNumInstances(int defaultIndexingNumInstances) {
-            this.defaultIndexingNumInstances = defaultIndexingNumInstances;
             return this;
         }
 
@@ -256,17 +219,14 @@ public class TableSpace {
             if (maxLeaderInactivityTime > 0 && maxLeaderInactivityTime < 5000) {
                 throw new IllegalArgumentException("maxLeaderInactivityTime must be >= 5000");
             }
-            if (defaultIndexingNumInstances < 1) {
-                throw new IllegalArgumentException("defaultIndexingNumInstances must be >= 1");
-            }
-            return new TableSpace(uuid, name, leaderId, Collections.unmodifiableSet(replicas), expectedReplicaCount, maxLeaderInactivityTime, defaultIndexingNumInstances, null, 0);
+            return new TableSpace(uuid, name, leaderId, Collections.unmodifiableSet(replicas), expectedReplicaCount, maxLeaderInactivityTime, null, 0);
         }
 
     }
 
     @Override
     public String toString() {
-        return "TableSpace{" + "uuid=" + uuid + ", name=" + name + ", leaderId=" + leaderId + ", replicas=" + replicas + ", expectedReplicaCount=" + expectedReplicaCount + ", maxLeaderInactivityTime=" + maxLeaderInactivityTime + ", defaultIndexingNumInstances=" + defaultIndexingNumInstances + ", metadataStorageVersion=" + metadataStorageVersion + '}';
+        return "TableSpace{" + "uuid=" + uuid + ", name=" + name + ", leaderId=" + leaderId + ", replicas=" + replicas + ", expectedReplicaCount=" + expectedReplicaCount + ", maxLeaderInactivityTime=" + maxLeaderInactivityTime + ", metadataStorageVersion=" + metadataStorageVersion + '}';
     }
 
 }

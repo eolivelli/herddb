@@ -376,18 +376,22 @@ public class ShardAssignmentTest {
             engine0.awaitPendingWorkForTest();
             engine1.awaitPendingWorkForTest();
 
-            // After update, updates are NOT filtered by shard, so the update (remove+add)
-            // re-adds vectors on both engines. Each engine should now have all records.
+            // After UPDATE: removeVector is broadcast (wipes any stale copy
+            // left by a prior mapping) but addVector is filtered. So each
+            // engine ends up with EXACTLY the same per-shard subset as
+            // after the initial INSERT — no phantom vectors leak onto
+            // non-owners.
             List<?> results0After = engine0.search("default", "mytable", "vidx",
                     new float[]{1.0f, 2.0f, 3.0f}, numRecords);
             List<?> results1After = engine1.search("default", "mytable", "vidx",
                     new float[]{1.0f, 2.0f, 3.0f}, numRecords);
 
-            // Both engines should have all records after unfiltered updates
-            assertEquals("Engine 0 should have all records after unfiltered update",
-                    numRecords, results0After.size());
-            assertEquals("Engine 1 should have all records after unfiltered update",
-                    numRecords, results1After.size());
+            assertEquals("engine 0 must hold exactly its shard subset after UPDATE",
+                    results0Before.size(), results0After.size());
+            assertEquals("engine 1 must hold exactly its shard subset after UPDATE",
+                    results1Before.size(), results1After.size());
+            assertEquals("cluster total must still equal numRecords",
+                    numRecords, results0After.size() + results1After.size());
         } finally {
             engine0.close();
             engine1.close();

@@ -146,9 +146,8 @@ The number of indexing-service primary replicas across which an index is
 sharded — `numInstances` — is **not** an index-level property. It lives
 on the engine (initialised from the JVM property
 `indexing.cluster.numInstances` and then updated at runtime by every
-`INDEXING_SERVICE_REBALANCE` log entry); the per-tablespace persisted
-setting `TableSpace.defaultIndexingNumInstances` is the source the
-`EXECUTE INDEXING_SERVICE_REBALANCE` command writes into. See [Dynamic
+`INDEXING_SERVICE_REBALANCE` log entry the operator triggers via
+`EXECUTE INDEXING_SERVICE_REBALANCE 'tablespace', N`). See [Dynamic
 Scale-Up of Indexing Service Replicas](#dynamic-scale-up-of-indexing-service-replicas)
 for the full design.
 
@@ -801,14 +800,12 @@ EXECUTE INDEXING_SERVICE_REBALANCE 'tablespace', N
 
 The leader:
 
-1. Updates `TableSpace.defaultIndexingNumInstances = N` in metadata
-   (ZooKeeper in cluster mode). This persists `N` for joining
-   replicas that subsequently boot from scratch.
-2. Snapshots every `Table` and every vector `Index` in the tablespace
-   into an `IndexingServiceRebalanceDescriptor`.
-3. Writes the descriptor in a new `INDEXING_SERVICE_REBALANCE` log
+1. Snapshots every `Table` and every vector `Index` in the tablespace
+   into an `IndexingServiceRebalanceDescriptor` carrying `epoch`,
+   `defaultNumInstances=N`, and the schema.
+2. Writes the descriptor in a new `INDEXING_SERVICE_REBALANCE` log
    entry (`LogEntryType=15`) and fsyncs.
-4. Returns immediately. There is **no ACK protocol** — log ordering
+3. Returns immediately. There is **no ACK protocol** — log ordering
    is the natural barrier.
 
 Re-running with the same `N` is valid and idempotent: each replica
@@ -845,10 +842,48 @@ EVERY existing index immediately.
 The new entry type is meaningful only to indexing-service replicas;
 HerdDB Followers in classic cluster mode (BookKeeper + ZooKeeper
 replication) silently ignore it via the `default: break` clause in
-`TableSpaceManager.apply()`. The `defaultIndexingNumInstances`
-property propagates to every node through ZK metadata, so a Follower
-that is later promoted to leader writes the correct N when it
-generates the next REBALANCE entry.
+`TableSpaceManager.apply()`. Operators can read the current value
+live from any indexing-service replica via
+`indexing-admin engine-stats`.
+
+### Indexing-service restart after a rebalance
+
+Recovery uses two complementary mechanisms:
+
+1. **Watermark snapshot.** Every successful indexing-service
+   checkpoint persists a `WatermarkSnapshot` — last-applied
+   `LogSequenceNumber` AND the engine's effective `numInstances`
+   at that point — through the configured `WatermarkStore`
+   (`LocalWatermarkStore` for persistent local volumes,
+   `S3WatermarkStore` for ephemeral pods on shared object storage).
+   Both fields are serialised in a single object: file format `byte
+   version=1 | long ledgerId | long offset | int numInstances`
+   for the local store; checksummed
+   `version | flags | ledgerId | offset | numInstances | XXHash64`
+   on S3. On engine startup the snapshot is loaded and
+   `currentNumInstances` is set from it, so a freshly-restarted
+   engine starts ALREADY at the correct routing value — even if
+   the BookKeeper ledger that carried the most recent
+   `INDEXING_SERVICE_REBALANCE` entry has been trimmed in the
+   meantime. A snapshot value of `0` (the
+   `WatermarkSnapshot.START_OF_TIME` sentinel) means "no recovery
+   state yet"; the engine falls back to its JVM-property
+   bootstrap `indexing.cluster.numInstances`.
+2. **Log replay.** After loading the snapshot, the tailer also
+   replays the commit log from `LogSequenceNumber.START_OF_TIME`
+   so it can reprocess DDL entries (CREATE_TABLE, CREATE_INDEX,
+   ALTER_*) and rebuild the in-memory `SchemaTracker`. Any
+   `INDEXING_SERVICE_REBALANCE` entry it encounters in replay
+   updates `currentNumInstances` again — idempotent, since the
+   snapshot value is already correct.
+
+The only situation where neither mechanism is sufficient is a pod
+that has BOTH no persistent watermark AND no BK history available
+(typically a brand-new pod added during a scale-up after history
+was trimmed). That is exactly what the JOINING fallback covers:
+the engine enters `JOINING`, drops every commit-log entry, and
+waits for the next REBALANCE entry — which the operator triggers
+via the same `EXECUTE INDEXING_SERVICE_REBALANCE` SQL.
 
 ### Transactions across a rebalance
 

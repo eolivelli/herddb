@@ -25,13 +25,13 @@ import herddb.model.DDLStatement;
 /**
  * {@code EXECUTE INDEXING_SERVICE_REBALANCE 'tableSpace', N}.
  *
- * <p>Updates the tablespace's {@code defaultIndexingNumInstances} to the
- * supplied N (which any subsequent CREATE VECTOR INDEX inherits) and writes
- * an {@link herddb.log.LogEntryType#INDEXING_SERVICE_REBALANCE} entry whose
- * payload also embeds a snapshot of the current schema. The entry is the
- * mechanism by which indexing-service replicas observe the change and by
- * which freshly-added replicas (whose BookKeeper history has been trimmed)
- * acquire their schema.
+ * <p>Writes an {@link herddb.log.LogEntryType#INDEXING_SERVICE_REBALANCE}
+ * entry whose payload carries the new {@code numInstances} and a snapshot
+ * of the current schema. Every indexing-service replica that observes the
+ * entry updates its effective {@code numInstances} on the spot — so from
+ * that LSN onward EVERY existing vector index spreads new writes across
+ * the new owner set. Freshly-added replicas (whose BookKeeper history has
+ * been trimmed) also use the schema snapshot to bootstrap.
  *
  * <p>The call returns as soon as the entry is durable; there is no
  * acknowledgement or barrier, since log ordering already gives every

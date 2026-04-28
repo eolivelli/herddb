@@ -843,12 +843,6 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
                     return Futures.exception(new StatementExecutionException(
                             "tablespace " + rb.getTableSpace() + " does not exist"));
                 }
-                herddb.model.TableSpace updated = herddb.model.TableSpace.builder()
-                        .cloning(prev)
-                        .defaultIndexingNumInstances(rb.getNumInstances())
-                        .build();
-                metadataStorageManager.updateTableSpace(updated, prev);
-
                 IndexingServiceRebalanceDescriptor descriptor = new IndexingServiceRebalanceDescriptor(
                         System.currentTimeMillis(),
                         rb.getNumInstances(),
@@ -857,8 +851,7 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
                 LogEntry entry = LogEntryFactory.indexingServiceRebalance(descriptor);
                 manager.getLog().log(entry, true);
             } catch (LogNotAvailableException | DataStorageManagerException
-                    | herddb.metadata.MetadataStorageManagerException
-                    | DDLException e) {
+                    | herddb.metadata.MetadataStorageManagerException e) {
                 return Futures.exception(new StatementExecutionException(
                         "INDEXING_SERVICE_REBALANCE failed: " + e.getMessage(), e));
             }

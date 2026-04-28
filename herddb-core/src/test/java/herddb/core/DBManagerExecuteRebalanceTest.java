@@ -36,7 +36,6 @@ import herddb.log.LogSequenceNumber;
 import herddb.model.Index;
 import herddb.model.StatementEvaluationContext;
 import herddb.model.StatementExecutionException;
-import herddb.model.TableSpace;
 import herddb.model.TransactionContext;
 import herddb.model.commands.CreateTableSpaceStatement;
 import java.nio.file.Path;
@@ -129,15 +128,9 @@ public class DBManagerExecuteRebalanceTest {
             execute(m, "EXECUTE INDEXING_SERVICE_REBALANCE 'tblspace1', 4",
                     Collections.emptyList());
 
-            // Tablespace property updated; this is what every indexing-service
-            // replica reads when it later applies the REBALANCE log entry.
-            TableSpace ts = m.getMetadataStorageManager().describeTableSpace("tblspace1");
-            assertNotNull(ts);
-            assertEquals(4, ts.defaultIndexingNumInstances);
-
             // Existing index definitions are NOT mutated by the REBALANCE —
             // the descriptor in the log entry is what carries the new N
-            // out to indexing-service replicas (no per-index stamping).
+            // out to indexing-service replicas.
             Index oldIdx = m.getTableSpaceManager("tblspace1")
                     .getIndexesOnTable("t1").get("vidx").getIndex();
             assertNotNull(oldIdx);
@@ -174,13 +167,18 @@ public class DBManagerExecuteRebalanceTest {
                     Collections.emptyList());
             execute(m, "EXECUTE INDEXING_SERVICE_REBALANCE 'tblspace1', 2",
                     Collections.emptyList());
-
-            assertEquals(2, m.getMetadataStorageManager()
-                    .describeTableSpace("tblspace1").defaultIndexingNumInstances);
         }
+        // Every EXECUTE writes an entry; later REBALANCE entries override
+        // the engine's effective numInstances even when the value didn't
+        // change, so the leader is allowed to issue them without errors.
         List<LogEntry> rebalances = filter(readPersistedLog(data, logs, meta, tmo),
                 LogEntryType.INDEXING_SERVICE_REBALANCE);
         assertEquals(3, rebalances.size());
+        for (LogEntry e : rebalances) {
+            IndexingServiceRebalanceDescriptor d =
+                    IndexingServiceRebalanceDescriptor.deserialize(e.value.to_array());
+            assertEquals(2, d.defaultNumInstances);
+        }
     }
 
     @Test

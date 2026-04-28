@@ -66,7 +66,7 @@ public class S3WatermarkStoreTest {
     public void loadReturnsStartOfTimeWhenAbsent() throws IOException {
         FakeRemoteFileIO io = new FakeRemoteFileIO();
         S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 0);
-        assertEquals(LogSequenceNumber.START_OF_TIME, store.load());
+        assertEquals(WatermarkSnapshot.START_OF_TIME, store.load());
     }
 
     @Test
@@ -74,12 +74,13 @@ public class S3WatermarkStoreTest {
         FakeRemoteFileIO io = new FakeRemoteFileIO();
         S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 0);
 
-        LogSequenceNumber saved = new LogSequenceNumber(42L, 7L);
+        WatermarkSnapshot saved = new WatermarkSnapshot(new LogSequenceNumber(42L, 7L), 4);
         store.save(saved);
 
-        LogSequenceNumber loaded = store.load();
-        assertEquals(saved.ledgerId, loaded.ledgerId);
-        assertEquals(saved.offset, loaded.offset);
+        WatermarkSnapshot loaded = store.load();
+        assertEquals(saved.lsn.ledgerId, loaded.lsn.ledgerId);
+        assertEquals(saved.lsn.offset, loaded.lsn.offset);
+        assertEquals(saved.numInstances, loaded.numInstances);
     }
 
     @Test
@@ -94,23 +95,25 @@ public class S3WatermarkStoreTest {
         FakeRemoteFileIO io = new FakeRemoteFileIO();
         S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 0);
 
-        store.save(new LogSequenceNumber(5L, 100L));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(5L, 100L), 2));
         byte[] persisted = io.store.get(store.getPath());
 
         // Attempt to save an older LSN — should be a no-op.
-        store.save(new LogSequenceNumber(5L, 50L));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(5L, 50L), 4));
         assertArrayEquals("older save must not overwrite",
                 persisted, io.store.get(store.getPath()));
 
-        // Verify the stored LSN is still the newer one.
-        LogSequenceNumber loaded = store.load();
-        assertEquals(5L, loaded.ledgerId);
-        assertEquals(100L, loaded.offset);
+        // Verify the stored snapshot is still the newer one.
+        WatermarkSnapshot loaded = store.load();
+        assertEquals(5L, loaded.lsn.ledgerId);
+        assertEquals(100L, loaded.lsn.offset);
+        assertEquals(2, loaded.numInstances);
 
         // A newer save goes through.
-        store.save(new LogSequenceNumber(5L, 200L));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(5L, 200L), 4));
         loaded = store.load();
-        assertEquals(200L, loaded.offset);
+        assertEquals(200L, loaded.lsn.offset);
+        assertEquals(4, loaded.numInstances);
     }
 
     @Test
@@ -118,12 +121,12 @@ public class S3WatermarkStoreTest {
         FakeRemoteFileIO io = new FakeRemoteFileIO();
         S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 0);
 
-        LogSequenceNumber lsn = new LogSequenceNumber(1L, 1L);
-        store.save(lsn);
-        store.save(lsn);
+        WatermarkSnapshot snap = new WatermarkSnapshot(new LogSequenceNumber(1L, 1L), 1);
+        store.save(snap);
+        store.save(snap);
         // Both saves happened — monotonicity allows equal LSN.
         assertEquals(2, io.writeCount);
-        assertEquals(lsn.offset, store.load().offset);
+        assertEquals(snap.lsn.offset, store.load().lsn.offset);
     }
 
     @Test
@@ -131,7 +134,7 @@ public class S3WatermarkStoreTest {
         FakeRemoteFileIO io = new FakeRemoteFileIO();
         S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 0);
 
-        store.save(new LogSequenceNumber(7L, 99L));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(7L, 99L), 1));
         byte[] data = io.store.get(store.getPath());
         // Flip a byte in the payload (not the XXHash footer) — integrity check must catch.
         data[0] ^= 0x55;
@@ -155,8 +158,8 @@ public class S3WatermarkStoreTest {
         // Seed a corrupt object.
         io.store.put(store.getPath(), new byte[]{9, 9, 9});
         // Writing over it must succeed (corrupt current value does not block saves).
-        store.save(new LogSequenceNumber(3L, 3L));
-        assertEquals(3L, store.load().offset);
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(3L, 3L), 1));
+        assertEquals(3L, store.load().lsn.offset);
     }
 
     @Test
@@ -174,7 +177,7 @@ public class S3WatermarkStoreTest {
         io.failNextWrite = true;
         S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 0);
         IOException ex = assertThrows(IOException.class,
-                () -> store.save(new LogSequenceNumber(1L, 1L)));
+                () -> store.save(new WatermarkSnapshot(new LogSequenceNumber(1L, 1L), 1)));
         assertTrue(ex.getMessage().contains("watermark"));
         // No object was written.
         assertNull(io.store.get(store.getPath()));

@@ -44,11 +44,11 @@ public class LogEntryType {
     /**
      * Carries an {@link IndexingServiceRebalanceDescriptor} payload.
      * Written by the leader when an operator runs
-     * {@code EXECUTE INDEXING_SERVICE_REBALANCE N}. Replayed by HerdDB
-     * Followers as a no-op other than the embedded
-     * {@code defaultIndexingNumInstances} update applied to the in-memory
-     * tablespace metadata. Indexing-service replicas use the entry to bootstrap
-     * schema when the BookKeeper history is no longer available.
+     * {@code EXECUTE INDEXING_SERVICE_REBALANCE N}. HerdDB Followers ignore
+     * it (no DB state to mutate). Indexing-service replicas update their
+     * effective {@code numInstances} on the spot and use the embedded
+     * schema snapshot to bootstrap when the BookKeeper history is no
+     * longer available.
      */
     public static final short INDEXING_SERVICE_REBALANCE = 15;
 
