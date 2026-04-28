@@ -253,6 +253,15 @@ indexingService:
     log:
       size: 5Gi
       storageClass: ""
+  # Liveness probe tuning for the IS container.
+  # During heavy GC / memory-flush cycles (see issue #340) the JVM may starve
+  # the Jetty thread pool for 10–30 s.  Raise failureThreshold + periodSeconds
+  # in production to avoid false-positive SIGKILL restarts (e.g. 20 × 30 s =
+  # 10 min tolerance as used in the GKE example values).
+  livenessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    failureThreshold: 3
   # PodDisruptionBudget — see server.pdb above. Disabled by default; enable in
   # production / long-running benchmarks (see issue #332).
   pdb:
