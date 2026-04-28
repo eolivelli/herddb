@@ -13,3 +13,36 @@ tests:
       - matchRegex:
           path: spec.template.metadata.annotations["checksum/config"]
           pattern: ^[a-f0-9]{64}$
+
+  - it: should use default liveness probe values when livenessProbe is not overridden
+    template: templates/indexing-service-statefulset.yaml
+    set:
+      indexingService.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.initialDelaySeconds
+          value: 30
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.periodSeconds
+          value: 15
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.failureThreshold
+          value: 3
+
+  - it: should apply custom liveness probe values when livenessProbe is overridden
+    template: templates/indexing-service-statefulset.yaml
+    set:
+      indexingService.enabled: true
+      indexingService.livenessProbe.initialDelaySeconds: 60
+      indexingService.livenessProbe.periodSeconds: 30
+      indexingService.livenessProbe.failureThreshold: 20
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.initialDelaySeconds
+          value: 60
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.periodSeconds
+          value: 30
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.failureThreshold
+          value: 20

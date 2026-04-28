@@ -187,16 +187,16 @@ zookeeper:
   # Pin to europe-west4-a (same-zone traffic is free).
   nodeSelector:
     topology.kubernetes.io/zone: "europe-west4-a"
-  javaOpts: "-Xms512m -Xmx512m -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=536870912 -XX:MaxDirectMemorySize=512m"
+  javaOpts: "-Xms1g -Xmx1g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=536870912 -XX:MaxDirectMemorySize=512m"
   storage:
     size: 10Gi
   resources:
     requests:
-      memory: "768Mi"
-      cpu: "0.25"
+      memory: "2Gi"
+      cpu: "4"
     limits:
-      memory: "768Mi"
-      cpu: "0.5"
+      memory: "2Gi"
+      cpu: "4"
 
 bookkeeper:
   enabled: true
@@ -254,15 +254,21 @@ bookkeeper:
     # Raise bookie ZK session timeout from the 10s default (AbstractConfiguration.getZkTimeout())
     # to 40s so it survives checkpoint-induced I/O bursts without expiring (issue #210).
     zkTimeout: "40000"
-  # Journal: SSD (pd-balanced default) — random write I/O, latency-sensitive.
-  # Ledger: HDD (pd-standard) — large sequential append; saves ~1000 GiB of SSD quota.
-  # The 500 GiB SSD_TOTAL_GB project quota in europe-west4 is tight; keeping only
-  # the journal on SSD stays well within it.
-  # standard-hdd-zonal: pd-standard HDD with WaitForFirstConsumer so the PV is
-  # always provisioned in the same zone as the pod (unlike "standard" which uses
-  # Immediate binding and lands in a random zone, breaking zone-pinned StatefulSets).
+  # Journal: pd-SSD (premium-rwo) — random write I/O, latency-sensitive.
+  #   During a 1B bigann ingest run the bookie journal showed p99.9 write
+  #   latency of 45–60 ms on pd-balanced (standard-rwo). This tail feeds a
+  #   queuing effect: 8 ingest workers serialised on 1 BK ledger — the p99
+  #   commit arriving at the back of a queue of ~11 others must wait ~5 s.
+  #   Switching to pd-SSD (premium-rwo) should reduce the journal p99.9 to
+  #   sub-ms, eliminating the tail and flattening commit-latency p99 from
+  #   ~5,100 ms to the sub-second range. (Analysis from run 2026-04-28.)
+  # Ledger: HDD (pd-standard) — large sequential append; saves SSD quota.
+  # standard-hdd-zonal: pd-standard HDD with WaitForFirstConsumer so the PV
+  # is always provisioned in the same zone as the pod (unlike "standard" which
+  # uses Immediate binding and can land in the wrong zone for zone-pinned pods).
   storage:
     journal:
+      storageClass: "premium-rwo"   # pd-SSD: low-latency journal writes
       size: 100Gi
     ledger:
       storageClass: "standard-hdd-zonal"
@@ -270,15 +276,25 @@ bookkeeper:
   resources:
     requests:
       memory: "4Gi"
-      cpu: "0.25"
+      cpu: "4"
     limits:
       memory: "4Gi"
-      cpu: "0.5"
+      cpu: "4"
 
 indexingService:
   enabled: true
   storageMode: remote
   replicaCount: 2
+  # Raised from the chart default (failureThreshold=3, periodSeconds=15 → 45s tolerance)
+  # to survive IS memory-flush cycles where the HTTP /metrics endpoint becomes temporarily
+  # unresponsive under extreme GC pressure (98% heap). The double-flush scenario observed
+  # on 2026-04-28 (issue #340) stalled both IS replicas for up to 8+ minutes; at 45s
+  # tolerance both pods were SIGKILL'd (exit 137) by the kubelet.
+  # 20 × 30s = 600s (10 min) gives enough headroom for the flush to complete.
+  livenessProbe:
+    failureThreshold: 20
+    periodSeconds: 30
+    initialDelaySeconds: 30
   pdb:
     enabled: true
   # Request AVX-512 capable nodes for jvector acceleration.
