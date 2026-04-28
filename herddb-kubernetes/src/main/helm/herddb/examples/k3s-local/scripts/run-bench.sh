@@ -10,8 +10,15 @@
 # much smaller on long runs. See issue #89 for background.
 #
 # Usage:
-#   ./scripts/run-bench.sh --dataset sift10k -n 10000 -k 100 --checkpoint
-#   ./scripts/run-bench.sh --dataset sift1m -n 100000 --checkpoint
+#   ./scripts/run-bench.sh [--background] --dataset sift10k -n 10000 -k 100 --checkpoint
+#   ./scripts/run-bench.sh [--background] --dataset sift1m -n 100000 --checkpoint
+#
+# --background: start the benchmark inside the pod as a pod-resident nohup
+#   process and exit immediately.  The JVM writes its log to a file inside
+#   the pod (/tmp/vector-bench-<TS>.log) and is fully decoupled from the
+#   kubectl connection — a broken pipe or buffer overflow cannot kill it.
+#   Progress is monitored via the admin HTTP API (GET /status) rather than
+#   streaming the log.  See issue #325.
 #
 # On success: writes reports/run-<timestamp>.log and prints its path
 # on the last line (prefixed "RUN_LOG="). Exits non-zero on failure.
@@ -22,8 +29,21 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
-if [[ $# -eq 0 ]]; then
-    echo "Usage: $0 <vector-bench args>" >&2
+# ---------------------------------------------------------------------------
+# Parse --background flag; collect the remaining vector-bench args.
+# ---------------------------------------------------------------------------
+BACKGROUND=false
+BENCH_ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == "--background" ]]; then
+        BACKGROUND=true
+    else
+        BENCH_ARGS+=("$arg")
+    fi
+done
+
+if [[ ${#BENCH_ARGS[@]} -eq 0 ]]; then
+    echo "Usage: $0 [--background] <vector-bench args>" >&2
     echo "Example: $0 --dataset sift10k -n 10000 -k 100 --checkpoint" >&2
     exit 2
 fi
@@ -32,20 +52,54 @@ TS="$(timestamp)"
 RUN_LOG="$REPORTS_DIR/run-$TS.log"
 
 section "Running vector-bench inside sts/herddb-tools"
-echo "  args: $*"
+echo "  args: ${BENCH_ARGS[*]}"
 echo "  log:  $RUN_LOG"
 echo ""
 
 {
     echo "# vector-bench run $TS"
-    echo "# args: $*"
+    echo "# args: ${BENCH_ARGS[*]}"
     echo "# start: $(date -Iseconds)"
     echo ""
 } > "$RUN_LOG"
 
+if [[ "$BACKGROUND" == "true" ]]; then
+    # -----------------------------------------------------------------------
+    # Background mode (issue #325): start the JVM inside the pod as a nohup
+    # process so its lifecycle is fully decoupled from the kubectl connection.
+    # A broken kubectl TCP session will NOT send SIGPIPE to the VectorBench
+    # JVM.  The benchmark log lives inside the pod at REMOTE_LOG; progress is
+    # available at any time via the admin HTTP API at /status.
+    # -----------------------------------------------------------------------
+    REMOTE_LOG="/tmp/vector-bench-${TS}.log"
+    # printf %q safely escapes each arg for embedding inside a bash -c string.
+    ESCAPED_ARGS=$(printf ' %q' "${BENCH_ARGS[@]}")
+    REMOTE_PID=$(kubectl --kubeconfig "$KUBECONFIG" -n default exec sts/herddb-tools -- bash -c \
+        "nohup /opt/herddb/bin/vector-bench.sh --no-progress${ESCAPED_ARGS} > '${REMOTE_LOG}' 2>&1 & echo \$!")
+    {
+        echo "# mode: background (pod-resident nohup, issue #325)"
+        echo "# remote-log: $REMOTE_LOG"
+        echo "# remote-pid: $REMOTE_PID"
+    } >> "$RUN_LOG"
+    echo "  Benchmark started in background inside pod (PID: $REMOTE_PID)."
+    echo "  Pod log:    $REMOTE_LOG"
+    echo "  Local log:  $RUN_LOG"
+    echo ""
+    echo "  Check status: kubectl --kubeconfig $KUBECONFIG -n default exec herddb-tools-0 -- curl -s http://localhost:8080/status"
+    echo "  Follow log:   kubectl --kubeconfig $KUBECONFIG -n default exec sts/herddb-tools -- tail -f $REMOTE_LOG"
+    echo "  Stop bench:   ./scripts/kill-bench.sh"
+    echo ""
+    echo "RUN_LOG=$RUN_LOG"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Foreground mode: stream output through tee so the operator can watch live
+# progress while also capturing it to the log file.
+# ---------------------------------------------------------------------------
 set +e
-kubectl -n default exec sts/herddb-tools -- \
-    /opt/herddb/bin/vector-bench.sh --no-progress "$@" 2>&1 | tee -a "$RUN_LOG"
+kubectl --kubeconfig "$KUBECONFIG" -n default exec sts/herddb-tools -- \
+    /opt/herddb/bin/vector-bench.sh --no-progress "${BENCH_ARGS[@]}" 2>&1 | tee -a "$RUN_LOG"
 status=${PIPESTATUS[0]}
 set -e
 

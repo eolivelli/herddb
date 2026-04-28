@@ -26,8 +26,14 @@
 # much smaller on long runs.
 #
 # Usage:
-#   ./scripts/run-bench.sh --dataset sift10k -n 10000 -k 100 --checkpoint
-#   ./scripts/run-bench.sh --dataset sift1m -n 100000 --checkpoint
+#   ./scripts/run-bench.sh [--background] --dataset sift10k -n 10000 -k 100 --checkpoint
+#   ./scripts/run-bench.sh [--background] --dataset sift1m -n 100000 --checkpoint
+#
+# --background: launch the VectorBench JVM as a local nohup background
+#   process and exit immediately.  Output is appended to the same RUN_LOG.
+#   A PID file is written to $REPORTS_DIR/run-<TS>.pid so the process can be
+#   found and killed later.  Progress is monitored via the admin HTTP API
+#   (GET /status) rather than following the log.  See issue #325.
 #
 # On success: writes $REPORTS_DIR/run-<timestamp>.log and prints its path
 # on the last line (prefixed "RUN_LOG="). Exits non-zero on failure.
@@ -40,8 +46,21 @@ source "$SCRIPT_DIR/common.sh"
 
 require_cluster_dir
 
-if [[ $# -eq 0 ]]; then
-    echo "Usage: $0 <vector-bench args>" >&2
+# ---------------------------------------------------------------------------
+# Parse --background flag; collect the remaining vector-bench args.
+# ---------------------------------------------------------------------------
+BACKGROUND=false
+BENCH_ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == "--background" ]]; then
+        BACKGROUND=true
+    else
+        BENCH_ARGS+=("$arg")
+    fi
+done
+
+if [[ ${#BENCH_ARGS[@]} -eq 0 ]]; then
+    echo "Usage: $0 [--background] <vector-bench args>" >&2
     echo "Example: $0 --dataset sift10k -n 10000 -k 100 --checkpoint" >&2
     exit 2
 fi
@@ -51,13 +70,13 @@ RUN_LOG="$REPORTS_DIR/run-$TS.log"
 
 section "Running vector-bench against local cluster"
 echo "  cluster: $CLUSTER_DIR"
-echo "  args:    $*"
+echo "  args:    ${BENCH_ARGS[*]}"
 echo "  log:     $RUN_LOG"
 echo ""
 
 {
     echo "# vector-bench run $TS"
-    echo "# args: $*"
+    echo "# args: ${BENCH_ARGS[*]}"
     echo "# start: $(date -Iseconds)"
     echo ""
 } > "$RUN_LOG"
@@ -72,8 +91,40 @@ if [[ -z "${VECTORBENCH_DATASET_DIR:-}" && -n "${HERDDB_TESTS_HOME:-}" ]]; then
     export VECTORBENCH_DATASET_DIR="$HERDDB_TESTS_HOME"
 fi
 
+if [[ "$BACKGROUND" == "true" ]]; then
+    # -----------------------------------------------------------------------
+    # Background mode (issue #325): launch the JVM as a local nohup process
+    # so it survives shell/terminal closure and is decoupled from any pipe.
+    # Output is appended to RUN_LOG.  PID is saved to a .pid file so the
+    # process can be stopped later via kill-bench.sh.
+    # -----------------------------------------------------------------------
+    PID_FILE="$REPORTS_DIR/run-${TS}.pid"
+    nohup "$CLUSTER_DIR/bin/vector-bench.sh" --no-progress "${BENCH_ARGS[@]}" >> "$RUN_LOG" 2>&1 &
+    BENCH_PID=$!
+    echo "$BENCH_PID" > "$PID_FILE"
+    {
+        echo "# mode: background (local nohup, issue #325)"
+        echo "# pid: $BENCH_PID"
+        echo "# pid-file: $PID_FILE"
+    } >> "$RUN_LOG"
+    echo "  Benchmark started in background (PID: $BENCH_PID)."
+    echo "  PID file:   $PID_FILE"
+    echo "  Log:        $RUN_LOG"
+    echo ""
+    echo "  Check status: curl -s http://localhost:8080/status"
+    echo "  Follow log:   tail -f $RUN_LOG"
+    echo "  Stop bench:   ./scripts/kill-bench.sh"
+    echo ""
+    echo "RUN_LOG=$RUN_LOG"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Foreground mode: stream output through tee so the operator can watch live
+# progress while also capturing it to the log file.
+# ---------------------------------------------------------------------------
 set +e
-"$CLUSTER_DIR/bin/vector-bench.sh" --no-progress "$@" 2>&1 | tee -a "$RUN_LOG"
+"$CLUSTER_DIR/bin/vector-bench.sh" --no-progress "${BENCH_ARGS[@]}" 2>&1 | tee -a "$RUN_LOG"
 status=${PIPESTATUS[0]}
 set -e
 

@@ -37,21 +37,23 @@ before running anything. All paths below are relative to that directory.
   explicitly asks, OR as step 1 of a PVC-resize ceremony after the user
   explicitly asks for a retry with a bigger PVC.
 - `./scripts/check-cluster.sh` — pod health check. Exit 0 = healthy.
-- `./scripts/run-bench.sh <vector-bench args>` — run the workload. The last
-  line of stdout is `RUN_LOG=<path>` — capture it. Must be launched with
-  `run_in_background: true` so the supervision loop can run in parallel.
-  The script always prepends `--no-progress` to `vector-bench.sh`, so the
-  captured `RUN_LOG` is `\n`-terminated plain-text output (no `\r` spinner
-  frames). You can and should `Read` this file during supervision to see
-  the current phase and live progress samples (one line every ~5 s) — see
-  §Supervision. If the user explicitly asks for structured output, pass
-  `--output-format json` through to `run-bench.sh` and the log will become
-  NDJSON (one JSON object per line with `event` values `config`,
-  `phase_start`, `progress`, `phase_end`, `summary`, `done`, or `error`).
-  `--output-format json` implicitly enables `--no-progress`.
-  `write-report.sh` still parses plain mode (`^phase=` lines + SUMMARY
-  block) — do not switch to NDJSON unless the user asks for it, or
-  `write-report.sh` will not produce a report.
+- `./scripts/run-bench.sh [--background] <vector-bench args>` — run the
+  workload inside `sts/herddb-tools`. The last line of stdout is
+  `RUN_LOG=<path>` — capture it. **Always pass `--background`** so the JVM
+  runs as a pod-resident `nohup` process fully decoupled from the kubectl
+  connection; the script then exits 0 immediately and you enter the
+  supervision loop (see §Supervision and issue #325). Without `--background`
+  the script blocks until the JVM exits, streaming output through a tee pipe
+  that is vulnerable to SIGPIPE on output-buffer exhaustion — do not use that
+  mode for automated runs. The script always prepends `--no-progress` to
+  `vector-bench.sh`; in background mode the benchmark log lives inside the
+  pod at `/tmp/vector-bench-<TS>.log` (path printed on stdout as `Pod log:`).
+  Progress is monitored via `GET /status` on the admin HTTP API. If the user
+  explicitly asks for structured output, pass `--output-format json` through
+  to `run-bench.sh` and the log will become NDJSON. `write-report.sh` still
+  parses plain mode (`^phase=` lines + SUMMARY block) — do not switch to
+  NDJSON unless the user asks for it, or `write-report.sh` will not produce a
+  report.
 - `./scripts/collect-logs.sh` — dump pod logs into a timestamped dir. Last
   line is `LOGS_DIR=<path>`.
 - `./scripts/analyze-server-checkpoints.sh [--run-log <f>] [--lines N] [--previous]`
@@ -290,13 +292,16 @@ Rules that apply to every workload, including user-specified ones:
 3. **Health check.** Run `./scripts/check-cluster.sh`. On failure go to the
    failure path.
 
-4. **Run the workload.** Launch `./scripts/run-bench.sh …` with
-   `run_in_background: true`. Capture the background task ID. Enter the
-   supervision loop (§Supervision) until the background task finishes OR
-   the loop detects a fatal signal.
+4. **Run the workload.** Call `./scripts/run-bench.sh --background …`
+   (without `run_in_background: true` — the `--background` flag starts the
+   JVM inside the pod as a `nohup` process and the script exits immediately).
+   Capture `RUN_LOG=<path>` from the last line of stdout. Enter the
+   supervision loop (§Supervision) immediately; poll until `GET /status`
+   returns `phase=done` or the benchmark process is gone, or the loop detects
+   a fatal signal.
 
-   - If the bench exits 0 and supervision saw no fatal signals → capture
-     `RUN_LOG=<path>` and go to step 5.
+   - If supervision ends with `phase=done` and no fatal signals → go to
+     step 5.
    - Otherwise → go to the failure path.
 
 5. **Generate report.** Run `./scripts/write-report.sh <RUN_LOG>` and
@@ -309,15 +314,26 @@ Rules that apply to every workload, including user-specified ones:
 
 ## Supervision
 
-While `run-bench.sh` runs in the background, poll the cluster at least every
-60 seconds (minimum 30 s, maximum 90 s between polls). **On each tick: spawn
-the `herddb-cluster-monitor` sub-agent** (see §Supervision delegation above)
-and wait for its TICK SUMMARY.
+Once `run-bench.sh --background` has started the JVM inside the pod and
+returned, poll the cluster at least every 60 seconds (minimum 30 s, maximum
+90 s between polls). **On each tick: spawn the `herddb-cluster-monitor`
+sub-agent** (see §Supervision delegation above) and wait for its TICK SUMMARY.
+
+The primary progress source is always `GET /status` via the admin HTTP API:
+```
+kubectl --kubeconfig .kubeconfig -n default exec herddb-tools-0 -- curl -s http://localhost:8080/status
+```
+In background mode the local `$RUN_LOG` contains only the header and start
+marker — the benchmark output lives inside the pod at
+`/tmp/vector-bench-<TS>.log` (path recorded in `$RUN_LOG` as `remote-log:`).
+You can fetch the pod log tail for raw output when needed:
+```
+kubectl --kubeconfig .kubeconfig -n default exec sts/herddb-tools -- tail -n 50 /tmp/vector-bench-<TS>.log
+```
 
 The cluster-monitor sub-agent handles all per-tick diagnostics:
-- Polling the VectorBench admin API (`GET /status`) for rows, rate, commits
-- Reading the run log tail as fallback / supplemental
-- Checking pod status for crashes / increasing RESTARTS
+- Polling `GET /status` for rows, rate, commits (primary source)
+- Pod status checks for crashes / increasing RESTARTS
 - Scanning component logs for error keywords
 - Running `indexing-admin list-indexes` per IS replica for vector counts
 - Running `indexing-admin engine-stats` per IS replica for queue/memory state
@@ -327,10 +343,12 @@ The cluster-monitor sub-agent handles all per-tick diagnostics:
 You receive a structured TICK SUMMARY (~300 tokens, ~20 lines) with a VERDICT:
 - `healthy` — continue to next tick
 - `warning` — log the warning and continue
-- `fatal` — stop the background task, proceed to §Failure handling
+- `fatal` — run `./scripts/kill-bench.sh`, then proceed to §Failure handling
 
-Between ticks, wait for the background task completion notification or
-schedule the next tick ~60 s after the previous one.
+The benchmark is complete when `GET /status` returns `phase=done` (or the
+vector-bench process no longer exists in the pod, detectable via
+`kubectl --kubeconfig .kubeconfig -n default exec sts/herddb-tools -- kill -0 <REMOTE_PID> 2>/dev/null || echo gone`).
+Schedule the next tick ~60 s after the previous one.
 
 Example cluster-monitor invocation:
 
@@ -388,9 +406,9 @@ Agent(
 - **Bookie line**: omit entirely when `blocked=0`, `rejected=0`, `skipThr=0`.
   Only surface it when at least one of those counters is non-zero.
 
-If any VERDICT is `fatal`: stop the background `run-bench.sh` task immediately,
-then proceed to §Failure handling. Do NOT attempt to mitigate on the running
-cluster.
+If any VERDICT is `fatal`: run `./scripts/kill-bench.sh` to stop the
+pod-resident vector-bench process immediately, then proceed to §Failure
+handling. Do NOT attempt to mitigate on the running cluster.
 
 **Checkpoint timeout escalation (warning-level, non-fatal):** If a TICK
 SUMMARY contains any of the following signals, immediately spawn the
@@ -415,7 +433,7 @@ You never try to recover a broken cluster. Every failure produces a
 reproducible GitHub issue. On any failure (install, health check, bench
 non-zero exit, or supervision-detected fault):
 
-1. If the bench is still running in the background, stop it.
+1. If the bench is still running, stop it: `./scripts/kill-bench.sh`.
 
 2. **OOM only — collect profiles and heap dump while the pod is still
    live.** If the fatal signal was an `OutOfMemoryError` and the affected
@@ -690,12 +708,13 @@ is inactive; prefer the direct `--server` flag.
 (Moved from the repository-level `CLAUDE.md`.)
 
 ### Supervision loop
-The agent supervises a running benchmark at ≤60 s cadence. Each tick:
-0. `Read` the `RUN_LOG` (tail) — `run-bench.sh` drives `vector-bench.sh`
-   with `--no-progress` so the log is `\n`-terminated plain-text
-   (~one progress line every 5 s, phase boundaries visible as
-   `phase=<name>` lines). `--output-format json` is also available for
-   NDJSON consumers.
+The agent supervises a running benchmark at ≤60 s cadence. When started with
+`--background`, the JVM runs inside the pod as a nohup process; the primary
+progress source is the admin HTTP API, not the local log file. Each tick:
+0. `GET /status` via `kubectl --kubeconfig .kubeconfig -n default exec herddb-tools-0 -- curl -s http://localhost:8080/status`
+   — primary source for phase, rows, rate, commits.
+   The pod log at `/tmp/vector-bench-<TS>.log` (path in `$RUN_LOG`) can be
+   fetched for raw output: `kubectl --kubeconfig .kubeconfig -n default exec sts/herddb-tools -- tail -n 50 /tmp/vector-bench-<TS>.log`
 1. `./scripts/check-cluster.sh`
 2. `kubectl get pods -o wide` — watch RESTARTS column
 3. `kubectl logs --tail=200 <pod>` for each component — scan for OOM/Exception/FATAL
