@@ -53,15 +53,12 @@ public class BytesCompareJavaTest {
     public void checkCompare() {
 
         /* Builds 08000000000008d47f */
-
-        Bytes suffix = Bytes.from_long(578687L);
-
-        byte[] array = new byte[suffix.getLength() + 1];
-        array[0] = 8;
-
-        System.arraycopy(suffix.getBuffer(), suffix.getOffset(), array, 1, suffix.getLength());
-
-        Bytes low = Bytes.from_array(array);
+        byte[] lowArray = new byte[] {
+                (byte) 0x08, (byte) 0x00, (byte) 0x00, (byte) 0x00,
+                (byte) 0x00, (byte) 0x00, (byte) 0x08, (byte) 0xd4,
+                (byte) 0x7f
+        };
+        Bytes low = Bytes.from_array(lowArray);
 
         Assert.assertEquals("08000000000008d47f", low.toString());
 
