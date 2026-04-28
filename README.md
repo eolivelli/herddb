@@ -255,6 +255,25 @@ indexes on its own schedule.
   **load-balances across `{primary, shadow1, shadow2, …}`** for
   the target index, failing over within the pool on `NOT_READY`
   or retryable errors. JDBC clients see a single SQL endpoint.
+- **The number of primary indexing-service replicas can be scaled UP
+  dynamically at runtime** (no scale-down). Each vector index is
+  sharded across `numInstances` primaries by `XXHash64(pk) % numShards
+  % numInstances`; the value is **stamped onto each Index at CREATE
+  INDEX time** and is permanent for the life of that index, so
+  existing data never moves on a rebalance. The operator workflow
+  is:
+    1. Bump `indexingService.replicaCount` via `helm upgrade` — new
+       pods come up.
+    2. Run `EXECUTE INDEXING_SERVICE_REBALANCE 'tablespace', N`
+       against any HerdDB JDBC endpoint to update the tablespace's
+       default `numInstances` for **future** vector indexes.
+    3. Subsequent `CREATE VECTOR INDEX` statements stamp the new
+       `numInstances`; new pods become owners of those new indexes.
+  Existing indexes keep their original sharding (and original data
+  placement); they are never re-routed. Pods that boot after the
+  BookKeeper history has been trimmed bootstrap their schema from the
+  next `INDEXING_SERVICE_REBALANCE` log entry rather than replaying
+  from start-of-time.
 
 ```mermaid
 flowchart LR

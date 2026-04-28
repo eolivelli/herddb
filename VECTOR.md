@@ -140,6 +140,8 @@ All parameters are optional. Unspecified parameters use the defaults shown below
 | `fusedPQ` | boolean | `true` | Use FusedPQ on-disk format when dim ≥ 8 and vectors ≥ 256. |
 | `maxSegmentSize` | long | `2147483648` | Maximum on-disk segment size in bytes before segment rotation. |
 | `maxLiveGraphSize` | integer | `0` | Maximum vectors per live graph shard before rotation. 0 = auto (see Shard Rotation). |
+| `numShards` | integer | `1` | Number of logical shards across which the index's data is partitioned (`shardId = XXHash64(pk) % numShards`). Per-index property; immutable after CREATE INDEX. |
+| `numInstances` | integer | tablespace default | Number of indexing-service primary replicas the index is sharded across (`owner = shardId % numInstances`). Stamped onto the `Index` at CREATE INDEX time from `TableSpace.defaultIndexingNumInstances`; **immutable for the life of the index**, so a later cluster rebalance never moves this index's data. Explicit `WITH numInstances=N` overrides the tablespace default. |
 
 ---
 
@@ -740,6 +742,137 @@ On `start()`, the engine reads `indexing.storage.type` from configuration:
 - `indexes: HashMap<String, Index>` — current index definitions.
 
 On CREATE_INDEX: the engine calls `createVectorStoreIfNeeded()` → `factory.create()` → registers the store. On DROP_INDEX or DROP_TABLE: the corresponding store is removed and closed.
+
+---
+
+## Dynamic Scale-Up of Indexing Service Replicas
+
+The indexing service supports **online scale-up of primary replicas**
+(no scale-down). The design avoids any data movement at rebalance time
+by making `numInstances` a per-index property baked at CREATE INDEX
+time rather than a cluster-wide runtime value.
+
+### Routing model
+
+For every entry the tailer applies (INSERT / UPDATE / DELETE), the
+engine decides per vector index whether this replica owns the key:
+
+```
+owner(pk, index) = (XXHash64(pk) % index.numShards) % index.numInstances
+```
+
+Both `numShards` and `numInstances` live on the `Index` itself
+(`herddb.index.vector.VectorIndexManager.PROP_NUM_SHARDS` and
+`PROP_NUM_INSTANCES`). They are stamped at CREATE INDEX time and
+**never change** — the existing index keeps its sharding even if the
+cluster grows, so its data never moves.
+
+A consequence: if a table has two vector indexes, one created at
+`numInstances=2` and one at `numInstances=4`, the same INSERT can
+land on a different replica for each index.
+
+### EXECUTE INDEXING_SERVICE_REBALANCE
+
+```sql
+EXECUTE INDEXING_SERVICE_REBALANCE 'tablespace', N
+```
+
+The leader:
+
+1. Updates `TableSpace.defaultIndexingNumInstances = N` in metadata
+   (ZooKeeper in cluster mode).
+2. Snapshots every `Table` and every vector `Index` in the tablespace
+   into an `IndexingServiceRebalanceDescriptor`.
+3. Writes the descriptor in a new `INDEXING_SERVICE_REBALANCE` log
+   entry (`LogEntryType=15`) and fsyncs.
+4. Returns immediately. There is **no ACK protocol** — log ordering
+   is the natural barrier.
+
+The new default applies to **future** `CREATE VECTOR INDEX`
+statements; existing indexes keep their stamped `numInstances`.
+Re-running with the same `N` is valid and idempotent (useful for
+re-bootstrapping joining replicas, see below).
+
+### Operator workflow
+
+Steady-state scale-up from K to N primaries:
+
+```bash
+# 1. Bring up additional pods.
+helm upgrade herddb herddb-kubernetes/src/main/helm/herddb/ \
+    --set indexingService.replicaCount=N
+
+# 2. Update the tablespace's default numInstances (any tablespace
+#    whose new vector indexes you want to span all N pods).
+herddb-cli.sh -q "EXECUTE INDEXING_SERVICE_REBALANCE 'herd', $N"
+
+# 3. Future CREATE VECTOR INDEX statements stamp N automatically.
+herddb-cli.sh -q "CREATE VECTOR INDEX vidx2 ON herd.docs(vec)"
+```
+
+Existing indexes are not rebalanced — their data lives on the
+original `K` primaries forever. The new pods (`K..N-1`) own zero
+data for those indexes (their `instanceId` is outside the index's
+permanent owner set), but they immediately begin owning their share
+of any newly-created index.
+
+### Behaviour of HerdDB Followers
+
+The new entry type is meaningful only to indexing-service replicas;
+HerdDB Followers in classic cluster mode (BookKeeper + ZooKeeper
+replication) silently ignore it via the `default: break` clause in
+`TableSpaceManager.apply()`. The `defaultIndexingNumInstances`
+property propagates to every node through ZK metadata, so a Follower
+that is later promoted to leader stamps the correct value on
+subsequent CREATE VECTOR INDEX statements.
+
+### Bootstrap of joining replicas
+
+A primary replica that has no local state — typically a freshly
+added pod after a scale-up — still boots normally as long as the
+BookKeeper history (CREATE_TABLE / CREATE_INDEX entries from
+start-of-time) is intact: the tailer replays everything and the
+SchemaTracker reconstructs the full schema.
+
+When the BookKeeper first ledger has been trimmed and history replay
+is impossible, the engine falls back to a **JOINING bootstrap**:
+
+- Set `indexing.bootstrap.fromRebalance=true` (JVM property) on the
+  joining pod.
+- The engine boots in `EngineStatus.JOINING`, drops every commit-log
+  entry that is **not** an `INDEXING_SERVICE_REBALANCE`.
+- The operator runs `EXECUTE INDEXING_SERVICE_REBALANCE 'tablespace',
+  N` on the leader; the entry rides the WAL to every replica.
+- On observing the entry, the joiner installs the embedded schema
+  snapshot (Tables + vector Indexes), creates its vector stores,
+  transitions to `EngineStatus.ACTIVE`, and starts processing
+  subsequent log entries normally.
+
+The same `EXECUTE` is therefore the trigger for both "bump the
+default for new indexes" and "bootstrap a fresh replica that lost the
+history". Re-running it with the same `N` is harmless.
+
+### Shadow replicas across rebalance
+
+Shadows do not tail the commit log and are not affected by routing
+changes — they continue to mirror their paired primary
+(`shadowOf={primaryOrdinal}`) regardless of any REBALANCE entry. A
+shadow whose paired primary has not yet published checkpoint state at
+boot (e.g. a shadow deployed for a brand-new primary) waits gracefully
+via the existing `exists` watcher in `ZookeeperMetadataStorageManager.
+installIndexingServiceStateWatch`, and reloads automatically once the
+primary publishes its first state.
+
+### Limitations
+
+- **Scale-up only.** There is no online scale-down: removing a primary
+  would orphan the data its `instanceId` owns for every index
+  whose `numInstances` covers it.
+- **No data redistribution.** Existing indexes keep their original
+  shard placement forever. New replicas only carry data for indexes
+  created (or re-created) after they joined.
+- **Operator-driven.** The `EXECUTE` is a manual step; there is no
+  auto-rebalance triggered by pod-count changes.
 
 ---
 
