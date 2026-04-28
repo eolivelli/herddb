@@ -75,19 +75,6 @@ public class VectorIndexManager extends AbstractIndexManager {
     public static final String PROP_NUM_SHARDS = "numShards";
 
     /**
-     * Number of indexing-service primary instances across which this index's
-     * data is sharded. Stamped onto the index at CREATE INDEX time from the
-     * tablespace's {@code defaultIndexingNumInstances} property and is then
-     * immutable for the life of the index. Owner of a key {@code k} on this
-     * index is {@code (XXHash64(k) % numShards) % numInstances}.
-     *
-     * <p>Indexes created before this property existed do not carry it; the
-     * indexing-service engine falls back to its bootstrap
-     * {@code indexing.cluster.numInstances} JVM property in that case.
-     */
-    public static final String PROP_NUM_INSTANCES = "numInstances";
-
-    /**
      * Resolved lazily at every call so that the owning DBManager can
      * swap the underlying {@link RemoteVectorIndexService} instance
      * (e.g. when the indexing-service client is restarted) without

@@ -68,14 +68,13 @@ public class JoiningFallbackTest {
                 .build();
     }
 
-    private Index vectorIndex(int numShards, int numInstances) {
+    private Index vectorIndex(int numShards) {
         return Index.builder()
                 .name("vidx")
                 .table("mytable")
                 .type(Index.TYPE_VECTOR)
                 .column("vec", ColumnTypes.FLOATARRAY)
                 .property(VectorIndexManager.PROP_NUM_SHARDS, String.valueOf(numShards))
-                .property(VectorIndexManager.PROP_NUM_INSTANCES, String.valueOf(numInstances))
                 .build();
     }
 
@@ -107,7 +106,7 @@ public class JoiningFallbackTest {
             assertEquals(IndexingServiceEngine.EngineStatus.JOINING, engine.getEngineStatus());
 
             Table t = table();
-            Index ix = vectorIndex(2, 1);
+            Index ix = vectorIndex(2);
 
             // Pre-REBALANCE entries: dropped because engine is JOINING
             engine.applyEntry(new LogSequenceNumber(1, 1),
@@ -174,7 +173,7 @@ public class JoiningFallbackTest {
             assertEquals(IndexingServiceEngine.EngineStatus.ACTIVE, engine.getEngineStatus());
 
             Table t = table();
-            Index ix = vectorIndex(2, 1);
+            Index ix = vectorIndex(2);
             engine.applyEntry(new LogSequenceNumber(1, 1),
                     LogEntryFactory.createTable(t, null));
             engine.applyEntry(new LogSequenceNumber(1, 2),

@@ -53,7 +53,7 @@ public class IndexingServiceRebalanceDescriptorTest {
                 .build();
     }
 
-    private Index makeVectorIndex(String name, String table, int numShards, int numInstances) {
+    private Index makeVectorIndex(String name, String table, int numShards) {
         return Index.builder()
                 .name(name)
                 .table(table)
@@ -61,7 +61,6 @@ public class IndexingServiceRebalanceDescriptorTest {
                 .type(Index.TYPE_VECTOR)
                 .column("vec", ColumnTypes.FLOATARRAY)
                 .property(VectorIndexManager.PROP_NUM_SHARDS, String.valueOf(numShards))
-                .property(VectorIndexManager.PROP_NUM_INSTANCES, String.valueOf(numInstances))
                 .build();
     }
 
@@ -81,11 +80,11 @@ public class IndexingServiceRebalanceDescriptorTest {
     public void roundTripWithTablesAndIndexes() throws Exception {
         Table t1 = makeTable("t1");
         Table t2 = makeTable("t2");
-        Index ixOld = makeVectorIndex("vidx_old", "t1", 4, 2);
-        Index ixNew = makeVectorIndex("vidx_new", "t1", 4, 4);
+        Index ix1 = makeVectorIndex("vidx_a", "t1", 4);
+        Index ix2 = makeVectorIndex("vidx_b", "t1", 8);
         IndexingServiceRebalanceDescriptor d = new IndexingServiceRebalanceDescriptor(
                 System.currentTimeMillis(), 4,
-                Arrays.asList(t1, t2), Arrays.asList(ixOld, ixNew));
+                Arrays.asList(t1, t2), Arrays.asList(ix1, ix2));
         IndexingServiceRebalanceDescriptor restored =
                 IndexingServiceRebalanceDescriptor.deserialize(d.serialize());
 
@@ -95,8 +94,8 @@ public class IndexingServiceRebalanceDescriptorTest {
         assertEquals("t1", restored.tables.get(0).name);
         assertEquals("t2", restored.tables.get(1).name);
         assertEquals(2, restored.vectorIndexes.size());
-        assertEquals("2", restored.vectorIndexes.get(0).properties.get(VectorIndexManager.PROP_NUM_INSTANCES));
-        assertEquals("4", restored.vectorIndexes.get(1).properties.get(VectorIndexManager.PROP_NUM_INSTANCES));
+        assertEquals("4", restored.vectorIndexes.get(0).properties.get(VectorIndexManager.PROP_NUM_SHARDS));
+        assertEquals("8", restored.vectorIndexes.get(1).properties.get(VectorIndexManager.PROP_NUM_SHARDS));
     }
 
     @Test
@@ -111,7 +110,7 @@ public class IndexingServiceRebalanceDescriptorTest {
         IndexingServiceRebalanceDescriptor d = new IndexingServiceRebalanceDescriptor(
                 7L, 8,
                 Collections.singletonList(makeTable("t1")),
-                Collections.singletonList(makeVectorIndex("v", "t1", 4, 8)));
+                Collections.singletonList(makeVectorIndex("v", "t1", 4)));
         LogEntry entry = LogEntryFactory.indexingServiceRebalance(d);
         assertEquals(LogEntryType.INDEXING_SERVICE_REBALANCE, entry.type);
         assertEquals(0L, entry.transactionId);
@@ -125,8 +124,8 @@ public class IndexingServiceRebalanceDescriptorTest {
                 IndexingServiceRebalanceDescriptor.deserialize(restoredEntry.value.to_array());
         assertEquals(7L, restoredDescriptor.epoch);
         assertEquals(8, restoredDescriptor.defaultNumInstances);
-        assertEquals("8", restoredDescriptor.vectorIndexes.get(0).properties
-                .get(VectorIndexManager.PROP_NUM_INSTANCES));
+        assertEquals("4", restoredDescriptor.vectorIndexes.get(0).properties
+                .get(VectorIndexManager.PROP_NUM_SHARDS));
     }
 
     /**
@@ -146,7 +145,7 @@ public class IndexingServiceRebalanceDescriptorTest {
         assertEquals(Bytes.from_string("v1"), restored.value);
 
         LogEntry createIndex = LogEntryFactory.createIndex(
-                makeVectorIndex("v", "t1", 4, 2), null);
+                makeVectorIndex("v", "t1", 4), null);
         LogEntry restoredCreate = LogEntry.deserialize(createIndex.serialize());
         assertEquals(LogEntryType.CREATE_INDEX, restoredCreate.type);
         assertArrayEquals(createIndex.value.to_array(), restoredCreate.value.to_array());

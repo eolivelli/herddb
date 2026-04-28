@@ -29,7 +29,6 @@ import herddb.core.indexes.MockRemoteVectorIndexService;
 import herddb.file.FileCommitLogManager;
 import herddb.file.FileDataStorageManager;
 import herddb.file.FileMetadataStorageManager;
-import herddb.index.vector.VectorIndexManager;
 import herddb.log.IndexingServiceRebalanceDescriptor;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryType;
@@ -130,23 +129,18 @@ public class DBManagerExecuteRebalanceTest {
             execute(m, "EXECUTE INDEXING_SERVICE_REBALANCE 'tblspace1', 4",
                     Collections.emptyList());
 
-            // Tablespace property updated for future CREATE INDEX
+            // Tablespace property updated; this is what every indexing-service
+            // replica reads when it later applies the REBALANCE log entry.
             TableSpace ts = m.getMetadataStorageManager().describeTableSpace("tblspace1");
             assertNotNull(ts);
             assertEquals(4, ts.defaultIndexingNumInstances);
 
-            // Existing index is NOT mutated (stamped before the rebalance)
+            // Existing index definitions are NOT mutated by the REBALANCE —
+            // the descriptor in the log entry is what carries the new N
+            // out to indexing-service replicas (no per-index stamping).
             Index oldIdx = m.getTableSpaceManager("tblspace1")
                     .getIndexesOnTable("t1").get("vidx").getIndex();
-            assertEquals(String.valueOf(TableSpace.DEFAULT_INDEXING_NUM_INSTANCES_DEFAULT),
-                    oldIdx.properties.get(VectorIndexManager.PROP_NUM_INSTANCES));
-
-            // A NEW index picks up the new default
-            execute(m, "CREATE VECTOR INDEX vidx2 ON tblspace1.t1(vec)",
-                    Collections.emptyList());
-            Index newIdx = m.getTableSpaceManager("tblspace1")
-                    .getIndexesOnTable("t1").get("vidx2").getIndex();
-            assertEquals("4", newIdx.properties.get(VectorIndexManager.PROP_NUM_INSTANCES));
+            assertNotNull(oldIdx);
         }
 
         // Reopen and inspect the log via recovery (safe on a closed log)

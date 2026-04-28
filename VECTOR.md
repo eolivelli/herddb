@@ -140,8 +140,17 @@ All parameters are optional. Unspecified parameters use the defaults shown below
 | `fusedPQ` | boolean | `true` | Use FusedPQ on-disk format when dim ≥ 8 and vectors ≥ 256. |
 | `maxSegmentSize` | long | `2147483648` | Maximum on-disk segment size in bytes before segment rotation. |
 | `maxLiveGraphSize` | integer | `0` | Maximum vectors per live graph shard before rotation. 0 = auto (see Shard Rotation). |
-| `numShards` | integer | `1` | Number of logical shards across which the index's data is partitioned (`shardId = XXHash64(pk) % numShards`). Per-index property; immutable after CREATE INDEX. |
-| `numInstances` | integer | tablespace default | Number of indexing-service primary replicas the index is sharded across (`owner = shardId % numInstances`). Stamped onto the `Index` at CREATE INDEX time from `TableSpace.defaultIndexingNumInstances`; **immutable for the life of the index**, so a later cluster rebalance never moves this index's data. Explicit `WITH numInstances=N` overrides the tablespace default. |
+| `numShards` | integer | `1` | Number of logical hash buckets within the index (`shardId = XXHash64(pk) % numShards`). Per-index, immutable after CREATE INDEX — it controls bucket granularity, not which replica owns a bucket. |
+
+The number of indexing-service primary replicas across which an index is
+sharded — `numInstances` — is **not** an index-level property. It lives
+on the engine (initialised from the JVM property
+`indexing.cluster.numInstances` and then updated at runtime by every
+`INDEXING_SERVICE_REBALANCE` log entry); the per-tablespace persisted
+setting `TableSpace.defaultIndexingNumInstances` is the source the
+`EXECUTE INDEXING_SERVICE_REBALANCE` command writes into. See [Dynamic
+Scale-Up of Indexing Service Replicas](#dynamic-scale-up-of-indexing-service-replicas)
+for the full design.
 
 ---
 
@@ -748,9 +757,9 @@ On CREATE_INDEX: the engine calls `createVectorStoreIfNeeded()` → `factory.cre
 ## Dynamic Scale-Up of Indexing Service Replicas
 
 The indexing service supports **online scale-up of primary replicas**
-(no scale-down). The design avoids any data movement at rebalance time
-by making `numInstances` a per-index property baked at CREATE INDEX
-time rather than a cluster-wide runtime value.
+(no scale-down). After a rebalance, EVERY existing vector index
+spreads new writes across the new owner set — no per-index
+permanence, no static-at-CREATE stamping.
 
 ### Routing model
 
@@ -758,18 +767,31 @@ For every entry the tailer applies (INSERT / UPDATE / DELETE), the
 engine decides per vector index whether this replica owns the key:
 
 ```
-owner(pk, index) = (XXHash64(pk) % index.numShards) % index.numInstances
+owner(pk, index) = (XXHash64(pk) % index.numShards) % engine.currentNumInstances
 ```
 
-Both `numShards` and `numInstances` live on the `Index` itself
-(`herddb.index.vector.VectorIndexManager.PROP_NUM_SHARDS` and
-`PROP_NUM_INSTANCES`). They are stamped at CREATE INDEX time and
-**never change** — the existing index keeps its sharding even if the
-cluster grows, so its data never moves.
+`numShards` is per-index, immutable, set at CREATE INDEX time — it
+controls hash-bucket granularity, NOT which replica owns a bucket.
+`engine.currentNumInstances` is engine-wide and **mutable**: every
+`INDEXING_SERVICE_REBALANCE` log entry updates it on the spot, so
+from the entry's LSN onward every routing decision uses the new
+value.
 
-A consequence: if a table has two vector indexes, one created at
-`numInstances=2` and one at `numInstances=4`, the same INSERT can
-land on a different replica for each index.
+INSERT / UPDATE / DELETE differ in how they handle a rebalance:
+
+- **INSERT** is filtered: only the current owner under the new
+  mapping installs the vector.
+- **UPDATE** is split: the `removeVector` half is **broadcast** to
+  every replica (so a stale copy left on the previous owner by an
+  earlier write is wiped), then the `addVector` half is filtered
+  (only the current owner installs the new value).
+- **DELETE** is **broadcast** unconditionally. After a rebalance the
+  same primary key may briefly sit on two replicas at once — its
+  original-owner copy under the old N, and a new-owner copy under
+  the new N (e.g. a re-INSERT after the rebalance). A filtered
+  DELETE would leak one of them; broadcast guarantees the key
+  disappears from everywhere. `removeVector` is a no-op on replicas
+  that never had the key.
 
 ### EXECUTE INDEXING_SERVICE_REBALANCE
 
@@ -780,7 +802,8 @@ EXECUTE INDEXING_SERVICE_REBALANCE 'tablespace', N
 The leader:
 
 1. Updates `TableSpace.defaultIndexingNumInstances = N` in metadata
-   (ZooKeeper in cluster mode).
+   (ZooKeeper in cluster mode). This persists `N` for joining
+   replicas that subsequently boot from scratch.
 2. Snapshots every `Table` and every vector `Index` in the tablespace
    into an `IndexingServiceRebalanceDescriptor`.
 3. Writes the descriptor in a new `INDEXING_SERVICE_REBALANCE` log
@@ -788,33 +811,34 @@ The leader:
 4. Returns immediately. There is **no ACK protocol** — log ordering
    is the natural barrier.
 
-The new default applies to **future** `CREATE VECTOR INDEX`
-statements; existing indexes keep their stamped `numInstances`.
-Re-running with the same `N` is valid and idempotent (useful for
-re-bootstrapping joining replicas, see below).
+Re-running with the same `N` is valid and idempotent: each replica
+re-records the descriptor for its `lastObservedRebalance` accessor
+and the routing value stays unchanged.
 
 ### Operator workflow
 
-Steady-state scale-up from K to N primaries:
+Scale-up from K to N primaries:
 
 ```bash
-# 1. Bring up additional pods.
+# 1. Bring up additional pods. Because they have no local state,
+#    they boot in JOINING mode (waiting for the next REBALANCE
+#    entry to acquire the schema).
 helm upgrade herddb herddb-kubernetes/src/main/helm/herddb/ \
     --set indexingService.replicaCount=N
 
-# 2. Update the tablespace's default numInstances (any tablespace
-#    whose new vector indexes you want to span all N pods).
+# 2. Update the engine's effective numInstances on every replica
+#    (the existing K AND the new K..N-1) by writing one log entry.
 herddb-cli.sh -q "EXECUTE INDEXING_SERVICE_REBALANCE 'herd', $N"
 
-# 3. Future CREATE VECTOR INDEX statements stamp N automatically.
-herddb-cli.sh -q "CREATE VECTOR INDEX vidx2 ON herd.docs(vec)"
+# 3. Done. New writes against EVERY existing vector index now spread
+#    across all N pods. Search continues to fan out across all
+#    replicas as before.
 ```
 
-Existing indexes are not rebalanced — their data lives on the
-original `K` primaries forever. The new pods (`K..N-1`) own zero
-data for those indexes (their `instanceId` is outside the index's
-permanent owner set), but they immediately begin owning their share
-of any newly-created index.
+Historical on-disk data is not migrated. The original K replicas
+keep their phase-1 vectors and continue serving them on search; the
+new K..N-1 replicas start owning their share of new writes against
+EVERY existing index immediately.
 
 ### Behaviour of HerdDB Followers
 
@@ -823,8 +847,19 @@ HerdDB Followers in classic cluster mode (BookKeeper + ZooKeeper
 replication) silently ignore it via the `default: break` clause in
 `TableSpaceManager.apply()`. The `defaultIndexingNumInstances`
 property propagates to every node through ZK metadata, so a Follower
-that is later promoted to leader stamps the correct value on
-subsequent CREATE VECTOR INDEX statements.
+that is later promoted to leader writes the correct N when it
+generates the next REBALANCE entry.
+
+### Transactions across a rebalance
+
+The engine buffers transactional entries in memory until COMMIT
+arrives; the buffered entries are then applied through the same
+INSERT/UPDATE/DELETE handlers, using the engine's CURRENT
+`numInstances` at COMMIT time. Consequence: a transaction begun
+pre-rebalance and committed post-rebalance lands every buffered
+INSERT on its post-rebalance owner — this is the user's "no change
+is lost (even with transactions open during a rebalance)"
+guarantee. ROLLBACK discards the buffered entries.
 
 ### Bootstrap of joining replicas
 
@@ -845,12 +880,13 @@ is impossible, the engine falls back to a **JOINING bootstrap**:
   N` on the leader; the entry rides the WAL to every replica.
 - On observing the entry, the joiner installs the embedded schema
   snapshot (Tables + vector Indexes), creates its vector stores,
-  transitions to `EngineStatus.ACTIVE`, and starts processing
-  subsequent log entries normally.
+  bumps its `currentNumInstances`, transitions to
+  `EngineStatus.ACTIVE`, and starts processing subsequent log
+  entries normally.
 
-The same `EXECUTE` is therefore the trigger for both "bump the
-default for new indexes" and "bootstrap a fresh replica that lost the
-history". Re-running it with the same `N` is harmless.
+The same `EXECUTE` is therefore the trigger for both "rebalance the
+existing cluster" and "bootstrap a fresh replica that lost the
+history".
 
 ### Shadow replicas across rebalance
 
@@ -866,11 +902,11 @@ primary publishes its first state.
 ### Limitations
 
 - **Scale-up only.** There is no online scale-down: removing a primary
-  would orphan the data its `instanceId` owns for every index
-  whose `numInstances` covers it.
-- **No data redistribution.** Existing indexes keep their original
-  shard placement forever. New replicas only carry data for indexes
-  created (or re-created) after they joined.
+  would orphan the historical data its `instanceId` still owns.
+- **Historical data is not redistributed.** Old vectors stay on
+  their original owners. Search fans out across all replicas, so
+  results are complete; but the new pods don't start owning historical
+  data until a write touches it.
 - **Operator-driven.** The `EXECUTE` is a manual step; there is no
   auto-rebalance triggered by pod-count changes.
 

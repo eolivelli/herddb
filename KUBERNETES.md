@@ -72,20 +72,22 @@ all configurable options.
 ## Scaling indexing-service replicas up
 
 The indexing-service StatefulSet supports **online scale-up** of its
-primary replicas (no scale-down). Existing vector indexes keep their
-original sharding — `numInstances` is stamped onto each `Index` at
-CREATE INDEX time and is permanent — so no historical data is moved.
-Only **new** vector indexes pick up the larger replica count.
+primary replicas (no scale-down). After the rebalance EVERY existing
+vector index immediately starts spreading new writes across the new
+owner set — including the freshly added pods. Historical on-disk data
+stays where it is and continues to be served from its original owner;
+search fans out across all replicas regardless.
 
 Workflow:
 
 ```bash
-# 1. Bump the StatefulSet replica count.
+# 1. Bump the StatefulSet replica count. New pods come up in JOINING
+#    mode, waiting for the next REBALANCE entry to acquire schema.
 helm upgrade herddb herddb-kubernetes/src/main/helm/herddb/ \
   --set indexingService.replicaCount=N
 
-# 2. Update the tablespace's default numInstances so future
-#    CREATE VECTOR INDEX statements span all N pods.
+# 2. Update the engine's effective numInstances on every replica
+#    by writing a single log entry.
 kubectl exec -it herddb-tools-0 -- herddb-cli.sh \
   -q "EXECUTE INDEXING_SERVICE_REBALANCE 'herd', $N"
 
@@ -98,9 +100,10 @@ The `EXECUTE INDEXING_SERVICE_REBALANCE` call writes a single log
 entry — there is no ACK protocol and the call returns immediately
 once the entry is durable. See [VECTOR.md §"Dynamic Scale-Up of
 Indexing Service Replicas"](./VECTOR.md#dynamic-scale-up-of-indexing-service-replicas)
-for the full design (per-index routing, joining-pod bootstrap when the
-BookKeeper history was trimmed, and shadow-replica behaviour across
-rebalance).
+for the full design (mutable engine-level routing, broadcast DELETE
+to wipe stale duplicates left across the rebalance, transactions
+spanning the rebalance, joining-pod bootstrap when the BookKeeper
+history was trimmed, and shadow-replica behaviour across rebalance).
 
 ## Deployment examples
 

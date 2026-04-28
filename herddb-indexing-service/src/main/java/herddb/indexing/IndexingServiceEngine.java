@@ -106,7 +106,23 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private final IndexingServerConfiguration config;
 
     private final int instanceId;
-    private final int numInstances;
+    /**
+     * Bootstrap value of {@link #currentNumInstances} read from the JVM
+     * property {@code indexing.cluster.numInstances} at engine construction.
+     * Routing decisions read {@link #currentNumInstances}, which a REBALANCE
+     * log entry can update at runtime.
+     */
+    private final int bootstrapNumInstances;
+    /**
+     * Effective number of indexing-service primary instances used for routing
+     * decisions on every INSERT/UPDATE/DELETE applied by this engine. Mutable
+     * because a {@code INDEXING_SERVICE_REBALANCE} log entry updates it on
+     * the fly: existing data on the old owners stays where it is, but every
+     * subsequent write routes by the new value, so a freshly-added pod
+     * starts owning a share of NEW writes against EVERY existing vector
+     * index without any data movement.
+     */
+    private volatile int currentNumInstances;
 
     private WatermarkStore watermarkStore;
     private SchemaTracker schemaTracker;
@@ -119,10 +135,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     /**
      * Most recent {@link IndexingServiceRebalanceDescriptor} observed by the
-     * tailer. Held only for diagnostics on an active engine — actual routing
-     * lives on each individual {@link Index}'s {@code PROP_NUM_INSTANCES}, so
-     * an active engine has no other use for this descriptor. The JOINING
-     * fallback path (Step 7) consults the same field to bootstrap schema.
+     * tailer. Drives two effects: (a) updates {@link #currentNumInstances}
+     * for routing decisions on every subsequent INSERT/UPDATE/DELETE, so a
+     * scale-up immediately spreads new writes against EVERY existing index
+     * across the new owner set without moving any historical data; and
+     * (b) supplies the schema snapshot used by the JOINING-fallback boot
+     * path when the BookKeeper history has been trimmed.
      *
      * <p>Lower-or-equal epochs are treated as no-ops (idempotent on log
      * replay).
@@ -258,8 +276,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         this.config = config;
         this.instanceId = config.getInt(IndexingServerConfiguration.PROPERTY_INSTANCE_ID,
                 IndexingServerConfiguration.PROPERTY_INSTANCE_ID_DEFAULT);
-        this.numInstances = config.getInt(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES,
+        this.bootstrapNumInstances = config.getInt(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES,
                 IndexingServerConfiguration.PROPERTY_NUM_INSTANCES_DEFAULT);
+        this.currentNumInstances = this.bootstrapNumInstances;
     }
 
     private MetadataStorageManager buildMetadataStorageManager() {
@@ -605,16 +624,27 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             return t;
         });
 
-        // Validate instance identity
-        if (numInstances < 1) {
-            throw new IllegalArgumentException("numInstances must be >= 1, got " + numInstances);
+        // Validate instance identity. The bootstrap numInstances is a lower
+        // bound on the engine's identity range; the running value may grow
+        // when a REBALANCE entry arrives, so we accept any instanceId
+        // strictly less than the bootstrap value here. Pods with an
+        // instanceId outside that range are intended to come up with
+        // bootstrapFromRebalance=true and will be activated by the next
+        // REBALANCE entry.
+        if (bootstrapNumInstances < 1) {
+            throw new IllegalArgumentException("numInstances must be >= 1, got " + bootstrapNumInstances);
         }
-        if (instanceId < 0 || instanceId >= numInstances) {
+        if (instanceId < 0) {
+            throw new IllegalArgumentException("instanceId must be >= 0, got " + instanceId);
+        }
+        if (!config.isBootstrapFromRebalance() && instanceId >= bootstrapNumInstances) {
             throw new IllegalArgumentException(
-                    "instanceId must be in [0, " + (numInstances - 1) + "], got " + instanceId);
+                    "instanceId must be in [0, " + (bootstrapNumInstances - 1) + "], got " + instanceId
+                            + "; for a fresh joining replica set "
+                            + IndexingServerConfiguration.PROPERTY_BOOTSTRAP_FROM_REBALANCE + "=true");
         }
-        LOGGER.log(Level.INFO, "Instance identity: instanceId={0}, numInstances={1}",
-                new Object[]{instanceId, numInstances});
+        LOGGER.log(Level.INFO, "Instance identity: instanceId={0}, bootstrapNumInstances={1}",
+                new Object[]{instanceId, bootstrapNumInstances});
 
         // Boot MetadataStorageManager if not injected
         if (metadataStorageManager == null) {
@@ -817,6 +847,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     public LogSequenceNumber getLastProcessedLsn() {
         return lastProcessedLsn;
+    }
+
+    /**
+     * Test-only: drive an entry through the same path the live tailer uses,
+     * including the transaction buffer (so BEGINTRANSACTION /
+     * COMMITTRANSACTION / ROLLBACKTRANSACTION work end-to-end without
+     * having to spin up a real commit log).
+     */
+    // package-private for testing
+    void processEntryForTest(LogSequenceNumber lsn, LogEntry entry) {
+        processEntry(lsn, entry);
     }
 
     /**
@@ -1113,42 +1154,30 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     }
 
     /**
-     * Per-index ownership decision for a given primary key.
+     * Per-key ownership decision for a given vector index using this engine's
+     * current number of instances.
      *
-     * <p>Each vector index carries its own {@code numShards} and
-     * {@code numInstances} in {@link Index#properties}. Both are baked at
-     * CREATE INDEX time and immutable for the life of the index, so a
-     * cluster-wide rebalance does not move data: an index created when
-     * {@code numInstances=2} keeps that mapping forever; only indexes
-     * created after the rebalance use the new value.
+     * <p>{@code numShards} is a per-index property (set at CREATE INDEX time)
+     * because it controls hash-bucket granularity within the index — it does
+     * not move data, just decides how many distinct buckets exist.
      *
-     * <p>{@link VectorIndexManager#PROP_NUM_INSTANCES} is missing on indexes
-     * created before this property existed; in that case we fall back to the
-     * engine's JVM-property bootstrap value ({@link #numInstances}).
+     * <p>{@code numInstances} is engine-wide and mutable: the
+     * {@link #handleRebalanceEntry} path updates it on the fly when a
+     * {@code INDEXING_SERVICE_REBALANCE} log entry is observed. Existing
+     * data on the previous owners stays where it is, but every subsequent
+     * write routes by the new value — so a freshly-added pod starts owning
+     * a share of NEW writes against EVERY existing vector index, without
+     * any data migration.
      */
     boolean isAcceptedLocally(Bytes key, Index index) {
-        int indexNumInstances = getNumInstancesForIndex(index);
+        int n = currentNumInstances;
         int indexNumShards = getNumShardsForIndex(index);
-        if (indexNumInstances <= 1 || indexNumShards <= 1) {
+        if (n <= 1 || indexNumShards <= 1) {
             return true;
         }
         long hash = XXHash64Utils.hash(key.getBuffer(), key.getOffset(), key.getLength());
         int shardId = Math.floorMod((int) hash, indexNumShards);
-        return shardId % indexNumInstances == instanceId;
-    }
-
-    private int getNumInstancesForIndex(Index index) {
-        String val = index.properties.get(VectorIndexManager.PROP_NUM_INSTANCES);
-        if (val != null) {
-            try {
-                return Integer.parseInt(val);
-            } catch (NumberFormatException e) {
-                LOGGER.log(Level.WARNING,
-                        "Invalid {0} on index {1}: {2}; falling back to engine bootstrap value {3}",
-                        new Object[]{VectorIndexManager.PROP_NUM_INSTANCES, index.name, val, numInstances});
-            }
-        }
-        return numInstances;
+        return shardId % n == instanceId;
     }
 
     private int getNumShardsForIndex(Index index) {
@@ -1208,19 +1237,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         Record record = new Record(entry.key, entry.value);
         DataAccessorForFullRecord accessor = new DataAccessorForFullRecord(table, record);
         for (Index idx : vectorIndexes) {
-            // Per-index ownership: skip indexes for which this instance is
-            // not the owner of the key. Without this filter, an UPDATE would
-            // unconditionally addVector on every replica and create phantom
-            // vectors on non-owners (whose store should not contain the key).
-            if (!isAcceptedLocally(entry.key, idx)) {
-                continue;
-            }
             AbstractVectorStore store = vectorStores.get(storeKey(tableName, idx.name));
             if (store == null) {
                 continue;
             }
-            // Remove old entry, add new one
+            // Broadcast the remove: a rebalance may have left stale copies of
+            // this key on previous owners that no longer own it under the
+            // current numInstances; we have to clean them up wherever they
+            // sit. The add side is filtered: only the current owner under
+            // the new mapping installs the new vector — otherwise we'd
+            // phantom-add the key onto every replica.
             store.removeVector(entry.key);
+            if (!isAcceptedLocally(entry.key, idx)) {
+                continue;
+            }
             float[] vector = extractVector(accessor, store.getVectorColumnName());
             if (vector != null) {
                 store.addVector(entry.key, vector);
@@ -1234,13 +1264,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         if (vectorIndexes.isEmpty()) {
             return;
         }
+        // Broadcast: every replica calls removeVector unconditionally.
+        // After a rebalance, the same primary key may sit on TWO replicas at
+        // once — on its original owner under the old numInstances (the
+        // historical write) AND on its new owner under the new numInstances
+        // (a subsequent re-INSERT or UPDATE). A filtered DELETE would only
+        // hit one of them and leak the other; broadcast guarantees the key
+        // disappears from everywhere. removeVector is a no-op on replicas
+        // that never had the key, so the cost is a single map lookup.
         for (Index idx : vectorIndexes) {
-            // Per-index ownership: removeVector is a no-op for non-owners
-            // (they never had the key), but the explicit filter avoids the
-            // store lookup and matches the INSERT/UPDATE filter shape.
-            if (!isAcceptedLocally(entry.key, idx)) {
-                continue;
-            }
             AbstractVectorStore store = vectorStores.get(storeKey(tableName, idx.name));
             if (store != null) {
                 store.removeVector(entry.key);
@@ -1250,10 +1282,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     /**
      * Processes an {@link LogEntryType#INDEXING_SERVICE_REBALANCE} entry.
-     * For an active engine this is a near-no-op: routing already lives on
-     * each {@link Index}'s {@code PROP_NUM_INSTANCES}, so the only side
-     * effect is updating {@link #lastObservedRebalance} for diagnostics and
-     * bumping {@link #observedRebalanceEpoch}.
+     * Updates {@link #currentNumInstances} from the descriptor so every
+     * subsequent routing decision uses the new value (existing data on
+     * previous owners stays put — search fans out across all replicas
+     * regardless), and bumps {@link #observedRebalanceEpoch}.
      *
      * <p>Lower-or-equal epochs are silently ignored to keep log replay
      * idempotent. The JOINING fallback path (Step 7) overrides this with
@@ -1292,6 +1324,19 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     new Object[]{descriptor.epoch,
                             descriptor.tables.size(), descriptor.vectorIndexes.size()});
         }
+        // Update the engine's effective numInstances. This is the load-bearing
+        // change of the REBALANCE entry: from this LSN onward every routing
+        // decision uses the new value. Existing data on previous owners stays
+        // where it is (search fans out across all replicas anyway), but new
+        // writes are spread across the new owner set — including freshly
+        // added pods, for EVERY existing vector index.
+        int previousN = currentNumInstances;
+        currentNumInstances = descriptor.defaultNumInstances;
+        if (previousN != currentNumInstances) {
+            LOGGER.log(Level.INFO,
+                    "currentNumInstances {0} -> {1} (REBALANCE epoch={2})",
+                    new Object[]{previousN, currentNumInstances, descriptor.epoch});
+        }
         // Always advance the high-water mark to the OBSERVED value, even if
         // the JOINING bootstrap accepted an older epoch — subsequent REBALANCE
         // entries with strictly higher epochs will then be processed normally.
@@ -1303,6 +1348,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 "Observed REBALANCE epoch={0} defaultNumInstances={1} tables={2} vectorIndexes={3}",
                 new Object[]{descriptor.epoch, descriptor.defaultNumInstances,
                         descriptor.tables.size(), descriptor.vectorIndexes.size()});
+    }
+
+    /** Test- and diagnostics-only accessor for the engine's current effective numInstances. */
+    public int getCurrentNumInstances() {
+        return currentNumInstances;
     }
 
     /**

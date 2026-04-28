@@ -69,16 +69,18 @@ public class TableSpace {
     public final long metadataStorageCreationTime;
 
     /**
-     * Default number of indexing-service primary instances stamped onto a
-     * vector index at CREATE INDEX time (as
-     * {@link herddb.index.vector.VectorIndexManager#PROP_NUM_INSTANCES}).
-     * Updated by the {@code EXECUTE INDEXING_SERVICE_REBALANCE N} SQL
-     * command. Defaults to {@value #DEFAULT_INDEXING_NUM_INSTANCES_DEFAULT};
-     * older serialized payloads (version 1) deserialise to the default.
+     * Number of indexing-service primary instances the cluster is currently
+     * sized for. The {@code EXECUTE INDEXING_SERVICE_REBALANCE N} SQL command
+     * updates this field and writes a {@code INDEXING_SERVICE_REBALANCE} log
+     * entry that tells every indexing-service replica to switch its routing
+     * to the new value. Existing on-disk vector data is NOT moved by a
+     * rebalance — it stays on its original owner — but every subsequent
+     * INSERT/UPDATE/DELETE is routed by the new value, so a freshly-added
+     * pod immediately starts owning a share of new writes against EVERY
+     * existing vector index.
      *
-     * <p>This value affects only newly-created vector indexes — existing
-     * indexes keep the {@code PROP_NUM_INSTANCES} stamped at their own
-     * CREATE INDEX time, so a rebalance does not move historical data.
+     * <p>Defaults to {@value #DEFAULT_INDEXING_NUM_INSTANCES_DEFAULT}; older
+     * serialized payloads (version 1) deserialise to the default.
      */
     public final int defaultIndexingNumInstances;
 
