@@ -62,6 +62,35 @@ public class VectorBench {
         return sb.toString();
     }
 
+    /**
+     * Returns the SQL used to check whether the vector index {@code vidx} already exists
+     * for a given table in the {@code herd} tablespace.
+     * The query uses a positional parameter ({@code ?}) for the table name.
+     */
+    static String buildVectorIndexExistsSql() {
+        return "SELECT index_name FROM herd.sysindexes"
+                + " WHERE table_name=? AND index_name='vidx' AND index_type='vector'";
+    }
+
+    /**
+     * Returns {@code true} if the vector index {@code vidx} already exists for
+     * {@link Config#tableName} in the {@code herd} tablespace.
+     * <p>
+     * Called before each {@code CREATE VECTOR INDEX} attempt so the benchmark skips
+     * creation and logs a notice rather than crashing with
+     * {@code IndexAlreadyExistsException} when a previous run already built the index.
+     * </p>
+     */
+    static boolean vectorIndexExists(Config config) throws java.sql.SQLException {
+        try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+             java.sql.PreparedStatement ps = conn.prepareStatement(buildVectorIndexExistsSql())) {
+            ps.setString(1, config.tableName);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
     /** Runs a task with a progress spinner and returns elapsed wall-clock seconds. */
     private static double runWithProgress(BenchOutput out, String phase, String label, SqlTask task) throws Exception {
         if (!out.suppressesText()) {
@@ -131,6 +160,10 @@ public class VectorBench {
         double ingestionWallSecs = -1, indexWallSecs = -1, queryWallSecs = -1;
         double checkpointPostIngestSecs = -1, checkpointPostIndexSecs = -1;
         double waitForIndexesSecs = -1;
+        // True only when a post-ingest CREATE VECTOR INDEX was actually executed this run
+        // (not skipped via --skip-index, not created pre-ingest, and not already present).
+        // Used to gate the Phase 5b checkpoint so we don't checkpoint when nothing changed.
+        boolean indexCreatedPostIngest = false;
         long ingestionRows = 0;
         double ingestionThroughput = 0;
         MetricsCollector.Stats ingestionLatency = null;
@@ -205,14 +238,21 @@ public class VectorBench {
 
         // Phase 4a: Index creation before ingestion (if requested)
         if (config.indexBeforeIngest && !config.skipIndex) {
-            String indexSql = buildCreateVectorIndexSql(config);
-            out.info("Executing (pre-ingest): " + indexSql);
-            indexWallSecs = runWithProgress(out, "index_creation", "=== INDEX CREATION (pre-ingest) ===", () -> {
-                try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
-                     Statement stmt = conn.createStatement()) {
-                    stmt.execute(indexSql);
-                }
-            });
+            if (vectorIndexExists(config)) {
+                out.info("Vector index 'vidx' already exists — skipping CREATE VECTOR INDEX.");
+                out.info("  Note: index parameters (m, beamWidth, similarity, numShards) cannot be"
+                        + " verified automatically. If they changed since the index was built,"
+                        + " drop and recreate the index manually.");
+            } else {
+                String indexSql = buildCreateVectorIndexSql(config);
+                out.info("Executing (pre-ingest): " + indexSql);
+                indexWallSecs = runWithProgress(out, "index_creation", "=== INDEX CREATION (pre-ingest) ===", () -> {
+                    try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+                         Statement stmt = conn.createStatement()) {
+                        stmt.execute(indexSql);
+                    }
+                });
+            }
         }
 
         // Phase 4: Ingestion
@@ -528,20 +568,29 @@ public class VectorBench {
 
         // Phase 5: Index creation (post-ingest, unless already created before ingestion)
         if (!config.skipIndex && !config.indexBeforeIngest) {
-            String indexSql = buildCreateVectorIndexSql(config);
-            out.info("Executing: " + indexSql);
-            indexWallSecs = runWithProgress(out, "index_creation", "=== INDEX CREATION ===", () -> {
-                try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
-                     Statement stmt = conn.createStatement()) {
-                    stmt.execute(indexSql);
-                }
-            });
+            if (vectorIndexExists(config)) {
+                out.info("Vector index 'vidx' already exists — skipping CREATE VECTOR INDEX.");
+                out.info("  Note: index parameters (m, beamWidth, similarity, numShards) cannot be"
+                        + " verified automatically. If they changed since the index was built,"
+                        + " drop and recreate the index manually.");
+            } else {
+                String indexSql = buildCreateVectorIndexSql(config);
+                out.info("Executing: " + indexSql);
+                indexWallSecs = runWithProgress(out, "index_creation", "=== INDEX CREATION ===", () -> {
+                    try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
+                         Statement stmt = conn.createStatement()) {
+                        stmt.execute(indexSql);
+                    }
+                });
+                indexCreatedPostIngest = true;
+            }
         } else if (config.skipIndex) {
             out.info("Skipping index creation.");
         }
 
-        // Phase 5b: Checkpoint after index creation
-        if (config.checkpoint && !config.skipIndex && !config.indexBeforeIngest) {
+        // Phase 5b: Checkpoint after index creation — only when a post-ingest index was
+        // actually created this run (not skipped because it already existed or via --skip-index).
+        if (config.checkpoint && indexCreatedPostIngest) {
             out.info("Executing checkpoint with timeout " + config.checkpointTimeoutSeconds + "s ...");
             checkpointPostIndexSecs = runWithProgress(out, "checkpoint_post_index", "=== CHECKPOINT (post-index) ===", () -> {
                 try (Connection conn = DriverManager.getConnection(config.effectiveJdbcUrl(), config.username, config.password);
