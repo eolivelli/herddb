@@ -108,9 +108,9 @@ spec:
             httpGet:
               path: /metrics
               port: {{ .Values.indexingService.httpPort }}
-            initialDelaySeconds: 30
-            periodSeconds: 15
-            failureThreshold: 3
+            initialDelaySeconds: {{ .Values.indexingService.livenessProbe.initialDelaySeconds | default 30 }}
+            periodSeconds: {{ .Values.indexingService.livenessProbe.periodSeconds | default 15 }}
+            failureThreshold: {{ .Values.indexingService.livenessProbe.failureThreshold | default 3 }}
           resources:
             {{- toYaml .Values.indexingService.resources | nindent 12 }}
           volumeMounts:
