@@ -1,0 +1,52 @@
+suite: prometheus PodDisruptionBudget
+templates:
+  - templates/prometheus-pdb.yaml
+tests:
+  - it: should not render by default (prometheus disabled, pdb disabled)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when prometheus.enabled is true but pdb is off
+    set:
+      prometheus.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when pdb is on but prometheus.enabled is false
+    set:
+      prometheus.pdb.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render when prometheus.enabled and prometheus.pdb.enabled
+    set:
+      prometheus.enabled: true
+      prometheus.pdb.enabled: true
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-herddb-prometheus
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: prometheus
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: prometheus
+
+  - it: should honour a custom prometheus.pdb.minAvailable value
+    set:
+      prometheus.enabled: true
+      prometheus.pdb.enabled: true
+      prometheus.pdb.minAvailable: 2
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 2

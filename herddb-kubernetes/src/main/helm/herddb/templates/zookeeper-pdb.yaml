@@ -1,0 +1,15 @@
+{{- if and .Values.zookeeper.enabled .Values.zookeeper.pdb.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "herddb.fullname" . }}-zookeeper
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: zookeeper
+spec:
+  minAvailable: {{ .Values.zookeeper.pdb.minAvailable | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: zookeeper
+{{- end }}

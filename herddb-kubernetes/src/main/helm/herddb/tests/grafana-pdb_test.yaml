@@ -1,0 +1,52 @@
+suite: grafana PodDisruptionBudget
+templates:
+  - templates/grafana-pdb.yaml
+tests:
+  - it: should not render by default (grafana disabled, pdb disabled)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when grafana.enabled is true but pdb is off
+    set:
+      grafana.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when pdb is on but grafana.enabled is false
+    set:
+      grafana.pdb.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render when grafana.enabled and grafana.pdb.enabled
+    set:
+      grafana.enabled: true
+      grafana.pdb.enabled: true
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-herddb-grafana
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: grafana
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: grafana
+
+  - it: should honour a custom grafana.pdb.minAvailable value
+    set:
+      grafana.enabled: true
+      grafana.pdb.enabled: true
+      grafana.pdb.minAvailable: 2
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 2

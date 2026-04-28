@@ -1,0 +1,15 @@
+{{- if and .Values.minio.enabled .Values.minio.pdb.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "herddb.fullname" . }}-minio
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+spec:
+  minAvailable: {{ .Values.minio.pdb.minAvailable | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: minio
+{{- end }}

@@ -1,0 +1,15 @@
+{{- if and (eq .Values.server.storageMode "remote") .Values.fileServer.pdb.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "herddb.fullname" . }}-file-server
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: file-server
+spec:
+  minAvailable: {{ .Values.fileServer.pdb.minAvailable | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: file-server
+{{- end }}

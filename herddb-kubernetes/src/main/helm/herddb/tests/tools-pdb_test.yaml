@@ -1,0 +1,42 @@
+suite: tools PodDisruptionBudget
+templates:
+  - templates/tools-pdb.yaml
+tests:
+  - it: should render by default (tools.enabled and tools.pdb.enabled both default true)
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-herddb-tools
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: tools
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: tools
+
+  - it: should honour a custom tools.pdb.minAvailable value
+    set:
+      tools.pdb.minAvailable: 2
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 2
+
+  - it: should not render when tools.pdb.enabled is false
+    set:
+      tools.pdb.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when tools.enabled is false
+    set:
+      tools.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

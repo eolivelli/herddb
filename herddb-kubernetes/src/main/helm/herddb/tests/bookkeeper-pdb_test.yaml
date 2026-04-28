@@ -1,0 +1,52 @@
+suite: bookkeeper PodDisruptionBudget
+templates:
+  - templates/bookkeeper-pdb.yaml
+tests:
+  - it: should not render by default (bookkeeper disabled, pdb disabled)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when bookkeeper.enabled is true but pdb is off
+    set:
+      bookkeeper.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when pdb is on but bookkeeper.enabled is false
+    set:
+      bookkeeper.pdb.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render when bookkeeper.enabled and bookkeeper.pdb.enabled
+    set:
+      bookkeeper.enabled: true
+      bookkeeper.pdb.enabled: true
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-herddb-bookkeeper
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: bookkeeper
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: bookkeeper
+
+  - it: should honour a custom bookkeeper.pdb.minAvailable value
+    set:
+      bookkeeper.enabled: true
+      bookkeeper.pdb.enabled: true
+      bookkeeper.pdb.minAvailable: 2
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 2

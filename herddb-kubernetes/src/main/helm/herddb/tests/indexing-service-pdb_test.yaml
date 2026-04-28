@@ -1,0 +1,52 @@
+suite: indexing-service PodDisruptionBudget
+templates:
+  - templates/indexing-service-pdb.yaml
+tests:
+  - it: should not render by default (indexingService disabled, pdb disabled)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when indexingService.enabled is true but pdb is off
+    set:
+      indexingService.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when pdb is on but indexingService.enabled is false
+    set:
+      indexingService.pdb.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render when indexingService.enabled and indexingService.pdb.enabled
+    set:
+      indexingService.enabled: true
+      indexingService.pdb.enabled: true
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-herddb-indexing-service
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: indexing-service
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: indexing-service
+
+  - it: should honour a custom indexingService.pdb.minAvailable value
+    set:
+      indexingService.enabled: true
+      indexingService.pdb.enabled: true
+      indexingService.pdb.minAvailable: 2
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 2
