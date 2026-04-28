@@ -22,11 +22,16 @@ package herddb.vectortesting;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.OutputStream;
+import java.io.PrintStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -414,6 +419,79 @@ class VectorBenchTest {
         org.junit.jupiter.api.Assertions.assertTrue(
                 sql.contains("table_name=?"),
                 "SQL must use a positional parameter (?) for table_name; got: " + sql);
+    }
+
+    // -----------------------------------------------------------------------
+    // runWithProgress tests (issue #329)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Issue #329: an exception thrown by the task inside runWithProgress must be
+     * re-thrown on the calling thread so that the JVM exits with a non-zero code.
+     * Previously, a visibility race between the worker thread and the main thread
+     * (no happens-before when the last join(500) timed out) could leave the caller
+     * unaware of the failure and allow execution to continue normally to System.exit(0).
+     */
+    @Test
+    void runWithProgressPropagatesCheckedExceptionFromWorkerThread() throws Exception {
+        BenchOutput out = BenchOutput.create(
+                Config.parse(new String[]{"--no-progress"}),
+                new PrintStream(OutputStream.nullOutputStream()));
+
+        SQLException cause = new SQLException("WAITFORINDEXES timed out after 1800000 ms");
+
+        Exception thrown = assertThrows(SQLException.class, () ->
+                VectorBench.runWithProgress(out, "test_phase", "=== TEST ===", () -> {
+                    throw cause;
+                }));
+
+        assertSame(cause, thrown,
+                "runWithProgress must re-throw the exact exception from the worker thread");
+    }
+
+    /**
+     * Issue #329: an Error (e.g. OutOfMemoryError) thrown by the task must also be
+     * surfaced to the caller. Previously, only Exception was caught; an Error would be
+     * silently swallowed by the thread's UncaughtExceptionHandler and the caller would
+     * see a successful return.
+     */
+    @Test
+    void runWithProgressPropagatesErrorFromWorkerThread() {
+        BenchOutput out;
+        try {
+            out = BenchOutput.create(
+                    Config.parse(new String[]{"--no-progress"}),
+                    new PrintStream(OutputStream.nullOutputStream()));
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
+        Error cause = new OutOfMemoryError("simulated OOM");
+
+        RuntimeException wrapped = assertThrows(RuntimeException.class, () ->
+                VectorBench.runWithProgress(out, "test_phase", "=== TEST ===", () -> {
+                    throw cause;
+                }));
+
+        assertSame(cause, wrapped.getCause(),
+                "runWithProgress must wrap Error in RuntimeException and preserve the cause");
+    }
+
+    /**
+     * Sanity check: runWithProgress must return a positive elapsed time when the
+     * task completes successfully.
+     */
+    @Test
+    void runWithProgressReturnsTotalElapsedSecondsOnSuccess() throws Exception {
+        BenchOutput out = BenchOutput.create(
+                Config.parse(new String[]{"--no-progress"}),
+                new PrintStream(OutputStream.nullOutputStream()));
+
+        double elapsed = VectorBench.runWithProgress(out, "test_phase", "=== TEST ===", () -> {
+            // no-op task — completes immediately
+        });
+
+        assertTrue(elapsed >= 0.0, "elapsed time must be non-negative");
     }
 
     private static void writeLittleEndianInt(DataOutputStream dos, int value) throws Exception {

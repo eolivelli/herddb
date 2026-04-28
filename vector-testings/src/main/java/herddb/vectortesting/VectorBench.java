@@ -91,20 +91,31 @@ public class VectorBench {
         }
     }
 
-    /** Runs a task with a progress spinner and returns elapsed wall-clock seconds. */
-    private static double runWithProgress(BenchOutput out, String phase, String label, SqlTask task) throws Exception {
+    /**
+     * Runs a task with a progress spinner and returns elapsed wall-clock seconds.
+     * Any exception (or error) thrown by the task is captured and re-thrown on the
+     * calling thread so that the JVM exits with a non-zero code instead of swallowing
+     * the failure silently.
+     */
+    static double runWithProgress(BenchOutput out, String phase, String label, SqlTask task) throws Exception {
         if (!out.suppressesText()) {
             out.header(label);
         }
         out.phaseStart(phase);
         long startNs = System.nanoTime();
-        Exception[] err = {null};
+        // AtomicReference provides volatile read/write semantics so the error written
+        // by the worker thread is always visible to the calling thread after join().
+        AtomicReference<Throwable> workerError = new AtomicReference<>();
 
         Thread worker = new Thread(() -> {
             try {
                 task.run();
-            } catch (Exception e) {
-                err[0] = e;
+            } catch (Throwable t) {
+                // Catch Throwable — not just Exception — so that Errors such as
+                // OutOfMemoryError are also propagated to the caller rather than
+                // silently swallowed by the thread's default UncaughtExceptionHandler,
+                // which would leave the main thread unaware of the failure.
+                workerError.set(t);
             }
         });
         worker.start();
@@ -115,12 +126,19 @@ public class VectorBench {
             out.progress(phase, elapsed, null, fields);
             worker.join(500);
         }
+        // Unconditional join() after the loop establishes a happens-before relationship
+        // between the worker's last write (workerError.set) and our read below, even when
+        // the final worker.join(500) inside the loop timed out before the worker died.
+        worker.join();
 
         double totalSecs = (System.nanoTime() - startNs) / 1e9;
         out.phaseDone(phase, totalSecs);
 
-        if (err[0] != null) {
-            throw err[0];
+        Throwable t = workerError.get();
+        if (t instanceof Exception) {
+            throw (Exception) t;
+        } else if (t != null) {
+            throw new RuntimeException("Benchmark phase failed: " + t.getMessage(), t);
         }
         return totalSecs;
     }
