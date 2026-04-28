@@ -1132,8 +1132,15 @@ public class BookkeeperCommitLog extends CommitLog {
                 ledgerToTail = actualList.get(0);
             }
             if (!actualList.contains(ledgerToTail)) {
-                throw new LogNotAvailableException(tableSpaceDescription() + " First Ledger to open " + ledgerToTail
-                        + ", is not in the activer ledgers list " + actualList);
+                // Permanent when every active ledger is newer than the one we
+                // need: the required ledger has been dropped and retrying will
+                // never help.
+                boolean permanent = !actualList.isEmpty()
+                        && actualList.stream().allMatch(id -> id > ledgerToTail);
+                throw new LogNotAvailableException(
+                        tableSpaceDescription() + " First Ledger to open " + ledgerToTail
+                                + ", is not in the activer ledgers list " + actualList,
+                        permanent);
             }
             // no ledger opened, we are booting
             if (currentLedger == null) {

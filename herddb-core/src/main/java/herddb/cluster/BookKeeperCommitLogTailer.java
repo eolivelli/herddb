@@ -132,6 +132,20 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
                         if (!running) {
                             break;
                         }
+                        if (e.isPermanent()) {
+                            // The required ledger has been dropped and all active
+                            // ledgers are newer. Retrying will never succeed.
+                            // Stop the tailer so that the IS process (or its
+                            // supervisor) can restart and recover.
+                            LOGGER.log(Level.SEVERE,
+                                    "Commit-log tailer detected a permanent ledger gap at watermark {0}: "
+                                    + "the required ledger has been dropped from the active list. "
+                                    + "Stopping tailer — the indexing-service instance must be restarted. "
+                                    + "Error: {1}",
+                                    new Object[]{watermark, e.getMessage()});
+                            running = false;
+                            break;
+                        }
                         consecutiveErrors++;
                         LOGGER.log(Level.WARNING,
                                 "Error tailing BookKeeper log (consecutive errors: {0}), retrying",

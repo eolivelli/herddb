@@ -90,6 +90,21 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
     private final CountDownLatch serversReadyLatch = new CountDownLatch(1);
 
     /**
+     * High-water mark of distinct channel addresses ever present in any
+     * snapshot. Written only inside the constructor (single-threaded setup)
+     * and inside {@link #updateInstances(List)} ({@code synchronized}).
+     * A {@code volatile} read is sufficient for the unsynchronised
+     * {@link #getMinProcessedLsn} hot-path.
+     *
+     * <p>Used to detect when an IS instance has been temporarily removed from
+     * ZK (e.g. due to a GC pause or pod restart). When the current snapshot
+     * has fewer channels than the peak, commit-log retention is pinned to
+     * {@link LogSequenceNumber#START_OF_TIME} so that the server never drops
+     * ledgers that the absent instance might still need. See issue #331.
+     */
+    private volatile int peakChannelCount = 0;
+
+    /**
      * A single gRPC endpoint: an address + open channel, plus the role and
      * effective instanceId needed to group it into a pool.
      */
@@ -183,7 +198,9 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                                  long timeoutSeconds, ClientInterceptor clientInterceptor) {
         this.timeoutSeconds = timeoutSeconds;
         this.clientInterceptor = clientInterceptor;
-        this.snapshot = buildSnapshot(instances, Collections.emptyMap());
+        ServerSnapshot initial = buildSnapshot(instances, Collections.emptyMap());
+        this.snapshot = initial;
+        this.peakChannelCount = initial.channels.size();
         if (!instances.isEmpty()) {
             this.serversReadyLatch.countDown();
         }
@@ -243,6 +260,11 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
 
         Set<String> removed = new LinkedHashSet<>(current.channels.keySet());
         removed.removeAll(next.channels.keySet());
+
+        // Maintain high-water mark so getMinProcessedLsn can detect absent instances.
+        if (next.channels.size() > peakChannelCount) {
+            peakChannelCount = next.channels.size();
+        }
 
         this.snapshot = next;
         serversReadyLatch.countDown();
@@ -608,6 +630,24 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
         if (s.channels.isEmpty()) {
             return Optional.empty();
         }
+
+        // If fewer IS instances are reachable than the peak ever seen, at least
+        // one instance has temporarily left ZK (e.g. GC pause, pod restart).
+        // Pin retention to START_OF_TIME so the server never drops commit-log
+        // ledgers that the absent instance might still need when it comes back.
+        // Issue #331: without this guard, dropOldLedgers used only the
+        // connected instance's position as the floor, dropping ledgers that
+        // the offline instance required — making it permanently unrecoverable.
+        int peak = peakChannelCount;
+        if (s.channels.size() < peak) {
+            LOGGER.log(Level.WARNING,
+                    "getMinProcessedLsn: only {0}/{1} IS instance(s) reachable for tablespace {2} "
+                    + "(peak was {1}); pinning commit-log retention at START_OF_TIME to protect "
+                    + "the absent instance(s)'' commit-log position",
+                    new Object[]{s.channels.size(), peak, tablespace});
+            return Optional.of(LogSequenceNumber.START_OF_TIME);
+        }
+
         LogSequenceNumber min = null;
         for (Map.Entry<String, ManagedChannel> serverEntry : s.channels.entrySet()) {
             String server = serverEntry.getKey();
