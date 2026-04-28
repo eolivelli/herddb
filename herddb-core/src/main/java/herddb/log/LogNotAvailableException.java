@@ -29,16 +29,40 @@ import herddb.core.HerdDBInternalException;
  */
 public class LogNotAvailableException extends HerdDBInternalException {
 
+    /**
+     * When {@code true} the error is permanent: the required ledger is
+     * confirmed absent from the active-ledgers list and all active ledgers
+     * have higher IDs. Retrying will never succeed; the tailer must stop.
+     */
+    private final boolean permanent;
+
     public LogNotAvailableException(String message) {
         super(message);
+        this.permanent = false;
+    }
+
+    public LogNotAvailableException(String message, boolean permanent) {
+        super(message);
+        this.permanent = permanent;
     }
 
     public LogNotAvailableException(String message, Throwable cause) {
         super(message, cause);
+        this.permanent = false;
     }
 
     public LogNotAvailableException(Throwable cause) {
         super(cause);
+        this.permanent = false;
+    }
+
+    /**
+     * Returns {@code true} when the error is permanent: the required ledger
+     * has been dropped and all remaining active ledgers are newer. Retrying
+     * will never resolve this condition; the tailer should stop.
+     */
+    public boolean isPermanent() {
+        return permanent;
     }
 
 }
