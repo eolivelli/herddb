@@ -1,0 +1,15 @@
+{{- if and .Values.grafana.enabled .Values.grafana.pdb.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "herddb.fullname" . }}-grafana
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+spec:
+  minAvailable: {{ .Values.grafana.pdb.minAvailable | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: grafana
+{{- end }}

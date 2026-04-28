@@ -1,0 +1,52 @@
+suite: minio PodDisruptionBudget
+templates:
+  - templates/minio-pdb.yaml
+tests:
+  - it: should not render by default (minio disabled, pdb disabled)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when minio.enabled is true but pdb is off
+    set:
+      minio.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when pdb is on but minio.enabled is false
+    set:
+      minio.pdb.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render when minio.enabled and minio.pdb.enabled
+    set:
+      minio.enabled: true
+      minio.pdb.enabled: true
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-herddb-minio
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: minio
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: minio
+
+  - it: should honour a custom minio.pdb.minAvailable value
+    set:
+      minio.enabled: true
+      minio.pdb.enabled: true
+      minio.pdb.minAvailable: 2
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 2

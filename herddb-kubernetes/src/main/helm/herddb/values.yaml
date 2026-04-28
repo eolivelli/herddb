@@ -42,6 +42,13 @@ server:
   loggingProperties: ""
   # Extra key=value entries appended to server.properties
   extraConfig: {}
+  # PodDisruptionBudget — blocks voluntary node evictions (cluster-autoscaler
+  # scale-down, kubectl drain) so that a single-replica server cannot be
+  # involuntarily killed mid-operation. Disabled by default; enable in
+  # production / long-running benchmarks (see issue #332).
+  pdb:
+    enabled: false
+    minAvailable: 1
   storage:
     data:
       size: 10Gi
@@ -105,6 +112,11 @@ fileServer:
     size: 10Gi
     storageClass: ""
   extraConfig: {}
+  # PodDisruptionBudget — see server.pdb above. Disabled by default; enable in
+  # production / long-running benchmarks (see issue #332).
+  pdb:
+    enabled: false
+    minAvailable: 1
   resources:
     requests:
       memory: "1Gi"
@@ -126,6 +138,11 @@ minio:
   storage:
     size: 10Gi
     storageClass: ""
+  # PodDisruptionBudget — see server.pdb above. Disabled by default; enable in
+  # production / long-running benchmarks (see issue #332).
+  pdb:
+    enabled: false
+    minAvailable: 1
   resources:
     requests:
       memory: "512Mi"
@@ -152,6 +169,15 @@ zookeeper:
   storage:
     size: 2Gi
     storageClass: ""
+  # PodDisruptionBudget — strongly recommended for ZooKeeper. The original
+  # motivation for the chart-wide PDB knob was a GKE cluster-autoscaler
+  # scale-down event that evicted herddb-zookeeper-0 and expired all client
+  # sessions, permanently losing a tablespace (issue #332). Disabled by
+  # default to keep the standalone helm install drainable; enable in any
+  # cluster-mode deployment.
+  pdb:
+    enabled: false
+    minAvailable: 1
   resources:
     requests:
       memory: "256Mi"
@@ -180,6 +206,11 @@ bookkeeper:
     ledger:
       size: 5Gi
       storageClass: ""
+  # PodDisruptionBudget — see server.pdb above. Disabled by default; enable in
+  # production / long-running benchmarks (see issue #332).
+  pdb:
+    enabled: false
+    minAvailable: 1
   resources:
     requests:
       memory: "512Mi"
@@ -222,6 +253,11 @@ indexingService:
     log:
       size: 5Gi
       storageClass: ""
+  # PodDisruptionBudget — see server.pdb above. Disabled by default; enable in
+  # production / long-running benchmarks (see issue #332).
+  pdb:
+    enabled: false
+    minAvailable: 1
   resources:
     requests:
       memory: "1Gi"
@@ -246,6 +282,7 @@ tools:
   # when tools is enabled. Set to false only for short-lived / disposable runs.
   pdb:
     enabled: true
+    minAvailable: 1
   gcs:
     # Kubernetes Secret containing GCS HMAC credentials (keys: S3_ACCESS_KEY, S3_SECRET_KEY).
     # When set, the tools pod can download datasets from gs:// URLs using the S3-compatible API.
@@ -281,6 +318,11 @@ prometheus:
   storage:
     size: 10Gi
     storageClass: ""
+  # PodDisruptionBudget — see server.pdb above. Disabled by default; enable in
+  # production / long-running benchmarks (see issue #332).
+  pdb:
+    enabled: false
+    minAvailable: 1
   resources:
     requests:
       memory: "512Mi"
@@ -296,6 +338,11 @@ grafana:
     repository: grafana/grafana
     tag: "11.1.0"
   port: 3000
+  # PodDisruptionBudget — see server.pdb above. Disabled by default; enable in
+  # production / long-running benchmarks (see issue #332).
+  pdb:
+    enabled: false
+    minAvailable: 1
   resources:
     requests:
       memory: "256Mi"

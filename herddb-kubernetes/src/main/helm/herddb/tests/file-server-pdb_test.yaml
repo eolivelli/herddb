@@ -1,0 +1,51 @@
+suite: file-server PodDisruptionBudget
+templates:
+  - templates/file-server-pdb.yaml
+tests:
+  - it: should not render by default (storageMode=remote, but pdb disabled)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render when fileServer.pdb.enabled is true
+    set:
+      fileServer.pdb.enabled: true
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-herddb-file-server
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: file-server
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: file-server
+
+  - it: should honour a custom fileServer.pdb.minAvailable value
+    set:
+      fileServer.pdb.enabled: true
+      fileServer.pdb.minAvailable: 2
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 2
+
+  - it: should not render when fileServer.pdb.enabled is false
+    set:
+      fileServer.pdb.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when server.storageMode is local even if pdb enabled
+    set:
+      server.storageMode: local
+      fileServer.pdb.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0

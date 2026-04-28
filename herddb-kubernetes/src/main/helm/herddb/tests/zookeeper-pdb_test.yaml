@@ -1,0 +1,52 @@
+suite: zookeeper PodDisruptionBudget
+templates:
+  - templates/zookeeper-pdb.yaml
+tests:
+  - it: should not render by default (zookeeper disabled, pdb disabled)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when zookeeper.enabled is true but pdb is off
+    set:
+      zookeeper.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should not render when pdb is on but zookeeper.enabled is false
+    set:
+      zookeeper.pdb.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render when zookeeper.enabled and zookeeper.pdb.enabled
+    set:
+      zookeeper.enabled: true
+      zookeeper.pdb.enabled: true
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-herddb-zookeeper
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: zookeeper
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: zookeeper
+
+  - it: should honour a custom zookeeper.pdb.minAvailable value
+    set:
+      zookeeper.enabled: true
+      zookeeper.pdb.enabled: true
+      zookeeper.pdb.minAvailable: 2
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 2

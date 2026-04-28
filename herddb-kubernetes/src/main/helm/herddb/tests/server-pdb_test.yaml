@@ -1,0 +1,43 @@
+suite: server PodDisruptionBudget
+templates:
+  - templates/server-pdb.yaml
+tests:
+  - it: should not render by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render when server.pdb.enabled is true
+    set:
+      server.pdb.enabled: true
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-herddb-server
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: server
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: server
+
+  - it: should honour a custom server.pdb.minAvailable value
+    set:
+      server.pdb.enabled: true
+      server.pdb.minAvailable: 2
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 2
+
+  - it: should not render when server.pdb.enabled is false
+    set:
+      server.pdb.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

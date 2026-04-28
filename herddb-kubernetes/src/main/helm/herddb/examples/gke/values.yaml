@@ -29,6 +29,13 @@
 #   bookkeeper      :   2 g heap +  1 g direct + 1 g =  4 g  (< 8 GiB)
 #   zookeeper       : 512 m heap + 512 m direct       = ~1 g  (< 4 GiB)
 
+#
+# PodDisruptionBudgets are enabled below for every workload that runs in this
+# example. The original motivation for this knob was a GKE cluster-autoscaler
+# scale-down event that evicted herddb-zookeeper-0 mid-benchmark, expired all
+# client sessions, and permanently lost a tablespace (see issue #332). On a
+# long-running benchmark, blocking voluntary evictions is the desired default.
+
 image:
   # Always re-pull so that re-pushed tags (common during active
   # benchmark iteration) are picked up on every pod restart.
@@ -40,6 +47,8 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
+  pdb:
+    enabled: true
   # Pin to europe-west4-a to keep all traffic within a single zone
   # (cross-zone egress in GKE is billed; same-zone traffic is free).
   nodeSelector:
@@ -123,6 +132,8 @@ server:
 
 fileServer:
   replicaCount: 2
+  pdb:
+    enabled: true
   # Pin to europe-west4-a (same-zone traffic is free).
   nodeSelector:
     topology.kubernetes.io/zone: "europe-west4-a"
@@ -171,6 +182,8 @@ minio:
 
 zookeeper:
   enabled: true
+  pdb:
+    enabled: true
   # Pin to europe-west4-a (same-zone traffic is free).
   nodeSelector:
     topology.kubernetes.io/zone: "europe-west4-a"
@@ -188,6 +201,8 @@ zookeeper:
 bookkeeper:
   enabled: true
   replicaCount: 2
+  pdb:
+    enabled: true
   # Pin to europe-west4-a (same-zone traffic is free).
   nodeSelector:
     topology.kubernetes.io/zone: "europe-west4-a"
@@ -264,6 +279,8 @@ indexingService:
   enabled: true
   storageMode: remote
   replicaCount: 2
+  pdb:
+    enabled: true
   # Request AVX-512 capable nodes for jvector acceleration.
   # europe-west4 (Netherlands) has both C3 (Intel Sapphire Rapids, AVX-512F/BW/VL/DQ/VNNI/FP16)
   # and C3D (AMD EPYC Genoa, AVX-512F/BW/VL/DQ/VNNI).  Either is a significant upgrade
@@ -351,6 +368,9 @@ indexingService:
 
 tools:
   enabled: true
+  # PDB is on by default for tools (see values.yaml); pinned here for clarity.
+  pdb:
+    enabled: true
   # Pin to europe-west4-a (same-zone traffic is free).
   nodeSelector:
     topology.kubernetes.io/zone: "europe-west4-a"
