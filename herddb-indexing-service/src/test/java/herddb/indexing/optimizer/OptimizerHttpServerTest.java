@@ -141,4 +141,57 @@ public class OptimizerHttpServerTest {
     public void portZeroSelectsFreePort() {
         assertTrue("bound port should be > 0", http.getBoundPort() > 0);
     }
+
+    @Test
+    public void healthReturns503WhenEngineHasNotTicked() throws Exception {
+        // Review-item B6: bring up a separate server with an aggressive 100ms staleness
+        // threshold + a manual clock. Run the engine once to seed the heartbeat, then
+        // advance the clock past the threshold WITHOUT ticking again — the next /health
+        // call must return 503.
+        java.util.concurrent.atomic.AtomicLong fakeClock =
+                new java.util.concurrent.atomic.AtomicLong(0L);
+        OptimizerHttpServer livenessHttp = new OptimizerHttpServer("127.0.0.1", 0, engine,
+                /* stalenessThresholdMillis */ 100L, fakeClock::get);
+        try {
+            livenessHttp.start();
+            // First call seeds the heartbeat.
+            engine.runOnce();
+            int code = headStatus("http://127.0.0.1:" + livenessHttp.getBoundPort() + "/health");
+            assertEquals(200, code);
+
+            // Advance the fake clock past the threshold without further ticks.
+            fakeClock.addAndGet(500L);
+            int code2 = headStatus("http://127.0.0.1:" + livenessHttp.getBoundPort() + "/health");
+            assertEquals("/health must return 503 when engine is stale", 503, code2);
+
+            // Tick the engine again; the next call refreshes the heartbeat.
+            engine.runOnce();
+            int code3 = headStatus("http://127.0.0.1:" + livenessHttp.getBoundPort() + "/health");
+            assertEquals(200, code3);
+        } finally {
+            livenessHttp.close();
+        }
+    }
+
+    private static int headStatus(String url) throws Exception {
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
+                new java.net.URL(url).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(2000);
+        conn.setReadTimeout(2000);
+        conn.connect();
+        int code = conn.getResponseCode();
+        try {
+            conn.getInputStream().close();
+        } catch (Exception ignored) {
+            // 503 path produces an error stream; drain it.
+            try {
+                if (conn.getErrorStream() != null) {
+                    conn.getErrorStream().close();
+                }
+            } catch (Exception ignored2) {
+            }
+        }
+        return code;
+    }
 }

@@ -319,12 +319,25 @@ public final class TombstoneOverlayManager {
                 throw new IOException("unexpected tombstone overlay version: " + header);
             }
             int uuidLen = readIntFully(reader);
+            // Bounds check (review-item B2 from second pr-reviewer pass): a malformed or
+            // malicious overlay must not be able to coerce us into allocating a multi-GB
+            // byte[] before we read any further. The cap is the same one used by
+            // TombstoneOverlay.deserialize for the in-memory path.
+            if (uuidLen < 0 || uuidLen > 1 << 12) {
+                throw new IOException("implausible segment uuid length: " + uuidLen);
+            }
             byte[] uuidBytes = new byte[uuidLen];
             reader.readFully(uuidBytes);
             long lsnLedgerId = readLongFully(reader);
             long lsnOffset = readLongFully(reader);
             long generation = readLongFully(reader);
             int count = readIntFully(reader);
+            // Same cap as TombstoneOverlay.MAX_TOMBSTONED_ORDINALS — a corrupted
+            // payload would otherwise force an int[] allocation of up to 8 GB.
+            if (count < 0 || count > TombstoneOverlay.MAX_TOMBSTONED_ORDINALS) {
+                throw new IOException("implausible tombstone count: " + count
+                        + " (max=" + TombstoneOverlay.MAX_TOMBSTONED_ORDINALS + ")");
+            }
             int[] ordinals = new int[count];
             for (int i = 0; i < count; i++) {
                 ordinals[i] = readIntFully(reader);

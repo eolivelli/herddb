@@ -113,4 +113,48 @@ public class TombstoneOverlayBoundsTest {
         assertEquals(4, roundtrip.ordinalCount());
         assertEquals(7, roundtrip.ordinalAt(3));
     }
+
+    /**
+     * Validates fix B2 from the second pr-reviewer pass: the production read path
+     * via {@link herddb.indexing.segment.TombstoneOverlayManager#loadOverlay}
+     * also enforces the {@code MAX_TOMBSTONED_ORDINALS} cap, not just the
+     * in-memory {@link TombstoneOverlay#deserialize}.
+     */
+    @Test
+    public void loadOverlayRejectsImplausibleCount() throws Exception {
+        // Build the overlay file ourselves and stage it through a real DSM.
+        java.nio.file.Path baseDir = java.nio.file.Files.createTempDirectory("herd-overlay-bounds");
+        herddb.file.FileDataStorageManager dsm = new herddb.file.FileDataStorageManager(baseDir);
+        try {
+            String ts = "ts";
+            String idxUuid = "idx";
+            String segUuid = "seg";
+            dsm.initTablespace(ts);
+            byte[] payload = buildPayload(TombstoneOverlay.MAX_TOMBSTONED_ORDINALS + 1);
+            java.nio.file.Path tmp = java.nio.file.Files.createTempFile(baseDir, "ov-", ".bin");
+            java.nio.file.Files.write(tmp, payload);
+            dsm.writeMultipartIndexFile(ts,
+                    herddb.indexing.segment.TombstoneOverlayManager.multipartUuidFor(idxUuid, segUuid),
+                    herddb.indexing.segment.TombstoneOverlayManager.fileTypeFor(1L),
+                    tmp, null);
+            try {
+                herddb.indexing.segment.TombstoneOverlayManager.loadOverlay(dsm, ts, idxUuid, segUuid, 1L);
+                fail("expected IOException for over-cap count");
+            } catch (IOException ok) {
+                assertTrue("error must mention count: " + ok.getMessage(),
+                        ok.getMessage().contains("implausible tombstone count"));
+            }
+        } finally {
+            dsm.close();
+            try (java.util.stream.Stream<java.nio.file.Path> walk =
+                    java.nio.file.Files.walk(baseDir)) {
+                walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                    try {
+                        java.nio.file.Files.deleteIfExists(p);
+                    } catch (IOException ignored) {
+                    }
+                });
+            }
+        }
+    }
 }

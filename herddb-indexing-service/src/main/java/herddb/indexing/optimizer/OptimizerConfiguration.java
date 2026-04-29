@@ -80,6 +80,18 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_RETENTION_MS = "indexoptimizer.retention.ms";
     public static final long PROPERTY_RETENTION_MS_DEFAULT = 10L * 60_000L;
 
+    /**
+     * When {@code true} (the default), the reaper does NOT physically delete
+     * graph/map/tombstone files at retention — it only removes the registry
+     * znode. Production deployments require the IS-side
+     * {@code SegmentAssignmentWatcher} to be wired before flipping this to
+     * {@code false}; otherwise the IS will fail to load on restart with
+     * file-not-found (review-item B1).
+     */
+    public static final String PROPERTY_SAFE_MODE_FILE_DELETION =
+            "indexoptimizer.safeMode.fileDeletion";
+    public static final boolean PROPERTY_SAFE_MODE_FILE_DELETION_DEFAULT = true;
+
     /** HTTP admin endpoint port (review item E1 + E3). 0 disables. */
     public static final String PROPERTY_HTTP_PORT = "indexoptimizer.http.port";
     public static final int PROPERTY_HTTP_PORT_DEFAULT = 9853;
@@ -106,5 +118,10 @@ public final class OptimizerConfiguration {
     public long getLong(String key, long defaultValue) {
         String v = properties.getProperty(key);
         return v == null ? defaultValue : Long.parseLong(v);
+    }
+
+    public boolean getBoolean(String key, boolean defaultValue) {
+        String v = properties.getProperty(key);
+        return v == null ? defaultValue : Boolean.parseBoolean(v);
     }
 }

@@ -1337,18 +1337,30 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         dataStorageManager.initIndex(tableSpaceUUID, indexUUID);
 
-        // Try to load existing state
+        // Try to load existing state. We separate "no prior state, start empty" (a
+        // DataStorageManagerException from getIndexStatus when there is no checkpoint
+        // yet) from "prior state exists but loadFromStatus rejected it" (a
+        // DataStorageManagerException from loadFromStatus, e.g. unsupported metadata
+        // version on rollback — review-item B4 from the second pr-reviewer pass).
+        // The first is benign and we swallow it; the second is operator-actionable
+        // and we propagate it so the boot fails fast instead of silently emptying
+        // the index.
+        IndexStatus status = null;
         try {
-            IndexStatus status = dataStorageManager.getIndexStatus(
+            status = dataStorageManager.getIndexStatus(
                     tableSpaceUUID, indexUUID, LogSequenceNumber.START_OF_TIME);
-            if (status != null && status.indexData != null && status.indexData.length > 0) {
-                loadFromStatus(status);
-                this.loadedLsn = status.sequenceNumber;
-            }
         } catch (DataStorageManagerException e) {
             LOGGER.log(Level.INFO,
                     "no existing state for PersistentVectorStore {0}, starting empty: {1}",
                     new Object[]{indexName, e.getMessage()});
+        }
+        if (status != null && status.indexData != null && status.indexData.length > 0) {
+            // Do NOT swallow exceptions from loadFromStatus — they indicate the
+            // persisted state is unreadable by this binary (e.g. future format
+            // version), which is operator-actionable and must surface as a boot
+            // failure rather than a silent data-loss-equivalent regression.
+            loadFromStatus(status);
+            this.loadedLsn = status.sequenceNumber;
         }
 
         if (readOnly) {
@@ -4310,12 +4322,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         int version = metaBuf.getInt();
         if (version != METADATA_VERSION_MULTI_SEGMENT && version != METADATA_VERSION_MULTI_SEGMENT_V4) {
-            LOGGER.log(Level.SEVERE,
-                    "unsupported vector index metadata version {0} for {1} (supported: v{2}, v{3}),"
-                            + " starting empty — old experimental formats have been removed",
-                    new Object[]{version, indexName,
-                            METADATA_VERSION_MULTI_SEGMENT, METADATA_VERSION_MULTI_SEGMENT_V4});
-            return;
+            // Review-item B4 (second pr-reviewer pass): on rollback to a binary that
+            // doesn't know about a newer format version, the previous behaviour was to
+            // log SEVERE and "start empty" — i.e. silently drop every segment from the
+            // in-memory state while the underlying graph/map files still exist on
+            // remote storage. That makes queries return an empty result set without
+            // any indication to the operator that something went wrong. Fail-fast
+            // instead: an immediate boot failure is far easier to diagnose and far
+            // safer than a silent data-loss-equivalent regression.
+            throw new DataStorageManagerException(
+                    "unsupported vector index metadata version " + version + " for " + indexName
+                            + " (supported: v" + METADATA_VERSION_MULTI_SEGMENT
+                            + ", v" + METADATA_VERSION_MULTI_SEGMENT_V4
+                            + "). This typically means the index was upgraded by a newer"
+                            + " binary and is being rolled back to one that does not yet"
+                            + " support the new format. Either re-deploy a binary that"
+                            + " supports v" + version + " OR delete the index and re-create it.");
         }
 
         int dim = metaBuf.getInt();

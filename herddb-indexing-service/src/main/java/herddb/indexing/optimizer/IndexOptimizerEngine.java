@@ -94,6 +94,18 @@ public final class IndexOptimizerEngine {
     private final OptimizerLeaderLock leaderLock;
     private final AtomicLong ticksSkippedNotLeader = new AtomicLong();
 
+    /**
+     * When {@code true} (the default), the reaper at retention time does NOT call
+     * {@link DataStorageManager#deleteMultipartIndexFile}. Production deployments
+     * of segmented-v2 require a IS-side {@code SegmentAssignmentWatcher} that
+     * notifies owners to close their handles before files vanish; until that
+     * wiring exists deleting files would corrupt the IS that still references the
+     * segment in its IndexStatus. Operators MUST opt out explicitly via
+     * {@link Builder#unsafeAllowFileDeletion()} once the listener wiring is
+     * verified end-to-end (review-item B1 from the second pr-reviewer pass).
+     */
+    private final boolean safeModeFileDeletion;
+
     private final AtomicLong runs = new AtomicLong();
     private final AtomicLong segmentsMerged = new AtomicLong();
     private final AtomicLong segmentsDeprecated = new AtomicLong();
@@ -140,7 +152,9 @@ public final class IndexOptimizerEngine {
 
     /**
      * Full constructor wiring a {@link DataStorageManager} (for A8 file deletion)
-     * and an {@link OptimizerLeaderLock} (for C2 singleton enforcement).
+     * and an {@link OptimizerLeaderLock} (for C2 singleton enforcement). Defaults
+     * to {@code safeModeFileDeletion = true} so the reaper does NOT physically
+     * delete files until the operator opts in via the next constructor.
      */
     public IndexOptimizerEngine(SegmentRegistryClient registry,
                                 SegmentMerger merger,
@@ -151,6 +165,30 @@ public final class IndexOptimizerEngine {
                                 LongSupplier clock,
                                 DataStorageManager dataStorageManager,
                                 OptimizerLeaderLock leaderLock) {
+        this(registry, merger, tablespaceUuid, mergePolicy, retentionMillis,
+                ownerSelector, clock, dataStorageManager, leaderLock,
+                /* safeModeFileDeletion */ true);
+    }
+
+    /**
+     * Power-user constructor that lets the deployer opt out of safe-mode and let
+     * the reaper physically delete graph/map/tombstone files when transitioning
+     * DEPRECATED → DELETED (review-item B1). Set
+     * {@code safeModeFileDeletion = false} ONLY when the IS-side
+     * {@code SegmentAssignmentWatcher} wiring is in place — otherwise the IS
+     * still references the segment in IndexStatus and will fail to load on the
+     * next restart.
+     */
+    public IndexOptimizerEngine(SegmentRegistryClient registry,
+                                SegmentMerger merger,
+                                String tablespaceUuid,
+                                MergePolicy mergePolicy,
+                                long retentionMillis,
+                                IntSupplier ownerSelector,
+                                LongSupplier clock,
+                                DataStorageManager dataStorageManager,
+                                OptimizerLeaderLock leaderLock,
+                                boolean safeModeFileDeletion) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.merger = Objects.requireNonNull(merger, "merger");
         this.tablespaceUuid = Objects.requireNonNull(tablespaceUuid, "tablespaceUuid");
@@ -160,6 +198,20 @@ public final class IndexOptimizerEngine {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.dataStorageManager = dataStorageManager;
         this.leaderLock = leaderLock;
+        this.safeModeFileDeletion = safeModeFileDeletion;
+        if (!safeModeFileDeletion && dataStorageManager == null) {
+            throw new IllegalArgumentException(
+                    "safeModeFileDeletion=false requires a non-null DataStorageManager");
+        }
+        if (!safeModeFileDeletion) {
+            LOGGER.log(Level.SEVERE,
+                    "OPTIMIZER FILE-DELETION ENABLED (safeMode=false): the optimizer will"
+                            + " physically delete multipart graph/map/tombstone files at"
+                            + " retention. Verify that every IS instance hosting this"
+                            + " tablespace has a SegmentAssignmentWatcher consuming"
+                            + " ownership-change events; otherwise the IS will fail to"
+                            + " load on next restart with file-not-found.");
+        }
     }
 
     public long getRuns() {
@@ -365,21 +417,24 @@ public final class IndexOptimizerEngine {
     }
 
     private void deleteRetainedSegment(VersionedSegmentMetadata v) {
+        // Reaping order (review-item B3 from second pr-reviewer pass): keep the znode
+        // in DEPRECATED until the very last step, then casDelete it directly. The
+        // previous design transitioned DEPRECATED → DELETED → casDelete, but
+        // runForIndex() does NOT iterate DELETED segments, so a crash between the
+        // state-change CAS and the casDelete left an orphan znode that no future
+        // tick would clean up. The new ordering is:
+        //   1. delete multipart files (idempotent on missing files)
+        //   2. casDeleteSegment using the DEPRECATED-state version
+        // A crash between (1) and (2) leaves the znode DEPRECATED with files
+        // maybe-gone; the next tick re-enters this method via the DEPRECATED branch
+        // of runForIndex, re-runs (1) (idempotent), and finishes (2).
         try {
-            VersionedSegmentMetadata afterStateChange = registry.casUpdateSegment(v,
-                    v.metadata().toBuilder().state(SegmentState.DELETED).build());
-            // Physically delete the multipart files BEFORE removing the znode (review
-            // item A8). The order matters: if we crash after znode delete but before
-            // file delete, the files become unreachable orphans (no znode points to
-            // them). Doing the files first means a crash leaves the znode in DELETED
-            // state with the files maybe-gone — the next tick reaches the same code
-            // path, calls deleteMultipartIndexFile (which is idempotent on missing
-            // files), and removes the znode. Net effect: idempotent recovery.
-            deleteSegmentFilesBestEffort(afterStateChange.metadata());
-            registry.casDeleteSegment(afterStateChange);
+            deleteSegmentFilesBestEffort(v.metadata());
+            registry.casDeleteSegment(v);
             segmentsDeleted.incrementAndGet();
         } catch (SegmentRegistryException.VersionMismatch retry) {
-            // CAS bumped under us; will be re-attempted on next tick.
+            // CAS bumped under us (e.g. ownership transfer started); will be
+            // re-attempted on next tick.
         } catch (SegmentRegistryException e) {
             LOGGER.log(Level.WARNING,
                     "failed to delete retained segment " + v.metadata().getSegmentUuid()
@@ -397,6 +452,18 @@ public final class IndexOptimizerEngine {
      */
     private void deleteSegmentFilesBestEffort(SegmentMetadata m) {
         if (dataStorageManager == null) {
+            return;
+        }
+        if (safeModeFileDeletion) {
+            // Safe-mode default (review-item B1): the IS-side ownership-change
+            // listener is not yet wired in production — deleting files now would
+            // corrupt any IS that still references the segment in its IndexStatus.
+            // Skip silently; the znode lifecycle still progresses (DEPRECATED →
+            // DELETED) so registry observability is unaffected. A future cleanup
+            // pass (or operator) can sweep orphan files once the wiring exists.
+            LOGGER.log(Level.FINE,
+                    "safeMode: skipping multipart-file deletion for segment {0}",
+                    m.getSegmentUuid());
             return;
         }
         if (m.getSegmentId() != SegmentMetadata.NO_SEGMENT_ID) {

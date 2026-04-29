@@ -131,7 +131,9 @@ public class ReaperFileDeletionTest {
                 /* retentionMs */ 60_000L,
                 () -> 0,
                 fakeClock::get,
-                dsm);
+                dsm,
+                /* leaderLock */ null,
+                /* safeModeFileDeletion */ false);
         // Advance clock past retention so reaper fires.
         fakeClock.set(1000L);
         engine.runOnce();
@@ -153,7 +155,9 @@ public class ReaperFileDeletionTest {
                 60_000L,
                 () -> 0,
                 fakeClock::get,
-                dsm);
+                dsm,
+                /* leaderLock */ null,
+                /* safeModeFileDeletion */ false);
         fakeClock.set(1000L);
         engine.runOnce();
 
@@ -175,7 +179,9 @@ public class ReaperFileDeletionTest {
                 60_000L,
                 () -> 0,
                 fakeClock::get,
-                dsm);
+                dsm,
+                /* leaderLock */ null,
+                /* safeModeFileDeletion */ false);
         fakeClock.set(1000L);
         engine.runOnce();
 
@@ -183,6 +189,36 @@ public class ReaperFileDeletionTest {
         // Probed window of generations means at least tombstones-1 was attempted.
         assertTrue("expected tombstones-1 delete attempt; saw " + dsm.deletes,
                 dsm.deletes.contains(deleteKey(TS_UUID, "idxuid_seg_seg-3", "tombstones-1")));
+    }
+
+    @Test
+    public void safeModeDefaultPreservesFilesWhileRemovingZnode() throws Exception {
+        // Review-item B1: by default the reaper MUST NOT delete files even when a DSM
+        // is wired, because the IS-side ownership-change listener may not be in place.
+        registry.createSegment(buildSegment("seg-safe", 11, null));
+        IndexOptimizerEngine safeEngine = new IndexOptimizerEngine(registry, merger, TS_UUID,
+                new MergePolicy.SmallestFirstPolicy(99, 99, Long.MAX_VALUE, Long.MAX_VALUE),
+                60_000L, () -> 0, fakeClock::get, dsm); // safeMode = true by default
+        fakeClock.set(1000L);
+        safeEngine.runOnce();
+
+        assertEquals(1, safeEngine.getSegmentsDeleted());
+        assertFalse(registry.getSegment(TS_UUID, IDX_UUID, "seg-safe").isPresent());
+        assertTrue("safeMode default must NOT delete graph/map files; saw " + dsm.deletes,
+                dsm.deletes.isEmpty());
+    }
+
+    @Test
+    public void unsafeModeRequiresDsm() {
+        try {
+            new IndexOptimizerEngine(registry, merger, TS_UUID,
+                    new MergePolicy.SmallestFirstPolicy(99, 99, Long.MAX_VALUE, Long.MAX_VALUE),
+                    60_000L, () -> 0, fakeClock::get, /* dsm */ null,
+                    /* leaderLock */ null, /* safeModeFileDeletion */ false);
+            org.junit.Assert.fail("expected IllegalArgumentException");
+        } catch (IllegalArgumentException ok) {
+            assertTrue(ok.getMessage().contains("DataStorageManager"));
+        }
     }
 
     @Test
@@ -204,6 +240,108 @@ public class ReaperFileDeletionTest {
     }
 
     @Test
+    public void crashBetweenFileDeleteAndZnodeDeleteIsHealedByNextTick() throws Exception {
+        // Review-item B3: simulate a crash AFTER deleteSegmentFilesBestEffort()
+        // succeeded but BEFORE the casDelete landed. The znode stays DEPRECATED
+        // (NOT DELETED) so the next tick's runForIndex re-enters deleteRetainedSegment
+        // via the DEPRECATED branch and finishes the job.
+        //
+        // We inject the crash by wrapping the ZK supplier so the first attempted
+        // ZK.delete throws ConnectionLossException once, then proceeds normally.
+        // The retry logic in SegmentRegistryClient bounds it to 5 attempts; with
+        // crashCount=Integer.MAX_VALUE we exceed the cap and the casDelete fails
+        // on the first runOnce; after we reset to 0 the second runOnce succeeds.
+        registry.createSegment(buildSegment("seg-crash", 5, null));
+
+        final java.util.concurrent.atomic.AtomicInteger crashCount =
+                new java.util.concurrent.atomic.AtomicInteger(Integer.MAX_VALUE);
+        java.util.function.Supplier<org.apache.zookeeper.ZooKeeper> faultySupplier = () -> {
+            try {
+                return newFaultyZk(crashCount);
+            } catch (java.io.IOException ioe) {
+                throw new RuntimeException(ioe);
+            }
+        };
+
+        org.apache.zookeeper.ZooKeeper faultyZk = faultySupplier.get();
+        SegmentRegistryClient crashingRegistry = new SegmentRegistryClient(() -> faultyZk, BASE_PATH);
+        IndexOptimizerEngine engine = new IndexOptimizerEngine(crashingRegistry, merger, TS_UUID,
+                new MergePolicy.SmallestFirstPolicy(99, 99, Long.MAX_VALUE, Long.MAX_VALUE),
+                60_000L, () -> 0, fakeClock::get, dsm,
+                /* leaderLock */ null, /* safeModeFileDeletion */ false);
+
+        fakeClock.set(1000L);
+        engine.runOnce(); // first tick: files deleted, znode delete fails after retries
+
+        // Files were deleted (idempotently).
+        assertTrue("files were deleted on the failing tick: " + dsm.deletes,
+                dsm.deletes.contains(deleteKey(TS_UUID, "idxuid_seg5", "graph")));
+        // Znode is STILL DEPRECATED (not DELETED, not gone).
+        herddb.indexing.segment.VersionedSegmentMetadata after =
+                registry.getSegment(TS_UUID, IDX_UUID, "seg-crash").orElseThrow();
+        assertEquals(SegmentState.DEPRECATED, after.metadata().getState());
+
+        // Second tick: crash counter zeroed, casDelete succeeds, znode disappears.
+        crashCount.set(0);
+        engine.runOnce();
+        assertFalse("znode must be gone after recovery tick",
+                registry.getSegment(TS_UUID, IDX_UUID, "seg-crash").isPresent());
+    }
+
+    private org.apache.zookeeper.ZooKeeper newFaultyZk(
+            java.util.concurrent.atomic.AtomicInteger crashCount) throws java.io.IOException {
+        return new org.apache.zookeeper.ZooKeeper(zk.toString(), 30000, e -> { }) {
+                {
+                    try {
+                        super.close();
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+
+                @Override
+                public void delete(String path, int version)
+                        throws InterruptedException, org.apache.zookeeper.KeeperException {
+                    if (crashCount.getAndDecrement() > 0) {
+                        throw new org.apache.zookeeper.KeeperException.ConnectionLossException();
+                    }
+                    zk.delete(path, version);
+                }
+
+                @Override
+                public byte[] getData(String path, org.apache.zookeeper.Watcher watcher,
+                        org.apache.zookeeper.data.Stat stat)
+                        throws org.apache.zookeeper.KeeperException, InterruptedException {
+                    return zk.getData(path, watcher, stat);
+                }
+
+                @Override
+                public java.util.List<String> getChildren(String path, org.apache.zookeeper.Watcher watcher)
+                        throws org.apache.zookeeper.KeeperException, InterruptedException {
+                    return zk.getChildren(path, watcher);
+                }
+
+                @Override
+                public java.util.List<String> getChildren(String path, boolean watch)
+                        throws org.apache.zookeeper.KeeperException, InterruptedException {
+                    return zk.getChildren(path, watch);
+                }
+
+                @Override
+                public org.apache.zookeeper.data.Stat setData(String path, byte[] data, int version)
+                        throws org.apache.zookeeper.KeeperException, InterruptedException {
+                    return zk.setData(path, data, version);
+                }
+
+                @Override
+                public org.apache.zookeeper.data.Stat exists(String path, org.apache.zookeeper.Watcher watcher)
+                        throws org.apache.zookeeper.KeeperException, InterruptedException {
+                    return zk.exists(path, watcher);
+                }
+            };
+    }
+
+    @Test
     public void reaperToleratesDsmFailure() throws Exception {
         // DSM throws on every delete. The reaper must still remove the znode.
         Path baseDir = tmp.newFolder("faulty").toPath();
@@ -222,7 +360,9 @@ public class ReaperFileDeletionTest {
                 60_000L,
                 () -> 0,
                 fakeClock::get,
-                faultyDsm);
+                faultyDsm,
+                /* leaderLock */ null,
+                /* safeModeFileDeletion */ false);
         fakeClock.set(1000L);
         engine.runOnce();
 

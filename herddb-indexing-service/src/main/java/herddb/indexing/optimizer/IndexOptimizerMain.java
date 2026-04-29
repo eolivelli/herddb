@@ -157,11 +157,20 @@ public final class IndexOptimizerMain {
 
         MergePolicy policy = new MergePolicy.SmallestFirstPolicy(minCount, maxCount, minBytes, maxBytes);
         this.leaderLock = new OptimizerLeaderLock(zkRef::get, basePath, tablespaceUuid);
+        boolean safeModeFileDeletion = configuration.getBoolean(
+                OptimizerConfiguration.PROPERTY_SAFE_MODE_FILE_DELETION,
+                OptimizerConfiguration.PROPERTY_SAFE_MODE_FILE_DELETION_DEFAULT);
+        // Production deployments today have no DataStorageManager wired (the merger
+        // SPI provides its own). When safeMode is true (default) this is fine; when
+        // operators opt out we still pass null because file-deletion-from-the-engine
+        // requires a real DSM and that's a future-work item — the constructor will
+        // refuse the unsafe combination.
         this.engine = new IndexOptimizerEngine(registry, merger, tablespaceUuid, policy, retentionMs,
                 () -> 0 /* MVP: assign new segments to instance 0 — see step 7 for owner-aware routing */,
                 System::currentTimeMillis,
                 /* dataStorageManager — wired by future production deployments */ null,
-                leaderLock);
+                leaderLock,
+                safeModeFileDeletion);
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "index-optimizer-engine");
@@ -179,7 +188,12 @@ public final class IndexOptimizerMain {
             String httpHost = configuration.getString(
                     OptimizerConfiguration.PROPERTY_HTTP_HOST,
                     OptimizerConfiguration.PROPERTY_HTTP_HOST_DEFAULT);
-            this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine);
+            // Liveness staleness = 2 × tick interval — the engine should have ticked
+            // at least once in that window unless something is stuck (review-item B6
+            // from second pr-reviewer pass).
+            this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine,
+                    /* stalenessThresholdMillis */ 2L * intervalMs,
+                    System::currentTimeMillis);
             this.httpServer.start();
         }
 
