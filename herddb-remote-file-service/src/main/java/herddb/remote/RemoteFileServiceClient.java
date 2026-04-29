@@ -439,7 +439,12 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         LOGGER.log(Level.INFO, "Updated remote file servers: {0} (added: {1}, removed: {2})",
                 new Object[]{newServers, added, removed});
 
-        // Gracefully shutdown removed channel pairs in background
+        // Cancel in-flight RPCs to removed servers immediately via shutdownNow().
+        // Graceful shutdown (awaitTermination) is intentionally skipped: a server
+        // is removed because it crashed or deregistered from ZooKeeper, so any
+        // in-flight write to it is already lost. Using shutdownNow() ensures that
+        // callers blocking on writeFile() (e.g. during a Phase C checkpoint) fail
+        // fast rather than hanging for up to clientTimeoutSeconds (default 30 min).
         if (!removed.isEmpty()) {
             List<ManagedChannel> toShutdown = new ArrayList<>();
             for (String server : removed) {
@@ -454,12 +459,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
             }
             Thread shutdownThread = new Thread(() -> {
                 for (ManagedChannel ch : toShutdown) {
-                    try {
-                        ch.shutdown().awaitTermination(10, TimeUnit.SECONDS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        ch.shutdownNow();
-                    }
+                    ch.shutdownNow();
                 }
             }, "remote-file-channel-shutdown");
             shutdownThread.setDaemon(true);
