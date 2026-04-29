@@ -390,6 +390,24 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private volatile boolean externalCompactionEnabled;
 
     /**
+     * Cached "this index is segmented-v2 (has at least one UUID-stamped segment)"
+     * flag (review-item N1 from second pr-reviewer pass). Once flipped to
+     * {@code true} it stays true — even legacy v3 segments coexisting with a
+     * v4 segment in the same IndexStatus must be persisted in v4 format. Avoids
+     * re-scanning all sealed/mergeable/new lists on every checkpoint.
+     */
+    private volatile boolean segmentedV2Cached;
+
+    /**
+     * Test hook (package-visible) — runs between segment stage and IndexStatus
+     * persist in {@link #doCheckpointFusedPQPhaseB}. Used by
+     * {@code PublisherHotSwapTest} to swap {@link #segmentPublisher} mid-Phase-B
+     * and assert the captured snapshot is what handles the commit (review-item R3
+     * from second pr-reviewer pass). Production code never sets this field.
+     */
+    volatile Runnable phaseBHookForTesting;
+
+    /**
      * Monotonically increasing IndexStatus generation. Each successful
      * call to {@link #persistIndexStatusMultiSegment} bumps this counter
      * and stamps every newly-produced segment with the new value.
@@ -1459,13 +1477,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * Installs (or replaces) the {@link SegmentPublisher} hook called after each
      * successful checkpoint. Pass {@code null} to disable.
      *
-     * <p><b>Per-index opt-in (review item G3):</b> the publisher reference is per
-     * {@link PersistentVectorStore} instance and therefore per-index. An IS that
-     * hosts both legacy v1 indexes and new v2 indexes simply attaches the
-     * publisher to the v2 stores only — the v1 stores retain their classic
-     * behavior. This means cluster-wide flags like {@code indexing.optimizer.enabled}
-     * are merely defaults that callers can override per index when constructing
-     * the store.
+     * <p><b>Per-index opt-in (future-work, see VECTOR.md "Production
+     * prerequisites"):</b> structurally the publisher reference is per
+     * {@link PersistentVectorStore} instance, so per-index opt-in is possible at
+     * the API level — but as of this writing no production caller exists. The
+     * {@code IndexingServiceEngine} does NOT currently read
+     * {@code indexing.optimizer.enabled} and never invokes this method. Tests
+     * exercise the per-index path (see {@code MixedModeIndexesTest}); production
+     * deployments should not enable {@code indexOptimizer.enabled=true} until
+     * this wiring lands and the prerequisites in VECTOR.md are satisfied.
      *
      * <p><b>Concurrency contract (review item C1):</b> changes take effect on the
      * NEXT checkpoint cycle, not the in-flight one. The checkpoint Phase B reads
@@ -1496,6 +1516,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /** Visible for tests: the in-IS compaction thread (null when not running). */
     Thread getVectorIndexCompactionThread() {
         return vectorIndexCompactionThread;
+    }
+
+    /**
+     * Visible for tests: install a hook that runs in the middle of Phase B,
+     * AFTER the staged publish and BEFORE the IndexStatus persist + commit.
+     * Production code never calls this — see review-item R3.
+     */
+    public void setPhaseBHookForTesting(Runnable hook) {
+        this.phaseBHookForTesting = hook;
     }
 
     /** Wakes the compaction thread. Called by tests and the retention reaper. */
@@ -3569,6 +3598,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
             stageNewSegmentsBestEffort(publisherSnapshot, publishInfo);
         }
 
+        // Test hook for review-item R3 (second pr-reviewer pass): invoked AFTER stage
+        // and BEFORE commit. Production code never sets this field; tests use it to
+        // exercise the publisher-snapshot torn-read protection by swapping the
+        // segmentPublisher field at this exact moment and asserting the snapshot
+        // (publisherSnapshot, captured above) is what actually receives the commit.
+        Runnable midCheckpointHook = phaseBHookForTesting;
+        if (midCheckpointHook != null) {
+            midCheckpointHook.run();
+        }
+
         persistIndexStatusMultiSegment(sealedSegments, mergeableSegments, newSegmentResults, sequenceNumber);
 
         if (publisherSnapshot != null) {
@@ -4418,6 +4457,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
             seg.mapFileSize = mapFileSize;
             seg.generation = generation;
             seg.segmentUuid = segmentUuid;
+            if (segmentUuid != null) {
+                segmentedV2Cached = true;
+            }
 
             Path mapFile = readMultipartMapDataToTempFile(seg);
             loadFusedPQSegment(seg, mapFile, dim, savedNextNodeId);
@@ -4833,28 +4875,38 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         // Decide format version: v4 if any segment carries a non-null UUID (i.e. the index
         // is in segmented-v2 mode), otherwise v3 to keep binary-compatible rollback for
-        // legacy clusters that never opted into the optimizer.
-        boolean anyUuid = false;
-        for (VectorSegment seg : sealedSegments) {
-            if (seg.segmentUuid != null) {
-                anyUuid = true;
-                break;
-            }
-        }
+        // legacy clusters that never opted into the optimizer. Once we've seen a UUID we
+        // remember it (segmentedV2Cached) so subsequent checkpoints skip the scan
+        // entirely (review-item N1 from second pr-reviewer pass).
+        boolean anyUuid = segmentedV2Cached;
         if (!anyUuid) {
-            for (VectorSegment seg : mergeableSegments) {
-                if (seg.segmentUuid != null) {
-                    anyUuid = true;
-                    break;
-                }
-            }
-        }
-        if (!anyUuid) {
+            // Fastest probe first: freshly-emitted segments (whose UUIDs were stamped at
+            // the start of Phase C). Only scan the loaded segments if necessary — those
+            // are the ones that contain UUIDs persisted from a previous run.
             for (SegmentWriteResult swr : newSegmentResults) {
                 if (swr.segmentUuid != null) {
                     anyUuid = true;
                     break;
                 }
+            }
+            if (!anyUuid) {
+                for (VectorSegment seg : sealedSegments) {
+                    if (seg.segmentUuid != null) {
+                        anyUuid = true;
+                        break;
+                    }
+                }
+            }
+            if (!anyUuid) {
+                for (VectorSegment seg : mergeableSegments) {
+                    if (seg.segmentUuid != null) {
+                        anyUuid = true;
+                        break;
+                    }
+                }
+            }
+            if (anyUuid) {
+                segmentedV2Cached = true;
             }
         }
         final int formatVersion = anyUuid

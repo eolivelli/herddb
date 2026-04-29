@@ -35,9 +35,28 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class InMemorySegmentMerger implements SegmentMerger {
 
     private final AtomicLong invocations = new AtomicLong();
+    private final AtomicLong abandonInvocations = new AtomicLong();
+    private final java.util.List<String> abandonedUuids =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
     public long getInvocationCount() {
         return invocations.get();
+    }
+
+    public long getAbandonInvocationCount() {
+        return abandonInvocations.get();
+    }
+
+    public java.util.List<String> getAbandonedUuids() {
+        synchronized (abandonedUuids) {
+            return new java.util.ArrayList<>(abandonedUuids);
+        }
+    }
+
+    @Override
+    public void abandon(SegmentMetadata produced) {
+        abandonInvocations.incrementAndGet();
+        abandonedUuids.add(produced.getSegmentUuid());
     }
 
     @Override

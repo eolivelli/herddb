@@ -147,6 +147,57 @@ public class PublisherHotSwapTest {
     }
 
     @Test
+    public void midPhaseBSwapDoesNotProduceTornStageCommit() throws Exception {
+        // Review-item R3 from second pr-reviewer pass: install a phaseBHookForTesting
+        // that swaps the publisher reference between stage and commit. The captured
+        // snapshot (a local in doCheckpointFusedPQPhaseB) is what handles BOTH stage
+        // and commit, so the original publisher must see exactly one stage AND one
+        // commit; the swapped-in publisher must see neither.
+        Path baseDir = tmpFolder.newFolder("data").toPath();
+        Path tmpDir = tmpFolder.newFolder("tmp").toPath();
+        FileDataStorageManager dsm = new FileDataStorageManager(baseDir);
+        dsm.initTablespace(TABLE_SPACE);
+
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            CountingPublisher original = new CountingPublisher();
+            CountingPublisher swappedIn = new CountingPublisher();
+            store.setSegmentPublisher(original);
+            store.start();
+            for (int i = 0; i < 300; i++) {
+                store.addVector(Bytes.from_int(i), randomVector(new Random(i), 32));
+            }
+
+            // Hook fires after stage, before persist+commit. Swap the publisher.
+            store.setPhaseBHookForTesting(() -> store.setSegmentPublisher(swappedIn));
+
+            store.checkpoint();
+
+            // The original publisher (snapshotted at Phase B start) handled BOTH stage
+            // and commit. The swapped-in publisher saw nothing in this checkpoint.
+            assertEquals("original publisher must see exactly one stage",
+                    1, original.stageCalls.get());
+            assertEquals("original publisher must see exactly one commit",
+                    1, original.commitCalls.get());
+            assertEquals("swapped-in publisher must see no stage in this checkpoint",
+                    0, swappedIn.stageCalls.get());
+            assertEquals("swapped-in publisher must see no commit in this checkpoint",
+                    0, swappedIn.commitCalls.get());
+
+            // The swap takes effect on the NEXT checkpoint. Clear the hook and
+            // run another checkpoint.
+            store.setPhaseBHookForTesting(null);
+            for (int i = 300; i < 600; i++) {
+                store.addVector(Bytes.from_int(i), randomVector(new Random(i), 32));
+            }
+            store.checkpoint();
+            assertEquals("swapped-in publisher must see one stage on the next checkpoint",
+                    1, swappedIn.stageCalls.get());
+            assertEquals("swapped-in publisher must see one commit on the next checkpoint",
+                    1, swappedIn.commitCalls.get());
+        }
+    }
+
+    @Test
     public void clearingPublisherAfterCheckpointMakesNextCheckpointLegacy() throws Exception {
         Path baseDir = tmpFolder.newFolder("data").toPath();
         Path tmpDir = tmpFolder.newFolder("tmp").toPath();

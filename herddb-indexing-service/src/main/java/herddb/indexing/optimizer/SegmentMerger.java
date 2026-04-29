@@ -50,4 +50,19 @@ public interface SegmentMerger {
      *         the metadata payload.
      */
     SegmentMetadata merge(List<SegmentMetadata> inputs, int newOwnerInstance) throws Exception;
+
+    /**
+     * Abandon a previously-produced merged output (review-item R4 from second pr-reviewer
+     * pass). Called by the optimizer engine when the post-merge revalidation aborts a run
+     * — the merger may have already uploaded graph/map files to remote storage; this hook
+     * lets it delete them so they don't leak. The default is a no-op for backward
+     * compatibility with stub mergers (e.g. test {@code InMemorySegmentMerger}); production
+     * mergers SHOULD override.
+     *
+     * <p>Best-effort: implementations log and continue on failure — a leaked output file
+     * is wasted bytes, not corruption, and the next reconcile cycle can sweep stragglers.
+     */
+    default void abandon(SegmentMetadata produced) {
+        // no-op default — production mergers override to clean up multipart artefacts
+    }
 }

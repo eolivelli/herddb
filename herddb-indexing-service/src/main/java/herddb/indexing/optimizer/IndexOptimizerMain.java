@@ -284,7 +284,7 @@ public final class IndexOptimizerMain {
             return candidate;
         }
         LOGGER.log(Level.WARNING,
-                "no SegmentMerger SPI registered; using NoopMerger — the optimizer will declines"
+                "no SegmentMerger SPI registered; using NoopMerger — the optimizer will decline"
                         + " every merge until a real merger is provided.");
         return new NoopMerger();
     }

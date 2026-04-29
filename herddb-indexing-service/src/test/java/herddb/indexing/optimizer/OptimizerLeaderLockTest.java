@@ -181,6 +181,53 @@ public class OptimizerLeaderLockTest {
     }
 
     @Test
+    public void expiredSessionAllowsAnotherToAcquire() throws Exception {
+        // Review-item R6 from the second pr-reviewer pass: when lockA's ZK session
+        // expires (e.g. network partition), the ephemeral znode is automatically
+        // removed by ZK. lockA's cached held=true should be detected as stale on
+        // the next tryAcquire — the verification path in tryAcquire reads the znode
+        // and clears the cache when it's gone. Meanwhile lockB (a separate ZK
+        // client) can acquire fresh.
+        ZooKeeper zkA = freshZkClient();
+        try {
+            OptimizerLeaderLock lockA = new OptimizerLeaderLock(() -> zkA, BASE_PATH, TS_UUID);
+            assertTrue(lockA.tryAcquire());
+            assertTrue(lockA.isHeld());
+
+            // Forcibly close zkA — its ephemeral lock node disappears.
+            zkA.close();
+
+            // A fresh lockB on a separate ZK session can now acquire.
+            ZooKeeper zkB = freshZkClient();
+            try {
+                OptimizerLeaderLock lockB = new OptimizerLeaderLock(() -> zkB, BASE_PATH, TS_UUID);
+                // Wait briefly for the ephemeral to drop server-side.
+                long deadline = System.currentTimeMillis() + 5000L;
+                while (System.currentTimeMillis() < deadline && !lockB.tryAcquire()) {
+                    Thread.sleep(50);
+                }
+                assertTrue("lockB must be able to acquire after lockA's session ended",
+                        lockB.isHeld());
+            } finally {
+                zkB.close();
+            }
+        } finally {
+            // zkA already closed; nothing else to do.
+        }
+    }
+
+    private ZooKeeper freshZkClient() throws Exception {
+        java.util.concurrent.CountDownLatch connected = new java.util.concurrent.CountDownLatch(1);
+        ZooKeeper newZk = new ZooKeeper(zkServer.getConnectString(), 5000, event -> {
+            if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
+                connected.countDown();
+            }
+        });
+        assertTrue(connected.await(30, TimeUnit.SECONDS));
+        return newZk;
+    }
+
+    @Test
     public void engineWithoutLockBehavesLikeBefore() throws Exception {
         // Sanity: an engine with no lock (legacy ctor) keeps the original behaviour.
         for (int i = 0; i < 3; i++) {

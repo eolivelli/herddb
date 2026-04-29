@@ -95,6 +95,15 @@ public final class IndexOptimizerEngine {
     private final AtomicLong ticksSkippedNotLeader = new AtomicLong();
 
     /**
+     * Test hook (package-private) — invoked AFTER {@link #revalidateInputsStillActive}
+     * returns true but BEFORE {@link #deprecateInputSegment} runs on each candidate.
+     * Used by {@code OptimizerTransferRaceTest.driftBetweenRevalidateAndDeprecate} to
+     * inject ownership-change drift into the narrow remaining race window. Production
+     * code never sets this field.
+     */
+    volatile Runnable postRevalidatePreDeprecateHookForTests;
+
+    /**
      * When {@code true} (the default), the reaper at retention time does NOT call
      * {@link DataStorageManager#deleteMultipartIndexFile}. Production deployments
      * of segmented-v2 require a IS-side {@code SegmentAssignmentWatcher} that
@@ -326,6 +335,17 @@ public final class IndexOptimizerEngine {
             LOGGER.log(Level.INFO,
                     "optimizer aborted merge for index {0}: at least one input drifted under us",
                     indexUuid);
+            // Notify the merger so it can clean up the multipart artefacts it just
+            // uploaded (review-item R4 from the second pr-reviewer pass). The default
+            // implementation is a no-op; production mergers override to delete the
+            // graph/map files of the abandoned output.
+            try {
+                merger.abandon(output);
+            } catch (RuntimeException abandonFailed) {
+                LOGGER.log(Level.WARNING,
+                        "merger.abandon failed for {0}: {1}",
+                        new Object[]{output.getSegmentUuid(), abandonFailed.getMessage()});
+            }
             return;
         }
 
@@ -344,6 +364,13 @@ public final class IndexOptimizerEngine {
             // is already published; fall through to deprecate inputs.
             LOGGER.log(Level.INFO, "merged segment {0} already registered (idempotent)",
                     output.getSegmentUuid());
+        }
+
+        // Test hook for review-item R2 (second pr-reviewer pass): inject drift in the
+        // narrow window between createSegment-of-output and deprecate-of-inputs.
+        Runnable hook = postRevalidatePreDeprecateHookForTests;
+        if (hook != null) {
+            hook.run();
         }
 
         long retentionUntil = (retentionMillis == 0L)

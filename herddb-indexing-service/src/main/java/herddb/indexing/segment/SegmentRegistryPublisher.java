@@ -172,13 +172,28 @@ public final class SegmentRegistryPublisher implements SegmentPublisher {
     }
 
     /**
-     * Reconcile the registry with IndexStatus at IS start (review item A1+A3 phase 3):
+     * Reconcile the registry with IndexStatus at IS start (review-item A1+A3 phase 3,
+     * extended for review-item R5 from the second pr-reviewer pass).
+     *
+     * <p>The reconcile considers every (znode-state × in-IndexStatus) combination:
      * <ul>
-     *   <li>For each existing segment in IndexStatus: if its znode is missing, register
-     *       as ACTIVE; if PROVISIONAL, promote to ACTIVE.</li>
-     *   <li>Walk PROVISIONAL znodes registered for this index whose UUID is NOT in
-     *       IndexStatus — they are orphans from a prior crash between stage and
-     *       IndexStatus persist. Drop them.</li>
+     *   <li>znode missing + in IndexStatus → register as ACTIVE.</li>
+     *   <li>znode PROVISIONAL + in IndexStatus → promote to ACTIVE.</li>
+     *   <li>znode PROVISIONAL + NOT in IndexStatus → drop the orphan (Pass 2).</li>
+     *   <li>znode ACTIVE + in IndexStatus → leave alone (no-op).</li>
+     *   <li>znode TRANSFERRING + in IndexStatus → leave alone; the in-flight
+     *       transfer (or its abort by a future tick) will resolve the state.</li>
+     *   <li>znode DEPRECATED + in IndexStatus → leave alone; the IS still references
+     *       this segment but the optimizer has scheduled it for retention. The IS
+     *       must continue to load the segment until it gets a transfer-away or
+     *       observes the znode disappear. Logged at WARNING so operators notice
+     *       the gap (review-item R5).</li>
+     *   <li>znode DEPRECATED + NOT in IndexStatus → leave alone; the optimizer
+     *       owns the lifecycle.</li>
+     *   <li>znode DELETED + anything → leave alone; the optimizer is mid-reap.</li>
+     *   <li>znode ACTIVE + NOT in IndexStatus → leave alone; this is a segment
+     *       transferred TO us that we have not yet learned about — it will surface
+     *       on the next checkpoint.</li>
      * </ul>
      */
     @Override
@@ -227,8 +242,24 @@ public final class SegmentRegistryPublisher implements SegmentPublisher {
                         } catch (SegmentRegistryException.VersionMismatch retry) {
                             // someone won the CAS — that's fine, the znode is no longer PROVISIONAL.
                         }
+                    } else if (m.getState() == SegmentState.DEPRECATED) {
+                        // Review-item R5: the optimizer has already scheduled this
+                        // segment for retention, but we still reference it in IndexStatus.
+                        // Surface a WARNING so the operator knows there's a gap in the
+                        // ownership pipeline — typically the IS-side
+                        // SegmentAssignmentWatcher hasn't processed the transfer yet.
+                        // We do NOT roll the segment back to ACTIVE: the optimizer's
+                        // decision is authoritative, and the IS should learn about the
+                        // deprecation through the watcher when it lands.
+                        LOGGER.log(Level.WARNING,
+                                "reconcile: segment {0} is DEPRECATED in registry but still"
+                                        + " referenced by IndexStatus. The IS will keep loading"
+                                        + " it until the assignment-change handler processes the"
+                                        + " transfer; verify that the SegmentAssignmentWatcher"
+                                        + " is wired and consuming events.",
+                                new Object[]{segmentUuid});
                     }
-                    // ACTIVE / TRANSFERRING / DEPRECATED: leave alone.
+                    // ACTIVE / TRANSFERRING / DELETED: leave alone — see Javadoc table.
                 } catch (SegmentRegistryException e) {
                     LOGGER.log(Level.WARNING,
                             "reconcile failed to inspect/promote segment {0}: {1}",

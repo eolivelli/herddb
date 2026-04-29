@@ -745,6 +745,18 @@ replacedBy[], retentionUntilEpochMillis, createdAtEpochMillis
 
 CRUD operations are exposed by `SegmentRegistryClient` (`createSegment`, `getSegment`, `listSegments`, `casUpdateSegment`, `casDeleteSegment`, plus parent listings `listIndexes`, `listTablespaces`). Watcher arming is supported on both child and data znodes; the registry lazily creates parent znodes on first segment registration.
 
+### Production prerequisites — DO NOT enable `indexOptimizer.enabled=true` until ALL of the following are in place
+
+The current PR ships the registry-side state machine, the staged-publish protocol, the leader-lock, the in-process tombstone overlay, and the optimizer service itself, but it does NOT yet wire them through the IS hot path. Flipping the Helm chart's `indexOptimizer.enabled=true` against an IS that lacks these wirings will silently corrupt indexes (the optimizer would deprecate segments the IS still references, and on the next IS restart the segments would fail to load with file-not-found). Verify each prerequisite before enabling:
+
+1. **Real `SegmentMerger` SPI registered.** The default `IndexOptimizerMain` SPI loader returns a `NoopMerger` that declines every merge. A production deployment must register a `SegmentMerger` ServiceLoader file (see `META-INF/services/herddb.indexing.optimizer.SegmentMerger`) backed by a real graph-aware implementation extracted from `VectorIndexCompactor`. The merger must also implement the `abandon(SegmentMetadata)` callback to clean up multipart files when a revalidate-abort discards an output (review-item R4).
+2. **IS-side `SegmentAssignmentWatcher` wired in `IndexingServiceEngine`.** Every IS instance must run a watcher that, on `onSegmentReleased`, closes its local segment handle BEFORE the optimizer reaps the underlying files. Without this, ownership transfers and reaps run blind.
+3. **`indexoptimizer.safeMode.fileDeletion=false` opt-in.** The optimizer ships with safe-mode enabled by default; the reaper progresses the znode lifecycle (DEPRECATED → casDelete) but does NOT call `DataStorageManager.deleteMultipartIndexFile`. Disable safe-mode only after #2 above is verified end-to-end. Doing so requires a non-null `DataStorageManager` to be wired into `IndexOptimizerEngine`.
+4. **Per-index opt-in plumbed through `IndexingServiceEngine`.** `PROPERTY_INDEX_OPTIMIZER_ENABLED` is currently parsed but never read by the IS engine. Production code must call `PersistentVectorStore.setSegmentPublisher` and `setExternalCompactionEnabled` based on the per-index flag at construction time. Until this lands, only test code exercises the publisher attach path.
+5. **Rollback strategy documented.** Indexes written in v4 IndexStatus format cannot be loaded by a binary that only knows v3 — the v3-only loader fails fast with a clear `DataStorageManagerException` (review-item B4). If you need bidirectional compatibility for a phased rollout, gate `indexOptimizer.enabled` per-tenant and keep at least one tier on the v3-only binary.
+
+When all five are in place, follow the validation checklist in the PR description before flipping the production switch.
+
 ---
 
 ## FusedPQ On-Disk Format
