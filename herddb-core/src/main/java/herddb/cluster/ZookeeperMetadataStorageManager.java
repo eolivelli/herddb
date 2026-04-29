@@ -560,8 +560,8 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
                 ensureZooKeeper().delete(ledgersPath + "/" + child, -1);
             }
             {
-                // Delete children of indexing-services/instances (ephemeral)
-                // and state (persistent). The /instances and /state subnodes
+                // Delete children of indexing-services/instances and state
+                // (both persistent). The /instances and /state subnodes
                 // themselves are preserved — ensureRoot() re-creates them.
                 List<String> instanceChildren =
                         ensureZooKeeper().getChildren(indexingServicesInstancesPath, false);
@@ -621,12 +621,64 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
             String path = indexingServicesInstancesPath + "/" + descriptor.getServiceId();
             byte[] data = descriptor.serialize();
             try {
-                ensureZooKeeper().create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+                // PERSISTENT: the registration is permanent and survives ZK
+                // session expiries / restarts / crashes. Failure detection is
+                // the client's responsibility (gRPC connect/RPC errors → mark
+                // the peer as failing and route around it). Stale entries left
+                // by deleted pods are cleaned up via the herddb-cli
+                // --remove-indexing-service-instance command.
+                ensureZooKeeper().create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
             } catch (KeeperException.NodeExistsException ok) {
                 ensureZooKeeper().setData(path, data, -1);
             }
             this.registeredIndexingServiceDescriptor = descriptor;
             LOGGER.log(Level.INFO, "Registered indexing service instance: {0}", descriptor);
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    /**
+     * Reads the registration descriptor for the given {@code serviceId}, or
+     * {@code null} if no registration exists. Used by the herddb-cli
+     * --describe-indexing-service-instance command.
+     */
+    public IndexingServiceInstanceDescriptor getIndexingServiceInstanceRegistration(String serviceId)
+            throws MetadataStorageManagerException {
+        try {
+            String path = indexingServicesInstancesPath + "/" + serviceId;
+            byte[] data;
+            try {
+                data = ensureZooKeeper().getData(path, false, null);
+            } catch (KeeperException.NoNodeException absent) {
+                return null;
+            }
+            return IndexingServiceInstanceDescriptor.deserialize(data);
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    /**
+     * Removes the registration of an indexing-service instance from the
+     * persistent znode store. Idempotent: a missing registration is not an
+     * error. Used by the herddb-cli --remove-indexing-service-instance
+     * command to clean up stale entries left by deleted pods.
+     *
+     * <p>Note: if the registering process is still up and connected to ZK,
+     * its in-process state-machine will re-create the registration on its
+     * next reconnect / session-restart cycle. The operator is expected to
+     * confirm the instance is gone before invoking this command.
+     */
+    public void removeIndexingServiceInstanceRegistration(String serviceId)
+            throws MetadataStorageManagerException {
+        try {
+            ensureZooKeeper().delete(indexingServicesInstancesPath + "/" + serviceId, -1);
+            LOGGER.log(Level.INFO, "Removed indexing service instance registration: {0}", serviceId);
+        } catch (KeeperException.NoNodeException ok) {
+            // already gone — idempotent
         } catch (KeeperException | InterruptedException | IOException err) {
             handleSessionExpiredError(err);
             throw new MetadataStorageManagerException(err);
@@ -766,13 +818,63 @@ public class ZookeeperMetadataStorageManager extends MetadataStorageManager {
             String path = fileServersPath + "/" + serviceId;
             byte[] data = address.getBytes(StandardCharsets.UTF_8);
             try {
-                ensureZooKeeper().create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+                // PERSISTENT: the registration is permanent and survives ZK
+                // session expiries / restarts / crashes. Failure detection is
+                // the client's responsibility (gRPC connect/RPC errors → mark
+                // the peer as failing and route around it). Stale entries left
+                // by deleted pods are cleaned up via the herddb-cli
+                // --remove-file-server command.
+                ensureZooKeeper().create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
             } catch (KeeperException.NodeExistsException ok) {
                 ensureZooKeeper().setData(path, data, -1);
             }
             this.registeredFileServerId = serviceId;
             this.registeredFileServerAddress = address;
             LOGGER.log(Level.INFO, "Registered file server: {0} -> {1}", new Object[]{serviceId, address});
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    /**
+     * Reads the registration address for the given file-server {@code serviceId},
+     * or {@code null} if no registration exists. Used by the herddb-cli
+     * --describe-file-server command.
+     */
+    public String getFileServerRegistration(String serviceId) throws MetadataStorageManagerException {
+        try {
+            String path = fileServersPath + "/" + serviceId;
+            byte[] data;
+            try {
+                data = ensureZooKeeper().getData(path, false, null);
+            } catch (KeeperException.NoNodeException absent) {
+                return null;
+            }
+            return new String(data, StandardCharsets.UTF_8);
+        } catch (KeeperException | InterruptedException | IOException err) {
+            handleSessionExpiredError(err);
+            throw new MetadataStorageManagerException(err);
+        }
+    }
+
+    /**
+     * Removes the registration of a file-server from the persistent znode
+     * store. Idempotent: a missing registration is not an error. Used by the
+     * herddb-cli --remove-file-server command to clean up stale entries left
+     * by deleted pods.
+     *
+     * <p>Note: if the registering process is still up and connected to ZK,
+     * its in-process state-machine will re-create the registration on its
+     * next reconnect / session-restart cycle. The operator is expected to
+     * confirm the instance is gone before invoking this command.
+     */
+    public void removeFileServerRegistration(String serviceId) throws MetadataStorageManagerException {
+        try {
+            ensureZooKeeper().delete(fileServersPath + "/" + serviceId, -1);
+            LOGGER.log(Level.INFO, "Removed file server registration: {0}", serviceId);
+        } catch (KeeperException.NoNodeException ok) {
+            // already gone — idempotent
         } catch (KeeperException | InterruptedException | IOException err) {
             handleSessionExpiredError(err);
             throw new MetadataStorageManagerException(err);

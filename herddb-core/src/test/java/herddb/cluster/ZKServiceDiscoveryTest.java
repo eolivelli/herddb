@@ -141,8 +141,11 @@ public class ZKServiceDiscoveryTest {
     }
 
     @Test
-    public void testEphemeralNodeDisappearsOnClose() throws Exception {
-        // Manager 1 registers a service
+    public void testRegistrationSurvivesManagerClose() throws Exception {
+        // Registrations are PERSISTENT (issue #350): they must survive the
+        // registering manager closing its session. Failure detection is the
+        // client's responsibility; stale entries are cleaned up by operator
+        // action (herddb-cli --remove-indexing-service-instance).
         ZookeeperMetadataStorageManager manager1 = new ZookeeperMetadataStorageManager(
                 testEnv.getAddress(), testEnv.getTimeout(), testEnv.getPath());
         manager1.start();
@@ -156,14 +159,21 @@ public class ZKServiceDiscoveryTest {
             manager2.start();
             assertEquals(1, manager2.listIndexingServiceInstances().size());
 
-            // Close manager1 - ephemeral node should disappear
+            // Close manager1 - the persistent registration must remain
             manager1.close();
 
-            // Wait for ZK to detect session close
+            // Give ZK plenty of time to detect the closed session; if the
+            // registration were ephemeral it would be gone after this sleep.
             Thread.sleep(2000);
 
-            assertTrue("Ephemeral node should be gone after close",
-                    manager2.listIndexingServiceInstances().isEmpty());
+            assertEquals("Persistent registration must survive manager close",
+                    1, manager2.listIndexingServiceInstances().size());
+            assertEquals("localhost:9850",
+                    manager2.listIndexingServiceInstances().get(0).getAddress());
+
+            // Operator cleanup
+            manager2.removeIndexingServiceInstanceRegistration("svc1");
+            assertTrue(manager2.listIndexingServiceInstances().isEmpty());
         }
     }
 }

@@ -49,7 +49,7 @@ data:
     {{- if .Values.zookeeper.enabled }}
     server.zookeeper.address={{ include "herddb.zkAddress" . }}
     server.zookeeper.path=/herd
-    server.zookeeper.session.timeout=40000
+    server.zookeeper.session.timeout={{ .Values.fileServer.zkSessionTimeout }}
     {{- end }}
     {{- range $k, $v := .Values.fileServer.extraConfig }}
     {{ $k }}={{ $v }}

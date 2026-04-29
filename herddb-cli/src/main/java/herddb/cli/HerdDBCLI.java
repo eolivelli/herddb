@@ -45,6 +45,8 @@ import herddb.index.blink.BLinkMetadata;
 import herddb.jdbc.HerdDBConnection;
 import herddb.jdbc.HerdDBDataSource;
 import herddb.jdbc.PreparedStatementAsync;
+import herddb.metadata.IndexingServiceInstanceDescriptor;
+import herddb.metadata.MetadataStorageManager;
 import herddb.metadata.MetadataStorageManagerException;
 import herddb.model.Column;
 import herddb.model.ColumnTypes;
@@ -184,6 +186,20 @@ public class HerdDBCLI {
             options.addOption("at", "alter-tablespace", false,
                     "Alter a tablespace (needs -s, -param and --values options)");
 
+            options.addOption("lfs", "list-file-servers", false,
+                    "List all file-server registrations stored in ZooKeeper");
+            options.addOption("dfs", "describe-file-server", false,
+                    "Show details of one file-server registration (needs --service-id)");
+            options.addOption("rfs", "remove-file-server", false,
+                    "Remove a stale file-server registration from ZooKeeper (needs --service-id)");
+            options.addOption("lisi", "list-indexing-service-instances", false,
+                    "List all indexing-service registrations stored in ZooKeeper");
+            options.addOption("disi", "describe-indexing-service-instance", false,
+                    "Show details of one indexing-service registration (needs --service-id)");
+            options.addOption("risi", "remove-indexing-service-instance", false,
+                    "Remove a stale indexing-service registration from ZooKeeper (needs --service-id)");
+            options.addOption("sid", "service-id", true,
+                    "Service id used by the file-server / indexing-service registration commands");
             options.addOption("d", "describe", false, "Checks and describes a raw file");
             options.addOption("ft", "filetype", true,
                     "Checks and describes a raw file (valid options are txlog, datapage, tablecheckpoint, indexcheckpoint, tablesmetadata, bkledger");
@@ -276,6 +292,23 @@ public class HerdDBCLI {
 
             boolean listTablespaces = commandLine.hasOption("list-tablespaces");
             boolean listNodes = commandLine.hasOption("list-nodes");
+            boolean listFileServers = commandLine.hasOption("list-file-servers");
+            boolean describeFileServer = commandLine.hasOption("describe-file-server");
+            boolean removeFileServer = commandLine.hasOption("remove-file-server");
+            boolean listIndexingServiceInstances =
+                    commandLine.hasOption("list-indexing-service-instances");
+            boolean describeIndexingServiceInstance =
+                    commandLine.hasOption("describe-indexing-service-instance");
+            boolean removeIndexingServiceInstance =
+                    commandLine.hasOption("remove-indexing-service-instance");
+            String serviceId = commandLine.getOptionValue("service-id", "");
+            if ((describeFileServer || removeFileServer
+                    || describeIndexingServiceInstance || removeIndexingServiceInstance)
+                    && serviceId.isEmpty()) {
+                println("Specify the service id (--service-id <id>)");
+                exitCode = 1;
+                System.exit(exitCode);
+            }
             boolean showTablespace = commandLine.hasOption("show-tablespace");
             boolean listTables = commandLine.hasOption("list-tables");
             boolean showTable = commandLine.hasOption("show-table");
@@ -392,6 +425,18 @@ public class HerdDBCLI {
                         printTableSpaces(verbose, ignoreerrors, statement, tableSpaceMapper, metadataStorageManager);
                     } else if (listNodes) {
                         printNodes(verbose, ignoreerrors, statement, tableSpaceMapper, metadataStorageManager);
+                    } else if (listFileServers) {
+                        printFileServers(metadataStorageManager);
+                    } else if (describeFileServer) {
+                        describeFileServer(metadataStorageManager, serviceId);
+                    } else if (removeFileServer) {
+                        removeFileServer(metadataStorageManager, serviceId);
+                    } else if (listIndexingServiceInstances) {
+                        printIndexingServiceInstances(metadataStorageManager);
+                    } else if (describeIndexingServiceInstance) {
+                        describeIndexingServiceInstance(metadataStorageManager, serviceId);
+                    } else if (removeIndexingServiceInstance) {
+                        removeIndexingServiceInstance(metadataStorageManager, serviceId);
                     } else if (showTablespace) {
                         printTableSpaceInfos(verbose, ignoreerrors, statement, tableSpaceMapper, schema,
                                 metadataStorageManager);
@@ -834,6 +879,145 @@ public class HerdDBCLI {
             }
         }
 
+    }
+
+    // -------------------------------------------------------------------------
+    // File-server / indexing-service registration commands (issue #350).
+    //
+    // Registrations are PERSISTENT in ZooKeeper — they survive ZK session
+    // expiries, process restarts, and crashes. Failure detection is the
+    // client's responsibility (gRPC connect/RPC errors → mark the peer as
+    // failing and route around it). These commands let an operator inspect
+    // the registry and clean up stale entries left behind by deleted pods or
+    // scaled-down replicas.
+    // -------------------------------------------------------------------------
+
+    static void printFileServers(MetadataStorageManager metadataStorageManager)
+            throws MetadataStorageManagerException {
+        if (!ensureClusterMode(metadataStorageManager)) {
+            return;
+        }
+        List<String> servers = metadataStorageManager.listFileServers();
+        println("");
+        println(" File servers (registered in ZooKeeper):");
+        println("");
+        if (servers.isEmpty()) {
+            println("   No file-server registrations to show");
+            return;
+        }
+        for (String address : servers) {
+            // listFileServers returns addresses; the serviceId is the same as
+            // the address by convention (see RemoteFileServer#start).
+            println("   Address: " + address);
+        }
+        println("");
+    }
+
+    static void describeFileServer(MetadataStorageManager metadataStorageManager, String serviceId)
+            throws MetadataStorageManagerException {
+        if (!ensureClusterMode(metadataStorageManager)) {
+            return;
+        }
+        String address = metadataStorageManager.getFileServerRegistration(serviceId);
+        println("");
+        if (address == null) {
+            println(" File server '" + serviceId + "' not found");
+            exitCode = 1;
+            return;
+        }
+        println(" File server: " + serviceId);
+        println("   Address: " + address);
+        println("");
+    }
+
+    static void removeFileServer(MetadataStorageManager metadataStorageManager, String serviceId)
+            throws MetadataStorageManagerException {
+        if (!ensureClusterMode(metadataStorageManager)) {
+            return;
+        }
+        String address = metadataStorageManager.getFileServerRegistration(serviceId);
+        if (address == null) {
+            println(" File server '" + serviceId + "' not found — nothing to remove");
+            return;
+        }
+        metadataStorageManager.removeFileServerRegistration(serviceId);
+        println(" Removed file-server registration: " + serviceId + " (was " + address + ")");
+    }
+
+    static void printIndexingServiceInstances(MetadataStorageManager metadataStorageManager)
+            throws MetadataStorageManagerException {
+        if (!ensureClusterMode(metadataStorageManager)) {
+            return;
+        }
+        List<IndexingServiceInstanceDescriptor> instances =
+                metadataStorageManager.listIndexingServiceInstances();
+        println("");
+        println(" Indexing-service instances (registered in ZooKeeper):");
+        println("");
+        if (instances.isEmpty()) {
+            println("   No indexing-service registrations to show");
+            return;
+        }
+        for (IndexingServiceInstanceDescriptor d : instances) {
+            println("   Service: " + d.getServiceId());
+            println("     Address:    " + d.getAddress());
+            println("     Role:       " + d.getRole());
+            println("     InstanceId: " + d.getInstanceId());
+            if (d.isShadow()) {
+                println("     ShadowOf:   " + d.getShadowOf());
+            }
+            println("");
+        }
+    }
+
+    static void describeIndexingServiceInstance(
+            MetadataStorageManager metadataStorageManager, String serviceId)
+            throws MetadataStorageManagerException {
+        if (!ensureClusterMode(metadataStorageManager)) {
+            return;
+        }
+        IndexingServiceInstanceDescriptor d =
+                metadataStorageManager.getIndexingServiceInstanceRegistration(serviceId);
+        println("");
+        if (d == null) {
+            println(" Indexing-service instance '" + serviceId + "' not found");
+            exitCode = 1;
+            return;
+        }
+        println(" Indexing-service instance: " + d.getServiceId());
+        println("   Address:    " + d.getAddress());
+        println("   Role:       " + d.getRole());
+        println("   InstanceId: " + d.getInstanceId());
+        if (d.isShadow()) {
+            println("   ShadowOf:   " + d.getShadowOf());
+        }
+        println("");
+    }
+
+    static void removeIndexingServiceInstance(
+            MetadataStorageManager metadataStorageManager, String serviceId)
+            throws MetadataStorageManagerException {
+        if (!ensureClusterMode(metadataStorageManager)) {
+            return;
+        }
+        IndexingServiceInstanceDescriptor d =
+                metadataStorageManager.getIndexingServiceInstanceRegistration(serviceId);
+        if (d == null) {
+            println(" Indexing-service instance '" + serviceId + "' not found — nothing to remove");
+            return;
+        }
+        metadataStorageManager.removeIndexingServiceInstanceRegistration(serviceId);
+        println(" Removed indexing-service registration: " + serviceId
+                + " (was " + d.getAddress() + ", role=" + d.getRole() + ")");
+    }
+
+    private static boolean ensureClusterMode(MetadataStorageManager metadataStorageManager) {
+        if (metadataStorageManager == null) {
+            println("You are not managing a cluster. This command requires a JDBC URL with :zookeeper:");
+            exitCode = 1;
+            return false;
+        }
+        return true;
     }
 
     private static void printTableSpaceInfos(
