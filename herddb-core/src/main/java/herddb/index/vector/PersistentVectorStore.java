@@ -2700,6 +2700,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 total += shardMemoryBytes(shard);
             }
         }
+        // Include on-disk segments' in-memory footprint (issue #360).
+        // Each VectorSegment retains pkData/pkOffsets/pkLengths arrays and a
+        // BLink pk-to-ordinal tree whose internal TreeMap nodes account for the
+        // 6-8 GiB gap observed between engine-stats estimated memory and
+        // actual G1 old-gen usage in the GKE benchmark.
+        for (VectorSegment seg : segments) {
+            total += seg.estimatedInMemoryBytes();
+        }
         return total;
     }
 
