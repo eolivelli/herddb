@@ -116,9 +116,21 @@ public class PersistentVectorStoreBackpressureLivelockTest {
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         MemoryManager mm = new MemoryManager(128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
 
-        // Small memory limit to trigger backpressure during ingestion.
-        // 256KB allows ~400 vectors before backpressure kicks in.
-        long smallMemoryLimit = 256 * 1024;
+        // Memory limit calibrated for the post-fix accounting that now includes
+        // on-disk VectorSegment memory (pkData/pkOffsets/pkLengths + BLink tree).
+        //
+        // The limit must satisfy two constraints:
+        //   (a) > max total with all 2000 vectors on-disk + empty live shard, so
+        //       back-pressure always releases after a checkpoint.
+        //       Upper bound: ~200 KB (OnHeapGraphIndex.CompletionTracker[50000])
+        //                   + ~240 KB (2000 vectors × ~120B on-disk estimate)
+        //                   = ~440 KB  →  use 512 KB for headroom.
+        //   (b) < peak estimate with 2000 vectors filling the live shard, so
+        //       back-pressure fires at least once during ingestion (~1.1 MB peak).
+        //
+        // With this limit back-pressure fires ~3-5 times during the run, which is
+        // sufficient to exercise the livelock-prevention code.
+        long smallMemoryLimit = 512 * 1024;
         long compactionIntervalMs = 100;
 
         try (PersistentVectorStore store = new PersistentVectorStore(
