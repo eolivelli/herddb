@@ -75,6 +75,12 @@ public class GroundTruthTracker {
     /**
      * Returns the ground truth as int[][] (one row per query, K columns),
      * sorted nearest-first (ascending distance).
+     *
+     * <p>This method is non-destructive: it copies each heap into a fresh
+     * array and sorts the copy, so the internal state is untouched. Callers
+     * may invoke it multiple times during a generation run (e.g. to write
+     * intermediate ground-truth files at user-specified base-vector
+     * checkpoints) and obtain a consistent snapshot at every call.</p>
      */
     public int[][] getGroundTruth() {
         int[][] result = new int[queryVectors.length][];

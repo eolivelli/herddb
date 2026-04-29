@@ -21,6 +21,7 @@ package herddb.vectortesting;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.File;
 import java.io.FileInputStream;
@@ -29,7 +30,9 @@ import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -62,15 +65,28 @@ public class DatasetGenerator {
 
         File baseFile = new File(outputDir, prefix + "_base.fvecs");
         File queryFile = new File(outputDir, prefix + "_query.fvecs");
-        File groundTruthFile = new File(outputDir, prefix + "_groundtruth.ivecs");
         File csvFile = new File(outputDir, prefix + "_sentences.csv");
         File descriptorFile = new File(outputDir, prefix + "_descriptor.json");
+
+        // Resolve checkpoint plan: ascending base-vector counts → file. The final
+        // checkpoint always equals config.total and uses the legacy
+        // {prefix}_groundtruth.ivecs name, so old descriptor consumers keep working.
+        long[] checkpointCounts = config.groundTruthCheckpoints;
+        Map<Long, File> checkpointFiles = new LinkedHashMap<>();
+        for (long count : checkpointCounts) {
+            String fileName = (count == config.total)
+                    ? prefix + "_groundtruth.ivecs"
+                    : prefix + "_groundtruth_" + count + ".ivecs";
+            checkpointFiles.put(count, new File(outputDir, fileName));
+        }
 
         // Buffer first numQueries vectors in memory for ground truth tracker
         List<float[]> queryVectorsList = new ArrayList<>(config.numQueries);
         GroundTruthTracker tracker = null;
 
         long startTime = System.currentTimeMillis();
+        // Index of the next checkpoint to emit; advances each time we cross one.
+        int nextCheckpointIdx = 0;
 
         try (SiftWriter baseWriter = new SiftWriter(baseFile);
              SiftWriter queryWriter = new SiftWriter(queryFile);
@@ -118,6 +134,22 @@ public class DatasetGenerator {
                         csvWriter.print(',');
                         csvWriter.println(vectorToString(vec));
                     }
+
+                    // Emit any pending checkpoints we just crossed. Multiple checkpoints can
+                    // theoretically share a count if the user's CSV is malformed, but
+                    // GeneratorConfig.parseCheckpoints already rejects duplicates, so this is
+                    // a single iteration in practice.
+                    long crossedCount = (long) globalIdx + 1L;
+                    while (tracker != null
+                            && nextCheckpointIdx < checkpointCounts.length
+                            && checkpointCounts[nextCheckpointIdx] == crossedCount) {
+                        long count = checkpointCounts[nextCheckpointIdx];
+                        File gtFile = checkpointFiles.get(count);
+                        writeGroundTruthFile(gtFile, tracker);
+                        System.out.printf("%n  Wrote ground truth checkpoint @ %,d vectors → %s%n",
+                                count, gtFile.getName());
+                        nextCheckpointIdx++;
+                    }
                 }
 
                 generated += embeddings.length;
@@ -130,45 +162,55 @@ public class DatasetGenerator {
             System.out.println();
         }
 
-        // Handle edge case where total == numQueries (tracker never initialized in the else-if branch)
-        if (tracker == null && !queryVectorsList.isEmpty()) {
-            float[][] queryVectors = queryVectorsList.toArray(new float[0][]);
-            tracker = new GroundTruthTracker(queryVectors, config.groundTruthK, config.similarity);
-            for (int j = 0; j < queryVectors.length; j++) {
-                tracker.offer(j, queryVectors[j]);
-            }
-        }
-
-        // Write ground truth
-        if (tracker != null) {
-            System.out.println("Writing ground truth...");
-            int[][] groundTruth = tracker.getGroundTruth();
-            try (SiftWriter gtWriter = new SiftWriter(groundTruthFile)) {
-                for (int[] row : groundTruth) {
-                    gtWriter.writeIvec(row);
+        // Defensive fallback: if no checkpoint was emitted (e.g. a future code path leaves
+        // total < numQueries), still write the final ground-truth file at config.total so
+        // older consumers find {prefix}_groundtruth.ivecs.
+        if (nextCheckpointIdx < checkpointCounts.length) {
+            if (tracker == null && !queryVectorsList.isEmpty()) {
+                float[][] queryVectors = queryVectorsList.toArray(new float[0][]);
+                tracker = new GroundTruthTracker(queryVectors, config.groundTruthK, config.similarity);
+                for (int j = 0; j < queryVectors.length; j++) {
+                    tracker.offer(j, queryVectors[j]);
                 }
             }
-            System.out.println("Ground truth: " + groundTruth.length + " queries, "
-                    + config.groundTruthK + " neighbors each");
+            while (nextCheckpointIdx < checkpointCounts.length && tracker != null) {
+                long count = checkpointCounts[nextCheckpointIdx];
+                File gtFile = checkpointFiles.get(count);
+                writeGroundTruthFile(gtFile, tracker);
+                System.out.printf("  Wrote ground truth checkpoint @ %,d vectors → %s%n",
+                        count, gtFile.getName());
+                nextCheckpointIdx++;
+            }
         }
 
         // Write dataset descriptor
         System.out.println("Writing dataset descriptor...");
-        writeDescriptor(descriptorFile, config, prefix, dim);
+        writeDescriptor(descriptorFile, config, prefix, dim, checkpointFiles);
 
         // Optional ZIP compression
         File zipFile = null;
         if (config.zip) {
             zipFile = new File(outputDir, prefix + "_dataset.zip");
             System.out.println("Creating ZIP archive: " + zipFile.getName());
-            createZip(zipFile, baseFile, queryFile, groundTruthFile, descriptorFile,
-                    config.csv ? csvFile : null);
+            List<File> zipEntries = new ArrayList<>();
+            zipEntries.add(baseFile);
+            zipEntries.add(queryFile);
+            for (File gt : checkpointFiles.values()) {
+                zipEntries.add(gt);
+            }
+            zipEntries.add(descriptorFile);
+            if (config.csv) {
+                zipEntries.add(csvFile);
+            }
+            createZip(zipFile, zipEntries.toArray(new File[0]));
 
             // Remove individual files — the ZIP is the single deliverable
             System.out.println("Removing individual files (kept in ZIP)...");
             deleteQuietly(baseFile);
             deleteQuietly(queryFile);
-            deleteQuietly(groundTruthFile);
+            for (File gt : checkpointFiles.values()) {
+                deleteQuietly(gt);
+            }
             deleteQuietly(descriptorFile);
             deleteQuietly(csvFile);
         }
@@ -183,15 +225,34 @@ public class DatasetGenerator {
             System.out.println("  Descriptor:     " + descriptorFile.getName());
             System.out.println("  Base vectors:   " + baseFile.getName() + " (" + formatSize(baseFile.length()) + ")");
             System.out.println("  Query vectors:  " + queryFile.getName() + " (" + formatSize(queryFile.length()) + ")");
-            System.out.println("  Ground truth:   " + groundTruthFile.getName() + " (" + formatSize(groundTruthFile.length()) + ")");
+            for (Map.Entry<Long, File> e : checkpointFiles.entrySet()) {
+                File gt = e.getValue();
+                System.out.printf("  Ground truth @ %,d: %s (%s)%n",
+                        e.getKey(), gt.getName(), formatSize(gt.length()));
+            }
             if (config.csv) {
                 System.out.println("  CSV:            " + csvFile.getName() + " (" + formatSize(csvFile.length()) + ")");
             }
         }
     }
 
+    /**
+     * Writes one IVECS ground-truth file using the tracker's current snapshot. Safe to
+     * call multiple times during a generation run — {@link GroundTruthTracker#getGroundTruth()}
+     * is non-destructive.
+     */
+    private static void writeGroundTruthFile(File gtFile, GroundTruthTracker tracker) throws Exception {
+        int[][] groundTruth = tracker.getGroundTruth();
+        try (SiftWriter gtWriter = new SiftWriter(gtFile)) {
+            for (int[] row : groundTruth) {
+                gtWriter.writeIvec(row);
+            }
+        }
+    }
+
     private static void writeDescriptor(File descriptorFile, GeneratorConfig config,
-                                          String prefix, int dimensions) throws Exception {
+                                          String prefix, int dimensions,
+                                          Map<Long, File> checkpointFiles) throws Exception {
         ObjectMapper mapper = new ObjectMapper();
         mapper.enable(SerializationFeature.INDENT_OUTPUT);
         ObjectNode root = mapper.createObjectNode();
@@ -205,7 +266,19 @@ public class DatasetGenerator {
         root.put("embeddingModel", config.model);
         root.put("baseFile", prefix + "_base.fvecs");
         root.put("queryFile", prefix + "_query.fvecs");
+        // Legacy field: always points to the ground-truth file matching --total. This
+        // duplicates the last entry of groundTruthCheckpoints, but old descriptor
+        // consumers only look at this field.
         root.put("groundTruthFile", prefix + "_groundtruth.ivecs");
+        // New field: list of (baseVectorCount, file) pairs in ascending order, including
+        // the final entry whose file equals groundTruthFile. Consumers that want recall
+        // for prefix runs (--rows N) look up the matching baseVectorCount here.
+        ArrayNode checkpoints = root.putArray("groundTruthCheckpoints");
+        for (Map.Entry<Long, File> e : checkpointFiles.entrySet()) {
+            ObjectNode entry = checkpoints.addObject();
+            entry.put("baseVectorCount", e.getKey());
+            entry.put("file", e.getValue().getName());
+        }
         root.put("createdAt", Instant.now().toString());
         mapper.writeValue(descriptorFile, root);
     }

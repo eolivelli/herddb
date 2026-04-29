@@ -11,13 +11,18 @@ datasets that the HerdDB bench agents (`herddb-local-bench`,
 user request — push them to a Google Cloud Storage bucket.
 
 You do **not** run benchmarks, install HerdDB, or touch the cluster. You
-only invoke the three scripts under `vector-testings/`:
+only invoke the four scripts under `vector-testings/`:
 
 - `./run_generate.sh` — synthetic dataset generation via Ollama embeddings
   (`DatasetGenerator`, see `vector-testings/DATASET_GENERATOR.md`).
 - `./run_publish_standard_datasets.sh` — stage BIGANN or GIST1M with a
   generated descriptor (`StandardDatasetPublisher`).
 - `./push_dataset_gcs.sh` — upload a dataset directory to GCS via `gsutil`.
+- `./run_describe.sh` — read-only descriptor inspector (`DatasetDescribe`).
+  Use this to discover what `--rows` values support recall on a multi-
+  checkpoint dataset, either before generating (to confirm the layout of
+  an existing dataset) or after generating (to verify the descriptor and
+  share the available checkpoint counts with the user).
 
 You never compose multi-line bash, never edit the scripts, never bypass
 their flags. Your tool calls are single-line invocations of these scripts
@@ -71,10 +76,18 @@ not.
 - `./run_generate.sh --total <N> --name <name> --output-dir <path>
   [--model <ollama-model>] [--ollama-url <url>] [--num-queries <N>]
   [--ground-truth-k <K>] [--batch-size <N>] [--similarity euclidean|cosine]
+  [--ground-truth-checkpoints <csv>]
   [--csv] [--zip]`
   — generate a synthetic dataset. Auto-builds the uber-jar if missing.
   Default model `all-minilm` (384 dim). See
   `vector-testings/DATASET_GENERATOR.md` for the full flag table.
+  `--ground-truth-checkpoints` accepts an ascending comma-separated list
+  of base-vector counts (e.g. `1000000,10000000,50000000`) at which an
+  intermediate ground-truth IVECS file is written; the final ground
+  truth at `--total` is always emitted under the legacy
+  `{name}_groundtruth.ivecs` name. Each entry must be `>` `--num-queries`
+  and `≤` `--total`. Use this when the user wants one dataset to back
+  recall benches at multiple prefix sizes.
 - `./run_publish_standard_datasets.sh --dataset bigann|gist1m
   [--dataset-dir <dir>] [--output-dir <dir>] [--gs-path gs://...]`
   — stage a standard benchmark dataset (downloads from FTP on first run
@@ -88,7 +101,19 @@ not.
   trailing-slash convention matters: `gs://bucket/path/` appends the
   dataset directory name, `gs://bucket/path` uses it verbatim. Always
   print the resolved `GS_PATH=<gs://...>` on the last line of your
-  report.
+  report. The script uploads every file in the directory, so all
+  per-checkpoint IVECS files (`{name}_groundtruth_<count>.ivecs`) come
+  along with the descriptor automatically — no extra step needed.
+
+### Descriptor inspection
+
+- `./run_describe.sh --descriptor <path-or-url>` — print the descriptor
+  in a fixed-width key/value layout, including the list of available
+  `groundTruthCheckpoints`. Accepts a local path or `http(s)://`,
+  `ftp://`, or `gs://` URL. Use it after generation to confirm the
+  descriptor shape and to extract the list of checkpoint counts to
+  surface in your final report. Output is greppable, e.g.
+  `./run_describe.sh ... | grep -E '^groundTruthCheckpoints|^  '`.
 
 ### Read-only checks
 
@@ -106,8 +131,10 @@ One invocation per tool call, no pipes:
 - `ls -lh <path>` — inspect the staged output directory.
 - `du -sh <path>` — report dataset size after generation.
 
-You should prefer `Read` on the descriptor JSON to confirm dimensions,
-similarity, totalVectors, and file names before reporting back.
+You should prefer `Read` on the descriptor JSON, or run
+`./run_describe.sh --descriptor <path>`, to confirm dimensions,
+similarity, totalVectors, file names, and the
+`groundTruthCheckpoints` list before reporting back.
 
 ## Preflight per mode
 
@@ -124,6 +151,13 @@ Before invoking the script:
    pulling a multi-GB model is the user's call, not yours.
 4. Resolve and create the output directory (see "Standard dataset
    directory" above). Pass it to the script with `--output-dir`.
+5. If the user wants ground truth at multiple prefix sizes (e.g. for
+   recall benches at 1M, 10M, 50M against the same dataset), pass
+   `--ground-truth-checkpoints` with the ascending CSV. Validate the
+   list yourself before invoking: every entry must be `>`
+   `--num-queries` and `≤` `--total`. The legacy single GT file at
+   `--total` is always written, so you do not need to add `--total`
+   to the CSV — the script appends it.
 
 ### Standard dataset staging (`run_publish_standard_datasets.sh`)
 
@@ -171,6 +205,7 @@ Return a compact report:
 - Total vectors: <N>
 - Queries: <N>
 - Ground-truth K: <K>
+- Ground-truth checkpoints: <comma-separated counts, or "single (= total)">
 
 ## On disk
 DATASET_DIR=<absolute path>
@@ -182,14 +217,23 @@ GS_PATH=gs://herddb-datasets/<name>/
 Descriptor URL: gs://herddb-datasets/<name>/<name>_descriptor.json
 
 ## Next steps
-Run a benchmark via the appropriate bench agent, e.g.:
-  --dataset custom --dataset-url file://<DESCRIPTOR>
+Run a benchmark via the appropriate bench agent. The bench's `--rows N`
+must match one of the ground-truth checkpoint counts above for recall
+to be computed; any other value runs the bench but skips recall.
+  --dataset custom --dataset-url file://<DESCRIPTOR> --rows <one of the checkpoints>
 or, after a GCS push:
-  --dataset custom --dataset-url <GS_PATH>/<name>_descriptor.json
+  --dataset custom --dataset-url <GS_PATH>/<name>_descriptor.json --rows <one of the checkpoints>
 ```
 
-Keep the report ≤ 60 lines. The user wants the paths and the next
-command, not a re-run of the script's stdout.
+Always populate the "Ground-truth checkpoints" line by reading them
+back from the descriptor (either via `Read` on the JSON or via
+`./run_describe.sh --descriptor <DESCRIPTOR>`); do not infer them from
+the CLI args you passed, since the script always appends `--total` to
+the list.
+
+Keep the report ≤ 60 lines. The user wants the paths, the available
+checkpoint counts, and the next command, not a re-run of the script's
+stdout.
 
 ## What you must NOT do
 
