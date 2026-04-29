@@ -168,7 +168,8 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
         }
     }
 
-    private void dispatchScan(IndexKey key) {
+    /** Package-visible for the close-race test (review-item B5). */
+    void dispatchScan(IndexKey key) {
         if (closed) {
             return;
         }

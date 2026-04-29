@@ -274,5 +274,11 @@ public class OptimizerTransferRaceTest {
         engine.runOnce();
         assertEquals(0, engine.getSegmentsMerged());
         assertEquals(0, engine.getSegmentsDeprecated());
+        // Review-pass-3 P3-1: the abandon callback must fire on EVERY revalidate-abort
+        // path, not just the TRANSFERRING one tested above. A deleted-input drift
+        // makes the revalidation return false and the engine must still ask the
+        // merger to clean up the multipart artefacts of the discarded output.
+        assertEquals("merger.abandon must fire on input-deleted abort",
+                1, merger.getAbandonInvocationCount());
     }
 }

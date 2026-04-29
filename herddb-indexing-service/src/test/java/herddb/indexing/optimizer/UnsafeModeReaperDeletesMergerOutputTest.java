@@ -47,14 +47,22 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 /**
- * Validates fix R7 from the second pr-reviewer pass: drive the optimizer through
- * a full merge → deprecate → reap cycle using a {@link SegmentMerger} that
- * produces metadata with a REAL (non-{@link SegmentMetadata#NO_SEGMENT_ID})
- * {@code segmentId} AND uploads actual graph/map files via
- * {@link FileDataStorageManager}. The reaper (with safeMode disabled) must
- * physically delete those files.
+ * Validates fix R7 (second pr-reviewer pass) and review-pass-3 P3-6: drive the
+ * optimizer through a full merge → deprecate → reap cycle using a
+ * {@link SegmentMerger} that produces metadata with a REAL (non-{@link
+ * SegmentMetadata#NO_SEGMENT_ID}) {@code segmentId} AND uploads actual
+ * graph/map files via {@link FileDataStorageManager}. The reaper deletes the
+ * files only when {@code safeModeFileDeletion = false}.
+ *
+ * <p><b>Important:</b> this test exercises the UNSAFE-mode reaper path. Default
+ * production deployments run with {@code indexoptimizer.safeMode.fileDeletion=true}
+ * (see VECTOR.md "Production prerequisites") and therefore do NOT delete files
+ * — the znode lifecycle still progresses but graph/map/tombstone bytes remain
+ * on remote storage. The class name advertises this distinction so a future
+ * reader does not mistake a green run here for "file deletion works in
+ * production".
  */
-public class ProductionMergerOutputDeletedTest {
+public class UnsafeModeReaperDeletesMergerOutputTest {
 
     private static final String BASE_PATH = "/herd-test-R7";
     private static final String TS_UUID = "tsuid";

@@ -82,6 +82,22 @@ public class PublisherHotSwapTest {
         return v;
     }
 
+    /**
+     * Installs the package-private {@code betweenStageAndCommitHookForTests} hook
+     * via reflection. The production class deliberately exposes no public setter
+     * (review-pass-3 P3-4: keep test-only knobs off the production API surface).
+     */
+    private static void installBetweenStageAndCommitHook(PersistentVectorStore store, Runnable hook) {
+        try {
+            java.lang.reflect.Field f = PersistentVectorStore.class
+                    .getDeclaredField("betweenStageAndCommitHookForTests");
+            f.setAccessible(true);
+            f.set(store, hook);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to install Phase-B test hook via reflection", e);
+        }
+    }
+
     @Test
     public void publisherAttachedBeforeCheckpointParticipatesInStageAndCommit() throws Exception {
         Path baseDir = tmpFolder.newFolder("data").toPath();
@@ -168,7 +184,9 @@ public class PublisherHotSwapTest {
             }
 
             // Hook fires after stage, before persist+commit. Swap the publisher.
-            store.setPhaseBHookForTesting(() -> store.setSegmentPublisher(swappedIn));
+            // Use reflection to set the package-private hook field — the production
+            // class deliberately does not expose a setter (review-pass-3 P3-4).
+            installBetweenStageAndCommitHook(store, () -> store.setSegmentPublisher(swappedIn));
 
             store.checkpoint();
 
@@ -185,7 +203,7 @@ public class PublisherHotSwapTest {
 
             // The swap takes effect on the NEXT checkpoint. Clear the hook and
             // run another checkpoint.
-            store.setPhaseBHookForTesting(null);
+            installBetweenStageAndCommitHook(store, null);
             for (int i = 300; i < 600; i++) {
                 store.addVector(Bytes.from_int(i), randomVector(new Random(i), 32));
             }

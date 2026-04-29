@@ -75,14 +75,17 @@ public class TombstoneOverlayBoundsTest {
     }
 
     @Test
-    public void acceptsCountAtMaximum() throws Exception {
-        // At the cap, deserialization will allocate a (potentially huge) int[] and try
-        // to read its contents. For the test we don't supply data — readInt() will
-        // throw EOFException (or OutOfMemoryError if the JVM heap is too small for
-        // the int[] allocation). Either is fine — we only assert that the count
-        // bounds check itself does NOT reject this value.
+    public void acceptsCountWellAboveTypicalWithoutBoundsRejection() throws Exception {
+        // Review-pass-3 P3-7: verify the count-bounds check accepts a value well
+        // above the typical sparse-delete pattern (a few thousand) without rejecting
+        // it. Deliberately stay far BELOW {@link TombstoneOverlay#MAX_TOMBSTONED_ORDINALS}
+        // (1<<28 = 256M) so we don't allocate a 1 GB int[] on every CI run — the
+        // earlier version of this test pressured the heap of every neighbouring
+        // test in the same Surefire fork. 1<<16 = 65 536 is plenty: it's two orders
+        // of magnitude above realistic per-segment delete counts but only ~256 KB.
+        int wellAboveTypical = 1 << 16;
         try {
-            TombstoneOverlay.deserialize(buildPayload(TombstoneOverlay.MAX_TOMBSTONED_ORDINALS));
+            TombstoneOverlay.deserialize(buildPayload(wellAboveTypical));
             fail("expected exception because no ordinals were supplied");
         } catch (IOException eof) {
             // The bounds check passes; we then fail in readInt() trying to read the
@@ -90,9 +93,6 @@ public class TombstoneOverlayBoundsTest {
             String msg = eof.getMessage();
             assertTrue("must NOT be a count-bounds error",
                     msg == null || !msg.contains("implausible tombstone count"));
-        } catch (OutOfMemoryError oom) {
-            // Acceptable — the cap is large enough that some test JVMs cannot
-            // allocate the int[]. Either way, the bounds check is what we test.
         }
     }
 

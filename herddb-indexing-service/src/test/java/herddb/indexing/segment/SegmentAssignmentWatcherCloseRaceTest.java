@@ -83,22 +83,17 @@ public class SegmentAssignmentWatcherCloseRaceTest {
 
     @Test
     public void closedWatcherIgnoresStaleWatcherFires() throws Exception {
+        // Review-item B5 / P3-3: deterministically exercise the close-then-fire race.
+        // Calling dispatchScan directly on the closed watcher is the most reliable
+        // signal: it goes through the same code path the ZK Watcher.process() lambda
+        // takes when it fires after close(), AND any exception propagates to the
+        // calling thread (the JUnit test thread) rather than being swallowed by the
+        // ZK EventThread. This eliminates the Thread.sleep + UEH-on-event-thread
+        // dance the previous version relied on, which the reviewer correctly flagged
+        // as both flaky AND under-asserting.
         registry.createSegment(sample());
 
-        // Review-item B5 from the second pr-reviewer pass: install a global
-        // UncaughtExceptionHandler so a RejectedExecutionException thrown on the ZK
-        // event thread (the failure mode B1 fixes) actually fails the test rather
-        // than being silently swallowed. Use a CountDownLatch on the initial scan
-        // to remove the Thread.sleep(150) timing dependency.
-        java.util.concurrent.atomic.AtomicReference<Throwable> uncaught =
-                new java.util.concurrent.atomic.AtomicReference<>();
-        Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
-        Thread.setDefaultUncaughtExceptionHandler((t, e) -> uncaught.compareAndSet(null, e));
-
         java.util.concurrent.CountDownLatch initialAssigned = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.CountDownLatch postCloseDispatched =
-                new java.util.concurrent.CountDownLatch(1);
-
         SegmentAssignmentListener listener = new SegmentAssignmentListener() {
             @Override
             public void onSegmentAssigned(VersionedSegmentMetadata segment) {
@@ -106,46 +101,24 @@ public class SegmentAssignmentWatcherCloseRaceTest {
             }
         };
 
-        try {
-            SegmentAssignmentWatcher watcher = new SegmentAssignmentWatcher(registry, 0, listener);
-            watcher.watchIndex(TS_UUID, IDX_UUID);
-            // Wait deterministically for the initial scan to fire its first event.
-            assertTrue("initial onSegmentAssigned must fire",
-                    initialAssigned.await(10, TimeUnit.SECONDS));
+        SegmentAssignmentWatcher watcher = new SegmentAssignmentWatcher(registry, 0, listener);
+        watcher.watchIndex(TS_UUID, IDX_UUID);
+        // Wait deterministically for the initial scan to land before we close.
+        assertTrue("initial onSegmentAssigned must fire",
+                initialAssigned.await(10, TimeUnit.SECONDS));
 
-            // Close the watcher; subsequent watcher fires must NOT propagate
-            // RejectedExecutionException through the ZK event thread.
-            watcher.close();
+        // Close — dispatchExecutor is now shut down.
+        watcher.close();
 
-            // Trigger many watcher fires by mutating the registry repeatedly. With a
-            // closed dispatch executor, each fire would normally hit the executor's
-            // RejectedExecutionHandler and bubble out via the ZK client's event thread.
-            for (int i = 0; i < 5; i++) {
-                VersionedSegmentMetadata current = registry.getSegment(TS_UUID, IDX_UUID, "seg-A")
-                        .orElseThrow();
-                registry.casUpdateSegment(current,
-                        current.metadata().toBuilder().generation(100L + i).build());
-            }
-
-            // Give the ZK event thread time to fire all the watchers. We can't latch
-            // on "watcher fired" here because the watcher is closed — but a cheap
-            // equivalent is to round-trip through ZK once more (forces the event
-            // thread to drain).
-            registry.listSegments(TS_UUID, IDX_UUID);
-            // Small bounded sleep to flush any queued event-thread callbacks. This
-            // is not a sync primitive — it's a drain barrier; if B1 is broken the
-            // exception is already in `uncaught` by now.
-            Thread.sleep(100);
-        } finally {
-            Thread.setDefaultUncaughtExceptionHandler(previous);
+        // Direct invocation of the package-private dispatchScan: this is the same
+        // method the ZK Watcher lambda invokes. Without the B1 fix, this submits to
+        // the closed executor and throws RejectedExecutionException to OUR thread.
+        // With the B1 fix, the catch swallows it.
+        SegmentAssignmentWatcher.IndexKey key = new SegmentAssignmentWatcher.IndexKey(
+                TS_UUID, IDX_UUID);
+        for (int i = 0; i < 10; i++) {
+            // Must NOT throw — that's the entire B1 contract.
+            watcher.dispatchScan(key);
         }
-
-        Throwable caught = uncaught.get();
-        if (caught != null && caught instanceof java.util.concurrent.RejectedExecutionException) {
-            org.junit.Assert.fail("RejectedExecutionException leaked through ZK event thread: "
-                    + caught);
-        }
-        // Other unrelated exceptions from the JVM (e.g. test runner threads) should
-        // not fail this assertion — only the specific REJ leak we are guarding against.
     }
 }

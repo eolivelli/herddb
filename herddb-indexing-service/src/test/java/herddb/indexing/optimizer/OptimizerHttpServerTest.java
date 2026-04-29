@@ -164,10 +164,18 @@ public class OptimizerHttpServerTest {
             int code2 = headStatus("http://127.0.0.1:" + livenessHttp.getBoundPort() + "/health");
             assertEquals("/health must return 503 when engine is stale", 503, code2);
 
-            // Tick the engine again; the next call refreshes the heartbeat.
+            // Tick the engine again, then advance the fake clock past the staleness
+            // threshold AGAIN. With the engine's run counter strictly higher than the
+            // last observation, the heartbeat-refresh branch (currentRuns > observedRuns)
+            // must reset the timer and return 200. Without the new tick the call
+            // would return 503 — which means a passing assertion here exclusively
+            // validates the heartbeat-refresh branch (review-pass-3 P3-2).
             engine.runOnce();
+            fakeClock.addAndGet(700L);
             int code3 = headStatus("http://127.0.0.1:" + livenessHttp.getBoundPort() + "/health");
-            assertEquals(200, code3);
+            assertEquals("after a fresh tick, /health must refresh and return 200 even"
+                    + " though the absolute clock is past the threshold",
+                    200, code3);
         } finally {
             livenessHttp.close();
         }

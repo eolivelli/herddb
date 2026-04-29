@@ -399,13 +399,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private volatile boolean segmentedV2Cached;
 
     /**
-     * Test hook (package-visible) — runs between segment stage and IndexStatus
-     * persist in {@link #doCheckpointFusedPQPhaseB}. Used by
-     * {@code PublisherHotSwapTest} to swap {@link #segmentPublisher} mid-Phase-B
-     * and assert the captured snapshot is what handles the commit (review-item R3
-     * from second pr-reviewer pass). Production code never sets this field.
+     * Test hook (package-private) — runs in Phase B AFTER the staged publish and
+     * BEFORE the IndexStatus persist. Used by {@code PublisherHotSwapTest} to swap
+     * {@link #segmentPublisher} mid-Phase-B and assert the captured snapshot is
+     * what handles the commit (review-item R3 from pr-reviewer pass 2). Distinct
+     * from {@link #checkpointPhaseBHook} (which fires at end of Phase B) — this
+     * one is specifically wedged between {@code stageNewSegmentsBestEffort} and
+     * {@code persistIndexStatusMultiSegment}.
+     *
+     * <p>Production code never sets this field. Tests outside this package use
+     * reflection to install the hook (no public setter — keeps the API surface
+     * clean per pr-reviewer pass-3 P3-4).
      */
-    volatile Runnable phaseBHookForTesting;
+    volatile Runnable betweenStageAndCommitHookForTests;
 
     /**
      * Monotonically increasing IndexStatus generation. Each successful
@@ -1516,15 +1522,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /** Visible for tests: the in-IS compaction thread (null when not running). */
     Thread getVectorIndexCompactionThread() {
         return vectorIndexCompactionThread;
-    }
-
-    /**
-     * Visible for tests: install a hook that runs in the middle of Phase B,
-     * AFTER the staged publish and BEFORE the IndexStatus persist + commit.
-     * Production code never calls this — see review-item R3.
-     */
-    public void setPhaseBHookForTesting(Runnable hook) {
-        this.phaseBHookForTesting = hook;
     }
 
     /** Wakes the compaction thread. Called by tests and the retention reaper. */
@@ -3599,11 +3596,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         // Test hook for review-item R3 (second pr-reviewer pass): invoked AFTER stage
-        // and BEFORE commit. Production code never sets this field; tests use it to
-        // exercise the publisher-snapshot torn-read protection by swapping the
-        // segmentPublisher field at this exact moment and asserting the snapshot
-        // (publisherSnapshot, captured above) is what actually receives the commit.
-        Runnable midCheckpointHook = phaseBHookForTesting;
+        // and BEFORE commit. Production code never sets this field; tests use it via
+        // reflection to exercise the publisher-snapshot torn-read protection by
+        // swapping the segmentPublisher field at this exact moment and asserting
+        // the snapshot (publisherSnapshot, captured above) is what actually receives
+        // the commit.
+        Runnable midCheckpointHook = betweenStageAndCommitHookForTests;
         if (midCheckpointHook != null) {
             midCheckpointHook.run();
         }

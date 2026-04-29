@@ -109,9 +109,11 @@ public final class IndexOptimizerEngine {
      * of segmented-v2 require a IS-side {@code SegmentAssignmentWatcher} that
      * notifies owners to close their handles before files vanish; until that
      * wiring exists deleting files would corrupt the IS that still references the
-     * segment in its IndexStatus. Operators MUST opt out explicitly via
-     * {@link Builder#unsafeAllowFileDeletion()} once the listener wiring is
-     * verified end-to-end (review-item B1 from the second pr-reviewer pass).
+     * segment in its IndexStatus. Operators MUST opt out explicitly by passing
+     * {@code safeModeFileDeletion = false} to the long-form constructor
+     * {@link #IndexOptimizerEngine(SegmentRegistryClient, SegmentMerger, String, MergePolicy, long, java.util.function.IntSupplier, java.util.function.LongSupplier, herddb.storage.DataStorageManager, OptimizerLeaderLock, boolean)}
+     * once the listener wiring is verified end-to-end (review-item B1 from the
+     * second pr-reviewer pass).
      */
     private final boolean safeModeFileDeletion;
 
@@ -460,8 +462,11 @@ public final class IndexOptimizerEngine {
             registry.casDeleteSegment(v);
             segmentsDeleted.incrementAndGet();
         } catch (SegmentRegistryException.VersionMismatch retry) {
-            // CAS bumped under us (e.g. ownership transfer started); will be
-            // re-attempted on next tick.
+            // Defense-in-depth: no current production code path bumps a DEPRECATED
+            // znode's version (OwnershipTransfer.initiate requires ACTIVE state),
+            // so this catch is unreachable today. If a future caller starts
+            // mutating DEPRECATED znodes, the next tick re-enters this method via
+            // the DEPRECATED branch and retries idempotently.
         } catch (SegmentRegistryException e) {
             LOGGER.log(Level.WARNING,
                     "failed to delete retained segment " + v.metadata().getSegmentUuid()
