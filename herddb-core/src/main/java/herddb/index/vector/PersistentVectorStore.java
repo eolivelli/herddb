@@ -2702,9 +2702,26 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
         // Include on-disk segments' in-memory footprint (issue #360).
         // Each VectorSegment retains pkData/pkOffsets/pkLengths arrays and a
-        // BLink pk-to-ordinal tree whose internal TreeMap nodes account for the
-        // 6-8 GiB gap observed between engine-stats estimated memory and
+        // BLink pk-to-ordinal tree whose internal BLink Node structures account
+        // for the 6-8 GiB gap observed between engine-stats estimated memory and
         // actual G1 old-gen usage in the GKE benchmark.
+        for (VectorSegment seg : segments) {
+            total += seg.estimatedInMemoryBytes();
+        }
+        return total;
+    }
+
+    /**
+     * Returns the sum of {@link VectorSegment#estimatedInMemoryBytes()} across all
+     * current on-disk segments.  Exposed for testing so that tests can assert the
+     * on-disk segment contribution separately from the live-shard contribution,
+     * which is non-zero even for empty shards (the underlying
+     * {@code OnHeapGraphIndex} retains a small fixed overhead).
+     *
+     * @return estimated bytes held by all current on-disk segments
+     */
+    public long getOnDiskSegmentsEstimatedMemoryBytes() {
+        long total = 0;
         for (VectorSegment seg : segments) {
             total += seg.estimatedInMemoryBytes();
         }

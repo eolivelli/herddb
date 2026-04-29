@@ -70,10 +70,10 @@ class VectorSegment implements Closeable {
     }
 
     final int segmentId;
-    OnDiskGraphIndex onDiskGraph;
+    volatile OnDiskGraphIndex onDiskGraph;
     Path onDiskGraphFile;
     ReaderSupplier onDiskReaderSupplier;
-    BLink<Bytes, Long> onDiskPkToNode;
+    volatile BLink<Bytes, Long> onDiskPkToNode;
     long estimatedSizeBytes;
     volatile boolean dirty;
 
@@ -89,9 +89,9 @@ class VectorSegment implements Closeable {
 
     // Compact ordinal-to-PK cache: all PKs packed in one byte[],
     // with parallel offset/length arrays indexed by ordinal.
-    byte[] pkData;
-    int[] pkOffsets;   // -1 means deleted/absent
-    int[] pkLengths;
+    volatile byte[] pkData;
+    volatile int[] pkOffsets;   // -1 means deleted/absent
+    volatile int[] pkLengths;
     final AtomicInteger liveCount = new AtomicInteger();
     int maxOrdinal = -1;
 
@@ -319,20 +319,24 @@ class VectorSegment implements Closeable {
     /**
      * Estimates the heap memory currently held by this on-disk segment.
      *
-     * <p>Accounts for four components that are completely absent from the
+     * <p>Accounts for three components that are completely absent from the
      * live-shard estimate in {@code PersistentVectorStore.estimatedMemoryUsageBytes()}:
      * <ol>
      *   <li>{@link #pkData} — byte array with all PKs packed end-to-end.</li>
      *   <li>{@link #pkOffsets} / {@link #pkLengths} — parallel {@code int[]}
      *       arrays mapping ordinal → offset/length inside {@code pkData}.</li>
      *   <li>{@link #onDiskPkToNode} — pk-to-ordinal {@link BLink} tree whose
-     *       internal {@code TreeMap} nodes are the single largest contributor
+     *       internal BLink Node structures are the single largest contributor
      *       to the unaccounted heap gap (issue #360).  BLink already tracks
      *       its loaded-page memory in {@link BLink#getUsedMemory()}.</li>
-     *   <li>{@link #onDiskGraph} — upper HNSW layers (level&gt;0) that
-     *       jvector keeps in heap for fast search, measured by
-     *       {@link io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex#ramBytesUsed()}.</li>
      * </ol>
+     *
+     * <p>Note: {@link #onDiskGraph} upper HNSW layers are intentionally excluded.
+     * {@code OnDiskGraphIndex.ramBytesUsed()} iterates the in-memory neighbor maps
+     * with no result caching; including it would add O(segments × upper-layer-nodes)
+     * work to every {@code addVector} call via the back-pressure hot path.
+     * The three components above (pkData + BLink) already account for the primary
+     * 5–6 GiB unaccounted gap observed in the GKE BIGANN benchmark.
      *
      * <p>Each field is null-guarded: fields that have not yet been populated
      * (e.g. before the segment is fully loaded) contribute 0.
@@ -356,10 +360,6 @@ class VectorSegment implements Closeable {
         BLink<Bytes, Long> p2n = this.onDiskPkToNode;
         if (p2n != null) {
             bytes += p2n.getUsedMemory();
-        }
-        OnDiskGraphIndex odg = this.onDiskGraph;
-        if (odg != null) {
-            bytes += odg.ramBytesUsed();
         }
         return bytes;
     }
