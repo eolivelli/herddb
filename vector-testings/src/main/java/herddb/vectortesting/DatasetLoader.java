@@ -41,6 +41,7 @@ import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -231,11 +232,25 @@ public class DatasetLoader {
         // Parse descriptor to find data files
         DatasetDescriptor desc = DatasetDescriptor.load(descriptorFile);
 
-        // Download each data file
-        for (String fileName : new String[]{desc.baseFile, desc.queryFile, desc.groundTruthFile}) {
-            if (fileName == null) {
-                continue;
-            }
+        // Build a deduped list of files to fetch: base + query + legacy ground-truth
+        // file + every entry from groundTruthCheckpoints. The last checkpoint's file
+        // typically equals desc.groundTruthFile, so a LinkedHashSet keeps insertion
+        // order while suppressing the duplicate.
+        java.util.LinkedHashSet<String> filesToFetch = new java.util.LinkedHashSet<>();
+        if (desc.baseFile != null) {
+            filesToFetch.add(desc.baseFile);
+        }
+        if (desc.queryFile != null) {
+            filesToFetch.add(desc.queryFile);
+        }
+        if (desc.groundTruthFile != null) {
+            filesToFetch.add(desc.groundTruthFile);
+        }
+        for (DatasetDescriptor.GroundTruthCheckpoint cp : desc.groundTruthCheckpoints) {
+            filesToFetch.add(cp.file);
+        }
+
+        for (String fileName : filesToFetch) {
             File target = new File(dir, fileName);
             if (!target.exists()) {
                 String fileUrl = baseUrl + "/" + fileName;
@@ -276,8 +291,11 @@ public class DatasetLoader {
     /**
      * Downloads a file, routing gs:// URLs through the S3-compatible GCS API
      * and all other URLs through HTTP/FTP.
+     *
+     * <p>Package-private so the {@code DatasetDescribe} CLI tool can reuse the
+     * same URL-resolution path as the bench loader.</p>
      */
-    private void downloadSmartUrl(String url, File dest) throws IOException {
+    void downloadSmartUrl(String url, File dest) throws IOException {
         if (url.startsWith("gs://")) {
             downloadGsFile(url, dest);
         } else {
@@ -787,13 +805,78 @@ public class DatasetLoader {
     }
 
     public List<int[]> loadGroundTruth(int maxVectors) throws IOException {
+        // Delegate to the count-aware variant. For non-CUSTOM presets the count is ignored;
+        // for CUSTOM datasets we ask for the ground truth matching totalVectors (the legacy
+        // file). Callers that want recall for a prefix run should call
+        // loadGroundTruth(maxVectors, baseVectorCount) directly.
+        long defaultCount = preset == DatasetPreset.CUSTOM && customDescriptor != null
+                ? customDescriptor.totalVectors
+                : Long.MIN_VALUE; // sentinel: ignored for non-CUSTOM presets
+        return loadGroundTruth(maxVectors, defaultCount);
+    }
+
+    /**
+     * Loads ground truth for a specific base-vector count. Used when a custom dataset
+     * ships multiple ground-truth files keyed by prefix size (e.g. for prefix runs at
+     * 1M, 10M, 1B base vectors).
+     *
+     * @param maxVectors      max ground-truth records to load (typically the query count).
+     * @param baseVectorCount the number of base vectors the bench will run against.
+     *                        For CUSTOM datasets, the descriptor's
+     *                        {@code groundTruthCheckpoints} list must contain an entry
+     *                        with this exact count, or an IOException is thrown.
+     *                        Ignored for HDF5 and non-CUSTOM presets.
+     * @throws IOException if the matching ground truth file is missing, or, for CUSTOM
+     *                     datasets, no checkpoint matches {@code baseVectorCount}.
+     */
+    public List<int[]> loadGroundTruth(int maxVectors, long baseVectorCount) throws IOException {
         if (preset.baseFormat == VecFormat.HDF5) {
             return loadHdf5GroundTruth(maxVectors);
         }
-        String gtFileName = preset == DatasetPreset.CUSTOM && customDescriptor != null
-                ? customDescriptor.groundTruthFile : preset.groundTruthFile;
+        String gtFileName;
+        if (preset == DatasetPreset.CUSTOM && customDescriptor != null) {
+            gtFileName = resolveCustomGroundTruthFile(baseVectorCount);
+        } else {
+            gtFileName = preset.groundTruthFile;
+        }
         File file = new File(getDatasetSubDir(), gtFileName);
         return loadIvecs(openInputStream(file), maxVectors);
+    }
+
+    /**
+     * Picks the ground-truth file from {@link DatasetDescriptor#groundTruthCheckpoints}
+     * matching {@code baseVectorCount} exactly. Recall against a non-matching ground
+     * truth is mathematically meaningless, so we fail hard rather than silently use a
+     * close-but-wrong file.
+     */
+    private String resolveCustomGroundTruthFile(long baseVectorCount) throws IOException {
+        List<DatasetDescriptor.GroundTruthCheckpoint> checkpoints =
+                customDescriptor.groundTruthCheckpoints;
+        if (checkpoints == null || checkpoints.isEmpty()) {
+            // Old descriptor with neither field present, or HDF5-style: fall back to the
+            // legacy single-file field. If that's also null the IO read will fail with a
+            // clear message.
+            if (customDescriptor.groundTruthFile == null) {
+                throw new IOException("Custom dataset has no ground truth file configured");
+            }
+            return customDescriptor.groundTruthFile;
+        }
+        for (DatasetDescriptor.GroundTruthCheckpoint cp : checkpoints) {
+            if (cp.baseVectorCount == baseVectorCount) {
+                return cp.file;
+            }
+        }
+        StringBuilder available = new StringBuilder();
+        for (int i = 0; i < checkpoints.size(); i++) {
+            if (i > 0) {
+                available.append(", ");
+            }
+            available.append(checkpoints.get(i).baseVectorCount);
+        }
+        throw new IOException("No ground truth checkpoint matches baseVectorCount=" + baseVectorCount
+                + " for custom dataset; available checkpoints: [" + available + "]."
+                + " Pass --rows N where N is one of the listed values to enable recall;"
+                + " or omit --rows to use the full dataset.");
     }
 
     private List<float[]> loadFvecs(InputStream in, int maxVectors) throws IOException {
@@ -891,12 +974,22 @@ public class DatasetLoader {
         final int groundTruthK;
         final String baseFile;
         final String queryFile;
+        // Legacy single ground-truth file. Always points at the file matching
+        // {@code totalVectors}. New descriptors duplicate this entry as the last
+        // element of {@link #groundTruthCheckpoints}.
         final String groundTruthFile;
+        // Ascending list of (baseVectorCount, file) pairs. For new descriptors the
+        // last entry's file equals {@link #groundTruthFile} and its baseVectorCount
+        // equals {@link #totalVectors}. For old descriptors that lack the
+        // groundTruthCheckpoints array, this is synthesised from groundTruthFile +
+        // totalVectors so callers see a uniform shape.
+        final List<GroundTruthCheckpoint> groundTruthCheckpoints;
 
         DatasetDescriptor(String name, String similarity, VecFormat format,
                           int dimensions, long totalVectors,
                           long numQueries, int groundTruthK,
-                          String baseFile, String queryFile, String groundTruthFile) {
+                          String baseFile, String queryFile, String groundTruthFile,
+                          List<GroundTruthCheckpoint> groundTruthCheckpoints) {
             this.name = name;
             this.similarity = similarity;
             this.format = format;
@@ -907,23 +1000,70 @@ public class DatasetLoader {
             this.baseFile = baseFile;
             this.queryFile = queryFile;
             this.groundTruthFile = groundTruthFile;
+            this.groundTruthCheckpoints = groundTruthCheckpoints == null
+                    ? Collections.emptyList()
+                    : Collections.unmodifiableList(new ArrayList<>(groundTruthCheckpoints));
+        }
+
+        /**
+         * One ground-truth file in a multi-checkpoint custom dataset. {@code file} is a
+         * relative path resolved against the dataset directory.
+         */
+        static final class GroundTruthCheckpoint {
+            final long baseVectorCount;
+            final String file;
+
+            GroundTruthCheckpoint(long baseVectorCount, String file) {
+                this.baseVectorCount = baseVectorCount;
+                this.file = file;
+            }
         }
 
         static DatasetDescriptor load(File jsonFile) throws IOException {
             ObjectMapper mapper = new ObjectMapper();
             JsonNode root = mapper.readTree(jsonFile);
+            String groundTruthFile = root.path("groundTruthFile").asText(null);
+            long totalVectors = root.path("totalVectors").asLong(0L);
+            List<GroundTruthCheckpoint> checkpoints = parseCheckpoints(
+                    root.path("groundTruthCheckpoints"), totalVectors, groundTruthFile);
             return new DatasetDescriptor(
                     root.path("name").asText("custom"),
                     root.path("similarity").asText("euclidean"),
                     parseFormat(root.path("format").asText("fvecs")),
                     root.path("dimensions").asInt(0),
-                    root.path("totalVectors").asLong(0L),
+                    totalVectors,
                     root.path("numQueries").asLong(0L),
                     root.path("groundTruthK").asInt(0),
                     root.path("baseFile").asText(null),
                     root.path("queryFile").asText(null),
-                    root.path("groundTruthFile").asText(null)
+                    groundTruthFile,
+                    checkpoints
             );
+        }
+
+        /**
+         * Parses the {@code groundTruthCheckpoints} array. When the array is missing
+         * or empty, synthesises a singleton from the legacy {@code groundTruthFile} +
+         * {@code totalVectors} so old descriptors still resolve to a single ground-truth
+         * file via the new lookup path.
+         */
+        private static List<GroundTruthCheckpoint> parseCheckpoints(
+                JsonNode arrayNode, long totalVectors, String groundTruthFile) {
+            List<GroundTruthCheckpoint> out = new ArrayList<>();
+            if (arrayNode != null && arrayNode.isArray() && arrayNode.size() > 0) {
+                for (JsonNode entry : arrayNode) {
+                    long count = entry.path("baseVectorCount").asLong(-1L);
+                    String file = entry.path("file").asText(null);
+                    if (count <= 0 || file == null) {
+                        continue;
+                    }
+                    out.add(new GroundTruthCheckpoint(count, file));
+                }
+            }
+            if (out.isEmpty() && groundTruthFile != null && totalVectors > 0) {
+                out.add(new GroundTruthCheckpoint(totalVectors, groundTruthFile));
+            }
+            return out;
         }
 
         private static VecFormat parseFormat(String s) throws IOException {
@@ -964,6 +1104,16 @@ public class DatasetLoader {
                 + ", Format: " + customDescriptor.format
                 + ", Queries: " + customDescriptor.numQueries
                 + ", GroundTruth-K: " + customDescriptor.groundTruthK);
+        if (!customDescriptor.groundTruthCheckpoints.isEmpty()) {
+            StringBuilder cps = new StringBuilder();
+            for (int i = 0; i < customDescriptor.groundTruthCheckpoints.size(); i++) {
+                if (i > 0) {
+                    cps.append(", ");
+                }
+                cps.append(customDescriptor.groundTruthCheckpoints.get(i).baseVectorCount);
+            }
+            System.out.println("  Ground-truth checkpoints (base-vector counts): [" + cps + "]");
+        }
         return customDescriptor;
     }
 

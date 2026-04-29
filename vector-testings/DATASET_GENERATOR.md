@@ -97,6 +97,7 @@ cd vector-testings
 | `--zip` | off | Compress output into a ZIP archive and remove individual files |
 | `--batch-size` | `100` | Sentences per Ollama API call |
 | `--similarity` | `euclidean` | Distance function: `euclidean` or `cosine` |
+| `--ground-truth-checkpoints` | (only at `--total`) | Comma-separated ascending base-vector counts at which intermediate ground-truth IVECS files are written. Each value must be > `--num-queries` and ≤ `--total`. The final ground truth at `--total` is always emitted; this flag adds extra ground-truth files for prefix runs (so a single 1B-vector dataset can serve recall benches at 1M, 10M, 50M, …). |
 
 ### Examples
 
@@ -127,6 +128,22 @@ cd vector-testings
     --output-dir ./datasets/cosine-100k
 ```
 
+**Multi-checkpoint ground truth for prefix benchmarking:**
+
+```bash
+./run_generate.sh \
+    --total 1000000000 \
+    --name multi-1b \
+    --num-queries 1000 \
+    --ground-truth-k 100 \
+    --ground-truth-checkpoints 1000000,10000000,50000000,500000000
+```
+
+Produces five ground-truth files — at 1M, 10M, 50M, 500M, and 1B — letting the
+same generated dataset back recall benchmarks against any of those prefix
+sizes. The dataset descriptor records all checkpoints; VectorBench picks the
+file matching `--rows N` automatically when running with `--dataset custom`.
+
 **Using a remote Ollama instance:**
 
 ```bash
@@ -143,7 +160,8 @@ All files are written to the `--output-dir` directory, prefixed with `--name`
 | `{name}_descriptor.json` | JSON | Dataset metadata (dimensions, similarity, file names, etc.) |
 | `{name}_base.fvecs` | FVECS | All base vectors. IDs are implicit (position 0, 1, 2, ...) |
 | `{name}_query.fvecs` | FVECS | First N query vectors (also included in base) |
-| `{name}_groundtruth.ivecs` | IVECS | K nearest neighbor IDs per query, sorted nearest-first |
+| `{name}_groundtruth.ivecs` | IVECS | K nearest neighbor IDs per query, sorted nearest-first. Always corresponds to the full dataset (matches `--total`). |
+| `{name}_groundtruth_<count>.ivecs` | IVECS | (if `--ground-truth-checkpoints`) Per-checkpoint ground truth, one file per intermediate count. The final checkpoint reuses the legacy `{name}_groundtruth.ivecs` name and is not duplicated. |
 | `{name}_sentences.csv` | CSV | (if `--csv`) Columns: id, sentence, vector |
 | `{name}_dataset.zip` | ZIP | (if `--zip`) All above files compressed; individual files are removed |
 
@@ -164,6 +182,10 @@ The descriptor file contains all metadata needed to auto-configure VectorBench:
   "baseFile": "my-dataset_base.fvecs",
   "queryFile": "my-dataset_query.fvecs",
   "groundTruthFile": "my-dataset_groundtruth.ivecs",
+  "groundTruthCheckpoints": [
+    {"baseVectorCount": 5000, "file": "my-dataset_groundtruth_5000.ivecs"},
+    {"baseVectorCount": 10000, "file": "my-dataset_groundtruth.ivecs"}
+  ],
   "createdAt": "2026-04-09T10:00:00Z"
 }
 ```
@@ -300,6 +322,42 @@ For BIGANN, the tool flattens the native `bigann_gnd/idx_1000000000.ivecs` to
 
 VectorBench downloads the descriptor, then the base / query / ground-truth
 files named in it, and auto-configures similarity, row count, and top-K.
+
+## Describing a Dataset
+
+`./run_describe.sh --descriptor <path-or-url>` prints the descriptor in a
+fixed-width key/value layout, including the list of available
+`groundTruthCheckpoints`. The descriptor argument can be a local file or any
+URL supported by VectorBench (`http://`, `https://`, `ftp://`, `gs://`).
+
+```bash
+./run_describe.sh --descriptor ./datasets/multi-1b/multi-1b_descriptor.json
+./run_describe.sh --descriptor gs://herddb-datasets/multi-1b/multi-1b_descriptor.json
+```
+
+Example output:
+
+```
+name                   multi-1b
+dimensions             384
+similarity             euclidean
+format                 fvecs
+totalVectors           1000000000
+numQueries             1000
+groundTruthK           100
+baseFile               multi-1b_base.fvecs
+queryFile              multi-1b_query.fvecs
+groundTruthFile        multi-1b_groundtruth.ivecs
+groundTruthCheckpoints 5
+  1000000              multi-1b_groundtruth_1000000.ivecs
+  10000000             multi-1b_groundtruth_10000000.ivecs
+  50000000             multi-1b_groundtruth_50000000.ivecs
+  500000000            multi-1b_groundtruth_500000000.ivecs
+  1000000000           multi-1b_groundtruth.ivecs
+```
+
+The output is deliberately greppable by automation — bench-driving agents use
+this to discover what `--rows` values support recall before dispatching a run.
 
 ## How It Works
 

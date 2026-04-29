@@ -227,8 +227,13 @@ public class VectorBench {
 
         List<int[]> groundTruth = null;
         try {
-            groundTruth = loader.loadGroundTruth(queryVectors.size());
-            out.info("Loaded " + groundTruth.size() + " ground truth entries");
+            // Pass config.numRows so multi-checkpoint custom datasets can pick the
+            // ground-truth file matching the prefix being benched (e.g. recall against
+            // the first 10M of a 1B-vector dataset uses the 10M ground truth, not the 1B
+            // one). Non-CUSTOM presets ignore the count.
+            groundTruth = loader.loadGroundTruth(queryVectors.size(), config.numRows);
+            out.info("Loaded " + groundTruth.size() + " ground truth entries"
+                    + " (matched checkpoint at " + config.numRows + " base vectors)");
         } catch (java.io.IOException e) {
             out.info("Ground truth not available: " + e.getMessage());
         }

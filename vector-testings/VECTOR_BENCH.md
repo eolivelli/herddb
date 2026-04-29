@@ -27,7 +27,7 @@ Invocation: `java -jar vector-testings-*.jar [options]`.
 | `--dataset <preset>` | `SIFT1M` | Built-in dataset preset, or `CUSTOM` for a descriptor-driven dataset. |
 | `--dataset-dir <path>` | `./datasets` | Local cache directory for dataset files. |
 | `--dataset-url <url>` | — | Override the download URL for the selected preset. |
-| `--rows <N>` | `100000` | Vectors to ingest. For `CUSTOM`, auto-derived from the descriptor if left at default. |
+| `--rows <N>` | `100000` | Vectors to ingest. For `CUSTOM`, auto-derived from the descriptor if left at default. For multi-checkpoint custom datasets, `N` must match one of the descriptor's `groundTruthCheckpoints` entries to enable recall — otherwise the bench logs the available counts and continues without recall. Discover the available counts with `./run_describe.sh --descriptor <path-or-url>`. |
 
 ### Ingestion
 

@@ -19,6 +19,10 @@
  */
 package herddb.vectortesting;
 
+import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.Set;
+import java.util.TreeSet;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.HelpFormatter;
@@ -38,6 +42,14 @@ public class GeneratorConfig {
     boolean zip = false;
     int batchSize = 100;
     String similarity = "euclidean";
+    /**
+     * Ascending list of base-vector counts at which a ground-truth IVECS
+     * file must be emitted. The final entry always equals {@link #total}
+     * (so the legacy single ground-truth file is always produced). When
+     * the user does not pass {@code --ground-truth-checkpoints}, this is
+     * a singleton {@code [total]}.
+     */
+    long[] groundTruthCheckpoints = null;
 
     private static Options buildOptions() {
         Options opts = new Options();
@@ -52,6 +64,11 @@ public class GeneratorConfig {
         opts.addOption(null, "zip", false, "Compress output files into a ZIP archive");
         opts.addOption(null, "batch-size", true, "Sentences per Ollama API call (default: 100)");
         opts.addOption(null, "similarity", true, "Distance function: euclidean, cosine (default: euclidean)");
+        opts.addOption(null, "ground-truth-checkpoints", true,
+                "Comma-separated ascending base-vector counts at which intermediate ground-truth"
+                        + " IVECS files are emitted (e.g. 1000000,10000000,50000000). The final ground"
+                        + " truth at --total is always written; checkpoint counts must be strictly"
+                        + " greater than --num-queries and not exceed --total.");
         opts.addOption("h", "help", false, "Show help");
         return opts;
     }
@@ -112,7 +129,74 @@ public class GeneratorConfig {
             System.exit(1);
         }
 
+        cfg.groundTruthCheckpoints = parseCheckpoints(
+                cmd.getOptionValue("ground-truth-checkpoints"), cfg.total, cfg.numQueries);
+
         return cfg;
+    }
+
+    /**
+     * Parse the {@code --ground-truth-checkpoints} CSV value into a sorted, deduped,
+     * ascending {@code long[]} that always ends with {@code total}.
+     *
+     * <p>Validation rules:</p>
+     * <ul>
+     *   <li>Each entry must parse as a positive long.</li>
+     *   <li>Each entry must be {@code > numQueries} (a checkpoint at or below the query
+     *       count would yield meaningless ground truth, since the tracker is only
+     *       initialised after the first {@code numQueries} vectors).</li>
+     *   <li>Each entry must be {@code <= total}.</li>
+     *   <li>{@code total} is always appended (deduped) so the legacy single ground
+     *       truth file is produced.</li>
+     * </ul>
+     *
+     * <p>When {@code csv} is {@code null} or blank, returns a singleton {@code [total]}
+     * — i.e. the historical single-ground-truth behaviour.</p>
+     *
+     * @throws IllegalArgumentException for any validation failure (unparseable entry,
+     *     duplicate, out-of-range value).
+     */
+    static long[] parseCheckpoints(String csv, int total, int numQueries) {
+        Set<Long> sorted = new TreeSet<>();
+        if (csv != null && !csv.trim().isEmpty()) {
+            // Use LinkedHashSet first to detect duplicates (a duplicate checkpoint count
+            // is almost certainly a typo and silently swallowing it would be confusing).
+            Set<Long> seen = new LinkedHashSet<>();
+            for (String token : csv.split(",")) {
+                String t = token.trim();
+                if (t.isEmpty()) {
+                    continue;
+                }
+                long v;
+                try {
+                    v = Long.parseLong(t);
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException(
+                            "Invalid --ground-truth-checkpoints entry: '" + t + "' is not a number");
+                }
+                if (v <= numQueries) {
+                    throw new IllegalArgumentException("Ground-truth checkpoint " + v
+                            + " must be greater than --num-queries (" + numQueries + ")");
+                }
+                if (v > total) {
+                    throw new IllegalArgumentException("Ground-truth checkpoint " + v
+                            + " exceeds --total (" + total + ")");
+                }
+                if (!seen.add(v)) {
+                    throw new IllegalArgumentException(
+                            "Duplicate --ground-truth-checkpoints entry: " + v);
+                }
+                sorted.add(v);
+            }
+        }
+        // The total checkpoint is always emitted; deduped automatically by TreeSet.
+        sorted.add((long) total);
+        long[] out = new long[sorted.size()];
+        int i = 0;
+        for (long v : sorted) {
+            out[i++] = v;
+        }
+        return out;
     }
 
     @Override
@@ -129,6 +213,7 @@ public class GeneratorConfig {
                 + ", zip=" + zip
                 + ", batchSize=" + batchSize
                 + ", similarity=" + similarity
+                + ", groundTruthCheckpoints=" + Arrays.toString(groundTruthCheckpoints)
                 + '}';
     }
 }
