@@ -204,10 +204,11 @@ public final class SegmentRegistryClient {
         String parent = indexPath(tablespaceUuid, indexUuid);
         List<String> children;
         try {
-            children = zk().getChildren(parent, childrenWatcher);
+            children = withConnectionLossRetry("listSegments(" + indexUuid + ")",
+                    () -> zk().getChildren(parent, childrenWatcher));
         } catch (KeeperException.NoNodeException e) {
             return Collections.emptyList();
-        } catch (KeeperException | InterruptedException e) {
+        } catch (KeeperException | InterruptedException | java.io.IOException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
@@ -227,10 +228,11 @@ public final class SegmentRegistryClient {
      */
     public List<String> listIndexes(String tablespaceUuid) throws SegmentRegistryException {
         try {
-            return zk().getChildren(tablespacePath(tablespaceUuid), false);
+            return withConnectionLossRetry("listIndexes(" + tablespaceUuid + ")",
+                    () -> zk().getChildren(tablespacePath(tablespaceUuid), false));
         } catch (KeeperException.NoNodeException e) {
             return Collections.emptyList();
-        } catch (KeeperException | InterruptedException e) {
+        } catch (KeeperException | InterruptedException | java.io.IOException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
@@ -244,10 +246,11 @@ public final class SegmentRegistryClient {
      */
     public List<String> listTablespaces() throws SegmentRegistryException {
         try {
-            return zk().getChildren(registryRootPath, false);
+            return withConnectionLossRetry("listTablespaces",
+                    () -> zk().getChildren(registryRootPath, false));
         } catch (KeeperException.NoNodeException e) {
             return Collections.emptyList();
-        } catch (KeeperException | InterruptedException e) {
+        } catch (KeeperException | InterruptedException | java.io.IOException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
@@ -279,13 +282,14 @@ public final class SegmentRegistryClient {
         }
         String path = segmentPath(updated.getTablespaceUuid(), updated.getIndexUuid(), updated.getSegmentUuid());
         try {
-            Stat stat = zk().setData(path, updated.serialize(), expected.zkVersion());
+            Stat stat = withConnectionLossRetry("casUpdateSegment(" + updated.getSegmentUuid() + ")",
+                    () -> zk().setData(path, updated.serialize(), expected.zkVersion()));
             return new VersionedSegmentMetadata(updated, stat.getVersion());
         } catch (KeeperException.NoNodeException e) {
             throw new SegmentRegistryException.SegmentNotFound(updated.getSegmentUuid());
         } catch (KeeperException.BadVersionException e) {
             throw new SegmentRegistryException.VersionMismatch(updated.getSegmentUuid(), expected.zkVersion());
-        } catch (KeeperException | InterruptedException e) {
+        } catch (KeeperException | InterruptedException | java.io.IOException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
@@ -302,12 +306,15 @@ public final class SegmentRegistryClient {
         SegmentMetadata previous = expected.metadata();
         String path = segmentPath(previous.getTablespaceUuid(), previous.getIndexUuid(), previous.getSegmentUuid());
         try {
-            zk().delete(path, expected.zkVersion());
+            withConnectionLossRetry("casDeleteSegment(" + previous.getSegmentUuid() + ")", () -> {
+                zk().delete(path, expected.zkVersion());
+                return null;
+            });
         } catch (KeeperException.NoNodeException e) {
             throw new SegmentRegistryException.SegmentNotFound(previous.getSegmentUuid());
         } catch (KeeperException.BadVersionException e) {
             throw new SegmentRegistryException.VersionMismatch(previous.getSegmentUuid(), expected.zkVersion());
-        } catch (KeeperException | InterruptedException e) {
+        } catch (KeeperException | InterruptedException | java.io.IOException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }

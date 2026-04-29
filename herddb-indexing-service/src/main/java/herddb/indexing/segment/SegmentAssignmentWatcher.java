@@ -174,14 +174,25 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
         }
         // Hop to the dispatch thread so listener callbacks are serialised
         // and watcher firings don't block ZK's event thread.
-        dispatchExecutor.execute(() -> {
-            try {
-                scanIndex(key);
-            } catch (SegmentRegistryException e) {
-                LOGGER.log(Level.WARNING, "watcher rescan failed for "
-                        + key.tablespaceUuid + "/" + key.indexUuid + ": " + e.getMessage());
-            }
-        });
+        //
+        // Review item B1: a watcher fire that races with close() may attempt to
+        // submit on a now-shutdown executor. Catch RejectedExecutionException
+        // explicitly — it's a benign close-then-fire — instead of letting it
+        // propagate up the ZK event-thread call stack.
+        try {
+            dispatchExecutor.execute(() -> {
+                try {
+                    scanIndex(key);
+                } catch (SegmentRegistryException e) {
+                    LOGGER.log(Level.WARNING, "watcher rescan failed for "
+                            + key.tablespaceUuid + "/" + key.indexUuid + ": " + e.getMessage());
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException benign) {
+            // Watcher fired after we started closing — there's no listener to notify.
+            LOGGER.log(Level.FINE, "watcher fired after close; dropping scan for {0}/{1}",
+                    new Object[]{key.tablespaceUuid, key.indexUuid});
+        }
     }
 
     private void applyDiff(VersionedSegmentMetadata current) {

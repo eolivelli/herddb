@@ -53,8 +53,37 @@ public final class SegmentMetadata {
     public static final long NO_RETENTION = -1L;
     public static final int NO_SEGMENT_ID = -1;
 
+    /**
+     * Current znode JSON schema version (review item D5). Bumped when a
+     * non-backward-compatible field rename or structural change lands.
+     * Adding a new field does NOT require bumping the version (the
+     * {@code @JsonIgnoreProperties(ignoreUnknown = true)} reader handles
+     * forward-compatible additions). Bumping IS required when:
+     * <ul>
+     *   <li>renaming a field in a way the reader can't auto-map;</li>
+     *   <li>changing a field's semantics (e.g. units);</li>
+     *   <li>removing a required field.</li>
+     * </ul>
+     * The deserializer rejects payloads with a {@code schemaVersion} the
+     * runtime doesn't know.
+     */
+    public static final int SCHEMA_VERSION = 1;
+
+    /**
+     * Highest schema version this code can read. Increase together with
+     * {@link #SCHEMA_VERSION} only when forward-compat reading of a future
+     * version is supported.
+     */
+    public static final int MAX_SUPPORTED_SCHEMA_VERSION = 1;
+
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /**
+     * Wire schema version of THIS instance. Always serialized; absent in the
+     * JSON means the writer pre-dates the field (the deserializer maps that to
+     * {@link #SCHEMA_VERSION} = 1 via the {@code @JsonProperty} default).
+     */
+    private final int schemaVersion;
     private final String segmentUuid;
     private final String tablespaceUuid;
     private final String tableName;
@@ -88,6 +117,7 @@ public final class SegmentMetadata {
 
     @JsonCreator
     public SegmentMetadata(
+            @JsonProperty("schemaVersion") Integer schemaVersionOrNull,
             @JsonProperty("segmentUuid") String segmentUuid,
             @JsonProperty("tablespaceUuid") String tablespaceUuid,
             @JsonProperty("tableName") String tableName,
@@ -110,6 +140,10 @@ public final class SegmentMetadata {
             @JsonProperty("replacedBy") List<String> replacedBy,
             @JsonProperty("retentionUntilEpochMillis") long retentionUntilEpochMillis,
             @JsonProperty("createdAtEpochMillis") long createdAtEpochMillis) {
+        // Treat absent or zero schemaVersion as v1 so payloads written before the
+        // field existed deserialize cleanly (review item D5).
+        this.schemaVersion = (schemaVersionOrNull == null || schemaVersionOrNull == 0)
+                ? 1 : schemaVersionOrNull;
         this.segmentUuid = Objects.requireNonNull(segmentUuid, "segmentUuid");
         this.tablespaceUuid = Objects.requireNonNull(tablespaceUuid, "tablespaceUuid");
         this.tableName = Objects.requireNonNull(tableName, "tableName");
@@ -134,6 +168,10 @@ public final class SegmentMetadata {
                 : Collections.unmodifiableList(new java.util.ArrayList<>(replacedBy));
         this.retentionUntilEpochMillis = retentionUntilEpochMillis;
         this.createdAtEpochMillis = createdAtEpochMillis;
+    }
+
+    public int getSchemaVersion() {
+        return schemaVersion;
     }
 
     public String getSegmentUuid() {
@@ -247,7 +285,15 @@ public final class SegmentMetadata {
     }
 
     public static SegmentMetadata deserialize(byte[] data) throws IOException {
-        return MAPPER.readValue(data, SegmentMetadata.class);
+        SegmentMetadata m = MAPPER.readValue(data, SegmentMetadata.class);
+        // Reject payloads emitted by a future, non-backward-compatible writer
+        // (review item D5). Older writers either omit the schemaVersion field
+        // entirely (mapped to 1) or write 1 explicitly — both are accepted.
+        if (m.schemaVersion > MAX_SUPPORTED_SCHEMA_VERSION) {
+            throw new IOException("unsupported segment metadata schemaVersion: " + m.schemaVersion
+                    + " (max supported: " + MAX_SUPPORTED_SCHEMA_VERSION + ")");
+        }
+        return m;
     }
 
     public Builder toBuilder() {
@@ -486,7 +532,12 @@ public final class SegmentMetadata {
         }
 
         public SegmentMetadata build() {
-            return new SegmentMetadata(segmentUuid, tablespaceUuid, tableName, indexUuid, indexName,
+            // The builder always stamps the current code's SCHEMA_VERSION; callers
+            // never manipulate it directly. Loading from an older payload that lacks
+            // the field still produces a SegmentMetadata with schemaVersion=1 because
+            // the @JsonCreator default kicks in (review item D5).
+            return new SegmentMetadata(SCHEMA_VERSION,
+                    segmentUuid, tablespaceUuid, tableName, indexUuid, indexName,
                     state, ownerInstanceId, pendingOwnerInstanceId, segmentId, graphPath, mapPath,
                     tombstonePath, tombstoneLsnLedgerId, tombstoneLsnOffset,
                     baseLsnLedgerId, baseLsnOffset, sizeBytes, vectorCount, generation,
