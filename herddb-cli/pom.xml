@@ -56,6 +56,27 @@
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-jdk14</artifactId>
         </dependency>
+        <!-- Direct compile-scope declarations (issue #350): the new CLI
+             commands (and ServiceDiscoveryCliHelpersTest) reference
+             MetadataStorageManager / IndexingServiceInstanceDescriptor.
+             herddb-jdbc's maven-shade-plugin produces a dependency-reduced
+             pom that hides herddb-core / herddb-utils; declaring them
+             explicitly here keeps the symbols on both compile and test
+             classpaths whether the build uses the reactor poms or the
+             installed dependency-reduced ones. Compile scope (not test)
+             is required so Maven's "nearest wins" resolution does not
+             downgrade the transitive herddb-jdbc → herddb-core chain to
+             test-only and break herddb-cli's main compilation. -->
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>herddb-utils</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>herddb-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
     </dependencies>
     <build>
         <plugins>

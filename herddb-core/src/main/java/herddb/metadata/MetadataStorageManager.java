@@ -147,9 +147,12 @@ public abstract class MetadataStorageManager implements AutoCloseable {
 
     /**
      * Registers an indexing-service instance with its full descriptor (role,
-     * instanceId, shadowOf, address). Implementations should create an
-     * ephemeral znode / equivalent so the entry is cleaned up automatically
-     * when the process disconnects.
+     * instanceId, shadowOf, address). Implementations create a PERSISTENT
+     * znode / equivalent — the registration survives ZK session expiries and
+     * process restarts. Failure detection is the client's responsibility;
+     * stale entries are cleaned up via
+     * {@link #removeIndexingServiceInstanceRegistration(String)} (operator
+     * action via herddb-cli).
      */
     public void registerIndexingServiceInstance(IndexingServiceInstanceDescriptor descriptor)
             throws MetadataStorageManagerException {
@@ -158,6 +161,7 @@ public abstract class MetadataStorageManager implements AutoCloseable {
     /**
      * Removes the registration created by
      * {@link #registerIndexingServiceInstance(IndexingServiceInstanceDescriptor)}.
+     * Called on clean shutdown.
      */
     public void unregisterIndexingServiceInstance(String serviceId) throws MetadataStorageManagerException {
     }
@@ -168,6 +172,23 @@ public abstract class MetadataStorageManager implements AutoCloseable {
     public List<IndexingServiceInstanceDescriptor> listIndexingServiceInstances()
             throws MetadataStorageManagerException {
         return Collections.emptyList();
+    }
+
+    /**
+     * Reads the registration descriptor for the given indexing-service
+     * {@code serviceId}, or {@code null} if no registration exists.
+     */
+    public IndexingServiceInstanceDescriptor getIndexingServiceInstanceRegistration(String serviceId)
+            throws MetadataStorageManagerException {
+        return null;
+    }
+
+    /**
+     * Operator-driven removal of a stale indexing-service registration.
+     * Idempotent: a missing registration is not an error.
+     */
+    public void removeIndexingServiceInstanceRegistration(String serviceId)
+            throws MetadataStorageManagerException {
     }
 
     /**
@@ -198,14 +219,40 @@ public abstract class MetadataStorageManager implements AutoCloseable {
             throws MetadataStorageManagerException {
     }
 
+    /**
+     * Registers a file-server in the persistent znode store. The registration
+     * survives ZK session expiries and process restarts. Stale entries left
+     * by deleted pods are cleaned up via
+     * {@link #removeFileServerRegistration(String)} (operator action via
+     * herddb-cli).
+     */
     public void registerFileServer(String serviceId, String address) throws MetadataStorageManagerException {
     }
 
+    /**
+     * Removes the registration created by
+     * {@link #registerFileServer(String, String)}. Called on clean shutdown.
+     */
     public void unregisterFileServer(String serviceId) throws MetadataStorageManagerException {
     }
 
     public List<String> listFileServers() throws MetadataStorageManagerException {
         return Collections.emptyList();
+    }
+
+    /**
+     * Reads the registration address for the given file-server
+     * {@code serviceId}, or {@code null} if no registration exists.
+     */
+    public String getFileServerRegistration(String serviceId) throws MetadataStorageManagerException {
+        return null;
+    }
+
+    /**
+     * Operator-driven removal of a stale file-server registration. Idempotent:
+     * a missing registration is not an error.
+     */
+    public void removeFileServerRegistration(String serviceId) throws MetadataStorageManagerException {
     }
 
     public final void addServiceDiscoveryListener(ServiceDiscoveryListener listener) {

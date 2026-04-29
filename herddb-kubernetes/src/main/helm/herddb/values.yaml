@@ -111,6 +111,13 @@ fileServer:
   storage:
     size: 10Gi
     storageClass: ""
+  # ZooKeeper session timeout (ms) for the file-server's metadata client.
+  # Registrations are PERSISTENT (issue #350) so this timeout no longer
+  # governs registration liveness — only the latency window over which a
+  # session-loss is detected and the client reconnects. Raise it (e.g.
+  # 60000–90000 ms) on workloads with frequent long GC pauses or I/O stalls
+  # to reduce reconnect churn.
+  zkSessionTimeout: 40000
   extraConfig: {}
   # PodDisruptionBudget — see server.pdb above. Disabled by default; enable in
   # production / long-running benchmarks (see issue #332).
@@ -253,6 +260,13 @@ indexingService:
     log:
       size: 5Gi
       storageClass: ""
+  # ZooKeeper session timeout (ms) for the indexing-service's metadata client.
+  # Registrations are PERSISTENT (issue #350) so this timeout no longer
+  # governs registration liveness — only the latency window over which a
+  # session-loss is detected and the client reconnects. Raise it (e.g.
+  # 60000–90000 ms) on workloads with frequent long GC pauses or I/O stalls
+  # to reduce reconnect churn.
+  zkSessionTimeout: 40000
   # Liveness probe tuning for the IS container.
   # During heavy GC / memory-flush cycles (see issue #340) the JVM may starve
   # the Jetty thread pool for 10–30 s.  Raise failureThreshold + periodSeconds

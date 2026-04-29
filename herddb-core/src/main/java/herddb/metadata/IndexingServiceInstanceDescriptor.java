@@ -31,8 +31,11 @@ import java.util.Objects;
 /**
  * Registration record for a single indexing-service process. Primaries and
  * shadow replicas both register under
- * {@code /herddb/indexingServices/instances/{serviceId}} as an ephemeral
- * znode whose payload is the JSON serialization of this descriptor.
+ * {@code /herddb/indexingServices/instances/{serviceId}} as a PERSISTENT
+ * znode whose payload is the JSON serialization of this descriptor. The
+ * registration survives ZK session expiries / restarts / crashes; stale
+ * entries are cleaned up by an operator via the herddb-cli
+ * {@code --remove-indexing-service-instance} command.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public final class IndexingServiceInstanceDescriptor {

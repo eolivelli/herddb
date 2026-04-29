@@ -46,3 +46,39 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].livenessProbe.failureThreshold
           value: 20
+
+  # Issue #350 — server.zookeeper.session.timeout for the indexing-service is
+  # configurable via indexingService.zkSessionTimeout (default 40000 ms).
+  - it: should default zk session timeout to 40000 in the IS ConfigMap
+    template: templates/indexing-service-configmap.yaml
+    set:
+      indexingService.enabled: true
+      server.mode: cluster
+    asserts:
+      - matchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "server\\.zookeeper\\.session\\.timeout=40000"
+
+  - it: should honour overridden indexingService.zkSessionTimeout
+    template: templates/indexing-service-configmap.yaml
+    set:
+      indexingService.enabled: true
+      server.mode: cluster
+      indexingService.zkSessionTimeout: 90000
+    asserts:
+      - matchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "server\\.zookeeper\\.session\\.timeout=90000"
+      - notMatchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "server\\.zookeeper\\.session\\.timeout=40000"
+
+  - it: should omit zk session timeout when not in cluster mode
+    template: templates/indexing-service-configmap.yaml
+    set:
+      indexingService.enabled: true
+      server.mode: standalone
+    asserts:
+      - notMatchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "server\\.zookeeper\\.session\\.timeout"

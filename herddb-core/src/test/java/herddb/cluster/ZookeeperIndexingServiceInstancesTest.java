@@ -104,26 +104,30 @@ public class ZookeeperIndexingServiceInstancesTest {
     }
 
     @Test
-    public void ephemeralCleanupOnClose() throws Exception {
+    public void registrationSurvivesManagerClose() throws Exception {
+        // Issue #350: indexing-service registrations are PERSISTENT and must
+        // survive the registering manager closing its session. Operator
+        // cleanup happens via removeIndexingServiceInstanceRegistration().
         try (ZookeeperMetadataStorageManager writer = newManager()) {
             writer.registerIndexingServiceInstance(
                     IndexingServiceInstanceDescriptor.primary("p0", "host-p0:9850", 0));
         }
-        // Re-open; the ephemeral znode should be gone because the previous
-        // session was closed.
+        // Re-open; the persistent znode must still be there because the
+        // previous session being closed no longer cleans up registrations.
         try (ZookeeperMetadataStorageManager reader = newManager()) {
-            // Poll briefly — ephemeral deletion is observed via the session
-            // close; ZK may lag by ticks.
-            long deadline = System.currentTimeMillis() + 10_000L;
-            List<IndexingServiceInstanceDescriptor> instances;
-            do {
-                instances = reader.listIndexingServiceInstances();
-                if (instances.isEmpty()) {
-                    break;
-                }
-                Thread.sleep(50);
-            } while (System.currentTimeMillis() < deadline);
-            assertEquals(0, instances.size());
+            // A small sleep guards against false positives if the znode were
+            // (incorrectly) ephemeral — give ZK time to react to the closed
+            // session before checking.
+            Thread.sleep(2000);
+            List<IndexingServiceInstanceDescriptor> instances =
+                    reader.listIndexingServiceInstances();
+            assertEquals("Persistent registration must survive manager close",
+                    1, instances.size());
+            assertEquals("host-p0:9850", instances.get(0).getAddress());
+
+            // Operator cleanup
+            reader.removeIndexingServiceInstanceRegistration("p0");
+            assertEquals(0, reader.listIndexingServiceInstances().size());
         }
     }
 
