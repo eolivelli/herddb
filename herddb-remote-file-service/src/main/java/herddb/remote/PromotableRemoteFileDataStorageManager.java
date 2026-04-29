@@ -62,6 +62,8 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
     private final Path dataDirectory;
     private final Path tmpDirectory;
     private final int swapThreshold;
+    private final boolean pageHashWritesEnabled;
+    private final boolean pageHashChecksEnabled;
 
     private volatile DataStorageManager activeDelegate;
     private volatile boolean promoted = false;
@@ -73,12 +75,28 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
             Path dataDirectory,
             Path tmpDirectory,
             int swapThreshold) {
+        this(readOnlyDelegate, client, metadataManager, dataDirectory, tmpDirectory, swapThreshold,
+                herddb.server.ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT,
+                herddb.server.ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
+    }
+
+    public PromotableRemoteFileDataStorageManager(
+            ReadReplicaDataStorageManager readOnlyDelegate,
+            RemoteFileServiceClient client,
+            SharedCheckpointMetadataManager metadataManager,
+            Path dataDirectory,
+            Path tmpDirectory,
+            int swapThreshold,
+            boolean pageHashWritesEnabled,
+            boolean pageHashChecksEnabled) {
         this.readOnlyDelegate = readOnlyDelegate;
         this.client = client;
         this.metadataManager = metadataManager;
         this.dataDirectory = dataDirectory;
         this.tmpDirectory = tmpDirectory;
         this.swapThreshold = swapThreshold;
+        this.pageHashWritesEnabled = pageHashWritesEnabled;
+        this.pageHashChecksEnabled = pageHashChecksEnabled;
         this.activeDelegate = readOnlyDelegate;
     }
 
@@ -94,7 +112,10 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
         LOGGER.log(Level.INFO, "Promoting storage manager to writable mode");
 
         RemoteFileDataStorageManager writableDelegate = new RemoteFileDataStorageManager(
-                dataDirectory, tmpDirectory, swapThreshold, client);
+                dataDirectory, tmpDirectory, swapThreshold, client,
+                new LazyValueCache(0L),
+                herddb.server.ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT,
+                pageHashWritesEnabled, pageHashChecksEnabled);
         writableDelegate.setSharedCheckpointMetadataManager(metadataManager);
         writableDelegate.start();
 

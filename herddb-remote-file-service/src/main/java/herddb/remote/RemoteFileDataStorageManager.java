@@ -152,29 +152,59 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      */
     private volatile StatsLogger readerStatsLogger = NullStatsLogger.INSTANCE;
 
+    /**
+     * Whether to compute XXHash64 and write it as a page footer on the write path.
+     * When {@code false}, {@code 0L} (NO_HASH_PRESENT) is stored instead, saving
+     * significant CPU during Phase C checkpoints.
+     */
+    private final boolean pageHashWritesEnabled;
+
+    /**
+     * Whether to verify the page footer hash on the read path.
+     * When {@code false}, footer verification is skipped entirely.
+     */
+    private final boolean pageHashChecksEnabled;
+
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
             RemoteFileServiceClient client) {
         this(localMetadataDir, tmpDir, swapThreshold, client, new LazyValueCache(0L),
-                ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT);
+                ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT,
+                ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT,
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
     }
 
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
             RemoteFileServiceClient client, LazyValueCache lazyValueCache) {
         this(localMetadataDir, tmpDir, swapThreshold, client, lazyValueCache,
-                ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT);
+                ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT,
+                ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT,
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
     }
 
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
             RemoteFileServiceClient client, LazyValueCache lazyValueCache,
             int blockUploadParallelism) {
+        this(localMetadataDir, tmpDir, swapThreshold, client, lazyValueCache,
+                blockUploadParallelism,
+                ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT,
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
+    }
+
+    public RemoteFileDataStorageManager(
+            Path localMetadataDir, Path tmpDir, int swapThreshold,
+            RemoteFileServiceClient client, LazyValueCache lazyValueCache,
+            int blockUploadParallelism,
+            boolean pageHashWritesEnabled, boolean pageHashChecksEnabled) {
         this.tmpDir = tmpDir;
         this.swapThreshold = swapThreshold;
         this.client = client;
         this.lazyValueCache = lazyValueCache == null ? new LazyValueCache(0L) : lazyValueCache;
         this.blockUploadParallelism = Math.max(1, blockUploadParallelism);
+        this.pageHashWritesEnabled = pageHashWritesEnabled;
+        this.pageHashChecksEnabled = pageHashChecksEnabled;
         this.localMetadataManager = new FileDataStorageManager(
                 localMetadataDir, tmpDir, swapThreshold,
                 false, false, false, false, false,
@@ -420,19 +450,30 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     // Page serialization (matches FileDataStorageManager format)
     // -------------------------------------------------------------------------
 
-    private static ByteBuf serializeIndexPage(DataWriter writer) throws IOException {
+    private ByteBuf serializeIndexPage(DataWriter writer) throws IOException {
         ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(4096);
         try {
             ByteBufOutputStream bufOut = new ByteBufOutputStream(buf);
-            XXHash64Utils.HashingOutputStream hashOut = new XXHash64Utils.HashingOutputStream(bufOut);
-            try (ExtendedDataOutputStream out = new ExtendedDataOutputStream(hashOut)) {
-                out.writeVLong(1); // version
-                out.writeVLong(0); // flags
-                writer.write(out);
-                out.flush();
-                long hash = hashOut.hash(); // hash of data bytes only, before footer
-                out.writeLong(hash); // footer
-                out.flush();
+            if (pageHashWritesEnabled) {
+                XXHash64Utils.HashingOutputStream hashOut = new XXHash64Utils.HashingOutputStream(bufOut);
+                try (ExtendedDataOutputStream out = new ExtendedDataOutputStream(hashOut)) {
+                    out.writeVLong(1); // version
+                    out.writeVLong(0); // flags
+                    writer.write(out);
+                    out.flush();
+                    long hash = hashOut.hash(); // hash of data bytes only, before footer
+                    out.writeLong(hash); // footer
+                    out.flush();
+                }
+            } else {
+                try (ExtendedDataOutputStream out = new ExtendedDataOutputStream(bufOut)) {
+                    out.writeVLong(1); // version
+                    out.writeVLong(0); // flags
+                    writer.write(out);
+                    out.flush();
+                    out.writeLong(0L); // NO_HASH_PRESENT footer
+                    out.flush();
+                }
             }
         } catch (IOException e) {
             buf.release();
@@ -488,7 +529,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         }
         ByteBuf buf = io.netty.buffer.Unpooled.wrappedBuffer(full);
         try {
-            return LazyDataPageFormat.readAllRecords(buf);
+            return LazyDataPageFormat.readAllRecords(buf, pageHashChecksEnabled);
         } finally {
             buf.release();
         }
@@ -498,7 +539,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     public void writePage(String tableSpace, String uuid, long pageId,
             Collection<Record> newPage) throws DataStorageManagerException {
         String path = remoteDataPagePath(tableSpace, uuid, pageId);
-        ByteBuf buf = LazyDataPageFormat.write(newPage);
+        ByteBuf buf = LazyDataPageFormat.write(newPage, pageHashWritesEnabled);
         try {
             writeAsMultipart(path, buf);
         } finally {

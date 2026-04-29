@@ -478,6 +478,14 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                         configuration.getInt(
                                 ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM,
                                 ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT));
+                dsmConfig.put(ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED,
+                        configuration.getBoolean(
+                                ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED,
+                                ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT));
+                dsmConfig.put(ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
+                        configuration.getBoolean(
+                                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
+                                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT));
                 DataStorageManager dsm = factory.createDataStorageManager(
                         dataDirectory, tmpDirectory, diskswapThreshold, client, dsmConfig);
 
@@ -578,8 +586,17 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         // Create SharedCheckpointMetadata + PromotableRemoteFileDataStorageManager
         // (wraps a ReadReplicaDataStorageManager) for failover support.
         SharedCheckpointMetadata metaMgr = factory.createSharedCheckpointMetadata(client);
+        Map<String, Object> sharedConfig = new HashMap<>();
+        sharedConfig.put(ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED,
+                configuration.getBoolean(
+                        ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED,
+                        ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT));
+        sharedConfig.put(ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
+                configuration.getBoolean(
+                        ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
+                        ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT));
         return factory.createPromotableDataStorageManager(
-                client, metaMgr, dataDirectory, tmpDirectory, diskswapThreshold);
+                client, metaMgr, dataDirectory, tmpDirectory, diskswapThreshold, sharedConfig);
     }
 
     protected CommitLogManager buildCommitLogManager() {
