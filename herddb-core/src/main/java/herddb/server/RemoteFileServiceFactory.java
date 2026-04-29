@@ -90,6 +90,23 @@ public interface RemoteFileServiceFactory {
             int swapThreshold);
 
     /**
+     * Config-aware overload of {@link #createPromotableDataStorageManager}.
+     * Accepts the same {@code config} map used by
+     * {@link #createDataStorageManager(Path, Path, int, RemoteFileClient, Map)}
+     * so that page-checksum knobs flow through to the promoted write manager.
+     * The default delegates to the legacy method for backward compatibility.
+     */
+    default DataStorageManager createPromotableDataStorageManager(
+            RemoteFileClient client,
+            SharedCheckpointMetadata metadata,
+            Path dataDirectory,
+            Path tmpDirectory,
+            int swapThreshold,
+            Map<String, Object> config) {
+        return createPromotableDataStorageManager(client, metadata, dataDirectory, tmpDirectory, swapThreshold);
+    }
+
+    /**
      * Creates a strictly read-only data storage manager for indexing-service
      * shadow replicas. Unlike the promotable variant, this one never transitions
      * to writable and throws {@link UnsupportedOperationException} on any

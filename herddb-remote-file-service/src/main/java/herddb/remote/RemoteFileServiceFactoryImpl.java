@@ -67,10 +67,17 @@ public class RemoteFileServiceFactoryImpl implements RemoteFileServiceFactory {
         int blockParallelism = readInt(config,
                 ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM,
                 ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT);
+        boolean hashWritesEnabled = readBoolean(config,
+                ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED,
+                ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT);
+        boolean hashChecksEnabled = readBoolean(config,
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
         LazyValueCache cache = new LazyValueCache(valueCacheBytes);
         return new RemoteFileDataStorageManager(
                 dataDirectory, tmpDirectory, swapThreshold,
-                (RemoteFileServiceClient) client, cache, blockParallelism);
+                (RemoteFileServiceClient) client, cache, blockParallelism,
+                hashWritesEnabled, hashChecksEnabled);
     }
 
     private static long readLong(Map<String, Object> config, String key, long defaultValue) {
@@ -103,6 +110,17 @@ public class RemoteFileServiceFactoryImpl implements RemoteFileServiceFactory {
         }
     }
 
+    private static boolean readBoolean(Map<String, Object> config, String key, boolean defaultValue) {
+        Object v = config.get(key);
+        if (v == null) {
+            return defaultValue;
+        }
+        if (v instanceof Boolean) {
+            return (Boolean) v;
+        }
+        return Boolean.parseBoolean(v.toString());
+    }
+
     @Override
     public DataStorageManager createPromotableDataStorageManager(
             RemoteFileClient client,
@@ -110,13 +128,32 @@ public class RemoteFileServiceFactoryImpl implements RemoteFileServiceFactory {
             Path dataDirectory,
             Path tmpDirectory,
             int swapThreshold) {
+        return createPromotableDataStorageManager(client, metadata, dataDirectory, tmpDirectory,
+                swapThreshold, java.util.Collections.emptyMap());
+    }
+
+    @Override
+    public DataStorageManager createPromotableDataStorageManager(
+            RemoteFileClient client,
+            SharedCheckpointMetadata metadata,
+            Path dataDirectory,
+            Path tmpDirectory,
+            int swapThreshold,
+            Map<String, Object> config) {
         RemoteFileServiceClient concreteClient = (RemoteFileServiceClient) client;
         SharedCheckpointMetadataManager concreteMetadata = (SharedCheckpointMetadataManager) metadata;
+        boolean hashWritesEnabled = readBoolean(config,
+                ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED,
+                ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT);
+        boolean hashChecksEnabled = readBoolean(config,
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
         ReadReplicaDataStorageManager readReplica = new ReadReplicaDataStorageManager(
                 concreteClient, concreteMetadata, tmpDirectory, swapThreshold);
         return new PromotableRemoteFileDataStorageManager(
                 readReplica, concreteClient, concreteMetadata,
-                dataDirectory, tmpDirectory, swapThreshold);
+                dataDirectory, tmpDirectory, swapThreshold,
+                hashWritesEnabled, hashChecksEnabled);
     }
 
     @Override

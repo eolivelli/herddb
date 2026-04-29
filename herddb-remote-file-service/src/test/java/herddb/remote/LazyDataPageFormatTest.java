@@ -192,13 +192,14 @@ public class LazyDataPageFormatTest {
     @Test
     public void corruptedFooterIsDetected() {
         List<Record> records = makeRecords(3, 16);
-        ByteBuf buf = LazyDataPageFormat.write(records);
+        // write with checksums enabled so there is a real hash in the footer
+        ByteBuf buf = LazyDataPageFormat.write(records, true);
         try {
             // flip a byte in the footer
             int footerPos = buf.readableBytes() - LazyDataPageFormat.FOOTER_SIZE;
             buf.setByte(footerPos, buf.getByte(footerPos) ^ 0xFF);
             try {
-                LazyDataPageFormat.readAllRecords(buf);
+                LazyDataPageFormat.readAllRecords(buf, true);
                 fail("expected footer hash mismatch");
             } catch (DataStorageManagerException expected) {
                 assertTrue(expected.getMessage().contains("footer hash mismatch"));
@@ -211,16 +212,42 @@ public class LazyDataPageFormatTest {
     @Test
     public void corruptedBodyIsDetectedByHash() {
         List<Record> records = makeRecords(5, 16);
-        ByteBuf buf = LazyDataPageFormat.write(records);
+        // write with checksums enabled so there is a real hash to catch body corruption
+        ByteBuf buf = LazyDataPageFormat.write(records, true);
         try {
             // flip a byte in the middle of the values section
             int mid = buf.readableBytes() / 2;
             buf.setByte(mid, buf.getByte(mid) ^ 0x01);
             try {
-                LazyDataPageFormat.readAllRecords(buf);
+                LazyDataPageFormat.readAllRecords(buf, true);
                 fail("expected footer hash mismatch from body corruption");
             } catch (DataStorageManagerException expected) {
                 assertTrue(expected.getMessage().contains("footer hash mismatch"));
+            }
+        } finally {
+            buf.release();
+        }
+    }
+
+    @Test
+    public void noChecksumZeroFooterRoundTrip() throws DataStorageManagerException {
+        // When checksums are disabled the footer slot must be 0L (NO_HASH_PRESENT)
+        // and readAllRecords must parse the page correctly without verifying the footer.
+        List<Record> records = makeRecords(4, 32);
+        ByteBuf buf = LazyDataPageFormat.write(records, false);
+        try {
+            // verify the footer is exactly 0L
+            int footerPos = buf.readableBytes() - LazyDataPageFormat.FOOTER_SIZE;
+            assertEquals("footer must be 0L when checksums are disabled",
+                    0L, buf.getLong(footerPos));
+
+            // readAllRecords with checksums disabled must succeed and return the original records
+            List<Record> out = LazyDataPageFormat.readAllRecords(buf, false);
+            assertEquals(records.size(), out.size());
+            for (int i = 0; i < records.size(); i++) {
+                assertEquals("key mismatch at " + i, records.get(i).key, out.get(i).key);
+                assertArrayEquals("value mismatch at " + i,
+                        records.get(i).value.to_array(), out.get(i).value.to_array());
             }
         } finally {
             buf.release();

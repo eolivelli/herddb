@@ -166,8 +166,12 @@ public final class LazyDataPageFormat {
      * Serialises {@code records} into a fresh pooled heap {@link ByteBuf}
      * containing a v2 page. Caller takes ownership and must release the
      * returned buffer.
+     *
+     * <p>When {@code checksumEnabled} is {@code false}, the footer slot is
+     * written as {@code 0L} (the {@code NO_HASH_PRESENT} sentinel) and no
+     * hash computation is performed, saving CPU on the write path.
      */
-    public static ByteBuf write(Collection<Record> records) {
+    public static ByteBuf write(Collection<Record> records, boolean checksumEnabled) {
         final int numRecords = records.size();
         long totalValueBytes = 0L;
         long estimatedIndexBytes = 0L;
@@ -206,14 +210,23 @@ public final class LazyDataPageFormat {
             buf.setInt(OFFSET_NUM_RECORDS, numRecords);
             buf.setInt(OFFSET_INDEX_SIZE, indexSize);
             buf.setLong(OFFSET_VALUE_SIZE, valueSize);
-            // footer: xxhash64 over everything written so far
-            final long hash = hashBytes(buf, 0, valueEnd);
+            // footer: xxhash64 when checksums are enabled, 0L (NO_HASH_PRESENT) otherwise
+            final long hash = checksumEnabled ? hashBytes(buf, 0, valueEnd) : 0L;
             buf.writeLong(hash);
             return buf;
         } catch (RuntimeException t) {
             buf.release();
             throw t;
         }
+    }
+
+    /**
+     * Convenience overload with checksums disabled (default). Use
+     * {@link #write(Collection, boolean)} when checksum behaviour must be
+     * controlled explicitly.
+     */
+    public static ByteBuf write(Collection<Record> records) {
+        return write(records, false);
     }
 
     /**
@@ -276,11 +289,14 @@ public final class LazyDataPageFormat {
 
     /**
      * Eagerly parses a complete v2 page and returns the full list of
-     * {@link Record}s, verifying the xxhash64 footer. Used by code paths that
-     * always need every value (e.g. {@code fullTableScan}) or by fallback
-     * paths.
+     * {@link Record}s. When {@code checksumEnabled} is {@code true}, the
+     * xxhash64 footer is verified and a {@link DataStorageManagerException}
+     * is thrown on mismatch. When {@code false}, footer verification is
+     * skipped entirely (no CPU spent on hashing), regardless of the stored
+     * footer value.
      */
-    public static List<Record> readAllRecords(ByteBuf wholeFile) throws DataStorageManagerException {
+    public static List<Record> readAllRecords(ByteBuf wholeFile, boolean checksumEnabled)
+            throws DataStorageManagerException {
         final int startIdx = wholeFile.readerIndex();
         final int available = wholeFile.readableBytes();
         if (available < FIXED_HEADER_SIZE + FOOTER_SIZE) {
@@ -292,12 +308,14 @@ public final class LazyDataPageFormat {
             throw new DataStorageManagerException("v2 page shorter than declared: "
                     + available + " < " + declared);
         }
-        // verify footer hash (over bytes [startIdx .. startIdx + footerOffset))
-        final int footerPos = startIdx + (int) h.footerOffset();
-        final long expected = wholeFile.getLong(footerPos);
-        final long actual = hashBytes(wholeFile, startIdx, (int) h.footerOffset());
-        if (expected != actual) {
-            throw new DataStorageManagerException("v2 page footer hash mismatch");
+        // verify footer hash only when checksums are enabled
+        if (checksumEnabled) {
+            final int footerPos = startIdx + (int) h.footerOffset();
+            final long expected = wholeFile.getLong(footerPos);
+            final long actual = hashBytes(wholeFile, startIdx, (int) h.footerOffset());
+            if (expected != actual) {
+                throw new DataStorageManagerException("v2 page footer hash mismatch");
+            }
         }
         // parse index
         final ByteBuf indexSlice = wholeFile.slice(startIdx + FIXED_HEADER_SIZE, h.indexSize);
@@ -313,6 +331,15 @@ public final class LazyDataPageFormat {
             result.add(new Record(m.key, Bytes.from_array(value)));
         }
         return result;
+    }
+
+    /**
+     * Convenience overload with checksums disabled (default). Use
+     * {@link #readAllRecords(ByteBuf, boolean)} when checksum behaviour must
+     * be controlled explicitly.
+     */
+    public static List<Record> readAllRecords(ByteBuf wholeFile) throws DataStorageManagerException {
+        return readAllRecords(wholeFile, false);
     }
 
     /**

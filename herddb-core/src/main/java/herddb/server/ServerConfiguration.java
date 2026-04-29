@@ -227,12 +227,18 @@ public final class ServerConfiguration {
     public static final boolean PROPERTY_INDEX_USE_ODIRECT_DEFAULT = USE_O_DIRECT_DEFAULT;
 
     /**
-     * In some cases the usage of XXHash64 might to be overkilling
+     * Whether to compute and verify XXHash64 checksums on data and index page files.
+     * Disabled by default: writing zero instead of the hash and skipping checksum
+     * verification on reads saves significant CPU during Phase C checkpoints.
+     * Set to {@code true} to restore integrity checking (e.g. after a suspected
+     * hardware-level data corruption event).
+     * Note: checkpoint metadata files (table/index status) always carry checksums
+     * regardless of this setting.
      */
     public static final String PROPERTY_HASH_CHECKS_ENABLED = "server.filedatastorage.checkhash";
-    public static final boolean PROPERTY_HASH_CHECKS_ENABLED_DEFAULT = true;
+    public static final boolean PROPERTY_HASH_CHECKS_ENABLED_DEFAULT = false;
     public static final String PROPERTY_HASH_WRITES_ENABLED = "server.filedatastorage.writehash";
-    public static final boolean PROPERTY_HASH_WRITES_ENABLED_DEFAULT = true;
+    public static final boolean PROPERTY_HASH_WRITES_ENABLED_DEFAULT = false;
 
     public static final String PROPERTY_TMPDIR = "server.tmp.dir";
     public static final String PROPERTY_TMPDIR_DEFAULT = "tmp";
