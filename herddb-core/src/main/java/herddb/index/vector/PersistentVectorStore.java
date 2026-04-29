@@ -423,6 +423,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     private volatile int vectorIndexCompactionMaxCount = 200;
     private volatile long vectorIndexCompactionRetentionMs = 10L * 60_000L;
+    /**
+     * When {@code true} (the default), the per-cycle byte cap and segment
+     * count cap are scaled up by {@link VectorIndexCompactor#tieredMultiplier}
+     * so that compaction throughput stays proportional to the segment
+     * accumulation rate (issue #354).
+     */
+    private volatile boolean vectorIndexCompactionTieredEnabled = true;
+    /**
+     * Segment-count back-pressure threshold (issue #354).  When the total
+     * number of on-disk segments exceeds this value, {@link #addVectorInternal}
+     * blocks and wakes the compaction thread before accepting new vectors.
+     * Default is 500 — set to {@link Integer#MAX_VALUE} to disable.
+     */
+    private volatile int compactionBackpressureThreshold = 500;
 
     /**
      * Log a WARNING during Phase A when the total on-disk segment count
@@ -567,6 +581,26 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final Object memoryPressureMonitor = new Object();
     private final Object compactionWakeUp = new Object();
     private boolean compactionWakeUpPending = false;
+
+    // -------------------------------------------------------------------------
+    // Segment-count back-pressure statistics (issue #354)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Monitor used to park {@link #addVectorInternal} callers while the
+     * on-disk segment count exceeds {@link #compactionBackpressureThreshold}.
+     * Notified after every successful compaction swap.
+     */
+    private final Object segmentCountMonitor = new Object();
+    private volatile int segmentCountBackpressureActive;
+    private final AtomicLong segmentCountBackpressureTotal = new AtomicLong(0);
+    private final AtomicLong segmentCountBackpressureTimeMs = new AtomicLong(0);
+    /**
+     * Generation counter incremented inside {@link #notifySegmentCountMonitor}
+     * to satisfy SpotBugs NN_NAKED_NOTIFY: the monitor must see a visible
+     * state change before {@code notifyAll()} is called.
+     */
+    private int segmentCountGeneration;
 
     // -------------------------------------------------------------------------
     // Provisional page tracking
@@ -1313,6 +1347,27 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.vectorIndexCompactionRetentionMs = retentionMs;
     }
 
+    /**
+     * Enables or disables tiered compaction scaling (issue #354).
+     * When enabled, the per-cycle byte cap and segment-count cap are
+     * multiplied by a tier-dependent factor when the total on-disk
+     * segment count exceeds the tier thresholds, keeping compaction
+     * throughput proportional to the ingest rate.
+     */
+    public void setTieredCompactionEnabled(boolean enabled) {
+        this.vectorIndexCompactionTieredEnabled = enabled;
+    }
+
+    /**
+     * Sets the segment-count back-pressure threshold (issue #354).
+     * {@link #addVectorInternal} will block when {@code segments.size()}
+     * exceeds this value, waking the compaction thread first.
+     * Set to {@link Integer#MAX_VALUE} to disable.
+     */
+    public void setCompactionBackpressureThreshold(int threshold) {
+        this.compactionBackpressureThreshold = threshold;
+    }
+
     /** Wakes the compaction thread. Called by tests and the retention reaper. */
     public void wakeVectorIndexCompaction() {
         synchronized (vectorIndexCompactionWakeup) {
@@ -1525,12 +1580,33 @@ public class PersistentVectorStore extends AbstractVectorStore {
             long cycleId = compactionRunsTotal.incrementAndGet();
 
             List<VectorSegment> snapshot = new ArrayList<>(segments);
+
+            // Tiered compaction (issue #354): scale the per-cycle byte cap and
+            // segment-count cap when there are many segments, so that compaction
+            // throughput stays proportional to the ingest rate.
+            long effectiveMaxBytes = vectorIndexCompactionMaxBytes;
+            int effectiveMaxCount = vectorIndexCompactionMaxCount;
+            if (vectorIndexCompactionTieredEnabled) {
+                int tier = VectorIndexCompactor.tieredMultiplier(snapshot.size());
+                if (tier > 1) {
+                    effectiveMaxBytes = VectorIndexCompactor.computeTieredMaxBytes(
+                            snapshot.size(), vectorIndexCompactionMaxBytes);
+                    effectiveMaxCount = VectorIndexCompactor.computeTieredMaxCount(
+                            snapshot.size(), vectorIndexCompactionMaxCount);
+                    LOGGER.log(Level.INFO,
+                            "vector store {0}: tiered compaction — {1} segments → "
+                                    + "effective maxBytes={2} ({3}×), effective maxCount={4} ({3}×)",
+                            new Object[]{indexName, snapshot.size(),
+                                    effectiveMaxBytes, tier, effectiveMaxCount});
+                }
+            }
+
             List<VectorSegment> candidates = VectorIndexCompactor.chooseSegmentsToMerge(
                     snapshot,
                     vectorIndexCompactionMinCount,
                     vectorIndexCompactionMinBytes,
-                    vectorIndexCompactionMaxBytes,
-                    vectorIndexCompactionMaxCount);
+                    effectiveMaxBytes,
+                    effectiveMaxCount);
             if (candidates.isEmpty()) {
                 if (snapshot.size() >= COMPACTION_SEGMENT_COUNT_WARN_THRESHOLD) {
                     LOGGER.log(Level.WARNING,
@@ -1594,6 +1670,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                 "vector store {0}: empty-result compaction in {1} ms — "
                                         + "swapped out {2} fully-obsolete segments",
                                 new Object[]{indexName, emptyCycleMs, candidates.size()});
+                        notifySegmentCountMonitor();
                         return;
                     }
 
@@ -1622,6 +1699,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     compactionLastInputSegments.set(candidates.size());
                     compactionLastOutputSegments.set(1);
                     compactionLivePkFilteredTotal.addAndGet(vectorsFiltered);
+
+                    // Notify any addVector callers waiting on segment-count
+                    // back-pressure (issue #354) that the segment list shrank.
+                    notifySegmentCountMonitor();
 
                     LOGGER.log(Level.INFO,
                             "vector store {0}: compaction complete in {1} ms — "
@@ -2030,6 +2111,69 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 && estimatedMemoryUsageBytes() > maxVectorMemoryBytes;
     }
 
+    /**
+     * Blocks {@link #addVectorInternal} when the on-disk segment count
+     * exceeds {@link #compactionBackpressureThreshold} (issue #354).
+     *
+     * <p>Wakes the compaction thread before parking, then polls every 100 ms
+     * until either the segment count falls below the threshold or the store
+     * is shut down. The same {@link ThreadPoolExecutor.CallerRunsPolicy}
+     * that propagates memory back-pressure to the tailer thread propagates
+     * this back-pressure too.
+     */
+    private void waitForSegmentCountRelief() {
+        long startMs = System.currentTimeMillis();
+        segmentCountBackpressureActive = 1;
+        segmentCountBackpressureTotal.incrementAndGet();
+        int threshold = compactionBackpressureThreshold;
+        LOGGER.log(Level.WARNING,
+                "vector store {0} segment-count back-pressure: {1} segments exceeds "
+                        + "threshold {2}, blocking addVector and waking compaction",
+                new Object[]{indexName, segments.size(), threshold});
+
+        // Wake the compaction thread so it drains segments while we wait.
+        synchronized (vectorIndexCompactionWakeup) {
+            vectorIndexCompactionWakeupPending = true;
+            vectorIndexCompactionWakeup.notifyAll();
+        }
+
+        synchronized (segmentCountMonitor) {
+            // segmentCountGeneration is incremented by notifySegmentCountMonitor each
+            // time a compaction cycle completes, giving SpotBugs a traceable
+            // producer-consumer relationship (NN_NAKED_NOTIFY avoidance).
+            while (running && segments.size() > threshold && segmentCountGeneration >= 0) {
+                try {
+                    segmentCountMonitor.wait(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        segmentCountBackpressureActive = 0;
+        long elapsedMs = System.currentTimeMillis() - startMs;
+        segmentCountBackpressureTimeMs.addAndGet(elapsedMs);
+        LOGGER.log(Level.INFO,
+                "vector store {0} segment-count back-pressure released after {1} ms "
+                        + "({2} segments remaining)",
+                new Object[]{indexName, elapsedMs, segments.size()});
+    }
+
+    /**
+     * Notifies any threads parked in {@link #waitForSegmentCountRelief}
+     * that the segment list has shrunk (called after each successful swap).
+     *
+     * <p>{@code segmentCountGeneration} is incremented before {@code notifyAll()}
+     * to give SpotBugs a visible state change inside the synchronized block
+     * (avoids the NN_NAKED_NOTIFY warning).
+     */
+    private void notifySegmentCountMonitor() {
+        synchronized (segmentCountMonitor) {
+            segmentCountGeneration++;
+            segmentCountMonitor.notifyAll();
+        }
+    }
+
     @Override
     public void close() throws Exception {
         running = false;
@@ -2048,6 +2192,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
             vct.join(10000);
             vectorIndexCompactionThread = null;
         }
+        // Unblock any addVector callers that are parked on segment-count
+        // back-pressure so they see running=false and exit cleanly.
+        notifySegmentCountMonitor();
 
         for (LiveGraphShard shard : liveShards) {
             if (shard.builder != null) {
@@ -2160,6 +2307,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         } else if (maxVectorMemoryBytes != Long.MAX_VALUE
                 && estimatedMemoryUsageBytes() > maxVectorMemoryBytes) {
             waitForMemoryPressureRelief();
+        }
+
+        // Segment-count back-pressure (issue #354): block when there are too
+        // many on-disk segments to prevent unbounded accumulation.
+        if (segments.size() > compactionBackpressureThreshold) {
+            waitForSegmentCountRelief();
         }
 
         // Phase 1 — structural checks: decide whether init or rotation is needed
@@ -5224,6 +5377,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public boolean isBackpressureActive() {
         return backpressureActive != 0;
+    }
+
+    /** Returns the total number of segment-count back-pressure events (issue #354). */
+    public long getSegmentCountBackpressureTotal() {
+        return segmentCountBackpressureTotal.get();
+    }
+
+    /** Returns the total wall-clock milliseconds spent in segment-count back-pressure (issue #354). */
+    public long getSegmentCountBackpressureTimeMs() {
+        return segmentCountBackpressureTimeMs.get();
+    }
+
+    /** Returns {@code true} while a caller is blocked in segment-count back-pressure (issue #354). */
+    public boolean isSegmentCountBackpressureActive() {
+        return segmentCountBackpressureActive != 0;
     }
 
     public long getMaxVectorMemoryBytes() {
