@@ -81,12 +81,16 @@ public class FileCommitLogTailerFloorTest {
     }
 
     /**
-     * Without a tailer floor ({@code START_OF_TIME}), deletion is governed solely by the
-     * checkpoint LSN — existing behavior. Ledgers below the checkpoint are deleted;
+     * Without a tailers floor ({@code null}), deletion is governed solely by the
+     * checkpoint LSN — baseline behavior. Ledgers below the checkpoint are deleted;
      * the last file is always retained.
+     *
+     * <p>Note: before issue #355 was fixed, {@code START_OF_TIME} was used here to
+     * mean "no constraint."  After the fix {@code null} is the "no external tailer"
+     * signal; {@code START_OF_TIME} now means "IS present but frozen — protect all."
      */
     @Test
-    public void startOfTimeFloorBehavesLikeBefore() throws Exception {
+    public void nullFloorBehavesLikeNoConstraint() throws Exception {
         Path base = folder.newFolder().toPath();
         LogSequenceNumber checkpoint;
         try (FileCommitLogManager manager = newManager(base)) {
@@ -101,7 +105,8 @@ public class FileCommitLogTailerFloorTest {
                 List<Long> before = listLogLedgers(tsFolder(base));
                 assertTrue("expected multiple ledgers to be created, got " + before,
                         before.size() >= 3);
-                log.dropOldLedgers(checkpoint, LogSequenceNumber.START_OF_TIME);
+                // null = no external tailer constraint (no vector index in this tablespace).
+                log.dropOldLedgers(checkpoint, null);
             }
             List<Long> after = listLogLedgers(tsFolder(base));
             for (long id : after) {

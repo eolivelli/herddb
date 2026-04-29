@@ -913,16 +913,29 @@ public class BookkeeperCommitLog extends CommitLog {
         // Time-based retention must never delete them. When no checkpoint has happened yet
         // (START_OF_TIME, ledgerId = -1) the floor is -1 and every active ledger is kept.
         long ledgerLimit = Math.min(lastCheckPointSequenceNumber.ledgerId, currentLedgerId);
-        // Honor an external tailers floor (e.g. remote indexing services): we must not
-        // delete ledgers any tailer still needs to read. START_OF_TIME (ledgerId = -1)
-        // means "no tailer constraint" and collapses to the pre-tailer behavior; any
-        // real floor pins retention at min(ledgerLimit, tailersFloor.ledgerId).
-        if (tailersFloor != null && tailersFloor.ledgerId >= 0
-                && tailersFloor.ledgerId < ledgerLimit) {
-            LOGGER.log(Level.INFO,
-                    "dropOldLedgers pinning retention at tailersFloor {0} (was {1}), tablespace {2}",
-                    new Object[]{tailersFloor, ledgerLimit, tableSpaceDescription()});
-            ledgerLimit = tailersFloor.ledgerId;
+        // Honor an external tailers floor (e.g. remote IndexingService via gRPC):
+        // we must not delete ledgers any tailer still needs to read.
+        //
+        // null                  → no external tailer; fall back to time-based retention.
+        // START_OF_TIME (-1,-1) → IS is present but frozen in Phase A compaction or
+        //                         temporarily unreachable.  The IS tailer position is
+        //                         unknown / at the very beginning of the log — protect
+        //                         every ledger until the IS recovers (issue #355).
+        // any other LSN         → pin retention at min(ledgerLimit, tailersFloor.ledgerId).
+        if (tailersFloor != null) {
+            if (LogSequenceNumber.START_OF_TIME.equals(tailersFloor)) {
+                LOGGER.log(Level.INFO,
+                        "dropOldLedgers: tailersFloor=START_OF_TIME (IS frozen/unreachable) "
+                        + "— keeping all ledgers, tablespace {0}",
+                        tableSpaceDescription());
+                return;
+            }
+            if (tailersFloor.ledgerId < ledgerLimit) {
+                LOGGER.log(Level.INFO,
+                        "dropOldLedgers pinning retention at tailersFloor {0} (was {1}), tablespace {2}",
+                        new Object[]{tailersFloor, ledgerLimit, tableSpaceDescription()});
+                ledgerLimit = tailersFloor.ledgerId;
+            }
         }
         LOGGER.log(Level.INFO,
                 "dropOldLedgers lastCheckPointSequenceNumber: {0}, tailersFloor: {1}, ledgersRetentionPeriod: {2}, ledgerLimit: {3}, lastLedgerId: {4}, currentLedgerId: {5}, tablespace {6}, actualLedgersList {7}",
