@@ -1390,8 +1390,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Installs (or replaces) the {@link SegmentPublisher} hook called after each
-     * successful checkpoint. Pass {@code null} to disable. May be called before
-     * or after {@link #start()}.
+     * successful checkpoint. Pass {@code null} to disable.
+     *
+     * <p><b>Concurrency contract (review item C1):</b> changes take effect on the
+     * NEXT checkpoint cycle, not the in-flight one. The checkpoint Phase B reads
+     * the publisher reference once into a local snapshot and uses that snapshot
+     * for both stage and commit — so a publisher swapped (or cleared) midway
+     * never sees a torn read where stage went through the old publisher and
+     * commit through the new one. Callers that need a guarantee about the
+     * publisher being attached for a specific checkpoint should call this method
+     * BEFORE issuing the {@code addVector} that will be observed by that
+     * checkpoint.
      */
     public void setSegmentPublisher(SegmentPublisher publisher) {
         this.segmentPublisher = publisher;

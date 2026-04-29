@@ -80,11 +80,19 @@ public final class IndexOptimizerEngine {
      * Optional: when non-null, the reaper invokes
      * {@link DataStorageManager#deleteMultipartIndexFile} for the graph + map +
      * current tombstone-overlay files of every reaped segment (review item A8).
-     * Pass {@code null} (or the unit-test {@link #IndexOptimizerEngine(SegmentRegistryClient, SegmentMerger, String, MergePolicy, long, IntSupplier)}
-     * convenience constructor) to skip physical-file deletion — useful when the
-     * test fakes the storage layer or doesn't care about file residue.
+     * Pass {@code null} to skip physical-file deletion — useful when the test fakes
+     * the storage layer or doesn't care about file residue.
      */
     private final DataStorageManager dataStorageManager;
+    /**
+     * Optional: when non-null, every {@link #runOnce()} invocation tries to acquire
+     * this lock first and skips the tick if it can't. Enforces the singleton
+     * invariant across rolling upgrades / k8s evictions where Helm's {@code replicas: 1}
+     * alone briefly allows two pods (review item C2). Pass {@code null} for tests
+     * that don't want lock contention.
+     */
+    private final OptimizerLeaderLock leaderLock;
+    private final AtomicLong ticksSkippedNotLeader = new AtomicLong();
 
     private final AtomicLong runs = new AtomicLong();
     private final AtomicLong segmentsMerged = new AtomicLong();
@@ -98,10 +106,11 @@ public final class IndexOptimizerEngine {
                                 long retentionMillis,
                                 IntSupplier ownerSelector) {
         this(registry, merger, tablespaceUuid, mergePolicy, retentionMillis,
-                ownerSelector, System::currentTimeMillis, /* dataStorageManager */ null);
+                ownerSelector, System::currentTimeMillis, /* dataStorageManager */ null,
+                /* leaderLock */ null);
     }
 
-    /** Test-friendly constructor accepting an injected clock and no DSM. */
+    /** Test-friendly constructor accepting an injected clock and no DSM / no lock. */
     public IndexOptimizerEngine(SegmentRegistryClient registry,
                                 SegmentMerger merger,
                                 String tablespaceUuid,
@@ -110,13 +119,12 @@ public final class IndexOptimizerEngine {
                                 IntSupplier ownerSelector,
                                 LongSupplier clock) {
         this(registry, merger, tablespaceUuid, mergePolicy, retentionMillis,
-                ownerSelector, clock, /* dataStorageManager */ null);
+                ownerSelector, clock, /* dataStorageManager */ null, /* leaderLock */ null);
     }
 
     /**
-     * Full constructor wiring a {@link DataStorageManager} so the reaper can
-     * physically delete graph/map/tombstone files when transitioning DEPRECATED →
-     * DELETED (review item A8).
+     * Variant that accepts a {@link DataStorageManager} but no leader lock — used by
+     * the reaper-file-deletion tests.
      */
     public IndexOptimizerEngine(SegmentRegistryClient registry,
                                 SegmentMerger merger,
@@ -126,6 +134,23 @@ public final class IndexOptimizerEngine {
                                 IntSupplier ownerSelector,
                                 LongSupplier clock,
                                 DataStorageManager dataStorageManager) {
+        this(registry, merger, tablespaceUuid, mergePolicy, retentionMillis,
+                ownerSelector, clock, dataStorageManager, /* leaderLock */ null);
+    }
+
+    /**
+     * Full constructor wiring a {@link DataStorageManager} (for A8 file deletion)
+     * and an {@link OptimizerLeaderLock} (for C2 singleton enforcement).
+     */
+    public IndexOptimizerEngine(SegmentRegistryClient registry,
+                                SegmentMerger merger,
+                                String tablespaceUuid,
+                                MergePolicy mergePolicy,
+                                long retentionMillis,
+                                IntSupplier ownerSelector,
+                                LongSupplier clock,
+                                DataStorageManager dataStorageManager,
+                                OptimizerLeaderLock leaderLock) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.merger = Objects.requireNonNull(merger, "merger");
         this.tablespaceUuid = Objects.requireNonNull(tablespaceUuid, "tablespaceUuid");
@@ -134,6 +159,7 @@ public final class IndexOptimizerEngine {
         this.ownerSelector = Objects.requireNonNull(ownerSelector, "ownerSelector");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.dataStorageManager = dataStorageManager;
+        this.leaderLock = leaderLock;
     }
 
     public long getRuns() {
@@ -152,8 +178,19 @@ public final class IndexOptimizerEngine {
         return segmentsDeleted.get();
     }
 
+    public long getTicksSkippedNotLeader() {
+        return ticksSkippedNotLeader.get();
+    }
+
     public void runOnce() throws Exception {
+        // Singleton enforcement (review item C2). When a lock is configured, only
+        // the leader runs work; everyone else short-circuits. The runs counter still
+        // ticks so observability sees liveness regardless of leadership.
         runs.incrementAndGet();
+        if (leaderLock != null && !leaderLock.tryAcquire()) {
+            ticksSkippedNotLeader.incrementAndGet();
+            return;
+        }
         long now = clock.getAsLong();
         List<String> indexes = registry.listIndexes(tablespaceUuid);
         for (String indexUuid : indexes) {

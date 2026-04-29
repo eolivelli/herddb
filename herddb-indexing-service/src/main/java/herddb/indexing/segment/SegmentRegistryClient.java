@@ -60,6 +60,16 @@ public final class SegmentRegistryClient {
      */
     public static final String REGISTRY_SUBPATH = "/index-segments";
 
+    /**
+     * Number of attempts for a ZK operation that fails with
+     * {@link KeeperException.ConnectionLossException} (review item D4).
+     * Bounded — each retry waits {@link #RETRY_BACKOFF_MS} so we never busy-loop.
+     * After exhausting all attempts the original exception bubbles up wrapped
+     * in a {@link SegmentRegistryException}.
+     */
+    static final int CONNECTION_LOSS_RETRIES = 5;
+    static final long RETRY_BACKOFF_MS = 200L;
+
     private final Supplier<ZooKeeper> zkSupplier;
     private final String registryRootPath;
 
@@ -131,10 +141,13 @@ public final class SegmentRegistryClient {
         ensureParentChain(segment.getTablespaceUuid(), segment.getIndexUuid());
         String path = segmentPath(segment.getTablespaceUuid(), segment.getIndexUuid(), segment.getSegmentUuid());
         try {
-            zk().create(path, segment.serialize(), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            withConnectionLossRetry("createSegment(" + segment.getSegmentUuid() + ")", () -> {
+                zk().create(path, segment.serialize(), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                return null;
+            });
         } catch (KeeperException.NodeExistsException e) {
             throw new SegmentRegistryException.SegmentAlreadyExists(segment.getSegmentUuid());
-        } catch (KeeperException | InterruptedException e) {
+        } catch (KeeperException | InterruptedException | java.io.IOException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
@@ -157,9 +170,12 @@ public final class SegmentRegistryClient {
             Watcher watcher) throws SegmentRegistryException {
         String path = segmentPath(tablespaceUuid, indexUuid, segmentUuid);
         try {
-            Stat stat = new Stat();
-            byte[] data = zk().getData(path, watcher, stat);
-            return Optional.of(new VersionedSegmentMetadata(SegmentMetadata.deserialize(data), stat.getVersion()));
+            return withConnectionLossRetry("getSegment(" + segmentUuid + ")", () -> {
+                Stat stat = new Stat();
+                byte[] data = zk().getData(path, watcher, stat);
+                return Optional.of(new VersionedSegmentMetadata(
+                        SegmentMetadata.deserialize(data), stat.getVersion()));
+            });
         } catch (KeeperException.NoNodeException e) {
             return Optional.empty();
         } catch (KeeperException | InterruptedException | IOException e) {
@@ -327,5 +343,44 @@ public final class SegmentRegistryClient {
             throw new IllegalStateException("ZooKeeper supplier returned null");
         }
         return zk;
+    }
+
+    /**
+     * Functional interface for a ZK operation that may throw KeeperException or
+     * InterruptedException — used by {@link #withConnectionLossRetry}.
+     */
+    @FunctionalInterface
+    interface ZkOperation<T> {
+        T run() throws KeeperException, InterruptedException, java.io.IOException;
+    }
+
+    /**
+     * Retries the supplied operation on transient {@link KeeperException.ConnectionLossException}
+     * (review item D4). Bounded by {@link #CONNECTION_LOSS_RETRIES} with a
+     * {@link #RETRY_BACKOFF_MS} sleep between attempts. Other ZK errors and the
+     * checked {@code KeeperException} subclasses propagate immediately so callers
+     * (e.g. CAS callers) can map them to typed
+     * {@link SegmentRegistryException} variants.
+     *
+     * <p>Hot-path note: the retry path adds at most {@code retries × backoff} of
+     * latency on a degraded ZK; on the happy path it has zero overhead beyond a
+     * direct lambda invocation.
+     */
+    private <T> T withConnectionLossRetry(String opName, ZkOperation<T> op)
+            throws KeeperException, InterruptedException, java.io.IOException {
+        KeeperException.ConnectionLossException lastFailure = null;
+        for (int attempt = 0; attempt < CONNECTION_LOSS_RETRIES; attempt++) {
+            try {
+                return op.run();
+            } catch (KeeperException.ConnectionLossException e) {
+                lastFailure = e;
+                java.util.logging.Logger.getLogger(SegmentRegistryClient.class.getName())
+                        .log(java.util.logging.Level.INFO,
+                                "ZK ConnectionLoss on {0} (attempt {1}/{2}); retrying",
+                                new Object[]{opName, attempt + 1, CONNECTION_LOSS_RETRIES});
+                Thread.sleep(RETRY_BACKOFF_MS);
+            }
+        }
+        throw lastFailure;
     }
 }

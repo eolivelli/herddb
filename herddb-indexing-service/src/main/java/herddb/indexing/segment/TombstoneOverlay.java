@@ -58,6 +58,17 @@ public final class TombstoneOverlay {
 
     public static final int WIRE_FORMAT_VERSION = 1;
 
+    /**
+     * Sanity bound on the {@code count} field of a deserialised overlay
+     * (review item D2). Anything larger almost certainly means a corrupted
+     * or malicious payload — a single segment bounded by the default 2 GiB
+     * {@code maxSegmentSize} can hold at most ~500M vectors. We pick 1<<28
+     * (~268M) as a forgiving ceiling: real workloads stay far below this and
+     * a malformed overlay won't be able to coerce the reader into allocating
+     * a multi-GB int array.
+     */
+    public static final int MAX_TOMBSTONED_ORDINALS = 1 << 28;
+
     private final String segmentUuid;
     private final LogSequenceNumber tombstoneLsn;
     private final long overlayGeneration;
@@ -151,8 +162,9 @@ public final class TombstoneOverlay {
             long lsnOffset = dis.readLong();
             long overlayGeneration = dis.readLong();
             int count = dis.readInt();
-            if (count < 0) {
-                throw new IOException("implausible tombstone count: " + count);
+            if (count < 0 || count > MAX_TOMBSTONED_ORDINALS) {
+                throw new IOException("implausible tombstone count: " + count
+                        + " (max=" + MAX_TOMBSTONED_ORDINALS + ")");
             }
             int[] ordinals = new int[count];
             for (int i = 0; i < count; i++) {

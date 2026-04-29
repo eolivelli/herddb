@@ -64,6 +64,7 @@ public final class IndexOptimizerMain {
     private ZooKeeper zooKeeper;
     private ScheduledExecutorService scheduler;
     private SegmentRegistryClient registry;
+    private OptimizerLeaderLock leaderLock;
     private IndexOptimizerEngine engine;
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
 
@@ -132,8 +133,12 @@ public final class IndexOptimizerMain {
                 OptimizerConfiguration.PROPERTY_MAX_BYTES_DEFAULT);
 
         MergePolicy policy = new MergePolicy.SmallestFirstPolicy(minCount, maxCount, minBytes, maxBytes);
+        this.leaderLock = new OptimizerLeaderLock(zkRef::get, basePath, tablespaceUuid);
         this.engine = new IndexOptimizerEngine(registry, merger, tablespaceUuid, policy, retentionMs,
-                () -> 0 /* MVP: assign new segments to instance 0 — see step 7 for owner-aware routing */);
+                () -> 0 /* MVP: assign new segments to instance 0 — see step 7 for owner-aware routing */,
+                System::currentTimeMillis,
+                /* dataStorageManager — wired by future production deployments */ null,
+                leaderLock);
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "index-optimizer-engine");
@@ -160,6 +165,17 @@ public final class IndexOptimizerMain {
     public synchronized void shutdown() {
         if (scheduler != null) {
             scheduler.shutdownNow();
+        }
+        // Release the leader lock BEFORE closing the ZK client so the ephemeral
+        // znode is gone immediately; otherwise a peer waiting on session-expiry
+        // would have to wait the full session timeout to take over.
+        if (leaderLock != null) {
+            try {
+                leaderLock.release();
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING, "leader lock release on shutdown failed: {0}",
+                        e.getMessage());
+            }
         }
         if (zooKeeper != null) {
             try {
