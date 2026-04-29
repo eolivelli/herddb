@@ -24,7 +24,7 @@
 #
 # Memory layout (heap + direct + ~1 GiB JVM overhead = container limit):
 #   server          :  22 g heap + 17 g direct + 1 g = 40 GiB
-#   fileServer      :   6 g heap +  8 g direct + 1 g = 15 g  (< 16 GiB)
+#   fileServer      :   6 g heap +  8 g direct + 1 g = 15 g  (< 16 GiB, 16 CPU)
 #   indexingService :  24 g heap + 10 g direct + 1 g = 35 g  (< 36 GiB)
 #   bookkeeper      :   2 g heap +  1 g direct + 1 g =  4 g  (< 8 GiB)
 #   zookeeper       : 512 m heap + 512 m direct       = ~1 g  (< 4 GiB)
@@ -138,8 +138,11 @@ fileServer:
   nodeSelector:
     topology.kubernetes.io/zone: "europe-west4-a"
   # 6 g heap + 8 g direct + ~1 g JVM overhead = 15 g (< 16 GiB container).
-  # The file server's hot path is disk-cache NIO I/O and gRPC streaming;
-  # generous direct memory is more valuable than heap here.
+  # The file server's working set is almost entirely off-heap: the
+  # InMemoryBlockCacheObjectStorage holds pooled direct ByteBufs (heap dump
+  # analysis confirmed <50 MB on-heap even under load). Heap is only needed for
+  # Caffeine metadata, gRPC/ZK client objects, and classpath overhead — 6 g is
+  # sufficient. The block cache budget auto-sizes to MaxDirectMemorySize/4 = 2 GiB.
   # -Dio.netty.maxDirectMemory=8589934592 (= MaxDirectMemorySize=8g in bytes):
   # Netty uses Unsafe.allocateMemory bypassing JVM Bits.reserveMemory (issue #253).
   javaOpts: "-Xms6g -Xmx6g -Djava.net.preferIPv4Stack=true -Dio.netty.maxDirectMemory=8589934592 -XX:MaxDirectMemorySize=8g"
@@ -172,10 +175,10 @@ fileServer:
   resources:
     requests:
       memory: "16Gi"
-      cpu: "8"
+      cpu: "16"
     limits:
       memory: "16Gi"
-      cpu: "8"
+      cpu: "16"
 
 minio:
   enabled: false

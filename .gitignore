@@ -42,6 +42,7 @@ vector-testings/datasets/
 # local-bench fallback workspace (when neither HERDDB_TESTS_HOME nor
 # HERDDB_SERVER_HOME is set, the local-bench scripts default to this dir).
 herddb-services/examples/local-bench/workspace/
+herddb-kubernetes/src/main/helm/herddb/examples/gke/workspace/
 
 # Mac
 **/.DS_Store
