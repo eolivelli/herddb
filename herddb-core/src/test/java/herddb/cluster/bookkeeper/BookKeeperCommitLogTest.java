@@ -658,7 +658,10 @@ public class BookKeeperCommitLogTest {
                 info.setLedgersTimestamps(backdated);
                 man.saveActualLedgersList(tableSpaceUUID, info);
 
-                writer.dropOldLedgers(checkpointLsn, LogSequenceNumber.START_OF_TIME);
+                // null = no external tailer constraint (tablespace has no vector index).
+                // After issue #355, START_OF_TIME means "IS present but frozen — protect all",
+                // so we must pass null here to exercise the time-based drop path.
+                writer.dropOldLedgers(checkpointLsn, null);
 
                 List<Long> remaining = writer.getActualLedgersList().getActiveLedgers();
                 for (Long id : below) {

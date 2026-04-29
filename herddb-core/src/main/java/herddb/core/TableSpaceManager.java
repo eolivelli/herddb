@@ -2979,11 +2979,25 @@ public class TableSpaceManager {
 
     /**
      * Computes the commit-log retention floor contributed by external tailers
-     * across every index in this tablespace. Returns {@link LogSequenceNumber#START_OF_TIME}
-     * when no index contributes a floor (meaning: no tailer constraint; the
-     * commit log falls back to its default retention behavior). Short-circuits
-     * to {@code START_OF_TIME} the moment any index reports it — a tailer we
-     * can't reach pins retention entirely.
+     * across every index in this tablespace.
+     *
+     * <p>Returns {@code null} when no index contributes a floor — meaning there is
+     * no external tailer constraint and the commit log can fall back to its default
+     * time-based retention behaviour.
+     *
+     * <p>Returns {@link LogSequenceNumber#START_OF_TIME} the moment any index
+     * reports it.  This signals that a remote IndexingService is present but its
+     * tailer is frozen (e.g. Phase A compaction) or temporarily unreachable via
+     * gRPC.  {@code START_OF_TIME} must be interpreted by
+     * {@link herddb.log.CommitLog#dropOldLedgers} as "protect all ledgers" — the IS
+     * needs to replay from the beginning once it recovers, and any ledger drop now
+     * would cause a permanent gap.
+     *
+     * <p>Fix for issue #355: previously this method returned {@code START_OF_TIME}
+     * for <em>both</em> cases (no indexes AND IS frozen), and
+     * {@code dropOldLedgers} treated {@code START_OF_TIME} as "no constraint"
+     * because {@code ledgerId == -1 &lt; 0}.  Returning {@code null} for the
+     * "no-indexes" case makes the two situations distinguishable.
      */
     private LogSequenceNumber computeTailersRetentionFloor() {
         LogSequenceNumber floor = null;
@@ -2994,13 +3008,15 @@ public class TableSpaceManager {
             }
             LogSequenceNumber lsn = contributed.get();
             if (LogSequenceNumber.START_OF_TIME.equals(lsn)) {
+                // IS is present but frozen or unreachable — protect all ledgers.
                 return LogSequenceNumber.START_OF_TIME;
             }
             if (floor == null || floor.after(lsn)) {
                 floor = lsn;
             }
         }
-        return floor != null ? floor : LogSequenceNumber.START_OF_TIME;
+        // null = no external tailer constraint (no vector indexes in this tablespace).
+        return floor;
     }
 
     private CompletableFuture<StatementExecutionResult> beginTransactionAsync(StatementEvaluationContext context, boolean releaseLock) throws StatementExecutionException {

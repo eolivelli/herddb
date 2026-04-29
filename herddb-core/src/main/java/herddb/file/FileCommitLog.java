@@ -746,13 +746,25 @@ public class FileCommitLog extends CommitLog {
 
             long ledgerLimit = Math.min(lastCheckPointSequenceNumber.ledgerId, currentLedgerId);
             // Tailer floor: don't delete files any external tailer still needs.
-            // START_OF_TIME (ledgerId = -1) means "no constraint".
-            if (tailersFloor != null && tailersFloor.ledgerId >= 0
-                    && tailersFloor.ledgerId < ledgerLimit) {
-                LOGGER.log(Level.INFO,
-                        "dropOldLedgers {0}: pinning retention at tailersFloor {1} (was {2})",
-                        new Object[]{tableSpaceName, tailersFloor, ledgerLimit});
-                ledgerLimit = tailersFloor.ledgerId;
+            //
+            // null                  → no external tailer; fall back to time-based retention.
+            // START_OF_TIME (-1,-1) → IS present but frozen (Phase A) or unreachable;
+            //                         protect all ledgers until the IS recovers (issue #355).
+            // any other LSN         → pin retention at min(ledgerLimit, tailersFloor.ledgerId).
+            if (tailersFloor != null) {
+                if (LogSequenceNumber.START_OF_TIME.equals(tailersFloor)) {
+                    LOGGER.log(Level.INFO,
+                            "dropOldLedgers {0}: tailersFloor=START_OF_TIME "
+                            + "(IS frozen/unreachable) — keeping all ledgers",
+                            tableSpaceName);
+                    return;
+                }
+                if (tailersFloor.ledgerId < ledgerLimit) {
+                    LOGGER.log(Level.INFO,
+                            "dropOldLedgers {0}: pinning retention at tailersFloor {1} (was {2})",
+                            new Object[]{tableSpaceName, tailersFloor, ledgerLimit});
+                    ledgerLimit = tailersFloor.ledgerId;
+                }
             }
 
             for (Path path : names) {
