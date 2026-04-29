@@ -229,6 +229,46 @@ public class ColumnTypes {
                                 && ColumnTypes.getNonNullTypeForPrimitiveType(newType) == oldType);
     }
 
+    /**
+     * Returns {@code true} when values of {@code type} encoded by
+     * {@link herddb.codec.RecordSerializer} sort in natural order under
+     * unsigned-lex byte comparison (i.e. {@code herddb.utils.Bytes.compareTo}).
+     *
+     * <p>This unlocks several index fast paths:
+     * <ul>
+     *   <li>{@code BLinkKeyToPageIndex#isSortedAscending} → ORDER BY
+     *       and range-scan pushdown to the primary-key index.</li>
+     *   <li>{@code TableSpaceManager#fastMinMaxPrimaryKeyNoTransaction}
+     *       and {@code fastMinMaxBrinNoTransaction} → use the index's
+     *       byte-extreme key directly instead of streaming + decoding.</li>
+     * </ul>
+     *
+     * <p>STRING and BYTEARRAY are sortable by construction (UTF-8 / raw
+     * bytes). INTEGER, LONG and TIMESTAMP are sortable because
+     * {@link herddb.utils.Bytes#putInt}/{@link herddb.utils.Bytes#putLong}
+     * apply a sign-bit flip so two's-complement order matches unsigned-lex.
+     * DOUBLE and FLOAT are <strong>not</strong> sortable: IEEE-754 bit
+     * patterns require a separate transformation and the encoder keeps the
+     * raw bit pattern for round-trip fidelity.
+     */
+    public static boolean isByteSortable(int type) {
+        switch (type) {
+            case STRING:
+            case NOTNULL_STRING:
+            case BYTEARRAY:
+            case NOTNULL_BYTEARRAY:
+            case INTEGER:
+            case NOTNULL_INTEGER:
+            case LONG:
+            case NOTNULL_LONG:
+            case TIMESTAMP:
+            case NOTNULL_TIMESTAMP:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     public static boolean isNullToNotNullConversion(int oldType, int newType) {
         return (ColumnTypes.isNotNullDataType(newType)
                                 && !ColumnTypes.isNotNullDataType(oldType)

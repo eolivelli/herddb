@@ -229,17 +229,10 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
 
     @Override
     public boolean isSortedAscending(int[] pkTypes) {
-        if (pkTypes.length != 1) {
-            return false;
-        }
-        switch (pkTypes[0]) {
-            case ColumnTypes.NOTNULL_STRING:
-            case ColumnTypes.STRING:
-            case ColumnTypes.BYTEARRAY:
-                return true;
-            default:
-                return false;
-        }
+        // Composite PKs are byte-sortable when every component is, but the
+        // planner currently only consumes single-column ascending PKs, so
+        // we keep the simple guard here.
+        return pkTypes.length == 1 && ColumnTypes.isByteSortable(pkTypes[0]);
     }
 
     @Override

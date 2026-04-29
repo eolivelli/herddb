@@ -42,7 +42,11 @@ public class XXHash64Utils {
 
     public static byte[] digest(byte[] array, int offset, int len) {
         long hash = HASHER.hash(array, offset, len, DEFAULT_SEED);
-        byte[] digest = Bytes.longToByteArray(hash);
+        // hashes are bit patterns, not signed integers: store raw big-endian
+        // so the on-disk format matches canonical XXHash64 and pairs with
+        // DataOutputStream.writeLong on the writer side.
+        byte[] digest = new byte[HASH_LEN];
+        Bytes.putRawLong(digest, 0, hash);
         return digest;
     }
 
@@ -53,7 +57,7 @@ public class XXHash64Utils {
     public static boolean verifyBlockWithFooter(byte[] array, int offset, int len) {
         byte[] expectedFooter = Arrays.copyOfRange(array, len - HASH_LEN, len);
         long expectedHash = HASHER.hash(array, offset, len - HASH_LEN, DEFAULT_SEED);
-        long hash = Bytes.toLong(expectedFooter, 0);
+        long hash = Bytes.toRawLong(expectedFooter, 0);
         return hash == expectedHash;
     }
 

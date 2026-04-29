@@ -59,27 +59,29 @@ import org.junit.runners.Parameterized;
 /**
  * Exercises the {@code SELECT MIN(pk) FROM t} / {@code SELECT MAX(pk) FROM t}
  * fast-path introduced for issue #307. The fast-path bypasses the row-by-row
- * scan and reads the value directly from the primary-key index in autocommit:
- * O(log n) for byte-sortable PK types (STRING / BYTEARRAY) and O(n_keys)
- * with zero data-page reads for numeric PK types.
+ * scan and reads the value directly from the primary-key index in autocommit.
+ *
+ * <p>After the order-preserving int/long/timestamp encoding (PR #343)
+ * INTEGER, LONG and TIMESTAMP PKs are byte-sortable too, so the
+ * {@code getMin/MaxKey()} O(log n) path now applies for them as well as
+ * for STRING / BYTEARRAY. The decode-stream fallback (still in
+ * {@code TableSpaceManager.decodeExtremeFromKeyStream}) is reserved for
+ * the remaining non-byte-sortable types (DOUBLE / FLOAT IEEE-754).
  *
  * <p>The instrumentation hooks count two distinct events on the primary-key
  * index:
  * <ul>
- *   <li>{@code scanner()} calls — the entry point used by both the slow
- *       scan path and the numeric-PK fast-path "iterate keys" loop;</li>
+ *   <li>{@code scanner()} calls — the entry point used by the slow
+ *       row-scan path and by the decode-stream fallback;</li>
  *   <li>{@code getMinKey()} / {@code getMaxKey()} calls — the entry point
  *       used only by the byte-sortable fast-path.</li>
  * </ul>
  *
- * <p>For the byte-sortable case (STRING PK) we assert
- * {@code scannerCalls == 0}, proving the slow scan was bypassed entirely.
- * For the numeric case (INTEGER PK) we cannot use a scanner counter to
- * prove the fast-path was taken (both the fast and slow path call
- * {@code scanner()}); instead we use a mixed-sign INTEGER dataset where
- * the byte-extreme answer differs from the natural-extreme answer — a
- * correct result is therefore the smoking gun for the decode-and-compare
- * fast-path.</p>
+ * <p>The mixed-sign INTEGER PK test is the strict correctness check: it
+ * uses a dataset where the old byte-wise extreme differed from the
+ * natural extreme (negatives have the high bit set in raw two's
+ * complement). After the encoding fix the byte-extreme path produces the
+ * same answer as a decode-and-compare scan would.</p>
  *
  * <p>The test is parameterised over the two SQL planners.</p>
  */
