@@ -26,13 +26,18 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -220,6 +225,93 @@ public class RemoteFileServiceClientDynamicTest {
 
             // The list should eventually succeed
             listFuture.get(30, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Reproducer for issue #342: when a file-server pod crashes during Phase C
+     * checkpoint, in-flight gRPC write calls to that server must fail promptly
+     * after {@link RemoteFileServiceClient#updateServers} removes it — not hang
+     * for up to {@code clientTimeoutSeconds} (default 30 min).
+     *
+     * <p>Uses a TCP "black-hole" server (accepts connections, never sends data)
+     * so the gRPC HTTP/2 handshake never completes and the write future stays
+     * pending indefinitely. After {@code updateServers} removes the black-hole
+     * address, {@code shutdownNow()} must cancel the in-flight call within a
+     * short window.
+     */
+    @Test
+    public void testRemovedServerWritesCancelledPromptly() throws Exception {
+        // Open a "black-hole" TCP server: accepts connections but never sends
+        // any bytes, so the gRPC HTTP/2 handshake never completes and any
+        // pending RPC hangs until the channel is forcibly shut down.
+        try (ServerSocket blackHole = new ServerSocket(0)) {
+            final String blackHoleAddr = "localhost:" + blackHole.getLocalPort();
+            final String addr1 = "localhost:" + server1.getPort();
+
+            // Accept connections silently in the background.
+            Thread acceptor = new Thread(() -> {
+                while (!blackHole.isClosed()) {
+                    try {
+                        Socket s = blackHole.accept();
+                        // Keep the socket open but do not write anything —
+                        // this simulates a server that is TCP-reachable but
+                        // application-layer unresponsive (e.g. OOM-killed process
+                        // where the OS still has the port bound briefly).
+                        s.setSoTimeout(0);
+                    } catch (IOException e) {
+                        break; // socket closed; exit
+                    }
+                }
+            }, "black-hole-acceptor");
+            acceptor.setDaemon(true);
+            acceptor.start();
+
+            try (RemoteFileServiceClient client = new RemoteFileServiceClient(
+                    Arrays.asList(addr1, blackHoleAddr))) {
+
+                // Find a path that the consistent-hash ring routes to the black-hole.
+                String pathToBlackHole = null;
+                for (int i = 0; i < 500; i++) {
+                    String candidate = "issue342/probe" + i + ".dat";
+                    if (blackHoleAddr.equals(client.getServerForPath(candidate))) {
+                        pathToBlackHole = candidate;
+                        break;
+                    }
+                }
+                assertNotNull("Could not find a path routing to the black-hole server", pathToBlackHole);
+
+                // Start an async write to the black-hole — this will be pending
+                // forever because the channel can never become READY.
+                CompletableFuture<Long> writeFuture = client.writeFileAsync(
+                        pathToBlackHole, "checkpoint-page-data".getBytes());
+
+                // Give the gRPC machinery a moment to attempt the connection.
+                Thread.sleep(300);
+                assertFalse("Write to black-hole should not have completed yet",
+                        writeFuture.isDone());
+
+                // Remove the black-hole from the server list (mirrors what ZK
+                // does when a pod deregisters). shutdownNow() must cancel the
+                // in-flight call so the future completes exceptionally, quickly.
+                long t0 = System.currentTimeMillis();
+                client.updateServers(Collections.singletonList(addr1));
+
+                // The write must fail within a short window — NOT after 30 min.
+                try {
+                    writeFuture.get(5, TimeUnit.SECONDS);
+                    fail("Expected write to black-hole to fail after updateServers removed it");
+                } catch (ExecutionException e) {
+                    // Expected: the gRPC channel was shut down by shutdownNow().
+                } catch (TimeoutException e) {
+                    fail("Write to removed server did not fail within 5 s; "
+                            + "shutdownNow() may not have cancelled the in-flight call");
+                }
+
+                long elapsed = System.currentTimeMillis() - t0;
+                assertTrue("Write should fail promptly after server removal (got " + elapsed + " ms)",
+                        elapsed < 5_000);
+            }
         }
     }
 

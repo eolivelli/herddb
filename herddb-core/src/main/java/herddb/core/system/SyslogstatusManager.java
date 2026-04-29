@@ -56,6 +56,7 @@ public class SyslogstatusManager extends AbstractSystemTableManager {
             .column("checkpoint_offset", ColumnTypes.LONG)
             .column("checkpoint_timestamp", ColumnTypes.TIMESTAMP)
             .column("checkpoint_duration_ms", ColumnTypes.LONG)
+            .column("checkpoint_start_ts", ColumnTypes.TIMESTAMP)
             .column("dirty_ledgers_count", ColumnTypes.INTEGER)
             .primaryKey("tablespace_uuid", false)
             .primaryKey("nodeid", false)
@@ -73,6 +74,7 @@ public class SyslogstatusManager extends AbstractSystemTableManager {
         LogSequenceNumber checkpointLsn = isVirtual ? null : tableSpaceManager.getLastCheckpointSequenceNumber();
         long checkpointTimestamp = isVirtual ? 0L : tableSpaceManager.getLastCheckpointTimestamp();
         long checkpointDurationMs = isVirtual ? 0L : tableSpaceManager.getLastCheckpointDurationMs();
+        long checkpointStartTs = isVirtual ? 0L : tableSpaceManager.getLastCheckpointStartTs();
 
         Long ledger = isVirtual ? 0L : logSequenceNumber.ledgerId;
         Long offset = isVirtual ? 0L : logSequenceNumber.offset;
@@ -80,6 +82,7 @@ public class SyslogstatusManager extends AbstractSystemTableManager {
         Long cpOffset = checkpointLsn != null ? checkpointLsn.offset : null;
         Timestamp cpTs = checkpointTimestamp > 0 ? new Timestamp(checkpointTimestamp) : null;
         Long cpDuration = checkpointTimestamp > 0 ? checkpointDurationMs : null;
+        Timestamp cpStartTs = checkpointStartTs > 0 ? new Timestamp(checkpointStartTs) : null;
         Integer dirtyLedgers = (!isVirtual && checkpointLsn != null)
                 ? (int) Math.max(0L, logSequenceNumber.ledgerId - checkpointLsn.ledgerId)
                 : null;
@@ -97,6 +100,7 @@ public class SyslogstatusManager extends AbstractSystemTableManager {
                 "checkpoint_offset", cpOffset,
                 "checkpoint_timestamp", cpTs,
                 "checkpoint_duration_ms", cpDuration,
+                "checkpoint_start_ts", cpStartTs,
                 "dirty_ledgers_count", dirtyLedgers
         ));
         return result;

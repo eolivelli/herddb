@@ -215,6 +215,14 @@ public class TableSpaceManager {
      * Duration in milliseconds of the last completed checkpoint; {@code 0} until the first one.
      */
     private volatile long lastCheckpointDurationMs;
+    /**
+     * Wall-clock timestamp (epoch millis) at which the last checkpoint acquired
+     * {@link #checkpointMutex} (i.e. when Phase A started). Used by
+     * {@link #processAbandonedTransactions} to avoid abandoning transactions that
+     * were merely blocked by a long Phase C (e.g. writing PK-index pages to a
+     * remote file-server that was restarting). {@code 0} until the first checkpoint runs.
+     */
+    private volatile long lastCheckpointStartTs;
 
     // only for tests
     private Runnable afterTableCheckPointAction;
@@ -1315,6 +1323,27 @@ public class TableSpaceManager {
             return;
         }
         long abandonedTransactionTimeout = now - timeout;
+
+        // A long checkpoint (e.g. Phase C writing PK-index pages to a remote
+        // file-server that is restarting) blocks the activator thread and prevents
+        // clients from receiving server responses. Their implicit transactions appear
+        // idle even though the clients are still connected and waiting.
+        //
+        // Guard: if a checkpoint finished recently (within the last 'timeout' ms),
+        // shift the effective cutoff back to (checkpointStart - timeout). This way a
+        // transaction is only declared abandoned if it was idle BEFORE the checkpoint
+        // started AND for longer than the configured timeout. The protection expires
+        // automatically once 'timeout' ms have elapsed after the checkpoint ended,
+        // reverting to the normal abandonment window.
+        long cpEndTs = this.lastCheckpointTimestamp;
+        long cpStartTs = this.lastCheckpointStartTs;
+        if (cpEndTs > 0 && cpStartTs > 0 && (now - cpEndTs) < timeout) {
+            long cpAwareCutoff = cpStartTs - timeout;
+            if (cpAwareCutoff < abandonedTransactionTimeout) {
+                abandonedTransactionTimeout = cpAwareCutoff;
+            }
+        }
+
         for (Transaction t : transactions.values()) {
             if (t.isAbandoned(abandonedTransactionTimeout)) {
                 LOGGER.log(Level.SEVERE, "forcing rollback of abandoned transaction {0},"
@@ -2769,6 +2798,7 @@ public class TableSpaceManager {
                     LOGGER.log(Level.INFO, "Checkpoint for tablespace {0} skipped. Another checkpoint is already running", tableSpaceName);
                     return null;
                 }
+                lastCheckpointStartTs = System.currentTimeMillis();
                 try {
                     List<AbstractTableManager> tablesToCheckpoint;
 
@@ -3279,6 +3309,33 @@ public class TableSpaceManager {
      */
     public long getLastCheckpointDurationMs() {
         return lastCheckpointDurationMs;
+    }
+
+    /**
+     * Wall-clock timestamp (epoch millis) at which the most-recent checkpoint acquired the
+     * checkpoint mutex (start of Phase A), or {@code 0} if no checkpoint has started yet.
+     * Exposed for tests that exercise {@link #processAbandonedTransactions()}.
+     */
+    public long getLastCheckpointStartTs() {
+        return lastCheckpointStartTs;
+    }
+
+    /**
+     * For testing only: directly set {@link #lastCheckpointStartTs} so unit tests can
+     * simulate a checkpoint having started at an arbitrary wall-clock time without
+     * running a full checkpoint cycle.
+     */
+    void setLastCheckpointStartTs(long ts) {
+        this.lastCheckpointStartTs = ts;
+    }
+
+    /**
+     * For testing only: directly set {@link #lastCheckpointTimestamp} (the checkpoint
+     * completion time) so unit tests can simulate a checkpoint having finished at an
+     * arbitrary wall-clock time without running a full checkpoint cycle.
+     */
+    void setLastCheckpointTimestamp(long ts) {
+        this.lastCheckpointTimestamp = ts;
     }
 
     public ExecutorService getCallbacksExecutor() {
