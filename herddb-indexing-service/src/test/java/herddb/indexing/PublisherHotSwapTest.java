@@ -164,11 +164,12 @@ public class PublisherHotSwapTest {
 
     @Test
     public void midPhaseBSwapDoesNotProduceTornStageCommit() throws Exception {
-        // Review-item R3 from second pr-reviewer pass: install a phaseBHookForTesting
-        // that swaps the publisher reference between stage and commit. The captured
-        // snapshot (a local in doCheckpointFusedPQPhaseB) is what handles BOTH stage
-        // and commit, so the original publisher must see exactly one stage AND one
-        // commit; the swapped-in publisher must see neither.
+        // Review-item R3 from second pr-reviewer pass: install a
+        // betweenStageAndCommitHookForTests hook (renamed in pass-3 P3-4) that
+        // swaps the publisher reference between stage and commit. The captured
+        // snapshot (a local in doCheckpointFusedPQPhaseB) is what handles BOTH
+        // stage and commit, so the original publisher must see exactly one stage
+        // AND one commit; the swapped-in publisher must see neither.
         Path baseDir = tmpFolder.newFolder("data").toPath();
         Path tmpDir = tmpFolder.newFolder("tmp").toPath();
         FileDataStorageManager dsm = new FileDataStorageManager(baseDir);

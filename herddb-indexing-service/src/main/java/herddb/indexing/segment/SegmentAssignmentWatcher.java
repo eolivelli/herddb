@@ -87,15 +87,31 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
                                     int instanceId,
                                     SegmentAssignmentListener listener,
                                     long refreshIntervalMs) {
+        this(registry, instanceId, listener, refreshIntervalMs,
+                Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "segment-assignment-watcher-" + instanceId);
+                    t.setDaemon(true);
+                    return t;
+                }));
+    }
+
+    /**
+     * Package-private constructor that accepts a pre-built {@link ScheduledExecutorService}.
+     * Used by tests (review-pass-3 P4-1) to inject a pre-shut-down executor and exercise
+     * the {@code RejectedExecutionException} catch in {@link #dispatchScan} without
+     * having to {@link #close()} the watcher first (close() flips {@code closed=true},
+     * which short-circuits {@code dispatchScan} BEFORE the catch can fire).
+     */
+    SegmentAssignmentWatcher(SegmentRegistryClient registry,
+                             int instanceId,
+                             SegmentAssignmentListener listener,
+                             long refreshIntervalMs,
+                             ScheduledExecutorService dispatchExecutor) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.instanceId = instanceId;
         this.listener = Objects.requireNonNull(listener, "listener");
         this.refreshIntervalMs = refreshIntervalMs;
-        this.dispatchExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "segment-assignment-watcher-" + instanceId);
-            t.setDaemon(true);
-            return t;
-        });
+        this.dispatchExecutor = Objects.requireNonNull(dispatchExecutor, "dispatchExecutor");
     }
 
     /**
@@ -168,8 +184,7 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
         }
     }
 
-    /** Package-visible for the close-race test (review-item B5). */
-    void dispatchScan(IndexKey key) {
+    private void dispatchScan(IndexKey key) {
         if (closed) {
             return;
         }
