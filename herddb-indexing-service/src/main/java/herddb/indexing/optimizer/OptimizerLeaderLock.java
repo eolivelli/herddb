@@ -149,14 +149,20 @@ public final class OptimizerLeaderLock implements AutoCloseable {
                     new Object[]{lockPath, holderId});
             return true;
         } catch (KeeperException.NodeExistsException heldByOther) {
-            // Inspect the current holder for visibility.
+            // Inspect the current holder for visibility. Best-effort: a failure here
+            // doesn't change our return value (we definitely don't hold the lock).
+            // Narrow catch by type — broad catch was flagged by SpotBugs DE_MIGHT_IGNORE.
             try {
                 String currentHolder = readHolderId(zk(), lockPath);
                 LOGGER.log(Level.FINE,
                         "optimizer leader lock held by {0}; we ({1}) will retry on next tick",
                         new Object[]{currentHolder, holderId});
-            } catch (Exception ignored) {
-                // not fatal
+            } catch (KeeperException | InterruptedException | IOException ignored) {
+                if (ignored instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                LOGGER.log(Level.FINE, "could not read current lock holder: {0}",
+                        ignored.getMessage());
             }
             return false;
         } catch (KeeperException | InterruptedException e) {

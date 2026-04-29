@@ -300,6 +300,9 @@ indexOptimizer:
   # optimizer is single-tablespace for the MVP; multi-tablespace support is
   # left for a future revision.
   tablespaceUuid: ""
+  # HTTP admin endpoint port — exposes /health (probe target) and /metrics
+  # (Prometheus scrape). Set to 0 to disable.
+  httpPort: 9853
   intervalMs: 300000
   minCount: 4
   maxCount: 200

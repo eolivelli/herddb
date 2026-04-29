@@ -66,6 +66,7 @@ public final class IndexOptimizerMain {
     private SegmentRegistryClient registry;
     private OptimizerLeaderLock leaderLock;
     private IndexOptimizerEngine engine;
+    private OptimizerHttpServer httpServer;
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
 
     public IndexOptimizerMain(OptimizerConfiguration configuration, SegmentMerger merger) {
@@ -113,6 +114,28 @@ public final class IndexOptimizerMain {
         this.registry = new SegmentRegistryClient(zkRef::get, basePath);
         registry.ensureRoot();
 
+        // Validate the configured tablespace UUID is present in the cluster's
+        // metadata (review item E4). Without this, a typo'd UUID makes the
+        // optimizer idle forever logging empty registry scans. The tablespace
+        // znode in cluster mode lives under {basePath}/replicas/{tablespaceUuid}
+        // — probe its existence and log a clear WARNING if missing.
+        try {
+            String tablespaceReplicaPath = basePath + "/replicas/" + tablespaceUuid;
+            org.apache.zookeeper.data.Stat st = zk.exists(tablespaceReplicaPath, false);
+            if (st == null) {
+                LOGGER.log(Level.WARNING,
+                        "tablespace {0} not found at {1} — optimizer will scan an empty registry"
+                                + " until the tablespace is created.",
+                        new Object[]{tablespaceUuid, tablespaceReplicaPath});
+            }
+        } catch (org.apache.zookeeper.KeeperException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            LOGGER.log(Level.WARNING, "tablespace existence check failed (will continue): {0}",
+                    e.getMessage());
+        }
+
         long intervalMs = configuration.getLong(
                 OptimizerConfiguration.PROPERTY_INTERVAL_MS,
                 OptimizerConfiguration.PROPERTY_INTERVAL_MS_DEFAULT);
@@ -147,22 +170,44 @@ public final class IndexOptimizerMain {
         });
         scheduler.scheduleAtFixedRate(this::tickSafe, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
 
+        // Admin HTTP endpoint (review item E1+E3). Disabled when port == 0; otherwise
+        // exposes /health (Helm probe target) and /metrics (Prometheus scrape).
+        int httpPort = configuration.getInt(
+                OptimizerConfiguration.PROPERTY_HTTP_PORT,
+                OptimizerConfiguration.PROPERTY_HTTP_PORT_DEFAULT);
+        if (httpPort > 0) {
+            String httpHost = configuration.getString(
+                    OptimizerConfiguration.PROPERTY_HTTP_HOST,
+                    OptimizerConfiguration.PROPERTY_HTTP_HOST_DEFAULT);
+            this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine);
+            this.httpServer.start();
+        }
+
         LOGGER.log(Level.INFO,
-                "index-optimizer started: zk={0}, basePath={1}, tablespace={2}, intervalMs={3}",
-                new Object[]{zkAddress, basePath, tablespaceUuid, intervalMs});
+                "index-optimizer started: zk={0}, basePath={1}, tablespace={2}, intervalMs={3}, httpPort={4}",
+                new Object[]{zkAddress, basePath, tablespaceUuid, intervalMs, httpPort});
     }
 
     private void tickSafe() {
         try {
             engine.runOnce();
-        } catch (Exception e) {
-            // Broad catch is intentional: a misbehaving merger or transient ZK error must
-            // never kill the scheduler. Logged at WARNING; the next tick will retry.
+        } catch (herddb.indexing.segment.SegmentRegistryException | RuntimeException e) {
+            // Narrow catch (review item H1): the engine's runOnce now declares a typed
+            // SegmentRegistryException; merger / scheduler failures still surface as
+            // RuntimeException. Either way we log and let the next tick retry — a
+            // misbehaving merger or transient ZK error must never kill the scheduler.
             LOGGER.log(Level.WARNING, "optimizer tick failed", e);
         }
     }
 
     public synchronized void shutdown() {
+        if (httpServer != null) {
+            try {
+                httpServer.close();
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING, "http server close failed: {0}", e.getMessage());
+            }
+        }
         if (scheduler != null) {
             scheduler.shutdownNow();
         }

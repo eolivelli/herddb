@@ -84,6 +84,26 @@ spec:
               value: {{ .Values.indexOptimizer.javaOptsExtra | quote }}
             {{- end }}
           {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.indexOptimizer.httpPort | default 9853 }}
+              protocol: TCP
+          # Liveness + readiness probes against the JDK HttpServer admin endpoint
+          # (review item E1+E3). The endpoint is single-threaded but only handles
+          # /health and /metrics so it stays responsive even under heavy ZK load.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.indexOptimizer.httpPort | default 9853 }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.indexOptimizer.httpPort | default 9853 }}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
           resources:
             {{- toYaml .Values.indexOptimizer.resources | nindent 12 }}
           volumeMounts:

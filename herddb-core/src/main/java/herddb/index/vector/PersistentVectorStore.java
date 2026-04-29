@@ -1447,6 +1447,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * Installs (or replaces) the {@link SegmentPublisher} hook called after each
      * successful checkpoint. Pass {@code null} to disable.
      *
+     * <p><b>Per-index opt-in (review item G3):</b> the publisher reference is per
+     * {@link PersistentVectorStore} instance and therefore per-index. An IS that
+     * hosts both legacy v1 indexes and new v2 indexes simply attaches the
+     * publisher to the v2 stores only — the v1 stores retain their classic
+     * behavior. This means cluster-wide flags like {@code indexing.optimizer.enabled}
+     * are merely defaults that callers can override per index when constructing
+     * the store.
+     *
      * <p><b>Concurrency contract (review item C1):</b> changes take effect on the
      * NEXT checkpoint cycle, not the in-flight one. The checkpoint Phase B reads
      * the publisher reference once into a local snapshot and uses that snapshot
@@ -4806,16 +4814,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // legacy clusters that never opted into the optimizer.
         boolean anyUuid = false;
         for (VectorSegment seg : sealedSegments) {
-            if (seg.segmentUuid != null) { anyUuid = true; break; }
+            if (seg.segmentUuid != null) {
+                anyUuid = true;
+                break;
+            }
         }
         if (!anyUuid) {
             for (VectorSegment seg : mergeableSegments) {
-                if (seg.segmentUuid != null) { anyUuid = true; break; }
+                if (seg.segmentUuid != null) {
+                    anyUuid = true;
+                    break;
+                }
             }
         }
         if (!anyUuid) {
             for (SegmentWriteResult swr : newSegmentResults) {
-                if (swr.segmentUuid != null) { anyUuid = true; break; }
+                if (swr.segmentUuid != null) {
+                    anyUuid = true;
+                    break;
+                }
             }
         }
         final int formatVersion = anyUuid

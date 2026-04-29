@@ -26,7 +26,6 @@ import herddb.file.FileDataStorageManager;
 import herddb.indexing.segment.SegmentMetadata;
 import herddb.indexing.segment.SegmentRegistryClient;
 import herddb.indexing.segment.SegmentState;
-import herddb.indexing.segment.VersionedSegmentMetadata;
 import herddb.log.LogSequenceNumber;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;

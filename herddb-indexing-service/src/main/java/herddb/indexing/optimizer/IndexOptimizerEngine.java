@@ -182,7 +182,13 @@ public final class IndexOptimizerEngine {
         return ticksSkippedNotLeader.get();
     }
 
-    public void runOnce() throws Exception {
+    /**
+     * Runs one optimizer tick. Throws {@link SegmentRegistryException} only on
+     * top-level registry failures (e.g. ZK session expiry while listing indexes);
+     * per-index failures are caught internally and logged, so a single bad index
+     * does not stop the tick (review item H1: narrow exception types).
+     */
+    public void runOnce() throws SegmentRegistryException {
         // Singleton enforcement (review item C2). When a lock is configured, only
         // the leader runs work; everyone else short-circuits. The runs counter still
         // ticks so observability sees liveness regardless of leadership.
@@ -196,16 +202,17 @@ public final class IndexOptimizerEngine {
         for (String indexUuid : indexes) {
             try {
                 runForIndex(indexUuid, now);
-            } catch (Exception e) {
+            } catch (RuntimeException | SegmentRegistryException e) {
                 LOGGER.log(Level.WARNING, "optimizer tick failed for index " + indexUuid, e);
                 // Continue with the next index — a single index failure must not stop the
-                // whole tick. Broad catch here is intentional: the engine is the supervision
-                // boundary for per-index work.
+                // whole tick. We catch RuntimeException + SegmentRegistryException because
+                // the merger is a plugin boundary that may throw arbitrary runtime
+                // exceptions; SegmentRegistryException covers our own typed failures.
             }
         }
     }
 
-    private void runForIndex(String indexUuid, long now) throws Exception {
+    private void runForIndex(String indexUuid, long now) throws SegmentRegistryException {
         List<VersionedSegmentMetadata> all = registry.listSegments(tablespaceUuid, indexUuid);
         List<VersionedSegmentMetadata> active = new ArrayList<>();
         List<VersionedSegmentMetadata> deprecated = new ArrayList<>();

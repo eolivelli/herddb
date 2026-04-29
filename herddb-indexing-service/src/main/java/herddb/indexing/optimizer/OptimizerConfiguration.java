@@ -80,6 +80,14 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_RETENTION_MS = "indexoptimizer.retention.ms";
     public static final long PROPERTY_RETENTION_MS_DEFAULT = 10L * 60_000L;
 
+    /** HTTP admin endpoint port (review item E1 + E3). 0 disables. */
+    public static final String PROPERTY_HTTP_PORT = "indexoptimizer.http.port";
+    public static final int PROPERTY_HTTP_PORT_DEFAULT = 9853;
+
+    /** HTTP admin endpoint bind host. */
+    public static final String PROPERTY_HTTP_HOST = "indexoptimizer.http.host";
+    public static final String PROPERTY_HTTP_HOST_DEFAULT = "0.0.0.0";
+
     private final Properties properties;
 
     public OptimizerConfiguration(Properties properties) {
