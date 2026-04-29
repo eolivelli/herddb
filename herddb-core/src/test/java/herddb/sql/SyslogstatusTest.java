@@ -80,6 +80,8 @@ public class SyslogstatusTest {
                         row.get("checkpoint_timestamp"));
                 assertNull("checkpoint_duration_ms must be null before any checkpoint",
                         row.get("checkpoint_duration_ms"));
+                assertNull("checkpoint_start_ts must be null before any checkpoint",
+                        row.get("checkpoint_start_ts"));
                 assertNull("dirty_ledgers_count must be null before any checkpoint",
                         row.get("dirty_ledgers_count"));
             }
@@ -151,6 +153,15 @@ public class SyslogstatusTest {
                         cpTsMs >= beforeCheckpointMs);
                 assertTrue("checkpoint_timestamp must not be in the future",
                         cpTsMs <= System.currentTimeMillis() + 1000);
+
+                // checkpoint_start_ts: set when checkpointMutex is acquired (Phase A start)
+                Object cpStartTs = row.get("checkpoint_start_ts");
+                assertNotNull("checkpoint_start_ts should be populated after checkpoint", cpStartTs);
+                long cpStartTsMs = ((java.sql.Timestamp) cpStartTs).getTime();
+                assertTrue("checkpoint_start_ts must be >= before-checkpoint time",
+                        cpStartTsMs >= beforeCheckpointMs);
+                assertTrue("checkpoint_start_ts must be <= checkpoint_timestamp (start before or equal to end)",
+                        cpStartTsMs <= cpTsMs + 1);
 
                 int dirtyLedgersVal = ((Number) dirtyLedgers).intValue();
                 assertTrue("dirty_ledgers_count must be >= 0", dirtyLedgersVal >= 0);
