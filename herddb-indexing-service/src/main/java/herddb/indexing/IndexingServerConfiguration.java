@@ -207,6 +207,30 @@ public final class IndexingServerConfiguration {
     public static final long PROPERTY_VECTOR_INDEX_COMPACTION_RETENTION_MS_DEFAULT =
             10L * 60_000L; // 10 min
 
+    /**
+     * Enables tiered compaction scaling (issue #354). When {@code true}
+     * (the default), the per-cycle byte cap and segment-count cap are
+     * multiplied by a tier-dependent factor (2×/4×/8×) when the total
+     * on-disk segment count exceeds 100/300/500 segments respectively,
+     * keeping compaction throughput proportional to the ingest rate.
+     * Set to {@code false} to revert to the flat, unscaled caps.
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_TIERED_ENABLED =
+            "vector.index.compaction.tiered.enabled";
+    public static final boolean PROPERTY_VECTOR_INDEX_COMPACTION_TIERED_ENABLED_DEFAULT = true;
+
+    /**
+     * Segment-count back-pressure threshold (issue #354).
+     * {@code addVector} blocks when the total number of on-disk segments
+     * exceeds this value, waking the compaction thread before parking.
+     * This prevents the tailer from accumulating an unbounded backlog of
+     * segments when compaction cannot keep up with the ingest rate.
+     * Default is 500.  Set to {@link Integer#MAX_VALUE} to disable.
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS =
+            "vector.index.compaction.backpressure.segments";
+    public static final int PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS_DEFAULT = 500;
+
     // Apply parallelism
     public static final String PROPERTY_APPLY_PARALLELISM = "indexing.apply.parallelism";
     public static final int PROPERTY_APPLY_PARALLELISM_DEFAULT = 0; // 0 = auto: max(1, availableProcessors/2)

@@ -2153,6 +2153,163 @@
     },
     {
       "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 614,
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_count_backpressure_active\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": "0.5",
+          "title": "Segment-Count Back-Pressure Active",
+          "description": "1 while an addVector call is blocked waiting for compaction to drain the on-disk segment backlog below the threshold. Sustained non-zero means compaction cannot keep up with ingest.",
+          "type": "singlestat",
+          "valueName": "current",
+          "colorBackground": true,
+          "colors": [
+            "#299c46",
+            "#d44a3a",
+            "#d44a3a"
+          ],
+          "valueMaps": [
+            {
+              "value": "0",
+              "text": "OK",
+              "op": "="
+            },
+            {
+              "value": "1",
+              "text": "THROTTLED",
+              "op": "="
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 615,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_count_backpressure_total\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Segment-Count Back-Pressure Events (cumulative)",
+          "description": "Running total of times addVector entered back-pressure due to on-disk segment count exceeding the compaction threshold (vector.index.compaction.backpressure.segments).",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "short",
+              "decimals": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 616,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_count_backpressure_time_ms\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": [],
+          "title": "Cumulative Segment-Count Back-Pressure Time",
+          "description": "Total wall-clock milliseconds spent blocked in segment-count back-pressure across all addVector calls since the indexing service started.",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "ms",
+              "show": true
+            },
+            {
+              "format": "short",
+              "show": true
+            }
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Segment-Count Back-Pressure",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
       "height": 300,
       "panels": [
         {

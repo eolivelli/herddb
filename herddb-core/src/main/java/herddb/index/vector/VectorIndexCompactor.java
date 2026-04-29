@@ -195,6 +195,77 @@ final class VectorIndexCompactor {
         return new ArrayList<>();
     }
 
+    // -------------------------------------------------------------------------
+    // Tiered compaction scaling (issue #354)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Segment-count thresholds that trigger higher compaction fan-in.
+     * When {@code totalSegmentCount >= TIERED_THRESHOLDS[i]}, the base
+     * {@code maxBytes} and {@code maxCount} are multiplied by
+     * {@code TIERED_MULTIPLIERS[i]}.  Thresholds are evaluated
+     * highest-first so the last matching entry wins.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static final int[] TIERED_THRESHOLDS = {500, 300, 100};
+    static final int[] TIERED_MULTIPLIERS = {8, 4, 2};
+
+    /**
+     * Returns the scaling multiplier for the given total on-disk segment
+     * count according to the tiered thresholds.  Returns 1 when the count
+     * falls below all thresholds (no scaling).
+     *
+     * <p>Package-private for unit tests.
+     */
+    static int tieredMultiplier(int totalSegmentCount) {
+        for (int i = 0; i < TIERED_THRESHOLDS.length; i++) {
+            if (totalSegmentCount >= TIERED_THRESHOLDS[i]) {
+                return TIERED_MULTIPLIERS[i];
+            }
+        }
+        return 1;
+    }
+
+    /**
+     * Returns the effective per-cycle byte cap after applying the tiered
+     * scaling factor for {@code totalSegmentCount}.  The result is capped
+     * at {@link Long#MAX_VALUE} to avoid overflow.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static long computeTieredMaxBytes(int totalSegmentCount, long baseMaxBytes) {
+        int multiplier = tieredMultiplier(totalSegmentCount);
+        if (multiplier == 1) {
+            return baseMaxBytes;
+        }
+        // Guard against overflow: if baseMaxBytes * multiplier would exceed MAX_VALUE,
+        // return MAX_VALUE so the byte cap becomes effectively unlimited.
+        if (baseMaxBytes > Long.MAX_VALUE / multiplier) {
+            return Long.MAX_VALUE;
+        }
+        return baseMaxBytes * multiplier;
+    }
+
+    /**
+     * Returns the effective per-cycle segment count cap after applying the
+     * tiered scaling factor for {@code totalSegmentCount}.  The result is
+     * capped at {@link Integer#MAX_VALUE} to avoid overflow.
+     *
+     * <p>Package-private for unit tests.
+     */
+    static int computeTieredMaxCount(int totalSegmentCount, int baseMaxCount) {
+        int multiplier = tieredMultiplier(totalSegmentCount);
+        if (multiplier == 1) {
+            return baseMaxCount;
+        }
+        // Guard against overflow.
+        if (baseMaxCount > Integer.MAX_VALUE / multiplier) {
+            return Integer.MAX_VALUE;
+        }
+        return baseMaxCount * multiplier;
+    }
+
     /**
      * Populates the supplied {@link CompactionAuthorityMap} with the per-PK
      * authority decisions used by the live-PK filter during a compaction

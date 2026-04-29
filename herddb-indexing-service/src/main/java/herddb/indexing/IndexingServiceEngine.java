@@ -471,6 +471,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final int vectorCompactionMaxCount = config.getInt(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_COUNT,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_MAX_COUNT_DEFAULT);
+            final boolean vectorCompactionTieredEnabled = config.getBoolean(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_TIERED_ENABLED,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_TIERED_ENABLED_DEFAULT);
+            final int vectorCompactionBackpressureSegments = config.getInt(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS_DEFAULT);
+            LOGGER.log(Level.INFO,
+                    "vector index compaction: tieredEnabled={0}, backpressureSegments={1}",
+                    new Object[]{vectorCompactionTieredEnabled, vectorCompactionBackpressureSegments});
             final long maxLiveBytesPerCheckpoint = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT,
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT);
@@ -564,6 +573,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         /*minCount*/ 4,
                         vectorCompactionMaxCount,
                         vectorCompactionRetentionMs);
+                store.setTieredCompactionEnabled(vectorCompactionTieredEnabled);
+                store.setCompactionBackpressureThreshold(vectorCompactionBackpressureSegments);
                 try {
                     store.start();
                 } catch (Exception e) {
@@ -2383,6 +2394,36 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 @Override
                 public Long getSample() {
                     return pvs.getTotalBackpressureTimeMs();
+                }
+            });
+            indexStats.registerGauge("segment_count_backpressure_active", new Gauge<Integer>() {
+                @Override
+                public Integer getDefaultValue() {
+                    return 0;
+                }
+                @Override
+                public Integer getSample() {
+                    return pvs.isSegmentCountBackpressureActive() ? 1 : 0;
+                }
+            });
+            indexStats.registerGauge("segment_count_backpressure_total", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getSegmentCountBackpressureTotal();
+                }
+            });
+            indexStats.registerGauge("segment_count_backpressure_time_ms", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getSegmentCountBackpressureTimeMs();
                 }
             });
             indexStats.registerGauge("max_vector_memory_bytes", new Gauge<Long>() {
