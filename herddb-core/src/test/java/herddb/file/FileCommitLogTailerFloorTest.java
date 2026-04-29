@@ -20,6 +20,7 @@
 
 package herddb.file;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import herddb.log.LogEntryFactory;
 import herddb.log.LogSequenceNumber;
@@ -136,6 +137,65 @@ public class FileCommitLogTailerFloorTest {
             List<Long> after = listLogLedgers(tsFolder(base));
             assertTrue("ledger " + oldLsn.ledgerId + " must be kept (tailer still needs it); got " + after,
                     after.contains(oldLsn.ledgerId));
+        }
+    }
+
+    /**
+     * Issue #355 regression test.
+     *
+     * <p>When a remote IndexingService (IS) is present but its tailer is frozen
+     * in Phase A compaction, {@code VectorIndexManager.getTailersMinLsn()} returns
+     * {@code Optional.of(START_OF_TIME)} (either because {@code getMinProcessedLsn}
+     * received a gRPC response with {@code lastLsnLedger=-1, lastLsnOffset=-1}, or
+     * because the gRPC call timed out while Phase A was consuming all CPU).
+     *
+     * <p>{@code computeTailersRetentionFloor()} short-circuits to {@code START_OF_TIME}
+     * in this case and passes it to {@code dropOldLedgers}.  The intent of that
+     * short-circuit is "a tailer we can't safely pin — protect everything."  However
+     * the guard in {@code dropOldLedgers} is:
+     * <pre>
+     *     if (tailersFloor != null {@code &&} tailersFloor.ledgerId &gt;= 0 ...)
+     * </pre>
+     * {@code START_OF_TIME.ledgerId == -1 &lt; 0}, so the guard is <em>never entered</em>
+     * and the log files are dropped as if no floor existed — destroying commit-log
+     * ledgers the frozen IS still needs.
+     *
+     * <p>This test asserts the <em>correct post-fix behaviour</em>: when the tailers
+     * floor is {@code START_OF_TIME} (IS present but frozen), <strong>no</strong>
+     * ledger file must be deleted.  The test currently <em>fails</em>, thereby
+     * reproducing the bug.
+     */
+    @Test
+    public void issue355FrozenIsAtStartOfTimePreventsLedgerDrop() throws Exception {
+        Path base = folder.newFolder().toPath();
+        LogSequenceNumber checkpoint;
+        List<Long> before;
+        try (FileCommitLogManager manager = newManager(base)) {
+            manager.start();
+            try (FileCommitLog log = manager.createCommitLog("ts", "ts", "n1")) {
+                log.startWriting(1);
+                writeEntry(log);
+                writeEntry(log);
+                checkpoint = writeEntry(log);
+                writeEntry(log);
+                writeEntry(log);
+                before = listLogLedgers(tsFolder(base));
+                assertTrue("expected multiple ledgers before drop, got " + before,
+                        before.size() >= 3);
+
+                // Simulate the IS being frozen in Phase A: computeTailersRetentionFloor()
+                // returns START_OF_TIME. The floor should prevent ANY ledger from being
+                // dropped because the IS tailer position is unknown / at the very beginning.
+                log.dropOldLedgers(checkpoint, LogSequenceNumber.START_OF_TIME);
+            }
+            List<Long> after = listLogLedgers(tsFolder(base));
+            // BUG (issue #355): currently dropOldLedgers treats START_OF_TIME as
+            // "no constraint" and drops ledgers below the checkpoint.
+            // After the fix START_OF_TIME must mean "IS present but frozen — keep all".
+            assertEquals(
+                    "No ledger must be dropped when the IS tailer floor is START_OF_TIME "
+                            + "(frozen IS, issue #355); before=" + before + " after=" + after,
+                    before.size(), after.size());
         }
     }
 
