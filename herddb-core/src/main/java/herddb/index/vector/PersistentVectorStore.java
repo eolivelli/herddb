@@ -366,6 +366,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final AtomicInteger nextSegmentId = new AtomicInteger(0);
 
     /**
+     * Optional pluggable publisher invoked after each successful checkpoint to
+     * register the freshly-emitted segments with an external registry (the
+     * segmented-v2 ZooKeeper segment registry, see {@link SegmentPublisher}).
+     * {@code null} means no external publication; this is the legacy behaviour.
+     */
+    private volatile SegmentPublisher segmentPublisher;
+
+    /**
+     * When {@code true}, {@link #start()} does NOT spawn the in-IS
+     * {@link #vectorIndexCompactionLoop()} thread — compaction is expected to be
+     * driven by an external index-optimizer service (see
+     * {@code herddb.indexing.optimizer.IndexOptimizerEngine}). Tailer and
+     * checkpoint loops still run as normal.
+     */
+    private volatile boolean externalCompactionEnabled;
+
+    /**
      * Monotonically increasing IndexStatus generation. Each successful
      * call to {@link #persistIndexStatusMultiSegment} bumps this counter
      * and stamps every newly-produced segment with the new value.
@@ -1201,15 +1218,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
         final String mapFilePath;
         final long mapFileSize;
         final long estimatedSizeBytes;
+        /** Number of live vectors written to this segment. */
+        final long vectorCount;
 
         SegmentWriteResult(int segmentId, String graphFilePath, long graphFileSize,
                            String mapFilePath, long mapFileSize, long estimatedSizeBytes) {
+            this(segmentId, graphFilePath, graphFileSize, mapFilePath, mapFileSize,
+                    estimatedSizeBytes, 0L);
+        }
+
+        SegmentWriteResult(int segmentId, String graphFilePath, long graphFileSize,
+                           String mapFilePath, long mapFileSize, long estimatedSizeBytes,
+                           long vectorCount) {
             this.segmentId = segmentId;
             this.graphFilePath = graphFilePath;
             this.graphFileSize = graphFileSize;
             this.mapFilePath = mapFilePath;
             this.mapFileSize = mapFileSize;
             this.estimatedSizeBytes = estimatedSizeBytes;
+            this.vectorCount = vectorCount;
         }
     }
 
@@ -1288,11 +1315,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
         compactionThread.start();
 
         // Start background graph-merge compaction thread (separate cadence,
-        // separate responsibilities from the checkpoint driver).
-        vectorIndexCompactionThread = new Thread(this::vectorIndexCompactionLoop,
-                "persistent-vector-store-vidxcompaction-" + indexName);
-        vectorIndexCompactionThread.setDaemon(true);
-        vectorIndexCompactionThread.start();
+        // separate responsibilities from the checkpoint driver). Suppressed
+        // when an external index-optimizer service is doing this work
+        // (segmented-v2 mode).
+        if (!externalCompactionEnabled) {
+            vectorIndexCompactionThread = new Thread(this::vectorIndexCompactionLoop,
+                    "persistent-vector-store-vidxcompaction-" + indexName);
+            vectorIndexCompactionThread.setDaemon(true);
+            vectorIndexCompactionThread.start();
+        } else {
+            LOGGER.log(Level.INFO,
+                    "PersistentVectorStore {0}: external compaction enabled — in-IS"
+                            + " compaction loop suppressed",
+                    indexName);
+        }
 
         LOGGER.log(Level.INFO, "PersistentVectorStore {0} started", indexName);
     }
@@ -1311,6 +1347,32 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.vectorIndexCompactionMinCount = minCount;
         this.vectorIndexCompactionMaxCount = maxCount;
         this.vectorIndexCompactionRetentionMs = retentionMs;
+    }
+
+    /**
+     * Installs (or replaces) the {@link SegmentPublisher} hook called after each
+     * successful checkpoint. Pass {@code null} to disable. May be called before
+     * or after {@link #start()}.
+     */
+    public void setSegmentPublisher(SegmentPublisher publisher) {
+        this.segmentPublisher = publisher;
+    }
+
+    /**
+     * When {@code true}, the in-IS compaction loop is suppressed. Must be set
+     * before {@link #start()} to influence the launch decision.
+     */
+    public void setExternalCompactionEnabled(boolean enabled) {
+        this.externalCompactionEnabled = enabled;
+    }
+
+    public boolean isExternalCompactionEnabled() {
+        return externalCompactionEnabled;
+    }
+
+    /** Visible for tests: the in-IS compaction thread (null when not running). */
+    Thread getVectorIndexCompactionThread() {
+        return vectorIndexCompactionThread;
     }
 
     /** Wakes the compaction thread. Called by tests and the retention reaper. */
@@ -3250,7 +3312,45 @@ public class PersistentVectorStore extends AbstractVectorStore {
         newSegmentResults.sort(java.util.Comparator.comparingInt(r -> r.segmentId));
         persistIndexStatusMultiSegment(sealedSegments, mergeableSegments, newSegmentResults, sequenceNumber);
 
+        publishNewSegmentsBestEffort(newSegmentResults, sequenceNumber);
+
         return newSegmentResults;
+    }
+
+    /**
+     * Best-effort publication of freshly-emitted segments to the configured
+     * {@link SegmentPublisher} (segmented-v2 ZooKeeper segment registry).
+     * Failures here are swallowed (logged): the local IndexStatus has already
+     * been durably persisted, so the segments are visible locally and a future
+     * checkpoint cycle can re-register any missing entries. We catch broad
+     * Exception here on purpose — the publisher is a plugin boundary and a
+     * misbehaving publisher MUST NOT abort an otherwise-successful checkpoint.
+     */
+    private void publishNewSegmentsBestEffort(
+            List<SegmentWriteResult> newSegmentResults, LogSequenceNumber sequenceNumber) {
+        SegmentPublisher publisher = this.segmentPublisher;
+        if (publisher == null) {
+            return;
+        }
+        long generation = currentIndexStatusGeneration.get();
+        List<NewSegmentInfo> info = new ArrayList<>(newSegmentResults.size());
+        for (SegmentWriteResult swr : newSegmentResults) {
+            info.add(new NewSegmentInfo(
+                    swr.segmentId,
+                    swr.graphFilePath, swr.graphFileSize,
+                    swr.mapFilePath, swr.mapFileSize,
+                    swr.estimatedSizeBytes, swr.vectorCount, generation,
+                    sequenceNumber));
+        }
+        try {
+            publisher.publishNewSegments(info);
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING,
+                    "segment publisher failed for index {0} (generation {1}, {2} new segments); "
+                            + "checkpoint succeeded locally — will retry on next cycle",
+                    new Object[]{indexName, generation, info.size()});
+            LOGGER.log(Level.WARNING, "publisher failure detail", e);
+        }
     }
 
     /**
@@ -3612,7 +3712,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     return new SegmentWriteResult(segmentId,
                             graphFilePath, graphSize,
                             mapFilePath, mapSize,
-                            graphSize + mapSize);
+                            graphSize + mapSize,
+                            shardSize);
                 } finally {
                     Files.deleteIfExists(mapFile);
                 }
@@ -4178,7 +4279,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 return new SegmentWriteResult(s.segmentId,
                         graphFilePath, graphFileSize,
                         mapFilePath, mapFileSize,
-                        graphFileSize + mapFileSize);
+                        graphFileSize + mapFileSize,
+                        partNodeToPk.size());
             } finally {
                 Files.deleteIfExists(mapTempFile);
             }

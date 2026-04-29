@@ -39,14 +39,12 @@ import io.grpc.StatusRuntimeException;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CountDownLatch;
@@ -401,9 +399,12 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
             inflight.add(dispatchSearch(ep, request, deadlineNanos));
         }
 
-        int initialCapacity = Math.max(1, Math.min(limit, 1024));
-        PriorityQueue<Map.Entry<Bytes, Float>> topK =
-                new PriorityQueue<>(initialCapacity, Comparator.comparing(Map.Entry::getValue));
+        // Collect each pool's response, then merge with PK-dedup. Dedup matters
+        // because under segmented-v2 ownership transfer the same PK can briefly
+        // be served by both the old and new owner; the merge would otherwise
+        // include the duplicate in the top-K (issue #339 — search fan-out for
+        // segmented-v2).
+        List<List<Map.Entry<Bytes, Float>>> perPoolResults = new ArrayList<>(inflight.size());
 
         for (int i = 0; i < inflight.size(); i++) {
             Pool pool = s.pools.get(i);
@@ -451,18 +452,10 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                     throw new RuntimeException("Search interrupted while waiting for indexing-service pools", ie);
                 }
             }
-            for (Map.Entry<Bytes, Float> e : toEntryList(response)) {
-                if (topK.size() < limit) {
-                    topK.offer(e);
-                } else if (e.getValue() > topK.peek().getValue()) {
-                    topK.poll();
-                    topK.offer(e);
-                }
-            }
+            perPoolResults.add(toEntryList(response));
         }
 
-        List<Map.Entry<Bytes, Float>> out = new ArrayList<>(topK);
-        out.sort(Comparator.<Map.Entry<Bytes, Float>, Float>comparing(Map.Entry::getValue).reversed());
+        List<Map.Entry<Bytes, Float>> out = SearchResultMerger.merge(perPoolResults, limit);
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
         LOGGER.log(Level.FINE, "client search completed (multi-pool fan-out): index={0}, {1} results in {2} ms",
                 new Object[]{index, out.size(), elapsedMs});

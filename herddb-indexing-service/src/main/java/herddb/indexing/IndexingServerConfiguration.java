@@ -207,6 +207,16 @@ public final class IndexingServerConfiguration {
     public static final long PROPERTY_VECTOR_INDEX_COMPACTION_RETENTION_MS_DEFAULT =
             10L * 60_000L; // 10 min
 
+    /**
+     * When {@code true}, the IS does NOT run the per-store
+     * {@code vectorIndexCompactionLoop()} thread — compaction is delegated to
+     * the external index-optimizer service, which scans the segment registry
+     * and merges segments out-of-process. The IS still runs the tailer and
+     * checkpoint loop. Default {@code false} (legacy in-IS compaction).
+     */
+    public static final String PROPERTY_INDEX_OPTIMIZER_ENABLED = "indexing.optimizer.enabled";
+    public static final boolean PROPERTY_INDEX_OPTIMIZER_ENABLED_DEFAULT = false;
+
     // Apply parallelism
     public static final String PROPERTY_APPLY_PARALLELISM = "indexing.apply.parallelism";
     public static final int PROPERTY_APPLY_PARALLELISM_DEFAULT = 0; // 0 = auto: max(1, availableProcessors/2)

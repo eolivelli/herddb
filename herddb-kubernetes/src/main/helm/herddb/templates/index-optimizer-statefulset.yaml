@@ -1,0 +1,115 @@
+{{- if .Values.indexOptimizer.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "herddb.fullname" . }}-index-optimizer
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: index-optimizer
+spec:
+  # Singleton: at most one optimizer per cluster (per the user-approved plan).
+  # Helm replicas: 1 is the only enforcement mechanism — there is no in-process
+  # ZK leader-election to keep the bootstrap simple. Two pods running briefly
+  # during a rolling upgrade will compete on the registry CAS but cannot
+  # corrupt anything.
+  replicas: 1
+  serviceName: {{ include "herddb.fullname" . }}-index-optimizer
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: index-optimizer
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/index-optimizer-configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "herddb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: index-optimizer
+    spec:
+      serviceAccountName: {{ include "herddb.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.indexOptimizer.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.indexOptimizer.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.indexOptimizer.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.zookeeper.enabled }}
+      initContainers:
+        - name: wait-for-zookeeper
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "Waiting for ZooKeeper at {{ include "herddb.zkAddress" . }}..."
+              {{- $zkHost := printf "%s-zookeeper-0.%s-zookeeper.%s.svc.cluster.local"
+                    (include "herddb.fullname" .)
+                    (include "herddb.fullname" .)
+                    .Release.Namespace }}
+              while ! echo ruok > /dev/tcp/{{ $zkHost }}/{{ .Values.zookeeper.clientPort }} 2>/dev/null; do
+                echo "ZooKeeper not ready, retrying in 2s..."
+                sleep 2
+              done
+              echo "ZooKeeper is ready."
+      {{- end }}
+      containers:
+        - name: index-optimizer
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              exec /opt/herddb/bin/service index-optimizer console \
+                /opt/herddb/conf/indexoptimizer.properties \
+                -Dindexoptimizer.tmp.dir=/opt/herddb/optimizer-tmp
+          {{- if or .Values.indexOptimizer.javaOpts .Values.indexOptimizer.javaOptsExtra }}
+          env:
+            {{- if .Values.indexOptimizer.javaOpts }}
+            - name: JAVA_OPTS
+              value: {{ .Values.indexOptimizer.javaOpts | quote }}
+            {{- end }}
+            {{- if .Values.indexOptimizer.javaOptsExtra }}
+            - name: JAVA_OPTS_EXTRA
+              value: {{ .Values.indexOptimizer.javaOptsExtra | quote }}
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.indexOptimizer.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /opt/herddb/optimizer-tmp
+            - name: config
+              mountPath: /opt/herddb/conf/indexoptimizer.properties
+              subPath: indexoptimizer.properties
+            {{- if .Values.indexOptimizer.loggingProperties }}
+            - name: config
+              mountPath: /opt/herddb/conf/logging.properties
+              subPath: logging.properties
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "herddb.fullname" . }}-index-optimizer-config
+  volumeClaimTemplates:
+    - metadata:
+        name: tmp
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.indexOptimizer.storage.tmp.storageClass }}
+        storageClassName: {{ .Values.indexOptimizer.storage.tmp.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.indexOptimizer.storage.tmp.size }}
+{{- end }}

@@ -1,0 +1,18 @@
+{{- if and .Values.indexOptimizer.enabled .Values.indexOptimizer.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "herddb.fullname" . }}-index-optimizer
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: index-optimizer
+spec:
+  # Default minAvailable: 0 — the optimizer is a singleton; we tolerate
+  # transient eviction during node maintenance because a missed merge cycle
+  # is harmless.
+  minAvailable: {{ .Values.indexOptimizer.pdb.minAvailable | default 0 }}
+  selector:
+    matchLabels:
+      {{- include "herddb.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: index-optimizer
+{{- end }}
