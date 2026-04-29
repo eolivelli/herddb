@@ -953,7 +953,7 @@ public class TableSpaceManager {
             return FastMinMaxResult.of(null);
         }
         try {
-            if (isByteSortableType(pkType)) {
+            if (ColumnTypes.isByteSortable(pkType)) {
                 // For byte-sortable types the byte-extreme key IS the
                 // natural-extreme. Use the index's getMin/MaxKey API,
                 // which is O(log n) on BLink-backed implementations and
@@ -965,9 +965,9 @@ public class TableSpaceManager {
                 }
                 return FastMinMaxResult.of(RecordSerializer.deserialize(extreme, pkType));
             }
-            // Numeric / non-byte-sortable PK: stream all keys and decode
-            // each, picking the natural-order extreme. O(n_keys) CPU and
-            // *no data-page IO*.
+            // Non-byte-sortable PK (e.g. DOUBLE): stream all keys and
+            // decode each, picking the natural-order extreme. O(n_keys)
+            // CPU and *no data-page IO*.
             Object value = decodeExtremeFromKeyStream(idx, pkType, max);
             return FastMinMaxResult.of(value);
         } catch (UnsupportedOperationException err) {
@@ -979,11 +979,11 @@ public class TableSpaceManager {
 
     /**
      * Fast-path {@code MIN(col)} / {@code MAX(col)} for a column covered
-     * by a single-column BRIN secondary index. Currently only fires for
-     * byte-sortable column types (STRING / BYTEARRAY) — for numeric
-     * BRIN-indexed columns the caller falls back to the regular scan,
-     * because the BRIN's byte-wise key ordering does not match natural
-     * order for two's-complement numerics.
+     * by a single-column BRIN secondary index. Fires for any
+     * {@link ColumnTypes#isByteSortable byte-sortable} column type — for
+     * non-byte-sortable columns (DOUBLE / FLOAT) the caller falls back to
+     * the regular scan, because the BRIN's byte-wise key ordering does not
+     * match natural order for those types.
      *
      * <p>Returns {@link FastMinMaxResult#notApplied()} when the fast-path
      * does not apply.
@@ -1008,9 +1008,10 @@ public class TableSpaceManager {
             return FastMinMaxResult.notApplied();
         }
         int colType = col.type;
-        if (!isByteSortableType(colType)) {
-            // BRIN orders keys byte-wise; for numeric types we'd need a
-            // full key scan with decode (not supported here yet).
+        if (!ColumnTypes.isByteSortable(colType)) {
+            // BRIN orders keys byte-wise; non-byte-sortable types (DOUBLE
+            // / FLOAT) would need a full key scan with decode (not
+            // supported here yet).
             return FastMinMaxResult.notApplied();
         }
         // Find a BRIN index whose first/only indexed column equals `column`.
@@ -1045,8 +1046,9 @@ public class TableSpaceManager {
      * Streams every key currently in the primary-key index, decodes each
      * to the given column type, and returns the natural-order min or max.
      * Used by {@link #fastMinMaxPrimaryKeyNoTransaction} for column types
-     * whose byte order does not match natural order (e.g. mixed-sign
-     * INTEGER / LONG / TIMESTAMP / DOUBLE).
+     * whose byte order does not match natural order (DOUBLE / FLOAT
+     * IEEE-754 patterns are the remaining case after the
+     * order-preserving int/long/timestamp encoding).
      *
      * <p>This still avoids data-page IO entirely — only the BLink leaf
      * pages are touched.
@@ -1080,18 +1082,6 @@ public class TableSpaceManager {
             throw new StatementExecutionException(err);
         }
         return best;
-    }
-
-    private static boolean isByteSortableType(int type) {
-        switch (type) {
-            case ColumnTypes.STRING:
-            case ColumnTypes.NOTNULL_STRING:
-            case ColumnTypes.BYTEARRAY:
-            case ColumnTypes.NOTNULL_BYTEARRAY:
-                return true;
-            default:
-                return false;
-        }
     }
 
     private void downloadTableSpaceData() throws MetadataStorageManagerException, DataStorageManagerException, LogNotAvailableException {

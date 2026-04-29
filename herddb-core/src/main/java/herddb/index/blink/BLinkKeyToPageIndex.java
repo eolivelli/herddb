@@ -198,26 +198,10 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
 
     @Override
     public boolean isSortedAscending(int[] pkTypes) {
-        if (pkTypes.length != 1) {
-            return false;
-        }
-        switch (pkTypes[0]) {
-            case ColumnTypes.NOTNULL_STRING:
-            case ColumnTypes.STRING:
-            case ColumnTypes.BYTEARRAY:
-            case ColumnTypes.INTEGER:
-            case ColumnTypes.NOTNULL_INTEGER:
-            case ColumnTypes.LONG:
-            case ColumnTypes.NOTNULL_LONG:
-            case ColumnTypes.TIMESTAMP:
-            case ColumnTypes.NOTNULL_TIMESTAMP:
-                // Bytes encodes int/long/timestamp with a sign-bit flip
-                // (herddb.utils.Bytes#putInt / #putLong), so unsigned-lex byte
-                // comparison matches signed numeric order.
-                return true;
-            default:
-                return false;
-        }
+        // Composite PKs are byte-sortable when every component is, but the
+        // planner currently only consumes single-column ascending PKs, so
+        // we keep the simple guard here.
+        return pkTypes.length == 1 && ColumnTypes.isByteSortable(pkTypes[0]);
     }
 
     @Override
