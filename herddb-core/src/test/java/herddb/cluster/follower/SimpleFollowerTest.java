@@ -432,18 +432,18 @@ public class SimpleFollowerTest extends MultiServerBase {
         serverconfig_1.set(ServerConfiguration.PROPERTY_ENFORCE_LEADERSHIP, false);
         serverconfig_1.set(ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_RETENTION_PERIOD, 1);
         serverconfig_1.set(ServerConfiguration.PROPERTY_CHECKPOINT_PERIOD, 0);
-        // A small non-zero maxIdleTime is required here.  BEGIN_TX and INSERT
-        // inside the auto-transaction are written to BookKeeper as deferred
-        // (async) entries.  All three writes (BEGIN_TX, INSERT key5, INSERT key6)
-        // may be sent to BookKeeper before any of them is acknowledged, so their
-        // piggybacked LAC field all carry the *pre-batch* LAC value.  Without a
-        // subsequent write that carries the post-confirmation LAC, the bookies'
-        // lastKnownLac never advances and the follower's readLastAddConfirmedAndEntry
-        // long-poll sees the old LAC and cannot read the new entries — even though
-        // they are physically stored on the bookies.
-        // Setting maxIdleTime=100 causes the leader to write a NOOP ≤200 ms after
-        // the last confirmed write; that NOOP piggybacks the up-to-date LAC so the
-        // follower can make progress within one long-poll cycle (~1 s).
+        // A small non-zero maxIdleTime is required here.  Even though BEGIN_TX
+        // is acknowledged before INSERT key5 is submitted (the auto-transaction path
+        // chains them), the BK client's local lastAddConfirmed view can lag behind the
+        // confirmed state at the time each subsequent write is initiated.  INSERT key6
+        // (the sync write below) is sent with whatever LAC the writer holds at that
+        // instant; if that LAC has not yet advanced past BEGIN_TX or INSERT key5, the
+        // bookies' lastKnownLac stays below the entries' IDs and the follower's
+        // readLastAddConfirmedAndEntry long-poll sees a stale LAC — the entries are
+        // physically present on the bookies but the follower cannot discover them.
+        // Setting maxIdleTime=100 causes the leader to emit a NOOP ≤200 ms after the
+        // last confirmed write; that NOOP piggybacks the up-to-date LAC so the follower
+        // can make progress within one long-poll cycle (~1 s).
         serverconfig_1.set(ServerConfiguration.PROPERTY_BOOKKEEPER_MAX_IDLE_TIME, 100);
 
         ServerConfiguration serverconfig_2 = serverconfig_1
