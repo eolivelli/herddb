@@ -175,11 +175,17 @@ public class TombstoneOverlayManagerTest {
         // Each generation writes to a distinct multipart fileType, so paths differ.
         assertFalse("each flush must produce a new path", firstPath.equals(secondPath));
 
-        TombstoneOverlay gen1 = TombstoneOverlayManager.loadOverlay(
-                dsm, TS_UUID, IDX_UUID, SEG_UUID, 1L);
+        // After review item A4: a successful gen-2 flush physically deletes gen-1's
+        // overlay file to prevent leaks. Loading gen-1 must therefore fail; gen-2
+        // contains the cumulative tombstone set.
+        try {
+            TombstoneOverlayManager.loadOverlay(dsm, TS_UUID, IDX_UUID, SEG_UUID, 1L);
+            org.junit.Assert.fail("expected gen-1 overlay file to be deleted by review item A4");
+        } catch (herddb.storage.DataStorageManagerException expectedDeleted) {
+            // good — A4 removes the previous generation file after a successful flush
+        }
         TombstoneOverlay gen2 = TombstoneOverlayManager.loadOverlay(
                 dsm, TS_UUID, IDX_UUID, SEG_UUID, 2L);
-        assertArrayEquals(new int[]{1}, gen1.getTombstonedOrdinals());
         assertArrayEquals(new int[]{1, 2}, gen2.getTombstonedOrdinals());
     }
 

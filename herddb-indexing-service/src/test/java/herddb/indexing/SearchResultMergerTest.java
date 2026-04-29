@@ -74,13 +74,62 @@ public class SearchResultMergerTest {
     }
 
     @Test
-    public void identicalScoresKeepFirstObservation() {
+    public void identicalScoresForSamePkAreDeduped() {
         // PK 5 in both pools with the SAME score; no duplicate in output.
         List<Map.Entry<Bytes, Float>> poolA = Arrays.asList(entry(5, 0.5f));
         List<Map.Entry<Bytes, Float>> poolB = Arrays.asList(entry(5, 0.5f));
         List<Map.Entry<Bytes, Float>> out = SearchResultMerger.merge(Arrays.asList(poolA, poolB), 10);
         assertEquals(1, out.size());
         assertEquals(Bytes.from_int(5), out.get(0).getKey());
+    }
+
+    @Test
+    public void distinctPksWithEqualScoresUsePkLexOrderAsTiebreaker() {
+        // Three distinct PKs, ALL with score 0.5. Output must be sorted by PK lex order.
+        List<Map.Entry<Bytes, Float>> response = Arrays.asList(
+                entry(20, 0.5f), entry(5, 0.5f), entry(10, 0.5f));
+        List<Map.Entry<Bytes, Float>> out = SearchResultMerger.merge(
+                Collections.singletonList(response), 10);
+        assertEquals(3, out.size());
+        // Bytes.from_int produces big-endian 4-byte payloads; lex order on these matches
+        // numeric order for non-negative ints, so 5 < 10 < 20.
+        assertEquals(Bytes.from_int(5), out.get(0).getKey());
+        assertEquals(Bytes.from_int(10), out.get(1).getKey());
+        assertEquals(Bytes.from_int(20), out.get(2).getKey());
+    }
+
+    @Test
+    public void mergeOrderInvariantToPoolIterationOrder() {
+        // Build two pools and feed them in either order; output must be byte-identical.
+        // This is the regression guard for review item A7 — pool order must NOT shift
+        // results across requests.
+        List<Map.Entry<Bytes, Float>> poolA = Arrays.asList(
+                entry(1, 0.9f), entry(7, 0.1f), entry(42, 0.5f));
+        List<Map.Entry<Bytes, Float>> poolB = Arrays.asList(
+                entry(2, 0.8f), entry(7, 0.2f), entry(99, 0.5f));
+        List<Map.Entry<Bytes, Float>> orderAB = SearchResultMerger.merge(
+                Arrays.asList(poolA, poolB), 100);
+        List<Map.Entry<Bytes, Float>> orderBA = SearchResultMerger.merge(
+                Arrays.asList(poolB, poolA), 100);
+        assertEquals(orderAB, orderBA);
+        // Sanity: the duplicate PK 7 has the higher score (0.2) survive.
+        for (Map.Entry<Bytes, Float> e : orderAB) {
+            if (e.getKey().equals(Bytes.from_int(7))) {
+                assertEquals(0.2f, e.getValue(), 0f);
+            }
+        }
+        // Sanity: PK 42 and PK 99 both have score 0.5; PK 42 lex-precedes PK 99.
+        int idx42 = -1, idx99 = -1;
+        for (int i = 0; i < orderAB.size(); i++) {
+            Bytes pk = orderAB.get(i).getKey();
+            if (pk.equals(Bytes.from_int(42))) {
+                idx42 = i;
+            }
+            if (pk.equals(Bytes.from_int(99))) {
+                idx99 = i;
+            }
+        }
+        assertTrue("PK 42 must come before PK 99 in tied-score region", idx42 < idx99);
     }
 
     @Test

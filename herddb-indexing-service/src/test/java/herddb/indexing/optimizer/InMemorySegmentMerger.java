@@ -67,6 +67,10 @@ public final class InMemorySegmentMerger implements SegmentMerger {
                 .state(SegmentState.ACTIVE)
                 .ownerInstanceId(newOwnerInstance)
                 .pendingOwnerInstanceId(SegmentMetadata.NO_INSTANCE)
+                // Synthetic merger doesn't allocate a real local segmentId; the reaper
+                // skips file deletion when this is NO_SEGMENT_ID, which is what the
+                // unit tests expect (no DSM wired).
+                .segmentId(SegmentMetadata.NO_SEGMENT_ID)
                 .graphPath("merged/" + mergedUuid + "/graph")
                 .mapPath("merged/" + mergedUuid + "/map")
                 .baseLsn(first.baseLsn())

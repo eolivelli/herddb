@@ -51,6 +51,7 @@ public final class SegmentMetadata {
     public static final long NO_LSN_LEDGER_ID = -1L;
     public static final long NO_LSN_OFFSET = -1L;
     public static final long NO_RETENTION = -1L;
+    public static final int NO_SEGMENT_ID = -1;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -62,6 +63,15 @@ public final class SegmentMetadata {
     private final SegmentState state;
     private final int ownerInstanceId;
     private final int pendingOwnerInstanceId;
+    /**
+     * Original IS-local int segment-id under which the multipart graph/map files
+     * were written. Needed by the optimizer's reaper to call
+     * {@code DataStorageManager.deleteMultipartIndexFile(tableSpace,
+     * indexUuid + "_seg" + segmentId, "graph"/"map")} (review item A8).
+     * Defaults to {@link #NO_SEGMENT_ID} (-1) when unknown — in that case the
+     * reaper skips file deletion and only removes the znode.
+     */
+    private final int segmentId;
     private final String graphPath;
     private final String mapPath;
     private final String tombstonePath;
@@ -86,6 +96,7 @@ public final class SegmentMetadata {
             @JsonProperty("state") SegmentState state,
             @JsonProperty("ownerInstanceId") int ownerInstanceId,
             @JsonProperty("pendingOwnerInstanceId") int pendingOwnerInstanceId,
+            @JsonProperty("segmentId") int segmentId,
             @JsonProperty("graphPath") String graphPath,
             @JsonProperty("mapPath") String mapPath,
             @JsonProperty("tombstonePath") String tombstonePath,
@@ -107,6 +118,7 @@ public final class SegmentMetadata {
         this.state = Objects.requireNonNull(state, "state");
         this.ownerInstanceId = ownerInstanceId;
         this.pendingOwnerInstanceId = pendingOwnerInstanceId;
+        this.segmentId = segmentId;
         this.graphPath = graphPath;
         this.mapPath = mapPath;
         this.tombstonePath = tombstonePath;
@@ -154,6 +166,10 @@ public final class SegmentMetadata {
 
     public int getPendingOwnerInstanceId() {
         return pendingOwnerInstanceId;
+    }
+
+    public int getSegmentId() {
+        return segmentId;
     }
 
     public String getGraphPath() {
@@ -244,6 +260,7 @@ public final class SegmentMetadata {
                 .state(state)
                 .ownerInstanceId(ownerInstanceId)
                 .pendingOwnerInstanceId(pendingOwnerInstanceId)
+                .segmentId(segmentId)
                 .graphPath(graphPath)
                 .mapPath(mapPath)
                 .tombstonePath(tombstonePath)
@@ -329,6 +346,7 @@ public final class SegmentMetadata {
         private SegmentState state = SegmentState.ACTIVE;
         private int ownerInstanceId = NO_INSTANCE;
         private int pendingOwnerInstanceId = NO_INSTANCE;
+        private int segmentId = NO_SEGMENT_ID;
         private String graphPath;
         private String mapPath;
         private String tombstonePath;
@@ -380,6 +398,11 @@ public final class SegmentMetadata {
 
         public Builder pendingOwnerInstanceId(int value) {
             this.pendingOwnerInstanceId = value;
+            return this;
+        }
+
+        public Builder segmentId(int value) {
+            this.segmentId = value;
             return this;
         }
 
@@ -464,7 +487,7 @@ public final class SegmentMetadata {
 
         public SegmentMetadata build() {
             return new SegmentMetadata(segmentUuid, tablespaceUuid, tableName, indexUuid, indexName,
-                    state, ownerInstanceId, pendingOwnerInstanceId, graphPath, mapPath,
+                    state, ownerInstanceId, pendingOwnerInstanceId, segmentId, graphPath, mapPath,
                     tombstonePath, tombstoneLsnLedgerId, tombstoneLsnOffset,
                     baseLsnLedgerId, baseLsnOffset, sizeBytes, vectorCount, generation,
                     replacedBy, retentionUntilEpochMillis, createdAtEpochMillis);

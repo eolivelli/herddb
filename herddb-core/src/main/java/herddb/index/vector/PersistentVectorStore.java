@@ -272,6 +272,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * graph-merge compaction retention protocol.
      */
     private static final int METADATA_VERSION_MULTI_SEGMENT = 3;
+    /**
+     * Format version 4 adds a per-segment {@code segmentUuid} string. Written when ANY
+     * segment in the IndexStatus carries a non-null UUID (i.e. the index is in
+     * segmented-v2 mode); otherwise we keep writing v3 to preserve binary-compatible
+     * rollback for legacy clusters. The reader supports both versions.
+     */
+    private static final int METADATA_VERSION_MULTI_SEGMENT_V4 = 4;
 
     // -------------------------------------------------------------------------
     // Configuration
@@ -1220,6 +1227,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
         final long estimatedSizeBytes;
         /** Number of live vectors written to this segment. */
         final long vectorCount;
+        /**
+         * Stable UUID stamped onto this segment for segmented-v2 indexes. Populated
+         * by {@link #stampSegmentUuid(String)} in Phase B once we know we will publish
+         * to a {@link SegmentPublisher}; carried through to {@link NewSegmentInfo} and
+         * persisted in v4 IndexStatus so the same UUID survives restarts. {@code null}
+         * for legacy (v3) indexes.
+         */
+        String segmentUuid;
 
         SegmentWriteResult(int segmentId, String graphFilePath, long graphFileSize,
                            String mapFilePath, long mapFileSize, long estimatedSizeBytes) {
@@ -1237,6 +1252,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
             this.mapFileSize = mapFileSize;
             this.estimatedSizeBytes = estimatedSizeBytes;
             this.vectorCount = vectorCount;
+        }
+
+        /** One-shot setter — Phase B stamps the UUID before Phase C persists IndexStatus. */
+        void stampSegmentUuid(String uuid) {
+            this.segmentUuid = uuid;
         }
     }
 
@@ -1328,6 +1348,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     "PersistentVectorStore {0}: external compaction enabled — in-IS"
                             + " compaction loop suppressed",
                     indexName);
+        }
+
+        // Reconcile the segmented-v2 registry with IndexStatus on every start
+        // (review item A1+A3). This heals partial-publish state from a previous
+        // crash: PROVISIONAL znodes whose UUID is in IndexStatus get promoted
+        // to ACTIVE; PROVISIONAL znodes whose UUID is unknown get dropped;
+        // IndexStatus segments with no znode get re-registered. We catch broad
+        // Exception here on purpose — reconcile is best-effort, the IS must
+        // start regardless.
+        SegmentPublisher reconciler = this.segmentPublisher;
+        if (reconciler != null) {
+            try {
+                reconciler.reconcileWithIndexStatus(buildExistingSegmentsInfoForReconcile());
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING,
+                        "segment publisher.reconcileWithIndexStatus failed for {0}; "
+                                + "continuing with un-reconciled state", indexName);
+                LOGGER.log(Level.WARNING, "reconcile failure detail", e);
+            }
         }
 
         LOGGER.log(Level.INFO, "PersistentVectorStore {0} started", indexName);
@@ -1982,6 +2021,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     VectorSegment preloadCompactedSegment(SegmentWriteResult swr) throws IOException, DataStorageManagerException {
         VectorSegment seg = new VectorSegment(swr.segmentId);
+        seg.segmentUuid = swr.segmentUuid;
         seg.estimatedSizeBytes = swr.estimatedSizeBytes;
         seg.graphFilePath = swr.graphFilePath;
         seg.graphFileSize = swr.graphFileSize;
@@ -3074,6 +3114,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 long freshGeneration = currentIndexStatusGeneration.get();
                 for (SegmentWriteResult swr : newSegmentResults) {
                     VectorSegment seg = new VectorSegment(swr.segmentId);
+                    seg.segmentUuid = swr.segmentUuid;
                     seg.estimatedSizeBytes = swr.estimatedSizeBytes;
                     seg.graphFilePath = swr.graphFilePath;
                     seg.graphFileSize = swr.graphFileSize;
@@ -3310,47 +3351,147 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // Order the results by segmentId so that the persisted IndexStatus and
         // the in-memory segment list are both deterministic.
         newSegmentResults.sort(java.util.Comparator.comparingInt(r -> r.segmentId));
+
+        // === Two-phase publish (review item A1+A3) ===
+        //
+        // 1. Stamp UUIDs (review item A2) before any persistence so the UUID is
+        //    durable in IndexStatus even if we crash mid-way.
+        // 2. STAGE: register PROVISIONAL znodes BEFORE IndexStatus persist.
+        // 3. Persist IndexStatus.
+        // 4. COMMIT: flip PROVISIONAL → ACTIVE.
+        //
+        // If we crash:
+        //   - between (1) and (2): no ZK record, no IndexStatus update — clean.
+        //   - between (2) and (3): PROVISIONAL znodes exist but their UUIDs are
+        //     not in IndexStatus. On next start, reconcile drops them.
+        //   - between (3) and (4): PROVISIONAL znodes exist AND their UUIDs are
+        //     in IndexStatus. On next start, reconcile promotes them to ACTIVE.
+        //
+        // Stage and commit failures are best-effort — the local IndexStatus has
+        // (or will have) the durable record; reconciliation on next start heals
+        // any gaps.
+        SegmentPublisher publisherSnapshot = this.segmentPublisher;
+        if (publisherSnapshot != null) {
+            for (SegmentWriteResult swr : newSegmentResults) {
+                if (swr.segmentUuid == null) {
+                    swr.stampSegmentUuid(java.util.UUID.randomUUID().toString());
+                }
+            }
+        }
+
+        List<NewSegmentInfo> publishInfo = (publisherSnapshot != null)
+                ? buildPublishInfo(newSegmentResults, sequenceNumber, currentIndexStatusGeneration.get() + 1)
+                : null;
+
+        if (publisherSnapshot != null) {
+            stageNewSegmentsBestEffort(publisherSnapshot, publishInfo);
+        }
+
         persistIndexStatusMultiSegment(sealedSegments, mergeableSegments, newSegmentResults, sequenceNumber);
 
-        publishNewSegmentsBestEffort(newSegmentResults, sequenceNumber);
+        if (publisherSnapshot != null) {
+            commitStagedSegmentsBestEffort(publisherSnapshot, publishInfo);
+        }
 
         return newSegmentResults;
     }
 
     /**
-     * Best-effort publication of freshly-emitted segments to the configured
-     * {@link SegmentPublisher} (segmented-v2 ZooKeeper segment registry).
-     * Failures here are swallowed (logged): the local IndexStatus has already
-     * been durably persisted, so the segments are visible locally and a future
-     * checkpoint cycle can re-register any missing entries. We catch broad
-     * Exception here on purpose — the publisher is a plugin boundary and a
-     * misbehaving publisher MUST NOT abort an otherwise-successful checkpoint.
+     * Builds the {@link NewSegmentInfo} list for a checkpoint cycle from its
+     * {@link SegmentWriteResult}s. Used both by {@link #stageNewSegmentsBestEffort}
+     * (before IndexStatus persist) and {@link #commitStagedSegmentsBestEffort}
+     * (after) so the same identity flows through both phases.
      */
-    private void publishNewSegmentsBestEffort(
-            List<SegmentWriteResult> newSegmentResults, LogSequenceNumber sequenceNumber) {
-        SegmentPublisher publisher = this.segmentPublisher;
-        if (publisher == null) {
-            return;
-        }
-        long generation = currentIndexStatusGeneration.get();
+    private List<NewSegmentInfo> buildPublishInfo(
+            List<SegmentWriteResult> newSegmentResults, LogSequenceNumber sequenceNumber,
+            long generation) {
         List<NewSegmentInfo> info = new ArrayList<>(newSegmentResults.size());
         for (SegmentWriteResult swr : newSegmentResults) {
+            if (swr.segmentUuid == null) {
+                LOGGER.log(Level.WARNING,
+                        "skipping publish of segment {0} (segmentId={1}) — UUID was not stamped",
+                        new Object[]{indexName, swr.segmentId});
+                continue;
+            }
             info.add(new NewSegmentInfo(
-                    swr.segmentId,
+                    swr.segmentId, swr.segmentUuid,
                     swr.graphFilePath, swr.graphFileSize,
                     swr.mapFilePath, swr.mapFileSize,
                     swr.estimatedSizeBytes, swr.vectorCount, generation,
                     sequenceNumber));
         }
+        return info;
+    }
+
+    /**
+     * Best-effort {@link SegmentPublisher#stageNewSegments} call: registers
+     * PROVISIONAL znodes BEFORE IndexStatus is durable. Failures are logged but
+     * don't fail the checkpoint — the next reconciliation pass will heal any
+     * gaps. Broad catch is intentional: the publisher is a plugin boundary.
+     */
+    private void stageNewSegmentsBestEffort(SegmentPublisher publisher, List<NewSegmentInfo> info) {
+        if (info == null || info.isEmpty()) {
+            return;
+        }
         try {
-            publisher.publishNewSegments(info);
+            publisher.stageNewSegments(info);
         } catch (Exception e) {
             LOGGER.log(Level.WARNING,
-                    "segment publisher failed for index {0} (generation {1}, {2} new segments); "
-                            + "checkpoint succeeded locally — will retry on next cycle",
-                    new Object[]{indexName, generation, info.size()});
-            LOGGER.log(Level.WARNING, "publisher failure detail", e);
+                    "segment publisher.stage failed for index {0} ({1} segments); "
+                            + "checkpoint will continue, reconcile-on-restart will heal",
+                    new Object[]{indexName, info.size()});
+            LOGGER.log(Level.WARNING, "stage failure detail", e);
         }
+    }
+
+    /**
+     * Best-effort {@link SegmentPublisher#commitStagedSegments} call: flips
+     * PROVISIONAL znodes to ACTIVE after IndexStatus is durable. Failures are
+     * logged; the next reconciliation pass will promote any orphan PROVISIONAL
+     * whose UUID is now in IndexStatus.
+     */
+    private void commitStagedSegmentsBestEffort(SegmentPublisher publisher, List<NewSegmentInfo> info) {
+        if (info == null || info.isEmpty()) {
+            return;
+        }
+        try {
+            publisher.commitStagedSegments(info);
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING,
+                    "segment publisher.commit failed for index {0} ({1} segments); "
+                            + "checkpoint succeeded locally, reconcile-on-restart will heal",
+                    new Object[]{indexName, info.size()});
+            LOGGER.log(Level.WARNING, "commit failure detail", e);
+        }
+    }
+
+    /**
+     * Walks the in-memory segments (loaded from IndexStatus) and produces a
+     * {@link NewSegmentInfo} list suitable for {@link SegmentPublisher#reconcileWithIndexStatus}.
+     * Only segments with a non-null UUID participate (legacy segments are skipped).
+     * Called once at {@link #start()} when a publisher is attached.
+     */
+    private List<NewSegmentInfo> buildExistingSegmentsInfoForReconcile() {
+        List<NewSegmentInfo> info = new ArrayList<>(segments.size());
+        long generation = currentIndexStatusGeneration.get();
+        for (VectorSegment seg : segments) {
+            if (seg.segmentUuid == null) {
+                continue;
+            }
+            // baseLsn for already-loaded segments is unknown post-restart (the
+            // sequence-number was an attribute of the IndexStatus snapshot, not of
+            // the segment); use START_OF_TIME as a sentinel — the registry never
+            // overwrites baseLsn during reconcile so an existing znode keeps its
+            // original value.
+            info.add(new NewSegmentInfo(
+                    seg.segmentId, seg.segmentUuid,
+                    seg.graphFilePath, seg.graphFileSize,
+                    seg.mapFilePath, seg.mapFileSize,
+                    seg.estimatedSizeBytes, /* vectorCount unknown post-restart */ 0L,
+                    Math.max(seg.generation, generation),
+                    LogSequenceNumber.START_OF_TIME));
+        }
+        return info;
     }
 
     /**
@@ -3998,11 +4139,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         ByteBuffer metaBuf = ByteBuffer.wrap(status.indexData);
 
         int version = metaBuf.getInt();
-        if (version != METADATA_VERSION_MULTI_SEGMENT) {
+        if (version != METADATA_VERSION_MULTI_SEGMENT && version != METADATA_VERSION_MULTI_SEGMENT_V4) {
             LOGGER.log(Level.SEVERE,
-                    "unsupported vector index metadata version {0} for {1} (only v{2} is supported),"
+                    "unsupported vector index metadata version {0} for {1} (supported: v{2}, v{3}),"
                             + " starting empty — old experimental formats have been removed",
-                    new Object[]{version, indexName, METADATA_VERSION_MULTI_SEGMENT});
+                    new Object[]{version, indexName,
+                            METADATA_VERSION_MULTI_SEGMENT, METADATA_VERSION_MULTI_SEGMENT_V4});
             return;
         }
 
@@ -4021,11 +4163,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.dimension = dim;
         newPageId.set(status.newPageId);
 
-        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha,
+                version);
     }
 
     private void loadMultiSegmentFormat(ByteBuffer metaBuf, int dim, long savedNextNodeId,
-                                         int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
+                                         int savedBeamWidth, float savedNeighborOverflow, float savedAlpha,
+                                         int formatVersion)
             throws IOException, DataStorageManagerException {
         java.io.DataInputStream dis = new java.io.DataInputStream(
                 new java.io.ByteArrayInputStream(metaBuf.array(), metaBuf.position(),
@@ -4057,6 +4201,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             String mapFilePath;
             long mapFileSize;
             long generation;
+            String segmentUuid = null;
             try {
                 segId = dis.readInt();
                 estimatedSize = dis.readLong();
@@ -4065,6 +4210,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 mapFilePath = dis.readUTF();
                 mapFileSize = dis.readLong();
                 generation = dis.readLong();
+                if (formatVersion >= METADATA_VERSION_MULTI_SEGMENT_V4) {
+                    String raw = dis.readUTF();
+                    segmentUuid = raw.isEmpty() ? null : raw;
+                }
             } catch (IOException e) {
                 throw new DataStorageManagerException("Failed to read segment metadata", e);
             }
@@ -4076,6 +4225,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             seg.mapFilePath = mapFilePath.isEmpty() ? null : mapFilePath;
             seg.mapFileSize = mapFileSize;
             seg.generation = generation;
+            seg.segmentUuid = segmentUuid;
 
             Path mapFile = readMultipartMapDataToTempFile(seg);
             loadFusedPQSegment(seg, mapFile, dim, savedNextNodeId);
@@ -4489,9 +4639,30 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // Existing (sealed/mergeable) segments keep their stored generation.
         long newGeneration = currentIndexStatusGeneration.get() + 1;
 
+        // Decide format version: v4 if any segment carries a non-null UUID (i.e. the index
+        // is in segmented-v2 mode), otherwise v3 to keep binary-compatible rollback for
+        // legacy clusters that never opted into the optimizer.
+        boolean anyUuid = false;
+        for (VectorSegment seg : sealedSegments) {
+            if (seg.segmentUuid != null) { anyUuid = true; break; }
+        }
+        if (!anyUuid) {
+            for (VectorSegment seg : mergeableSegments) {
+                if (seg.segmentUuid != null) { anyUuid = true; break; }
+            }
+        }
+        if (!anyUuid) {
+            for (SegmentWriteResult swr : newSegmentResults) {
+                if (swr.segmentUuid != null) { anyUuid = true; break; }
+            }
+        }
+        final int formatVersion = anyUuid
+                ? METADATA_VERSION_MULTI_SEGMENT_V4
+                : METADATA_VERSION_MULTI_SEGMENT;
+
         VisibleByteArrayOutputStream baos = new VisibleByteArrayOutputStream(256);
         try (java.io.DataOutputStream dos = new java.io.DataOutputStream(baos)) {
-            dos.writeInt(METADATA_VERSION_MULTI_SEGMENT);
+            dos.writeInt(formatVersion);
             dos.writeInt(dimension);
             dos.writeInt(m);
             dos.writeInt(beamWidth);
@@ -4500,27 +4671,27 @@ public class PersistentVectorStore extends AbstractVectorStore {
             dos.writeByte(ADD_HIERARCHY ? 1 : 0);
             dos.writeByte(1); // fusedPQ
             // nextNodeId widened to int64 after issue #256. Format version
-            // stays at v3 — the loader refuses unknown versions, so mixing
-            // old + new clients on the same checkpoint directory fails loud
-            // at load time rather than silently truncating the counter.
+            // stays at v3 in legacy mode — the loader refuses unknown versions,
+            // so mixing old + new clients on the same checkpoint directory fails
+            // loud at load time rather than silently truncating the counter.
             dos.writeLong(nextNodeId.get());
             dos.writeLong(newGeneration);
             dos.writeInt(totalSegments);
 
             for (VectorSegment seg : sealedSegments) {
-                writeSegmentMeta(dos, seg.segmentId, seg.estimatedSizeBytes,
+                writeSegmentMeta(dos, seg.segmentId, seg.segmentUuid, seg.estimatedSizeBytes,
                         seg.graphFilePath, seg.graphFileSize,
-                        seg.mapFilePath, seg.mapFileSize, seg.generation);
+                        seg.mapFilePath, seg.mapFileSize, seg.generation, formatVersion);
             }
             for (VectorSegment seg : mergeableSegments) {
-                writeSegmentMeta(dos, seg.segmentId, seg.estimatedSizeBytes,
+                writeSegmentMeta(dos, seg.segmentId, seg.segmentUuid, seg.estimatedSizeBytes,
                         seg.graphFilePath, seg.graphFileSize,
-                        seg.mapFilePath, seg.mapFileSize, seg.generation);
+                        seg.mapFilePath, seg.mapFileSize, seg.generation, formatVersion);
             }
             for (SegmentWriteResult swr : newSegmentResults) {
-                writeSegmentMeta(dos, swr.segmentId, swr.estimatedSizeBytes,
+                writeSegmentMeta(dos, swr.segmentId, swr.segmentUuid, swr.estimatedSizeBytes,
                         swr.graphFilePath, swr.graphFileSize,
-                        swr.mapFilePath, swr.mapFileSize, newGeneration);
+                        swr.mapFilePath, swr.mapFileSize, newGeneration, formatVersion);
             }
 
             List<PendingDelete> snapshotPending = new ArrayList<>(pendingDeletes);
@@ -4545,10 +4716,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     private static void writeSegmentMeta(
             java.io.DataOutputStream dos,
-            int segmentId, long estimatedSizeBytes,
+            int segmentId, String segmentUuid, long estimatedSizeBytes,
             String graphFilePath, long graphFileSize,
             String mapFilePath, long mapFileSize,
-            long generation) throws IOException {
+            long generation, int formatVersion) throws IOException {
         dos.writeInt(segmentId);
         dos.writeLong(estimatedSizeBytes);
         dos.writeUTF(graphFilePath);
@@ -4556,6 +4727,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         dos.writeUTF(mapFilePath != null ? mapFilePath : "");
         dos.writeLong(mapFileSize);
         dos.writeLong(generation);
+        if (formatVersion >= METADATA_VERSION_MULTI_SEGMENT_V4) {
+            // The empty string is the on-wire representation of "no UUID assigned"
+            // — the v3 reader doesn't see this byte at all, the v4 reader maps it
+            // back to null on load.
+            dos.writeUTF(segmentUuid != null ? segmentUuid : "");
+        }
     }
 
     // -------------------------------------------------------------------------

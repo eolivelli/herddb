@@ -23,7 +23,6 @@ import herddb.utils.Bytes;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,9 +38,13 @@ import java.util.Map;
  * to filter (or worse, the duplicate occupies a slot that should have gone
  * to the next-best result).
  *
- * <p>Tie-break: when the same PK appears in multiple sub-results with
- * different scores, the higher score wins. With identical scores the first
- * observation wins (deterministic).
+ * <p>Tie-break (review item A7 — explicit determinism): when the same PK
+ * appears in multiple sub-results with different scores, the higher score
+ * wins. When two distinct PKs have IDENTICAL scores, output order is
+ * stable: PKs are sorted by (descending score, ascending PK lex order).
+ * Pool iteration order does NOT influence the output, so a request that
+ * fans out to instances in different orderings (e.g. after a ZK reconnect
+ * shuffles the discovery list) returns the same top-K.
  *
  * <p>This class is a pure function and stateless; safe to call from any
  * thread.
@@ -89,13 +92,27 @@ public final class SearchResultMerger {
             }
         }
 
-        // Top-K by descending score. For our typical N=10..100 this is fine; for
-        // truly huge K a partial sort would be cheaper but is overkill here.
+        // Top-K by descending score, ties broken by ascending PK lex order so the
+        // output is fully deterministic across requests regardless of pool iteration
+        // order (review item A7). For our typical N=10..100 this comparator-based
+        // sort is fine; for truly huge K a partial sort would be cheaper but is
+        // overkill here.
+        //
+        // Hot-path note: this comparator runs on the client search-result merge path,
+        // O(N log N) where N is the deduped result count (typically < 1000). The
+        // tie-break uses Bytes.compareTo which is a single memcmp. Net cost is
+        // dominated by the gRPC call itself; the extra ordering work is sub-µs.
         List<Map.Entry<Bytes, Float>> sorted = new ArrayList<>(best.size());
         for (Map.Entry<Bytes, Float> e : best.entrySet()) {
             sorted.add(new AbstractMap.SimpleImmutableEntry<>(e.getKey(), e.getValue()));
         }
-        sorted.sort(Comparator.<Map.Entry<Bytes, Float>, Float>comparing(Map.Entry::getValue).reversed());
+        sorted.sort((a, b) -> {
+            int byScore = Float.compare(b.getValue(), a.getValue()); // descending
+            if (byScore != 0) {
+                return byScore;
+            }
+            return a.getKey().compareTo(b.getKey()); // ascending PK lex order
+        });
         if (sorted.size() > limit) {
             return new ArrayList<>(sorted.subList(0, limit));
         }

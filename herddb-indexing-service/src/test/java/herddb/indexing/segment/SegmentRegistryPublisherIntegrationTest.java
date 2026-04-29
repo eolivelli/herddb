@@ -197,8 +197,16 @@ public class SegmentRegistryPublisherIntegrationTest {
         dsm.initTablespace(TABLE_SPACE);
 
         // A publisher that always blows up. The checkpoint must still succeed.
-        herddb.index.vector.SegmentPublisher faulty = segments -> {
-            throw new RuntimeException("simulated publisher failure");
+        herddb.index.vector.SegmentPublisher faulty = new herddb.index.vector.SegmentPublisher() {
+            @Override
+            public void stageNewSegments(java.util.List<herddb.index.vector.NewSegmentInfo> segments) {
+                throw new RuntimeException("simulated publisher failure");
+            }
+
+            @Override
+            public void commitStagedSegments(java.util.List<herddb.index.vector.NewSegmentInfo> segments) {
+                throw new RuntimeException("simulated publisher failure");
+            }
         };
 
         int dim = 32;

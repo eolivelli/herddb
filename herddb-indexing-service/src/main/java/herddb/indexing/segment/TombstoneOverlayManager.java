@@ -56,14 +56,14 @@ public final class TombstoneOverlayManager {
     private static final Logger LOGGER = Logger.getLogger(TombstoneOverlayManager.class.getName());
 
     /** Multipart fileType prefix — overlays are written as {@code prefix + generation}. */
-    static final String FILE_TYPE_PREFIX = "tombstones-";
+    public static final String FILE_TYPE_PREFIX = "tombstones-";
 
     /** Multipart {@code uuid} component grouping all overlays for a single segment. */
-    static String multipartUuidFor(String indexUuid, String segmentUuid) {
+    public static String multipartUuidFor(String indexUuid, String segmentUuid) {
         return indexUuid + "_seg_" + segmentUuid;
     }
 
-    static String fileTypeFor(long overlayGeneration) {
+    public static String fileTypeFor(long overlayGeneration) {
         return FILE_TYPE_PREFIX + overlayGeneration;
     }
 
@@ -146,13 +146,40 @@ public final class TombstoneOverlayManager {
         }
         watermarkLsn = overlay.getTombstoneLsn();
         lastPublishedGeneration = overlay.getOverlayGeneration();
+        tombstoneCountAtLastFlush = overlay.ordinalCount();
     }
+
+    /**
+     * Tracks the size of {@code tombstoned} at the time of the last successful flush.
+     * Used to skip redundant flushes when no new tombstones were added since the
+     * previous publish (review item A5: avoids re-uploading an overlay file that
+     * would carry the same payload as the previous one).
+     */
+    private int tombstoneCountAtLastFlush = 0;
 
     /**
      * Snapshots the current state, uploads a new overlay file, and CASes the segment
      * znode to point at it. Returns the new overlay (with bumped generation) or
      * {@link Optional#empty()} if the in-memory state hasn't changed since the last
      * successful flush.
+     *
+     * <p><b>Concurrency contract (review item A5):</b> the snapshot is taken under
+     * {@code synchronized(this)} so {@code tombstoned} and {@code watermarkLsn} are
+     * captured atomically. The upload + ZK CAS run lock-free outside the monitor;
+     * concurrent {@link #markDeleted} calls during this window correctly land in
+     * {@code tombstoned} but are NOT reflected in the published overlay. They are
+     * picked up by the next flush. This is safe because:
+     * <ul>
+     *   <li>Tombstones are idempotent set adds — replaying the same delete is a no-op.</li>
+     *   <li>Ordinals are stable per segment — they are never reused by a different PK,
+     *       so an old tombstone for ordinal {@code O} can never accidentally apply to a
+     *       different (later-inserted) PK.</li>
+     *   <li>A new owner that takes over after this flush reads the published
+     *       {@code tombstoneLsn} and replays log entries from there to {@code current};
+     *       any tombstone that arrived in the previous owner's memory during the upload
+     *       window is in that LSN range and gets re-applied. Net result: the new owner's
+     *       in-memory state is a superset of (or equal to) the previous owner's.</li>
+     * </ul>
      *
      * <p>The CAS uses the supplied {@link VersionedSegmentMetadata} as the expected
      * version; on conflict the caller should re-read the znode and retry. We do NOT
@@ -166,6 +193,13 @@ public final class TombstoneOverlayManager {
         synchronized (this) {
             if (tombstoned.isEmpty() && lastPublishedGeneration == 0L) {
                 // Never had any tombstones at all; no need to upload an empty overlay.
+                return Optional.empty();
+            }
+            // Optimisation (review item A5): if nothing new since the last successful
+            // flush, skip the upload + CAS round-trip altogether. The in-flight watermark
+            // may have advanced, but with no new tombstones the published overlay is
+            // already accurate.
+            if (tombstoned.size() == tombstoneCountAtLastFlush && lastPublishedGeneration > 0L) {
                 return Optional.empty();
             }
             snapshotOrdinals = new int[tombstoned.size()];
@@ -231,8 +265,29 @@ public final class TombstoneOverlayManager {
             throw e;
         }
 
+        // Successful flush: now we can delete the *previous* generation's overlay file
+        // so we don't leak one orphan multipart directory per flush (review item A4).
+        // Deletes are best-effort: the segment's current overlay is already published
+        // and the registry znode points at the new path; an undeletable old file is
+        // wasted bytes, not corruption. The optimizer's reaper can sweep stragglers.
+        long previousGeneration;
         synchronized (this) {
+            previousGeneration = lastPublishedGeneration;
             lastPublishedGeneration = snapshotGeneration;
+            tombstoneCountAtLastFlush = snapshotOrdinals.length;
+        }
+        if (previousGeneration > 0L && previousGeneration != snapshotGeneration) {
+            try {
+                dataStorageManager.deleteMultipartIndexFile(
+                        tablespaceUuid,
+                        multipartUuidFor(indexUuid, segmentUuid),
+                        fileTypeFor(previousGeneration));
+            } catch (DataStorageManagerException cleanupErr) {
+                LOGGER.log(Level.WARNING,
+                        "failed to delete superseded tombstone overlay generation {0} for"
+                                + " segment {1} (will leak): {2}",
+                        new Object[]{previousGeneration, segmentUuid, cleanupErr.getMessage()});
+            }
         }
         LOGGER.log(Level.FINE,
                 "flushed tombstone overlay generation {0} for segment {1} ({2} ordinals, lsn={3}, {4} bytes)",

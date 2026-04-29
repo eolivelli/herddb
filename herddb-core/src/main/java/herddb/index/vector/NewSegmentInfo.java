@@ -33,6 +33,7 @@ import herddb.log.LogSequenceNumber;
 public final class NewSegmentInfo {
 
     private final int segmentId;
+    private final String segmentUuid;
     private final String graphFilePath;
     private final long graphFileSize;
     private final String mapFilePath;
@@ -42,12 +43,13 @@ public final class NewSegmentInfo {
     private final long generation;
     private final LogSequenceNumber baseLsn;
 
-    public NewSegmentInfo(int segmentId,
+    public NewSegmentInfo(int segmentId, String segmentUuid,
                           String graphFilePath, long graphFileSize,
                           String mapFilePath, long mapFileSize,
                           long estimatedSizeBytes, long vectorCount, long generation,
                           LogSequenceNumber baseLsn) {
         this.segmentId = segmentId;
+        this.segmentUuid = segmentUuid;
         this.graphFilePath = graphFilePath;
         this.graphFileSize = graphFileSize;
         this.mapFilePath = mapFilePath;
@@ -60,6 +62,15 @@ public final class NewSegmentInfo {
 
     public int getSegmentId() {
         return segmentId;
+    }
+
+    /**
+     * Stable UUID stamped onto this segment by {@link PersistentVectorStore} during
+     * Phase B; persisted in v4 IndexStatus so the same UUID is reused on restart.
+     * Never null when the publisher is invoked.
+     */
+    public String getSegmentUuid() {
+        return segmentUuid;
     }
 
     public String getGraphFilePath() {
@@ -97,6 +108,7 @@ public final class NewSegmentInfo {
     @Override
     public String toString() {
         return "NewSegmentInfo{segmentId=" + segmentId
+                + ", segmentUuid=" + segmentUuid
                 + ", graphPath=" + graphFilePath
                 + ", graphSize=" + graphFileSize
                 + ", mapPath=" + mapFilePath
