@@ -733,7 +733,7 @@ The engine is the core component of the standalone IndexingService. It:
 2. **Buffers transactions** via `TransactionBuffer` — delays DML application until COMMIT.
 3. **Tracks schema** via `SchemaTracker` — processes DDL entries (CREATE/DROP TABLE/INDEX).
 4. **Manages vector stores** — creates `AbstractVectorStore` instances per vector index via `VectorStoreFactory`.
-5. **Persists watermark** via `WatermarkStore` — tracks last processed LSN (`watermark.dat`, atomic write via temp + rename) for restart recovery.
+5. **Persists watermark** via `WatermarkStore` — at every successful checkpoint writes a `WatermarkSnapshot` containing the last-applied LSN, `numInstances`, the current table/index schema, and the per-store checkpoint UUID (`_is.store.uuid`) to disk or S3; on restart loads this snapshot to resume from the exact checkpoint state without full log replay.
 6. **Runs periodic checkpoints** via `ScheduledExecutorService` — triggers `PersistentVectorStore.checkpoint()` on all persistent stores.
 7. **Routes DML** via striped apply workers (see CommitLog Tailing & DML Parallelism).
 
@@ -750,6 +750,20 @@ On `start()`, the engine reads `indexing.storage.type` from configuration:
 - `indexes: HashMap<String, Index>` — current index definitions.
 
 On CREATE_INDEX: the engine calls `createVectorStoreIfNeeded()` → `factory.create()` → registers the store. On DROP_INDEX or DROP_TABLE: the corresponding store is removed and closed.
+
+**Duplicate CREATE_INDEX guard.** `createVectorStoreIfNeeded` also tracks the logical `Index.uuid` alongside each store. If the commit-log tailer replays a CREATE_INDEX entry for an index whose store was already created by `installSchemaFromSnapshot` on startup, the duplicate is detected and silently skipped (same UUID → no-op). If a different UUID is seen for the same `(table, index)` key — which should not happen in normal operation but could indicate log divergence — a WARNING is logged and the existing store is kept.
+
+### Schema snapshot in the watermark (issue #368)
+
+When a checkpoint completes, `checkpointAndSaveWatermark` collects the current schema from `SchemaTracker` and embeds it in the `WatermarkSnapshot` before writing it to `WatermarkStore`. Each vector index in the snapshot also carries the property `_is.store.uuid` (key `IndexingServiceEngine.PROP_IS_STORE_UUID`), which is the storage-level UUID of its `PersistentVectorStore` (obtained via `AbstractVectorStore.getStoreUUID()`).
+
+On restart the engine calls `installSchemaFromSnapshot`, which:
+
+1. Pre-populates `SchemaTracker` with the saved tables and indexes so that DML entries can be routed to the correct vector store even when the early BookKeeper ledgers that carried the original `CREATE_TABLE` / `CREATE_INDEX` entries have been trimmed by the server's retention policy.
+2. Creates each vector store via the configured `VectorStoreFactory`, passing the saved `_is.store.uuid` in `indexProperties`. The factory reads this value and reuses the same UUID instead of generating a fresh one. `PersistentVectorStore` uses this UUID to construct its S3 / local-disk checkpoint path, so `getIndexStatus()` finds the existing checkpoint from the previous run and loads its segments — no DML replay required.
+3. Sets the tailer start position to the **watermark LSN** (not `START_OF_TIME`), so only commit-log entries that arrived *after* the checkpoint need to be replayed.
+
+Stores that have no persistent checkpoint state (e.g. `InMemoryVectorStore`) return `null` from `getStoreUUID()`, so `_is.store.uuid` is omitted from the snapshot for those indexes. A subsequent checkpoint with an in-memory store also clears any stale UUID that was loaded from a previous snapshot.
 
 ---
 
@@ -848,42 +862,92 @@ live from any indexing-service replica via
 
 ### Indexing-service restart after a rebalance
 
-Recovery uses two complementary mechanisms:
+Recovery uses three complementary mechanisms:
 
-1. **Watermark snapshot.** Every successful indexing-service
-   checkpoint persists a `WatermarkSnapshot` — last-applied
-   `LogSequenceNumber` AND the engine's effective `numInstances`
-   at that point — through the configured `WatermarkStore`
-   (`LocalWatermarkStore` for persistent local volumes,
-   `S3WatermarkStore` for ephemeral pods on shared object storage).
-   Both fields are serialised in a single object: file format `byte
-   version=1 | long ledgerId | long offset | int numInstances`
-   for the local store; checksummed
-   `version | flags | ledgerId | offset | numInstances | XXHash64`
-   on S3. On engine startup the snapshot is loaded and
-   `currentNumInstances` is set from it, so a freshly-restarted
-   engine starts ALREADY at the correct routing value — even if
-   the BookKeeper ledger that carried the most recent
-   `INDEXING_SERVICE_REBALANCE` entry has been trimmed in the
-   meantime. A snapshot value of `0` (the
-   `WatermarkSnapshot.START_OF_TIME` sentinel) means "no recovery
-   state yet"; the engine falls back to its JVM-property
-   bootstrap `indexing.cluster.numInstances`.
-2. **Log replay.** After loading the snapshot, the tailer also
-   replays the commit log from `LogSequenceNumber.START_OF_TIME`
-   so it can reprocess DDL entries (CREATE_TABLE, CREATE_INDEX,
-   ALTER_*) and rebuild the in-memory `SchemaTracker`. Any
-   `INDEXING_SERVICE_REBALANCE` entry it encounters in replay
-   updates `currentNumInstances` again — idempotent, since the
-   snapshot value is already correct.
+1. **Watermark snapshot.** Every successful indexing-service checkpoint
+   persists a `WatermarkSnapshot` through the configured `WatermarkStore`
+   (`LocalWatermarkStore` for persistent local volumes, `S3WatermarkStore`
+   for ephemeral pods on shared object storage).  The snapshot contains:
 
-The only situation where neither mechanism is sufficient is a pod
-that has BOTH no persistent watermark AND no BK history available
-(typically a brand-new pod added during a scale-up after history
-was trimmed). That is exactly what the JOINING fallback covers:
-the engine enters `JOINING`, drops every commit-log entry, and
-waits for the next REBALANCE entry — which the operator triggers
-via the same `EXECUTE INDEXING_SERVICE_REBALANCE` SQL.
+   | Field | Purpose |
+   |---|---|
+   | `LogSequenceNumber lsn` | Resume point for the commit-log tailer |
+   | `int numInstances` | Effective routing fan-out at checkpoint time |
+   | `List<Table> tables` | Full table definitions at checkpoint time |
+   | `List<Index> vectorIndexes` | Vector index definitions, each carrying the property `_is.store.uuid` |
+
+   The binary format for the **local store** is:
+   ```
+   byte version=1 | long ledgerId | long offset | int numInstances
+   | int tableCount  | for each: int len, byte[len] Table
+   | int indexCount  | for each: int len, byte[len] Index
+   ```
+   The **S3 store** uses the same payload with an additional XXHash64
+   footer covering all preceding bytes for integrity detection.
+
+   On engine startup the snapshot is loaded and:
+   - `currentNumInstances` is set from it, so a freshly-restarted engine
+     starts ALREADY at the correct routing value — even if the BK ledger
+     that carried the most recent `INDEXING_SERVICE_REBALANCE` entry has
+     been trimmed.
+   - `SchemaTracker` is pre-populated from `tables` and `vectorIndexes`
+     (see [Schema snapshot in the watermark](#schema-snapshot-in-the-watermark-issue-368)).
+   - Each vector store is created with the UUID embedded in `_is.store.uuid`
+     (see [The `_is.store.uuid` property](#the-_isstoruuid-property) below).
+   - The tailer starts from `lsn` rather than `START_OF_TIME`, so only
+     entries newer than the checkpoint need to be replayed.
+
+   A snapshot value of `START_OF_TIME` (ledgerId=−1, offset=−1, numInstances=0)
+   means "no recovery state"; the engine falls back to its JVM-property
+   bootstrap `indexing.cluster.numInstances` and replays the full log.
+
+2. **Log replay (post-watermark only).** After schema is hydrated from the
+   snapshot, the tailer tails the commit log starting at the watermark LSN.
+   Only entries that arrived *after* the checkpoint are applied — DDL entries
+   (CREATE_TABLE, CREATE_INDEX) and any `INDEXING_SERVICE_REBALANCE` entries
+   in that window update the live state as usual.  When no snapshot is
+   available the tailer starts from `START_OF_TIME` and replays everything.
+
+3. **`_is.store.uuid` — persistent vector store checkpoint recovery.** Each
+   `PersistentVectorStore` instance has a storage-level UUID (obtained via
+   `AbstractVectorStore.getStoreUUID()`) that is the key segment of every S3
+   path that store has ever written to:
+
+   ```
+   {tableSpace}/_indexing/{instanceId}/{indexUUID}/...  ← S3 checkpoint data
+   ```
+
+   This UUID is auto-generated the *first* time the store is created:
+   ```java
+   // IndexingServiceEngine — VectorStoreFactory
+   String savedUUID = indexProperties.get("_is.store.uuid");   // from WatermarkSnapshot
+   String indexUUID = (savedUUID != null) ? savedUUID
+                    : indexName + "_" + tableName + "_" + System.nanoTime();
+   ```
+
+   The problem it solves: without this mechanism, every restart would generate
+   a fresh `nanoTime()` UUID.  `PersistentVectorStore.start()` calls
+   `dataStorageManager.getIndexStatus(tableSpaceUUID, freshUUID, ...)` — finds
+   nothing — and starts from an empty store.  If the tailer also starts from
+   `START_OF_TIME` the data is rebuilt by full replay; but when early BK
+   ledgers have been trimmed *and* the watermark LSN is used as the tailer
+   start, there is no DML replay to repopulate the store, and every ANN query
+   returns empty results.
+
+   The fix: at each checkpoint `checkpointAndSaveWatermark` reads
+   `store.getStoreUUID()` for every `PersistentVectorStore` and stores the
+   value in the snapshot index's `properties` map under key `_is.store.uuid`.
+   On restart the factory reads that property and reuses the same UUID, so
+   `getIndexStatus()` locates the existing S3 checkpoint and loads all
+   previously-persisted segments.  Only the DML entries that arrived after the
+   watermark LSN need to be replayed.
+
+The only situation where none of the three mechanisms is sufficient is a pod
+that has BOTH no persistent watermark AND no BK history available (typically a
+brand-new pod added during a scale-up after history was trimmed). That is
+exactly what the JOINING fallback covers: the engine enters `JOINING`, drops
+every commit-log entry, and waits for the next REBALANCE entry — which the
+operator triggers via the same `EXECUTE INDEXING_SERVICE_REBALANCE` SQL.
 
 ### Transactions across a rebalance
 
