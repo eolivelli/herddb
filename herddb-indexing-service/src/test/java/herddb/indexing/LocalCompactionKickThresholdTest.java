@@ -180,6 +180,37 @@ public class LocalCompactionKickThresholdTest {
         }
     }
 
+    @Test
+    public void cachedKickThresholdMatchesFreshComputationAtConstruction() throws Exception {
+        // Defense-in-depth: PersistentVectorStore initializes
+        // {@code kickThresholdCached} with a hand-rolled formula that must
+        // stay byte-equal to what {@code recomputeKickThresholdCached()} would
+        // compute from the configured defaults. If a future commit changes
+        // either default ({@code localCompactionKickFraction = 0.7d} or
+        // {@code compactionBackpressureThreshold = 500}) but forgets to
+        // update the field-initializer formula, this test fails immediately
+        // — without it, the cached threshold would silently drift away from
+        // the configured defaults until either setter happened to fire.
+        Path baseDir = tmpFolder.newFolder("data").toPath();
+        Path tmpDir = tmpFolder.newFolder("tmp").toPath();
+        FileDataStorageManager dsm = new FileDataStorageManager(baseDir);
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            int initial = store.currentLocalCompactionKickThreshold();
+            // Explicitly re-set to the SAME defaults; either setter triggers
+            // recomputeKickThresholdCached(), giving us the canonical value.
+            // If the field-initializer drifted from the recompute formula,
+            // {@code initial} would NOT equal {@code recomputed}.
+            store.setCompactionBackpressureThreshold(500);
+            store.setLocalCompactionKickFraction(0.7d);
+            int recomputed = store.currentLocalCompactionKickThreshold();
+            assertEquals("kickThresholdCached field initializer must match"
+                            + " recomputeKickThresholdCached()'s formula at the configured"
+                            + " defaults — mismatch means the cache silently drifted from"
+                            + " what the setter would compute",
+                    recomputed, initial);
+        }
+    }
+
     @Test(expected = IllegalArgumentException.class)
     public void kickFractionMustBeStrictlyBetweenZeroAndOne() throws Exception {
         Path baseDir = tmpFolder.newFolder("data").toPath();
