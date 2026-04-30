@@ -120,9 +120,13 @@ public class LocalWatermarkStore implements WatermarkStore {
                     vectorIndexes.add(Index.deserialize(blob));
                 }
             } catch (EOFException eof) {
-                // Pre-schema watermark file: no schema data present.
-                // The engine will start the tailer from START_OF_TIME to rebuild
-                // its SchemaTracker by replaying DDL entries.
+                // Pre-schema watermark file: no schema data present (or file is
+                // partially truncated mid-schema). The engine will start the tailer
+                // from START_OF_TIME to rebuild its SchemaTracker by replaying DDL.
+                LOGGER.log(Level.WARNING,
+                        "Watermark file at {0} has no schema data (pre-schema format or"
+                                + " truncated mid-schema); falling back to empty schema",
+                        watermarkFile);
                 tables = Collections.emptyList();
                 vectorIndexes = Collections.emptyList();
             }
