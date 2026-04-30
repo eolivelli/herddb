@@ -928,6 +928,9 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
                 type = ColumnTypes.BYTEARRAY;
                 break;
             case "floata":
+            case "floatarray":
+                // "floatarray" is the canonical name returned by ColumnTypes.typeToString();
+                // accept both so that DDL round-trips (e.g. SHOW CREATE TABLE output) work.
                 type = ColumnTypes.FLOATARRAY;
                 break;
             case "timestamp":

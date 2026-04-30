@@ -85,6 +85,8 @@ public class ColumnTypes {
                 return "timestamp not null";
             case NOTNULL_BOOLEAN:
                 return "boolean not null";
+            case NOTNULL_FLOATARRAY:
+                return "floatarray not null";
             default:
                 return "type?" + type;
         }

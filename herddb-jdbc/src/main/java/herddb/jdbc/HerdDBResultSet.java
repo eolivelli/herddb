@@ -207,6 +207,11 @@ public final class HerdDBResultSet implements ResultSet {
         ensureNextCalled();
         fillLastValue(columnLabel);
         if (lastValue != null) {
+            if (lastValue instanceof float[]) {
+                // float[] does not override Object.toString(), so use Arrays.toString()
+                // to produce a human-readable "[v0, v1, ...]" string instead of "[F@<hashcode>".
+                return Arrays.toString((float[]) lastValue);
+            }
             return lastValue.toString();
         } else {
             return null;
