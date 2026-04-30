@@ -888,20 +888,21 @@ public final class RecordSerializer {
                 throw new IllegalArgumentException("SQLTranslator error, " + Arrays.toString(columns) + " != " + Arrays.asList(pkColumn));
             }
             Column c = index.getColumn(pkColumn);
-            // Optimisation (issue #377): for FLOATARRAY columns backed by a
-            // DataAccessorForFullRecord extract the raw float bytes directly from the
-            // serialised record value — avoids the float[] decode + re-encode round trip.
-            if ((c.type == ColumnTypes.FLOATARRAY || c.type == ColumnTypes.NOTNULL_FLOATARRAY)
-                    && record instanceof DataAccessorForFullRecord) {
-                Bytes rawFloatBytes = ((DataAccessorForFullRecord) record).getFloatArrayColumnBytesNoCopy(c.name);
-                if (rawFloatBytes != null) {
-                    return rawFloatBytes;
+            // Optimisation (issue #377): for columns backed by a DataAccessorForFullRecord
+            // extract the raw index-key bytes directly from the serialised record value —
+            // avoids the decode + re-encode round trip for FLOATARRAY, STRING, BYTEARRAY,
+            // DOUBLE, and BOOLEAN.  INTEGER, LONG, and TIMESTAMP are NOT optimised here
+            // because their index-key encoding XORs a sign-flip mask that is absent from
+            // the record value encoding.
+            if (record instanceof DataAccessorForFullRecord) {
+                Bytes rawBytes = ((DataAccessorForFullRecord) record).getColumnBytesNoCopy(c.name);
+                if (rawBytes != null) {
+                    return rawBytes;
                 }
-                // rawFloatBytes == null: column is absent (null value)
-                if (index.allowNullsForIndexedValues()) {
-                    return null;
-                }
-                throw new IllegalArgumentException("key field " + pkColumn + " cannot be null. Record data: " + record);
+                // rawBytes == null: either the column is absent (null value) for a type
+                // that is optimisable, or the type is non-optimisable (INTEGER/LONG/
+                // TIMESTAMP).  Fall through to the general get() + serialize() path,
+                // which handles both cases correctly.
             }
             Object v = record.get(c.name);
             if (v == null) {
@@ -946,13 +947,38 @@ public final class RecordSerializer {
     }
 
     /**
-     * Extracts the raw IEEE 754 big-endian float bytes for a FLOATARRAY column from
-     * the record value bytes without allocating a {@code float[]}.
-     * The returned {@link Bytes} is a zero-copy view into the original value buffer.
-     * Returns {@code null} if the column is absent (null value) or if the stored type
-     * tag does not match a FLOATARRAY type.
+     * Extracts the raw index-key bytes for a single-column non-PK index column directly
+     * from the serialised record value without materialising a Java object.
+     *
+     * <p>The returned {@link Bytes} is a zero-copy view into the original value buffer —
+     * no heap allocation beyond the thin {@code Bytes} wrapper itself.
+     *
+     * <p>This optimisation is applicable to the types listed below, where the
+     * serialised form in the record value uses the <em>same</em> byte encoding as the
+     * single-column index key produced by {@link #serialize(Object, int)}:
+     * <ul>
+     *   <li>{@code FLOATARRAY} / {@code NOTNULL_FLOATARRAY}: strip the leading
+     *       {@code vint(numFloats)} prefix, return the raw IEEE 754 float bytes.
+     *   <li>{@code STRING} / {@code NOTNULL_STRING}: strip the leading {@code vint(len)}
+     *       prefix, return the raw UTF-8 bytes.
+     *   <li>{@code BYTEARRAY} / {@code NOTNULL_BYTEARRAY}: strip the leading
+     *       {@code vint(len)} prefix, return the raw bytes.
+     *   <li>{@code DOUBLE} / {@code NOTNULL_DOUBLE}: return the 8 raw big-endian bytes
+     *       (no prefix).
+     *   <li>{@code BOOLEAN} / {@code NOTNULL_BOOLEAN}: return the single raw byte
+     *       (no prefix).
+     * </ul>
+     *
+     * <p>{@code INTEGER}, {@code LONG}, and {@code TIMESTAMP} are <em>not</em> optimisable
+     * here because their index-key encoding XORs a sign-flip mask (see
+     * {@link Bytes#putInt}/{@link Bytes#putLong}) that is absent from the record value
+     * encoding ({@code DataOutputStream.writeInt/writeLong}).
+     *
+     * @return a zero-copy {@link Bytes} view of the raw index-key bytes, or {@code null}
+     *         if the column is absent / null in the record, or the column type is not
+     *         optimisable (caller should fall back to {@link #serialize(Object, int)}).
      */
-    static Bytes extractFloatArrayBytesNoCopy(
+    static Bytes extractRawIndexBytesNoCopy(
             String property, Bytes value, Table table) throws IOException {
         Column column = table.getColumn(property);
         if (column == null) {
@@ -967,18 +993,45 @@ public final class RecordSerializer {
                 Column col = table.getColumnBySerialPosition(serialPosition);
                 if (col != null && col.name.equals(property)) {
                     int type = din.readVInt();
-                    if (type == ColumnTypes.FLOATARRAY || type == ColumnTypes.NOTNULL_FLOATARRAY) {
-                        int len = din.readVInt();
-                        if (len == -1) {
-                            return null; // explicit NULL marker
+                    switch (type) {
+                        case ColumnTypes.FLOATARRAY:
+                        case ColumnTypes.NOTNULL_FLOATARRAY: {
+                            // vint(numFloats) prefix in value; index key = raw float bytes
+                            int len = din.readVInt();
+                            if (len == -1) {
+                                return null; // explicit NULL marker
+                            }
+                            if (len == 0) {
+                                return Bytes.EMPTY_ARRAY;
+                            }
+                            return Bytes.from_array(din.getArray(), din.getPosition(), len * 4);
                         }
-                        if (len == 0) {
-                            return Bytes.EMPTY_ARRAY;
+                        case ColumnTypes.STRING:
+                        case ColumnTypes.NOTNULL_STRING:
+                        case ColumnTypes.BYTEARRAY:
+                        case ColumnTypes.NOTNULL_BYTEARRAY: {
+                            // vint(len) prefix in value; index key = raw bytes only
+                            int len = din.readVInt();
+                            if (len == -1) {
+                                return null; // explicit NULL marker
+                            }
+                            if (len == 0) {
+                                return Bytes.EMPTY_ARRAY;
+                            }
+                            return Bytes.from_array(din.getArray(), din.getPosition(), len);
                         }
-                        // Zero-copy: return a view into the underlying byte array
-                        return Bytes.from_array(din.getArray(), din.getPosition(), len * 4);
+                        case ColumnTypes.DOUBLE:
+                        case ColumnTypes.NOTNULL_DOUBLE:
+                            // 8 raw big-endian bytes, no prefix; same encoding in value and key
+                            return Bytes.from_array(din.getArray(), din.getPosition(), 8);
+                        case ColumnTypes.BOOLEAN:
+                        case ColumnTypes.NOTNULL_BOOLEAN:
+                            // 1 raw byte, no prefix; same encoding in value and key
+                            return Bytes.from_array(din.getArray(), din.getPosition(), 1);
+                        default:
+                            // INTEGER, LONG, TIMESTAMP: sign-flipped key encoding; cannot copy raw bytes
+                            return null;
                     }
-                    return null; // unexpected type for this column
                 } else {
                     skipTypeAndValue(din);
                 }
@@ -1003,10 +1056,14 @@ public final class RecordSerializer {
                 throw new IllegalArgumentException("SQLTranslator error, " + Arrays.toString(columns) + " != " + Arrays.asList(pkColumn));
             }
             Column c = indexDefinition.getColumn(pkColumn);
-            // Optimisation (issue #377): for FLOATARRAY columns the type is always correct
-            // when the value comes from serialised bytes, so the instanceof check in validate()
-            // is a guaranteed no-op.  Avoid materialising a float[] entirely.
-            if (c.type == ColumnTypes.FLOATARRAY || c.type == ColumnTypes.NOTNULL_FLOATARRAY) {
+            // Optimisation (issue #377): for FLOATARRAY columns backed by
+            // DataAccessorForFullRecord the type is always correct (enforced by the
+            // serialised format), so the instanceof check inside validate() is a
+            // guaranteed no-op.  Other DataAccessor implementations (e.g. MapDataAccessor)
+            // may carry user-supplied values of unexpected types (List<Number>, String, …)
+            // so we must still run validate() for them.
+            if ((c.type == ColumnTypes.FLOATARRAY || c.type == ColumnTypes.NOTNULL_FLOATARRAY)
+                    && record instanceof DataAccessorForFullRecord) {
                 if (!indexDefinition.allowNullsForIndexedValues()) {
                     Object v = record.get(c.name);
                     if (v == null) {
@@ -1029,8 +1086,9 @@ public final class RecordSerializer {
                     throw new IllegalArgumentException("SQLTranslator error, " + Arrays.toString(columns) + " != " + Arrays.asList(columnListForIndex));
                 }
                 Column c = indexDefinition.getColumn(pkColumn);
-                // Optimisation (issue #377): same as single-column case above
-                if (c.type == ColumnTypes.FLOATARRAY || c.type == ColumnTypes.NOTNULL_FLOATARRAY) {
+                // Optimisation (issue #377): same gating as the single-column path above
+                if ((c.type == ColumnTypes.FLOATARRAY || c.type == ColumnTypes.NOTNULL_FLOATARRAY)
+                        && record instanceof DataAccessorForFullRecord) {
                     if (!indexDefinition.allowNullsForIndexedValues()) {
                         Object v = record.get(c.name);
                         if (v == null) {

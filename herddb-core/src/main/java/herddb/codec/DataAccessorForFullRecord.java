@@ -189,23 +189,30 @@ public class DataAccessorForFullRecord extends AbstractDataAccessor {
     }
 
     /**
-     * Returns the raw IEEE 754 big-endian float bytes for a FLOATARRAY column from the
-     * record value bytes without allocating a {@code float[]}.  The returned {@link Bytes}
-     * is a zero-copy view into the underlying record value buffer.
-     * Returns {@code null} if the column value is null/absent or if the column is a
-     * primary-key column (whose bytes live in the key, not the value).
-     * <p>
-     * Package-private: used exclusively by {@link RecordSerializer} as a performance
+     * Returns the raw index-key bytes for a non-PK column directly from the record value
+     * bytes, without materialising a Java object.  The returned {@link Bytes} is a
+     * zero-copy view into the underlying record value buffer.
+     *
+     * <p>Returns {@code null} when:
+     * <ul>
+     *   <li>the column is a primary-key column (its bytes live in the key buffer, not
+     *       the value buffer — the caller must use {@link #get(String)} in that case),
+     *   <li>the column value is absent / null in the serialised record, or
+     *   <li>the column type is not directly optimisable (e.g. INTEGER, LONG, TIMESTAMP
+     *       whose key encoding differs from the value encoding due to sign-flip masking).
+     *       In that case the caller must fall back to {@link #get(String)} +
+     *       {@link RecordSerializer#serialize(Object, int)}.
+     * </ul>
+     *
+     * <p>Package-private: used exclusively by {@link RecordSerializer} as a performance
      * optimisation (issue #377).
      */
-    Bytes getFloatArrayColumnBytesNoCopy(String property) {
+    Bytes getColumnBytesNoCopy(String property) {
         if (table.isPrimaryKeyColumn(property)) {
-            // PK columns are stored in the key buffer, not in the value bytes;
-            // fall back to the general path via get().
             return null;
         }
         try {
-            return RecordSerializer.extractFloatArrayBytesNoCopy(property, record.value, table);
+            return RecordSerializer.extractRawIndexBytesNoCopy(property, record.value, table);
         } catch (IOException err) {
             throw new IllegalStateException("bad data: " + err, err);
         }
