@@ -767,7 +767,7 @@ public class CalcitePlannerTest {
             manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
             manager.waitForTablespace("tblspace1", 10000);
 
-            // Create a table with nullable and not-null floatarray columns.
+            // Create a table with a nullable floatarray column.
             execute(manager, "CREATE TABLE tblspace1.vectable (id int primary key, vec floata)", Collections.emptyList());
 
             TranslatedQuery translatedQuery = manager.getPlanner().translate("tblspace1", "SHOW CREATE TABLE tblspace1.vectable",
