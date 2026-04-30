@@ -23,6 +23,7 @@ package herddb.remote.storage;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.RemovalListener;
+import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import com.google.common.util.concurrent.Striped;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
@@ -40,6 +41,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -60,6 +62,11 @@ import java.util.stream.Stream;
  * <p>
  * The cache directory is cleared on construction. Cache files are stored flat in
  * {@code cacheDir} with {@code /} replaced by {@code _} in filenames.
+ * <p>
+ * Metrics (issue #336): Caffeine {@code recordStats()} is enabled so callers can query
+ * hit/miss/eviction counts via {@link #diskLruStats()}. Byte-level hit/miss counters are
+ * maintained via {@link AtomicLong} fields incremented in {@link #readRange}. The maximum
+ * cache weight can be changed at runtime via {@link #setMaxCacheBytes(long)}.
  *
  * @author enrico.olivelli
  */
@@ -76,6 +83,18 @@ public class CachingObjectStorage implements ObjectStorage {
     private final ConcurrentHashMap<String, CompletableFuture<ByteBuf>> inFlightReads = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CompletableFuture<Void>> inFlightWrites = new ConcurrentHashMap<>();
 
+    /**
+     * Bytes served from the on-disk cache in {@link #readRange} calls.
+     * Incremented on a cache hit in the readRange hot path (issue #336).
+     */
+    private final AtomicLong hitBytes = new AtomicLong();
+
+    /**
+     * Bytes fetched from inner storage in {@link #readRange} calls (cache miss path).
+     * Incremented when readRange falls through to the inner storage (issue #336).
+     */
+    private final AtomicLong missBytes = new AtomicLong();
+
     public CachingObjectStorage(ObjectStorage inner, Path cacheDir, ExecutorService executor,
                                 long maxCacheBytes) throws IOException {
         this.inner = inner;
@@ -90,6 +109,10 @@ public class CachingObjectStorage implements ObjectStorage {
                     long s = size == null ? 0L : size;
                     return s > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) s;
                 })
+                // recordStats() is required for hit/miss/eviction counters exposed via
+                // diskLruStats(). The cost is negligible (a few AtomicLong increments
+                // per cache operation).
+                .recordStats()
                 .evictionListener((RemovalListener<String, Long>) (key, value, cause) -> {
                     // Synchronous, best-effort delete. Runs on Caffeine's maintenance thread
                     // (or inline on a put() that triggers eviction) — does NOT take the stripe
@@ -103,6 +126,83 @@ public class CachingObjectStorage implements ObjectStorage {
                 })
                 .build();
     }
+
+    // -----------------------------------------------------------------------
+    // Stats and dynamic resize (issue #336)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Returns a snapshot of Caffeine's stats for the disk-LRU index cache.
+     * Provides cumulative hit, miss, eviction and eviction-weight counts since pod start.
+     * Safe to call from gauge samplers (lock-free read of Caffeine's internal counters).
+     */
+    public CacheStats diskLruStats() {
+        return diskLru.stats();
+    }
+
+    /**
+     * Bytes served from the on-disk cache across all {@link #readRange} calls since pod start.
+     * Incremented once per successful disk-cache hit, before the I/O completes, so the counter
+     * counts <em>intended</em> hit bytes (matching the {@code length} parameter of readRange).
+     */
+    public long getHitBytes() {
+        return hitBytes.get();
+    }
+
+    /**
+     * Bytes fetched from the inner storage (GCS / S3 fallback) across all {@link #readRange}
+     * calls since pod start. Incremented on every cache miss.
+     */
+    public long getMissBytes() {
+        return missBytes.get();
+    }
+
+    /**
+     * Approximate number of entries currently tracked in the disk-LRU index.
+     * Safe to call from gauge samplers (Caffeine's {@code estimatedSize()} is thread-safe).
+     */
+    public long estimatedEntries() {
+        return diskLru.estimatedSize();
+    }
+
+    /**
+     * Returns the current maximum weight (bytes) of the disk-cache LRU as reported
+     * by Caffeine's eviction policy. Returns 0 if the policy is not weight-based.
+     */
+    public long getMaxCacheBytes() {
+        return diskLru.policy().eviction()
+                .map(e -> e.getMaximum())
+                .orElse(0L);
+    }
+
+    /**
+     * Dynamically resizes the disk-cache LRU to {@code newMaxBytes}.
+     * <p>
+     * The change is applied immediately via Caffeine's live policy API.
+     * If {@code newMaxBytes} is smaller than the current total weight, Caffeine will
+     * evict excess entries lazily on the next cache access or maintenance cycle.
+     * <p>
+     * <b>This change is NOT persistent</b>: a pod restart will revert to the value
+     * configured in {@code fileserver.properties} / Helm values (issue #336).
+     *
+     * @param newMaxBytes new maximum weight in bytes; must be &gt; 0
+     * @return the previous maximum, or 0 if the policy is not available
+     */
+    public long setMaxCacheBytes(long newMaxBytes) {
+        long[] prev = {0L};
+        diskLru.policy().eviction().ifPresent(e -> {
+            prev[0] = e.getMaximum();
+            e.setMaximum(newMaxBytes);
+        });
+        LOGGER.log(Level.INFO,
+                "Disk cache resized: previousMax={0} bytes, newMax={1} bytes",
+                new Object[]{prev[0], newMaxBytes});
+        return prev[0];
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
 
     private void clearCacheDir() throws IOException {
         if (Files.exists(cacheDir)) {
@@ -290,6 +390,10 @@ public class CachingObjectStorage implements ObjectStorage {
         return pending;
     }
 
+    // -----------------------------------------------------------------------
+    // ObjectStorage implementation
+    // -----------------------------------------------------------------------
+
     @Override
     public CompletableFuture<Void> write(String path, byte[] content) {
         return inner.write(path, content).thenCompose(v -> admitToDisk(path, content));
@@ -458,6 +562,10 @@ public class CachingObjectStorage implements ObjectStorage {
         return ReadResult.found(buf.retainedDuplicate());
     }
 
+    /**
+     * Serves a block slice from the disk cache (hit path) or from the inner storage
+     * (miss path), updating hit/miss byte counters for Prometheus metrics (issue #336).
+     */
     @Override
     public CompletableFuture<ReadResult> readRange(String path, long offset, int length, int blockSize) {
         long blockIndex = offset / blockSize;
@@ -466,8 +574,12 @@ public class CachingObjectStorage implements ObjectStorage {
         return tryReadSliceFromDiskAsync(blockPath, offsetInBlock, length)
                 .thenCompose(cached -> {
                     if (cached != null) {
+                        // Cache HIT: increment byte counter for Prometheus gauge.
+                        hitBytes.addAndGet(length);
                         return CompletableFuture.completedFuture(cached);
                     }
+                    // Cache MISS: increment byte counter and fall through to inner storage.
+                    missBytes.addAndGet(length);
                     return loadAndCache(blockPath).thenApply(full -> sliceFromFull(full, offsetInBlock, length));
                 });
     }

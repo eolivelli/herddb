@@ -97,7 +97,31 @@ public class InMemoryBlockCacheObjectStorage implements ObjectStorage {
     }
 
     public long getMaxBytes() {
-        return maxBytes;
+        return cache.policy().eviction()
+                .map(e -> e.getMaximum())
+                .orElse(maxBytes);
+    }
+
+    /**
+     * Dynamically resizes the in-heap block-cache LRU to {@code newMaxBytes}.
+     * <p>
+     * Applied immediately via Caffeine's live policy API. If {@code newMaxBytes} is
+     * smaller than the current total weight, excess entries are evicted lazily on
+     * the next access or maintenance cycle.
+     * <p>
+     * <b>This change is NOT persistent</b>: a pod restart reverts to the value
+     * configured at construction time (issue #336).
+     *
+     * @param newMaxBytes new maximum weight in bytes; must be &gt; 0
+     * @return the previous maximum, or 0 if the policy is not available
+     */
+    public long setMaxBytes(long newMaxBytes) {
+        long[] prev = {0L};
+        cache.policy().eviction().ifPresent(e -> {
+            prev[0] = e.getMaximum();
+            e.setMaximum(newMaxBytes);
+        });
+        return prev[0];
     }
 
     /**
