@@ -75,6 +75,54 @@ public interface SegmentPublisher {
     }
 
     /**
+     * Revalidate that every supplied input segment is still {@code ACTIVE} in
+     * the registry at the same version we observed. Used by the IS-local
+     * compaction fallback (companion to the external index-optimizer): after
+     * staging a merged output, we must verify no concurrent optimizer has
+     * already deprecated any of the inputs. If revalidation fails the local
+     * compactor aborts the swap, deletes the staged PROVISIONAL znode via
+     * {@link #unstage}, and queues the merged output's multipart files for
+     * cleanup.
+     *
+     * <p>Default returns {@code true} (no-op): publishers that don't track
+     * input lifecycle (legacy single-phase) treat every input as still ACTIVE.
+     *
+     * @return {@code true} iff every input is still {@code ACTIVE} at the same
+     *         registry version observed when the candidates were chosen
+     */
+    default boolean revalidateInputsActive(List<NewSegmentInfo> inputs) {
+        return true;
+    }
+
+    /**
+     * CAS-deprecate the given input segments after a successful local merge.
+     * For each input, transition its registry znode from {@code ACTIVE} to
+     * {@code DEPRECATED}, recording {@code replacementUuid} in {@code replacedBy}
+     * and {@code retentionUntilEpochMillis} in the metadata. Best-effort:
+     * implementations log and continue on per-input version-mismatch (the
+     * optimizer may have raced us on a single input; the merged output remains
+     * valid for the others).
+     *
+     * <p>Default no-op: legacy publishers don't drive the registry.
+     */
+    default void deprecateInputs(List<NewSegmentInfo> inputs, String replacementUuid,
+                                 long retentionUntilEpochMillis) {
+    }
+
+    /**
+     * Best-effort cleanup of previously-staged PROVISIONAL znodes. Called by
+     * the IS-local compactor when revalidation fails (a concurrent optimizer
+     * raced us between stage and revalidate) and we must abort the swap.
+     * Failures are logged; a leaked PROVISIONAL znode is reaped by the next
+     * {@link #reconcileWithIndexStatus} pass on restart, or by an out-of-band
+     * cleanup tick.
+     *
+     * <p>Default no-op: legacy publishers don't track PROVISIONAL state.
+     */
+    default void unstage(List<NewSegmentInfo> staged) {
+    }
+
+    /**
      * Reconcile the registry with IndexStatus on startup (review item A1+A3):
      * <ul>
      *   <li>Promote any PROVISIONAL znode whose UUID matches a segment in IndexStatus

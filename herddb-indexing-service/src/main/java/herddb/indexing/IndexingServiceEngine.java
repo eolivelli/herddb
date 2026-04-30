@@ -491,9 +491,27 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final int vectorCompactionBackpressureSegments = config.getInt(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS_DEFAULT);
+            final double vectorCompactionLocalKickFraction = config.getDouble(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION_DEFAULT);
+            if (!(vectorCompactionLocalKickFraction > 0.0d
+                    && vectorCompactionLocalKickFraction < 1.0d)) {
+                throw new IllegalArgumentException(
+                        IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION
+                                + " must be in (0.0, 1.0), got "
+                                + vectorCompactionLocalKickFraction);
+            }
+            final boolean vectorCompactionLocalEnabledWithOptimizer = config.getBoolean(
+                    IndexingServerConfiguration
+                            .PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_ENABLED_WITH_OPTIMIZER,
+                    IndexingServerConfiguration
+                            .PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_ENABLED_WITH_OPTIMIZER_DEFAULT);
             LOGGER.log(Level.INFO,
-                    "vector index compaction: tieredEnabled={0}, backpressureSegments={1}",
-                    new Object[]{vectorCompactionTieredEnabled, vectorCompactionBackpressureSegments});
+                    "vector index compaction: tieredEnabled={0}, backpressureSegments={1},"
+                            + " localKickFraction={2}, localEnabledWithOptimizer={3}",
+                    new Object[]{vectorCompactionTieredEnabled, vectorCompactionBackpressureSegments,
+                            vectorCompactionLocalKickFraction,
+                            vectorCompactionLocalEnabledWithOptimizer});
             final long maxLiveBytesPerCheckpoint = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT,
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT);
@@ -589,6 +607,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         vectorCompactionRetentionMs);
                 store.setTieredCompactionEnabled(vectorCompactionTieredEnabled);
                 store.setCompactionBackpressureThreshold(vectorCompactionBackpressureSegments);
+                store.setLocalCompactionKickFraction(vectorCompactionLocalKickFraction);
+                store.setLocalCompactionEnabledWithOptimizer(
+                        vectorCompactionLocalEnabledWithOptimizer);
                 try {
                     store.start();
                 } catch (Exception e) {

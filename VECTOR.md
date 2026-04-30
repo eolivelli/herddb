@@ -602,7 +602,7 @@ This reclaims storage held by deleted or superseded PKs — the previous design 
 
 **Concurrency.** Compaction acquires `checkpointLock` only for the final atomic swap and metadata publish — the same lock checkpoint Phase C uses — so `IndexStatus` updates stay monotonic. The heavy rebuild and write run lock-free. Deletes arriving during a rebuild are tracked in `pendingCompactionDeletes` and replayed against the merged output before it becomes visible.
 
-**Background thread.** `PersistentVectorStore` runs a dedicated `vectorIndexCompactionThread` (separate from the checkpoint driver) that wakes every `vector.index.compaction.intervalMs` and invokes `VectorIndexCompactor.runCompactionIfNeeded(...)`. The thread is started only on primaries — shadow replicas never compact. **When the external `index-optimizer` service is enabled (see next section), this thread is suppressed and compaction is driven out-of-process.**
+**Background thread.** `PersistentVectorStore` runs a dedicated `vectorIndexCompactionThread` (separate from the checkpoint driver) that wakes every `vector.index.compaction.intervalMs` and invokes `VectorIndexCompactor.runCompactionIfNeeded(...)`. The thread is started only on primaries — shadow replicas never compact. **When the external `index-optimizer` service is enabled (see next section), this thread becomes a pressure-driven fallback: it stays armed but its cycle body short-circuits below `kickFraction × backpressureThreshold` segments, letting the optimizer drive steady state and only firing locally when accumulation indicates the optimizer is falling behind. See "Pressure-driven IS-local compaction fallback" in the next section for the protocol.**
 
 **Shadow acknowledgement.** Shadow replicas expose their loaded generation via the `GetShadowStatus` RPC; `IndexingServiceEngine` aggregates `min(appliedIndexStatusGeneration)` across all registered shadows. The leader passes that minimum to `reapExpiredPendingDeletes` before every physical delete pass.
 
@@ -689,7 +689,33 @@ IS-side (`IndexingServerConfiguration`):
 
 | Property | Default | Notes |
 |----------|---------|-------|
-| `indexing.optimizer.enabled` | `false` | When `true`, suppresses the per-store `vectorIndexCompactionLoop` thread. Tailer + checkpoint loops still run. |
+| `indexing.optimizer.enabled` | `false` | When `true`, the IS-local `vectorIndexCompactionLoop` becomes pressure-driven (see below). Tailer + checkpoint loops still run. |
+| `vector.index.compaction.local.kick.fraction` | `0.7` | Fraction of `vector.index.compaction.backpressure.segments` above which the IS-local compaction fallback runs. Below this threshold the loop short-circuits and lets the optimizer drive steady state. Range: `(0.0, 1.0)`. |
+| `vector.index.compaction.local.enabledWithOptimizer` | `true` | Master switch for the IS-local fallback when the optimizer is enabled. Set to `false` to fully delegate compaction to the optimizer (the tailer may then stall on back-pressure if the optimizer cannot keep up). |
+
+#### Pressure-driven IS-local compaction fallback
+
+When `indexing.optimizer.enabled=true`, the IS-local compaction thread no longer disappears — it stays armed but only runs cycles when locally-observed segment count crosses `kickFraction × backpressureThreshold` (default `0.7 × 500 = 350`). Steady state remains optimizer-driven; the IS only kicks in when:
+
+- the optimizer is temporarily down,
+- it's leader-locked on a different tablespace,
+- or it's processing a long-running merge while a heavy ingest workload accumulates new sealed segments faster than it can drain them.
+
+The local fallback follows the same staged-publish protocol as the checkpoint:
+
+1. **Stage** the merged output via `SegmentRegistryPublisher.stageNewSegments` (PROVISIONAL znode).
+2. **Revalidate** every input is still ACTIVE in the registry. If a concurrent compactor (the optimizer or another IS) has already deprecated any input we ABORT — call `unstage` on the staged znode, queue the merged output's multipart files for the existing `pendingDeletes` retention reaper, and skip the in-memory swap.
+3. **Persist IndexStatus** locally (the merged output + remaining segments).
+4. **Commit** the staged znode (PROVISIONAL → ACTIVE) and **CAS-deprecate** every input (ACTIVE → DEPRECATED with `replacedBy=[mergedUuid]`).
+
+A per-input `VersionMismatch` during deprecate is benign — the optimizer raced us on that specific input; our merged output remains valid for the others, and the next optimizer tick folds the orphan ACTIVE input into a follow-up merge. Both compactors race freely; ZK CAS prevents corruption.
+
+The `addVectorInternal` hot path also pokes the local loop the instant segment count crosses the kick threshold (cheap int compare on the existing fast path), so the fallback responds within milliseconds, not the per-cycle interval.
+
+Operators can monitor whether the optimizer is keeping up via two new counters on `PersistentVectorStore`:
+
+- `getLocalCompactionPressureRunsTotal()` — number of fallback cycles fired. Non-zero, growing = optimizer is falling behind.
+- `getLocalCompactionSkippedBelowThresholdTotal()` — number of cycles short-circuited. Steady-state baseline.
 
 Optimizer-side (`OptimizerConfiguration`, `conf/indexoptimizer.properties`):
 

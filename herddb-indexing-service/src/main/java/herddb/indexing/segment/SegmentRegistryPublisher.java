@@ -294,6 +294,171 @@ public final class SegmentRegistryPublisher implements SegmentPublisher {
         }
     }
 
+    /**
+     * Revalidate that every input segment is still {@code ACTIVE} in the
+     * registry. Used by the IS-local compaction fallback (companion to the
+     * external optimizer) to catch the race where another compactor (a
+     * different IS instance, or the optimizer itself) deprecated an input
+     * between candidate selection and our merge attempt.
+     *
+     * <p>Returns {@code true} only if every input is present AND in
+     * {@code ACTIVE} state. A missing znode, a DEPRECATED state, or a registry
+     * error all return {@code false}; the caller (PersistentVectorStore) treats
+     * those uniformly as "abort the local merge, roll back staging".
+     */
+    @Override
+    public boolean revalidateInputsActive(List<NewSegmentInfo> inputs) {
+        if (inputs == null || inputs.isEmpty()) {
+            return true;
+        }
+        for (NewSegmentInfo info : inputs) {
+            String segmentUuid = info.getSegmentUuid();
+            if (segmentUuid == null) {
+                // Legacy segments (pre-segmented-v2) have no UUID and therefore
+                // no registry entry; the local compactor must not include them
+                // in the input set when the publisher is wired up. Treat as
+                // drift to be safe.
+                LOGGER.log(Level.WARNING,
+                        "revalidate: input segmentId={0} for index {1} has no UUID;"
+                                + " treating as drift",
+                        new Object[]{info.getSegmentId(), indexName});
+                return false;
+            }
+            try {
+                java.util.Optional<VersionedSegmentMetadata> latest =
+                        registry.getSegment(tablespaceUuid, indexUuid, segmentUuid);
+                if (!latest.isPresent()) {
+                    LOGGER.log(Level.INFO,
+                            "revalidate: input {0} disappeared from registry; aborting local merge",
+                            new Object[]{segmentUuid});
+                    return false;
+                }
+                SegmentState state = latest.get().metadata().getState();
+                if (state != SegmentState.ACTIVE) {
+                    LOGGER.log(Level.INFO,
+                            "revalidate: input {0} state={1} (expected ACTIVE);"
+                                    + " aborting local merge",
+                            new Object[]{segmentUuid, state});
+                    return false;
+                }
+            } catch (SegmentRegistryException e) {
+                LOGGER.log(Level.WARNING,
+                        "revalidate: registry error for input {0}: {1};"
+                                + " aborting local merge",
+                        new Object[]{segmentUuid, e.getMessage()});
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * CAS-deprecate every input segment after a successful local merge. Each
+     * znode transitions from {@code ACTIVE} to {@code DEPRECATED} carrying
+     * {@code replacementUuid} in {@code replacedBy} and the supplied retention
+     * timestamp. Best-effort: a per-input version mismatch (rare — the
+     * optimizer raced us between revalidate and deprecate on this specific
+     * input) is logged and skipped; our merged output remains valid for the
+     * remaining inputs, and the next optimizer tick will fold the orphan
+     * ACTIVE input into a follow-up merge.
+     */
+    @Override
+    public void deprecateInputs(List<NewSegmentInfo> inputs, String replacementUuid,
+                                long retentionUntilEpochMillis) {
+        if (inputs == null || inputs.isEmpty()) {
+            return;
+        }
+        for (NewSegmentInfo info : inputs) {
+            String segmentUuid = info.getSegmentUuid();
+            if (segmentUuid == null) {
+                continue;
+            }
+            try {
+                java.util.Optional<VersionedSegmentMetadata> current =
+                        registry.getSegment(tablespaceUuid, indexUuid, segmentUuid);
+                if (!current.isPresent()) {
+                    LOGGER.log(Level.INFO,
+                            "deprecate: input {0} disappeared between revalidate and deprecate;"
+                                    + " skipping (idempotent)",
+                            new Object[]{segmentUuid});
+                    continue;
+                }
+                SegmentMetadata m = current.get().metadata();
+                if (m.getState() != SegmentState.ACTIVE) {
+                    // Already deprecated by another actor — fine, idempotent.
+                    LOGGER.log(Level.INFO,
+                            "deprecate: input {0} already in state {1}; skipping",
+                            new Object[]{segmentUuid, m.getState()});
+                    continue;
+                }
+                SegmentMetadata next = m.toBuilder()
+                        .state(SegmentState.DEPRECATED)
+                        .replacedBy(java.util.Collections.singletonList(replacementUuid))
+                        .retentionUntilEpochMillis(retentionUntilEpochMillis)
+                        .build();
+                registry.casUpdateSegment(current.get(), next);
+                LOGGER.log(Level.INFO,
+                        "deprecated input segment {0} (replaced by {1})",
+                        new Object[]{segmentUuid, replacementUuid});
+            } catch (SegmentRegistryException.VersionMismatch retry) {
+                // Optimizer raced us on THIS specific input. Our merged output
+                // is still valid for the others. The next optimizer tick will
+                // fold the orphan ACTIVE input into a follow-up merge.
+                LOGGER.log(Level.INFO,
+                        "deprecate: input {0} CAS bumped (raced); leaving for next optimizer tick",
+                        new Object[]{segmentUuid});
+            } catch (SegmentRegistryException e) {
+                LOGGER.log(Level.WARNING,
+                        "deprecate: registry error for input {0}: {1}",
+                        new Object[]{segmentUuid, e.getMessage()});
+            }
+        }
+    }
+
+    /**
+     * Best-effort delete of previously-staged PROVISIONAL znodes. Called by the
+     * IS-local compactor when it must abort the swap (e.g. revalidation failed).
+     * We only delete the znode if it is still in {@code PROVISIONAL} state and
+     * still owned by us — a CAS bump or state change means another actor has
+     * taken over and we must not interfere.
+     */
+    @Override
+    public void unstage(List<NewSegmentInfo> staged) {
+        if (staged == null || staged.isEmpty()) {
+            return;
+        }
+        for (NewSegmentInfo info : staged) {
+            String segmentUuid = info.getSegmentUuid();
+            if (segmentUuid == null) {
+                continue;
+            }
+            try {
+                java.util.Optional<VersionedSegmentMetadata> current =
+                        registry.getSegment(tablespaceUuid, indexUuid, segmentUuid);
+                if (!current.isPresent()) {
+                    continue;
+                }
+                if (current.get().metadata().getState() != SegmentState.PROVISIONAL) {
+                    LOGGER.log(Level.INFO,
+                            "unstage: segment {0} is no longer PROVISIONAL (state={1});"
+                                    + " leaving alone",
+                            new Object[]{segmentUuid, current.get().metadata().getState()});
+                    continue;
+                }
+                try {
+                    registry.casDeleteSegment(current.get());
+                    LOGGER.log(Level.INFO, "unstaged PROVISIONAL segment {0}", segmentUuid);
+                } catch (SegmentRegistryException.VersionMismatch retry) {
+                    // someone else just touched it
+                }
+            } catch (SegmentRegistryException e) {
+                LOGGER.log(Level.WARNING,
+                        "unstage: registry error for segment {0}: {1}",
+                        new Object[]{segmentUuid, e.getMessage()});
+            }
+        }
+    }
+
     private String requireUuid(NewSegmentInfo info) {
         String segmentUuid = info.getSegmentUuid();
         if (segmentUuid == null || segmentUuid.isEmpty()) {

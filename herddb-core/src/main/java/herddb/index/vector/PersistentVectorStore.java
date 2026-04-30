@@ -487,6 +487,46 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private volatile int compactionBackpressureThreshold = 500;
 
     /**
+     * Pressure-driven IS-local compaction kick fraction (companion to the external
+     * index-optimizer). When {@link #externalCompactionEnabled} is {@code true},
+     * the IS-local compaction loop stays idle until {@code segments.size()} crosses
+     * {@code localCompactionKickFraction × compactionBackpressureThreshold}. Above
+     * that threshold the local loop runs as a fallback, draining segments before
+     * the back-pressure ceiling stalls the tailer. Default is {@code 0.7} —
+     * giving the optimizer 70% of the segment budget before the IS kicks in.
+     */
+    private volatile double localCompactionKickFraction = 0.7d;
+
+    /**
+     * Master switch for the IS-local compaction fallback when
+     * {@link #externalCompactionEnabled} is {@code true}. When {@code false},
+     * suppresses the IS-local loop entirely (fully delegated to the external
+     * optimizer); the tailer may then stall on back-pressure if the optimizer
+     * cannot keep up. Default {@code true}: IS keeps a pressure-driven fallback
+     * so the cluster never wedges on a slow optimizer.
+     */
+    private volatile boolean localCompactionEnabledWithOptimizer = true;
+
+    /**
+     * Counter: number of times the IS-local compaction loop ran a full cycle
+     * <em>specifically</em> as a pressure-driven fallback (i.e., with
+     * {@link #externalCompactionEnabled} {@code true} and segment count above the
+     * kick threshold). Distinct from {@link #compactionRunsTotal} which counts
+     * every cycle regardless of mode.
+     */
+    final AtomicLong localCompactionPressureRunsTotal = new AtomicLong();
+
+    /**
+     * Counter: number of cycles the IS-local loop short-circuited because the
+     * segment count was below the kick threshold. Useful for verifying that
+     * steady-state ingest is being handled by the optimizer (high counter value
+     * = optimizer is keeping up; counter staying flat while
+     * {@link #localCompactionPressureRunsTotal} climbs = optimizer is falling
+     * behind).
+     */
+    final AtomicLong localCompactionSkippedBelowThresholdTotal = new AtomicLong();
+
+    /**
      * Log a WARNING during Phase A when the total on-disk segment count
      * exceeds this threshold, making runaway accumulation visible without
      * having to parse checkpoint log lines.
@@ -746,6 +786,26 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public long getCompactionLivePkFilteredTotal() {
         return compactionLivePkFilteredTotal.get();
+    }
+
+    /**
+     * Number of times the IS-local compaction loop ran a full cycle as a
+     * pressure-driven fallback (companion to the external optimizer). Non-zero
+     * value = the optimizer is falling behind and the IS is draining segments
+     * to keep the tailer from stalling on back-pressure. Steady state should
+     * stay at zero (or grow only slowly) with the optimizer doing the work.
+     */
+    public long getLocalCompactionPressureRunsTotal() {
+        return localCompactionPressureRunsTotal.get();
+    }
+
+    /**
+     * Number of cycles the IS-local loop short-circuited because the segment
+     * count was below the kick threshold. High and growing = the optimizer is
+     * keeping up.
+     */
+    public long getLocalCompactionSkippedBelowThresholdTotal() {
+        return localCompactionSkippedBelowThresholdTotal.get();
     }
 
     public long getCompactionLastDurationMs() {
@@ -1405,19 +1465,27 @@ public class PersistentVectorStore extends AbstractVectorStore {
         compactionThread.start();
 
         // Start background graph-merge compaction thread (separate cadence,
-        // separate responsibilities from the checkpoint driver). Suppressed
-        // when an external index-optimizer service is doing this work
-        // (segmented-v2 mode).
-        if (!externalCompactionEnabled) {
-            vectorIndexCompactionThread = new Thread(this::vectorIndexCompactionLoop,
-                    "persistent-vector-store-vidxcompaction-" + indexName);
-            vectorIndexCompactionThread.setDaemon(true);
-            vectorIndexCompactionThread.start();
-        } else {
+        // separate responsibilities from the checkpoint driver).
+        //
+        // Pressure-driven local fallback (companion to the external optimizer):
+        // when {@link #externalCompactionEnabled} is {@code true} the thread
+        // still runs but the cycle body short-circuits below the kick threshold
+        // — the optimizer drives steady-state compaction, the IS-local loop
+        // only fires when segment accumulation indicates the optimizer is
+        // falling behind. Operators who want full delegation (no local
+        // fallback) can set {@link #localCompactionEnabledWithOptimizer} to
+        // {@code false}; the cycle then short-circuits unconditionally.
+        vectorIndexCompactionThread = new Thread(this::vectorIndexCompactionLoop,
+                "persistent-vector-store-vidxcompaction-" + indexName);
+        vectorIndexCompactionThread.setDaemon(true);
+        vectorIndexCompactionThread.start();
+        if (externalCompactionEnabled) {
             LOGGER.log(Level.INFO,
-                    "PersistentVectorStore {0}: external compaction enabled — in-IS"
-                            + " compaction loop suppressed",
-                    indexName);
+                    "PersistentVectorStore {0}: external compaction enabled — IS-local"
+                            + " compaction loop is pressure-driven (kickFraction={1},"
+                            + " enabledWithOptimizer={2})",
+                    new Object[]{indexName, localCompactionKickFraction,
+                            localCompactionEnabledWithOptimizer});
         }
 
         // Reconcile the segmented-v2 registry with IndexStatus on every start
@@ -1477,6 +1545,44 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     public void setCompactionBackpressureThreshold(int threshold) {
         this.compactionBackpressureThreshold = threshold;
+    }
+
+    /**
+     * Sets the IS-local compaction kick fraction (companion to the external
+     * optimizer). Must be in the open interval {@code (0.0, 1.0)}. Values
+     * outside that range are rejected to prevent silently disabling either the
+     * fallback (≥ 1.0) or both compactors (≤ 0.0).
+     */
+    public void setLocalCompactionKickFraction(double fraction) {
+        if (!(fraction > 0.0d && fraction < 1.0d)) {
+            throw new IllegalArgumentException(
+                    "localCompactionKickFraction must be in (0.0, 1.0), got " + fraction);
+        }
+        this.localCompactionKickFraction = fraction;
+    }
+
+    /**
+     * Master switch for the IS-local compaction fallback when
+     * {@link #externalCompactionEnabled} is {@code true}. See
+     * {@link #localCompactionEnabledWithOptimizer}.
+     */
+    public void setLocalCompactionEnabledWithOptimizer(boolean enabled) {
+        this.localCompactionEnabledWithOptimizer = enabled;
+    }
+
+    /**
+     * Computes the current segment-count threshold above which the IS-local
+     * compaction loop wakes from idle and runs a cycle. Always rounded UP
+     * (ceiling) so a threshold of 1 segment is reachable even at small
+     * back-pressure caps. Public so tests and Prometheus exporters can read
+     * it directly.
+     */
+    public int currentLocalCompactionKickThreshold() {
+        long t = (long) Math.ceil(localCompactionKickFraction * compactionBackpressureThreshold);
+        if (t > Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        return (int) Math.max(1L, t);
     }
 
     /**
@@ -1732,6 +1838,34 @@ public class PersistentVectorStore extends AbstractVectorStore {
             return; // a cycle is already running
         }
         try {
+            // Pressure-driven gate: when an external optimizer is enabled, the
+            // IS-local loop only runs as a fallback. Steady-state compaction is
+            // the optimizer's job; the IS just drains accumulation when the
+            // optimizer falls behind. The gate is intentionally rechecked here
+            // (not just at thread launch) so an operator can flip the master
+            // switch at runtime without restarting the IS.
+            if (externalCompactionEnabled) {
+                if (!localCompactionEnabledWithOptimizer) {
+                    // Operator opted out of the local fallback. The optimizer
+                    // is the only compactor; the tailer will hit back-pressure
+                    // and stall if the optimizer cannot keep up.
+                    return;
+                }
+                int kickThreshold = currentLocalCompactionKickThreshold();
+                int now = segments.size();
+                if (now < kickThreshold) {
+                    localCompactionSkippedBelowThresholdTotal.incrementAndGet();
+                    return;
+                }
+                localCompactionPressureRunsTotal.incrementAndGet();
+                LOGGER.log(Level.INFO,
+                        "vector store {0}: pressure-driven local compaction (segments={1},"
+                                + " kickThreshold={2}, backpressureThreshold={3}) — optimizer"
+                                + " is falling behind",
+                        new Object[]{indexName, now, kickThreshold,
+                                compactionBackpressureThreshold});
+            }
+
             long cycleStart = System.currentTimeMillis();
             long cycleId = compactionRunsTotal.incrementAndGet();
 
@@ -1811,7 +1945,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         // Nothing survived the filter — everything in these inputs
                         // is tombstoned or superseded. Skip the rebuild; just
                         // swap the inputs out and queue them for retention.
-                        atomicSwapCompactionResult(candidates, null, 0L);
+                        atomicSwapCompactionResult(candidates, null, 0L, 0L);
                         compactionSuccessesTotal.incrementAndGet();
                         compactionConsecutiveFailures.set(0);
                         long emptyCycleMs = System.currentTimeMillis() - cycleStart;
@@ -1844,7 +1978,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     }
 
                     atomicSwapCompactionResult(candidates, rebuild.mergedSegment,
-                            rebuild.bytesWritten);
+                            rebuild.bytesWritten, rebuild.vectorCount);
 
                     compactionSuccessesTotal.incrementAndGet();
                     compactionConsecutiveFailures.set(0);
@@ -1988,8 +2122,80 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     private void atomicSwapCompactionResult(List<VectorSegment> inputs,
                                             VectorSegment mergedOutput,
-                                            long bytesWritten)
+                                            long bytesWritten,
+                                            long mergedVectorCount)
             throws VectorIndexCompactor.CompactionException, DataStorageManagerException {
+        // Pre-lock registry coordination for the IS-local fallback path
+        // (companion to the external optimizer). When a publisher is wired up
+        // we MUST stage the merged output and revalidate the inputs in the
+        // registry BEFORE persisting IndexStatus locally, otherwise a
+        // concurrent optimizer may have already deprecated an input under us
+        // and we would silently produce a duplicate ACTIVE segment.
+        SegmentPublisher publisherSnapshot = this.segmentPublisher;
+        List<NewSegmentInfo> stagedInfo = null;
+        List<NewSegmentInfo> inputInfosForRegistry = null;
+        if (publisherSnapshot != null && mergedOutput != null) {
+            // Stamp UUID — same flow as Phase B: durable UUID survives a
+            // restart so we cannot double-register the same physical file.
+            if (mergedOutput.segmentUuid == null) {
+                mergedOutput.segmentUuid = java.util.UUID.randomUUID().toString();
+            }
+            long nextGen = currentIndexStatusGeneration.get() + 1;
+            NewSegmentInfo mergedInfo = new NewSegmentInfo(
+                    mergedOutput.segmentId, mergedOutput.segmentUuid,
+                    mergedOutput.graphFilePath, mergedOutput.graphFileSize,
+                    mergedOutput.mapFilePath, mergedOutput.mapFileSize,
+                    mergedOutput.estimatedSizeBytes, mergedVectorCount,
+                    nextGen, LogSequenceNumber.START_OF_TIME);
+            stagedInfo = java.util.Collections.singletonList(mergedInfo);
+
+            inputInfosForRegistry = new ArrayList<>(inputs.size());
+            for (VectorSegment in : inputs) {
+                // Legacy (v3) inputs without a UUID are not in the registry —
+                // skip them in the validate/deprecate set. The in-memory swap
+                // still happens below.
+                if (in.segmentUuid != null) {
+                    inputInfosForRegistry.add(new NewSegmentInfo(
+                            in.segmentId, in.segmentUuid,
+                            in.graphFilePath, in.graphFileSize,
+                            in.mapFilePath, in.mapFileSize,
+                            in.estimatedSizeBytes, /* vectorCount unknown for an existing input */ 0L,
+                            in.generation, LogSequenceNumber.START_OF_TIME));
+                }
+            }
+
+            try {
+                publisherSnapshot.stageNewSegments(stagedInfo);
+            } catch (RuntimeException stageFailed) {
+                // Stage failed (e.g. ZK unreachable). Abort the local merge —
+                // the rebuild's orphan files are queued for cleanup by the
+                // caller via the existing pendingDeletes mechanism.
+                LOGGER.log(Level.WARNING,
+                        "vector store {0}: stage of merged segment failed; aborting"
+                                + " local compaction merge",
+                        new Object[]{indexName});
+                throw new VectorIndexCompactor.CompactionException(
+                        VectorIndexCompactor.FailureReason.METADATA_IO,
+                        "stage of merged segment failed: " + stageFailed.getMessage());
+            }
+
+            // Revalidate inputs are still ACTIVE in the registry. If a
+            // concurrent optimizer (or another IS) already deprecated any
+            // input we MUST abort: producing a merged output covering an
+            // already-deprecated input would yield two ACTIVE segments
+            // covering the same data, with duplicate PKs surfacing on search.
+            if (!publisherSnapshot.revalidateInputsActive(inputInfosForRegistry)) {
+                try {
+                    publisherSnapshot.unstage(stagedInfo);
+                } catch (RuntimeException ignored) {
+                    // best-effort — reconcile-on-restart will sweep stragglers
+                }
+                throw new VectorIndexCompactor.CompactionException(
+                        VectorIndexCompactor.FailureReason.ABORTED_INPUT_GONE,
+                        "concurrent compactor deprecated at least one input under us");
+            }
+        }
+
         checkpointLock.lock();
         try {
             stateLock.writeLock().lock();
@@ -2002,6 +2208,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
                 for (VectorSegment in : inputs) {
                     if (!currentIds.contains(in.segmentId)) {
+                        // In-memory drift — undo the registry stage if any.
+                        if (publisherSnapshot != null && stagedInfo != null) {
+                            try {
+                                publisherSnapshot.unstage(stagedInfo);
+                            } catch (RuntimeException ignored) {
+                                // best-effort
+                            }
+                        }
                         throw new VectorIndexCompactor.CompactionException(
                                 VectorIndexCompactor.FailureReason.ABORTED_INPUT_GONE,
                                 "input segment " + in.segmentId + " disappeared from segment list");
@@ -2067,6 +2281,37 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         } finally {
             checkpointLock.unlock();
+        }
+
+        // Post-swap registry coordination. The IndexStatus is durable; if any
+        // of these calls fails the registry will be inconsistent until
+        // reconcile-on-restart (commit) or the next optimizer tick (deprecate).
+        // Best-effort by design — we never roll back a durable IndexStatus
+        // change because of a registry hiccup.
+        if (publisherSnapshot != null && stagedInfo != null) {
+            try {
+                publisherSnapshot.commitStagedSegments(stagedInfo);
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING,
+                        "vector store {0}: commit of merged segment failed; reconcile"
+                                + " on restart will heal: {1}",
+                        new Object[]{indexName, e.getMessage()});
+            }
+            if (inputInfosForRegistry != null && !inputInfosForRegistry.isEmpty()
+                    && mergedOutput != null) {
+                long retentionUntil = System.currentTimeMillis()
+                        + vectorIndexCompactionRetentionMs;
+                try {
+                    publisherSnapshot.deprecateInputs(inputInfosForRegistry,
+                            mergedOutput.segmentUuid, retentionUntil);
+                } catch (RuntimeException e) {
+                    LOGGER.log(Level.WARNING,
+                            "vector store {0}: deprecate of {1} input segments failed;"
+                                    + " optimizer will fold orphan ACTIVE inputs on next tick: {2}",
+                            new Object[]{indexName, inputInfosForRegistry.size(),
+                                    e.getMessage()});
+                }
+            }
         }
     }
 
@@ -2466,9 +2711,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
             waitForMemoryPressureRelief();
         }
 
+        // Pressure-driven local-compaction wake (companion to issue #354
+        // back-pressure). When an external optimizer is enabled the IS-local
+        // loop sleeps below the kick threshold; this poke wakes it the
+        // INSTANT segment count crosses the threshold instead of waiting for
+        // its idle interval to elapse, so we minimise the window where
+        // segments could keep accumulating toward the back-pressure ceiling.
+        // Cheap: one int compare on the existing fast path.
+        int currentSegments = segments.size();
+        if (externalCompactionEnabled
+                && localCompactionEnabledWithOptimizer
+                && currentSegments > currentLocalCompactionKickThreshold()) {
+            wakeVectorIndexCompaction();
+        }
+
         // Segment-count back-pressure (issue #354): block when there are too
         // many on-disk segments to prevent unbounded accumulation.
-        if (segments.size() > compactionBackpressureThreshold) {
+        if (currentSegments > compactionBackpressureThreshold) {
             waitForSegmentCountRelief();
         }
 
