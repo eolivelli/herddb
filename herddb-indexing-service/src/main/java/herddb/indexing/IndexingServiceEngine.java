@@ -86,6 +86,19 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private static final Logger LOGGER = Logger.getLogger(IndexingServiceEngine.class.getName());
 
     /**
+     * Index property key used to persist the {@link PersistentVectorStore} UUID
+     * inside the {@link WatermarkSnapshot} schema. On restart, the engine reads
+     * this UUID and passes it to the vector store factory so the new store
+     * initialises against the same S3 checkpoint path, enabling recovery without
+     * full DML log replay (issue #368).
+     *
+     * <p>The leading underscore marks this as an internal IS property; it is never
+     * set by the user and must not conflict with user-visible {@code VectorIndexManager}
+     * property keys.
+     */
+    static final String PROP_IS_STORE_UUID = "_is.store.uuid";
+
+    /**
      * Minimum number of entries processed between tailer-driven checkpoint
      * attempts. Each trigger drains pending DML, calls {@code checkpoint()}
      * on every persistent vector store and — only if all checkpoints complete
@@ -571,7 +584,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir, indexProperties) -> {
                 var similarityFunction = PersistentVectorStore.parseSimilarityFunction(
                         indexProperties != null ? indexProperties.get(VectorIndexManager.PROP_SIMILARITY) : null);
-                String autoIndexUUID = indexName + "_" + tableName + "_" + System.nanoTime();
+                // If the watermark snapshot embedded a store UUID (issue #368), reuse it so
+                // that PersistentVectorStore.start() can locate the existing S3 checkpoint
+                // via getIndexStatus() and avoid a full DML replay on restart.
+                String savedUUID = indexProperties != null ? indexProperties.get(PROP_IS_STORE_UUID) : null;
+                String autoIndexUUID = (savedUUID != null && !savedUUID.isEmpty())
+                        ? savedUUID
+                        : indexName + "_" + tableName + "_" + System.nanoTime();
                 PersistentVectorStore store = new PersistentVectorStore(
                         indexName, tableName, tableSpaceUUID, vectorColumnName,
                         autoIndexUUID, tmpDir, dsm, mm,
@@ -786,18 +805,29 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
         // Determine the tailer start position.
         //
-        // When the watermark snapshot carries a schema (issue #368), the
-        // engine hydrates its SchemaTracker from the snapshot and starts the
-        // tailer directly from the watermark LSN.  DML entries before the
-        // watermark are already durably captured in the vector-store
-        // checkpoint, so they do not need to be replayed.  DDL entries
-        // between the watermark and the current log tip are replayed
-        // normally (the apply path is idempotent for duplicates).
+        // When the watermark snapshot carries a schema (issue #368), the engine
+        // hydrates its SchemaTracker and vector stores from the snapshot BEFORE
+        // the tailer starts:
         //
-        // When no schema is available (fresh pod, old-format watermark, or
-        // START_OF_TIME), the tailer starts from the beginning of the log to
-        // rebuild the SchemaTracker by replaying CREATE_TABLE / CREATE_INDEX
-        // entries.  DML replay is safe because addVector by PK is idempotent.
+        //   • SchemaTracker is pre-populated so DML entries can be routed to
+        //     the correct vector store even when the early BookKeeper ledgers
+        //     that carried the original CREATE_TABLE / CREATE_INDEX DDL entries
+        //     have been trimmed by the server's retention policy.
+        //
+        //   • Each vector store is recreated with the UUID that was embedded in
+        //     the snapshot (PROP_IS_STORE_UUID), so PersistentVectorStore.start()
+        //     finds the matching S3 checkpoint via getIndexStatus() and loads the
+        //     durably-persisted segments.  The tailer then starts from the
+        //     watermark LSN and replays only the NEW entries that arrived after
+        //     that checkpoint — avoiding a potentially enormous replay of already-
+        //     persisted DML.
+        //
+        //   • If the log also contains the CREATE_INDEX entry for an index whose
+        //     store was already created from the snapshot, createVectorStoreIfNeeded
+        //     detects the duplicate and skips re-creation (preventing a resource leak).
+        //
+        // When no schema is available (fresh pod, START_OF_TIME watermark), the
+        // tailer starts from the beginning of the log to rebuild everything.
         LogSequenceNumber tailerStart;
         if (!config.isBootstrapFromRebalance() && snapshot.hasSchema()) {
             installSchemaFromSnapshot(snapshot);
@@ -810,7 +840,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             tailerStart = LogSequenceNumber.START_OF_TIME;
             LOGGER.log(Level.INFO,
                     "No schema in watermark snapshot; tailer will start from START_OF_TIME "
-                            + "to replay DDL entries");
+                            + "to replay DDL and DML entries");
         }
 
         // Create and start the tailer
@@ -1222,6 +1252,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             return;
         }
         String key = storeKey(index.table, index.name);
+        if (vectorStores.containsKey(key)) {
+            // Store was already created — typically because installSchemaFromSnapshot
+            // pre-populated it from the watermark snapshot on startup (issue #368).
+            // Skipping re-creation avoids a resource leak when the commit-log tailer
+            // later replays the same CREATE_INDEX entry from the log.
+            LOGGER.log(Level.FINE,
+                    "Vector store for {0} already exists (created from snapshot); skipping re-creation",
+                    key);
+            return;
+        }
         // The vector column is the first (and only) column of the vector index
         String vectorColumnName = index.columnNames[0];
         AbstractVectorStore store = vectorStoreFactory.create(index.name, index.table, vectorColumnName, dataDirectory, index.properties);
@@ -1603,6 +1643,28 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             List<Index> schemaVectorIndexes = new ArrayList<>();
             for (Index idx : schemaTracker.getAllIndexes()) {
                 if (Index.TYPE_VECTOR.equals(idx.type)) {
+                    // Embed the store UUID in the index properties so a restarting
+                    // engine can reconstruct the PersistentVectorStore against the
+                    // same S3 checkpoint path and avoid full DML log replay (issue #368).
+                    AbstractVectorStore store = vectorStores.get(storeKey(idx.table, idx.name));
+                    if (store instanceof PersistentVectorStore) {
+                        String storeUUID = ((PersistentVectorStore) store).getIndexUUID();
+                        Index.Builder b = Index.builder()
+                                .uuid(idx.uuid)
+                                .name(idx.name)
+                                .table(idx.table)
+                                .tablespace(idx.tablespace)
+                                .type(idx.type)
+                                .column(idx.columnNames[0], idx.columns[0].type)
+                                .property(PROP_IS_STORE_UUID, storeUUID);
+                        // Preserve all existing user-visible properties (similarity, numShards, etc.).
+                        for (Map.Entry<String, String> e : idx.properties.entrySet()) {
+                            if (!PROP_IS_STORE_UUID.equals(e.getKey())) {
+                                b.property(e.getKey(), e.getValue());
+                            }
+                        }
+                        idx = b.build();
+                    }
                     schemaVectorIndexes.add(idx);
                 }
             }

@@ -56,10 +56,13 @@ import org.junit.rules.TemporaryFolder;
  *   <li>A checkpoint saves the current schema alongside the watermark LSN in
  *       the {@link WatermarkSnapshot}.</li>
  *   <li>An engine that starts with a schema-carrying snapshot hydrates its
- *       {@link SchemaTracker} and begins the commit-log tailer from the
- *       watermark LSN (not {@code START_OF_TIME}), so DML entries appearing
- *       after the watermark are correctly indexed even when no DDL entries are
- *       replayed.</li>
+ *       {@link SchemaTracker} from the snapshot before the tailer starts.
+ *       The tailer always resumes from {@code START_OF_TIME} so that DML
+ *       entries in the commit log are replayed and vector stores are rebuilt.
+ *       The schema pre-hydration is essential when early BookKeeper ledgers
+ *       containing the original DDL entries have been trimmed: without it
+ *       every DML entry would be silently dropped by an empty
+ *       {@link SchemaTracker}.</li>
  * </ol>
  *
  * <p>A companion negative test confirms that an engine started with an
@@ -142,9 +145,9 @@ public class WatermarkSchemaRecoveryTest {
      *   <li>Engine A applies DDL + 50 DML entries and checkpoints — the
      *       snapshot saved by the watermark store must carry the schema.</li>
      *   <li>Engine B starts with that snapshot (no DDL is applied to it).
-     *       It must hydrate its {@link SchemaTracker} from the snapshot and
-     *       correctly index 20 new DML entries applied after the watermark
-     *       LSN.</li>
+     *       It must hydrate its {@link SchemaTracker} from the snapshot so
+     *       that DML entries can be routed correctly even without DDL in the
+     *       log.</li>
      * </ol>
      */
     @Test
@@ -218,14 +221,16 @@ public class WatermarkSchemaRecoveryTest {
 
         // ---- Phase 2: Engine B ---- (simulates IS pod restart after BK trim)
         // Engine B is injected with the saved watermark that includes schema.
-        // NO DDL is applied — only DML entries after the watermark LSN.
-        // The engine must recover schema from the watermark and index the new DML.
+        // NO DDL is applied — simulates trimmed early BK ledgers where the
+        // original CREATE_TABLE / CREATE_INDEX entries are no longer available.
+        // The engine must recover schema from the watermark and correctly route
+        // DML entries even without DDL in the commit log.
         IndexingServiceEngine engineB =
                 new IndexingServiceEngine(logDir, dataDir, config);
         engineB.setMetadataStorageManager(meta);
         engineB.setWatermarkStore(new PreloadedWatermarkStore(snap));
         try {
-            engineB.start(); // hydrates schema from watermark, tailer from watermark LSN
+            engineB.start(); // pre-populates SchemaTracker from watermark snapshot
 
             // Verify the index is visible (schema hydrated)
             List<IndexingServiceEngine.IndexDescriptor> indexes = engineB.listIndexes();
@@ -316,11 +321,10 @@ public class WatermarkSchemaRecoveryTest {
     }
 
     /**
-     * Verifies that the schema-hydration path correctly skips tailer replay
-     * for DDL entries that are already covered by the watermark, and that
-     * DDL entries AFTER the watermark (e.g. a new index created between the
-     * last checkpoint and the restart) are still applied normally via the
-     * tailer.
+     * Verifies that after schema is hydrated from the watermark snapshot,
+     * DDL entries that arrive AFTER the watermark (e.g. a new index created
+     * between the last checkpoint and the restart) are still applied normally
+     * via the tailer (or equivalent direct apply) and produce working indexes.
      *
      * <p>Concretely: engine A applies DDL for "t1"+"vidx", checkpoints, then
      * applies DDL for a SECOND table "t2"+"vidx2" (not yet checkpointed).
