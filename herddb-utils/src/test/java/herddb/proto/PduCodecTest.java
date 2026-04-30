@@ -155,6 +155,111 @@ public class PduCodecTest {
         }
     }
 
+    /**
+     * Verifies that {@link PduCodec.ExecuteStatements#write} correctly round-trips
+     * a batch that contains large {@code float[]} vector parameters (the primary
+     * source of buffer reallocations reported in issue #378).  The test also
+     * asserts that the pre-allocated buffer capacity was sufficient so that no
+     * internal reallocation was needed.
+     */
+    @Test
+    public void testExecuteStatementsWithFloatArrayParams() throws Exception {
+        long msgId = 42L;
+        String tableSpace = "myts";
+        String query = "INSERT INTO vectors(v) VALUES(?)";
+        long tx = 0L;
+        boolean returnValues = false;
+        long statementId = 99L;
+
+        // Build a batch of two statements, each containing a 1536-element float vector.
+        float[] vector1 = new float[1536];
+        float[] vector2 = new float[1536];
+        for (int i = 0; i < 1536; i++) {
+            vector1[i] = i * 0.001f;
+            vector2[i] = i * 0.002f;
+        }
+        List<List<Object>> statements = Arrays.asList(
+                Arrays.asList((Object) vector1),
+                Arrays.asList((Object) vector2)
+        );
+
+        ByteBuf buf = PduCodec.ExecuteStatements.write(msgId, tableSpace, query, tx, returnValues, statementId, statements);
+        // Pdu.close() releases the underlying buffer; no explicit buf.release() needed.
+        // Snapshot the capacity right after write(): if pre-sizing was correct Netty
+        // will not have reallocated, so writableBytes() should be a small over-estimate.
+        // A reallocation would at least double the capacity, leaving writableBytes >> writerIndex.
+        int writtenBytes = buf.writerIndex();
+        int allocatedCapacity = buf.capacity();
+        assertTrue("Pre-sized capacity should not have been exceeded (no reallocation)",
+                writtenBytes <= allocatedCapacity);
+        assertTrue("Pre-sized capacity should be a tight estimate, not a doubling reallocation",
+                allocatedCapacity < writtenBytes * 2);
+        try (Pdu pdu = PduCodec.decodePdu(buf)) {
+            assertEquals(msgId, pdu.messageId);
+            assertEquals(Pdu.TYPE_EXECUTE_STATEMENTS, pdu.type);
+            assertEquals(tableSpace, PduCodec.ExecuteStatements.readTablespace(pdu));
+            assertEquals(query, PduCodec.ExecuteStatements.readQuery(pdu));
+            assertEquals(tx, PduCodec.ExecuteStatements.readTx(pdu));
+            assertEquals(statementId, PduCodec.ExecuteStatements.readStatementId(pdu));
+
+            PduCodec.ListOfListsReader reader = PduCodec.ExecuteStatements.startReadStatementsParameters(pdu);
+            assertEquals(2, reader.getNumLists());
+
+            PduCodec.ObjectListReader list1 = reader.nextList();
+            assertEquals(1, list1.getNumParams());
+            assertArrayEquals(vector1, (float[]) list1.nextObject(), 0.0f);
+
+            PduCodec.ObjectListReader list2 = reader.nextList();
+            assertEquals(1, list2.getNumParams());
+            assertArrayEquals(vector2, (float[]) list2.nextObject(), 0.0f);
+        }
+    }
+
+    /**
+     * Verifies that {@link PduCodec.ExecuteStatement#write} correctly round-trips
+     * a single statement containing a large {@code float[]} vector parameter and that
+     * the pre-allocated buffer capacity was sufficient (no reallocation).
+     */
+    @Test
+    public void testExecuteStatementWithFloatArrayParam() throws Exception {
+        long msgId = 7L;
+        String tableSpace = "default";
+        String query = "INSERT INTO t(v) VALUES(?)";
+        long tx = 0L;
+        boolean returnValues = true;
+        long statementId = 55L;
+
+        float[] vector = new float[512];
+        for (int i = 0; i < 512; i++) {
+            vector[i] = i * 0.01f;
+        }
+        List<Object> params = Arrays.asList((Object) vector, "extra-string-param", 42L);
+
+        ByteBuf buf = PduCodec.ExecuteStatement.write(msgId, tableSpace, query, tx, returnValues, statementId, params);
+        // Pdu.close() releases the underlying buffer; no explicit buf.release() needed.
+        int writtenBytes = buf.writerIndex();
+        int allocatedCapacity = buf.capacity();
+        assertTrue("Pre-sized capacity should not have been exceeded (no reallocation)",
+                writtenBytes <= allocatedCapacity);
+        assertTrue("Pre-sized capacity should be a tight estimate, not a doubling reallocation",
+                allocatedCapacity < writtenBytes * 2);
+        try (Pdu pdu = PduCodec.decodePdu(buf)) {
+            assertEquals(msgId, pdu.messageId);
+            assertEquals(Pdu.TYPE_EXECUTE_STATEMENT, pdu.type);
+            assertEquals(tableSpace, PduCodec.ExecuteStatement.readTablespace(pdu));
+            assertEquals(query, PduCodec.ExecuteStatement.readQuery(pdu));
+            assertEquals(tx, PduCodec.ExecuteStatement.readTx(pdu));
+            assertEquals(statementId, PduCodec.ExecuteStatement.readStatementId(pdu));
+            assertTrue(PduCodec.ExecuteStatement.readReturnValues(pdu));
+
+            PduCodec.ObjectListReader paramsReader = PduCodec.ExecuteStatement.startReadParameters(pdu);
+            assertEquals(params.size(), paramsReader.getNumParams());
+            assertArrayEquals(vector, (float[]) paramsReader.nextObject(), 0.0f);
+            assertEquals(RawString.of("extra-string-param"), paramsReader.nextObject());
+            assertEquals(42L, paramsReader.nextObject());
+        }
+    }
+
     @Test
     public void testNormalizeParametersListWriteReadObject() {
         long now = System.currentTimeMillis();

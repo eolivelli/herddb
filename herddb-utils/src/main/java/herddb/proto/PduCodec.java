@@ -69,6 +69,8 @@ public abstract class PduCodec {
     private static final int TYPE_SIZE = 1;
     private static final int FLAGS_SIZE = 1;
     private static final int VERSION_SIZE = 1;
+    /** Maximum number of bytes a variable-length integer (vint) can occupy. */
+    private static final int VINT_MAX_SIZE = 5;
 
     private static final int NULLABLE_FIELD_PRESENT = 1;
     private static final int NULLABLE_FIELD_ABSENT = 0;
@@ -615,20 +617,27 @@ public abstract class PduCodec {
                 boolean keepReadLocks, boolean allowFollowerReads
         ) {
 
+            // Pre-compute an accurate upper-bound capacity to avoid internal
+            // ByteBuf reallocation and copy, especially for large float[] vector params.
+            int paramsPayload = VINT_MAX_SIZE; // vint(numParams)
+            for (Object p : params) {
+                paramsPayload += estimateObjectSize(p);
+            }
             ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
                     .directBuffer(
                             VERSION_SIZE
                                     + FLAGS_SIZE
                                     + TYPE_SIZE
                                     + MSGID_SIZE
-                                    + ONE_LONG
-                                    + ONE_INT
-                                    + ONE_INT
-                                    + ONE_LONG
-                                    + ONE_LONG
-                                    + 1 + tableSpace.length()
-                                    + 2 + query.length()
-                                    + 1 + params.size() * 8);
+                                    + ONE_LONG  // tx
+                                    + ONE_LONG  // statementId
+                                    + ONE_INT   // fetchSize
+                                    + ONE_INT   // maxRows
+                                    + ONE_LONG  // scannerId
+                                    + estimateStringSize(tableSpace)
+                                    + estimateStringSize(query)
+                                    + paramsPayload
+                                    + ONE_BYTE); // optional trailer byte
 
             byteBuf.writeByte(VERSION_3);
             byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
@@ -921,16 +930,27 @@ public abstract class PduCodec {
                 long tx, boolean returnValues, long statementId, List<List<Object>> statements
         ) {
 
+            // Pre-compute an accurate upper-bound capacity to avoid internal
+            // ByteBuf reallocation and copy, especially for large float[] vector params.
+            int statementsPayload = VINT_MAX_SIZE; // vint(numStatements)
+            for (List<Object> list : statements) {
+                statementsPayload += VINT_MAX_SIZE; // vint(numParams per statement)
+                for (Object param : list) {
+                    statementsPayload += estimateObjectSize(param);
+                }
+            }
             ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
                     .directBuffer(
                             VERSION_SIZE
                                     + FLAGS_SIZE
                                     + TYPE_SIZE
                                     + MSGID_SIZE
-                                    + ONE_LONG
-                                    + ONE_BYTE
-                                    + ONE_LONG
-                                    + 1 + statements.size() * 64);
+                                    + ONE_BYTE  // returnValues
+                                    + ONE_LONG  // tx
+                                    + ONE_LONG  // statementId
+                                    + estimateStringSize(tableSpace)
+                                    + estimateStringSize(query)
+                                    + statementsPayload);
             byteBuf.writeByte(VERSION_3);
             byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
             byteBuf.writeByte(Pdu.TYPE_EXECUTE_STATEMENTS);
@@ -1036,18 +1056,24 @@ public abstract class PduCodec {
                 List<Object> params
         ) {
 
+            // Pre-compute an accurate upper-bound capacity to avoid internal
+            // ByteBuf reallocation and copy, especially for large float[] vector params.
+            int paramsPayload = VINT_MAX_SIZE; // vint(numParams)
+            for (Object p : params) {
+                paramsPayload += estimateObjectSize(p);
+            }
             ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
                     .directBuffer(
                             VERSION_SIZE
                                     + FLAGS_SIZE
                                     + TYPE_SIZE
                                     + MSGID_SIZE
-                                    + ONE_BYTE
-                                    + ONE_LONG
-                                    + tableSpace.length()
-                                    + query.length()
-                                    + ONE_BYTE
-                                    + params.size() * 8);
+                                    + ONE_BYTE  // returnValues
+                                    + ONE_LONG  // tx
+                                    + ONE_LONG  // statementId
+                                    + estimateStringSize(tableSpace)
+                                    + estimateStringSize(query)
+                                    + paramsPayload);
             byteBuf.writeByte(VERSION_3);
             byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
             byteBuf.writeByte(Pdu.TYPE_EXECUTE_STATEMENT);
@@ -1862,6 +1888,63 @@ public abstract class PduCodec {
             return ((trailer & Pdu.FLAGS_OPENSCANNER_ALLOW_FOLLOWER_READS) == Pdu.FLAGS_OPENSCANNER_ALLOW_FOLLOWER_READS);
         }
 
+    }
+
+    /**
+     * Returns an upper-bound estimate of the number of bytes that
+     * {@link #writeObject(ByteBuf, Object)} will write for {@code v}.
+     * The estimate is intentionally conservative so that callers can pre-size
+     * their {@link ByteBuf} allocations without triggering costly
+     * reallocation and copy operations.
+     */
+    static int estimateObjectSize(Object v) {
+        // Every path in writeObject starts with ONE_BYTE for the type discriminator.
+        if (v == null) {
+            return ONE_BYTE;
+        } else if (v instanceof RawString) {
+            // type byte + vint(len) + raw bytes
+            return ONE_BYTE + VINT_MAX_SIZE + ((RawString) v).getLength();
+        } else if (v instanceof String) {
+            // type byte + vint(utf8_len) + up to 3 UTF-8 bytes per Java char
+            return ONE_BYTE + VINT_MAX_SIZE + ((String) v).length() * 3;
+        } else if (v instanceof Long) {
+            return ONE_BYTE + ONE_LONG;
+        } else if (v instanceof Integer) {
+            return ONE_BYTE + ONE_INT;
+        } else if (v instanceof Boolean) {
+            return ONE_BYTE + ONE_BYTE;
+        } else if (v instanceof java.util.Date) {
+            return ONE_BYTE + ONE_LONG;
+        } else if (v instanceof Double) {
+            return ONE_BYTE + ONE_LONG;
+        } else if (v instanceof Float) {
+            // Float is promoted to double on the wire (see writeObject)
+            return ONE_BYTE + ONE_LONG;
+        } else if (v instanceof Short) {
+            return ONE_BYTE + 2;
+        } else if (v instanceof byte[]) {
+            return ONE_BYTE + VINT_MAX_SIZE + ((byte[]) v).length;
+        } else if (v instanceof Byte) {
+            return ONE_BYTE + ONE_BYTE;
+        } else if (v instanceof float[]) {
+            // type byte + vint(len) + 4 bytes per float element
+            return ONE_BYTE + VINT_MAX_SIZE + ((float[]) v).length * 4;
+        } else if (v instanceof List) {
+            // List<Number> written as a float array: 4 bytes per element
+            return ONE_BYTE + VINT_MAX_SIZE + ((List<?>) v).size() * 4;
+        } else {
+            // Unknown type — writeObject will throw, but return a safe non-zero estimate.
+            return ONE_BYTE + 16;
+        }
+    }
+
+    /**
+     * Returns an upper-bound estimate of the bytes needed to serialise a {@link String}
+     * via {@link ByteBufUtils#writeString(ByteBuf, String)}: a vint length prefix
+     * (at most {@value #VINT_MAX_SIZE} bytes) plus up to 3 UTF-8 bytes per Java char.
+     */
+    private static int estimateStringSize(String s) {
+        return VINT_MAX_SIZE + s.length() * 3;
     }
 
     static void writeObject(ByteBuf byteBuf, Object v) {
