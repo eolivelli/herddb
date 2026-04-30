@@ -517,6 +517,93 @@ public class RecordSerializerTest {
         assertIndexKeyEquivalence(table, record, "ts", ColumnTypes.LONG, 123456789L);
     }
 
+    /**
+     * TIMESTAMP single-column index: sign-flip (via Bytes.putLong) means the optimisation
+     * is intentionally skipped; the general path must still produce the correct result.
+     */
+    @Test
+    public void testSerializeIndexKeyTimestampFallsThrough() {
+        Table table = Table.builder()
+                .name("t1")
+                .column("pk", ColumnTypes.INTEGER)
+                .column("created", ColumnTypes.TIMESTAMP)
+                .primaryKey("pk")
+                .build();
+
+        Timestamp ts = new Timestamp(1_609_459_200_000L); // 2021-01-01 00:00:00 UTC
+        Record record = makeCacheFreeRecord(table, "pk", 1, "created", ts);
+        assertIndexKeyEquivalence(table, record, "created", ColumnTypes.TIMESTAMP, ts);
+    }
+
+    /** BYTEARRAY single-column index: optimised and reference paths must agree,
+     *  and the result must be a zero-copy slice (isShared == true). */
+    @Test
+    public void testSerializeIndexKeyByteArrayNoCopy() {
+        Table table = Table.builder()
+                .name("t1")
+                .column("pk", ColumnTypes.INTEGER)
+                .column("data", ColumnTypes.BYTEARRAY)
+                .primaryKey("pk")
+                .build();
+
+        byte[] payload = "hello world".getBytes(StandardCharsets.UTF_8);
+        Record record = makeCacheFreeRecord(table, "pk", 1, "data", payload);
+
+        assertIndexKeyEquivalence(table, record, "data", ColumnTypes.BYTEARRAY, payload);
+
+        // Verify the no-copy path returns a shared slice, not a newly-allocated buffer
+        Column dataColumn = Column.column("data", ColumnTypes.BYTEARRAY);
+        ColumnsList index = new ColumnsListImpl(new Column[]{dataColumn});
+        DataAccessor rawAccessor = record.getDataAccessor(table);
+        Bytes actualKey = RecordSerializer.serializeIndexKey(rawAccessor, index, index.getPrimaryKey());
+        assertTrue("No-copy path should return a shared (sliced) Bytes", actualKey.isShared());
+    }
+
+    /** BOOLEAN single-column index: optimised and reference paths must agree for both true and false. */
+    @Test
+    public void testSerializeIndexKeyBooleanNoCopy() {
+        Table table = Table.builder()
+                .name("t1")
+                .column("pk", ColumnTypes.INTEGER)
+                .column("flag", ColumnTypes.BOOLEAN)
+                .primaryKey("pk")
+                .build();
+
+        // true
+        Record trueRecord = makeCacheFreeRecord(table, "pk", 1, "flag", Boolean.TRUE);
+        assertIndexKeyEquivalence(table, trueRecord, "flag", ColumnTypes.BOOLEAN, Boolean.TRUE);
+
+        // false
+        Record falseRecord = makeCacheFreeRecord(table, "pk", 2, "flag", Boolean.FALSE);
+        assertIndexKeyEquivalence(table, falseRecord, "flag", ColumnTypes.BOOLEAN, Boolean.FALSE);
+    }
+
+    /**
+     * Exercises the {@code skipTypeAndValue} branch inside {@code extractRawIndexBytesNoCopy}:
+     * the indexed column (DOUBLE) is preceded by another non-PK column (STRING) in the record
+     * value buffer, so the scan loop must skip it before reaching the target.
+     */
+    @Test
+    public void testSerializeIndexKeyDoubleNoCopyAtLaterSerialPosition() {
+        Table table = Table.builder()
+                .name("t1")
+                .column("pk", ColumnTypes.INTEGER)
+                .column("prev", ColumnTypes.STRING)    // serialised before target
+                .column("target", ColumnTypes.DOUBLE)  // the indexed column
+                .primaryKey("pk")
+                .build();
+
+        Record record = makeCacheFreeRecord(table, "pk", 1, "prev", RawString.of("skip-me"), "target", 2.718281828);
+        assertIndexKeyEquivalence(table, record, "target", ColumnTypes.DOUBLE, 2.718281828);
+
+        // Confirm isShared() == true (no-copy slice, not a fresh allocation)
+        Column targetColumn = Column.column("target", ColumnTypes.DOUBLE);
+        ColumnsList index = new ColumnsListImpl(new Column[]{targetColumn});
+        DataAccessor rawAccessor = record.getDataAccessor(table);
+        Bytes actualKey = RecordSerializer.serializeIndexKey(rawAccessor, index, index.getPrimaryKey());
+        assertTrue("No-copy path should return a shared (sliced) Bytes", actualKey.isShared());
+    }
+
     // ── Inner helpers ───────────────────────────────────────────────────────────
 
     private static Bytes varInt(int i) throws Exception {
