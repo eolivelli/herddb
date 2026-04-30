@@ -1671,11 +1671,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // BLink-backed authority map (issue #290): both replace the prior
             // unbounded HashMap/HashSet structures so memory stays bounded by
             // the index page replacement policy.
+            //
+            // IMPORTANT (issue #372): authority is declared null here and assigned
+            // as the very first statement inside the try block so that, if
+            // createTempCompactionAuthorityMap() throws a RuntimeException, the
+            // finally block is still entered and pendingDeletes.close() is called.
+            // If authority were allocated before the try, a failure there would skip
+            // the finally entirely and leak the already-allocated pendingDeletes BLink.
             PagedPkSet pendingDeletes = createTempPagedPkSet("cmpdel_" + cycleId);
             this.pendingCompactionDeletes = pendingDeletes;
-            CompactionAuthorityMap authority = createTempCompactionAuthorityMap(cycleId);
+            CompactionAuthorityMap authority = null;
 
             try {
+                authority = createTempCompactionAuthorityMap(cycleId);
                 // Stream live-shard PKs into the authority map (only updates
                 // entries already in it — see VectorIndexCompactor). We pass
                 // a flat Iterable<Bytes> view rather than materialising a
@@ -1791,12 +1799,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             "vector store " + indexName
                                     + ": failed to close pendingCompactionDeletes set", e);
                 }
-                try {
-                    authority.close();
-                } catch (IOException e) {
-                    LOGGER.log(Level.WARNING,
-                            "vector store " + indexName
-                                    + ": failed to close compaction authority map", e);
+                // authority is null when createTempCompactionAuthorityMap() threw
+                // before the try block was entered (issue #372).
+                if (authority != null) {
+                    try {
+                        authority.close();
+                    } catch (IOException e) {
+                        LOGGER.log(Level.WARNING,
+                                "vector store " + indexName
+                                        + ": failed to close compaction authority map", e);
+                    }
                 }
             }
         } finally {
