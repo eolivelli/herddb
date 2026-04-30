@@ -22,12 +22,21 @@ package herddb.indexing;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import herddb.log.LogSequenceNumber;
+import herddb.model.ColumnTypes;
+import herddb.model.Index;
+import herddb.model.Table;
+import herddb.utils.ExtendedDataOutputStream;
+import herddb.utils.VisibleByteArrayOutputStream;
+import herddb.utils.XXHash64Utils;
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import org.junit.Test;
@@ -61,6 +70,30 @@ public class S3WatermarkStoreTest {
             return data == null ? null : data.clone();
         }
     }
+
+    // ---------- helpers -------------------------------------------------------
+
+    private static Table buildTable(String name) {
+        return Table.builder()
+                .tablespace("default")
+                .name(name)
+                .column("pk", ColumnTypes.STRING)
+                .column("vec", ColumnTypes.FLOATARRAY)
+                .primaryKey("pk")
+                .build();
+    }
+
+    private static Index buildVectorIndex(String name, String table) {
+        return Index.builder()
+                .name(name)
+                .table(table)
+                .tablespace("default")
+                .type(Index.TYPE_VECTOR)
+                .column("vec", ColumnTypes.FLOATARRAY)
+                .build();
+    }
+
+    // ---------- existing tests ------------------------------------------------
 
     @Test
     public void loadReturnsStartOfTimeWhenAbsent() throws IOException {
@@ -181,5 +214,167 @@ public class S3WatermarkStoreTest {
         assertTrue(ex.getMessage().contains("watermark"));
         // No object was written.
         assertNull(io.store.get(store.getPath()));
+    }
+
+    // ---------- schema round-trip tests (issue #368) --------------------------
+
+    /**
+     * Verifies that a {@link WatermarkSnapshot} carrying schema (table and
+     * vector-index definitions) survives a save-load cycle through
+     * {@link S3WatermarkStore} with all fields intact, and that the
+     * XXHash64 integrity check covers the schema bytes.
+     */
+    @Test
+    public void saveAndLoadRoundTripWithSchema() throws IOException {
+        FakeRemoteFileIO io = new FakeRemoteFileIO();
+        S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 1);
+
+        Table t = buildTable("tbl1");
+        Index ix = buildVectorIndex("vidx1", "tbl1");
+
+        WatermarkSnapshot saved = new WatermarkSnapshot(
+                new LogSequenceNumber(5L, 300L), 2,
+                Arrays.asList(t), Arrays.asList(ix));
+        store.save(saved);
+
+        WatermarkSnapshot loaded = store.load();
+        assertEquals("lsn.ledgerId", 5L, loaded.lsn.ledgerId);
+        assertEquals("lsn.offset", 300L, loaded.lsn.offset);
+        assertEquals("numInstances", 2, loaded.numInstances);
+        assertTrue("snapshot must carry schema", loaded.hasSchema());
+        assertEquals("one table", 1, loaded.tables.size());
+        assertEquals("table name", "tbl1", loaded.tables.get(0).name);
+        assertEquals("one vector index", 1, loaded.vectorIndexes.size());
+        assertEquals("index name", "vidx1", loaded.vectorIndexes.get(0).name);
+    }
+
+    /**
+     * Verifies that multiple tables and indexes are round-tripped faithfully
+     * through {@link S3WatermarkStore}.
+     */
+    @Test
+    public void saveAndLoadRoundTripWithMultipleTablesAndIndexes() throws IOException {
+        FakeRemoteFileIO io = new FakeRemoteFileIO();
+        S3WatermarkStore store = new S3WatermarkStore(io, "ts", 0);
+
+        Table t1 = buildTable("ta");
+        Table t2 = buildTable("tb");
+        Index ix1 = buildVectorIndex("i1", "ta");
+        Index ix2 = buildVectorIndex("i2", "tb");
+
+        WatermarkSnapshot saved = new WatermarkSnapshot(
+                new LogSequenceNumber(3L, 77L), 4,
+                Arrays.asList(t1, t2), Arrays.asList(ix1, ix2));
+        store.save(saved);
+
+        WatermarkSnapshot loaded = store.load();
+        assertEquals("two tables", 2, loaded.tables.size());
+        assertEquals("two indexes", 2, loaded.vectorIndexes.size());
+        assertEquals("table 1", "ta", loaded.tables.get(0).name);
+        assertEquals("table 2", "tb", loaded.tables.get(1).name);
+        assertEquals("index 1", "i1", loaded.vectorIndexes.get(0).name);
+        assertEquals("index 2", "i2", loaded.vectorIndexes.get(1).name);
+    }
+
+    /**
+     * Verifies that the hash check catches corruption in schema bytes:
+     * flipping a bit in the middle of the schema payload must trigger
+     * {@link S3WatermarkStore.CorruptWatermarkException}.
+     */
+    @Test
+    public void schemaBytesAreCoveredByHashCheck() throws IOException {
+        FakeRemoteFileIO io = new FakeRemoteFileIO();
+        S3WatermarkStore store = new S3WatermarkStore(io, "ts", 0);
+
+        Table t = buildTable("mytable");
+        Index ix = buildVectorIndex("myidx", "mytable");
+        store.save(new WatermarkSnapshot(
+                new LogSequenceNumber(1L, 1L), 1,
+                Arrays.asList(t), Arrays.asList(ix)));
+
+        byte[] data = io.store.get(store.getPath());
+        // Corrupt the middle of the payload (well past the fixed header),
+        // which falls in the schema region.
+        int middle = data.length / 2;
+        data[middle] ^= 0xFF;
+        io.store.put(store.getPath(), data);
+
+        assertThrows("schema corruption must be detected by hash",
+                S3WatermarkStore.CorruptWatermarkException.class, store::load);
+    }
+
+    /**
+     * Simulates an object written by a pre-schema build (ends after
+     * {@code numInstances} immediately followed by the 8-byte hash). The new
+     * reader must detect that only the hash footer remains after
+     * {@code numInstances} ({@code available() == 8}) and return an empty
+     * schema rather than throwing an exception.
+     */
+    @Test
+    public void loadLegacyObjectWithoutSchema() throws IOException {
+        // Manually build the pre-schema binary format:
+        //   version(VLong=1) | flags(VLong=0) | ledgerId(ZLong) | offset(ZLong)
+        //   | numInstances(VInt) | hash(Long)
+        VisibleByteArrayOutputStream bos = new VisibleByteArrayOutputStream();
+        XXHash64Utils.HashingOutputStream hashOut = new XXHash64Utils.HashingOutputStream(bos);
+        try (ExtendedDataOutputStream dout = new ExtendedDataOutputStream(hashOut)) {
+            dout.writeVLong(1); // version
+            dout.writeVLong(0); // flags
+            dout.writeZLong(8L);   // ledgerId
+            dout.writeZLong(42L);  // offset
+            dout.writeVInt(3);     // numInstances
+            // No schema fields — pre-schema format ends here.
+            dout.writeLong(hashOut.hash()); // hash footer
+        }
+
+        FakeRemoteFileIO io = new FakeRemoteFileIO();
+        String path = "ts/_indexing/0/watermark.lsn";
+        io.store.put(path, bos.toByteArray());
+
+        S3WatermarkStore store = new S3WatermarkStore(io, "ts", 0);
+        WatermarkSnapshot loaded = store.load();
+
+        assertEquals("ledgerId", 8L, loaded.lsn.ledgerId);
+        assertEquals("offset", 42L, loaded.lsn.offset);
+        assertEquals("numInstances", 3, loaded.numInstances);
+        assertFalse("legacy object must return empty schema", loaded.hasSchema());
+        assertTrue("tables must be empty", loaded.tables.isEmpty());
+        assertTrue("vectorIndexes must be empty", loaded.vectorIndexes.isEmpty());
+    }
+
+    /**
+     * Verifies that the monotonicity check works correctly when the stored
+     * object carries schema: a newer snapshot (higher LSN) with different
+     * schema must overwrite the old one.
+     */
+    @Test
+    public void monotonicSaveWorksWithSchema() throws IOException {
+        FakeRemoteFileIO io = new FakeRemoteFileIO();
+        S3WatermarkStore store = new S3WatermarkStore(io, "ts", 0);
+
+        Table t1 = buildTable("first");
+        Index ix1 = buildVectorIndex("idx1", "first");
+        store.save(new WatermarkSnapshot(
+                new LogSequenceNumber(1L, 100L), 1,
+                Collections.singletonList(t1), Collections.singletonList(ix1)));
+
+        // Attempt to regress — must be rejected.
+        Table t2 = buildTable("second");
+        store.save(new WatermarkSnapshot(
+                new LogSequenceNumber(1L, 50L), 2,
+                Collections.singletonList(t2), Collections.emptyList()));
+
+        WatermarkSnapshot loaded = store.load();
+        assertEquals("must still see the first table", "first", loaded.tables.get(0).name);
+        assertEquals(100L, loaded.lsn.offset);
+
+        // Advance LSN — must go through.
+        Table t3 = buildTable("third");
+        store.save(new WatermarkSnapshot(
+                new LogSequenceNumber(1L, 200L), 1,
+                Collections.singletonList(t3), Collections.emptyList()));
+        loaded = store.load();
+        assertEquals("advanced table name", "third", loaded.tables.get(0).name);
+        assertEquals(200L, loaded.lsn.offset);
     }
 }

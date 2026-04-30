@@ -741,7 +741,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         if (watermarkStore == null) {
             watermarkStore = new LocalWatermarkStore(dataDirectory);
         }
-        WatermarkSnapshot snapshot = watermarkStore.load();
+        WatermarkSnapshot snapshot;
+        try {
+            snapshot = watermarkStore.load();
+        } catch (IOException e) {
+            // A corrupt or unreadable watermark is not fatal: start from the
+            // beginning of the commit log and rebuild state from scratch. This
+            // is the same behaviour as a brand-new pod with no watermark file.
+            LOGGER.log(Level.WARNING,
+                    "Failed to load watermark; starting from beginning: {0}", e.getMessage());
+            snapshot = WatermarkSnapshot.START_OF_TIME;
+        }
         LogSequenceNumber watermark = snapshot.lsn;
         lastProcessedLsn = watermark;
         // The loaded watermark IS the durable recovery LSN: by construction
@@ -774,24 +784,34 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     IndexingServerConfiguration.PROPERTY_BOOTSTRAP_FROM_REBALANCE);
         }
 
-        // Start the commit-log tailer from START_OF_TIME — not from the
-        // watermark. Rationale: the indexing service needs to reprocess DDL
-        // entries (CREATE_TABLE, CREATE_INDEX, ALTER_*) on every restart to
-        // rebuild its in-memory {@link SchemaTracker}. Skipping them by
-        // tailing from a non-trivial watermark would leave the service
-        // without knowledge of the vector indexes that exist, so it could
-        // not create their {@link AbstractVectorStore}s.
+        // Determine the tailer start position.
         //
-        // DML entries are replayed too; this is safe because vector-store
-        // apply operations are idempotent (addVector by PK replaces). With
-        // a hydrated {@code remote-metadata/} the PersistentVectorStores
-        // load their sealed segments from S3 on start, so the replay only
-        // has to re-add vectors that were never checkpointed.
+        // When the watermark snapshot carries a schema (issue #368), the
+        // engine hydrates its SchemaTracker from the snapshot and starts the
+        // tailer directly from the watermark LSN.  DML entries before the
+        // watermark are already durably captured in the vector-store
+        // checkpoint, so they do not need to be replayed.  DDL entries
+        // between the watermark and the current log tip are replayed
+        // normally (the apply path is idempotent for duplicates).
         //
-        // A future optimization can either (a) persist a schema snapshot
-        // next to the watermark, or (b) skip DML entries with LSN less than
-        // or equal to the watermark while always applying DDL.
-        LogSequenceNumber tailerStart = LogSequenceNumber.START_OF_TIME;
+        // When no schema is available (fresh pod, old-format watermark, or
+        // START_OF_TIME), the tailer starts from the beginning of the log to
+        // rebuild the SchemaTracker by replaying CREATE_TABLE / CREATE_INDEX
+        // entries.  DML replay is safe because addVector by PK is idempotent.
+        LogSequenceNumber tailerStart;
+        if (!config.isBootstrapFromRebalance() && snapshot.hasSchema()) {
+            installSchemaFromSnapshot(snapshot);
+            tailerStart = watermark;
+            LOGGER.log(Level.INFO,
+                    "Schema recovered from watermark snapshot ({0} tables, {1} vector indexes); "
+                            + "tailer will start from watermark {2}",
+                    new Object[]{snapshot.tables.size(), snapshot.vectorIndexes.size(), watermark});
+        } else {
+            tailerStart = LogSequenceNumber.START_OF_TIME;
+            LOGGER.log(Level.INFO,
+                    "No schema in watermark snapshot; tailer will start from START_OF_TIME "
+                            + "to replay DDL entries");
+        }
 
         // Create and start the tailer
         String logType = config.getString(IndexingServerConfiguration.PROPERTY_LOG_TYPE,
@@ -1437,6 +1457,33 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
     }
 
+    /**
+     * Hydrates the {@link SchemaTracker} and creates vector stores from the
+     * schema bundled in a {@link WatermarkSnapshot}. Called during
+     * {@link #start()} when the watermark carries a schema snapshot (issue
+     * #368), allowing the tailer to start from the watermark LSN instead of
+     * {@code START_OF_TIME}.
+     *
+     * <p>This mirrors {@link #installSchemaFromDescriptor} but sources schema
+     * from the watermark rather than a REBALANCE log entry.
+     */
+    private void installSchemaFromSnapshot(WatermarkSnapshot snapshot) {
+        for (Table t : snapshot.tables) {
+            byte[] blob = t.serialize();
+            schemaTracker.applyEntry(new LogEntry(System.currentTimeMillis(),
+                    LogEntryType.CREATE_TABLE, 0L, t.name, null,
+                    herddb.utils.Bytes.from_array(blob)));
+        }
+        for (Index ix : snapshot.vectorIndexes) {
+            byte[] blob = ix.serialize();
+            LogEntry synth = new LogEntry(System.currentTimeMillis(),
+                    LogEntryType.CREATE_INDEX, 0L, ix.table, null,
+                    herddb.utils.Bytes.from_array(blob));
+            schemaTracker.applyEntry(synth);
+            createVectorStoreIfNeeded(synth);
+        }
+    }
+
     /** Test- and diagnostics-only accessor for the engine lifecycle state. */
     public EngineStatus getEngineStatus() {
         return engineStatus;
@@ -1544,8 +1591,24 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             // LSN so a future restart re-acquires the right routing value
             // even if the BookKeeper history that carried the most recent
             // INDEXING_SERVICE_REBALANCE entry has been trimmed by then.
+            //
+            // We also capture a schema snapshot (table and vector-index
+            // definitions from the SchemaTracker). This lets a restarting
+            // engine hydrate its SchemaTracker from the watermark and start
+            // the tailer from the watermark LSN rather than START_OF_TIME,
+            // which is critical when early DDL ledgers have been trimmed from
+            // BookKeeper and the CREATE_TABLE / CREATE_INDEX entries are no
+            // longer replayable (issue #368).
+            List<Table> schemaTables = new ArrayList<>(schemaTracker.getAllTables());
+            List<Index> schemaVectorIndexes = new ArrayList<>();
+            for (Index idx : schemaTracker.getAllIndexes()) {
+                if (Index.TYPE_VECTOR.equals(idx.type)) {
+                    schemaVectorIndexes.add(idx);
+                }
+            }
             WatermarkSnapshot snapshotToSave =
-                    new WatermarkSnapshot(checkpointLsn, currentNumInstances);
+                    new WatermarkSnapshot(checkpointLsn, currentNumInstances,
+                            schemaTables, schemaVectorIndexes);
             try {
                 watermarkStore.save(snapshotToSave);
                 // Only after the watermark has been successfully persisted to
