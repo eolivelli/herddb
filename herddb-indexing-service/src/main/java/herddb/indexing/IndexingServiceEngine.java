@@ -86,11 +86,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private static final Logger LOGGER = Logger.getLogger(IndexingServiceEngine.class.getName());
 
     /**
-     * Index property key used to persist the {@link PersistentVectorStore} UUID
-     * inside the {@link WatermarkSnapshot} schema. On restart, the engine reads
-     * this UUID and passes it to the vector store factory so the new store
-     * initialises against the same S3 checkpoint path, enabling recovery without
-     * full DML log replay (issue #368).
+     * Index property key used to persist the storage-level UUID of the vector
+     * store inside the {@link WatermarkSnapshot} schema. The UUID is obtained
+     * via {@link AbstractVectorStore#getStoreUUID()} and is non-null only for
+     * stores that persist data across restarts (e.g. {@link PersistentVectorStore}).
+     *
+     * <p>On restart, the engine reads this UUID and passes it to the vector store
+     * factory so the new store can locate the same S3 / local checkpoint path,
+     * enabling recovery without full DML log replay (issue #368).
      *
      * <p>The leading underscore marks this as an internal IS property; it is never
      * set by the user and must not conflict with user-visible {@code VectorIndexManager}
@@ -287,6 +290,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * Each store holds all vectors for one vector index.
      */
     private final ConcurrentHashMap<String, AbstractVectorStore> vectorStores = new ConcurrentHashMap<>();
+
+    /**
+     * Tracks the logical {@link herddb.model.Index#uuid} that was used to create
+     * each vector store (keyed by the same {@link #storeKey} as {@link #vectorStores}).
+     * Used in {@link #createVectorStoreIfNeeded} to distinguish a true duplicate
+     * CREATE_INDEX (same UUID → skip) from a rename/recreate (different UUID → warn).
+     */
+    private final ConcurrentHashMap<String, String> vectorStoreIndexUuids = new ConcurrentHashMap<>();
 
     private VectorStoreFactory vectorStoreFactory = (indexName, tableName, vectorColumnName, dataDir, indexProperties) ->
             new InMemoryVectorStore(vectorColumnName,
@@ -760,17 +771,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         if (watermarkStore == null) {
             watermarkStore = new LocalWatermarkStore(dataDirectory);
         }
-        WatermarkSnapshot snapshot;
-        try {
-            snapshot = watermarkStore.load();
-        } catch (IOException e) {
-            // A corrupt or unreadable watermark is not fatal: start from the
-            // beginning of the commit log and rebuild state from scratch. This
-            // is the same behaviour as a brand-new pod with no watermark file.
-            LOGGER.log(Level.WARNING,
-                    "Failed to load watermark; starting from beginning: {0}", e.getMessage());
-            snapshot = WatermarkSnapshot.START_OF_TIME;
-        }
+        // A corrupt or unreadable watermark is fatal: silently falling back to
+        // START_OF_TIME would mask corruption and could trigger full BK log replay
+        // against ledgers that have already been trimmed (issue #368).  The stores
+        // return WatermarkSnapshot.START_OF_TIME themselves when the file/object is
+        // simply absent, so an IOException here always means something is wrong.
+        WatermarkSnapshot snapshot = watermarkStore.load();
         LogSequenceNumber watermark = snapshot.lsn;
         lastProcessedLsn = watermark;
         // The loaded watermark IS the durable recovery LSN: by construction
@@ -1218,7 +1224,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 // Remove vector store before updating schema (we need the index info)
                 Index idx = schemaTracker.getIndex(indexName);
                 if (idx != null && Index.TYPE_VECTOR.equals(idx.type)) {
-                    vectorStores.remove(storeKey(idx.table, idx.name));
+                    String k = storeKey(idx.table, idx.name);
+                    vectorStores.remove(k);
+                    vectorStoreIndexUuids.remove(k);
                     LOGGER.log(Level.INFO, "Removed vector store for index {0}", indexName);
                 }
                 schemaTracker.applyEntry(entry);
@@ -1253,19 +1261,30 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
         String key = storeKey(index.table, index.name);
         if (vectorStores.containsKey(key)) {
-            // Store was already created — typically because installSchemaFromSnapshot
-            // pre-populated it from the watermark snapshot on startup (issue #368).
-            // Skipping re-creation avoids a resource leak when the commit-log tailer
-            // later replays the same CREATE_INDEX entry from the log.
-            LOGGER.log(Level.FINE,
-                    "Vector store for {0} already exists (created from snapshot); skipping re-creation",
-                    key);
+            // Store already exists — compare the logical Index UUID to distinguish
+            // an idempotent replay (same UUID → benign) from a genuine schema
+            // divergence (different UUID → we already have a store, log a warning
+            // but skip because we cannot safely close-and-replace without knowing
+            // which store holds the authoritative data).
+            String existingUuid = vectorStoreIndexUuids.get(key);
+            if (existingUuid != null && !existingUuid.equals(index.uuid)) {
+                LOGGER.log(Level.WARNING,
+                        "CREATE_INDEX for {0} carries uuid={1} but existing store was created "
+                                + "for uuid={2}; skipping re-creation (snapshot store takes precedence)",
+                        new Object[]{key, index.uuid, existingUuid});
+            } else {
+                // Same UUID (or UUID unknown): benign duplicate from snapshot replay.
+                LOGGER.log(Level.FINE,
+                        "Vector store for {0} already exists (uuid={1}); skipping re-creation",
+                        new Object[]{key, existingUuid});
+            }
             return;
         }
         // The vector column is the first (and only) column of the vector index
         String vectorColumnName = index.columnNames[0];
         AbstractVectorStore store = vectorStoreFactory.create(index.name, index.table, vectorColumnName, dataDirectory, index.properties);
         vectorStores.put(key, store);
+        vectorStoreIndexUuids.put(key, index.uuid);
         registerIndexMetrics(index.tablespace, index.table, index.name, store);
         LOGGER.log(Level.INFO, "Created vector store for index {0} on column {1} with properties {2}",
                 new Object[]{index.name, vectorColumnName, index.properties});
@@ -1644,19 +1663,30 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             for (Index idx : schemaTracker.getAllIndexes()) {
                 if (Index.TYPE_VECTOR.equals(idx.type)) {
                     // Embed the store UUID in the index properties so a restarting
-                    // engine can reconstruct the PersistentVectorStore against the
+                    // engine can reconstruct the persistent vector store against the
                     // same S3 checkpoint path and avoid full DML log replay (issue #368).
+                    // Uses AbstractVectorStore.getStoreUUID() so this works for any
+                    // store implementation that supports UUID-based checkpoint recovery,
+                    // not just PersistentVectorStore (and is also testable without it).
                     AbstractVectorStore store = vectorStores.get(storeKey(idx.table, idx.name));
-                    if (store instanceof PersistentVectorStore) {
-                        String storeUUID = ((PersistentVectorStore) store).getIndexUUID();
+                    String storeUUID = store != null ? store.getStoreUUID() : null;
+                    // Always rebuild the index with a fresh UUID value: either the
+                    // current store's UUID (non-null → embed it), or no UUID at all
+                    // (null → drop any stale UUID that may have been loaded from a
+                    // previous snapshot via installSchemaFromSnapshot).
+                    boolean hasPropIsStoreUUID = idx.properties.containsKey(PROP_IS_STORE_UUID);
+                    if (storeUUID != null || hasPropIsStoreUUID) {
+                        // Rebuild the index, updating or removing PROP_IS_STORE_UUID.
                         Index.Builder b = Index.builder()
                                 .uuid(idx.uuid)
                                 .name(idx.name)
                                 .table(idx.table)
                                 .tablespace(idx.tablespace)
                                 .type(idx.type)
-                                .column(idx.columnNames[0], idx.columns[0].type)
-                                .property(PROP_IS_STORE_UUID, storeUUID);
+                                .column(idx.columnNames[0], idx.columns[0].type);
+                        if (storeUUID != null) {
+                            b.property(PROP_IS_STORE_UUID, storeUUID);
+                        }
                         // Preserve all existing user-visible properties (similarity, numShards, etc.).
                         for (Map.Entry<String, String> e : idx.properties.entrySet()) {
                             if (!PROP_IS_STORE_UUID.equals(e.getKey())) {

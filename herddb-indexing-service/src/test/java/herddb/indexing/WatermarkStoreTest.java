@@ -22,6 +22,7 @@ package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import herddb.log.LogSequenceNumber;
 import herddb.model.ColumnTypes;
@@ -180,6 +181,58 @@ public class WatermarkStoreTest {
         assertEquals("table 2 name", "tab2", loaded.tables.get(1).name);
         assertEquals("index 1 name", "idx1", loaded.vectorIndexes.get(0).name);
         assertEquals("index 2 name", "idx2", loaded.vectorIndexes.get(1).name);
+    }
+
+    /**
+     * Verifies that a corrupt watermark file with an absurdly large tableCount
+     * causes an {@link IOException} rather than an {@link OutOfMemoryError}
+     * (bounds-check regression for issue #368).
+     */
+    @Test
+    public void testCorruptTableCountThrowsIOException() throws Exception {
+        Path dir = folder.newFolder("corrupt-count").toPath();
+        java.nio.file.Files.createDirectories(dir);
+        Path wf = dir.resolve("watermark.dat");
+
+        // Manually craft a watermark file that has a valid header but an
+        // absurdly large tableCount, which must be caught before an OOM.
+        try (java.io.DataOutputStream dos =
+                new java.io.DataOutputStream(java.nio.file.Files.newOutputStream(wf))) {
+            dos.writeByte(1);                    // version
+            dos.writeLong(1L);                   // ledgerId
+            dos.writeLong(100L);                 // offset
+            dos.writeInt(2);                     // numInstances
+            dos.writeInt(Integer.MAX_VALUE);     // corrupt tableCount
+        }
+
+        LocalWatermarkStore store = new LocalWatermarkStore(dir);
+        assertThrows("corrupt tableCount must raise IOException, not OOM",
+                IOException.class, store::load);
+    }
+
+    /**
+     * Verifies that a corrupt watermark file with a negative per-blob length
+     * causes an {@link IOException} rather than {@link NegativeArraySizeException}.
+     */
+    @Test
+    public void testCorruptBlobLenThrowsIOException() throws Exception {
+        Path dir = folder.newFolder("corrupt-len").toPath();
+        java.nio.file.Files.createDirectories(dir);
+        Path wf = dir.resolve("watermark.dat");
+
+        try (java.io.DataOutputStream dos =
+                new java.io.DataOutputStream(java.nio.file.Files.newOutputStream(wf))) {
+            dos.writeByte(1);       // version
+            dos.writeLong(1L);      // ledgerId
+            dos.writeLong(100L);    // offset
+            dos.writeInt(1);        // numInstances
+            dos.writeInt(1);        // tableCount = 1
+            dos.writeInt(-7);       // corrupt blob length (negative)
+        }
+
+        LocalWatermarkStore store = new LocalWatermarkStore(dir);
+        assertThrows("negative blob length must raise IOException",
+                IOException.class, store::load);
     }
 
     /**

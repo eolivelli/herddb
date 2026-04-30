@@ -22,8 +22,10 @@ package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import herddb.codec.RecordSerializer;
+import herddb.index.vector.AbstractVectorStore;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
 import herddb.log.LogSequenceNumber;
@@ -51,18 +53,24 @@ import org.junit.rules.TemporaryFolder;
  * original {@code CREATE_TABLE} / {@code CREATE_INDEX} DDL entries have been
  * trimmed by the server's retention policy.
  *
- * <p>The test verifies two related properties:
+ * <p>The test verifies three related properties:
  * <ol>
  *   <li>A checkpoint saves the current schema alongside the watermark LSN in
  *       the {@link WatermarkSnapshot}.</li>
  *   <li>An engine that starts with a schema-carrying snapshot hydrates its
- *       {@link SchemaTracker} from the snapshot before the tailer starts.
- *       The tailer always resumes from {@code START_OF_TIME} so that DML
- *       entries in the commit log are replayed and vector stores are rebuilt.
- *       The schema pre-hydration is essential when early BookKeeper ledgers
- *       containing the original DDL entries have been trimmed: without it
- *       every DML entry would be silently dropped by an empty
- *       {@link SchemaTracker}.</li>
+ *       {@link SchemaTracker} and vector stores from the snapshot before the
+ *       tailer starts.  The tailer resumes from the <em>watermark LSN</em>
+ *       (not from {@code START_OF_TIME}), so only entries that arrived after
+ *       the checkpoint need to be replayed.  This is critical when early
+ *       BookKeeper ledgers have been trimmed: the engine must never attempt
+ *       to open a ledger that is no longer present.</li>
+ *   <li>When a vector store supports UUID-based checkpoint recovery
+ *       ({@link AbstractVectorStore#getStoreUUID()} is non-null), the UUID is
+ *       embedded in the watermark snapshot's index properties under the key
+ *       {@link IndexingServiceEngine#PROP_IS_STORE_UUID}.  A restarting engine
+ *       reads that UUID and passes it to the vector store factory so the new
+ *       store instance re-attaches to the same on-disk checkpoint without full
+ *       DML replay.</li>
  * </ol>
  *
  * <p>A companion negative test confirms that an engine started with an
@@ -140,14 +148,20 @@ public class WatermarkSchemaRecoveryTest {
     // ---------- tests --------------------------------------------------------
 
     /**
-     * Verifies the full recovery path:
+     * Verifies the full schema-recovery path and implicitly validates the
+     * BK-ledger-trimming scenario:
      * <ol>
      *   <li>Engine A applies DDL + 50 DML entries and checkpoints — the
      *       snapshot saved by the watermark store must carry the schema.</li>
-     *   <li>Engine B starts with that snapshot (no DDL is applied to it).
-     *       It must hydrate its {@link SchemaTracker} from the snapshot so
-     *       that DML entries can be routed correctly even without DDL in the
-     *       log.</li>
+     *   <li>Engine B starts with that snapshot (no DDL is applied to it,
+     *       simulating that the BK ledgers carrying CREATE_TABLE / CREATE_INDEX
+     *       have been trimmed).  It must hydrate its {@link SchemaTracker} from
+     *       the snapshot so that DML entries can be routed correctly.</li>
+     *   <li>Engine B only indexes the 20 new post-watermark DML entries
+     *       (vector count == 20), proving that the tailer started from the
+     *       watermark LSN, not from {@code START_OF_TIME}.  If the tailer had
+     *       started from {@code START_OF_TIME} it would have re-indexed all
+     *       50 original entries as well, making the count 70 instead of 20.</li>
      * </ol>
      */
     @Test
@@ -434,6 +448,158 @@ public class WatermarkSchemaRecoveryTest {
                     1L, engineB.getIndexStatus("default", "t1", "vidx").getVectorCount());
             assertEquals("t2/vidx2 must have 1 vector",
                     1L, engineB.getIndexStatus("default", "t2", "vidx2").getVectorCount());
+        } finally {
+            engineB.close();
+        }
+    }
+
+    // ======================================================================
+    // UUID round-trip test (issue #368 — PROP_IS_STORE_UUID persistence)
+    // ======================================================================
+
+    /**
+     * An {@link InMemoryVectorStore} subclass that reports a fixed UUID via
+     * {@link AbstractVectorStore#getStoreUUID()}.  Used to test the
+     * {@link IndexingServiceEngine#PROP_IS_STORE_UUID} embedding path without
+     * requiring a full {@link herddb.index.vector.PersistentVectorStore}.
+     */
+    private static final class UUIDReportingVectorStore extends InMemoryVectorStore {
+        private final String uuid;
+
+        UUIDReportingVectorStore(String vectorColumnName, String uuid) {
+            super(vectorColumnName);
+            this.uuid = uuid;
+        }
+
+        @Override
+        public String getStoreUUID() {
+            return uuid;
+        }
+    }
+
+    /**
+     * Verifies the {@link IndexingServiceEngine#PROP_IS_STORE_UUID} round-trip:
+     * <ol>
+     *   <li>Engine A uses a vector store factory that returns
+     *       {@link UUIDReportingVectorStore} instances with a known UUID for
+     *       each index.  After checkpoint the watermark snapshot must carry
+     *       {@code _is.store.uuid} in the index's properties.</li>
+     *   <li>Engine B uses a factory that records the UUID it receives via
+     *       {@code indexProperties}.  The recorded UUID must equal the one
+     *       embedded in the snapshot by Engine A — proving that a restarting
+     *       engine passes the persisted UUID to the vector store factory so
+     *       that a {@link herddb.index.vector.PersistentVectorStore} can
+     *       locate its existing S3 checkpoint.</li>
+     * </ol>
+     */
+    @Test
+    public void testStoreUUIDRoundTripThroughWatermarkSnapshot() throws Exception {
+        Path logDir  = folder.newFolder("log-uuid").toPath();
+        Path dataDir = folder.newFolder("data-uuid").toPath();
+
+        Properties props = new Properties();
+        props.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "memory");
+        IndexingServerConfiguration config = new IndexingServerConfiguration(props);
+
+        final String engineAUUID = "engine-a-store-uuid-12345";
+
+        AtomicReference<WatermarkSnapshot> capturedSnapshot = new AtomicReference<>();
+
+        // --- Engine A: uses a factory that returns stores with a known UUID ---
+        MemoryMetadataStorageManager meta = newMeta();
+        IndexingServiceEngine engineA = new IndexingServiceEngine(logDir, dataDir, config);
+        engineA.setMetadataStorageManager(meta);
+        engineA.setWatermarkStore(new WatermarkStore() {
+            @Override
+            public WatermarkSnapshot load() {
+                return WatermarkSnapshot.START_OF_TIME;
+            }
+            @Override
+            public void save(WatermarkSnapshot s) {
+                capturedSnapshot.set(s);
+            }
+        });
+        // Inject a factory that returns UUIDReportingVectorStore instances.
+        engineA.setVectorStoreFactory((indexName, tableName, vectorColumnName, dataDirectory2, indexProperties) ->
+                new UUIDReportingVectorStore(vectorColumnName, engineAUUID));
+
+        Table  table = buildTable();
+        Index  index = buildVectorIndex();
+        Random rng   = new Random(7);
+
+        try {
+            engineA.start();
+            engineA.applyEntry(new LogSequenceNumber(1, 1),
+                    LogEntryFactory.createTable(table, null));
+            engineA.applyEntry(new LogSequenceNumber(1, 2),
+                    LogEntryFactory.createIndex(index, null));
+
+            // Apply a few DML entries so there is something to checkpoint.
+            for (int i = 0; i < 10; i++) {
+                Record rec = RecordSerializer.makeRecord(table, "pk", "k" + i, "vec", randomVec(rng));
+                LogEntry ins = LogEntryFactory.insert(table, rec.key, rec.value, null);
+                engineA.applySingleEntryForTest(new LogSequenceNumber(1, 10 + i), ins);
+            }
+            engineA.awaitPendingWorkForTest();
+            engineA.setLastProcessedLsnForTest(new LogSequenceNumber(1, 19));
+            engineA.forceCheckpointAndSaveWatermark();
+        } finally {
+            engineA.close();
+        }
+
+        WatermarkSnapshot snap = capturedSnapshot.get();
+        assertNotNull("engine A must have saved a watermark snapshot", snap);
+        assertTrue("snapshot must carry schema", snap.hasSchema());
+        assertEquals("one index in snapshot", 1, snap.vectorIndexes.size());
+
+        Index savedIdx = snap.vectorIndexes.get(0);
+        assertEquals("PROP_IS_STORE_UUID must be embedded in snapshot",
+                engineAUUID, savedIdx.properties.get(IndexingServiceEngine.PROP_IS_STORE_UUID));
+
+        // --- Engine B: records the UUID received from indexProperties ---
+        AtomicReference<String> uuidReceivedByEngineB = new AtomicReference<>();
+        AtomicReference<WatermarkSnapshot> snapBRef = new AtomicReference<>();
+        // A capturing watermark store that seeds Engine B with the snapshot
+        // saved by Engine A and records every subsequent save().
+        WatermarkStore storeBWrapped = new WatermarkStore() {
+            private WatermarkSnapshot current = snap;
+            @Override
+            public WatermarkSnapshot load() {
+                return current;
+            }
+            @Override
+            public void save(WatermarkSnapshot s) {
+                current = s;
+                snapBRef.set(s);
+            }
+        };
+
+        IndexingServiceEngine engineB = new IndexingServiceEngine(logDir, dataDir, config);
+        engineB.setMetadataStorageManager(meta);
+        engineB.setWatermarkStore(storeBWrapped);
+        engineB.setVectorStoreFactory((indexName, tableName, vectorColumnName, dataDirectory2, indexProperties) -> {
+            String receivedUUID = indexProperties != null
+                    ? indexProperties.get(IndexingServiceEngine.PROP_IS_STORE_UUID) : null;
+            uuidReceivedByEngineB.set(receivedUUID);
+            return new InMemoryVectorStore(vectorColumnName);
+        });
+
+        try {
+            engineB.start(); // installSchemaFromSnapshot → factory called with PROP_IS_STORE_UUID
+
+            assertNotNull("engine B factory must have been called for the index", uuidReceivedByEngineB.get());
+            assertEquals(
+                    "engine B factory must receive the UUID that engine A embedded in the snapshot",
+                    engineAUUID, uuidReceivedByEngineB.get());
+
+            // Sanity: no UUID property is set for an index backed by a store whose
+            // getStoreUUID() returns null (InMemoryVectorStore).
+            engineB.setLastProcessedLsnForTest(new LogSequenceNumber(1, 19));
+            engineB.forceCheckpointAndSaveWatermark();
+            WatermarkSnapshot snapB = snapBRef.get();
+            assertNotNull("engine B must have saved a checkpoint", snapB);
+            assertNull("InMemoryVectorStore has no getStoreUUID(); PROP_IS_STORE_UUID must not appear",
+                    snapB.vectorIndexes.get(0).properties.get(IndexingServiceEngine.PROP_IS_STORE_UUID));
         } finally {
             engineB.close();
         }

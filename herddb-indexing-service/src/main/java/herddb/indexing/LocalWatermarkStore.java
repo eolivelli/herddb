@@ -63,6 +63,10 @@ public class LocalWatermarkStore implements WatermarkStore {
     private static final String WATERMARK_FILE = "watermark.dat";
     private static final String WATERMARK_TMP_FILE = "watermark.dat.tmp";
     private static final byte FORMAT_VERSION = 1;
+    /** Upper bound on the number of tables or indexes in a single watermark file. */
+    private static final int MAX_TABLES_OR_INDEXES = 10_000;
+    /** Upper bound on the serialized size of a single Table or Index blob. */
+    private static final int MAX_BLOB_BYTES = 10 * 1024 * 1024; // 10 MiB
 
     private final Path dataDirectory;
 
@@ -89,17 +93,33 @@ public class LocalWatermarkStore implements WatermarkStore {
             int numInstances = dis.readInt();
 
             int tableCount = dis.readInt();
+            if (tableCount < 0 || tableCount > MAX_TABLES_OR_INDEXES) {
+                throw new IOException("watermark file " + watermarkFile
+                        + " is corrupt: tableCount=" + tableCount);
+            }
             List<Table> tables = new ArrayList<>(tableCount);
             for (int i = 0; i < tableCount; i++) {
                 int len = dis.readInt();
+                if (len < 0 || len > MAX_BLOB_BYTES) {
+                    throw new IOException("watermark file " + watermarkFile
+                            + " is corrupt: table blob len=" + len + " at index " + i);
+                }
                 byte[] blob = new byte[len];
                 dis.readFully(blob);
                 tables.add(Table.deserialize(blob));
             }
             int indexCount = dis.readInt();
+            if (indexCount < 0 || indexCount > MAX_TABLES_OR_INDEXES) {
+                throw new IOException("watermark file " + watermarkFile
+                        + " is corrupt: indexCount=" + indexCount);
+            }
             List<Index> vectorIndexes = new ArrayList<>(indexCount);
             for (int i = 0; i < indexCount; i++) {
                 int len = dis.readInt();
+                if (len < 0 || len > MAX_BLOB_BYTES) {
+                    throw new IOException("watermark file " + watermarkFile
+                            + " is corrupt: index blob len=" + len + " at index " + i);
+                }
                 byte[] blob = new byte[len];
                 dis.readFully(blob);
                 vectorIndexes.add(Index.deserialize(blob));
