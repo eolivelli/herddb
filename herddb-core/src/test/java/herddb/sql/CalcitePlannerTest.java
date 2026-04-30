@@ -752,6 +752,51 @@ public class CalcitePlannerTest {
         }
     }
 
+    /**
+     * Regression test for issue #365: SHOW CREATE TABLE on a table with a floatarray column must
+     * produce DDL that can be re-parsed to recreate the same table (round-trip test).
+     * Before the fix, typeToString(NOTNULL_FLOATARRAY) returned "type?18" and the planner did not
+     * accept "floatarray" as a DDL keyword, so both directions of the round-trip were broken.
+     */
+    @Test
+    public void showCreateTable_roundtrip_floatarray_column() throws Exception {
+        String nodeId = "localhost";
+        try (DBManager manager = new DBManager("localhost", new MemoryMetadataStorageManager(), new MemoryDataStorageManager(), new MemoryCommitLogManager(), null, null)) {
+            manager.start();
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement("tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            // Create a table with nullable and not-null floatarray columns.
+            execute(manager, "CREATE TABLE tblspace1.vectable (id int primary key, vec floata)", Collections.emptyList());
+
+            TranslatedQuery translatedQuery = manager.getPlanner().translate("tblspace1", "SHOW CREATE TABLE tblspace1.vectable",
+                    Collections.emptyList(), true, false, true, -1);
+            ScanResult scanResult = (ScanResult) manager.executePlan(translatedQuery.plan, translatedQuery.context, TransactionContext.NO_TRANSACTION);
+            DataScanner dataScanner = scanResult.dataScanner;
+            List<DataAccessor> records = dataScanner.consume(2);
+            assertEquals(1, records.size());
+
+            String ddl = records.get(0).get("tabledef").toString();
+
+            // The DDL must name the type "floatarray" (not the raw integer "type?8" or "type?18").
+            assertTrue("SHOW CREATE TABLE must contain 'floatarray', got: " + ddl, ddl.contains("floatarray"));
+
+            // Drop the table, recreate from the SHOW CREATE TABLE output, and verify it exists.
+            execute(manager, "DROP TABLE tblspace1.vectable", Collections.emptyList());
+            try (DataScanner scan = scan(manager, "SELECT * FROM tblspace1.systables where table_name='vectable'", Collections.emptyList())) {
+                assertTrue("Table should be gone after DROP", scan.consume().isEmpty());
+            }
+
+            // The DDL produced by SHOW CREATE TABLE must be re-executable.
+            execute(manager, ddl, Collections.emptyList());
+
+            try (DataScanner scan = scan(manager, "SELECT * FROM tblspace1.systables where table_name='vectable'", Collections.emptyList())) {
+                assertFalse("Table must exist after re-creation from SHOW CREATE TABLE output", scan.consume().isEmpty());
+            }
+        }
+    }
+
     @Test(expected = TableDoesNotExistException.class)
     public void showCreateTable_Non_Existent_Table() throws Exception {
         String nodeId = "localhost";

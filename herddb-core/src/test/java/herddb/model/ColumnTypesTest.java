@@ -22,6 +22,8 @@ package herddb.model;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+import java.sql.Types;
 import org.junit.Test;
 
 /**
@@ -74,6 +76,48 @@ public class ColumnTypesTest {
                     name.startsWith("type?")
             );
         }
+    }
+
+    @Test
+    public void isNotNullDataTypeCoversAllNotNullConstants() {
+        // Every NOTNULL_* constant must be recognised as not-null. NOTNULL_FLOATARRAY was
+        // previously missing from this switch, so a "floatarray not null" column would not
+        // have its nullability enforced.
+        assertTrue(ColumnTypes.isNotNullDataType(ColumnTypes.NOTNULL_STRING));
+        assertTrue(ColumnTypes.isNotNullDataType(ColumnTypes.NOTNULL_INTEGER));
+        assertTrue(ColumnTypes.isNotNullDataType(ColumnTypes.NOTNULL_LONG));
+        assertTrue(ColumnTypes.isNotNullDataType(ColumnTypes.NOTNULL_BOOLEAN));
+        assertTrue(ColumnTypes.isNotNullDataType(ColumnTypes.NOTNULL_BYTEARRAY));
+        assertTrue(ColumnTypes.isNotNullDataType(ColumnTypes.NOTNULL_DOUBLE));
+        assertTrue(ColumnTypes.isNotNullDataType(ColumnTypes.NOTNULL_TIMESTAMP));
+        assertTrue(ColumnTypes.isNotNullDataType(ColumnTypes.NOTNULL_FLOATARRAY));
+
+        // The nullable variants must return false.
+        assertFalse(ColumnTypes.isNotNullDataType(ColumnTypes.STRING));
+        assertFalse(ColumnTypes.isNotNullDataType(ColumnTypes.INTEGER));
+        assertFalse(ColumnTypes.isNotNullDataType(ColumnTypes.LONG));
+        assertFalse(ColumnTypes.isNotNullDataType(ColumnTypes.BOOLEAN));
+        assertFalse(ColumnTypes.isNotNullDataType(ColumnTypes.BYTEARRAY));
+        assertFalse(ColumnTypes.isNotNullDataType(ColumnTypes.DOUBLE));
+        assertFalse(ColumnTypes.isNotNullDataType(ColumnTypes.TIMESTAMP));
+        assertFalse(ColumnTypes.isNotNullDataType(ColumnTypes.FLOATARRAY));
+    }
+
+    @Test
+    public void sqlDataTypeToJdbcTypeCoversFloatarray() {
+        // "floatarray" must resolve to an explicit (non-fallthrough) mapping.
+        // There is no standard JDBC type for float[]; Types.OTHER is the correct value.
+        assertEquals(Types.OTHER, ColumnTypes.sqlDataTypeToJdbcType("floatarray"));
+
+        // Verify the other standard types are still mapped correctly.
+        assertEquals(Types.VARCHAR,   ColumnTypes.sqlDataTypeToJdbcType("string"));
+        assertEquals(Types.BIGINT,    ColumnTypes.sqlDataTypeToJdbcType("long"));
+        assertEquals(Types.INTEGER,   ColumnTypes.sqlDataTypeToJdbcType("integer"));
+        assertEquals(Types.BLOB,      ColumnTypes.sqlDataTypeToJdbcType("bytearray"));
+        assertEquals(Types.TIMESTAMP, ColumnTypes.sqlDataTypeToJdbcType("timestamp"));
+        assertEquals(Types.NULL,      ColumnTypes.sqlDataTypeToJdbcType("null"));
+        assertEquals(Types.DOUBLE,    ColumnTypes.sqlDataTypeToJdbcType("double"));
+        assertEquals(Types.BOOLEAN,   ColumnTypes.sqlDataTypeToJdbcType("boolean"));
     }
 
     private static void assertTypeToString(String expected, int type) {

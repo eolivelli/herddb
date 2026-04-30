@@ -101,6 +101,7 @@ public class ColumnTypes {
             case NOTNULL_BYTEARRAY:
             case NOTNULL_DOUBLE:
             case NOTNULL_TIMESTAMP:
+            case NOTNULL_FLOATARRAY:
                 return true;
             default:
                 return false;
@@ -205,6 +206,9 @@ public class ColumnTypes {
                 return Types.INTEGER;
             case "bytearray":
                 return Types.BLOB;
+            case "floatarray":
+                // No standard JDBC type for float[]; Types.OTHER is the correct mapping.
+                return Types.OTHER;
             case "timestamp":
                 return Types.TIMESTAMP;
             case "null":
