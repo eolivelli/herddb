@@ -980,8 +980,8 @@ public final class RecordSerializer {
      */
     static Bytes extractRawIndexBytesNoCopy(
             String property, Bytes value, Table table) throws IOException {
-        Column column = table.getColumn(property);
-        if (column == null) {
+        // Fast-path: if the column is not in the schema, no need to scan the value buffer.
+        if (table.getColumn(property) == null) {
             return null;
         }
         try (ByteArrayCursor din = value.newCursor()) {
