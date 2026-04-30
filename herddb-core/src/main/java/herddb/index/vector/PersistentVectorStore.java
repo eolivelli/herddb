@@ -439,6 +439,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private volatile int compactionBackpressureThreshold = 500;
 
     /**
+     * Maximum wall-clock time (ms) a caller may spend in
+     * {@link #waitForSegmentCountRelief} before back-pressure is
+     * force-released with a SEVERE log (issue #370).
+     * Default is 300 000 ms (5 min).  Set to {@link Long#MAX_VALUE} to
+     * disable the safety timeout.
+     */
+    private volatile long compactionBackpressureMaxWaitMs = 300_000L;
+
+    /**
      * Log a WARNING during Phase A when the total on-disk segment count
      * exceeds this threshold, making runaway accumulation visible without
      * having to parse checkpoint log lines.
@@ -595,6 +604,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private volatile int segmentCountBackpressureActive;
     private final AtomicLong segmentCountBackpressureTotal = new AtomicLong(0);
     private final AtomicLong segmentCountBackpressureTimeMs = new AtomicLong(0);
+    /**
+     * Number of times segment-count back-pressure was force-released by
+     * the safety timeout ({@link #compactionBackpressureMaxWaitMs}) rather
+     * than by a successful compaction that reduced the segment count below
+     * the threshold (issue #370).
+     */
+    private final AtomicLong segmentCountBackpressureTimeouts = new AtomicLong(0);
     /**
      * Generation counter incremented inside {@link #notifySegmentCountMonitor}
      * to satisfy SpotBugs NN_NAKED_NOTIFY: the monitor must see a visible
@@ -1368,6 +1384,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.compactionBackpressureThreshold = threshold;
     }
 
+    /**
+     * Sets the maximum wall-clock time (ms) a caller may spend in
+     * segment-count back-pressure before it is force-released (issue #370).
+     * Use {@link Long#MAX_VALUE} to disable the safety timeout.
+     */
+    public void setCompactionBackpressureMaxWaitMs(long maxWaitMs) {
+        this.compactionBackpressureMaxWaitMs = maxWaitMs;
+    }
+
     /** Wakes the compaction thread. Called by tests and the retention reaper. */
     public void wakeVectorIndexCompaction() {
         synchronized (vectorIndexCompactionWakeup) {
@@ -1618,6 +1643,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                     vectorIndexCompactionMinBytes,
                                     vectorIndexCompactionMaxCount});
                 }
+                // Notify even when no candidates were selected (issue #370): apply
+                // threads parked in waitForSegmentCountRelief() must be woken after
+                // every cycle so they can re-check the segment count and, if the
+                // safety timeout has expired, release back-pressure.
+                notifySegmentCountMonitor();
                 return;
             }
 
@@ -1725,14 +1755,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                     now, sinceGen));
                         }
                     }
+                    // Notify parked apply threads even on failure (issue #370): without
+                    // this, threads wait up to 100 ms per poll cycle and cannot react to
+                    // the safety timeout while compaction is failing with back-off.
+                    notifySegmentCountMonitor();
                 } catch (IOException e) {
                     recordCompactionFailure(VectorIndexCompactor.FailureReason.WRITE_IO);
                     LOGGER.log(Level.WARNING,
                             "vector store " + indexName + ": compaction I/O failure", e);
+                    notifySegmentCountMonitor(); // issue #370
                 } catch (DataStorageManagerException e) {
                     recordCompactionFailure(VectorIndexCompactor.FailureReason.METADATA_IO);
                     LOGGER.log(Level.WARNING,
                             "vector store " + indexName + ": compaction metadata failure", e);
+                    notifySegmentCountMonitor(); // issue #370
                 }
             } finally {
                 // Drop the temporary BLink storages regardless of outcome so
@@ -2123,6 +2159,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     private void waitForSegmentCountRelief() {
         long startMs = System.currentTimeMillis();
+        long maxWaitMs = compactionBackpressureMaxWaitMs;
+        long deadlineMs = maxWaitMs == Long.MAX_VALUE ? Long.MAX_VALUE : startMs + maxWaitMs;
         segmentCountBackpressureActive = 1;
         segmentCountBackpressureTotal.incrementAndGet();
         int threshold = compactionBackpressureThreshold;
@@ -2137,13 +2175,24 @@ public class PersistentVectorStore extends AbstractVectorStore {
             vectorIndexCompactionWakeup.notifyAll();
         }
 
+        boolean timedOut = false;
         synchronized (segmentCountMonitor) {
             // segmentCountGeneration is incremented by notifySegmentCountMonitor each
             // time a compaction cycle completes, giving SpotBugs a traceable
             // producer-consumer relationship (NN_NAKED_NOTIFY avoidance).
             while (running && segments.size() > threshold && segmentCountGeneration >= 0) {
+                long remaining = deadlineMs - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    // Safety net (issue #370): compaction has not been able to relieve
+                    // back-pressure within maxWaitMs.  Log SEVERE and break out so the
+                    // IS does not hang permanently.  The caller will continue inserting
+                    // even though segment count is still above the threshold; operators
+                    // must investigate compaction failures reported in preceding WARNINGs.
+                    timedOut = true;
+                    break;
+                }
                 try {
-                    segmentCountMonitor.wait(100);
+                    segmentCountMonitor.wait(Math.min(100, remaining));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
@@ -2153,10 +2202,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
         segmentCountBackpressureActive = 0;
         long elapsedMs = System.currentTimeMillis() - startMs;
         segmentCountBackpressureTimeMs.addAndGet(elapsedMs);
-        LOGGER.log(Level.INFO,
-                "vector store {0} segment-count back-pressure released after {1} ms "
-                        + "({2} segments remaining)",
-                new Object[]{indexName, elapsedMs, segments.size()});
+        if (timedOut) {
+            segmentCountBackpressureTimeouts.incrementAndGet();
+            LOGGER.log(Level.SEVERE,
+                    "vector store {0}: segment-count back-pressure safety timeout after {1} ms "
+                            + "({2} segments still exceeds threshold {3}, consecutive compaction "
+                            + "failures={4}). Releasing back-pressure to prevent permanent IS hang. "
+                            + "Investigate compaction failures and consider raising "
+                            + "vector.index.compaction.backpressure.max.wait.ms or adjusting "
+                            + "compaction policy settings.",
+                    new Object[]{indexName, elapsedMs, segments.size(), threshold,
+                            compactionConsecutiveFailures.get()});
+        } else {
+            LOGGER.log(Level.INFO,
+                    "vector store {0} segment-count back-pressure released after {1} ms "
+                            + "({2} segments remaining)",
+                    new Object[]{indexName, elapsedMs, segments.size()});
+        }
     }
 
     /**
@@ -5427,6 +5489,24 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /** Returns {@code true} while a caller is blocked in segment-count back-pressure (issue #354). */
     public boolean isSegmentCountBackpressureActive() {
         return segmentCountBackpressureActive != 0;
+    }
+
+    /**
+     * Returns the number of times segment-count back-pressure was force-released
+     * by the safety timeout rather than by a successful compaction (issue #370).
+     */
+    public long getSegmentCountBackpressureTimeouts() {
+        return segmentCountBackpressureTimeouts.get();
+    }
+
+    /**
+     * Returns the current segment-count-monitor generation counter.
+     * Incremented by every {@link #notifySegmentCountMonitor()} call.
+     * Exposed for testing — callers can verify that a compaction cycle
+     * (including the empty-candidates and failure paths) notified the monitor.
+     */
+    public int getSegmentCountGeneration() {
+        return segmentCountGeneration;
     }
 
     public long getMaxVectorMemoryBytes() {
