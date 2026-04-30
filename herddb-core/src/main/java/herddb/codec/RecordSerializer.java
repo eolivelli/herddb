@@ -888,6 +888,21 @@ public final class RecordSerializer {
                 throw new IllegalArgumentException("SQLTranslator error, " + Arrays.toString(columns) + " != " + Arrays.asList(pkColumn));
             }
             Column c = index.getColumn(pkColumn);
+            // Optimisation (issue #377): for FLOATARRAY columns backed by a
+            // DataAccessorForFullRecord extract the raw float bytes directly from the
+            // serialised record value — avoids the float[] decode + re-encode round trip.
+            if ((c.type == ColumnTypes.FLOATARRAY || c.type == ColumnTypes.NOTNULL_FLOATARRAY)
+                    && record instanceof DataAccessorForFullRecord) {
+                Bytes rawFloatBytes = ((DataAccessorForFullRecord) record).getFloatArrayColumnBytesNoCopy(c.name);
+                if (rawFloatBytes != null) {
+                    return rawFloatBytes;
+                }
+                // rawFloatBytes == null: column is absent (null value)
+                if (index.allowNullsForIndexedValues()) {
+                    return null;
+                }
+                throw new IllegalArgumentException("key field " + pkColumn + " cannot be null. Record data: " + record);
+            }
             Object v = record.get(c.name);
             if (v == null) {
                 if (index.allowNullsForIndexedValues()) {
@@ -931,6 +946,48 @@ public final class RecordSerializer {
     }
 
     /**
+     * Extracts the raw IEEE 754 big-endian float bytes for a FLOATARRAY column from
+     * the record value bytes without allocating a {@code float[]}.
+     * The returned {@link Bytes} is a zero-copy view into the original value buffer.
+     * Returns {@code null} if the column is absent (null value) or if the stored type
+     * tag does not match a FLOATARRAY type.
+     */
+    static Bytes extractFloatArrayBytesNoCopy(
+            String property, Bytes value, Table table) throws IOException {
+        Column column = table.getColumn(property);
+        if (column == null) {
+            return null;
+        }
+        try (ByteArrayCursor din = value.newCursor()) {
+            while (!din.isEof()) {
+                int serialPosition = din.readVIntNoEOFException();
+                if (din.isEof()) {
+                    return null;
+                }
+                Column col = table.getColumnBySerialPosition(serialPosition);
+                if (col != null && col.name.equals(property)) {
+                    int type = din.readVInt();
+                    if (type == ColumnTypes.FLOATARRAY || type == ColumnTypes.NOTNULL_FLOATARRAY) {
+                        int len = din.readVInt();
+                        if (len == -1) {
+                            return null; // explicit NULL marker
+                        }
+                        if (len == 0) {
+                            return Bytes.EMPTY_ARRAY;
+                        }
+                        // Zero-copy: return a view into the underlying byte array
+                        return Bytes.from_array(din.getArray(), din.getPosition(), len * 4);
+                    }
+                    return null; // unexpected type for this column
+                } else {
+                    skipTypeAndValue(din);
+                }
+            }
+        }
+        return null; // column not found → null value
+    }
+
+    /**
      * Like {@link #serializeIndexKey(herddb.utils.DataAccessor, herddb.model.ColumnsList, java.lang.String[])
      * } but without return a value and/or creating temporary byte[]
      *
@@ -946,6 +1003,19 @@ public final class RecordSerializer {
                 throw new IllegalArgumentException("SQLTranslator error, " + Arrays.toString(columns) + " != " + Arrays.asList(pkColumn));
             }
             Column c = indexDefinition.getColumn(pkColumn);
+            // Optimisation (issue #377): for FLOATARRAY columns the type is always correct
+            // when the value comes from serialised bytes, so the instanceof check in validate()
+            // is a guaranteed no-op.  Avoid materialising a float[] entirely.
+            if (c.type == ColumnTypes.FLOATARRAY || c.type == ColumnTypes.NOTNULL_FLOATARRAY) {
+                if (!indexDefinition.allowNullsForIndexedValues()) {
+                    Object v = record.get(c.name);
+                    if (v == null) {
+                        throw new IllegalArgumentException("key field " + pkColumn + " cannot be null. Record data: " + record);
+                    }
+                }
+                // nulls allowed (common case for secondary indexes): nothing to validate
+                return;
+            }
             Object v = record.get(c.name);
             if (v == null && !indexDefinition.allowNullsForIndexedValues()) {
                 throw new IllegalArgumentException("key field " + pkColumn + " cannot be null. Record data: " + record);
@@ -959,6 +1029,17 @@ public final class RecordSerializer {
                     throw new IllegalArgumentException("SQLTranslator error, " + Arrays.toString(columns) + " != " + Arrays.asList(columnListForIndex));
                 }
                 Column c = indexDefinition.getColumn(pkColumn);
+                // Optimisation (issue #377): same as single-column case above
+                if (c.type == ColumnTypes.FLOATARRAY || c.type == ColumnTypes.NOTNULL_FLOATARRAY) {
+                    if (!indexDefinition.allowNullsForIndexedValues()) {
+                        Object v = record.get(c.name);
+                        if (v == null) {
+                            throw new IllegalArgumentException("key field " + pkColumn + " cannot be null. Record data: " + record);
+                        }
+                    }
+                    i++;
+                    continue;
+                }
                 Object v = record.get(c.name);
                 if (v == null && !indexDefinition.allowNullsForIndexedValues()) {
                     throw new IllegalArgumentException("key field " + pkColumn + " cannot be null. Record data: " + record);

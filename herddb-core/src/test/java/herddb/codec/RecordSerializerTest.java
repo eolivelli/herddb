@@ -22,6 +22,7 @@ package herddb.codec;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 import herddb.model.Column;
 import herddb.model.ColumnTypes;
 import herddb.model.ColumnsList;
@@ -272,6 +273,126 @@ public class RecordSerializerTest {
         public boolean allowNullsForIndexedValues() {
             return true;
         }
+    }
+
+    /**
+     * Verifies that {@link RecordSerializer#serializeIndexKey} on a
+     * {@link DataAccessorForFullRecord} with a FLOATARRAY column produces the same
+     * {@link Bytes} key as the general path that goes through a {@link MapDataAccessor}.
+     * This exercises the no-copy optimisation introduced in issue #377.
+     */
+    @Test
+    public void testSerializeIndexKeyFloatArrayNoCopy() {
+        Table table = Table.builder()
+                .name("t1")
+                .column("pk", ColumnTypes.INTEGER)
+                .column("vec", ColumnTypes.FLOATARRAY)
+                .primaryKey("pk")
+                .build();
+
+        float[] vector = {1.0f, 2.0f, 3.0f, 4.0f};
+        Record baseRecord = RecordSerializer.makeRecord(table, "pk", 1, "vec", vector);
+        // Use a cache-free record so getDataAccessor() returns DataAccessorForFullRecord
+        Record record = new Record(baseRecord.key, baseRecord.value);
+
+        Column vecColumn = Column.column("vec", ColumnTypes.FLOATARRAY);
+        ColumnsList index = new ColumnsListImpl(new Column[]{vecColumn});
+
+        // Reference result via MapDataAccessor (original path)
+        Map<String, Object> mapData = new HashMap<>();
+        mapData.put("pk", 1);
+        mapData.put("vec", vector);
+        DataAccessor mapAccessor = new MapDataAccessor(mapData, table.columnNames);
+        Bytes expectedKey = RecordSerializer.serializeIndexKey(mapAccessor, index, index.getPrimaryKey());
+
+        // Optimised path: DataAccessorForFullRecord
+        DataAccessor rawAccessor = record.getDataAccessor(table);
+        assertTrue("Expected DataAccessorForFullRecord", rawAccessor instanceof DataAccessorForFullRecord);
+        Bytes actualKey = RecordSerializer.serializeIndexKey(rawAccessor, index, index.getPrimaryKey());
+
+        assertEquals(expectedKey, actualKey);
+    }
+
+    /**
+     * Verifies that {@link RecordSerializer#serializeIndexKey} returns {@code null}
+     * when the FLOATARRAY column is absent from the record value bytes (null value),
+     * and that the index allows nulls.
+     */
+    @Test
+    public void testSerializeIndexKeyFloatArrayNullValue() {
+        Table table = Table.builder()
+                .name("t1")
+                .column("pk", ColumnTypes.INTEGER)
+                .column("vec", ColumnTypes.FLOATARRAY)
+                .primaryKey("pk")
+                .build();
+
+        // Record with no "vec" value → vec is null
+        Record baseRecord = RecordSerializer.makeRecord(table, "pk", 1);
+        Record record = new Record(baseRecord.key, baseRecord.value);
+
+        Column vecColumn = Column.column("vec", ColumnTypes.FLOATARRAY);
+        ColumnsList index = new ColumnsListImpl(new Column[]{vecColumn});
+
+        DataAccessor rawAccessor = record.getDataAccessor(table);
+        assertTrue("Expected DataAccessorForFullRecord", rawAccessor instanceof DataAccessorForFullRecord);
+
+        Bytes result = RecordSerializer.serializeIndexKey(rawAccessor, index, index.getPrimaryKey());
+        assertNull("Expected null for absent FLOATARRAY column", result);
+    }
+
+    /**
+     * Verifies that {@link RecordSerializer#validateIndexableValue} does not throw
+     * for a FLOATARRAY column with a valid value on a {@link DataAccessorForFullRecord}
+     * (the no-materialise optimisation must not break validation).
+     */
+    @Test
+    public void testValidateIndexableValueFloatArrayNoCopy() {
+        Table table = Table.builder()
+                .name("t1")
+                .column("pk", ColumnTypes.INTEGER)
+                .column("vec", ColumnTypes.FLOATARRAY)
+                .primaryKey("pk")
+                .build();
+
+        float[] vector = {0.5f, 1.5f, -3.0f};
+        Record baseRecord = RecordSerializer.makeRecord(table, "pk", 1, "vec", vector);
+        Record record = new Record(baseRecord.key, baseRecord.value);
+
+        Column vecColumn = Column.column("vec", ColumnTypes.FLOATARRAY);
+        ColumnsList index = new ColumnsListImpl(new Column[]{vecColumn});
+
+        DataAccessor rawAccessor = record.getDataAccessor(table);
+        assertTrue("Expected DataAccessorForFullRecord", rawAccessor instanceof DataAccessorForFullRecord);
+
+        // Must not throw
+        RecordSerializer.validateIndexableValue(rawAccessor, index, index.getPrimaryKey());
+    }
+
+    /**
+     * Verifies that {@link RecordSerializer#validateIndexableValue} does not throw
+     * when the FLOATARRAY column is null and nulls are allowed
+     * (common case for secondary indexes: {@link Index#allowNullsForIndexedValues()} = true).
+     */
+    @Test
+    public void testValidateIndexableValueFloatArrayNullAllowed() {
+        Table table = Table.builder()
+                .name("t1")
+                .column("pk", ColumnTypes.INTEGER)
+                .column("vec", ColumnTypes.FLOATARRAY)
+                .primaryKey("pk")
+                .build();
+
+        // No "vec" value → null
+        Record baseRecord = RecordSerializer.makeRecord(table, "pk", 1);
+        Record record = new Record(baseRecord.key, baseRecord.value);
+
+        Column vecColumn = Column.column("vec", ColumnTypes.FLOATARRAY);
+        ColumnsList index = new ColumnsListImpl(new Column[]{vecColumn}); // allowNulls = true
+
+        DataAccessor rawAccessor = record.getDataAccessor(table);
+        // Must not throw even though vec is null, because allowNullsForIndexedValues() = true
+        RecordSerializer.validateIndexableValue(rawAccessor, index, index.getPrimaryKey());
     }
 
 }

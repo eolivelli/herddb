@@ -188,4 +188,27 @@ public class DataAccessorForFullRecord extends AbstractDataAccessor {
         return record;
     }
 
+    /**
+     * Returns the raw IEEE 754 big-endian float bytes for a FLOATARRAY column from the
+     * record value bytes without allocating a {@code float[]}.  The returned {@link Bytes}
+     * is a zero-copy view into the underlying record value buffer.
+     * Returns {@code null} if the column value is null/absent or if the column is a
+     * primary-key column (whose bytes live in the key, not the value).
+     * <p>
+     * Package-private: used exclusively by {@link RecordSerializer} as a performance
+     * optimisation (issue #377).
+     */
+    Bytes getFloatArrayColumnBytesNoCopy(String property) {
+        if (table.isPrimaryKeyColumn(property)) {
+            // PK columns are stored in the key buffer, not in the value bytes;
+            // fall back to the general path via get().
+            return null;
+        }
+        try {
+            return RecordSerializer.extractFloatArrayBytesNoCopy(property, record.value, table);
+        } catch (IOException err) {
+            throw new IllegalStateException("bad data: " + err, err);
+        }
+    }
+
 }
