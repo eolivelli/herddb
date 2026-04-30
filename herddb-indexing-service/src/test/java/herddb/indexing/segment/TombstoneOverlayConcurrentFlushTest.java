@@ -243,12 +243,31 @@ public class TombstoneOverlayConcurrentFlushTest {
             assertTrue("published overlay must not contain more than the in-memory state",
                     gen1.ordinalCount() <= 200);
 
-            // A second flush picks up everything that wasn't in gen1.
-            mgr.flush(afterFlush).orElseThrow();
-            TombstoneOverlay gen2 = TombstoneOverlayManager.loadOverlay(
-                    dsm, TS_UUID, IDX_UUID, SEG_UUID, 2L);
-            assertEquals("gen 2 contains the full set",
-                    expected.size(), gen2.ordinalCount());
+            // A second flush picks up anything that wasn't in gen1. If worker
+            // B finished before worker A's snapshot was captured, gen1 already
+            // contains every ordinal and the second flush is a no-op (returns
+            // empty by design — see the {@code tombstoneCountAtLastFlush}
+            // short-circuit in TombstoneOverlayManager.flush). Don't blow up
+            // on that — verify the post-state instead.
+            java.util.Optional<VersionedSegmentMetadata> gen2Result = mgr.flush(afterFlush);
+            if (gen1.ordinalCount() < expected.size()) {
+                // gen1 had fewer than the full set, so a second flush MUST have
+                // produced gen 2 with the rest.
+                assertTrue("second flush must have produced gen 2 because gen1 ("
+                                + gen1.ordinalCount() + ") < expected (" + expected.size() + ")",
+                        gen2Result.isPresent());
+                TombstoneOverlay gen2 = TombstoneOverlayManager.loadOverlay(
+                        dsm, TS_UUID, IDX_UUID, SEG_UUID, 2L);
+                assertEquals("gen 2 contains the full set",
+                        expected.size(), gen2.ordinalCount());
+            } else {
+                // gen1 already had all 200 ordinals — the second flush is a
+                // no-op. The TombstoneOverlayManager's no-new-tombstones
+                // short-circuit returns Optional.empty() in this case.
+                assertEquals("when gen1 captured the full set, gen2 must NOT be produced"
+                                + " (no new tombstones since last flush)",
+                        java.util.Optional.empty(), gen2Result);
+            }
         } finally {
             es.shutdownNow();
         }
