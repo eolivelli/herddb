@@ -34,8 +34,13 @@ public final class IndexingServiceIndexDTO {
     private String status;
     private long vectorCount;
     private int segmentCount;
-    private long lastLsnLedger;
-    private long lastLsnOffset;
+    // In-memory tailer position (diagnostic only) and durable recovery LSN
+    // (used by server retention) — see IndexStatusInfo on
+    // RemoteVectorIndexService for the contract (issue #364).
+    private long tailerLsnLedger;
+    private long tailerLsnOffset;
+    private long durableLsnLedger;
+    private long durableLsnOffset;
     /** Original JSON properties string from sysindexstatus (for debugging). */
     private String rawProperties;
     /** Error string if the indexing service was unreachable when sysindexstatus was sampled. */
@@ -108,20 +113,36 @@ public final class IndexingServiceIndexDTO {
         this.segmentCount = segmentCount;
     }
 
-    public long getLastLsnLedger() {
-        return lastLsnLedger;
+    public long getTailerLsnLedger() {
+        return tailerLsnLedger;
     }
 
-    public void setLastLsnLedger(long lastLsnLedger) {
-        this.lastLsnLedger = lastLsnLedger;
+    public void setTailerLsnLedger(long tailerLsnLedger) {
+        this.tailerLsnLedger = tailerLsnLedger;
     }
 
-    public long getLastLsnOffset() {
-        return lastLsnOffset;
+    public long getTailerLsnOffset() {
+        return tailerLsnOffset;
     }
 
-    public void setLastLsnOffset(long lastLsnOffset) {
-        this.lastLsnOffset = lastLsnOffset;
+    public void setTailerLsnOffset(long tailerLsnOffset) {
+        this.tailerLsnOffset = tailerLsnOffset;
+    }
+
+    public long getDurableLsnLedger() {
+        return durableLsnLedger;
+    }
+
+    public void setDurableLsnLedger(long durableLsnLedger) {
+        this.durableLsnLedger = durableLsnLedger;
+    }
+
+    public long getDurableLsnOffset() {
+        return durableLsnOffset;
+    }
+
+    public void setDurableLsnOffset(long durableLsnOffset) {
+        this.durableLsnOffset = durableLsnOffset;
     }
 
     public String getRawProperties() {

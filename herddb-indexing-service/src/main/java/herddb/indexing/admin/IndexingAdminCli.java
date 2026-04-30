@@ -298,17 +298,21 @@ public final class IndexingAdminCli {
                 Map<String, Object> m = new LinkedHashMap<>();
                 m.put("vector_count", response.getVectorCount());
                 m.put("segment_count", response.getSegmentCount());
-                m.put("last_lsn_ledger", response.getLastLsnLedger());
-                m.put("last_lsn_offset", response.getLastLsnOffset());
+                m.put("tailer_lsn_ledger", response.getTailerLsnLedger());
+                m.put("tailer_lsn_offset", response.getTailerLsnOffset());
+                m.put("durable_lsn_ledger", response.getDurableLsnLedger());
+                m.put("durable_lsn_offset", response.getDurableLsnOffset());
                 m.put("status", response.getStatus());
                 out.println(JsonWriter.toJson(m));
             } else {
                 out.printf(Locale.ROOT,
-                        "vectors=%d segments=%d lsn=%d/%d status=%s%n",
+                        "vectors=%d segments=%d tailer_lsn=%d/%d durable_lsn=%d/%d status=%s%n",
                         response.getVectorCount(),
                         response.getSegmentCount(),
-                        response.getLastLsnLedger(),
-                        response.getLastLsnOffset(),
+                        response.getTailerLsnLedger(),
+                        response.getTailerLsnOffset(),
+                        response.getDurableLsnLedger(),
+                        response.getDurableLsnOffset(),
                         response.getStatus());
             }
         }
@@ -500,8 +504,10 @@ public final class IndexingAdminCli {
         m.put("live_vectors_memory_bytes", r.getLiveVectorsMemoryBytes());
         m.put("ondisk_size_bytes", r.getOndiskSizeBytes());
         m.put("dirty", r.getDirty());
-        m.put("last_lsn_ledger", r.getLastLsnLedger());
-        m.put("last_lsn_offset", r.getLastLsnOffset());
+        m.put("tailer_lsn_ledger", r.getTailerLsnLedger());
+        m.put("tailer_lsn_offset", r.getTailerLsnOffset());
+        m.put("durable_lsn_ledger", r.getDurableLsnLedger());
+        m.put("durable_lsn_offset", r.getDurableLsnOffset());
         m.put("fused_pq_enabled", r.getFusedPqEnabled());
         m.put("m", r.getM());
         m.put("beam_width", r.getBeamWidth());
@@ -568,8 +574,10 @@ public final class IndexingAdminCli {
         out.printf(Locale.ROOT, "  dirty                 = %s%n", r.getDirty());
         out.printf(Locale.ROOT, "  fused_pq_enabled      = %s%n", r.getFusedPqEnabled());
         out.printf(Locale.ROOT, "  m / beam_width        = %d / %d%n", r.getM(), r.getBeamWidth());
-        out.printf(Locale.ROOT, "  last_lsn              = %d/%d%n",
-                r.getLastLsnLedger(), r.getLastLsnOffset());
+        out.printf(Locale.ROOT, "  tailer_lsn            = %d/%d%n",
+                r.getTailerLsnLedger(), r.getTailerLsnOffset());
+        out.printf(Locale.ROOT, "  durable_lsn           = %d/%d%n",
+                r.getDurableLsnLedger(), r.getDurableLsnOffset());
         String phase = r.getCompactionPhase();
         if (phase != null && !phase.isEmpty() && !"idle".equals(phase)) {
             if ("uploading-segment".equals(phase)) {

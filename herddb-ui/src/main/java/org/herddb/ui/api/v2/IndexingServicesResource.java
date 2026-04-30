@@ -169,11 +169,17 @@ public class IndexingServicesResource {
                 if (tree.has("segmentCount")) {
                     dto.setSegmentCount(tree.get("segmentCount").asInt(0));
                 }
-                if (tree.has("lastLsnLedger")) {
-                    dto.setLastLsnLedger(tree.get("lastLsnLedger").asLong(0L));
+                if (tree.has("tailerLsnLedger")) {
+                    dto.setTailerLsnLedger(tree.get("tailerLsnLedger").asLong(0L));
                 }
-                if (tree.has("lastLsnOffset")) {
-                    dto.setLastLsnOffset(tree.get("lastLsnOffset").asLong(0L));
+                if (tree.has("tailerLsnOffset")) {
+                    dto.setTailerLsnOffset(tree.get("tailerLsnOffset").asLong(0L));
+                }
+                if (tree.has("durableLsnLedger")) {
+                    dto.setDurableLsnLedger(tree.get("durableLsnLedger").asLong(0L));
+                }
+                if (tree.has("durableLsnOffset")) {
+                    dto.setDurableLsnOffset(tree.get("durableLsnOffset").asLong(0L));
                 }
                 if (tree.has("status")) {
                     dto.setStatus(tree.get("status").asText(null));
