@@ -30,7 +30,6 @@ import herddb.utils.VisibleByteArrayOutputStream;
 import herddb.utils.XXHash64Utils;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -66,13 +65,6 @@ import java.util.logging.Logger;
  *   XXHash64(Long, 8 bytes, covering all preceding bytes)
  * </pre>
  *
- * <p>Older objects written before the schema-snapshot feature was added end
- * immediately after {@code numInstances} (followed by the 8-byte hash footer).
- * On load, if only 8 bytes remain after reading {@code numInstances}, they are
- * the hash footer and no schema data is present. The engine then starts the
- * tailer from {@code START_OF_TIME} to rebuild its {@link SchemaTracker} by
- * replaying DDL entries.
- *
  * <p>Monotonicity: {@link #save(WatermarkSnapshot)} rejects (no-op) any LSN
  * strictly before the currently-published one, so a stray concurrent writer cannot
  * regress progress.
@@ -82,9 +74,6 @@ import java.util.logging.Logger;
 public class S3WatermarkStore implements WatermarkStore {
 
     private static final Logger LOGGER = Logger.getLogger(S3WatermarkStore.class.getName());
-
-    /** Size in bytes of the XXHash64 footer appended to every object. */
-    private static final int HASH_FOOTER_BYTES = 8;
 
     /**
      * Abstraction over {@link herddb.remote.RemoteFileServiceClient} so this class
@@ -156,33 +145,21 @@ public class S3WatermarkStore implements WatermarkStore {
             long offset = din.readZLong();
             int numInstances = din.readVInt();
 
-            // If more than the 8-byte hash footer remains, the object contains
-            // a schema snapshot. Objects written before the schema feature was
-            // added end here (only the footer remains), so we skip schema
-            // reading and return an empty schema — the engine will then fall
-            // back to replaying DDL entries from START_OF_TIME.
-            List<Table> tables;
-            List<Index> vectorIndexes;
-            if (in.available() > HASH_FOOTER_BYTES) {
-                int tableCount = din.readVInt();
-                tables = new ArrayList<>(tableCount);
-                for (int i = 0; i < tableCount; i++) {
-                    int len = din.readVInt();
-                    byte[] blob = new byte[len];
-                    din.readFully(blob);
-                    tables.add(Table.deserialize(blob));
-                }
-                int indexCount = din.readVInt();
-                vectorIndexes = new ArrayList<>(indexCount);
-                for (int i = 0; i < indexCount; i++) {
-                    int len = din.readVInt();
-                    byte[] blob = new byte[len];
-                    din.readFully(blob);
-                    vectorIndexes.add(Index.deserialize(blob));
-                }
-            } else {
-                tables = Collections.emptyList();
-                vectorIndexes = Collections.emptyList();
+            int tableCount = din.readVInt();
+            List<Table> tables = new ArrayList<>(tableCount);
+            for (int i = 0; i < tableCount; i++) {
+                int len = din.readVInt();
+                byte[] blob = new byte[len];
+                din.readFully(blob);
+                tables.add(Table.deserialize(blob));
+            }
+            int indexCount = din.readVInt();
+            List<Index> vectorIndexes = new ArrayList<>(indexCount);
+            for (int i = 0; i < indexCount; i++) {
+                int len = din.readVInt();
+                byte[] blob = new byte[len];
+                din.readFully(blob);
+                vectorIndexes.add(Index.deserialize(blob));
             }
 
             WatermarkSnapshot snapshot = new WatermarkSnapshot(

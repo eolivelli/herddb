@@ -183,42 +183,6 @@ public class WatermarkStoreTest {
     }
 
     /**
-     * Simulates reading a pre-schema watermark file (one that was written by
-     * an older build without the schema fields). The file is crafted by
-     * writing a snapshot WITH schema and then truncating it to omit the schema
-     * bytes, so the format reader sees EOF after {@code numInstances} and
-     * returns an empty schema.
-     *
-     * <p>This test relies on the {@link LocalWatermarkStore} catching
-     * {@link java.io.EOFException} when attempting to read the {@code tableCount}
-     * field and gracefully returning an empty-schema snapshot.
-     */
-    @Test
-    public void testLoadOldFormatWithoutSchema() throws IOException {
-        // Write a legacy-format file manually: version=1 | ledgerId | offset | numInstances
-        // (no schema data after numInstances).
-        Path dir = folder.newFolder("old-fmt").toPath();
-        Path file = dir.resolve("watermark.dat");
-        java.io.DataOutputStream dos = new java.io.DataOutputStream(
-                java.nio.file.Files.newOutputStream(file));
-        dos.writeByte(1);           // FORMAT_VERSION
-        dos.writeLong(4L);          // ledgerId
-        dos.writeLong(77L);         // offset
-        dos.writeInt(3);            // numInstances
-        // (no table/index data — simulates pre-schema file)
-        dos.close();
-
-        LocalWatermarkStore store = new LocalWatermarkStore(dir);
-        WatermarkSnapshot loaded = store.load();
-        assertEquals("ledgerId preserved", 4, loaded.lsn.ledgerId);
-        assertEquals("offset preserved", 77, loaded.lsn.offset);
-        assertEquals("numInstances preserved", 3, loaded.numInstances);
-        assertFalse("pre-schema file must return empty schema", loaded.hasSchema());
-        assertTrue("tables must be empty", loaded.tables.isEmpty());
-        assertTrue("vectorIndexes must be empty", loaded.vectorIndexes.isEmpty());
-    }
-
-    /**
      * Verifies that schema is preserved across an overwrite: saving a snapshot
      * with schema, then a snapshot without schema (empty), results in a loaded
      * snapshot that has no schema.

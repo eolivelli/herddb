@@ -22,7 +22,6 @@ package herddb.indexing;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
@@ -31,9 +30,6 @@ import herddb.log.LogSequenceNumber;
 import herddb.model.ColumnTypes;
 import herddb.model.Index;
 import herddb.model.Table;
-import herddb.utils.ExtendedDataOutputStream;
-import herddb.utils.VisibleByteArrayOutputStream;
-import herddb.utils.XXHash64Utils;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
@@ -301,45 +297,6 @@ public class S3WatermarkStoreTest {
 
         assertThrows("schema corruption must be detected by hash",
                 S3WatermarkStore.CorruptWatermarkException.class, store::load);
-    }
-
-    /**
-     * Simulates an object written by a pre-schema build (ends after
-     * {@code numInstances} immediately followed by the 8-byte hash). The new
-     * reader must detect that only the hash footer remains after
-     * {@code numInstances} ({@code available() == 8}) and return an empty
-     * schema rather than throwing an exception.
-     */
-    @Test
-    public void loadLegacyObjectWithoutSchema() throws IOException {
-        // Manually build the pre-schema binary format:
-        //   version(VLong=1) | flags(VLong=0) | ledgerId(ZLong) | offset(ZLong)
-        //   | numInstances(VInt) | hash(Long)
-        VisibleByteArrayOutputStream bos = new VisibleByteArrayOutputStream();
-        XXHash64Utils.HashingOutputStream hashOut = new XXHash64Utils.HashingOutputStream(bos);
-        try (ExtendedDataOutputStream dout = new ExtendedDataOutputStream(hashOut)) {
-            dout.writeVLong(1); // version
-            dout.writeVLong(0); // flags
-            dout.writeZLong(8L);   // ledgerId
-            dout.writeZLong(42L);  // offset
-            dout.writeVInt(3);     // numInstances
-            // No schema fields — pre-schema format ends here.
-            dout.writeLong(hashOut.hash()); // hash footer
-        }
-
-        FakeRemoteFileIO io = new FakeRemoteFileIO();
-        String path = "ts/_indexing/0/watermark.lsn";
-        io.store.put(path, bos.toByteArray());
-
-        S3WatermarkStore store = new S3WatermarkStore(io, "ts", 0);
-        WatermarkSnapshot loaded = store.load();
-
-        assertEquals("ledgerId", 8L, loaded.lsn.ledgerId);
-        assertEquals("offset", 42L, loaded.lsn.offset);
-        assertEquals("numInstances", 3, loaded.numInstances);
-        assertFalse("legacy object must return empty schema", loaded.hasSchema());
-        assertTrue("tables must be empty", loaded.tables.isEmpty());
-        assertTrue("vectorIndexes must be empty", loaded.vectorIndexes.isEmpty());
     }
 
     /**
