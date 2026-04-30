@@ -432,7 +432,19 @@ public class SimpleFollowerTest extends MultiServerBase {
         serverconfig_1.set(ServerConfiguration.PROPERTY_ENFORCE_LEADERSHIP, false);
         serverconfig_1.set(ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_RETENTION_PERIOD, 1);
         serverconfig_1.set(ServerConfiguration.PROPERTY_CHECKPOINT_PERIOD, 0);
-        serverconfig_1.set(ServerConfiguration.PROPERTY_BOOKKEEPER_MAX_IDLE_TIME, 0); // disabled
+        // A small non-zero maxIdleTime is required here.  Even though BEGIN_TX
+        // is acknowledged before INSERT key5 is submitted (the auto-transaction path
+        // chains them), the BK client's local lastAddConfirmed view can lag behind the
+        // confirmed state at the time each subsequent write is initiated.  INSERT key6
+        // (the sync write below) is sent with whatever LAC the writer holds at that
+        // instant; if that LAC has not yet advanced past BEGIN_TX or INSERT key5, the
+        // bookies' lastKnownLac stays below the entries' IDs and the follower's
+        // readLastAddConfirmedAndEntry long-poll sees a stale LAC — the entries are
+        // physically present on the bookies but the follower cannot discover them.
+        // Setting maxIdleTime=100 causes the leader to emit a NOOP ≤200 ms after the
+        // last confirmed write; that NOOP piggybacks the up-to-date LAC so the follower
+        // can make progress within one long-poll cycle (~1 s).
+        serverconfig_1.set(ServerConfiguration.PROPERTY_BOOKKEEPER_MAX_IDLE_TIME, 100);
 
         ServerConfiguration serverconfig_2 = serverconfig_1
                 .copy()
@@ -484,9 +496,13 @@ public class SimpleFollowerTest extends MultiServerBase {
                 long tx = executeUpdateRes.transactionId;
                 assertTrue(tx > 0);
 
-                // Force a no-op sync write so that all previous deferred entries
-                // (BEGIN + INSERT) are guaranteed to be visible in BookKeeper
-                // before we start waiting for the follower to see them.
+                // Insert key 6 outside the transaction (auto-commit / NO_TRANSACTION).
+                // This produces a sync BookKeeper write that *may* carry an updated
+                // LAC if the deferred BEGIN_TX and INSERT(key5) entries were confirmed
+                // before this write is sent.  It is not sufficient on its own to
+                // advance the LAC reliably — the maxIdleTime=100 NOOP mechanism above
+                // is the authoritative guarantee — but it adds useful committed data
+                // and can accelerate the follower in the common case.
                 server_1.getManager().executeUpdate(
                         new InsertStatement(TableSpace.DEFAULT, "t1",
                                 RecordSerializer.makeRecord(table, "c", 6)),
