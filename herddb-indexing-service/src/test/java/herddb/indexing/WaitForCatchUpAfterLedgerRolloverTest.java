@@ -113,7 +113,7 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
             long deadline = System.currentTimeMillis() + 10_000;
             while (System.currentTimeMillis() < deadline) {
                 IndexStatusInfo status = eis.getEngine().getIndexStatus("tablespace1", "", "");
-                if (status.getLastLsnLedger() == 1 && status.getLastLsnOffset() == 5) {
+                if (status.getTailerLsnLedger() == 1 && status.getTailerLsnOffset() == 5) {
                     break;
                 }
                 Thread.sleep(50);
@@ -121,9 +121,9 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
 
             IndexStatusInfo status = eis.getEngine().getIndexStatus("tablespace1", "", "");
             assertEquals("Tailer should have processed up to ledger 1",
-                    1, status.getLastLsnLedger());
+                    1, status.getTailerLsnLedger());
             assertEquals("Tailer should have processed up to offset 5",
-                    5, status.getLastLsnOffset());
+                    5, status.getTailerLsnOffset());
 
             // The phantom LSN that getLastSequenceNumber() would return after ledger rollover
             LogSequenceNumber phantomLsn = new LogSequenceNumber(2, -1);

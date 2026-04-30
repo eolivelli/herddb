@@ -82,8 +82,10 @@ public class IndexingServicesResourceTest {
                                 "11111111-1111-1111-1111-111111111111",
                                 "{\"vectorCount\":42,"
                                         + "\"segmentCount\":3,"
-                                        + "\"lastLsnLedger\":7,"
-                                        + "\"lastLsnOffset\":113,"
+                                        + "\"tailerLsnLedger\":7,"
+                                        + "\"tailerLsnOffset\":113,"
+                                        + "\"durableLsnLedger\":5,"
+                                        + "\"durableLsnOffset\":97,"
                                         + "\"status\":\"ready\"}"),
                         row("herd", "amounts_t", "brin_idx", "brin",
                                 "22222222-2222-2222-2222-222222222222",
@@ -102,8 +104,10 @@ public class IndexingServicesResourceTest {
         assertEquals("ready", dto.getStatus());
         assertEquals(42L, dto.getVectorCount());
         assertEquals(3, dto.getSegmentCount());
-        assertEquals(7L, dto.getLastLsnLedger());
-        assertEquals(113L, dto.getLastLsnOffset());
+        assertEquals(7L, dto.getTailerLsnLedger());
+        assertEquals(113L, dto.getTailerLsnOffset());
+        assertEquals(5L, dto.getDurableLsnLedger());
+        assertEquals(97L, dto.getDurableLsnOffset());
     }
 
     @Test

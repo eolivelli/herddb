@@ -131,6 +131,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private Thread tailerThread;
 
     private volatile LogSequenceNumber lastProcessedLsn;
+    /**
+     * The LSN of the most recent checkpoint whose watermark has been
+     * successfully persisted via {@link WatermarkStore#save(WatermarkSnapshot)}.
+     * After a restart, the engine resumes from this LSN — so the server-side
+     * commit-log retention floor MUST pin against this value (and not the
+     * in-memory {@link #lastProcessedLsn}) to avoid dropping ledgers the IS
+     * would still need on recovery (issue #364).
+     *
+     * <p>Initialized at {@link #start()} from the loaded
+     * {@link WatermarkSnapshot#lsn}. Advanced strictly inside
+     * {@link #checkpointAndSaveWatermark()}, immediately after a successful
+     * {@code watermarkStore.save(...)} call. Never moves backwards.
+     */
+    private volatile LogSequenceNumber lastDurableLsn = LogSequenceNumber.START_OF_TIME;
     private long entriesSinceLastCheckpoint;
 
     /**
@@ -730,6 +744,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         WatermarkSnapshot snapshot = watermarkStore.load();
         LogSequenceNumber watermark = snapshot.lsn;
         lastProcessedLsn = watermark;
+        // The loaded watermark IS the durable recovery LSN: by construction
+        // checkpointAndSaveWatermark only ever publishes an LSN once every
+        // store has finished its checkpoint Phase C, so resuming from this
+        // value is safe even if the JVM was killed mid-checkpoint after the
+        // save. See lastDurableLsn JavaDoc (issue #364).
+        lastDurableLsn = watermark;
         if (snapshot.numInstances > 0) {
             int previous = currentNumInstances;
             currentNumInstances = snapshot.numInstances;
@@ -874,6 +894,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     public LogSequenceNumber getLastProcessedLsn() {
         return lastProcessedLsn;
+    }
+
+    /**
+     * Returns the LSN of the most recent checkpoint whose watermark has been
+     * successfully persisted to remote storage. After a restart, the engine
+     * resumes from this value. Used by {@code GetIndexStatus} so the server
+     * can pin commit-log retention against the IS's recovery floor (issue
+     * #364), not its volatile in-memory tailer position.
+     */
+    public LogSequenceNumber getLastDurableLsn() {
+        return lastDurableLsn;
     }
 
     /**
@@ -1517,8 +1548,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     new WatermarkSnapshot(checkpointLsn, currentNumInstances);
             try {
                 watermarkStore.save(snapshotToSave);
+                // Only after the watermark has been successfully persisted to
+                // remote storage is the engine guaranteed to recover from
+                // checkpointLsn on restart — this is the LSN the server's
+                // retention floor must pin against (issue #364).
+                lastDurableLsn = checkpointLsn;
                 LOGGER.log(Level.FINE, "Saved watermark snapshot {0}", snapshotToSave);
             } catch (IOException e) {
+                // Watermark save failed: leave lastDurableLsn unchanged.
+                // lastProcessedLsn keeps advancing in the in-memory tailer,
+                // but the recovery floor stays anchored at the previous
+                // durable LSN — exactly the invariant the server relies on.
                 LOGGER.log(Level.WARNING, "Failed to save watermark", e);
             }
             // Advertise the new durable LSN to ZK so shadow replicas can reload.
@@ -1836,9 +1876,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         if (store instanceof PersistentVectorStore) {
             segmentCount = ((PersistentVectorStore) store).getSegmentCount();
         }
+        // Snapshot both LSNs together so the response is internally consistent.
+        // Server-side retention pins on durable_lsn_*; tailer_lsn_* is exposed
+        // for diagnostics only (issue #364).
+        LogSequenceNumber tailerSnap = lastProcessedLsn;
+        LogSequenceNumber durableSnap = lastDurableLsn;
         return new IndexStatusInfo(vectorCount, segmentCount,
-                lastProcessedLsn != null ? lastProcessedLsn.ledgerId : -1,
-                lastProcessedLsn != null ? lastProcessedLsn.offset : -1,
+                tailerSnap != null ? tailerSnap.ledgerId : -1,
+                tailerSnap != null ? tailerSnap.offset : -1,
+                durableSnap != null ? durableSnap.ledgerId : -1,
+                durableSnap != null ? durableSnap.offset : -1,
                 "tailing");
     }
 
@@ -1953,13 +2000,21 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             d.liveNodeCount = store.size();
             d.liveShardCount = 1;
         }
-        LogSequenceNumber lsn = lastProcessedLsn;
-        if (lsn != null) {
-            d.lastLsnLedger = lsn.ledgerId;
-            d.lastLsnOffset = lsn.offset;
+        LogSequenceNumber tailerSnap = lastProcessedLsn;
+        if (tailerSnap != null) {
+            d.tailerLsnLedger = tailerSnap.ledgerId;
+            d.tailerLsnOffset = tailerSnap.offset;
         } else {
-            d.lastLsnLedger = -1L;
-            d.lastLsnOffset = -1L;
+            d.tailerLsnLedger = -1L;
+            d.tailerLsnOffset = -1L;
+        }
+        LogSequenceNumber durableSnap = lastDurableLsn;
+        if (durableSnap != null) {
+            d.durableLsnLedger = durableSnap.ledgerId;
+            d.durableLsnOffset = durableSnap.offset;
+        } else {
+            d.durableLsnLedger = -1L;
+            d.durableLsnOffset = -1L;
         }
         return d;
     }
@@ -2953,20 +3008,37 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     /**
      * Status information for a single vector index.
+     *
+     * <p>Carries two LSNs with very different semantics (issue #364):
+     * <ul>
+     *   <li>{@code tailerLsn*} — the in-memory tailer position; updated on
+     *       every applied entry; useful for diagnostic visibility but UNSAFE
+     *       as a recovery floor.</li>
+     *   <li>{@code durableLsn*} — the LSN of the most recent checkpoint whose
+     *       watermark has been persisted to remote storage; the LSN the
+     *       engine will resume from on restart. The server's commit-log
+     *       retention floor MUST be pinned against this value.</li>
+     * </ul>
      */
     public static class IndexStatusInfo {
         private final long vectorCount;
         private final int segmentCount;
-        private final long lastLsnLedger;
-        private final long lastLsnOffset;
+        private final long tailerLsnLedger;
+        private final long tailerLsnOffset;
+        private final long durableLsnLedger;
+        private final long durableLsnOffset;
         private final String status;
 
         public IndexStatusInfo(long vectorCount, int segmentCount,
-                               long lastLsnLedger, long lastLsnOffset, String status) {
+                               long tailerLsnLedger, long tailerLsnOffset,
+                               long durableLsnLedger, long durableLsnOffset,
+                               String status) {
             this.vectorCount = vectorCount;
             this.segmentCount = segmentCount;
-            this.lastLsnLedger = lastLsnLedger;
-            this.lastLsnOffset = lastLsnOffset;
+            this.tailerLsnLedger = tailerLsnLedger;
+            this.tailerLsnOffset = tailerLsnOffset;
+            this.durableLsnLedger = durableLsnLedger;
+            this.durableLsnOffset = durableLsnOffset;
             this.status = status;
         }
 
@@ -2978,12 +3050,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             return segmentCount;
         }
 
-        public long getLastLsnLedger() {
-            return lastLsnLedger;
+        public long getTailerLsnLedger() {
+            return tailerLsnLedger;
         }
 
-        public long getLastLsnOffset() {
-            return lastLsnOffset;
+        public long getTailerLsnOffset() {
+            return tailerLsnOffset;
+        }
+
+        public long getDurableLsnLedger() {
+            return durableLsnLedger;
+        }
+
+        public long getDurableLsnOffset() {
+            return durableLsnOffset;
         }
 
         public String getStatus() {
@@ -3058,8 +3138,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         public long liveVectorsMemoryBytes;
         public long onDiskSizeBytes;
         public boolean dirty;
-        public long lastLsnLedger;
-        public long lastLsnOffset;
+        // In-memory tailer position; diagnostic only. See IndexStatusInfo.
+        public long tailerLsnLedger;
+        public long tailerLsnOffset;
+        // Durable recovery LSN; the LSN the engine resumes from on restart.
+        public long durableLsnLedger;
+        public long durableLsnOffset;
         public boolean fusedPQEnabled;
         public int m;
         public int beamWidth;

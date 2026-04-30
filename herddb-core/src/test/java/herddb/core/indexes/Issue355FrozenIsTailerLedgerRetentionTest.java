@@ -129,10 +129,12 @@ public class Issue355FrozenIsTailerLedgerRetentionTest {
 
             @Override
             public IndexStatusInfo getIndexStatus(String tablespace, String table, String idx) {
-                // Returns the frozen IS LSN (ledgerId=-1, offset=-1 = START_OF_TIME).
+                // Returns the frozen IS LSN (ledgerId=-1, offset=-1 = START_OF_TIME)
+                // for both the in-memory tailer and the durable LSN — this mock
+                // represents a Phase A-frozen IS that has not advanced either.
                 long l = reportedLsn.isPresent() ? reportedLsn.get().ledgerId : -1L;
                 long o = reportedLsn.isPresent() ? reportedLsn.get().offset  : -1L;
-                return new IndexStatusInfo(0, 1, l, o, "phase-a-frozen");
+                return new IndexStatusInfo(0, 1, l, o, l, o, "phase-a-frozen");
             }
 
             @Override

@@ -70,9 +70,26 @@ message GetIndexStatusRequest {
 message GetIndexStatusResponse {
     int64 vector_count = 1;
     int32 segment_count = 2;
-    int64 last_lsn_ledger = 3;
-    int64 last_lsn_offset = 4;
+    // In-memory tailer position: the LSN of the most recently applied log
+    // entry. Updated on every tailer advance, BEFORE the underlying state is
+    // durably persisted to remote storage. Used by WAITFORINDEXES (a
+    // queryability gate: "have all entries through this LSN been applied to
+    // in-memory state?") and by diagnostic tooling. Must NEVER be used as a
+    // recovery floor or commit-log retention pin, because the IS cannot
+    // start from this LSN after a restart unless a checkpoint has covered
+    // it (issue #364).
+    int64 tailer_lsn_ledger = 3;
+    int64 tailer_lsn_offset = 4;
     string status = 5;
+    // Durable recovery LSN: the LSN of the most recent checkpoint whose
+    // watermark has been successfully written to remote storage. After a
+    // restart, the IS will resume from this LSN. Server-side commit-log
+    // retention MUST pin against this value (and not tailer_lsn_*) so it
+    // never drops a ledger that the IS would need to replay on recovery
+    // (issue #364). A {0,0} value means "no durable watermark yet" —
+    // callers MUST treat that as LogSequenceNumber.START_OF_TIME.
+    int64 durable_lsn_ledger = 6;
+    int64 durable_lsn_offset = 7;
 }
 
 // ---- Diagnostic RPCs ----
@@ -113,8 +130,10 @@ message DescribeIndexResponse {
     int64 live_vectors_memory_bytes = 9;
     int64 ondisk_size_bytes = 10;
     bool dirty = 11;
-    int64 last_lsn_ledger = 12;
-    int64 last_lsn_offset = 13;
+    // In-memory tailer position (most recently applied log entry).
+    // Diagnostic only — see the matching field on GetIndexStatusResponse.
+    int64 tailer_lsn_ledger = 12;
+    int64 tailer_lsn_offset = 13;
     bool fused_pq_enabled = 14;
     int32 m = 15;
     int32 beam_width = 16;
@@ -133,6 +152,11 @@ message DescribeIndexResponse {
     // silently wrap after 2^31 ids are burned by ingest + compaction
     // reservations on a long-running cluster.
     int64 next_node_id = 25;
+    // Durable recovery LSN: the LSN of the most recent checkpoint whose
+    // watermark has been successfully persisted to remote storage. Same
+    // semantics as the matching field on GetIndexStatusResponse (issue #364).
+    int64 durable_lsn_ledger = 26;
+    int64 durable_lsn_offset = 27;
 }
 
 message ListPrimaryKeysRequest {
