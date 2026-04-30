@@ -508,6 +508,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private volatile boolean localCompactionEnabledWithOptimizer = true;
 
     /**
+     * Pre-computed value of {@link #currentLocalCompactionKickThreshold()},
+     * recomputed only inside {@link #setLocalCompactionKickFraction} and
+     * {@link #setCompactionBackpressureThreshold}. Read on every
+     * {@link #addVectorInternal} call (the wake-on-threshold-crossing fast
+     * path) so the per-add cost stays at a single volatile load + int
+     * compare instead of {@code Math.ceil(double × int)} + two volatile
+     * reads. Kept consistent with the configured fraction/threshold by the
+     * setters; never read or written outside of those.
+     */
+    private volatile int kickThresholdCached =
+            (int) Math.max(1L, Math.ceil(0.7d * 500));
+
+    /**
      * Counter: number of times the IS-local compaction loop ran a full cycle
      * <em>specifically</em> as a pressure-driven fallback (i.e., with
      * {@link #externalCompactionEnabled} {@code true} and segment count above the
@@ -878,6 +891,55 @@ public class PersistentVectorStore extends AbstractVectorStore {
         if (seg.mapFilePath != null) {
             pendingDeletes.add(new PendingDelete(
                     encodeMultipartPath(segUuid, "map"), deadlineMs, sinceGen));
+        }
+    }
+
+    /**
+     * Cleanup helper for the abort paths in
+     * {@link #atomicSwapCompactionResult}: when a local compaction merge is
+     * aborted AFTER {@code rebuildSegment} has already uploaded the merged
+     * output's multipart files, this method (a) queues those files for
+     * retention-aware deletion via the existing {@code pendingDeletes}
+     * mechanism, and (b) closes the merged {@link VectorSegment} so its
+     * file handles + mmap'd buffers are released. Without this, every abort
+     * leaks up to {@code vector.index.compaction.maxBytes} of remote storage
+     * — and aborts are by-design steady-state behaviour of the pressure-
+     * driven local fallback when the optimizer races the IS.
+     *
+     * <p>The deadline is anchored to {@link #vectorIndexCompactionRetentionMs}
+     * (same window as the inputs of a successful merge would pay), giving
+     * any IS still loading the segment time to drop its reference. The
+     * {@code sinceGen} is the current generation: the merged output was
+     * never published in IndexStatus, so any generation ≥ the current one
+     * trivially "doesn't reference it" for the shadow-ack gating.
+     */
+    void queueMergedOutputForDeletion(VectorSegment mergedOutput) {
+        if (mergedOutput == null) {
+            return;
+        }
+        long deadlineMs = System.currentTimeMillis() + vectorIndexCompactionRetentionMs;
+        long sinceGen = currentIndexStatusGeneration.get();
+        String segUuid = indexUUID + "_seg" + mergedOutput.segmentId;
+        if (mergedOutput.graphFilePath != null) {
+            pendingDeletes.add(new PendingDelete(
+                    encodeMultipartPath(segUuid, "graph"), deadlineMs, sinceGen));
+        }
+        if (mergedOutput.mapFilePath != null) {
+            pendingDeletes.add(new PendingDelete(
+                    encodeMultipartPath(segUuid, "map"), deadlineMs, sinceGen));
+        }
+        try {
+            mergedOutput.close();
+        } catch (RuntimeException e) {
+            // Broad catch is intentional and limited to logging — close()
+            // surfaces BLink close failures and we must not let a stale handle
+            // mask the real abort reason. The next reap pass will still
+            // collect the multipart files queued above.
+            LOGGER.log(Level.WARNING,
+                    "vector store " + indexName
+                            + ": ignoring close failure for aborted merged segment "
+                            + mergedOutput.segmentId,
+                    e);
         }
     }
 
@@ -1545,6 +1607,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     public void setCompactionBackpressureThreshold(int threshold) {
         this.compactionBackpressureThreshold = threshold;
+        recomputeKickThresholdCached();
     }
 
     /**
@@ -1559,6 +1622,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     "localCompactionKickFraction must be in (0.0, 1.0), got " + fraction);
         }
         this.localCompactionKickFraction = fraction;
+        recomputeKickThresholdCached();
+    }
+
+    /**
+     * Recomputes {@link #kickThresholdCached} from the current fraction +
+     * back-pressure threshold. Called only by the two setters that mutate
+     * those inputs. Kept private to enforce the invariant that the cached
+     * value is always consistent with the configured fraction/threshold;
+     * callers never write {@code kickThresholdCached} directly.
+     */
+    private void recomputeKickThresholdCached() {
+        long t = (long) Math.ceil(localCompactionKickFraction * compactionBackpressureThreshold);
+        if (t > Integer.MAX_VALUE) {
+            this.kickThresholdCached = Integer.MAX_VALUE;
+        } else {
+            this.kickThresholdCached = (int) Math.max(1L, t);
+        }
     }
 
     /**
@@ -1571,18 +1651,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
-     * Computes the current segment-count threshold above which the IS-local
+     * Returns the current segment-count threshold above which the IS-local
      * compaction loop wakes from idle and runs a cycle. Always rounded UP
      * (ceiling) so a threshold of 1 segment is reachable even at small
      * back-pressure caps. Public so tests and Prometheus exporters can read
-     * it directly.
+     * it directly. Reads {@link #kickThresholdCached} (a single volatile
+     * load) — the cache is recomputed inside the setters that change the
+     * inputs, so this method is allocation-free and branch-free.
      */
     public int currentLocalCompactionKickThreshold() {
-        long t = (long) Math.ceil(localCompactionKickFraction * compactionBackpressureThreshold);
-        if (t > Integer.MAX_VALUE) {
-            return Integer.MAX_VALUE;
-        }
-        return (int) Math.max(1L, t);
+        return kickThresholdCached;
     }
 
     /**
@@ -1851,7 +1929,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     // and stall if the optimizer cannot keep up.
                     return;
                 }
-                int kickThreshold = currentLocalCompactionKickThreshold();
+                int kickThreshold = kickThresholdCached;
                 int now = segments.size();
                 if (now < kickThreshold) {
                     localCompactionSkippedBelowThresholdTotal.incrementAndGet();
@@ -2119,6 +2197,31 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * {@code segments} — if a concurrent checkpoint has moved an input
      * under us, aborts with {@code ABORTED_INPUT_GONE} instead of
      * silently dropping data.
+     *
+     * <p>When a {@link SegmentPublisher} is wired (segmented-v2 mode), this
+     * method also drives the registry-side staged-publish protocol around
+     * the local swap:
+     * <ol>
+     *   <li><b>Stage</b> the merged output as PROVISIONAL in the registry
+     *       BEFORE acquiring the local locks.</li>
+     *   <li><b>Revalidate</b> every input is still ACTIVE in the registry —
+     *       on drift (a concurrent optimizer or another IS deprecated an
+     *       input under us), abort with {@code ABORTED_INPUT_GONE}.</li>
+     *   <li><b>Persist IndexStatus</b> + in-memory swap (existing logic).</li>
+     *   <li><b>Commit</b> the staged znode (PROVISIONAL → ACTIVE) and
+     *       <b>CAS-deprecate</b> every input (post-lock, best-effort —
+     *       reconcile-on-restart heals failures).</li>
+     * </ol>
+     *
+     * <p>On any abort path (registry stage failure, registry revalidate
+     * failure, or in-memory drift), the merged output's already-uploaded
+     * multipart files are queued for the existing {@code pendingDeletes}
+     * retention reaper via {@link #queueMergedOutputForDeletion} and the
+     * merged {@link VectorSegment}'s file handles are released. Without
+     * this the abort path would leak up to
+     * {@code vector.index.compaction.maxBytes} of remote storage per
+     * occurrence — and aborts are by-design steady-state behaviour of the
+     * pressure-driven local fallback when the optimizer races the IS.
      */
     private void atomicSwapCompactionResult(List<VectorSegment> inputs,
                                             VectorSegment mergedOutput,
@@ -2167,13 +2270,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
             try {
                 publisherSnapshot.stageNewSegments(stagedInfo);
             } catch (RuntimeException stageFailed) {
-                // Stage failed (e.g. ZK unreachable). Abort the local merge —
-                // the rebuild's orphan files are queued for cleanup by the
-                // caller via the existing pendingDeletes mechanism.
+                // Stage failed (e.g. ZK unreachable). Abort the local merge.
+                // Stage failure means no PROVISIONAL znode was created (or
+                // creation was interrupted), so unstage is a no-op; we MUST
+                // still queue the rebuild's already-uploaded multipart files
+                // for cleanup, otherwise they leak indefinitely.
                 LOGGER.log(Level.WARNING,
                         "vector store {0}: stage of merged segment failed; aborting"
                                 + " local compaction merge",
                         new Object[]{indexName});
+                queueMergedOutputForDeletion(mergedOutput);
                 throw new VectorIndexCompactor.CompactionException(
                         VectorIndexCompactor.FailureReason.METADATA_IO,
                         "stage of merged segment failed: " + stageFailed.getMessage());
@@ -2188,8 +2294,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 try {
                     publisherSnapshot.unstage(stagedInfo);
                 } catch (RuntimeException ignored) {
-                    // best-effort — reconcile-on-restart will sweep stragglers
+                    // best-effort — reconcile-on-restart will sweep any leftover
+                    // PROVISIONAL znode; our merged-output bytes are queued for
+                    // local-side deletion via queueMergedOutputForDeletion below.
                 }
+                queueMergedOutputForDeletion(mergedOutput);
                 throw new VectorIndexCompactor.CompactionException(
                         VectorIndexCompactor.FailureReason.ABORTED_INPUT_GONE,
                         "concurrent compactor deprecated at least one input under us");
@@ -2208,14 +2317,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
                 for (VectorSegment in : inputs) {
                     if (!currentIds.contains(in.segmentId)) {
-                        // In-memory drift — undo the registry stage if any.
+                        // In-memory drift — undo the registry stage if any
+                        // and queue the merged output's bytes for cleanup so
+                        // they don't leak. The pre-existing version of this
+                        // branch (before the registry stage was added) only
+                        // had the empty rebuild.orphanPaths to fall back on
+                        // — that was a latent leak that became reachable
+                        // far more often once the new registry-revalidate
+                        // abort path landed alongside it.
                         if (publisherSnapshot != null && stagedInfo != null) {
                             try {
                                 publisherSnapshot.unstage(stagedInfo);
                             } catch (RuntimeException ignored) {
-                                // best-effort
+                                // best-effort — reconcile-on-restart will sweep
                             }
                         }
+                        queueMergedOutputForDeletion(mergedOutput);
                         throw new VectorIndexCompactor.CompactionException(
                                 VectorIndexCompactor.FailureReason.ABORTED_INPUT_GONE,
                                 "input segment " + in.segmentId + " disappeared from segment list");
@@ -2714,14 +2831,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // Pressure-driven local-compaction wake (companion to issue #354
         // back-pressure). When an external optimizer is enabled the IS-local
         // loop sleeps below the kick threshold; this poke wakes it the
-        // INSTANT segment count crosses the threshold instead of waiting for
+        // INSTANT segment count reaches the threshold instead of waiting for
         // its idle interval to elapse, so we minimise the window where
         // segments could keep accumulating toward the back-pressure ceiling.
-        // Cheap: one int compare on the existing fast path.
+        // The {@code >=} matches the {@code <} gate in {@code runCompactionCycle}
+        // — at exactly {@code kickThreshold} segments the cycle runs, so the
+        // wake must fire at that boundary too. Cheap: a few volatile reads
+        // and an int compare on the existing fast path; the synchronized
+        // {@code wakeVectorIndexCompaction} is skipped entirely when a wake
+        // is already pending (sustained-pressure ingest would otherwise pay
+        // a redundant notify on every add).
         int currentSegments = segments.size();
         if (externalCompactionEnabled
                 && localCompactionEnabledWithOptimizer
-                && currentSegments > currentLocalCompactionKickThreshold()) {
+                && !vectorIndexCompactionWakeupPending
+                && currentSegments >= kickThresholdCached) {
             wakeVectorIndexCompaction();
         }
 

@@ -75,20 +75,25 @@ public interface SegmentPublisher {
     }
 
     /**
-     * Revalidate that every supplied input segment is still {@code ACTIVE} in
-     * the registry at the same version we observed. Used by the IS-local
-     * compaction fallback (companion to the external index-optimizer): after
-     * staging a merged output, we must verify no concurrent optimizer has
-     * already deprecated any of the inputs. If revalidation fails the local
-     * compactor aborts the swap, deletes the staged PROVISIONAL znode via
-     * {@link #unstage}, and queues the merged output's multipart files for
-     * cleanup.
+     * Revalidate that every supplied input segment is still in {@code ACTIVE}
+     * state in the registry. Used by the IS-local compaction fallback
+     * (companion to the external index-optimizer): after staging a merged
+     * output, we must verify no concurrent optimizer has already deprecated
+     * any of the inputs. If revalidation fails the local compactor aborts
+     * the swap, deletes the staged PROVISIONAL znode via {@link #unstage},
+     * and queues the merged output's multipart files for cleanup.
+     *
+     * <p>The default {@code SegmentRegistryPublisher} implementation only
+     * checks {@code state == ACTIVE} (not znode version) — segment UUIDs are
+     * unique per physical segment so a state-only check is sufficient to
+     * detect the only race that matters: another actor moved the segment out
+     * of ACTIVE between candidate selection and our merge attempt.
      *
      * <p>Default returns {@code true} (no-op): publishers that don't track
      * input lifecycle (legacy single-phase) treat every input as still ACTIVE.
      *
-     * @return {@code true} iff every input is still {@code ACTIVE} at the same
-     *         registry version observed when the candidates were chosen
+     * @return {@code true} iff every input is still in {@code ACTIVE} state in
+     *         the registry
      */
     default boolean revalidateInputsActive(List<NewSegmentInfo> inputs) {
         return true;

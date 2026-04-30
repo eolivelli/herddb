@@ -31,10 +31,10 @@ import herddb.indexing.segment.VersionedSegmentMetadata;
 import herddb.log.LogSequenceNumber;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.curator.test.TestingServer;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.Watcher;
@@ -158,7 +158,7 @@ public class LocalCompactionRegistryRaceTest {
                 .orElseThrow();
         SegmentMetadata next = current.metadata().toBuilder()
                 .state(SegmentState.DEPRECATED)
-                .replacedBy(java.util.Collections.singletonList("optimizerMerged"))
+                .replacedBy(Collections.singletonList("optimizerMerged"))
                 .retentionUntilEpochMillis(now + 600_000L)
                 .build();
         registry.casUpdateSegment(current, next);
@@ -214,7 +214,7 @@ public class LocalCompactionRegistryRaceTest {
         VersionedSegmentMetadata bv = registry.getSegment(TS_UUID, IDX_UUID, "bDep").orElseThrow();
         registry.casUpdateSegment(bv, bv.metadata().toBuilder()
                 .state(SegmentState.DEPRECATED)
-                .replacedBy(java.util.Collections.singletonList("optimizerSneaky"))
+                .replacedBy(Collections.singletonList("optimizerSneaky"))
                 .retentionUntilEpochMillis(now + 600_000L)
                 .build());
 
@@ -252,7 +252,7 @@ public class LocalCompactionRegistryRaceTest {
         SegmentRegistryPublisher publisher = new SegmentRegistryPublisher(
                 registry, TS_UUID, TBL_NAME, IDX_UUID, IDX_NAME, 0);
 
-        publisher.unstage(java.util.Collections.singletonList(merged));
+        publisher.unstage(Collections.singletonList(merged));
 
         VersionedSegmentMetadata current = registry.getSegment(TS_UUID, IDX_UUID,
                 "active-already").orElseThrow();
@@ -267,10 +267,39 @@ public class LocalCompactionRegistryRaceTest {
         SegmentRegistryPublisher publisher = new SegmentRegistryPublisher(
                 registry, TS_UUID, TBL_NAME, IDX_UUID, IDX_NAME, 0);
         NewSegmentInfo missing = info("never-existed", 999, 1L);
-        AtomicInteger probes = new AtomicInteger();
-        boolean ok = publisher.revalidateInputsActive(java.util.Collections.singletonList(missing));
-        probes.incrementAndGet();
-        assertFalse(ok);
-        assertEquals(1, probes.get());
+        assertFalse("a single missing input must short-circuit revalidate to false",
+                publisher.revalidateInputsActive(Collections.singletonList(missing)));
+    }
+
+    @Test
+    public void revalidateScansAllInputsAndCatchesDriftAfterFirstActive() throws Exception {
+        // Defense-in-depth: revalidate must walk EVERY input — not just probe
+        // the first and shortcut. If a future refactor lazily probed only the
+        // first input then returned true on success, drift on the second
+        // would slip through, producing two ACTIVE segments covering the same
+        // data after the local compactor commits its merged output. This
+        // test pins that contract by registering input #1 as ACTIVE and
+        // input #2 as DEPRECATED, then asserting revalidate returns false.
+        long now = System.currentTimeMillis();
+        NewSegmentInfo good = info("scanGood", 31, 1L);
+        NewSegmentInfo drifted = info("scanDrifted", 32, 1L);
+        registry.createSegment(buildActive(good, now));
+        registry.createSegment(buildActive(drifted, now));
+        // Move the SECOND input to DEPRECATED so the publisher must scan past
+        // the first good one to detect drift.
+        VersionedSegmentMetadata current = registry.getSegment(TS_UUID, IDX_UUID,
+                "scanDrifted").orElseThrow();
+        registry.casUpdateSegment(current, current.metadata().toBuilder()
+                .state(SegmentState.DEPRECATED)
+                .replacedBy(Collections.singletonList("optimizerWon"))
+                .retentionUntilEpochMillis(now + 600_000L)
+                .build());
+
+        SegmentRegistryPublisher publisher = new SegmentRegistryPublisher(
+                registry, TS_UUID, TBL_NAME, IDX_UUID, IDX_NAME, 0);
+
+        assertFalse("revalidate must walk every input — drift on the second must"
+                        + " return false even though the first is still ACTIVE",
+                publisher.revalidateInputsActive(Arrays.asList(good, drifted)));
     }
 }

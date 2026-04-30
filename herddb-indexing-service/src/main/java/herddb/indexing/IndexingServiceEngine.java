@@ -491,16 +491,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final int vectorCompactionBackpressureSegments = config.getInt(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS_DEFAULT);
+            // Range validation (must be in (0, 1)) is enforced inside
+            // {@link PersistentVectorStore#setLocalCompactionKickFraction};
+            // we let the setter throw IllegalArgumentException at start time
+            // rather than duplicating the check here.
             final double vectorCompactionLocalKickFraction = config.getDouble(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION_DEFAULT);
-            if (!(vectorCompactionLocalKickFraction > 0.0d
-                    && vectorCompactionLocalKickFraction < 1.0d)) {
-                throw new IllegalArgumentException(
-                        IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION
-                                + " must be in (0.0, 1.0), got "
-                                + vectorCompactionLocalKickFraction);
-            }
             final boolean vectorCompactionLocalEnabledWithOptimizer = config.getBoolean(
                     IndexingServerConfiguration
                             .PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_ENABLED_WITH_OPTIMIZER,

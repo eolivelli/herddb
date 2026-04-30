@@ -24,7 +24,9 @@ import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
 import herddb.index.vector.PersistentVectorStore;
+import herddb.utils.Bytes;
 import java.nio.file.Path;
+import java.util.Random;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -51,6 +53,14 @@ public class LocalCompactionKickThresholdTest {
         return new PersistentVectorStore(INDEX_NAME, "testtable", TABLE_SPACE,
                 "vector_col", INDEX_UUID, tmpDir, dsm, mm,
                 16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0, Long.MAX_VALUE);
+    }
+
+    private float[] randomVector(Random rng, int dim) {
+        float[] v = new float[dim];
+        for (int i = 0; i < dim; i++) {
+            v[i] = rng.nextFloat();
+        }
+        return v;
     }
 
     @Test
@@ -89,24 +99,50 @@ public class LocalCompactionKickThresholdTest {
         // Operator opt-out path: enabledWithOptimizer=false restores the
         // pre-fallback behaviour (full delegation to the optimizer, no IS-local
         // compaction even at extreme pressure).
+        //
+        // Crucial that this test ACTUALLY reach high pressure — running cycles
+        // against an empty segment list would pass even if the order of the
+        // two early-return checks were inverted (since both branches return).
+        // To demonstrate that the opt-out short-circuit is unconditional, we
+        // accumulate real segments above the kick threshold via repeated tiny
+        // checkpoints.
         Path baseDir = tmpFolder.newFolder("data").toPath();
         Path tmpDir = tmpFolder.newFolder("tmp").toPath();
         FileDataStorageManager dsm = new FileDataStorageManager(baseDir);
         dsm.initTablespace(TABLE_SPACE);
 
         try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
-            store.setCompactionBackpressureThreshold(100);
-            store.setLocalCompactionKickFraction(0.7d);
+            // Tiny back-pressure threshold so we can cross it within the test
+            // budget. 0.5 × 4 = 2 → kickThreshold = 2.
+            store.setCompactionBackpressureThreshold(4);
+            store.setLocalCompactionKickFraction(0.5d);
             store.setLocalCompactionEnabledWithOptimizer(false);
             store.setExternalCompactionEnabled(true);
             store.start();
 
+            // Drive segment count above the kick threshold via 4 small
+            // checkpoints — each seals one segment.
+            Random rng = new Random(7);
+            for (int batch = 0; batch < 4; batch++) {
+                for (int i = 0; i < 80; i++) {
+                    store.addVector(Bytes.from_int(batch * 1000 + i),
+                            randomVector(rng, 32));
+                }
+                store.checkpoint();
+            }
+            assertTrue("test must actually be at high pressure (≥ kickThreshold) for the"
+                            + " assertion below to mean anything; saw " + store.getSegmentCount()
+                            + " segments vs kickThreshold " + store.currentLocalCompactionKickThreshold(),
+                    store.getSegmentCount() >= store.currentLocalCompactionKickThreshold());
+
+            // Run cycles directly. Even though pressure is real, the opt-out
+            // path must short-circuit BEFORE the threshold check — so neither
+            // counter advances.
             for (int i = 0; i < 5; i++) {
                 store.runCompactionCycle();
             }
-            // Both counters stay at zero — the early-return is unconditional
-            // (it never reaches the threshold check or the work path).
-            assertEquals("opt-out path must skip local compaction unconditionally",
+            assertEquals("opt-out path must skip local compaction even when"
+                            + " segment count exceeds the kick threshold",
                     0L, store.getLocalCompactionPressureRunsTotal());
             assertEquals("opt-out path must NOT bump the threshold-skip counter — that"
                             + " counter is reserved for cycles that genuinely fell below"

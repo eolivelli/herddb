@@ -124,4 +124,58 @@ public class LocalCompactionWakesOnThresholdCrossingTest {
             assertTrue("kick threshold must be ≥ 1", store.currentLocalCompactionKickThreshold() >= 1);
         }
     }
+
+    @Test
+    public void wakeFiresAtExactlyKickThreshold() throws Exception {
+        // Boundary case: when segment count is EXACTLY at kickThreshold, the
+        // gate in runCompactionCycle runs (now < threshold short-circuits, so
+        // now == threshold proceeds) and addVector's wake must fire too.
+        // Earlier the wake was {@code currentSegments > kickThreshold} (strict)
+        // while the gate was {@code now < kickThreshold} — a one-segment
+        // mismatch at the boundary that delayed the wake by one full
+        // ingest-cycle. This test pins the boundary.
+        Path baseDir = tmpFolder.newFolder("data").toPath();
+        Path tmpDir = tmpFolder.newFolder("tmp").toPath();
+        FileDataStorageManager dsm = new FileDataStorageManager(baseDir);
+        dsm.initTablespace(TABLE_SPACE);
+
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            // 0.5 × 4 = 2 → kickThreshold = 2. Drive segment count to exactly 2.
+            store.setCompactionBackpressureThreshold(4);
+            store.setLocalCompactionKickFraction(0.5d);
+            store.setLocalCompactionEnabledWithOptimizer(true);
+            store.setExternalCompactionEnabled(true);
+            store.configureCompaction(PIN_INTERVAL_MS, 0L, Long.MAX_VALUE, 2, 1024, 0L);
+            store.start();
+
+            Random rng = new Random(2);
+            for (int batch = 0; batch < 2; batch++) {
+                for (int i = 0; i < 80; i++) {
+                    store.addVector(Bytes.from_int(batch * 1000 + i),
+                            randomVector(rng, 32));
+                }
+                store.checkpoint();
+            }
+            // We should now be exactly at kickThreshold=2.
+            assertTrue("test must hit the boundary EXACTLY (saw " + store.getSegmentCount()
+                            + " segments, kick=" + store.currentLocalCompactionKickThreshold() + ")",
+                    store.getSegmentCount() == store.currentLocalCompactionKickThreshold());
+
+            long deadline = System.currentTimeMillis() + 5_000L;
+            long pressureRuns = 0L;
+            while (System.currentTimeMillis() < deadline) {
+                pressureRuns = store.getLocalCompactionPressureRunsTotal();
+                if (pressureRuns > 0L) {
+                    break;
+                }
+                // Keep poking the wake path with adds at the boundary.
+                store.addVector(Bytes.from_int(50_000 + (int) (System.nanoTime() & 0xFFFF)),
+                        randomVector(rng, 32));
+                Thread.sleep(20L);
+            }
+            assertNotEquals("at exactly kickThreshold segments the wake must still fire"
+                            + " (gate-vs-wake boundary alignment); did NOT see a pressure"
+                            + " run within 5 s", 0L, pressureRuns);
+        }
+    }
 }
