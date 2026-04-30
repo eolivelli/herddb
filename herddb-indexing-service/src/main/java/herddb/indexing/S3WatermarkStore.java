@@ -21,21 +21,24 @@
 package herddb.indexing;
 
 import herddb.log.LogSequenceNumber;
+import herddb.model.Index;
+import herddb.model.Table;
 import herddb.utils.ExtendedDataInputStream;
 import herddb.utils.ExtendedDataOutputStream;
 import herddb.utils.SimpleByteArrayInputStream;
 import herddb.utils.VisibleByteArrayOutputStream;
 import herddb.utils.XXHash64Utils;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
  * {@link WatermarkStore} that persists the durable indexing-service checkpoint
- * state — last applied {@link LogSequenceNumber} and effective
- * {@code numInstances} — on remote storage (S3 via the remote file service)
- * so that an indexing service pod with an ephemeral local disk can resume
- * from the correct state after a restart.
+ * state on remote storage (S3 via the remote file service) so that an indexing
+ * service pod with an ephemeral local disk can resume from the correct state
+ * after a restart.
  *
  * <p><b>Save contract</b>: per the {@link WatermarkStore} interface, this store is
  * only called after a matching {@code indexCheckpoint} has fully completed (all
@@ -49,7 +52,18 @@ import java.util.logging.Logger;
  *   {tableSpace}/_indexing/{instanceId}/watermark.lsn
  * </pre>
  * The {@code instanceId} segment keeps multi-instance shards from clobbering each
- * other. Format: {@code version | flags | ledgerId | offset | numInstances | XXHash64}.
+ * other.
+ *
+ * <p>Binary format (version 1, flags 0):
+ * <pre>
+ *   version(VLong=1) | flags(VLong=0)
+ *   ledgerId(ZLong) | offset(ZLong) | numInstances(VInt)
+ *   tableCount(VInt)
+ *   for each table:   VInt len, byte[len] serialised Table
+ *   indexCount(VInt)
+ *   for each index:   VInt len, byte[len] serialised Index
+ *   XXHash64(Long, 8 bytes, covering all preceding bytes)
+ * </pre>
  *
  * <p>Monotonicity: {@link #save(WatermarkSnapshot)} rejects (no-op) any LSN
  * strictly before the currently-published one, so a stray concurrent writer cannot
@@ -60,6 +74,16 @@ import java.util.logging.Logger;
 public class S3WatermarkStore implements WatermarkStore {
 
     private static final Logger LOGGER = Logger.getLogger(S3WatermarkStore.class.getName());
+
+    /**
+     * Upper bound on the number of tables or indexes in a single watermark object.
+     * The XXHash64 footer makes a corrupt count fail the hash check first, but these
+     * bounds provide defense-in-depth against format-version skew that might produce
+     * a hash-valid but semantically garbage payload.
+     */
+    private static final int MAX_TABLES_OR_INDEXES = 10_000;
+    /** Upper bound on the serialized size of a single Table or Index blob. */
+    private static final int MAX_BLOB_BYTES = 10 * 1024 * 1024; // 10 MiB
 
     /**
      * Abstraction over {@link herddb.remote.RemoteFileServiceClient} so this class
@@ -107,10 +131,16 @@ public class S3WatermarkStore implements WatermarkStore {
             throw new CorruptWatermarkException(
                     "watermark object at " + path + " is too short: " + data.length + " bytes");
         }
+        boolean hashValid;
         try {
-            XXHash64Utils.verifyBlockWithFooter(data, 0, data.length);
-        } catch (Exception e) {
+            hashValid = XXHash64Utils.verifyBlockWithFooter(data, 0, data.length);
+        } catch (RuntimeException e) {
+            // verifyBlockWithFooter is a pure array operation; a RuntimeException here means
+            // the data array is malformed (e.g. shorter than expected despite the length check).
             throw new CorruptWatermarkException("watermark checksum mismatch at " + path, e);
+        }
+        if (!hashValid) {
+            throw new CorruptWatermarkException("watermark checksum mismatch at " + path);
         }
         try (SimpleByteArrayInputStream in = new SimpleByteArrayInputStream(data);
                 ExtendedDataInputStream din = new ExtendedDataInputStream(in)) {
@@ -124,8 +154,45 @@ public class S3WatermarkStore implements WatermarkStore {
             long ledgerId = din.readZLong();
             long offset = din.readZLong();
             int numInstances = din.readVInt();
+
+            int tableCount = din.readVInt();
+            if (tableCount < 0 || tableCount > MAX_TABLES_OR_INDEXES) {
+                throw new CorruptWatermarkException(
+                        "watermark object at " + path + " is corrupt: tableCount=" + tableCount);
+            }
+            List<Table> tables = new ArrayList<>(tableCount);
+            for (int i = 0; i < tableCount; i++) {
+                int len = din.readVInt();
+                if (len < 0 || len > MAX_BLOB_BYTES) {
+                    throw new CorruptWatermarkException(
+                            "watermark object at " + path + " is corrupt: table blob len=" + len
+                                    + " at index " + i);
+                }
+                byte[] blob = new byte[len];
+                din.readFully(blob);
+                tables.add(Table.deserialize(blob));
+            }
+            int indexCount = din.readVInt();
+            if (indexCount < 0 || indexCount > MAX_TABLES_OR_INDEXES) {
+                throw new CorruptWatermarkException(
+                        "watermark object at " + path + " is corrupt: indexCount=" + indexCount);
+            }
+            List<Index> vectorIndexes = new ArrayList<>(indexCount);
+            for (int i = 0; i < indexCount; i++) {
+                int len = din.readVInt();
+                if (len < 0 || len > MAX_BLOB_BYTES) {
+                    throw new CorruptWatermarkException(
+                            "watermark object at " + path + " is corrupt: index blob len=" + len
+                                    + " at index " + i);
+                }
+                byte[] blob = new byte[len];
+                din.readFully(blob);
+                vectorIndexes.add(Index.deserialize(blob));
+            }
+
             WatermarkSnapshot snapshot = new WatermarkSnapshot(
-                    new LogSequenceNumber(ledgerId, offset), numInstances);
+                    new LogSequenceNumber(ledgerId, offset), numInstances,
+                    tables, vectorIndexes);
             LOGGER.log(Level.INFO, "Loaded watermark from {0}: {1}", new Object[]{path, snapshot});
             return snapshot;
         }
@@ -159,6 +226,21 @@ public class S3WatermarkStore implements WatermarkStore {
             dout.writeZLong(snapshot.lsn.ledgerId);
             dout.writeZLong(snapshot.lsn.offset);
             dout.writeVInt(snapshot.numInstances);
+            // Schema snapshot: tables
+            dout.writeVInt(snapshot.tables.size());
+            for (Table t : snapshot.tables) {
+                byte[] blob = t.serialize();
+                dout.writeVInt(blob.length);
+                dout.write(blob);
+            }
+            // Schema snapshot: vector indexes
+            dout.writeVInt(snapshot.vectorIndexes.size());
+            for (Index ix : snapshot.vectorIndexes) {
+                byte[] blob = ix.serialize();
+                dout.writeVInt(blob.length);
+                dout.write(blob);
+            }
+            // Hash footer covers all preceding bytes (including schema).
             dout.writeLong(hashOut.hash());
         }
         try {

@@ -166,4 +166,13 @@ public class SchemaTracker {
     public Collection<Index> getAllIndexes() {
         return new ArrayList<>(indexes.values());
     }
+
+    /**
+     * Returns a snapshot of every tracked table. Used when persisting the
+     * schema alongside the watermark so a restarting engine can hydrate its
+     * schema without replaying DDL entries from the commit log.
+     */
+    public Collection<Table> getAllTables() {
+        return new ArrayList<>(tables.values());
+    }
 }

@@ -237,6 +237,42 @@ public class SchemaTrackerTest {
     }
 
     @Test
+    public void testGetAllTables() {
+        // Initially empty
+        assertTrue(tracker.getAllTables().isEmpty());
+
+        // After CREATE_TABLE, the table appears in getAllTables()
+        Table t = buildTable("t1");
+        tracker.applyEntry(LogEntryFactory.createTable(t, null));
+        assertEquals("getAllTables must return 1 table after CREATE_TABLE", 1, tracker.getAllTables().size());
+        assertEquals("t1", tracker.getAllTables().iterator().next().name);
+
+        // After a second CREATE_TABLE, both appear
+        Table t2 = buildTable("t2");
+        tracker.applyEntry(LogEntryFactory.createTable(t2, null));
+        assertEquals(2, tracker.getAllTables().size());
+
+        // After DROP_TABLE, the dropped table is removed
+        tracker.applyEntry(LogEntryFactory.dropTable("t1", null));
+        assertEquals(1, tracker.getAllTables().size());
+        assertEquals("t2", tracker.getAllTables().iterator().next().name);
+    }
+
+    @Test
+    public void testGetAllIndexes() {
+        // Initially empty
+        assertTrue(tracker.getAllIndexes().isEmpty());
+
+        Table t = buildTableWithVector("mytable");
+        tracker.applyEntry(LogEntryFactory.createTable(t, null));
+        tracker.applyEntry(LogEntryFactory.createIndex(buildVectorIndex("myindex", "mytable"), null));
+
+        assertEquals("getAllIndexes must return 1 index after CREATE_INDEX",
+                1, tracker.getAllIndexes().size());
+        assertEquals("myindex", tracker.getAllIndexes().iterator().next().name);
+    }
+
+    @Test
     public void testAlterTable() {
         Table table = buildTable("mytable");
         tracker.applyEntry(LogEntryFactory.createTable(table, null));

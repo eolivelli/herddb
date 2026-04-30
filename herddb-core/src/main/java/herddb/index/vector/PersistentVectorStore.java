@@ -5206,6 +5206,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return indexUUID;
     }
 
+    /**
+     * Returns the {@link #indexUUID} so the indexing-service can embed it in
+     * the {@link herddb.indexing.WatermarkSnapshot} for checkpoint recovery
+     * without full DML log replay (issue #368).
+     */
+    @Override
+    public String getStoreUUID() {
+        return indexUUID;
+    }
+
     public String getVectorColumnName() {
         return vectorColumnName;
     }
