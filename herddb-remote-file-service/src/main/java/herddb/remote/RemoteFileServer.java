@@ -24,6 +24,7 @@ import herddb.auth.oidc.OidcBootstrap;
 import herddb.auth.oidc.OidcTokenValidator;
 import herddb.auth.oidc.grpc.JwtAuthServerInterceptor;
 import herddb.metadata.MetadataStorageManager;
+import herddb.remote.admin.RemoteFileServerAdminImpl;
 import herddb.remote.storage.CachingObjectStorage;
 import herddb.remote.storage.InMemoryBlockCacheObjectStorage;
 import herddb.remote.storage.LocalObjectStorage;
@@ -72,6 +73,10 @@ import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
 /**
  * Configurable gRPC server for RemoteFileService.
  * Supports local filesystem (default) and S3 storage backends via {@code storage.mode} property.
+ * <p>
+ * Also hosts the {@link RemoteFileServerAdminImpl} gRPC admin service on the same port
+ * (issue #336): operators can query cache stats and resize the disk cache at runtime
+ * without restarting the pod.
  *
  * @author enrico.olivelli
  */
@@ -116,6 +121,12 @@ public class RemoteFileServer implements AutoCloseable {
     private org.eclipse.jetty.server.Server httpServer;
     private MetadataStorageManager metadataStorageManager;
     private String registeredServiceId;
+    /** Non-null when storage.mode=s3; exposed to {@link RemoteFileServerAdminImpl} (issue #336). */
+    private CachingObjectStorage diskCache;
+    /** Non-null when block.cache.enabled=true; exposed to {@link RemoteFileServerAdminImpl} (issue #336). */
+    private InMemoryBlockCacheObjectStorage blockCacheRef;
+    /** Storage mode string used in admin GetServerInfo response. */
+    private String storageMode;
 
     public RemoteFileServer(String host, int port, Path dataDirectory, int ioThreads, Properties config) {
         this.host = host;
@@ -167,7 +178,7 @@ public class RemoteFileServer implements AutoCloseable {
         readExecutor = buildLaneExecutor("remote-file-read-exec-", readExecutorThreads);
         writeExecutor = buildLaneExecutor("remote-file-write-exec-", writeExecutorThreads);
 
-        String storageMode = config.getProperty("storage.mode", "local");
+        storageMode = config.getProperty("storage.mode", "local");
         if ("s3".equals(storageMode)) {
             objectStorage = buildS3ObjectStorage(statsLogger);
         } else {
@@ -192,8 +203,12 @@ public class RemoteFileServer implements AutoCloseable {
         } else {
             LOGGER.log(Level.INFO, "block cache disabled");
         }
+        blockCacheRef = blockCache;
         if (blockCache != null) {
             registerBlockCacheGauges(statsLogger, blockCache);
+        }
+        if (diskCache != null) {
+            registerDiskCacheGauges(statsLogger, diskCache);
         }
 
         int ioRatio = Integer.getInteger("herddb.fileserver.netty.ioRatio", DEFAULT_IO_RATIO);
@@ -218,6 +233,9 @@ public class RemoteFileServer implements AutoCloseable {
                 .workerEventLoopGroup(workerGroup)
                 .channelType(NioServerSocketChannel.class)
                 .addService(serviceImpl)
+                // Admin service (issue #336): live cache stats and disk-cache resize.
+                // Runs on the same port as the data service; gRPC multiplexes by service name.
+                .addService(new RemoteFileServerAdminImpl(this))
                 .maxInboundMessageSize(blockSize + 1024 * 1024);
         if (OidcBootstrap.isEnabled(config)) {
             try {
@@ -270,6 +288,39 @@ public class RemoteFileServer implements AutoCloseable {
                 new Object[]{port, storageMode, ioThreads, ioRatio, this.blockSize,
                         readExecutorThreads, writeExecutorThreads});
     }
+
+    // -----------------------------------------------------------------------
+    // Admin accessors (issue #336) — used by RemoteFileServerAdminImpl
+    // -----------------------------------------------------------------------
+
+    /**
+     * Returns the on-disk cache instance, or {@code null} when storage.mode is not s3.
+     * Used by {@link herddb.remote.admin.RemoteFileServerAdminImpl} to query stats
+     * and resize the cache at runtime.
+     */
+    public CachingObjectStorage getDiskCache() {
+        return diskCache;
+    }
+
+    /**
+     * Returns the in-heap block cache instance, or {@code null} when disabled.
+     * Used by {@link herddb.remote.admin.RemoteFileServerAdminImpl} to expose stats.
+     */
+    public InMemoryBlockCacheObjectStorage getBlockCache() {
+        return blockCacheRef;
+    }
+
+    /**
+     * Returns the configured storage mode string ({@code "s3"} or {@code "local"}).
+     * Available after {@link #start()} completes.
+     */
+    public String getStorageMode() {
+        return storageMode != null ? storageMode : "local";
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
 
     private ThreadPoolExecutor buildLaneExecutor(String namePrefix, int threads) {
         AtomicInteger counter = new AtomicInteger();
@@ -419,7 +470,11 @@ public class RemoteFileServer implements AutoCloseable {
 
         S3ObjectStorage s3Storage = new S3ObjectStorage(s3Client, bucket, s3Prefix, statsLogger);
         try {
-            return new CachingObjectStorage(s3Storage, cacheDirPath, metadataExecutor, cacheMaxBytes);
+            CachingObjectStorage cache = new CachingObjectStorage(
+                    s3Storage, cacheDirPath, metadataExecutor, cacheMaxBytes);
+            // Keep the reference so RemoteFileServerAdminImpl can read stats and resize.
+            diskCache = cache;
+            return cache;
         } catch (IOException e) {
             s3Client.close();
             throw e;
@@ -532,6 +587,91 @@ public class RemoteFileServer implements AutoCloseable {
             @Override
             public Long getSample() {
                 return cache.stats().evictionWeight();
+            }
+        });
+    }
+
+    /**
+     * Registers Prometheus gauges for the on-disk cache ({@link CachingObjectStorage})
+     * under the {@code rfs_disk_cache_*} namespace (issue #336).
+     */
+    private static void registerDiskCacheGauges(StatsLogger root, CachingObjectStorage cache) {
+        StatsLogger scope = root.scope("rfs").scope("disk_cache");
+        scope.registerGauge("max_bytes", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.getMaxCacheBytes();
+            }
+        });
+        scope.registerGauge("estimated_entries", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.estimatedEntries();
+            }
+        });
+        scope.registerGauge("hit_count", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.diskLruStats().hitCount();
+            }
+        });
+        scope.registerGauge("miss_count", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.diskLruStats().missCount();
+            }
+        });
+        scope.registerGauge("eviction_count", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.diskLruStats().evictionCount();
+            }
+        });
+        scope.registerGauge("hit_bytes", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.getHitBytes();
+            }
+        });
+        scope.registerGauge("miss_bytes", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.getMissBytes();
             }
         });
     }

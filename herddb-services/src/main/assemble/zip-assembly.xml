@@ -103,6 +103,16 @@
         <dependencySet>
             <useProjectArtifact>true</useProjectArtifact>
             <useStrictFiltering>true</useStrictFiltering>
+            <unpack>false</unpack>
+            <includes>
+                <include>org.herddb:herddb-remote-file-service:jar:admin-cli</include>
+            </includes>
+            <outputDirectory>fileserver-admin</outputDirectory>
+            <outputFileNameMapping>herddb-fileserver-admin-${project.version}.jar</outputFileNameMapping>
+        </dependencySet>
+        <dependencySet>
+            <useProjectArtifact>true</useProjectArtifact>
+            <useStrictFiltering>true</useStrictFiltering>
             <unpack>true</unpack>           
             <includes>
                 <include>org.herddb:herddb-ui:war:war-no-libs</include>                                

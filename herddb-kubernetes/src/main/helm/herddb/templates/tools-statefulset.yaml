@@ -52,6 +52,8 @@ spec:
               value: {{ include "herddb.jdbcUrl" . | quote }}
             - name: HERDDB_INDEXING_ZK
               value: {{ include "herddb.zkAddress" . | quote }}
+            - name: HERDDB_FILESERVER_SERVER
+              value: {{ include "herddb.fileServerAdminAddress" . | quote }}
             - name: JAVA_OPTS
               value: {{ .Values.tools.javaOpts | default "-Xms128m -Xmx256m -Djava.net.preferIPv4Stack=true" | quote }}
             - name: VECTORBENCH_DATASET_DIR
@@ -83,6 +85,9 @@ spec:
             - name: tools-scripts
               mountPath: /usr/local/bin/indexing-admin
               subPath: indexing-admin
+            - name: tools-scripts
+              mountPath: /usr/local/bin/fileserver-admin
+              subPath: fileserver-admin
             - name: datasets
               mountPath: /opt/herddb/vector-datasets
       volumes:

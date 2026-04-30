@@ -111,14 +111,25 @@
             <artifactId>jetty-servlet</artifactId>
             <version>9.4.51.v20230217</version>
         </dependency>
-        <dependency>
-            <groupId>org.testcontainers</groupId>
-            <artifactId>testcontainers</artifactId>
-            <scope>test</scope>
-        </dependency>
+        <!--
+          slf4j-jdk14 is included at compile scope so it is bundled into the
+          shaded fileserver-admin-cli uber jar. Without it slf4j-api 2.x would
+          fall back to the NOP logger inside the standalone CLI jar and print
+          a "No SLF4J providers were found" warning (mirrors the setup in
+          herddb-indexing-service, issue #336).
+        -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-jdk14</artifactId>
+        </dependency>
+        <!-- Used by the fileserver-admin CLI (herddb.remote.admin package, issue #336). -->
+        <dependency>
+            <groupId>commons-cli</groupId>
+            <artifactId>commons-cli</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
             <scope>test</scope>
         </dependency>
         <!--
@@ -182,6 +193,69 @@
                         <DOCKER_API_VERSION>1.43</DOCKER_API_VERSION>
                     </environmentVariables>
                 </configuration>
+            </plugin>
+            <!--
+              Secondary shade execution that produces
+              herddb-remote-file-service-<version>-admin-cli.jar, an uber-jar
+              bundling the main remote-file-service classes plus commons-cli,
+              with herddb.remote.admin.FileServerAdminCli as Main-Class.
+
+              Used by the fileserver-admin launcher script shipped in
+              herddb-services; the regular (unshaded) jar produced by
+              maven-jar-plugin is unaffected and is the artifact published
+              for downstream modules. Mirrors the pattern in
+              herddb-indexing-service (issue #336).
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>fileserver-admin-cli</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>admin-cli</shadedClassifierName>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>herddb.remote.admin.FileServerAdminCli</mainClass>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                                <!--
+                                  log4j-slf4j-impl is pulled in transitively
+                                  via bookkeeper-server. It targets the
+                                  slf4j 1.7 API and does not register as a
+                                  ServiceLoader provider for slf4j 2.x, so
+                                  leaving it in the uber jar produces a
+                                  spurious "No SLF4J providers were found"
+                                  warning and a log4j getCallerClass warning
+                                  on modern JDKs. slf4j-jdk14 (above) is the
+                                  actual provider we want to use.
+                                -->
+                                <filter>
+                                    <artifact>org.apache.logging.log4j:log4j-slf4j-impl</artifact>
+                                    <excludes>
+                                        <exclude>**</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
