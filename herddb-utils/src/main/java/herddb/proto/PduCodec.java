@@ -69,8 +69,18 @@ public abstract class PduCodec {
     private static final int TYPE_SIZE = 1;
     private static final int FLAGS_SIZE = 1;
     private static final int VERSION_SIZE = 1;
-    /** Maximum number of bytes a variable-length integer (vint) can occupy. */
-    private static final int VINT_MAX_SIZE = 5;
+    /**
+     * Estimated vint size for counts (number of statements, number of params per
+     * statement).  Two bytes cover values up to 16 383 — more than any realistic
+     * batch size.
+     */
+    private static final int VINT_COUNT_SIZE = 2;
+    /**
+     * Estimated vint size for data-payload lengths (string byte-length, array
+     * element count).  Four bytes cover values up to 268 435 455, which is far
+     * larger than any realistic parameter value.
+     */
+    private static final int VINT_LENGTH_SIZE = 4;
 
     private static final int NULLABLE_FIELD_PRESENT = 1;
     private static final int NULLABLE_FIELD_ABSENT = 0;
@@ -619,7 +629,7 @@ public abstract class PduCodec {
 
             // Pre-compute an accurate upper-bound capacity to avoid internal
             // ByteBuf reallocation and copy, especially for large float[] vector params.
-            int paramsPayload = VINT_MAX_SIZE; // vint(numParams)
+            int paramsPayload = VINT_COUNT_SIZE; // vint(numParams)
             for (Object p : params) {
                 paramsPayload += estimateObjectSize(p);
             }
@@ -932,9 +942,9 @@ public abstract class PduCodec {
 
             // Pre-compute an accurate upper-bound capacity to avoid internal
             // ByteBuf reallocation and copy, especially for large float[] vector params.
-            int statementsPayload = VINT_MAX_SIZE; // vint(numStatements)
+            int statementsPayload = VINT_COUNT_SIZE; // vint(numStatements)
             for (List<Object> list : statements) {
-                statementsPayload += VINT_MAX_SIZE; // vint(numParams per statement)
+                statementsPayload += VINT_COUNT_SIZE; // vint(numParams per statement)
                 for (Object param : list) {
                     statementsPayload += estimateObjectSize(param);
                 }
@@ -1058,7 +1068,7 @@ public abstract class PduCodec {
 
             // Pre-compute an accurate upper-bound capacity to avoid internal
             // ByteBuf reallocation and copy, especially for large float[] vector params.
-            int paramsPayload = VINT_MAX_SIZE; // vint(numParams)
+            int paramsPayload = VINT_COUNT_SIZE; // vint(numParams)
             for (Object p : params) {
                 paramsPayload += estimateObjectSize(p);
             }
@@ -1891,22 +1901,28 @@ public abstract class PduCodec {
     }
 
     /**
-     * Returns an upper-bound estimate of the number of bytes that
+     * Returns a practical upper-bound estimate of the number of bytes that
      * {@link #writeObject(ByteBuf, Object)} will write for {@code v}.
-     * The estimate is intentionally conservative so that callers can pre-size
-     * their {@link ByteBuf} allocations without triggering costly
-     * reallocation and copy operations.
+     * <p>
+     * Assumptions:
+     * <ul>
+     *   <li>String characters are single-byte (ASCII/Latin-1 content is the norm
+     *       for SQL parameters; the estimate may be slightly low for non-ASCII but
+     *       Netty will expand transparently in that rare case).</li>
+     *   <li>Length-prefix vints for payload sizes use at most
+     *       {@value #VINT_LENGTH_SIZE} bytes (covers up to ~268 M elements).</li>
+     * </ul>
      */
     static int estimateObjectSize(Object v) {
         // Every path in writeObject starts with ONE_BYTE for the type discriminator.
         if (v == null) {
             return ONE_BYTE;
         } else if (v instanceof RawString) {
-            // type byte + vint(len) + raw bytes
-            return ONE_BYTE + VINT_MAX_SIZE + ((RawString) v).getLength();
+            // type byte + vint(len) + raw bytes (byte length, not char count)
+            return ONE_BYTE + VINT_LENGTH_SIZE + ((RawString) v).getLength();
         } else if (v instanceof String) {
-            // type byte + vint(utf8_len) + up to 3 UTF-8 bytes per Java char
-            return ONE_BYTE + VINT_MAX_SIZE + ((String) v).length() * 3;
+            // type byte + vint(len) + 1 byte per char (ASCII assumption)
+            return ONE_BYTE + VINT_LENGTH_SIZE + ((String) v).length();
         } else if (v instanceof Long) {
             return ONE_BYTE + ONE_LONG;
         } else if (v instanceof Integer) {
@@ -1923,15 +1939,15 @@ public abstract class PduCodec {
         } else if (v instanceof Short) {
             return ONE_BYTE + 2;
         } else if (v instanceof byte[]) {
-            return ONE_BYTE + VINT_MAX_SIZE + ((byte[]) v).length;
+            return ONE_BYTE + VINT_LENGTH_SIZE + ((byte[]) v).length;
         } else if (v instanceof Byte) {
             return ONE_BYTE + ONE_BYTE;
         } else if (v instanceof float[]) {
             // type byte + vint(len) + 4 bytes per float element
-            return ONE_BYTE + VINT_MAX_SIZE + ((float[]) v).length * 4;
+            return ONE_BYTE + VINT_LENGTH_SIZE + ((float[]) v).length * 4;
         } else if (v instanceof List) {
             // List<Number> written as a float array: 4 bytes per element
-            return ONE_BYTE + VINT_MAX_SIZE + ((List<?>) v).size() * 4;
+            return ONE_BYTE + VINT_LENGTH_SIZE + ((List<?>) v).size() * 4;
         } else {
             // Unknown type — writeObject will throw, but return a safe non-zero estimate.
             return ONE_BYTE + 16;
@@ -1939,12 +1955,13 @@ public abstract class PduCodec {
     }
 
     /**
-     * Returns an upper-bound estimate of the bytes needed to serialise a {@link String}
-     * via {@link ByteBufUtils#writeString(ByteBuf, String)}: a vint length prefix
-     * (at most {@value #VINT_MAX_SIZE} bytes) plus up to 3 UTF-8 bytes per Java char.
+     * Returns a practical upper-bound estimate of the bytes needed to serialise a
+     * {@link String} via {@link ByteBufUtils#writeString(ByteBuf, String)}: a vint
+     * length prefix ({@value #VINT_LENGTH_SIZE} bytes) plus 1 byte per character
+     * (ASCII assumption — adequate for table-space names and SQL query text).
      */
     private static int estimateStringSize(String s) {
-        return VINT_MAX_SIZE + s.length() * 3;
+        return VINT_LENGTH_SIZE + s.length();
     }
 
     static void writeObject(ByteBuf byteBuf, Object v) {
