@@ -122,54 +122,53 @@ public class IndexingServiceClientDurableLsnTest {
     }
 
     /**
-     * {@link IndexingServiceClient#waitForCatchUp} must compare the target
-     * LSN against the durable LSN. Returning early just because the
-     * in-memory tailer reached the target would let WAITFORINDEXES fall
-     * through before the indexed state is durable across restart.
+     * {@link IndexingServiceClient#waitForCatchUp} is a queryability gate:
+     * it must compare against the tailer LSN (in-memory progress), NOT the
+     * durable LSN. WAITFORINDEXES is what SQL callers use to know "is it
+     * safe to issue a query?" — that question is about whether the in-memory
+     * state has all the entries, not whether they are durably checkpointed.
+     * Recovery / retention is the SEPARATE concern handled by
+     * {@link IndexingServiceClient#getMinProcessedLsn}.
      */
     @Test
-    public void waitForCatchUpComparesAgainstDurableLsn() throws Exception {
-        // tailer is at (70, 200) — past the target (60, 0) — but durable is
-        // only at (50, 10) — short of the target. waitForCatchUp must NOT
-        // return true for the target before the durable LSN catches up.
+    public void waitForCatchUpComparesAgainstTailerLsn() throws Exception {
+        // tailer is at (70, 200) — past the target (60, 0). Even though
+        // durable is well behind (50, 10), waitForCatchUp must return true
+        // because the IS has the entries in memory and is queryable now.
         StaticIndexStatusImpl impl = new StaticIndexStatusImpl(
                 70, 200, 50, 10);
         fakeServer = new FakeServer(impl);
         fakeServer.start();
 
         try (IndexingServiceClient client = IndexingServiceClient.fromAddresses(
-                Arrays.asList(fakeServer.address()), 2)) {
-            // Short timeout: the test asserts the deadline expires because
-            // the durable LSN never catches up — never the tailer's faster
-            // advance.
+                Arrays.asList(fakeServer.address()), 5)) {
             boolean caughtUp = client.waitForCatchUp(
-                    "ts1", new LogSequenceNumber(60, 0), 1500);
-            assertFalse(
-                    "waitForCatchUp must return false: the durable LSN (50,10) is "
-                            + "behind the target (60,0), even though the tailer "
-                            + "(70,200) is past it",
+                    "ts1", new LogSequenceNumber(60, 0), 5000);
+            assertTrue(
+                    "waitForCatchUp must return true when the tailer LSN (70,200) is "
+                            + "at or past the target (60,0), regardless of durable LSN",
                     caughtUp);
         }
     }
 
     /**
-     * The mirror of the previous test: when the durable LSN is past the
-     * target, waitForCatchUp returns true immediately, regardless of where
-     * the tailer is.
+     * The mirror of the previous test: when the tailer LSN is short of the
+     * target, waitForCatchUp returns false on timeout — even if the durable
+     * LSN happens to be advanced (e.g. recovered from snapshot).
      */
     @Test
-    public void waitForCatchUpReturnsTrueWhenDurableLsnAtOrPastTarget() throws Exception {
+    public void waitForCatchUpReturnsFalseWhenTailerLsnShortOfTarget() throws Exception {
         StaticIndexStatusImpl impl = new StaticIndexStatusImpl(
-                /*tailer*/ 90, 0, /*durable*/ 60, 50);
+                /*tailer*/ 50, 5, /*durable*/ 50, 5);
         fakeServer = new FakeServer(impl);
         fakeServer.start();
 
         try (IndexingServiceClient client = IndexingServiceClient.fromAddresses(
-                Arrays.asList(fakeServer.address()), 5)) {
+                Arrays.asList(fakeServer.address()), 2)) {
             boolean caughtUp = client.waitForCatchUp(
-                    "ts1", new LogSequenceNumber(60, 50), 5000);
-            assertTrue(
-                    "waitForCatchUp must return true once the durable LSN is at the target",
+                    "ts1", new LogSequenceNumber(60, 50), 1500);
+            assertFalse(
+                    "waitForCatchUp must return false when the tailer is short of the target",
                     caughtUp);
         }
     }

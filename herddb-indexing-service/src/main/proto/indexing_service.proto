@@ -72,10 +72,12 @@ message GetIndexStatusResponse {
     int32 segment_count = 2;
     // In-memory tailer position: the LSN of the most recently applied log
     // entry. Updated on every tailer advance, BEFORE the underlying state is
-    // durably persisted to remote storage. Use this for diagnostic
-    // observability ("how far has the tailer read?") only — never as a
-    // recovery floor or retention pin, because the IS cannot start from this
-    // LSN after a restart unless a checkpoint has covered it.
+    // durably persisted to remote storage. Used by WAITFORINDEXES (a
+    // queryability gate: "have all entries through this LSN been applied to
+    // in-memory state?") and by diagnostic tooling. Must NEVER be used as a
+    // recovery floor or commit-log retention pin, because the IS cannot
+    // start from this LSN after a restart unless a checkpoint has covered
+    // it (issue #364).
     int64 tailer_lsn_ledger = 3;
     int64 tailer_lsn_offset = 4;
     string status = 5;

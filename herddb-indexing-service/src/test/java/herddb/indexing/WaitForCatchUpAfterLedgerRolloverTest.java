@@ -141,17 +141,8 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
                 // This is what getLastWrittenSequenceNumber() would return instead of (2, -1)
                 LogSequenceNumber correctLsn = new LogSequenceNumber(1, 5);
 
-                // Issue #364: waitForCatchUp now compares against the engine's
-                // DURABLE LSN (the persisted watermark), not the in-memory
-                // tailer position. Force a checkpoint so the watermark
-                // catches up to the tailer's (1, 5) before the assertion;
-                // otherwise the wait would correctly time out — the IS
-                // would not yet be safely recoverable to (1, 5) on restart.
-                eis.getEngine().forceCheckpointAndSaveWatermark();
-
                 boolean fixedCaughtUp = client.waitForCatchUp("tablespace1", correctLsn, 30000);
-                assertTrue("waitForCatchUp with correct LSN (1, 5) should succeed "
-                                + "after a checkpoint advances the durable LSN",
+                assertTrue("waitForCatchUp with correct LSN (1, 5) should succeed",
                         fixedCaughtUp);
             }
         }

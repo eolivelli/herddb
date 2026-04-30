@@ -605,22 +605,29 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                         .setTable("")
                         .setIndex("")
                         .build());
-                // Wait on the durable LSN, not the in-memory tailer position:
-                // an instance that has tail-applied an entry but not yet
-                // checkpointed the resulting state cannot recover from that
-                // LSN after a restart. WAITFORINDEXES must mean "indexes are
-                // queryable AND durable across restart" (issue #364).
-                LogSequenceNumber instanceLsn = readDurableLsnOrStartOfTime(resp);
-                if (instanceLsn.after(target) || instanceLsn.equals(target)) {
-                    LOGGER.log(Level.INFO, "Instance {0} caught up for tablespace {1} to {2} (durable={3})",
-                            new Object[]{server, tablespace, target, instanceLsn});
+                // WAITFORINDEXES is a queryability gate: the caller wants
+                // to know that the IS has applied every entry up to {@code
+                // target} into its in-memory state, so a search issued
+                // immediately after returns those rows. Compare against the
+                // tailer LSN (in-memory progress), NOT the durable LSN —
+                // requiring durability here would force a checkpoint to
+                // succeed before WAITFORINDEXES returns, which has nothing
+                // to do with what the SQL caller is asking. Recovery / log
+                // retention is a SEPARATE concern, handled by
+                // {@link #getMinProcessedLsn} which DOES read the durable
+                // LSN (issue #364).
+                LogSequenceNumber tailerLsn = new LogSequenceNumber(
+                        resp.getTailerLsnLedger(), resp.getTailerLsnOffset());
+                if (tailerLsn.after(target) || tailerLsn.equals(target)) {
+                    LOGGER.log(Level.INFO, "Instance {0} caught up for tablespace {1} to {2} (tailer={3})",
+                            new Object[]{server, tablespace, target, tailerLsn});
                     return true;
                 }
                 LOGGER.log(Level.INFO,
-                        "Instance {0} durable={1} (tailer={2}/{3}) for tablespace {4}, "
+                        "Instance {0} tailer={1} (durable={2}/{3}) for tablespace {4}, "
                                 + "waiting for {5} (status: {6})",
-                        new Object[]{server, instanceLsn,
-                                resp.getTailerLsnLedger(), resp.getTailerLsnOffset(),
+                        new Object[]{server, tailerLsn,
+                                resp.getDurableLsnLedger(), resp.getDurableLsnOffset(),
                                 tablespace, target, resp.getStatus()});
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Instance {0} unreachable for tablespace {1}, retrying: {2}",
