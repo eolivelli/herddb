@@ -191,7 +191,6 @@ public class WatermarkStoreTest {
     @Test
     public void testCorruptTableCountThrowsIOException() throws Exception {
         Path dir = folder.newFolder("corrupt-count").toPath();
-        java.nio.file.Files.createDirectories(dir);
         Path wf = dir.resolve("watermark.dat");
 
         // Manually craft a watermark file that has a valid header but an
@@ -217,7 +216,6 @@ public class WatermarkStoreTest {
     @Test
     public void testCorruptBlobLenThrowsIOException() throws Exception {
         Path dir = folder.newFolder("corrupt-len").toPath();
-        java.nio.file.Files.createDirectories(dir);
         Path wf = dir.resolve("watermark.dat");
 
         try (java.io.DataOutputStream dos =
@@ -232,6 +230,57 @@ public class WatermarkStoreTest {
 
         LocalWatermarkStore store = new LocalWatermarkStore(dir);
         assertThrows("negative blob length must raise IOException",
+                IOException.class, store::load);
+    }
+
+    /**
+     * Verifies that an absurdly large indexCount causes an {@link IOException}
+     * rather than an {@link OutOfMemoryError}.
+     */
+    @Test
+    public void testCorruptIndexCountThrowsIOException() throws Exception {
+        Path dir = folder.newFolder("corrupt-index-count").toPath();
+        Path wf = dir.resolve("watermark.dat");
+
+        try (java.io.DataOutputStream dos =
+                new java.io.DataOutputStream(java.nio.file.Files.newOutputStream(wf))) {
+            dos.writeByte(1);               // version
+            dos.writeLong(1L);              // ledgerId
+            dos.writeLong(100L);            // offset
+            dos.writeInt(1);                // numInstances
+            dos.writeInt(0);                // tableCount = 0 (valid)
+            dos.writeInt(Integer.MAX_VALUE); // corrupt indexCount
+        }
+
+        LocalWatermarkStore store = new LocalWatermarkStore(dir);
+        assertThrows("corrupt indexCount must raise IOException, not OOM",
+                IOException.class, store::load);
+    }
+
+    /**
+     * Verifies that a blob length exceeding {@code MAX_BLOB_BYTES} (10 MiB)
+     * causes an {@link IOException} rather than allocating a huge array.
+     */
+    @Test
+    public void testOversizedBlobLenThrowsIOException() throws Exception {
+        Path dir = folder.newFolder("oversized-blob").toPath();
+        Path wf = dir.resolve("watermark.dat");
+
+        // Write a tableCount=1 with a blob length of 20 MiB (> MAX_BLOB_BYTES).
+        int oversizedLen = 20 * 1024 * 1024; // 20 MiB
+        try (java.io.DataOutputStream dos =
+                new java.io.DataOutputStream(java.nio.file.Files.newOutputStream(wf))) {
+            dos.writeByte(1);          // version
+            dos.writeLong(1L);         // ledgerId
+            dos.writeLong(100L);       // offset
+            dos.writeInt(1);           // numInstances
+            dos.writeInt(1);           // tableCount = 1
+            dos.writeInt(oversizedLen); // blob length far above MAX_BLOB_BYTES
+            // No actual blob data — the bounds check must fire before readFully.
+        }
+
+        LocalWatermarkStore store = new LocalWatermarkStore(dir);
+        assertThrows("blob length > MAX_BLOB_BYTES must raise IOException, not OOM",
                 IOException.class, store::load);
     }
 

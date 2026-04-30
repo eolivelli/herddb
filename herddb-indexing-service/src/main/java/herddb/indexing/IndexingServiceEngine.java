@@ -1212,6 +1212,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 // Remove all vector stores for this table
                 String droppedTable = entry.tableName;
                 vectorStores.entrySet().removeIf(e -> e.getKey().startsWith(droppedTable + "."));
+                // Keep vectorStoreIndexUuids in sync so a future CREATE_INDEX with the same
+                // (table, name) key does not mis-fire the "different UUID" guard and silently
+                // refuse to create the new store (issue #368 review).
+                vectorStoreIndexUuids.entrySet().removeIf(e -> e.getKey().startsWith(droppedTable + "."));
                 break;
 
             case LogEntryType.CREATE_INDEX:
@@ -3137,6 +3141,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             }
         }
         vectorStores.clear();
+        vectorStoreIndexUuids.clear();
 
         // Close the data storage manager if configured
         if (dataStorageManager != null) {

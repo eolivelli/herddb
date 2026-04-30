@@ -76,6 +76,16 @@ public class S3WatermarkStore implements WatermarkStore {
     private static final Logger LOGGER = Logger.getLogger(S3WatermarkStore.class.getName());
 
     /**
+     * Upper bound on the number of tables or indexes in a single watermark object.
+     * The XXHash64 footer makes a corrupt count fail the hash check first, but these
+     * bounds provide defense-in-depth against format-version skew that might produce
+     * a hash-valid but semantically garbage payload.
+     */
+    private static final int MAX_TABLES_OR_INDEXES = 10_000;
+    /** Upper bound on the serialized size of a single Table or Index blob. */
+    private static final int MAX_BLOB_BYTES = 10 * 1024 * 1024; // 10 MiB
+
+    /**
      * Abstraction over {@link herddb.remote.RemoteFileServiceClient} so this class
      * can be unit-tested without pulling in a full gRPC client. The indexing-service
      * module does not depend directly on herddb-remote-file-service; the concrete
@@ -146,17 +156,35 @@ public class S3WatermarkStore implements WatermarkStore {
             int numInstances = din.readVInt();
 
             int tableCount = din.readVInt();
+            if (tableCount < 0 || tableCount > MAX_TABLES_OR_INDEXES) {
+                throw new CorruptWatermarkException(
+                        "watermark object at " + path + " is corrupt: tableCount=" + tableCount);
+            }
             List<Table> tables = new ArrayList<>(tableCount);
             for (int i = 0; i < tableCount; i++) {
                 int len = din.readVInt();
+                if (len < 0 || len > MAX_BLOB_BYTES) {
+                    throw new CorruptWatermarkException(
+                            "watermark object at " + path + " is corrupt: table blob len=" + len
+                                    + " at index " + i);
+                }
                 byte[] blob = new byte[len];
                 din.readFully(blob);
                 tables.add(Table.deserialize(blob));
             }
             int indexCount = din.readVInt();
+            if (indexCount < 0 || indexCount > MAX_TABLES_OR_INDEXES) {
+                throw new CorruptWatermarkException(
+                        "watermark object at " + path + " is corrupt: indexCount=" + indexCount);
+            }
             List<Index> vectorIndexes = new ArrayList<>(indexCount);
             for (int i = 0; i < indexCount; i++) {
                 int len = din.readVInt();
+                if (len < 0 || len > MAX_BLOB_BYTES) {
+                    throw new CorruptWatermarkException(
+                            "watermark object at " + path + " is corrupt: index blob len=" + len
+                                    + " at index " + i);
+                }
                 byte[] blob = new byte[len];
                 din.readFully(blob);
                 vectorIndexes.add(Index.deserialize(blob));

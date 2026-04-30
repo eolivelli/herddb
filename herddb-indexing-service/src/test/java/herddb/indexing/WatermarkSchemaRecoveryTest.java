@@ -148,20 +148,20 @@ public class WatermarkSchemaRecoveryTest {
     // ---------- tests --------------------------------------------------------
 
     /**
-     * Verifies the full schema-recovery path and implicitly validates the
-     * BK-ledger-trimming scenario:
+     * Verifies the full schema-recovery path, simulating the BK-ledger-trimming scenario:
      * <ol>
-     *   <li>Engine A applies DDL + 50 DML entries and checkpoints — the
-     *       snapshot saved by the watermark store must carry the schema.</li>
-     *   <li>Engine B starts with that snapshot (no DDL is applied to it,
-     *       simulating that the BK ledgers carrying CREATE_TABLE / CREATE_INDEX
-     *       have been trimmed).  It must hydrate its {@link SchemaTracker} from
-     *       the snapshot so that DML entries can be routed correctly.</li>
-     *   <li>Engine B only indexes the 20 new post-watermark DML entries
-     *       (vector count == 20), proving that the tailer started from the
-     *       watermark LSN, not from {@code START_OF_TIME}.  If the tailer had
-     *       started from {@code START_OF_TIME} it would have re-indexed all
-     *       50 original entries as well, making the count 70 instead of 20.</li>
+     *   <li>Engine A applies DDL + 50 DML entries and checkpoints — the snapshot saved by
+     *       the watermark store must carry the schema.</li>
+     *   <li>Engine B starts with that snapshot (no DDL is applied to it, simulating that
+     *       the BK ledgers carrying CREATE_TABLE / CREATE_INDEX have been trimmed).  It must
+     *       hydrate its {@link SchemaTracker} from the snapshot so that DML entries can be
+     *       routed correctly without DDL replay.</li>
+     *   <li>Engine B is then fed only the 20 post-watermark DML entries via
+     *       {@code applySingleEntryForTest} (this test drives the engine directly, bypassing
+     *       the file-based tailer; the tailer-start-from-watermark integration path is
+     *       covered by {@code IndexingServiceWithS3E2ETest.restartIndexingServiceAfterCheckpoint}).
+     *       The vector count after the 20 entries must be exactly 20 — not 70 — confirming
+     *       that Engine B did not re-index the original 50 vectors from Engine A's run.</li>
      * </ol>
      */
     @Test
