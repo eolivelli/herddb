@@ -102,3 +102,15 @@ address is needed in the JDBC URL even when server.mode=cluster.
     .Release.Namespace
     (int .Values.server.port) -}}
 {{- end }}
+
+{{/*
+gRPC address of the first file-server pod, used by fileserver-admin CLI.
+The admin service shares the same gRPC port as the data-plane service.
+*/}}
+{{- define "herddb.fileServerAdminAddress" -}}
+{{- printf "%s-file-server-0.%s-file-server.%s.svc.cluster.local:%d"
+    (include "herddb.fullname" .)
+    (include "herddb.fullname" .)
+    .Release.Namespace
+    (int .Values.fileServer.port) -}}
+{{- end }}

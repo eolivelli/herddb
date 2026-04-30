@@ -200,7 +200,7 @@ if $PROFILE; then
     mkdir -p "$LOCAL_DIR"
 
     echo "  Downloading profile.jfr to $LOCAL_DIR ..."
-    kubectl -n default cp "${POD}:${REMOTE_DIR}/profile.jfr" "${LOCAL_DIR}/profile.jfr"
+    kubectl -n default cp --retries=99 "${POD}:${REMOTE_DIR}/profile.jfr" "${LOCAL_DIR}/profile.jfr"
 
     kubectl -n default exec "$POD" -- rm -rf "$REMOTE_DIR" || true
 
@@ -246,7 +246,7 @@ kubectl -n default exec "$POD" -- jcmd "$JVM_PID" GC.heap_dump "$REMOTE_DUMP"
 TS="$(timestamp)"
 LOCAL_DUMP="$REPORTS_DIR/heapdump-${POD}-${TS}.hprof"
 echo "  Downloading to $LOCAL_DUMP ..."
-kubectl -n default cp "${POD}:${REMOTE_DUMP}" "$LOCAL_DUMP"
+kubectl -n default cp --retries=99 "${POD}:${REMOTE_DUMP}" "$LOCAL_DUMP"
 
 kubectl -n default exec "$POD" -- rm -f "$REMOTE_DUMP" || true
 

@@ -25,7 +25,7 @@
 # Memory layout (heap + direct + ~1 GiB JVM overhead = container limit):
 #   server          :  22 g heap + 17 g direct + 1 g = 40 GiB
 #   fileServer      :   6 g heap +  8 g direct + 1 g = 15 g  (< 16 GiB, 16 CPU)
-#   indexingService :  24 g heap + 10 g direct + 1 g = 35 g  (< 36 GiB)
+#   indexingService :  28 g heap + 10 g direct + 1 g = 39 g  (< 40 GiB)
 #   bookkeeper      :   2 g heap +  1 g direct + 1 g =  4 g  (< 8 GiB)
 #   zookeeper       : 512 m heap + 512 m direct       = ~1 g  (< 4 GiB)
 
@@ -308,9 +308,16 @@ indexingService:
   nodeSelector:
     cloud.google.com/machine-family: "c3"
     topology.kubernetes.io/zone: "europe-west4-a"
-  # 24 g heap + 10 g direct + ~1 g JVM overhead = 35 g (< 36 GiB container; 1 GiB headroom).
-  # Heap sized for HNSW graph segment caching — the primary IS working set.
-  # 10 g direct: 3.5 GiB SegmentBlockCache (auto = heap/4 ≈ 6 GiB for this heap) + 256 MiB
+  # 28 g heap + 10 g direct + ~1 g JVM overhead = 39 g (< 40 GiB container; 1 GiB headroom).
+  # Heap raised from 24 g to 28 g (+4 GiB) to give more headroom above the
+  # indexing.memory.vector.limit flush point. jmap histograms at ~21% progress showed
+  # float[] at 9.36 GiB (1563 VectorSegments) + int[] 2.15 GiB + TreeMap$Entry 2.46 GiB
+  # + herddb.utils.Bytes 2.42 GiB totalling ~20 GiB, while the IS internal estimate
+  # reported only 14–15 GiB (6–8 GiB gap documented in issue #360). With 24 g heap the
+  # untracked jvector graph memory pushed old-gen to 22–23 GiB (92–96% of Xmx), triggering
+  # sustained G1 back-pressure cycles. At 28 g the same workload leaves ~5–9 GiB of GC
+  # headroom above the actual peak, reducing the frequency and severity of FATAL ticks.
+  # 10 g direct: 3.5 GiB SegmentBlockCache (auto = heap/4 ≈ 7 GiB for this heap) + 256 MiB
   # in-flight read reservation (remote.file.client.max.inflight.read.bytes below) + 4 GiB
   # Netty PoolArena transient peak for Phase C checkpoint loads and concurrent gRPC
   # streaming + ~2 GiB headroom. 6 g was insufficient under Phase C segment-load bursts
@@ -324,9 +331,24 @@ indexingService:
   # mitigate issue #122 lock contention without compounding arena growth.
   # tailbatchsize=1000 caps the BK read batch per followTheLeader() call in the IS
   # tailer, cutting retained working set by 10× vs. the 10000 default (issue #180).
-  javaOpts: "-Xms24g -Xmx24g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=10737418240 -XX:MaxDirectMemorySize=10g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=10000"
+  # -XX:+HeapDumpOnOutOfMemoryError: write a heap dump to the data PVC on any
+  # OutOfMemoryError so OOM crashes are analysable post-mortem even after a pod
+  # restart. The IS previously hit OOM in the compaction thread (Int2IntHashMap.rehash)
+  # without leaving any on-disk artefact because the flag was absent (observed at
+  # tick 84 and tick 105 of the BIGANN 1B run, 2026-04-29).
+  # -XX:HeapDumpPath=/opt/herddb/indexdata/heapdump.hprof: the data PVC is mounted
+  # at /opt/herddb/indexdata and survives pod restarts (PVC lifecycle > pod lifecycle).
+  # The PVC was enlarged to 100 GiB (from 20 GiB) to hold a full heap dump of the
+  # 28 GiB heap (worst-case ~28 GiB HPROF) plus IS working data (currently <1 GiB).
+  javaOpts: "-Xms28g -Xmx28g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=10737418240 -XX:MaxDirectMemorySize=10g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=10000 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/opt/herddb/indexdata/heapdump.hprof"
   storage:
     data:
+      # NOTE: PVC size kept at 20Gi to avoid StatefulSet volumeClaimTemplate
+      # immutability error on helm upgrade. GKE supports online PVC expansion
+      # but the StatefulSet template itself cannot change without deleting the
+      # STS first. A full heap dump (28g heap, worst-case ~28 GiB) will not fit
+      # here; to expand, manually patch PVCs and delete/recreate the STS via
+      # reset-cluster.sh on the next fresh run.
       size: 20Gi
     log:
       size: 5Gi
@@ -344,10 +366,14 @@ indexingService:
     bookkeeper.zkTimeout: "40000"
     # DML apply worker parallelism (IndexingServerConfiguration.PROPERTY_APPLY_PARALLELISM).
     # Default is 0 (auto = availableProcessors / 2 = 8 on a 16-CPU pod).
-    # Set explicitly to 16 so all allocated CPUs are used for HNSW indexing work.
-    # Confirmed via per-thread flamegraph (profiles-herddb-indexing-service-0-20260421-155442)
-    # that the auto default left 8 CPUs idle.
-    indexing.apply.parallelism: "16"
+    # Reduced from 16 to 8 (2026-04-29): at 16 threads with --index-num-shards 4 the IS
+    # ran 16 concurrent HNSW builders on a -Xmx24g (now 28g) heap, driving G1 old-gen to
+    # 23–25 GiB during bigann 1B ingest and causing repeated OOM in the compaction thread
+    # (Int2IntHashMap.rehash). Halving the worker count reduces peak live-set pressure while
+    # still utilising 8 of the 16 allocated CPUs. The remaining 8 CPUs absorb G1 GC, gRPC,
+    # and BK-tailer threads without competing with the apply workers.
+    # Effective apply_queue_capacity = 8 workers × 1000 (default queue per worker) = 8,000.
+    indexing.apply.parallelism: "8"
     # Vector store in-memory budget (IndexingServerConfiguration.PROPERTY_MEMORY_VECTOR_LIMIT).
     # Default 0 means maxMemory/3 = 24 GiB / 3 = 8 GiB.  At 8 GiB the IS triggers
     # memory-pressure checkpoints (flush to file-server) every second during heavy
@@ -373,16 +399,32 @@ indexingService:
     # MaxDirectMemorySize budgets, raise only if Netty PoolArena headroom
     # is proven sufficient (see issue #246).
     remote.file.client.max.inflight.read.bytes: "268435456"
+    # Disable segment-count back-pressure (PR #358 / issue #354).
+    # Default threshold is 500 segments: when exceeded, addVectorInternal()
+    # parks the apply thread in waitForSegmentCountRelief() until compaction
+    # drains below the limit. During bigann 1B ingest both IS replicas hit
+    # 570-672 segments and became permanently stuck — compaction could not
+    # outrun new segment creation, causing a deadlock. Setting to
+    # Integer.MAX_VALUE (documented disable value) unblocks the apply threads
+    # immediately. Compaction continues to run but no longer gates indexing.
+    vector.index.compaction.backpressure.segments: "2147483647"
+    # Allow compaction to merge up to 2000 segments per cycle (default 200).
+    # At 672/588 accumulated segments the default cap means compaction would
+    # need 3-4 cycles to catch up; raising to 2000 lets it drain the backlog
+    # in a single pass. Tiered compaction scaling (PR #358) applies an 8×
+    # multiplier at >500 segments anyway, so this raises the effective cap to
+    # 16000 in the current situation — well above the 672/588 observed counts.
+    vector.index.compaction.maxCount: "2000"
   resources:
-    # Bumped from 32 Gi to 36 Gi alongside the -XX:MaxDirectMemorySize 6 g → 10 g bump
-    # in issue #246. Budget: 24 g heap + 10 g direct + 1 g JVM overhead = 35 g.
-    # 2 replicas × 16 CPUs: each IS handles 4 of the 8 index shards (~250 M vectors/IS
-    # for the bigann 500 M longevity run).
+    # Bumped from 36 Gi to 40 Gi alongside the heap bump 24 g → 28 g (issue #360).
+    # Budget: 28 g heap + 10 g direct + 1 g JVM overhead = 39 g (< 40 GiB; 1 GiB headroom).
+    # 2 replicas × 16 CPUs: each IS handles 4 of the 8 index shards (~500 M vectors/IS
+    # for the bigann 1 B run).
     requests:
-      memory: "36Gi"
+      memory: "40Gi"
       cpu: "16"
     limits:
-      memory: "36Gi"
+      memory: "40Gi"
       cpu: "16"
 
 tools:

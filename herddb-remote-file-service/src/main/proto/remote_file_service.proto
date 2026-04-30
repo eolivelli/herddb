@@ -96,3 +96,61 @@ message DeleteByPrefixRequest {
 message DeleteByPrefixResponse {
     int32 deleted_count = 1;
 }
+
+// Admin service for file-server management operations (issue #336).
+// Runs on the same gRPC port as RemoteFileService; gRPC multiplexes by service name.
+service RemoteFileServerAdmin {
+    // Returns a snapshot of server identity, JVM stats, disk-cache stats, and
+    // in-heap block-cache stats. Fields for absent subsystems are left at zero.
+    rpc GetServerInfo (GetServerInfoRequest) returns (GetServerInfoResponse);
+
+    // Dynamically changes the maximum weight (bytes) of the disk-cache LRU.
+    // The new limit is applied immediately via Caffeine's policy API.
+    // The change is NOT persistent: a pod restart will revert to the
+    // value configured in fileserver.properties / Helm values.
+    rpc ResizeDiskCache (ResizeDiskCacheRequest) returns (ResizeDiskCacheResponse);
+}
+
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+    // Server identity
+    string grpc_host = 1;
+    int32  grpc_port = 2;
+    string storage_mode = 3;
+
+    // JVM heap
+    int64 jvm_heap_used_bytes = 4;
+    int64 jvm_heap_max_bytes  = 5;
+
+    // Disk cache (CachingObjectStorage) — populated when storage_mode = s3.
+    // Counts are cumulative since pod start.
+    int64 disk_cache_max_bytes        = 6;
+    int64 disk_cache_hit_count        = 7;
+    int64 disk_cache_miss_count       = 8;
+    int64 disk_cache_eviction_count   = 9;
+    int64 disk_cache_hit_bytes        = 10;
+    int64 disk_cache_miss_bytes       = 11;
+    int64 disk_cache_estimated_entries = 12;
+
+    // In-heap block cache (InMemoryBlockCacheObjectStorage) —
+    // populated when block.cache.enabled = true.
+    int64 block_cache_max_bytes         = 13;
+    int64 block_cache_estimated_bytes   = 14;
+    int64 block_cache_estimated_entries = 15;
+    int64 block_cache_hits              = 16;
+    int64 block_cache_misses            = 17;
+    int64 block_cache_evictions         = 18;
+}
+
+message ResizeDiskCacheRequest {
+    // New maximum weight in bytes for the disk-cache LRU.
+    // Must be > 0. Returns INVALID_ARGUMENT if not.
+    // Returns FAILED_PRECONDITION if storage_mode is not s3.
+    int64 new_max_bytes = 1;
+}
+
+message ResizeDiskCacheResponse {
+    int64 previous_max_bytes = 1;
+    int64 new_max_bytes      = 2;
+}

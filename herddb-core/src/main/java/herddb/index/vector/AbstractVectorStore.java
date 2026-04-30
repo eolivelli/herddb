@@ -106,6 +106,23 @@ public abstract class AbstractVectorStore implements AutoCloseable {
                 "forEachPrimaryKey not implemented by " + getClass().getName());
     }
 
+    /**
+     * Returns a stable storage-level UUID for this store instance that can be
+     * persisted in the {@link herddb.indexing.WatermarkSnapshot} so a restarting
+     * indexing-service engine can re-attach to the same on-disk / remote
+     * checkpoint without full DML log replay.
+     *
+     * <p>Returns {@code null} for stores that have no persistent identity
+     * (e.g. {@link herddb.indexing.InMemoryVectorStore}). In that case the
+     * checkpoint-and-save path skips UUID embedding.
+     *
+     * <p>{@link herddb.index.vector.PersistentVectorStore} overrides this to
+     * return {@code getIndexUUID()}.
+     */
+    public String getStoreUUID() {
+        return null;
+    }
+
     @Override
     public void close() throws Exception {
     }

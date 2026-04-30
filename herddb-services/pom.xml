@@ -177,6 +177,13 @@
         </dependency>
         <dependency>
             <groupId>${project.groupId}</groupId>
+            <artifactId>herddb-remote-file-service</artifactId>
+            <version>${project.version}</version>
+            <classifier>admin-cli</classifier>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
             <artifactId>herddb-indexing-service</artifactId>
             <version>${project.version}</version>
         </dependency>

@@ -232,6 +232,17 @@ public final class IndexingServerConfiguration {
     public static final int PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS_DEFAULT = 500;
 
     /**
+     * Maximum wall-clock time (ms) an apply thread may spend in segment-count
+     * back-pressure before it is force-released with a SEVERE log (issue #370).
+     * Default is 300 000 ms (5 minutes).  Set to {@link Long#MAX_VALUE} to
+     * disable the safety timeout.
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_MAX_WAIT_MS =
+            "vector.index.compaction.backpressure.max.wait.ms";
+    public static final long PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_MAX_WAIT_MS_DEFAULT =
+            300_000L;
+
+    /**
      * When {@code true}, the IS does NOT run the per-store
      * {@code vectorIndexCompactionLoop()} thread — compaction is delegated to
      * the external index-optimizer service, which scans the segment registry

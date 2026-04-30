@@ -631,6 +631,59 @@ public class CachingObjectStorageTest {
     }
 
     @Test
+    public void testSetMaxCacheBytesUpdatesPolicy() throws Exception {
+        FakeObjectStorage inner = new FakeObjectStorage();
+        long initialMax = 10 * 1024 * 1024; // 10 MB
+        CachingObjectStorage cache = build(inner, initialMax);
+
+        assertEquals("getMaxCacheBytes must match construction value",
+                initialMax, cache.getMaxCacheBytes());
+
+        long newMax = 20 * 1024 * 1024; // 20 MB
+        long prev = cache.setMaxCacheBytes(newMax);
+
+        assertEquals("setMaxCacheBytes must return the previous maximum",
+                initialMax, prev);
+        assertEquals("getMaxCacheBytes must reflect the new maximum after set",
+                newMax, cache.getMaxCacheBytes());
+    }
+
+    @Test
+    public void testByteCountersAfterMissAndHit() throws Exception {
+        FakeObjectStorage inner = new FakeObjectStorage();
+        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+
+        int blockSize = 4096;
+        byte[] block = new byte[blockSize];
+        for (int i = 0; i < block.length; i++) {
+            block[i] = (byte) (i & 0xFF);
+        }
+        // Write block to inner so a readRange will go to inner on first access.
+        inner.data.put("counters.page.multipart/0", block);
+
+        // First readRange → cache MISS: missBytes must be incremented by the requested length.
+        int readLen = 128;
+        long missBefore = caching.getMissBytes();
+        long hitBefore = caching.getHitBytes();
+        ReadResult r1 = caching.readRange("counters.page", 0, readLen, blockSize).get();
+        assertEquals(ReadResult.Status.FOUND, r1.status());
+        assertEquals("missBytes must increase by the requested length on a cache miss",
+                missBefore + readLen, caching.getMissBytes());
+        assertEquals("hitBytes must not change on a cache miss",
+                hitBefore, caching.getHitBytes());
+
+        // Second readRange of same block → cache HIT: hitBytes must be incremented.
+        long missBefore2 = caching.getMissBytes();
+        long hitBefore2 = caching.getHitBytes();
+        ReadResult r2 = caching.readRange("counters.page", 0, readLen, blockSize).get();
+        assertEquals(ReadResult.Status.FOUND, r2.status());
+        assertEquals("hitBytes must increase by the requested length on a cache hit",
+                hitBefore2 + readLen, caching.getHitBytes());
+        assertEquals("missBytes must not change on a cache hit",
+                missBefore2, caching.getMissBytes());
+    }
+
+    @Test
     public void testAsyncWriteFailureDoesNotCacheData() throws Exception {
         // Create a failing inner storage
         FakeObjectStorage inner = new FakeObjectStorage() {
