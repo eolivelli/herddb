@@ -100,6 +100,15 @@ public final class SegmentBlockCache {
             this.cache = Caffeine.newBuilder()
                     .maximumWeight(maxBytes)
                     .weigher((BlockKey k, ByteBuf v) -> v == null ? 0 : v.capacity())
+                    // Use a synchronous (caller-thread) executor so that the
+                    // removal listener is invoked inline during the maintenance
+                    // pass rather than dispatched asynchronously to
+                    // ForkJoinPool.commonPool(). This guarantees that after
+                    // cleanUp() or invalidateAll() returns, every
+                    // safeRelease() has already executed and no ByteBuf
+                    // reference is left dangling. The listener only does an
+                    // atomic ref-count decrement, so the cost is negligible.
+                    .executor(Runnable::run)
                     .removalListener((BlockKey k, ByteBuf v, RemovalCause cause) -> {
                         // Release the cache's reference when the entry leaves
                         // the cache. Callers receive retained slices, so an
