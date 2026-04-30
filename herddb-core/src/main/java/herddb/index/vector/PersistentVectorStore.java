@@ -615,6 +615,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * Generation counter incremented inside {@link #notifySegmentCountMonitor}
      * to satisfy SpotBugs NN_NAKED_NOTIFY: the monitor must see a visible
      * state change before {@code notifyAll()} is called.
+     * Always accessed while holding {@link #segmentCountMonitor}, so no
+     * {@code volatile} is needed; {@link #getSegmentCountGeneration()} acquires
+     * the same lock so external readers also see the latest value.
      */
     private int segmentCountGeneration;
 
@@ -1387,9 +1390,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /**
      * Sets the maximum wall-clock time (ms) a caller may spend in
      * segment-count back-pressure before it is force-released (issue #370).
-     * Use {@link Long#MAX_VALUE} to disable the safety timeout.
+     * Must be {@code > 0}.  Use {@link Long#MAX_VALUE} to disable the
+     * safety timeout entirely.
+     *
+     * @throws IllegalArgumentException if {@code maxWaitMs <= 0}
      */
     public void setCompactionBackpressureMaxWaitMs(long maxWaitMs) {
+        if (maxWaitMs <= 0) {
+            throw new IllegalArgumentException(
+                    "compactionBackpressureMaxWaitMs must be > 0; use Long.MAX_VALUE to disable");
+        }
         this.compactionBackpressureMaxWaitMs = maxWaitMs;
     }
 
@@ -1755,20 +1765,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
                                     now, sinceGen));
                         }
                     }
-                    // Notify parked apply threads even on failure (issue #370): without
-                    // this, threads wait up to 100 ms per poll cycle and cannot react to
-                    // the safety timeout while compaction is failing with back-off.
+                    // Notify parked apply threads immediately on failure (issue #370):
+                    // wakes threads right after the cycle rather than waiting up to 100 ms
+                    // for the next poll — letting them detect the safety timeout sooner.
                     notifySegmentCountMonitor();
                 } catch (IOException e) {
                     recordCompactionFailure(VectorIndexCompactor.FailureReason.WRITE_IO);
                     LOGGER.log(Level.WARNING,
                             "vector store " + indexName + ": compaction I/O failure", e);
-                    notifySegmentCountMonitor(); // issue #370
+                    notifySegmentCountMonitor(); // immediate wakeup (issue #370)
                 } catch (DataStorageManagerException e) {
                     recordCompactionFailure(VectorIndexCompactor.FailureReason.METADATA_IO);
                     LOGGER.log(Level.WARNING,
                             "vector store " + indexName + ": compaction metadata failure", e);
-                    notifySegmentCountMonitor(); // issue #370
+                    notifySegmentCountMonitor(); // immediate wakeup (issue #370)
                 }
             } finally {
                 // Drop the temporary BLink storages regardless of outcome so
@@ -1792,6 +1802,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
         } finally {
             compactionActive.set(0);
             compactionLock.unlock();
+            // Belt-and-suspenders notify (issue #370): all normal and checked-exception
+            // exit paths call notifySegmentCountMonitor() explicitly above for immediate
+            // wakeup.  This backstop ensures unchecked-exception paths (e.g. RuntimeException
+            // from createTempPagedPkSet / createTempCompactionAuthorityMap, or unchecked
+            // throws from buildAuthorityMap) also signal waiting apply threads rather than
+            // leaving them parked until the safety timeout.  A redundant notify is harmless:
+            // waiting threads re-check the segment count and immediately re-park if still
+            // above the threshold.
+            notifySegmentCountMonitor();
         }
     }
 
@@ -2160,7 +2179,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private void waitForSegmentCountRelief() {
         long startMs = System.currentTimeMillis();
         long maxWaitMs = compactionBackpressureMaxWaitMs;
-        long deadlineMs = maxWaitMs == Long.MAX_VALUE ? Long.MAX_VALUE : startMs + maxWaitMs;
+        // Compute deadline with overflow protection: if startMs + maxWaitMs wraps
+        // (possible for very large but non-MAX_VALUE values) treat as no deadline.
+        long deadlineMs;
+        if (maxWaitMs == Long.MAX_VALUE || maxWaitMs >= Long.MAX_VALUE - startMs) {
+            deadlineMs = Long.MAX_VALUE;
+        } else {
+            deadlineMs = startMs + maxWaitMs;
+        }
         segmentCountBackpressureActive = 1;
         segmentCountBackpressureTotal.incrementAndGet();
         int threshold = compactionBackpressureThreshold;
@@ -5504,9 +5530,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * Incremented by every {@link #notifySegmentCountMonitor()} call.
      * Exposed for testing — callers can verify that a compaction cycle
      * (including the empty-candidates and failure paths) notified the monitor.
+     *
+     * <p>Acquires {@code segmentCountMonitor} to guarantee the latest value is
+     * visible to any calling thread, matching the lock used by the writer.
      */
     public int getSegmentCountGeneration() {
-        return segmentCountGeneration;
+        synchronized (segmentCountMonitor) {
+            return segmentCountGeneration;
+        }
     }
 
     public long getMaxVectorMemoryBytes() {

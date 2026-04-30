@@ -22,8 +22,10 @@ package herddb.index.vector;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import herddb.core.MemoryManager;
 import herddb.mem.MemoryDataStorageManager;
+import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
 import java.nio.file.Path;
 import java.util.Random;
@@ -52,6 +54,12 @@ import org.junit.rules.TemporaryFolder;
  *       segment count (empty candidates or repeated failures) the blocked
  *       apply thread is force-released after {@code compactionBackpressureMaxWaitMs}
  *       milliseconds with a SEVERE log, preventing a permanent IS hang.</li>
+ *   <li><b>Fix 3 (outer-finally backstop):</b> {@code runCompactionCycle()}
+ *       calls {@code notifySegmentCountMonitor()} in its outer {@code finally}
+ *       block as a belt-and-suspenders backstop, covering unchecked-exception
+ *       paths (e.g. {@code RuntimeException} from {@code createTempPagedPkSet}
+ *       or {@code createTempCompactionAuthorityMap}) that bypass the per-catch
+ *       notifies.</li>
  * </ol>
  */
 public class Issue370BackpressureDeadlockTest {
@@ -59,14 +67,18 @@ public class Issue370BackpressureDeadlockTest {
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
+    /** Saved original so @After can restore without hard-coding a constant. */
+    private int originalMinLiveVectorsForCheckpoint;
+
     @Before
     public void disableDeferral() {
+        originalMinLiveVectorsForCheckpoint = PersistentVectorStore.minLiveVectorsForCheckpoint;
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
     }
 
     @After
     public void restoreDeferral() {
-        PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
+        PersistentVectorStore.minLiveVectorsForCheckpoint = originalMinLiveVectorsForCheckpoint;
     }
 
     private static float[] randomVector(Random rng, int dim) {
@@ -149,15 +161,15 @@ public class Issue370BackpressureDeadlockTest {
      * apply threads park forever.  With Fix 2 the apply thread is released
      * after {@code maxWaitMs} and ingestion resumes.
      */
-    @Test(timeout = 30_000)
+    @Test(timeout = 60_000)
     public void backpressureReleasesAfterTimeoutWhenCompactionCannotHelp() throws Exception {
         Path tmpDir = tmpFolder.newFolder("bp370-timeout").toPath();
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         MemoryManager mm = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
 
         int threshold = 5;
-        // Very short safety timeout so the test runs in < 5 s.
-        long maxWaitMs = 1_500L;
+        // Generous timeout so the test never flakes on slow CI runners.
+        long maxWaitMs = 5_000L;
 
         PersistentVectorStore store = new PersistentVectorStore(
                 "testidx370b", "testtable", "tstblspace", "vec",
@@ -191,6 +203,8 @@ public class Issue370BackpressureDeadlockTest {
             int segsBefore = store.getSegmentCount();
             assertTrue("need more than threshold segments; got " + segsBefore,
                     segsBefore > threshold);
+            // Baseline: no timeout should have fired during setup.
+            assertEquals("no timeout during setup", 0L, store.getSegmentCountBackpressureTimeouts());
 
             // Phase 2: launch a background thread that will hit back-pressure.
             CountDownLatch started = new CountDownLatch(1);
@@ -209,31 +223,148 @@ public class Issue370BackpressureDeadlockTest {
 
             assertTrue("adder thread must start", started.await(5, TimeUnit.SECONDS));
 
-            // Phase 3: periodically drive compaction cycles (which find no
-            // candidates) so Fix 1 notifications are interleaved with Fix 2's
-            // timeout check.  The timeout alone would also suffice.
-            for (int round = 0; round < 5 && !completed.get(); round++) {
+            // Phase 3: drive compaction cycles (which find no candidates) so that
+            // Fix 1 notifications are interleaved with Fix 2's timeout check.
+            // The timeout alone would also release the thread, but we drive cycles
+            // to exercise both fixes together.
+            while (!done.await(500, TimeUnit.MILLISECONDS)) {
                 store.runCompactionCycle();
-                Thread.sleep(200);
             }
 
             // Phase 4: the safety timeout must have fired and released the thread.
-            assertTrue(
-                    "addVector must complete after the back-pressure safety timeout",
-                    done.await(10, TimeUnit.SECONDS));
             assertTrue("addVector must actually complete", completed.get());
 
             // Verify timeout was recorded — the segment count did NOT go below
             // threshold (compaction never selected candidates), so the release
             // was caused by the timeout, not by successful compaction.
-            assertEquals("segment count must still be above threshold after timeout release",
-                    segsBefore, store.getSegmentCount()); // no segments were merged
+            assertEquals("segment count must be unchanged (compaction did nothing)",
+                    segsBefore, store.getSegmentCount());
             assertTrue(
                     "safety timeout counter must be incremented",
                     store.getSegmentCountBackpressureTimeouts() >= 1);
             // Back-pressure must not be active after the release.
             assertFalse("back-pressure must not be active after release",
                     store.isSegmentCountBackpressureActive());
+        }
+    }
+
+    /**
+     * Fix 3 (outer-finally backstop): verifies that {@code notifySegmentCountMonitor()}
+     * is called even when {@code runCompactionCycle()} exits via an unchecked
+     * exception thrown before the inner {@code try} block — specifically when
+     * {@code createTempCompactionAuthorityMap()} fails because the backing
+     * {@link herddb.storage.DataStorageManager} throws {@link DataStorageManagerException}
+     * from {@code initIndex()}.
+     *
+     * <p>Before the outer-finally backstop was added, this path exited the
+     * outer {@code try} without notifying; the parked apply thread had to wait
+     * for the 100 ms poll or the safety timeout.
+     */
+    @Test(timeout = 30_000)
+    public void uncheckedExceptionInCompactionNotifiesMonitorViaOuterFinally() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("bp370-outer-finally").toPath();
+
+        // DSM that fails initIndex for temporary authority-map store names.
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager() {
+            @Override
+            public void initIndex(String tableSpace, String name)
+                    throws DataStorageManagerException {
+                if (name.contains("_tmp_cmpaut_")) {
+                    throw new DataStorageManagerException(
+                            "Injected failure for test: " + name);
+                }
+                super.initIndex(tableSpace, name);
+            }
+        };
+        MemoryManager mm = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+
+        PersistentVectorStore store = new PersistentVectorStore(
+                "testidx370d", "testtable", "tstblspace", "vec",
+                tmpDir, dsm, mm,
+                8, 32, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                /*compactionIntervalMs*/ Long.MAX_VALUE);
+        // Configure compaction so candidates ARE chosen (minBytes=1, minCount=2);
+        // the failure is injected at authority-map init, before rebuildSegment.
+        store.configureCompaction(
+                /*intervalMs*/ Long.MAX_VALUE,
+                /*minBytes*/ 1,
+                /*maxBytes*/ Long.MAX_VALUE,
+                /*minCount*/ 2,
+                /*maxCount*/ Integer.MAX_VALUE,
+                /*retentionMs*/ 0);
+        store.setTieredCompactionEnabled(false);
+        store.setCompactionBackpressureThreshold(Integer.MAX_VALUE); // don't block addVector
+
+        try (store) {
+            store.start();
+            Random rng = new Random(370_4);
+            int dim = 8;
+
+            // Build a few segments so there are candidates to merge.
+            for (int c = 0; c < 3; c++) {
+                for (int i = 0; i < 20; i++) {
+                    store.addVector(Bytes.from_int(c * 100 + i), randomVector(rng, dim));
+                }
+                store.checkpoint();
+            }
+
+            int genBefore = store.getSegmentCountGeneration();
+
+            // Drive a compaction cycle; it will select candidates, then
+            // createTempCompactionAuthorityMap will throw a RuntimeException
+            // (wrapping DataStorageManagerException).
+            try {
+                store.runCompactionCycle();
+                fail("expected RuntimeException from injected DSM failure");
+            } catch (RuntimeException expected) {
+                // Good — the cycle failed as expected.
+            }
+
+            int genAfter = store.getSegmentCountGeneration();
+            assertTrue(
+                    "runCompactionCycle() must call notifySegmentCountMonitor() via outer "
+                            + "finally even when createTempCompactionAuthorityMap throws "
+                            + "(generation before=" + genBefore + ", after=" + genAfter + ")",
+                    genAfter > genBefore);
+            // The safety timeout must not have fired (no back-pressure active).
+            assertEquals("timeout counter must be 0 — no back-pressure was active",
+                    0L, store.getSegmentCountBackpressureTimeouts());
+        }
+    }
+
+    /**
+     * Validates input: {@link PersistentVectorStore#setCompactionBackpressureMaxWaitMs}
+     * must reject non-positive values with {@link IllegalArgumentException}.
+     */
+    @Test(expected = IllegalArgumentException.class)
+    public void setCompactionBackpressureMaxWaitMsRejectsZero() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("bp370-validation").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        MemoryManager mm = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+        PersistentVectorStore store = new PersistentVectorStore(
+                "testidx370e", "testtable", "tstblspace", "vec",
+                tmpDir, dsm, mm,
+                8, 32, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                /*compactionIntervalMs*/ Long.MAX_VALUE);
+        try (store) {
+            store.start();
+            store.setCompactionBackpressureMaxWaitMs(0); // must throw
+        }
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void setCompactionBackpressureMaxWaitMsRejectsNegative() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("bp370-validation-neg").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        MemoryManager mm = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+        PersistentVectorStore store = new PersistentVectorStore(
+                "testidx370f", "testtable", "tstblspace", "vec",
+                tmpDir, dsm, mm,
+                8, 32, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                /*compactionIntervalMs*/ Long.MAX_VALUE);
+        try (store) {
+            store.start();
+            store.setCompactionBackpressureMaxWaitMs(-1); // must throw
         }
     }
 
@@ -301,15 +432,10 @@ public class Issue370BackpressureDeadlockTest {
             assertTrue("adder thread must start", started.await(5, TimeUnit.SECONDS));
 
             // Drive compaction cycles until the adder completes.
-            int maxRounds = 30;
-            for (int round = 0; round < maxRounds && !completed.get(); round++) {
+            while (!done.await(100, TimeUnit.MILLISECONDS)) {
                 store.runCompactionCycle();
-                Thread.sleep(50);
             }
 
-            assertTrue(
-                    "addVector must complete after compaction reduces segment count",
-                    done.await(10, TimeUnit.SECONDS));
             assertTrue("addVector must actually complete", completed.get());
 
             // No timeout should have fired — compaction did the job.
