@@ -316,6 +316,43 @@ public class InMemoryBlockCacheObjectStorageTest {
     }
 
     @Test
+    public void testSetMaxBytesUpdatesPolicy() throws Exception {
+        CountingFake inner = new CountingFake();
+        long initialMax = 4 * 1024 * 1024; // 4 MB
+
+        try (InMemoryBlockCacheObjectStorage cache =
+                new InMemoryBlockCacheObjectStorage(inner, initialMax)) {
+
+            assertEquals("getMaxBytes must match construction value",
+                    initialMax, cache.getMaxBytes());
+
+            long newMax = 8 * 1024 * 1024; // 8 MB
+            long prev = cache.setMaxBytes(newMax);
+
+            assertEquals("setMaxBytes must return the previous maximum",
+                    initialMax, prev);
+            assertEquals("getMaxBytes must reflect the new maximum after set",
+                    newMax, cache.getMaxBytes());
+
+            // Shrink below current weight: subsequent cleanUp triggers eviction.
+            // Fill roughly 2 * BLOCK_SIZE of weight, then shrink to 1 * BLOCK_SIZE.
+            inner.putBlock("shrink/a", 0, makeBlock(40, BLOCK_SIZE));
+            inner.putBlock("shrink/b", 0, makeBlock(41, BLOCK_SIZE));
+            ReadResult r1 = cache.readRange("shrink/a", 0, 16, BLOCK_SIZE).get();
+            r1.release();
+            ReadResult r2 = cache.readRange("shrink/b", 0, 16, BLOCK_SIZE).get();
+            r2.release();
+
+            // Shrink to one block's worth — Caffeine evicts lazily after cleanUp.
+            cache.setMaxBytes(BLOCK_SIZE);
+            cache.cleanUp();
+
+            assertTrue("cache weight must not exceed new maximum after shrink and cleanUp",
+                    cache.estimatedBytes() <= BLOCK_SIZE);
+        }
+    }
+
+    @Test
     public void maxBytesMustBePositive() {
         CountingFake inner = new CountingFake();
         try {

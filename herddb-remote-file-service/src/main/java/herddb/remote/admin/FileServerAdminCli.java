@@ -94,11 +94,10 @@ public final class FileServerAdminCli {
         } catch (ParseException e) {
             err.println("Invalid arguments: " + e.getMessage());
             return 2;
-        } catch (RuntimeException e) {
-            err.println("ERROR: " + e.getMessage());
-            return 1;
         } catch (Exception e) {
-            err.println("ERROR: " + e.getMessage());
+            // Broad catch: top-level CLI entry point; any unhandled exception must map to
+            // a non-zero exit code rather than an unformatted stack trace on stderr.
+            err.println("ERROR: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             return 1;
         }
     }

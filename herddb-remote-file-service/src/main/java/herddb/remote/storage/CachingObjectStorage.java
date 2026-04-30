@@ -189,6 +189,9 @@ public class CachingObjectStorage implements ObjectStorage {
      * @return the previous maximum, or 0 if the policy is not available
      */
     public long setMaxCacheBytes(long newMaxBytes) {
+        if (newMaxBytes <= 0) {
+            throw new IllegalArgumentException("newMaxBytes must be > 0, got: " + newMaxBytes);
+        }
         long[] prev = {0L};
         diskLru.policy().eviction().ifPresent(e -> {
             prev[0] = e.getMaximum();

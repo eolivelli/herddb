@@ -104,6 +104,8 @@ public class RemoteFileServerAdminImpl extends RemoteFileServerAdminGrpc.RemoteF
             responseObserver.onNext(builder.build());
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
+            // Broad catch: gRPC service entry point — must not let an unchecked exception
+            // kill the worker thread without returning a status reply to the client.
             LOGGER.log(Level.WARNING, "GetServerInfo failed", e);
             responseObserver.onError(
                     Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());

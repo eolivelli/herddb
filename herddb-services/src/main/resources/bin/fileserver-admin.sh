@@ -42,7 +42,11 @@ JAVA_HEAP="${FILESERVER_ADMIN_HEAP:--Xms64m -Xmx256m}"
 # inside the k3s/GKE tools pod), auto-wire --server for sub-commands that
 # accept it unless the user already passed it.
 EXTRA_ARGS=()
-if [ -n "$HERDDB_FILESERVER_SERVER" ] && [ -n "$1" ]; then
+# Auto-wire --server when HERDDB_FILESERVER_SERVER is set, unless the user
+# already passed --server, or only asked for help (in which case the server
+# address is irrelevant and may not be reachable from the local shell).
+if [ -n "$HERDDB_FILESERVER_SERVER" ] && [ -n "$1" ] \
+        && [ "$1" != "-h" ] && [ "$1" != "--help" ]; then
     HAS_SERVER=false
     for arg in "$@"; do
         if [ "$arg" = "--server" ]; then
