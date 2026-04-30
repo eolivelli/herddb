@@ -92,8 +92,10 @@ public class SysindexstatusTableManager extends AbstractSystemTableManager {
                 RemoteVectorIndexService.IndexStatusInfo status = vim.getRemoteIndexStatus();
                 props.put("vectorCount", status.getVectorCount());
                 props.put("segmentCount", status.getSegmentCount());
-                props.put("lastLsnLedger", status.getLastLsnLedger());
-                props.put("lastLsnOffset", status.getLastLsnOffset());
+                props.put("tailerLsnLedger", status.getTailerLsnLedger());
+                props.put("tailerLsnOffset", status.getTailerLsnOffset());
+                props.put("durableLsnLedger", status.getDurableLsnLedger());
+                props.put("durableLsnOffset", status.getDurableLsnOffset());
                 props.put("status", status.getStatus());
             } catch (Exception e) {
                 props.put("error", e.getMessage());

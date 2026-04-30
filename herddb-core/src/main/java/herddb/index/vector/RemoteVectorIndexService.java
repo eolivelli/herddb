@@ -97,20 +97,32 @@ public interface RemoteVectorIndexService extends AutoCloseable {
 
     /**
      * Status information for a remote vector index.
+     *
+     * <p>Issue #364: carries both the in-memory tailer position
+     * ({@code tailerLsn*}, diagnostic only) and the durable recovery LSN
+     * ({@code durableLsn*}, used by the server's commit-log retention floor
+     * — never advance retention past this value, otherwise an IS restart
+     * cannot replay the missing entries).
      */
     class IndexStatusInfo {
         private final long vectorCount;
         private final int segmentCount;
-        private final long lastLsnLedger;
-        private final long lastLsnOffset;
+        private final long tailerLsnLedger;
+        private final long tailerLsnOffset;
+        private final long durableLsnLedger;
+        private final long durableLsnOffset;
         private final String status;
 
         public IndexStatusInfo(long vectorCount, int segmentCount,
-                               long lastLsnLedger, long lastLsnOffset, String status) {
+                               long tailerLsnLedger, long tailerLsnOffset,
+                               long durableLsnLedger, long durableLsnOffset,
+                               String status) {
             this.vectorCount = vectorCount;
             this.segmentCount = segmentCount;
-            this.lastLsnLedger = lastLsnLedger;
-            this.lastLsnOffset = lastLsnOffset;
+            this.tailerLsnLedger = tailerLsnLedger;
+            this.tailerLsnOffset = tailerLsnOffset;
+            this.durableLsnLedger = durableLsnLedger;
+            this.durableLsnOffset = durableLsnOffset;
             this.status = status;
         }
 
@@ -122,12 +134,20 @@ public interface RemoteVectorIndexService extends AutoCloseable {
             return segmentCount;
         }
 
-        public long getLastLsnLedger() {
-            return lastLsnLedger;
+        public long getTailerLsnLedger() {
+            return tailerLsnLedger;
         }
 
-        public long getLastLsnOffset() {
-            return lastLsnOffset;
+        public long getTailerLsnOffset() {
+            return tailerLsnOffset;
+        }
+
+        public long getDurableLsnLedger() {
+            return durableLsnLedger;
+        }
+
+        public long getDurableLsnOffset() {
+            return durableLsnOffset;
         }
 
         public String getStatus() {

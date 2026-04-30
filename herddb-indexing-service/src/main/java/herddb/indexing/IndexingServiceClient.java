@@ -546,7 +546,8 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                         .build());
                 return new RemoteVectorIndexService.IndexStatusInfo(
                         resp.getVectorCount(), resp.getSegmentCount(),
-                        resp.getLastLsnLedger(), resp.getLastLsnOffset(),
+                        resp.getTailerLsnLedger(), resp.getTailerLsnOffset(),
+                        resp.getDurableLsnLedger(), resp.getDurableLsnOffset(),
                         resp.getStatus());
             } catch (Exception e) {
                 if (isShadowNotReady(e)) {
@@ -604,15 +605,23 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                         .setTable("")
                         .setIndex("")
                         .build());
-                LogSequenceNumber instanceLsn = new LogSequenceNumber(
-                        resp.getLastLsnLedger(), resp.getLastLsnOffset());
+                // Wait on the durable LSN, not the in-memory tailer position:
+                // an instance that has tail-applied an entry but not yet
+                // checkpointed the resulting state cannot recover from that
+                // LSN after a restart. WAITFORINDEXES must mean "indexes are
+                // queryable AND durable across restart" (issue #364).
+                LogSequenceNumber instanceLsn = readDurableLsnOrStartOfTime(resp);
                 if (instanceLsn.after(target) || instanceLsn.equals(target)) {
-                    LOGGER.log(Level.INFO, "Instance {0} caught up for tablespace {1} to {2} (at {3})",
+                    LOGGER.log(Level.INFO, "Instance {0} caught up for tablespace {1} to {2} (durable={3})",
                             new Object[]{server, tablespace, target, instanceLsn});
                     return true;
                 }
-                LOGGER.log(Level.INFO, "Instance {0} at {1} for tablespace {2}, waiting for {3} (status: {4})",
-                        new Object[]{server, instanceLsn, tablespace, target, resp.getStatus()});
+                LOGGER.log(Level.INFO,
+                        "Instance {0} durable={1} (tailer={2}/{3}) for tablespace {4}, "
+                                + "waiting for {5} (status: {6})",
+                        new Object[]{server, instanceLsn,
+                                resp.getTailerLsnLedger(), resp.getTailerLsnOffset(),
+                                tablespace, target, resp.getStatus()});
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Instance {0} unreachable for tablespace {1}, retrying: {2}",
                         new Object[]{server, tablespace, e.getMessage()});
@@ -661,8 +670,25 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                         .setTable("")
                         .setIndex("")
                         .build());
-                LogSequenceNumber instanceLsn = new LogSequenceNumber(
-                        resp.getLastLsnLedger(), resp.getLastLsnOffset());
+                // Read the DURABLE LSN, not the in-memory tailer position
+                // (issue #364). The server's commit-log retention floor MUST
+                // be anchored at the LSN from which the IS could resume on a
+                // restart — otherwise it can drop ledgers the IS would need
+                // to replay, just because its tailer had momentarily advanced
+                // past them in memory without a successful checkpoint.
+                LogSequenceNumber instanceLsn = readDurableLsnOrStartOfTime(resp);
+                if (LogSequenceNumber.START_OF_TIME.equals(instanceLsn)) {
+                    // Sentinel: instance has not yet published a durable
+                    // watermark. Pin retention immediately — same protection
+                    // path as for an unreachable instance.
+                    LOGGER.log(Level.WARNING,
+                            "getMinProcessedLsn: instance {0} has no durable watermark yet "
+                                    + "for tablespace {1} (tailer={2}/{3}); "
+                                    + "pinning commit-log retention at START_OF_TIME",
+                            new Object[]{server, tablespace,
+                                    resp.getTailerLsnLedger(), resp.getTailerLsnOffset()});
+                    return Optional.of(LogSequenceNumber.START_OF_TIME);
+                }
                 if (min == null || min.after(instanceLsn)) {
                     min = instanceLsn;
                 }
@@ -676,6 +702,27 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
             }
         }
         return Optional.ofNullable(min);
+    }
+
+    /**
+     * Decodes the durable recovery LSN advertised by an IS instance via
+     * {@link GetIndexStatusResponse#getDurableLsnLedger()} /
+     * {@link GetIndexStatusResponse#getDurableLsnOffset()}. Treats the
+     * proto-default {@code (0, 0)} pair as
+     * {@link LogSequenceNumber#START_OF_TIME}: this happens either because
+     * the instance has not yet completed a checkpoint (and therefore has no
+     * durable recovery point) or because the field is unset on the wire.
+     * In both cases the safe interpretation is "do not advance retention",
+     * so callers see the START_OF_TIME sentinel and pin accordingly
+     * (issue #364).
+     */
+    private static LogSequenceNumber readDurableLsnOrStartOfTime(GetIndexStatusResponse resp) {
+        long ledger = resp.getDurableLsnLedger();
+        long offset = resp.getDurableLsnOffset();
+        if (ledger <= 0 && offset <= 0) {
+            return LogSequenceNumber.START_OF_TIME;
+        }
+        return new LogSequenceNumber(ledger, offset);
     }
 
     public List<String> getServers() {

@@ -121,7 +121,7 @@ public class MockRemoteVectorIndexService implements RemoteVectorIndexService {
     public IndexStatusInfo getIndexStatus(String tablespace, String table, String index) {
         String key = indexKey(table, index);
         List<VectorEntry> entries = indexes.getOrDefault(key, Collections.emptyList());
-        return new IndexStatusInfo(entries.size(), 1, 0, 0, "mock");
+        return new IndexStatusInfo(entries.size(), 1, 0, 0, 0, 0, "mock");
     }
 
     @Override

@@ -113,7 +113,7 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
             long deadline = System.currentTimeMillis() + 10_000;
             while (System.currentTimeMillis() < deadline) {
                 IndexStatusInfo status = eis.getEngine().getIndexStatus("tablespace1", "", "");
-                if (status.getLastLsnLedger() == 1 && status.getLastLsnOffset() == 5) {
+                if (status.getTailerLsnLedger() == 1 && status.getTailerLsnOffset() == 5) {
                     break;
                 }
                 Thread.sleep(50);
@@ -121,9 +121,9 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
 
             IndexStatusInfo status = eis.getEngine().getIndexStatus("tablespace1", "", "");
             assertEquals("Tailer should have processed up to ledger 1",
-                    1, status.getLastLsnLedger());
+                    1, status.getTailerLsnLedger());
             assertEquals("Tailer should have processed up to offset 5",
-                    5, status.getLastLsnOffset());
+                    5, status.getTailerLsnOffset());
 
             // The phantom LSN that getLastSequenceNumber() would return after ledger rollover
             LogSequenceNumber phantomLsn = new LogSequenceNumber(2, -1);
@@ -141,8 +141,17 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
                 // This is what getLastWrittenSequenceNumber() would return instead of (2, -1)
                 LogSequenceNumber correctLsn = new LogSequenceNumber(1, 5);
 
+                // Issue #364: waitForCatchUp now compares against the engine's
+                // DURABLE LSN (the persisted watermark), not the in-memory
+                // tailer position. Force a checkpoint so the watermark
+                // catches up to the tailer's (1, 5) before the assertion;
+                // otherwise the wait would correctly time out — the IS
+                // would not yet be safely recoverable to (1, 5) on restart.
+                eis.getEngine().forceCheckpointAndSaveWatermark();
+
                 boolean fixedCaughtUp = client.waitForCatchUp("tablespace1", correctLsn, 30000);
-                assertTrue("waitForCatchUp with correct LSN (1, 5) should succeed",
+                assertTrue("waitForCatchUp with correct LSN (1, 5) should succeed "
+                                + "after a checkpoint advances the durable LSN",
                         fixedCaughtUp);
             }
         }
