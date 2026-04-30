@@ -37,7 +37,6 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -256,13 +255,6 @@ public class SegmentBlockCacheHammerTest {
         // All remaining cached entries must be releasable cleanly.
         cache.clear();
         cache.cleanUp();
-        // Caffeine dispatches removal-listener calls through
-        // ForkJoinPool.commonPool() asynchronously (via executor.execute()).
-        // cleanUp() triggers the maintenance pass that *schedules* those calls,
-        // but they may not have run yet by the time we inspect refCounts.
-        // awaitQuiescence() blocks until the common pool has no remaining tasks,
-        // guaranteeing every safeRelease() has completed before the assertions.
-        ForkJoinPool.commonPool().awaitQuiescence(10, TimeUnit.SECONDS);
         assertEquals("cache fully drained", 0L, cache.estimatedSize());
 
         // Final invariant: every buffer the loader allocated must now be
