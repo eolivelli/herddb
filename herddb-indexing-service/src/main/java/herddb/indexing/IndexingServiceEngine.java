@@ -515,9 +515,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final int vectorCompactionBackpressureSegments = config.getInt(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS_DEFAULT);
+            final long vectorCompactionBackpressureMaxWaitMs = config.getLong(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_MAX_WAIT_MS,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_MAX_WAIT_MS_DEFAULT);
             LOGGER.log(Level.INFO,
-                    "vector index compaction: tieredEnabled={0}, backpressureSegments={1}",
-                    new Object[]{vectorCompactionTieredEnabled, vectorCompactionBackpressureSegments});
+                    "vector index compaction: tieredEnabled={0}, backpressureSegments={1}, "
+                            + "backpressureMaxWaitMs={2}",
+                    new Object[]{vectorCompactionTieredEnabled, vectorCompactionBackpressureSegments,
+                            vectorCompactionBackpressureMaxWaitMs});
             final long maxLiveBytesPerCheckpoint = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT,
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT);
@@ -619,6 +624,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         vectorCompactionRetentionMs);
                 store.setTieredCompactionEnabled(vectorCompactionTieredEnabled);
                 store.setCompactionBackpressureThreshold(vectorCompactionBackpressureSegments);
+                store.setCompactionBackpressureMaxWaitMs(vectorCompactionBackpressureMaxWaitMs);
                 try {
                     store.start();
                 } catch (Exception e) {
@@ -2638,6 +2644,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 @Override
                 public Long getSample() {
                     return pvs.getSegmentCountBackpressureTimeMs();
+                }
+            });
+            indexStats.registerGauge("segment_count_backpressure_timeouts", new Gauge<Long>() {
+                @Override
+                public Long getDefaultValue() {
+                    return 0L;
+                }
+                @Override
+                public Long getSample() {
+                    return pvs.getSegmentCountBackpressureTimeouts();
                 }
             });
             indexStats.registerGauge("max_vector_memory_bytes", new Gauge<Long>() {
