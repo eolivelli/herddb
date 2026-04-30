@@ -2302,6 +2302,45 @@
               "show": true
             }
           ]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 617,
+          "span": 4,
+          "targets": [
+            {
+              "expr": "{__name__=~\"tablespace_${tablespace}_table_${table}_vidx_${vidx}_segment_count_backpressure_timeouts\",job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "{{__name__}}",
+              "refId": "A"
+            }
+          ],
+          "thresholds": "0.5",
+          "title": "Back-Pressure Safety Timeout Fires (cumulative)",
+          "description": "Number of times the segment-count back-pressure safety timeout (vector.index.compaction.backpressure.max.wait.ms, default 300 s) fired and force-released a blocked addVector caller because compaction could not drain the segment count below the threshold. Any non-zero value means the IS was at risk of a permanent hang; investigate compaction failure logs (SEVERE entries) and consider adjusting compaction policy or raising the back-pressure threshold.",
+          "type": "singlestat",
+          "valueName": "current",
+          "colorBackground": true,
+          "colors": [
+            "#299c46",
+            "#d44a3a",
+            "#d44a3a"
+          ],
+          "valueMaps": [
+            {
+              "value": "0",
+              "text": "OK",
+              "op": "="
+            }
+          ],
+          "rangeMaps": [
+            {
+              "from": "1",
+              "to": "999999999",
+              "text": "TIMEOUT FIRED"
+            }
+          ]
         }
       ],
       "showTitle": true,
