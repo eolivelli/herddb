@@ -112,11 +112,24 @@ public interface RemoteVectorIndexService extends AutoCloseable {
         private final long durableLsnLedger;
         private final long durableLsnOffset;
         private final String status;
+        /** Number of segments loaded so far during cold-start recovery (0 when not loading). */
+        private final int loadingSegmentsDone;
+        /** Total number of segments to load during cold-start recovery (0 when not loading). */
+        private final int loadingSegmentsTotal;
 
         public IndexStatusInfo(long vectorCount, int segmentCount,
                                long tailerLsnLedger, long tailerLsnOffset,
                                long durableLsnLedger, long durableLsnOffset,
                                String status) {
+            this(vectorCount, segmentCount, tailerLsnLedger, tailerLsnOffset,
+                    durableLsnLedger, durableLsnOffset, status, 0, 0);
+        }
+
+        public IndexStatusInfo(long vectorCount, int segmentCount,
+                               long tailerLsnLedger, long tailerLsnOffset,
+                               long durableLsnLedger, long durableLsnOffset,
+                               String status,
+                               int loadingSegmentsDone, int loadingSegmentsTotal) {
             this.vectorCount = vectorCount;
             this.segmentCount = segmentCount;
             this.tailerLsnLedger = tailerLsnLedger;
@@ -124,6 +137,8 @@ public interface RemoteVectorIndexService extends AutoCloseable {
             this.durableLsnLedger = durableLsnLedger;
             this.durableLsnOffset = durableLsnOffset;
             this.status = status;
+            this.loadingSegmentsDone = loadingSegmentsDone;
+            this.loadingSegmentsTotal = loadingSegmentsTotal;
         }
 
         public long getVectorCount() {
@@ -152,6 +167,22 @@ public interface RemoteVectorIndexService extends AutoCloseable {
 
         public String getStatus() {
             return status;
+        }
+
+        /**
+         * Returns the number of segments that have finished loading during the current
+         * cold-start recovery pass. Returns 0 when the store is not loading from status.
+         */
+        public int getLoadingSegmentsDone() {
+            return loadingSegmentsDone;
+        }
+
+        /**
+         * Returns the total number of on-disk segments that must be loaded during the
+         * current cold-start recovery pass. Returns 0 when the store is not loading from status.
+         */
+        public int getLoadingSegmentsTotal() {
+            return loadingSegmentsTotal;
         }
     }
 }

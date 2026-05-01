@@ -99,6 +99,9 @@ public class RemoteFileDataStorageManagerDirectDownloadTest {
         if (dsm != null) {
             dsm.close();
         }
+        if (stubClient != null) {
+            stubClient.close();
+        }
         if (metadataExecutor != null) {
             metadataExecutor.shutdown();
         }

@@ -415,6 +415,11 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             try {
                 direct.close();
             } catch (Exception e) {
+                // ObjectStorage.close() is declared throws Exception by the AutoCloseable
+                // interface; concrete implementations (S3ObjectStorage, LocalObjectStorage)
+                // only throw unchecked exceptions, but the compiler requires catching the
+                // declared checked Exception. Swallowing is correct here: this is best-effort
+                // cleanup on shutdown and we must not prevent the rest of close() from running.
                 LOGGER.log(Level.WARNING,
                         "error closing direct S3 ObjectStorage on RemoteFileDataStorageManager.close()", e);
             }

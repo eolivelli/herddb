@@ -72,6 +72,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -4321,10 +4322,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // (loadingSegmentsDone, the counter below) is updated atomically.
         //
         // Publication order invariant (for gRPC GetIndexStatus consumers):
-        //   loadingFromStatus is set to true BEFORE the counters so that a
-        //   reader who sees isLoadingFromStatus()==true is guaranteed to also
-        //   see a non-zero loadingSegmentsTotal. The reverse order would allow
-        //   a reader to see loading=true, total=0 briefly.
+        //   loadingSegmentsTotal and loadingSegmentsDone are set BEFORE
+        //   loadingFromStatus is flipped to true, so any reader who observes
+        //   isLoadingFromStatus()==true is guaranteed to also see a non-zero
+        //   loadingSegmentsTotal. The reverse order would allow a brief window
+        //   where loading=true but total=0.
         //
         // Failure semantics: if any segment fails to load, ALL previously
         // opened BLinks (seg.onDiskPkToNode) for segments in segList are
@@ -4334,9 +4336,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // on the next start(). start() callers are expected to handle this
         // exception by propagating it up and allowing the service to restart.
         // ----------------------------------------------------------------
-        loadingFromStatus = true;         // publish before counters (see invariant above)
-        loadingSegmentsTotal.set(numSegments);
+        loadingSegmentsTotal.set(numSegments);   // set counters BEFORE the flag (invariant above)
         loadingSegmentsDone.set(0);
+        loadingFromStatus = true;
         LOGGER.log(Level.INFO,
                 "loading vector store {0}: {1} segments, direct-S3={2}",
                 new Object[]{indexName, numSegments,
@@ -4378,6 +4380,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             g.cancel(true);
                         }
                     }
+                } catch (CancellationException ignored) {
+                    // Expected: after the first failure triggers g.cancel(true), subsequent
+                    // f.get() calls on already-cancelled futures throw CancellationException.
+                    // Continue draining so the original loadingFailure is rethrown below
+                    // as an IOException/DataStorageManagerException, not as an opaque
+                    // CancellationException.
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     throw new IOException("Interrupted while loading segments", e);

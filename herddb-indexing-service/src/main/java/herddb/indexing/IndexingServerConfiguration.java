@@ -285,7 +285,20 @@ public final class IndexingServerConfiguration {
     // they are not visible in ConfigMaps or log output.
     // -------------------------------------------------------------------------
 
-    /** Enable direct S3 download for segment map files during recovery. Default false. */
+    /**
+     * Enable direct S3 download for segment map files during recovery. Default false.
+     *
+     * <p>When {@code true}, the indexing service opens an S3 client directly
+     * (using {@code indexing.s3.*} credentials) and downloads segment map files
+     * without routing through the gRPC file-server. This significantly reduces
+     * cold-start time when there are many segments (issue #381).
+     *
+     * <p><strong>Note:</strong> the configured bucket ({@link #PROPERTY_S3_BUCKET})
+     * is assumed to be pre-provisioned and accessible when the service starts.
+     * Unlike the file-server itself, the indexing service does NOT poll for the
+     * bucket to become available; a misconfigured or missing bucket will surface
+     * only at the first recovery attempt with a storage error.
+     */
     public static final String PROPERTY_S3_DIRECT_ENABLED = "indexing.s3.direct.enabled";
     public static final boolean PROPERTY_S3_DIRECT_ENABLED_DEFAULT = false;
 
