@@ -36,7 +36,6 @@ import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -86,14 +85,40 @@ public class PersistentVectorStoreDirectDownloadTest {
 
     /**
      * A {@link MemoryDataStorageManager} subclass that advertises direct-download
-     * support and counts how many times {@link #downloadMultipartIndexFile} is
-     * called. The implementation simply copies the in-memory byte[] content to
-     * the requested destination file — no gRPC, no block-cache, no ReaderSupplier.
+     * support and tracks call counts for both paths.
+     *
+     * <p>Distinguishes between:
+     * <ul>
+     *   <li>{@link #directDownloadCount} — calls via {@link #downloadMultipartIndexFile}
+     *       (the fast path that must be taken during recovery).</li>
+     *   <li>{@link #externalReaderSupplierCount} — calls to
+     *       {@link #multipartIndexReaderSupplier} for the <em>map</em> file type that did NOT
+     *       originate from inside {@link #downloadMultipartIndexFile} (i.e., the slow gRPC
+     *       fallback path). Graph file calls via the same method are expected (the
+     *       {@code OnDiskGraphIndex} keeps a live reader reference) and are therefore
+     *       excluded from this counter. This must be zero during recovery when
+     *       {@code supportsDirectMultipartDownload()} is true.
+     *   </li>
+     * </ul>
+     *
+     * <p>A {@link ThreadLocal} marker is used to detect calls to
+     * {@code multipartIndexReaderSupplier} that come from inside
+     * {@code downloadMultipartIndexFile} vs. from {@code readMultipartMapDataToTempFile}.
+     *
+     * <p>An optional per-download sleep widows the loading window so that the
+     * observer thread in the loading-progress test can reliably catch the
+     * {@code isLoadingFromStatus()==true} state.
      */
     private static final class DirectDownloadDSM extends MemoryDataStorageManager {
 
         final AtomicInteger directDownloadCount = new AtomicInteger(0);
-        final AtomicInteger readerSupplierCount = new AtomicInteger(0);
+        /** Count of {@code multipartIndexReaderSupplier} calls from the slow path only. */
+        final AtomicInteger externalReaderSupplierCount = new AtomicInteger(0);
+        /** Optional per-download delay in ms (0 = no delay). */
+        volatile long downloadDelayMs = 0;
+
+        /** Set while executing inside {@link #downloadMultipartIndexFile}. */
+        private final ThreadLocal<Boolean> insideDirectDownload = ThreadLocal.withInitial(() -> false);
 
         @Override
         public boolean supportsDirectMultipartDownload() {
@@ -105,23 +130,35 @@ public class PersistentVectorStoreDirectDownloadTest {
                                                long fileSize, Path destFile)
                 throws IOException, DataStorageManagerException {
             directDownloadCount.incrementAndGet();
-            // The in-memory map stores the file under the multipart key. Read
-            // the raw bytes via the standard reader supplier and write them to
-            // destFile, exactly as the production S3 path would do.
-            io.github.jbellis.jvector.disk.ReaderSupplier supplier =
-                    multipartIndexReaderSupplier(tableSpace, uuid, fileType, fileSize);
-            try (io.github.jbellis.jvector.disk.RandomAccessReader reader = supplier.get();
-                 java.io.OutputStream out = Files.newOutputStream(destFile)) {
-                byte[] buf = new byte[4096];
-                long remaining = fileSize;
-                reader.seek(0);
-                while (remaining > 0) {
-                    int toRead = (int) Math.min(buf.length, remaining);
-                    byte[] tmp = toRead == buf.length ? buf : new byte[toRead];
-                    reader.readFully(tmp);
-                    out.write(tmp, 0, toRead);
-                    remaining -= toRead;
+            insideDirectDownload.set(true);
+            try {
+                if (downloadDelayMs > 0) {
+                    try {
+                        Thread.sleep(downloadDelayMs);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
+                // Read the raw bytes via the parent in-memory supplier and write to destFile.
+                // This call does NOT increment externalReaderSupplierCount because the
+                // insideDirectDownload marker is set.
+                io.github.jbellis.jvector.disk.ReaderSupplier supplier =
+                        super.multipartIndexReaderSupplier(tableSpace, uuid, fileType, fileSize);
+                try (io.github.jbellis.jvector.disk.RandomAccessReader reader = supplier.get();
+                     java.io.OutputStream out = Files.newOutputStream(destFile)) {
+                    byte[] buf = new byte[4096];
+                    long remaining = fileSize;
+                    reader.seek(0);
+                    while (remaining > 0) {
+                        int toRead = (int) Math.min(buf.length, remaining);
+                        byte[] tmp = toRead == buf.length ? buf : new byte[toRead];
+                        reader.readFully(tmp);
+                        out.write(tmp, 0, toRead);
+                        remaining -= toRead;
+                    }
+                }
+            } finally {
+                insideDirectDownload.set(false);
             }
         }
 
@@ -129,7 +166,14 @@ public class PersistentVectorStoreDirectDownloadTest {
         public io.github.jbellis.jvector.disk.ReaderSupplier multipartIndexReaderSupplier(
                 String tableSpace, String uuid, String fileType, long fileSize)
                 throws DataStorageManagerException {
-            readerSupplierCount.incrementAndGet();
+            // Only count "map" calls that originate from outside downloadMultipartIndexFile.
+            // The "graph" file is always loaded via ReaderSupplier (OnDiskGraphIndex keeps a live
+            // reference to it), so graph calls are expected regardless of the direct-download flag.
+            // We specifically want to ensure that "map" file reads do NOT use the slow path when
+            // supportsDirectMultipartDownload() returns true.
+            if ("map".equals(fileType) && !insideDirectDownload.get()) {
+                externalReaderSupplierCount.incrementAndGet();
+            }
             return super.multipartIndexReaderSupplier(tableSpace, uuid, fileType, fileSize);
         }
     }
@@ -158,21 +202,27 @@ public class PersistentVectorStoreDirectDownloadTest {
 
         // Reset counters before the recovery pass
         dsm.directDownloadCount.set(0);
-        dsm.readerSupplierCount.set(0);
+        dsm.externalReaderSupplierCount.set(0);
 
         // Second run: cold-start recovery — must use the direct-download path
         try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
             store.start();
             assertEquals(200, store.size());
 
-            // The direct-download path must have been taken for at least one segment
-            assertTrue("downloadMultipartIndexFile should have been called at least once",
+            // The direct-download path must have been taken exactly once per on-disk segment.
+            // With 200 vectors (well below the flush threshold), there should be exactly 1 segment.
+            assertTrue("downloadMultipartIndexFile should have been called at least once "
+                    + "(one call per on-disk segment)",
                     dsm.directDownloadCount.get() > 0);
 
-            // The old gRPC/ReaderSupplier path must NOT have been used during recovery
-            // (the increment in downloadMultipartIndexFile itself calls the super
-            // multipartIndexReaderSupplier — that count is expected. Only counts
-            // from readMultipartMapDataToTempFile matter, which are indirect).
+            // The slow gRPC/ReaderSupplier fallback path MUST NOT have been called for
+            // map files during recovery when supportsDirectMultipartDownload()==true.
+            // (Graph files still go through the ReaderSupplier; that is expected and is
+            //  not counted in externalReaderSupplierCount.)
+            assertEquals("multipartIndexReaderSupplier for 'map' files must NOT be invoked "
+                    + "from the slow path when supportsDirectMultipartDownload()==true",
+                    0, dsm.externalReaderSupplierCount.get());
+
             // Verify search results are consistent with before-restart results.
             List<Map.Entry<Bytes, Float>> afterResults = store.search(query, 5);
             assertFalse("should return results after direct-download restart", afterResults.isEmpty());
@@ -203,7 +253,10 @@ public class PersistentVectorStoreDirectDownloadTest {
             assertEquals(300, store.size());
         }
 
-        // Second run: observe progress counters
+        // Second run: observe progress counters.
+        // A 50 ms delay per segment download widens the loading window so the
+        // observer thread can reliably catch isLoadingFromStatus()==true.
+        dsm.downloadDelayMs = 50;
         try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
             // Before start: counters should be zero, not loading
             assertEquals(0, store.getLoadingSegmentsDone());
@@ -213,62 +266,58 @@ public class PersistentVectorStoreDirectDownloadTest {
             // Track observed progress values from a concurrent observer thread
             AtomicInteger observedTotal = new AtomicInteger(-1);
             AtomicInteger observedDoneSnapshot = new AtomicInteger(-1);
-            AtomicReference<Boolean> observedLoading = new AtomicReference<>(null);
-            CountDownLatch startedLatch = new CountDownLatch(1);
-            CountDownLatch doneLatch = new CountDownLatch(1);
+            CountDownLatch capturedLatch = new CountDownLatch(1);
+            CountDownLatch observerReadyLatch = new CountDownLatch(1);
 
             Thread observer = new Thread(() -> {
-                startedLatch.countDown();
-                // Poll until loading starts or times out (max 10 s)
+                observerReadyLatch.countDown();
+                // Poll until loading starts or times out (max 10 s).
+                // The 50 ms download delay guarantees the window is wide enough.
                 long deadline = System.currentTimeMillis() + 10_000;
                 while (System.currentTimeMillis() < deadline) {
                     if (store.isLoadingFromStatus()) {
-                        observedLoading.set(true);
                         observedTotal.set(store.getLoadingSegmentsTotal());
                         observedDoneSnapshot.set(store.getLoadingSegmentsDone());
+                        capturedLatch.countDown();
                         break;
                     }
                     Thread.yield();
                 }
-                doneLatch.countDown();
+                // If we timed out without catching the loading state, count down anyway.
+                capturedLatch.countDown();
             });
             observer.setDaemon(true);
             observer.start();
-            startedLatch.await();
+            observerReadyLatch.await();
 
-            // Now start the store — this triggers loadMultiSegmentFormat
+            // Now start the store — this triggers loadMultiSegmentFormat (with delays)
             store.start();
 
-            doneLatch.await();
+            capturedLatch.await();
+            dsm.downloadDelayMs = 0;
 
-            // After start() returns, loading must be finished:
-            // isLoadingFromStatus is always false after loadMultiSegmentFormat returns.
+            // -----------------------------------------------------------------------
+            // Unconditional post-start assertions
+            // -----------------------------------------------------------------------
+            // 1. After start() returns, loading must be finished.
             assertFalse("isLoadingFromStatus must be false after start() returns",
                     store.isLoadingFromStatus());
 
-            // The counter values after loading are the final snapshot
-            // (done == total == numSegments). They're not reset to 0 —
-            // only meaningful when isLoadingFromStatus() is true.
+            // 2. After a successful load the final counters satisfy done == total.
+            //    (They are not reset to 0 after completion — only meaningful when
+            //     isLoadingFromStatus() is true.)
             int finalTotal = store.getLoadingSegmentsTotal();
             int finalDone = store.getLoadingSegmentsDone();
-            assertTrue("final total must be >= 0", finalTotal >= 0);
-            assertTrue("final done must be >= 0", finalDone >= 0);
-            // When there were segments to load, done must equal total at end
-            if (finalTotal > 0) {
-                assertEquals("done must equal total after successful load",
-                        finalTotal, finalDone);
-            }
+            assertTrue("final total must be > 0 (store had on-disk segments)", finalTotal > 0);
+            assertEquals("done must equal total after successful load", finalTotal, finalDone);
 
-            // The observer should have caught the in-progress state (or recovery was
-            // so fast the observer missed it — that is also acceptable for correctness,
-            // but we require at least the post-start state to be correct).
-            // Only assert the observed total if it was non-negative (i.e., observed).
-            if (observedTotal.get() >= 0) {
-                assertTrue("loading total must be > 0 when in progress",
-                        observedTotal.get() > 0);
-                assertTrue("loading done must be >= 0 when in progress",
-                        observedDoneSnapshot.get() >= 0);
-            }
+            // 3. The observer must have caught the in-progress state (the 50 ms delay
+            //    guarantees the loading window is wide enough to observe).
+            assertTrue("observer must have caught isLoadingFromStatus()==true within 10 s",
+                    observedTotal.get() >= 0);
+            assertTrue("loading total must be > 0 when in progress", observedTotal.get() > 0);
+            assertTrue("loading done must be >= 0 when in progress", observedDoneSnapshot.get() >= 0);
+
             assertEquals(300, store.size());
         }
     }

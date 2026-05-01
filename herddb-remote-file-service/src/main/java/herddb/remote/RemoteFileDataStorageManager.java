@@ -120,8 +120,10 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * {@code true} and {@link #downloadMultipartIndexFile} reads block objects directly
      * from S3 instead of routing through the gRPC file server.
      *
-     * @param storage an open, ready-to-use {@link ObjectStorage} instance; the caller
-     *                retains ownership and must close it after this manager is closed
+     * <p>Ownership of {@code storage} is transferred to this manager:
+     * it will be closed by {@link #close()} together with all other resources.
+     *
+     * @param storage an open, ready-to-use {@link ObjectStorage} instance
      */
     public void setDirectObjectStorage(ObjectStorage storage) {
         this.directObjectStorage = storage;
@@ -405,6 +407,18 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     @Override
     public void close() throws DataStorageManagerException {
         localMetadataManager.close();
+        // Close the direct-S3 client if one was wired in (issue #381).
+        // S3AsyncClient + CRT HTTP-client threads are native resources; closing
+        // here prevents leaks on pod shutdown and in tests that restart the IS.
+        ObjectStorage direct = this.directObjectStorage;
+        if (direct != null) {
+            try {
+                direct.close();
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING,
+                        "error closing direct S3 ObjectStorage on RemoteFileDataStorageManager.close()", e);
+            }
+        }
     }
 
     // -------------------------------------------------------------------------

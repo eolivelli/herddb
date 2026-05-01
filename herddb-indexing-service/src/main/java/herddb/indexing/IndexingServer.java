@@ -250,18 +250,29 @@ public class IndexingServer implements AutoCloseable {
                     // parallel S3 download. Must be wired before the DSM is handed
                     // to the engine so supportsDirectMultipartDownload() returns true
                     // on the very first loadMultiSegmentFormat() call.
+                    //
+                    // Shadow replicas discard this DSM (replaced by ReadReplicaDataStorageManager
+                    // below), so direct S3 is only wired for primaries.
                     boolean s3DirectEnabled = config.getBoolean(
                             IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED,
                             IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED_DEFAULT);
-                    if (s3DirectEnabled) {
-                        try {
-                            ObjectStorage directStorage = buildDirectS3ObjectStorage();
-                            ((RemoteFileDataStorageManager) dsm).setDirectObjectStorage(directStorage);
-                            LOGGER.log(Level.INFO,
-                                    "Direct S3 download enabled for segment map files (issue #381)");
-                        } catch (IOException ioe) {
-                            throw new RuntimeException(
-                                    "Failed to build direct S3 client for indexing service", ioe);
+                    if (s3DirectEnabled && !config.isShadow()) {
+                        if (dsm instanceof RemoteFileDataStorageManager) {
+                            try {
+                                ObjectStorage directStorage = buildDirectS3ObjectStorage();
+                                ((RemoteFileDataStorageManager) dsm).setDirectObjectStorage(directStorage);
+                                LOGGER.log(Level.INFO,
+                                        "Direct S3 download enabled for segment map files (issue #381)");
+                            } catch (IOException ioe) {
+                                throw new RuntimeException(
+                                        "Failed to build direct S3 client for indexing service", ioe);
+                            }
+                        } else {
+                            LOGGER.log(Level.WARNING,
+                                    "indexing.s3.direct.enabled=true but the data storage manager "
+                                            + "({0}) is not a RemoteFileDataStorageManager — "
+                                            + "direct S3 download will NOT be active",
+                                    dsm.getClass().getSimpleName());
                         }
                     }
 

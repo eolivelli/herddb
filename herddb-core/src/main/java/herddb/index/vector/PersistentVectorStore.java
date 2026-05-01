@@ -4319,14 +4319,29 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // that the existing thread budget controls parallelism — no extra
         // threads are created. Each segment is independent; shared state
         // (loadingSegmentsDone, the counter below) is updated atomically.
+        //
+        // Publication order invariant (for gRPC GetIndexStatus consumers):
+        //   loadingFromStatus is set to true BEFORE the counters so that a
+        //   reader who sees isLoadingFromStatus()==true is guaranteed to also
+        //   see a non-zero loadingSegmentsTotal. The reverse order would allow
+        //   a reader to see loading=true, total=0 briefly.
+        //
+        // Failure semantics: if any segment fails to load, ALL previously
+        // opened BLinks (seg.onDiskPkToNode) for segments in segList are
+        // closed and none are registered into the segments list (all-or-nothing).
+        // This is a deliberate choice: partial state after a storage error is
+        // harder to reason about than a clean failure that forces a full retry
+        // on the next start(). start() callers are expected to handle this
+        // exception by propagating it up and allowing the service to restart.
         // ----------------------------------------------------------------
+        loadingFromStatus = true;         // publish before counters (see invariant above)
         loadingSegmentsTotal.set(numSegments);
         loadingSegmentsDone.set(0);
-        loadingFromStatus = true;
         LOGGER.log(Level.INFO,
                 "loading vector store {0}: {1} segments, direct-S3={2}",
                 new Object[]{indexName, numSegments,
                         dataStorageManager.supportsDirectMultipartDownload()});
+        Throwable loadingFailure = null;
         try {
             List<Future<?>> futures = new ArrayList<>(numSegments);
             for (VectorSegment seg : segList) {
@@ -4334,7 +4349,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     Path mapFile = readMultipartMapDataToTempFile(seg);
                     loadFusedPQSegment(seg, mapFile, dim, savedNextNodeId);
                     int done = loadingSegmentsDone.incrementAndGet();
-                    if (done % 100 == 0 || done == numSegments) {
+                    if (done == 1 || done % 100 == 0 || done == numSegments) {
                         LOGGER.log(Level.INFO,
                                 "loading vector store {0}: {1}/{2} segments loaded",
                                 new Object[]{indexName, done, numSegments});
@@ -4343,19 +4358,26 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 });
                 futures.add(f);
             }
-            // Collect results; rethrow the first failure.
-            for (Future<?> f : futures) {
+            // Collect results. On the first failure, cancel all remaining pending
+            // tasks (so they don't consume pool threads after we've given up),
+            // then collect per-task failures to log before rethrowing.
+            for (int i = 0; i < futures.size(); i++) {
+                Future<?> f = futures.get(i);
                 try {
                     f.get();
                 } catch (ExecutionException e) {
-                    Throwable cause = e.getCause();
-                    if (cause instanceof IOException) {
-                        throw (IOException) cause;
+                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                    LOGGER.log(Level.WARNING,
+                            "segment load failed for store {0} segment index {1}: {2}",
+                            new Object[]{indexName, i, cause});
+                    if (loadingFailure == null) {
+                        loadingFailure = cause;
+                        // Cancel all remaining futures; already-running tasks are
+                        // interrupted where possible.
+                        for (Future<?> g : futures) {
+                            g.cancel(true);
+                        }
                     }
-                    if (cause instanceof DataStorageManagerException) {
-                        throw (DataStorageManagerException) cause;
-                    }
-                    throw new DataStorageManagerException("Segment load failed", cause);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     throw new IOException("Interrupted while loading segments", e);
@@ -4363,6 +4385,24 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         } finally {
             loadingFromStatus = false;
+            // All-or-nothing cleanup: if loading failed, close every BLink that
+            // was opened in phase 2 to avoid leaking paged-storage pages. None of
+            // these segments are registered in this.segments yet, so closing them
+            // here is safe and does not affect search.
+            if (loadingFailure != null) {
+                for (VectorSegment seg : segList) {
+                    seg.close();
+                }
+            }
+        }
+        if (loadingFailure instanceof IOException) {
+            throw (IOException) loadingFailure;
+        }
+        if (loadingFailure instanceof DataStorageManagerException) {
+            throw (DataStorageManagerException) loadingFailure;
+        }
+        if (loadingFailure != null) {
+            throw new DataStorageManagerException("Segment load failed", loadingFailure);
         }
 
         // ----------------------------------------------------------------
