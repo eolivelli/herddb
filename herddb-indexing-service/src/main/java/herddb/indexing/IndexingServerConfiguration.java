@@ -272,6 +272,47 @@ public final class IndexingServerConfiguration {
             "indexing.watermark.checkpoint.interval.entries";
     public static final long PROPERTY_WATERMARK_CHECKPOINT_INTERVAL_ENTRIES_DEFAULT = 100_000L;
 
+    // -------------------------------------------------------------------------
+    // Direct S3 access for cold-start recovery (issue #381)
+    //
+    // When indexing.s3.direct.enabled=true the indexing service connects
+    // directly to the S3 / GCS bucket to download segment map files during
+    // recovery, bypassing the gRPC file-server round-trips that dominate
+    // cold-start time with thousands of segments.
+    //
+    // The access/secret keys are injected at runtime via the S3_ACCESS_KEY and
+    // S3_SECRET_KEY environment variables (never in the properties file) so that
+    // they are not visible in ConfigMaps or log output.
+    // -------------------------------------------------------------------------
+
+    /** Enable direct S3 download for segment map files during recovery. Default false. */
+    public static final String PROPERTY_S3_DIRECT_ENABLED = "indexing.s3.direct.enabled";
+    public static final boolean PROPERTY_S3_DIRECT_ENABLED_DEFAULT = false;
+
+    /** S3 endpoint URL override. Leave empty for native AWS S3; set for GCS or MinIO. */
+    public static final String PROPERTY_S3_ENDPOINT = "indexing.s3.endpoint";
+    public static final String PROPERTY_S3_ENDPOINT_DEFAULT = "";
+
+    /** S3 bucket name containing the segment data. */
+    public static final String PROPERTY_S3_BUCKET = "indexing.s3.bucket";
+    public static final String PROPERTY_S3_BUCKET_DEFAULT = "";
+
+    /** AWS region. Used for native AWS S3; typically "us-east-1" for GCS. */
+    public static final String PROPERTY_S3_REGION = "indexing.s3.region";
+    public static final String PROPERTY_S3_REGION_DEFAULT = "us-east-1";
+
+    /** Optional key prefix within the bucket (e.g. "herddb/"). */
+    public static final String PROPERTY_S3_PREFIX = "indexing.s3.prefix";
+    public static final String PROPERTY_S3_PREFIX_DEFAULT = "";
+
+    /**
+     * Enable GCS-compatibility mode on the S3 client:
+     * path-style addressing + SDK checksum WHEN_REQUIRED.
+     * Automatically required for GCS and MinIO. Default false.
+     */
+    public static final String PROPERTY_S3_GCS_COMPATIBILITY = "indexing.s3.gcs.compatibility";
+    public static final boolean PROPERTY_S3_GCS_COMPATIBILITY_DEFAULT = false;
+
     // Storage
     public static final String PROPERTY_STORAGE_TYPE = "indexing.storage.type";
     public static final String PROPERTY_STORAGE_TYPE_DEFAULT = "file";

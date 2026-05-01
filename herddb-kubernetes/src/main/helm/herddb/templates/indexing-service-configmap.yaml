@@ -22,6 +22,22 @@ data:
     indexing.log.type=bookkeeper
     server.bookkeeper.ledgers.path=/ledgers
     {{- end }}
+    {{- if and .Values.indexingService.s3 .Values.indexingService.s3.directEnabled }}
+    indexing.s3.direct.enabled=true
+    {{- if .Values.indexingService.s3.endpoint }}
+    indexing.s3.endpoint={{ .Values.indexingService.s3.endpoint }}
+    {{- end }}
+    {{- if .Values.indexingService.s3.bucket }}
+    indexing.s3.bucket={{ .Values.indexingService.s3.bucket }}
+    {{- end }}
+    indexing.s3.region={{ .Values.indexingService.s3.region | default "us-east-1" }}
+    {{- if .Values.indexingService.s3.prefix }}
+    indexing.s3.prefix={{ .Values.indexingService.s3.prefix }}
+    {{- end }}
+    {{- if .Values.indexingService.s3.gcsCompatibility }}
+    indexing.s3.gcs.compatibility=true
+    {{- end }}
+    {{- end }}
     {{- range $k, $v := .Values.indexingService.extraConfig }}
     {{ $k }}={{ $v }}
     {{- end }}

@@ -32,6 +32,8 @@ import herddb.model.Index;
 import herddb.model.Record;
 import herddb.model.Table;
 import herddb.model.Transaction;
+import herddb.remote.storage.ObjectStorage;
+import herddb.remote.storage.ReadResult;
 import herddb.server.ServerConfiguration;
 import herddb.storage.DataPageDoesNotExistException;
 import herddb.storage.DataStorageManager;
@@ -45,6 +47,8 @@ import herddb.utils.XXHash64Utils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufOutputStream;
 import io.netty.buffer.PooledByteBufAllocator;
+import java.io.BufferedOutputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -97,6 +101,31 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * replicas can consume it.
      */
     private volatile SharedCheckpointMetadataManager sharedCheckpointMetadataManager;
+
+    /**
+     * When non-null, used by {@link #downloadMultipartIndexFile} to download segment
+     * map files directly from object storage (bypassing the gRPC file-server).
+     * This eliminates the serial gRPC round-trips that make cold-start recovery very
+     * slow when there are thousands of segments (issue #381).
+     *
+     * <p>Set via {@link #setDirectObjectStorage(ObjectStorage)} after construction,
+     * typically by the indexing-service bootstrap when
+     * {@code indexing.s3.direct.enabled=true}.
+     */
+    private volatile ObjectStorage directObjectStorage;
+
+    /**
+     * Configures a direct object-storage client for segment map-file downloads
+     * during recovery. When set, {@link #supportsDirectMultipartDownload()} returns
+     * {@code true} and {@link #downloadMultipartIndexFile} reads block objects directly
+     * from S3 instead of routing through the gRPC file server.
+     *
+     * @param storage an open, ready-to-use {@link ObjectStorage} instance; the caller
+     *                retains ownership and must close it after this manager is closed
+     */
+    public void setDirectObjectStorage(ObjectStorage storage) {
+        this.directObjectStorage = storage;
+    }
 
     /**
      * Tracks the set of active data page IDs as of the last successful tableCheckpoint per
@@ -941,6 +970,75 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         // Drop any cached blocks for this path so a future segment rewritten
         // under the same logical path does not serve stale bytes.
         segmentBlockCache.invalidatePath(logicalPath);
+    }
+
+    @Override
+    public boolean supportsDirectMultipartDownload() {
+        return directObjectStorage != null;
+    }
+
+    /**
+     * Downloads a multipart segment file directly from object storage to a local file,
+     * bypassing the gRPC file-server. Blocks are fetched sequentially (sufficient
+     * throughput for a single segment; parallelism across segments is handled by the
+     * caller). Each block is freed from the Netty pool immediately after being written
+     * to disk to keep peak heap / direct-memory usage bounded.
+     *
+     * <p>Only callable when {@link #supportsDirectMultipartDownload()} is {@code true}.
+     */
+    @Override
+    public void downloadMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                           long fileSize, java.nio.file.Path destFile)
+            throws IOException, DataStorageManagerException {
+        ObjectStorage storage = this.directObjectStorage;
+        if (storage == null) {
+            throw new UnsupportedOperationException(
+                    "Direct S3 not configured on this RemoteFileDataStorageManager");
+        }
+        String logicalPath = remoteMultipartPath(tableSpace, uuid, fileType);
+        // Block size must match what was used at write time.
+        int writeBlockSize = Math.max(client.getBlockSize(), MULTIPART_BLOCK_SIZE);
+        int numBlocks = (int) Math.ceil((double) fileSize / writeBlockSize);
+
+        LOGGER.log(Level.FINE,
+                "downloadMultipartIndexFile: {0} fileSize={1} writeBlockSize={2} numBlocks={3}",
+                new Object[]{logicalPath, fileSize, writeBlockSize, numBlocks});
+
+        try (FileOutputStream fos = new FileOutputStream(destFile.toFile());
+             BufferedOutputStream bos = new BufferedOutputStream(fos, writeBlockSize)) {
+            for (int i = 0; i < numBlocks; i++) {
+                String blockPath = logicalPath + ObjectStorage.MULTIPART_SUFFIX + "/" + i;
+                ReadResult result;
+                try {
+                    result = storage.read(blockPath).get();
+                } catch (java.util.concurrent.ExecutionException e) {
+                    throw new IOException(
+                            "Failed to download block " + i + " of " + logicalPath, e.getCause());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException(
+                            "Interrupted while downloading block " + i + " of " + logicalPath, e);
+                }
+                if (result.status() != ReadResult.Status.FOUND) {
+                    throw new IOException(
+                            "Block " + i + " of " + logicalPath + " not found in object storage");
+                }
+                ByteBuf buf = result.byteBuf();
+                try {
+                    int readable = buf.readableBytes();
+                    // Avoid allocating a separate byte[] when the buffer has a backing array.
+                    if (buf.hasArray()) {
+                        bos.write(buf.array(), buf.arrayOffset() + buf.readerIndex(), readable);
+                    } else {
+                        byte[] tmp = new byte[readable];
+                        buf.readBytes(tmp);
+                        bos.write(tmp);
+                    }
+                } finally {
+                    result.release();
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------------

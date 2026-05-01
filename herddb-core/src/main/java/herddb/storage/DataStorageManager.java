@@ -241,6 +241,48 @@ public abstract class DataStorageManager implements AutoCloseable {
             throws DataStorageManagerException;
 
     /**
+     * Returns {@code true} when this storage manager supports bypassing the gRPC
+     * file-server round-trips for bulk segment-file downloads during recovery.
+     * When {@code true}, callers may use
+     * {@link #downloadMultipartIndexFile(String, String, String, long, java.nio.file.Path)}
+     * to obtain a local copy of the file directly from object storage, which is
+     * significantly faster for the map-file reload phase on restart (issue #381).
+     *
+     * <p>Default: {@code false}. Subclasses that support a direct object-storage
+     * path override this to return {@code true} once the backing
+     * {@code ObjectStorage} client has been configured.
+     */
+    public boolean supportsDirectMultipartDownload() {
+        return false;
+    }
+
+    /**
+     * Downloads a multipart index file directly to a local file, bypassing the
+     * gRPC file server. Only valid when {@link #supportsDirectMultipartDownload()}
+     * returns {@code true}; subclasses that do not support this path throw
+     * {@link UnsupportedOperationException}.
+     *
+     * <p>The caller owns {@code destFile} and is responsible for deleting it when
+     * no longer needed.
+     *
+     * @param tableSpace logical tablespace name
+     * @param uuid       identifier of the index (or segment-level variant)
+     * @param fileType   file type tag (e.g. {@code "map"})
+     * @param fileSize   expected total size of the file in bytes (used to compute
+     *                   block boundaries)
+     * @param destFile   writable path where the assembled file should be written
+     * @throws IOException                  on I/O failure during download
+     * @throws DataStorageManagerException  on storage-layer errors
+     * @throws UnsupportedOperationException when direct download is not supported
+     */
+    public void downloadMultipartIndexFile(String tableSpace, String uuid, String fileType,
+                                           long fileSize, java.nio.file.Path destFile)
+            throws IOException, DataStorageManagerException {
+        throw new UnsupportedOperationException(
+                "Direct multipart download is not supported by " + getClass().getSimpleName());
+    }
+
+    /**
      * Reports whether this storage manager can host vector indexes
      * ({@code PersistentVectorStore}). Vector indexes persist large graph and
      * map artefacts via the multipart API above; backends that cannot
