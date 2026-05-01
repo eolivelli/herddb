@@ -29,6 +29,17 @@ public interface DataAccessor {
 
     Object get(String property);
 
+    /**
+     * Returns {@code true} if the value of {@code property} is SQL NULL.
+     *
+     * <p>The default implementation calls {@link #get(String)} and checks the result —
+     * implementations backed by serialised bytes (e.g. {@code DataAccessorForFullRecord})
+     * should override to avoid materialising the Java object.
+     */
+    default boolean isNull(String property) {
+        return get(property) == null;
+    }
+
     default Map<String, Object> toMap() {
         HashMap<String, Object> res = new HashMap<>();
         forEach(res::put);

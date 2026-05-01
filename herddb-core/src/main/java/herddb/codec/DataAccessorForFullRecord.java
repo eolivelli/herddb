@@ -189,30 +189,45 @@ public class DataAccessorForFullRecord extends AbstractDataAccessor {
     }
 
     /**
-     * Returns the raw index-key bytes for a non-PK column directly from the record value
-     * bytes, without materialising a Java object.  The returned {@link Bytes} is a
-     * zero-copy view into the underlying record value buffer.
+     * Fast null-check for a column without materialising a Java object (issue #377).
      *
-     * <p>Returns {@code null} when:
-     * <ul>
-     *   <li>the column is a primary-key column (its bytes live in the key buffer, not
-     *       the value buffer — the caller must use {@link #get(String)} in that case),
-     *   <li>the column value is absent / null in the serialised record, or
-     *   <li>the column type is not directly optimisable (e.g. INTEGER, LONG, TIMESTAMP
-     *       whose key encoding differs from the value encoding due to sign-flip masking).
-     *       In that case the caller must fall back to {@link #get(String)} +
-     *       {@link RecordSerializer#serialize(Object, int)}.
-     * </ul>
+     * <p>Used by {@link RecordSerializer#validateIndexableValue} to avoid a full
+     * deserialise + box + unbox round-trip when the only thing the validate path
+     * needs to know is whether the column is null.
      *
-     * <p>Package-private: used exclusively by {@link RecordSerializer} as a performance
-     * optimisation (issue #377).
+     * <p>For primary-key columns we always return {@code false} because PK columns
+     * cannot be NULL by construction.
      */
-    Bytes getColumnBytesNoCopy(String property) {
+    @Override
+    public boolean isNull(String property) {
+        if (table.isPrimaryKeyColumn(property)) {
+            // PK columns cannot be NULL by construction
+            return false;
+        }
+        try {
+            return RecordSerializer.isNullValueForColumn(property, record.value, table);
+        } catch (IOException err) {
+            throw new IllegalStateException("bad data: " + err, err);
+        }
+    }
+
+    /**
+     * Returns the FLOATARRAY index-key bytes for a non-PK column as a freshly-allocated
+     * {@code byte[]} — never a slice of the record value buffer (issue #377).
+     *
+     * <p>The fresh allocation is intentional: the returned bytes are stored long-term
+     * by the index manager, and a slice would pin the record's entire value buffer
+     * (and potentially a multi-MB DataPage backing array), causing a memory leak.
+     *
+     * <p>Returns {@code null} when the column is a primary key, is absent, or is NULL
+     * in the record.  Package-private — used exclusively by {@link RecordSerializer}.
+     */
+    byte[] extractFloatArrayIndexKeyBytes(String property) {
         if (table.isPrimaryKeyColumn(property)) {
             return null;
         }
         try {
-            return RecordSerializer.extractRawIndexBytesNoCopy(property, record.value, table);
+            return RecordSerializer.extractFloatArrayIndexKeyBytes(property, record.value, table);
         } catch (IOException err) {
             throw new IllegalStateException("bad data: " + err, err);
         }
