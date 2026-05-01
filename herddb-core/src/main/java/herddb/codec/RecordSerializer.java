@@ -727,6 +727,43 @@ public final class RecordSerializer {
         }
     }
 
+    /**
+     * Returns {@code true} if the column {@code property} has a NULL value (or is absent)
+     * in the record value buffer, without materialising a Java object.
+     *
+     * <p>Used by {@link DataAccessorForFullRecord#isNull(String)} as a fast path for
+     * {@link #validateIndexableValue(DataAccessor, ColumnsList, String[])} (issue #377):
+     * the only thing the validate path needs to know is whether the column is null,
+     * so we can skip the deserialise + box + unbox cycle entirely.
+     */
+    static boolean isNullValueForColumn(String property, Bytes value, Table table) throws IOException {
+        if (table.getColumn(property) == null) {
+            return true;
+        }
+        try (ByteArrayCursor din = value.newCursor()) {
+            while (!din.isEof()) {
+                int serialPosition = din.readVIntNoEOFException();
+                if (din.isEof()) {
+                    return true;
+                }
+                Column col = table.getColumnBySerialPosition(serialPosition);
+                if (col != null && col.name.equals(property)) {
+                    // The column was found in the buffer, so it is non-null.  A NULL
+                    // column is omitted from the value buffer entirely (see
+                    // serializeValueRaw); we never see {@code ColumnTypes.NULL} as the
+                    // type byte in the record-value format.  The defensive check below
+                    // is kept so a future writer that emits an explicit NULL marker
+                    // (e.g. for a column added without a default value) is handled.
+                    int type = din.readVInt();
+                    return type == ColumnTypes.NULL;
+                } else {
+                    skipTypeAndValue(din);
+                }
+            }
+            return true;
+        }
+    }
+
     static Object accessRawDataFromValue(int index, Bytes value, Table table) throws IOException {
         Column column = table.getColumn(index);
         try (ByteArrayCursor din = value.newCursor()) {
@@ -888,6 +925,21 @@ public final class RecordSerializer {
                 throw new IllegalArgumentException("SQLTranslator error, " + Arrays.toString(columns) + " != " + Arrays.asList(pkColumn));
             }
             Column c = index.getColumn(pkColumn);
+            // Optimisation (issue #377): for FLOATARRAY columns backed by
+            // DataAccessorForFullRecord, copy the raw IEEE 754 float bytes directly from
+            // the serialised record value into a fresh byte[].  This avoids the
+            // float[N] intermediate that record.get() + serialize() would allocate.
+            // We deliberately COPY (rather than zero-copy slice) so the index does not
+            // retain a reference to the record's value buffer (which could pin a whole
+            // DataPage byte array — a memory leak).
+            if (record instanceof DataAccessorForFullRecord
+                    && (c.type == ColumnTypes.FLOATARRAY || c.type == ColumnTypes.NOTNULL_FLOATARRAY)) {
+                byte[] keyBytes = ((DataAccessorForFullRecord) record).extractFloatArrayIndexKeyBytes(c.name);
+                if (keyBytes != null) {
+                    return Bytes.from_array(keyBytes);
+                }
+                // keyBytes == null: column is NULL — fall through to the general null-handling code
+            }
             Object v = record.get(c.name);
             if (v == null) {
                 if (index.allowNullsForIndexedValues()) {
@@ -931,6 +983,62 @@ public final class RecordSerializer {
     }
 
     /**
+     * Extracts the index-key bytes for a single-column FLOATARRAY index, copying the raw
+     * IEEE 754 float bytes from the serialised record value into a fresh {@code byte[]}
+     * without going through a {@code float[]} intermediate (issue #377).
+     *
+     * <p>The record value format for FLOATARRAY is {@code vint(N) | 4N raw bytes}; the
+     * single-column index-key format is just the raw 4N bytes.  We strip the vint
+     * prefix and copy the payload into a freshly-allocated {@code byte[4N]} — never a
+     * slice of the record buffer — so the resulting index key does not retain a
+     * reference to the record's value buffer (which would pin the whole DataPage byte
+     * array, a memory-leak vector).
+     *
+     * @return a fresh {@code byte[]} holding the index-key bytes, or {@code null} if
+     *         the column is absent / NULL in the record (caller must fall through to
+     *         the general null-handling path).
+     */
+    static byte[] extractFloatArrayIndexKeyBytes(
+            String property, Bytes value, Table table) throws IOException {
+        // Fast-path: if the column is not in the schema, no need to scan the value buffer.
+        if (table.getColumn(property) == null) {
+            return null;
+        }
+        try (ByteArrayCursor din = value.newCursor()) {
+            while (!din.isEof()) {
+                int serialPosition = din.readVIntNoEOFException();
+                if (din.isEof()) {
+                    return null;
+                }
+                Column col = table.getColumnBySerialPosition(serialPosition);
+                if (col != null && col.name.equals(property)) {
+                    int type = din.readVInt();
+                    if (type != ColumnTypes.FLOATARRAY && type != ColumnTypes.NOTNULL_FLOATARRAY) {
+                        // Defensive: should never happen for FLOATARRAY columns.
+                        return null;
+                    }
+                    int len = din.readVInt();
+                    if (len == -1) {
+                        // Defensive: writer omits NULL FLOATARRAY columns from the buffer,
+                        // so the -1 length marker is unreachable in practice — but mirror
+                        // the readFloatArray semantics in case a future writer emits it.
+                        return null;
+                    }
+                    int byteLen = len * 4;
+                    byte[] copy = new byte[byteLen];
+                    if (byteLen > 0) {
+                        System.arraycopy(din.getArray(), din.getPosition(), copy, 0, byteLen);
+                    }
+                    return copy;
+                } else {
+                    skipTypeAndValue(din);
+                }
+            }
+        }
+        return null; // column not found → null value
+    }
+
+    /**
      * Like {@link #serializeIndexKey(herddb.utils.DataAccessor, herddb.model.ColumnsList, java.lang.String[])
      * } but without return a value and/or creating temporary byte[]
      *
@@ -940,12 +1048,27 @@ public final class RecordSerializer {
      */
     public static void validateIndexableValue(DataAccessor record, ColumnsList indexDefinition, String[] columns) {
         String[] columnListForIndex = indexDefinition.getPrimaryKey();
+        // Optimisation (issue #377): for records backed by serialised bytes
+        // (DataAccessorForFullRecord) the column type is guaranteed correct by the
+        // serialised format itself, so we can skip the type-check inside validate()
+        // and only need to confirm whether the value is null.  DataAccessor.isNull()
+        // avoids materialising the (potentially large) Java object — this eliminates
+        // the float[] / byte[] / String allocation that would otherwise dominate this
+        // hot path on every insert / update touching a secondary index.
+        boolean rawRecord = record instanceof DataAccessorForFullRecord;
         if (columnListForIndex.length == 1) {
             String pkColumn = columnListForIndex[0];
             if (columns.length != 1 && !columns[0].equals(pkColumn)) {
                 throw new IllegalArgumentException("SQLTranslator error, " + Arrays.toString(columns) + " != " + Arrays.asList(pkColumn));
             }
             Column c = indexDefinition.getColumn(pkColumn);
+            if (rawRecord) {
+                if (!indexDefinition.allowNullsForIndexedValues() && record.isNull(c.name)) {
+                    throw new IllegalArgumentException("key field " + pkColumn + " cannot be null. Record data: " + record);
+                }
+                // nulls allowed or non-null: format guarantees type correctness, no validate() needed
+                return;
+            }
             Object v = record.get(c.name);
             if (v == null && !indexDefinition.allowNullsForIndexedValues()) {
                 throw new IllegalArgumentException("key field " + pkColumn + " cannot be null. Record data: " + record);
@@ -959,6 +1082,13 @@ public final class RecordSerializer {
                     throw new IllegalArgumentException("SQLTranslator error, " + Arrays.toString(columns) + " != " + Arrays.asList(columnListForIndex));
                 }
                 Column c = indexDefinition.getColumn(pkColumn);
+                if (rawRecord) {
+                    if (!indexDefinition.allowNullsForIndexedValues() && record.isNull(c.name)) {
+                        throw new IllegalArgumentException("key field " + pkColumn + " cannot be null. Record data: " + record);
+                    }
+                    i++;
+                    continue;
+                }
                 Object v = record.get(c.name);
                 if (v == null && !indexDefinition.allowNullsForIndexedValues()) {
                     throw new IllegalArgumentException("key field " + pkColumn + " cannot be null. Record data: " + record);

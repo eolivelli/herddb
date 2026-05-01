@@ -188,4 +188,49 @@ public class DataAccessorForFullRecord extends AbstractDataAccessor {
         return record;
     }
 
+    /**
+     * Fast null-check for a column without materialising a Java object (issue #377).
+     *
+     * <p>Used by {@link RecordSerializer#validateIndexableValue} to avoid a full
+     * deserialise + box + unbox round-trip when the only thing the validate path
+     * needs to know is whether the column is null.
+     *
+     * <p>For primary-key columns we always return {@code false} because PK columns
+     * cannot be NULL by construction.
+     */
+    @Override
+    public boolean isNull(String property) {
+        if (table.isPrimaryKeyColumn(property)) {
+            // PK columns cannot be NULL by construction
+            return false;
+        }
+        try {
+            return RecordSerializer.isNullValueForColumn(property, record.value, table);
+        } catch (IOException err) {
+            throw new IllegalStateException("bad data: " + err, err);
+        }
+    }
+
+    /**
+     * Returns the FLOATARRAY index-key bytes for a non-PK column as a freshly-allocated
+     * {@code byte[]} — never a slice of the record value buffer (issue #377).
+     *
+     * <p>The fresh allocation is intentional: the returned bytes are stored long-term
+     * by the index manager, and a slice would pin the record's entire value buffer
+     * (and potentially a multi-MB DataPage backing array), causing a memory leak.
+     *
+     * <p>Returns {@code null} when the column is a primary key, is absent, or is NULL
+     * in the record.  Package-private — used exclusively by {@link RecordSerializer}.
+     */
+    byte[] extractFloatArrayIndexKeyBytes(String property) {
+        if (table.isPrimaryKeyColumn(property)) {
+            return null;
+        }
+        try {
+            return RecordSerializer.extractFloatArrayIndexKeyBytes(property, record.value, table);
+        } catch (IOException err) {
+            throw new IllegalStateException("bad data: " + err, err);
+        }
+    }
+
 }
