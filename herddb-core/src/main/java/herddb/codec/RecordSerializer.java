@@ -748,7 +748,12 @@ public final class RecordSerializer {
                 }
                 Column col = table.getColumnBySerialPosition(serialPosition);
                 if (col != null && col.name.equals(property)) {
-                    // peek the type marker; -1 indicates an explicit NULL
+                    // The column was found in the buffer, so it is non-null.  A NULL
+                    // column is omitted from the value buffer entirely (see
+                    // serializeValueRaw); we never see {@code ColumnTypes.NULL} as the
+                    // type byte in the record-value format.  The defensive check below
+                    // is kept so a future writer that emits an explicit NULL marker
+                    // (e.g. for a column added without a default value) is handled.
                     int type = din.readVInt();
                     return type == ColumnTypes.NULL;
                 } else {
@@ -1014,7 +1019,10 @@ public final class RecordSerializer {
                     }
                     int len = din.readVInt();
                     if (len == -1) {
-                        return null; // explicit NULL marker
+                        // Defensive: writer omits NULL FLOATARRAY columns from the buffer,
+                        // so the -1 length marker is unreachable in practice — but mirror
+                        // the readFloatArray semantics in case a future writer emits it.
+                        return null;
                     }
                     int byteLen = len * 4;
                     byte[] copy = new byte[byteLen];
