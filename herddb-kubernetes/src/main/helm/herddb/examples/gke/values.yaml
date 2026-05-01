@@ -415,6 +415,23 @@ indexingService:
     # multiplier at >500 segments anyway, so this raises the effective cap to
     # 16000 in the current situation — well above the 672/588 observed counts.
     vector.index.compaction.maxCount: "2000"
+  # Direct S3 download for segment map files during cold-start recovery (issue #381).
+  # Mirrors the file server's GCS settings so the IS downloads segment map blocks
+  # directly from GCS rather than routing them through the gRPC file-server.
+  # With 7200+ segments at ~3s per segment over gRPC this cuts cold-start from
+  # 6+ hours to a few minutes (download is parallel + S3 throughput >> gRPC).
+  s3:
+    directEnabled: true
+    # GCS S3-compatible endpoint — same as fileServer.s3.endpoint.
+    endpoint: "https://storage.googleapis.com"
+    region: "auto"
+    # Must match fileServer.s3.bucket (override with --set on install).
+    bucket: "herddb-pages"
+    # Enable GCS-compatibility tweaks on the S3 client
+    # (path-style addressing + WHEN_REQUIRED SDK checksums) — required for GCS.
+    gcsCompatibility: true
+    # Reuse the same Kubernetes Secret as the file server (S3_ACCESS_KEY / S3_SECRET_KEY).
+    credentialsSecret: "herddb-gcs-credentials"
   resources:
     # Bumped from 36 Gi to 40 Gi alongside the heap bump 24 g → 28 g (issue #360).
     # Budget: 28 g heap + 10 g direct + 1 g JVM overhead = 39 g (< 40 GiB; 1 GiB headroom).

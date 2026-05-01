@@ -548,7 +548,8 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                         resp.getVectorCount(), resp.getSegmentCount(),
                         resp.getTailerLsnLedger(), resp.getTailerLsnOffset(),
                         resp.getDurableLsnLedger(), resp.getDurableLsnOffset(),
-                        resp.getStatus());
+                        resp.getStatus(),
+                        resp.getLoadingSegmentsDone(), resp.getLoadingSegmentsTotal());
             } catch (Exception e) {
                 if (isShadowNotReady(e)) {
                     LOGGER.log(Level.FINE, "GetIndexStatus: skipping NOT_READY shadow {0}", entry.getKey());

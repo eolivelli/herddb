@@ -275,6 +275,75 @@ public class IndexingServerConfigurationTest {
         assertTrue(ex.getMessage().contains("remote"));
     }
 
+    /**
+     * Verifies that all six {@code indexing.s3.*} properties introduced in issue #381
+     * carry the correct default values and that their constant names round-trip
+     * through the getter/setter API.
+     */
+    @Test
+    public void testS3DirectDownloadDefaults() {
+        IndexingServerConfiguration config = new IndexingServerConfiguration();
+
+        // indexing.s3.direct.enabled — off by default (opt-in feature)
+        assertFalse(config.getBoolean(
+                IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED,
+                IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED_DEFAULT));
+
+        // indexing.s3.endpoint — empty string by default (use region-default endpoint)
+        assertEquals("", config.getString(
+                IndexingServerConfiguration.PROPERTY_S3_ENDPOINT,
+                IndexingServerConfiguration.PROPERTY_S3_ENDPOINT_DEFAULT));
+
+        // indexing.s3.bucket — empty string by default
+        assertEquals("", config.getString(
+                IndexingServerConfiguration.PROPERTY_S3_BUCKET,
+                IndexingServerConfiguration.PROPERTY_S3_BUCKET_DEFAULT));
+
+        // indexing.s3.region — us-east-1 by default
+        assertEquals("us-east-1", config.getString(
+                IndexingServerConfiguration.PROPERTY_S3_REGION,
+                IndexingServerConfiguration.PROPERTY_S3_REGION_DEFAULT));
+
+        // indexing.s3.prefix — empty string by default
+        assertEquals("", config.getString(
+                IndexingServerConfiguration.PROPERTY_S3_PREFIX,
+                IndexingServerConfiguration.PROPERTY_S3_PREFIX_DEFAULT));
+
+        // indexing.s3.gcs.compatibility — off by default
+        assertFalse(config.getBoolean(
+                IndexingServerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY,
+                IndexingServerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY_DEFAULT));
+    }
+
+    /**
+     * Verifies that all six {@code indexing.s3.*} property keys round-trip correctly
+     * through {@link IndexingServerConfiguration#set(String, Object)} and the
+     * corresponding typed getter.
+     */
+    @Test
+    public void testS3DirectDownloadOverrides() {
+        IndexingServerConfiguration config = new IndexingServerConfiguration()
+                .set(IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED, true)
+                .set(IndexingServerConfiguration.PROPERTY_S3_ENDPOINT, "https://storage.googleapis.com")
+                .set(IndexingServerConfiguration.PROPERTY_S3_BUCKET, "my-bucket")
+                .set(IndexingServerConfiguration.PROPERTY_S3_REGION, "eu-central-1")
+                .set(IndexingServerConfiguration.PROPERTY_S3_PREFIX, "herddb/")
+                .set(IndexingServerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY, true);
+
+        assertTrue(config.getBoolean(
+                IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED, false));
+        assertEquals("https://storage.googleapis.com", config.getString(
+                IndexingServerConfiguration.PROPERTY_S3_ENDPOINT, ""));
+        assertEquals("my-bucket", config.getString(
+                IndexingServerConfiguration.PROPERTY_S3_BUCKET, ""));
+        assertEquals("eu-central-1", config.getString(
+                IndexingServerConfiguration.PROPERTY_S3_REGION, ""));
+        assertEquals("herddb/", config.getString(
+                IndexingServerConfiguration.PROPERTY_S3_PREFIX, ""));
+        assertTrue(config.getBoolean(
+                IndexingServerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY, false));
+    }
+
     @Test
     public void testValidShadowConfig() {
         IndexingServerConfiguration config = new IndexingServerConfiguration()

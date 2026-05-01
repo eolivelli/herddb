@@ -2038,8 +2038,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         AbstractVectorStore store = vectorStores.get(storeKey(table, index));
         long vectorCount = store != null ? store.size() : 0;
         int segmentCount = 1;
+        int loadingSegmentsDone = 0;
+        int loadingSegmentsTotal = 0;
+        String status = "tailing";
         if (store instanceof PersistentVectorStore) {
-            segmentCount = ((PersistentVectorStore) store).getSegmentCount();
+            PersistentVectorStore pvs = (PersistentVectorStore) store;
+            segmentCount = pvs.getSegmentCount();
+            if (pvs.isLoadingFromStatus()) {
+                loadingSegmentsDone = pvs.getLoadingSegmentsDone();
+                loadingSegmentsTotal = pvs.getLoadingSegmentsTotal();
+                status = "loading";
+            }
         }
         // Snapshot both LSNs together so the response is internally consistent.
         // Server-side retention pins on durable_lsn_*; tailer_lsn_* is exposed
@@ -2051,7 +2060,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 tailerSnap != null ? tailerSnap.offset : -1,
                 durableSnap != null ? durableSnap.ledgerId : -1,
                 durableSnap != null ? durableSnap.offset : -1,
-                "tailing");
+                status,
+                loadingSegmentsDone, loadingSegmentsTotal);
     }
 
     /**
@@ -2108,10 +2118,22 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             AbstractVectorStore store = vectorStores.get(storeKey(idx.table, idx.name));
             long vectorCount = store != null ? store.size() : 0;
             String status = store != null ? "tailing" : "missing";
-            int segmentCount = (store instanceof PersistentVectorStore)
-                    ? ((PersistentVectorStore) store).getSegmentCount()
-                    : (store != null ? 1 : 0);
-            out.add(new IndexDescriptor(idx.tablespace, idx.table, idx.name, vectorCount, status, segmentCount));
+            int segmentCount = 0;
+            int loadingDone = 0;
+            int loadingTotal = 0;
+            if (store instanceof PersistentVectorStore) {
+                PersistentVectorStore pvs = (PersistentVectorStore) store;
+                segmentCount = pvs.getSegmentCount();
+                if (pvs.isLoadingFromStatus()) {
+                    loadingDone = pvs.getLoadingSegmentsDone();
+                    loadingTotal = pvs.getLoadingSegmentsTotal();
+                    status = "loading";
+                }
+            } else if (store != null) {
+                segmentCount = 1;
+            }
+            out.add(new IndexDescriptor(idx.tablespace, idx.table, idx.name, vectorCount, status,
+                    segmentCount, loadingDone, loadingTotal));
         }
         return out;
     }
@@ -3204,11 +3226,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         private final long durableLsnLedger;
         private final long durableLsnOffset;
         private final String status;
+        private final int loadingSegmentsDone;
+        private final int loadingSegmentsTotal;
 
         public IndexStatusInfo(long vectorCount, int segmentCount,
                                long tailerLsnLedger, long tailerLsnOffset,
                                long durableLsnLedger, long durableLsnOffset,
-                               String status) {
+                               String status,
+                               int loadingSegmentsDone, int loadingSegmentsTotal) {
             this.vectorCount = vectorCount;
             this.segmentCount = segmentCount;
             this.tailerLsnLedger = tailerLsnLedger;
@@ -3216,6 +3241,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             this.durableLsnLedger = durableLsnLedger;
             this.durableLsnOffset = durableLsnOffset;
             this.status = status;
+            this.loadingSegmentsDone = loadingSegmentsDone;
+            this.loadingSegmentsTotal = loadingSegmentsTotal;
         }
 
         public long getVectorCount() {
@@ -3245,6 +3272,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         public String getStatus() {
             return status;
         }
+
+        /** Segments loaded so far during recovery; 0 when not loading. */
+        public int getLoadingSegmentsDone() {
+            return loadingSegmentsDone;
+        }
+
+        /** Total segments to load during recovery; 0 when not loading. */
+        public int getLoadingSegmentsTotal() {
+            return loadingSegmentsTotal;
+        }
     }
 
     /**
@@ -3257,15 +3294,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         private final long vectorCount;
         private final String status;
         private final int segmentCount;
+        private final int loadingSegmentsDone;
+        private final int loadingSegmentsTotal;
 
         public IndexDescriptor(String tablespace, String table, String index,
-                               long vectorCount, String status, int segmentCount) {
+                               long vectorCount, String status, int segmentCount,
+                               int loadingSegmentsDone, int loadingSegmentsTotal) {
             this.tablespace = tablespace;
             this.table = table;
             this.index = index;
             this.vectorCount = vectorCount;
             this.status = status;
             this.segmentCount = segmentCount;
+            this.loadingSegmentsDone = loadingSegmentsDone;
+            this.loadingSegmentsTotal = loadingSegmentsTotal;
         }
 
         public String getTablespace() {
@@ -3290,6 +3332,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
         public int getSegmentCount() {
             return segmentCount;
+        }
+
+        /** Segments loaded so far during recovery; 0 when not loading. */
+        public int getLoadingSegmentsDone() {
+            return loadingSegmentsDone;
+        }
+
+        /** Total segments to load during recovery; 0 when not loading. */
+        public int getLoadingSegmentsTotal() {
+            return loadingSegmentsTotal;
         }
     }
 

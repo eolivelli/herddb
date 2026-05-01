@@ -288,6 +288,27 @@ indexingService:
     limits:
       memory: "1Gi"
       cpu: "4"
+  # Direct S3 download for segment map files during cold-start recovery (issue #381).
+  # When enabled, the indexing service connects directly to the S3/GCS bucket to download
+  # segment map files, bypassing the gRPC file-server round-trips that dominate cold-start
+  # time with thousands of segments. Requires storageMode=remote.
+  s3:
+    # Set to true to enable direct S3 downloads during index recovery.
+    directEnabled: false
+    # S3 endpoint URL — leave empty for AWS S3, set for GCS or MinIO.
+    # When fileServer.storageMode=s3 this should match fileServer.s3.endpoint.
+    endpoint: ""
+    # Bucket containing the segment data. Should match fileServer.s3.bucket.
+    bucket: ""
+    region: "us-east-1"
+    # Optional key prefix within the bucket. Should match fileServer.s3.prefix.
+    prefix: ""
+    # Enable GCS-compatibility tweaks (path-style addressing, WHEN_REQUIRED checksums).
+    # Set to true for GCS and MinIO. Should match fileServer.s3.gcsCompatibility.
+    gcsCompatibility: false
+    # Name of a Kubernetes Secret with S3_ACCESS_KEY and S3_SECRET_KEY entries.
+    # When set, the env vars are injected into the indexing-service pods from this secret.
+    credentialsSecret: ""
 
 # Tools pod — sleep + pre-configured CLI for kubectl exec.
 # Runs as a StatefulSet with a persistent PVC for vector benchmark datasets.

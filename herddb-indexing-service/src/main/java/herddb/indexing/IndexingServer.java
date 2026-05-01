@@ -29,6 +29,9 @@ import herddb.mem.MemoryDataStorageManager;
 import herddb.metadata.IndexingServiceInstanceDescriptor;
 import herddb.metadata.MetadataStorageManager;
 import herddb.metadata.ServiceDiscoveryListener;
+import herddb.remote.RemoteFileDataStorageManager;
+import herddb.remote.storage.ObjectStorage;
+import herddb.remote.storage.S3ObjectStorage;
 import herddb.server.RemoteFileClient;
 import herddb.server.RemoteFileServiceFactory;
 import herddb.server.RemoteFileStorageManager;
@@ -37,6 +40,7 @@ import herddb.storage.DataStorageManager;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
@@ -53,6 +57,15 @@ import org.apache.commons.configuration2.PropertiesConfiguration;
 import org.eclipse.jetty.server.ServerConnector;
 import org.eclipse.jetty.servlet.ServletContextHandler;
 import org.eclipse.jetty.servlet.ServletHolder;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.checksums.RequestChecksumCalculation;
+import software.amazon.awssdk.core.checksums.ResponseChecksumValidation;
+import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3AsyncClient;
+import software.amazon.awssdk.services.s3.S3AsyncClientBuilder;
+import software.amazon.awssdk.services.s3.S3Configuration;
 
 /**
  * gRPC server for the IndexingService.
@@ -230,6 +243,39 @@ public class IndexingServer implements AutoCloseable {
                     this.remoteDataStorageManager = (RemoteFileStorageManager) dsm;
                     this.remoteMetaDir = metaDir;
 
+                    // Wire direct S3 for fast segment-map download during cold-start
+                    // recovery (issue #381). When enabled, PersistentVectorStore
+                    // bypasses the gRPC file-server and downloads segment map blocks
+                    // directly from S3, turning a 6+ hour serial gRPC walk into a
+                    // parallel S3 download. Must be wired before the DSM is handed
+                    // to the engine so supportsDirectMultipartDownload() returns true
+                    // on the very first loadMultiSegmentFormat() call.
+                    //
+                    // Shadow replicas discard this DSM (replaced by ReadReplicaDataStorageManager
+                    // below), so direct S3 is only wired for primaries.
+                    boolean s3DirectEnabled = config.getBoolean(
+                            IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED,
+                            IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED_DEFAULT);
+                    if (s3DirectEnabled && !config.isShadow()) {
+                        if (dsm instanceof RemoteFileDataStorageManager) {
+                            try {
+                                ObjectStorage directStorage = buildDirectS3ObjectStorage();
+                                ((RemoteFileDataStorageManager) dsm).setDirectObjectStorage(directStorage);
+                                LOGGER.log(Level.INFO,
+                                        "Direct S3 download enabled for segment map files (issue #381)");
+                            } catch (IOException ioe) {
+                                throw new RuntimeException(
+                                        "Failed to build direct S3 client for indexing service", ioe);
+                            }
+                        } else {
+                            LOGGER.log(Level.WARNING,
+                                    "indexing.s3.direct.enabled=true but the data storage manager "
+                                            + "({0}) is not a RemoteFileDataStorageManager — "
+                                            + "direct S3 download will NOT be active",
+                                    dsm.getClass().getSimpleName());
+                        }
+                    }
+
                     // Shadows operate strictly from remote storage. Swap the
                     // writable RemoteFileDataStorageManager we just built for
                     // a pure read-only DSM backed by the same client and
@@ -370,6 +416,79 @@ public class IndexingServer implements AutoCloseable {
 
     public void setMetadataStorageManager(MetadataStorageManager metadataStorageManager) {
         this.metadataStorageManager = metadataStorageManager;
+    }
+
+    /**
+     * Builds an {@link ObjectStorage} that connects directly to S3/GCS for
+     * segment map file downloads, bypassing the gRPC file-server (issue #381).
+     *
+     * <p>Access and secret keys are read from the {@code S3_ACCESS_KEY} and
+     * {@code S3_SECRET_KEY} environment variables — never from the properties
+     * file — so they are not visible in ConfigMaps or log output.
+     *
+     * @throws IOException if the required environment variables are absent or
+     *                     the S3 client cannot be constructed
+     */
+    private ObjectStorage buildDirectS3ObjectStorage() throws IOException {
+        String bucket = config.getString(IndexingServerConfiguration.PROPERTY_S3_BUCKET,
+                IndexingServerConfiguration.PROPERTY_S3_BUCKET_DEFAULT);
+        String region = config.getString(IndexingServerConfiguration.PROPERTY_S3_REGION,
+                IndexingServerConfiguration.PROPERTY_S3_REGION_DEFAULT);
+        String endpoint = config.getString(IndexingServerConfiguration.PROPERTY_S3_ENDPOINT,
+                IndexingServerConfiguration.PROPERTY_S3_ENDPOINT_DEFAULT);
+        String s3Prefix = config.getString(IndexingServerConfiguration.PROPERTY_S3_PREFIX,
+                IndexingServerConfiguration.PROPERTY_S3_PREFIX_DEFAULT);
+        boolean gcsCompatibility = config.getBoolean(
+                IndexingServerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY,
+                IndexingServerConfiguration.PROPERTY_S3_GCS_COMPATIBILITY_DEFAULT);
+        // Keys are injected exclusively via environment variables so that they
+        // never appear in ConfigMaps, properties files, or log output.
+        String accessKey = System.getenv("S3_ACCESS_KEY");
+        String secretKey = System.getenv("S3_SECRET_KEY");
+        if (accessKey == null || accessKey.isEmpty()) {
+            throw new IOException(
+                    "S3_ACCESS_KEY environment variable must be set when "
+                            + IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED + "=true");
+        }
+        if (secretKey == null || secretKey.isEmpty()) {
+            throw new IOException(
+                    "S3_SECRET_KEY environment variable must be set when "
+                            + IndexingServerConfiguration.PROPERTY_S3_DIRECT_ENABLED + "=true");
+        }
+
+        S3AsyncClientBuilder clientBuilder = S3AsyncClient.builder()
+                .region(Region.of(region))
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(accessKey, secretKey)))
+                .httpClientBuilder(AwsCrtAsyncHttpClient.builder());
+
+        if (gcsCompatibility) {
+            LOGGER.log(Level.INFO,
+                    "Direct S3 client (GCS compatibility): path-style addressing, "
+                            + "SDK checksums WHEN_REQUIRED");
+            clientBuilder
+                    .serviceConfiguration(S3Configuration.builder()
+                            .pathStyleAccessEnabled(true)
+                            .build())
+                    .requestChecksumCalculation(RequestChecksumCalculation.WHEN_REQUIRED)
+                    .responseChecksumValidation(ResponseChecksumValidation.WHEN_REQUIRED);
+        } else {
+            LOGGER.log(Level.INFO,
+                    "Direct S3 client (AWS mode): virtual-hosted-style, "
+                            + "SDK default checksums");
+        }
+        if (!endpoint.isEmpty()) {
+            clientBuilder.endpointOverride(URI.create(endpoint));
+        }
+
+        S3AsyncClient s3Client = clientBuilder.build();
+        LOGGER.log(Level.INFO,
+                "Direct S3 client built for segment map downloads: bucket={0}, region={1}, prefix={2}",
+                new Object[]{bucket, region, s3Prefix});
+        // No StatsLogger here: this object is used only for cold-start reads and
+        // the metrics provider is not yet initialised at the point buildDirectS3ObjectStorage
+        // is called (it is set up later in start()).
+        return new S3ObjectStorage(s3Client, bucket, s3Prefix);
     }
 
     /**
