@@ -1199,6 +1199,28 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                                 + ": failed to close vector store; resources may leak",
                         e);
             }
+            // Segmented-v2 registry sweep: when a publisher is wired, drop
+            // every registry znode for this index BEFORE we delete the
+            // multipart files. Doing it in this order means a crash between
+            // the two steps leaves orphan multipart files (the optimizer's
+            // reaper or a future restart sweep can catch them) rather than
+            // orphan registry znodes that point at files no longer on disk
+            // (which would cause other IS instances to observe phantom
+            // segments and attempt failed ownership transfers).
+            if (store instanceof PersistentVectorStore) {
+                try {
+                    ((PersistentVectorStore) store).dropAllRegistryEntries();
+                } catch (RuntimeException e) {
+                    // dropAllRegistryEntries is itself best-effort and never
+                    // throws back to here, but defend in depth — a registry
+                    // sweep failure must not block the multipart cleanup.
+                    LOGGER.log(Level.WARNING,
+                            "DROP cleanup for " + storeKeyForLog
+                                    + ": registry sweep failed (orphan znodes will be reaped"
+                                    + " by next reconcile or optimizer pass)",
+                            e);
+                }
+            }
             if (storeUUID != null && dataStorageManager != null && tableSpaceUUID != null) {
                 try {
                     dataStorageManager.dropIndex(tableSpaceUUID, storeUUID);

@@ -1740,6 +1740,40 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Drops every registry entry this store has published, via the wired
+     * {@link SegmentPublisher#dropAllSegmentsForIndex}. Invoked by the IS
+     * engine on DROP_INDEX or TRUNCATE_TABLE AFTER {@link #close()} and
+     * BEFORE the {@code DataStorageManager.dropIndex} call deletes the
+     * multipart files. No-op when no publisher is attached (legacy
+     * single-IS mode). Best-effort: a registry error is logged but does
+     * NOT propagate — the surrounding DROP/TRUNCATE flow must always
+     * complete the local cleanup regardless of registry state.
+     *
+     * <p>Without this hook the segmented-v2 registry would be left with
+     * orphan ACTIVE / TRANSFERRING / DEPRECATED znodes pointing at
+     * now-deleted multipart files; other IS instances watching the registry
+     * would observe phantom segments and (in the worst case) attempt
+     * ownership-transfers for files that no longer exist.
+     */
+    public void dropAllRegistryEntries() {
+        SegmentPublisher snapshot = this.segmentPublisher;
+        if (snapshot == null) {
+            return;
+        }
+        try {
+            snapshot.dropAllSegmentsForIndex();
+        } catch (RuntimeException e) {
+            // Plugin boundary — never let a registry hiccup block the local
+            // DROP/TRUNCATE flow. The next reconcile pass (or the operator)
+            // will catch any residual state.
+            LOGGER.log(Level.WARNING,
+                    "dropAllRegistryEntries failed for index {0}; local DROP/TRUNCATE"
+                            + " continues regardless: {1}",
+                    new Object[]{indexName, e.getMessage()});
+        }
+    }
+
+    /**
      * When {@code true}, the in-IS compaction loop is suppressed. Must be set
      * before {@link #start()} to influence the launch decision.
      */

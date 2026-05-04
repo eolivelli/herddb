@@ -144,4 +144,26 @@ public interface SegmentPublisher {
      */
     default void reconcileWithIndexStatus(List<NewSegmentInfo> existingSegments) {
     }
+
+    /**
+     * Drop every registry entry for the index this publisher is bound to.
+     * Invoked when the IS receives a DROP_INDEX or TRUNCATE_TABLE log entry,
+     * AFTER the local store has been closed and BEFORE
+     * {@code DataStorageManager.dropIndex} wipes the on-storage data: without
+     * this hook the segmented-v2 registry would be left with orphan ACTIVE
+     * znodes pointing at now-deleted multipart files. Other IS instances
+     * watching the registry would observe phantom segments and (in the worst
+     * case) attempt ownership-transfers for files that no longer exist.
+     *
+     * <p>Best-effort: implementations log per-segment failures and continue.
+     * A znode that cannot be deleted (concurrent CAS bump from a transfer
+     * recovery, or transient ZK error) is left for the next reconcile pass on
+     * restart, OR for the optimizer's reaper if it ever picks up an
+     * abandoned-index sweep.
+     *
+     * <p>Default no-op: legacy publishers that don't track a registry have
+     * nothing to drop.
+     */
+    default void dropAllSegmentsForIndex() {
+    }
 }

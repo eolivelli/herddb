@@ -459,6 +459,62 @@ public final class SegmentRegistryPublisher implements SegmentPublisher {
         }
     }
 
+    /**
+     * Best-effort sweep of every registry entry for {@link #indexUuid}. Used
+     * by the IS engine on DROP_INDEX / TRUNCATE_TABLE: after the local store
+     * is closed and before the DataStorageManager.dropIndex call wipes the
+     * multipart files, we walk {@code listSegments} and CAS-delete each
+     * znode regardless of state — including TRANSFERRING and DEPRECATED
+     * entries. Skipping that step would leave orphan ACTIVE/TRANSFERRING
+     * znodes in the registry pointing at now-deleted files, which other IS
+     * instances would observe as phantom segments.
+     *
+     * <p>Per-znode CAS failures (a concurrent transfer or optimizer bumping
+     * the version under us) are logged and skipped — the next sweep, the
+     * optimizer's reaper, or a future reconcile pass will catch any
+     * stragglers. The sweep does NOT touch the underlying multipart files;
+     * those are the {@link herddb.storage.DataStorageManager#dropIndex}
+     * caller's responsibility.
+     */
+    @Override
+    public void dropAllSegmentsForIndex() {
+        try {
+            List<VersionedSegmentMetadata> all = registry.listSegments(tablespaceUuid, indexUuid);
+            int deleted = 0;
+            int skipped = 0;
+            for (VersionedSegmentMetadata v : all) {
+                try {
+                    registry.casDeleteSegment(v);
+                    deleted++;
+                } catch (SegmentRegistryException.VersionMismatch raceLost) {
+                    // Another actor (transfer recovery, optimizer reaper) bumped
+                    // the znode between list and delete. Leave it; the next sweep
+                    // handles it.
+                    LOGGER.log(Level.INFO,
+                            "dropAllSegmentsForIndex: znode {0} CAS-bumped, skipping (will be"
+                                    + " reaped by next sweep or optimizer)",
+                            new Object[]{v.metadata().getSegmentUuid()});
+                    skipped++;
+                } catch (SegmentRegistryException e) {
+                    LOGGER.log(Level.WARNING,
+                            "dropAllSegmentsForIndex: registry error deleting {0}: {1}",
+                            new Object[]{v.metadata().getSegmentUuid(), e.getMessage()});
+                    skipped++;
+                }
+            }
+            LOGGER.log(Level.INFO,
+                    "dropAllSegmentsForIndex: index {0} swept ({1} znodes deleted, {2} skipped)",
+                    new Object[]{indexName, deleted, skipped});
+        } catch (SegmentRegistryException e) {
+            // listSegments failed — nothing more we can do here. The IS
+            // engine still proceeds with the local store close + dropIndex;
+            // a future reconcile (or operator) may catch the residual state.
+            LOGGER.log(Level.WARNING,
+                    "dropAllSegmentsForIndex: failed to list segments for index {0}: {1}",
+                    new Object[]{indexName, e.getMessage()});
+        }
+    }
+
     private String requireUuid(NewSegmentInfo info) {
         String segmentUuid = info.getSegmentUuid();
         if (segmentUuid == null || segmentUuid.isEmpty()) {
