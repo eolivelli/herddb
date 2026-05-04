@@ -242,6 +242,8 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setDurableLsnLedger(info.getDurableLsnLedger())
                     .setDurableLsnOffset(info.getDurableLsnOffset())
                     .setStatus(info.getStatus())
+                    .setLoadingSegmentsDone(info.getLoadingSegmentsDone())
+                    .setLoadingSegmentsTotal(info.getLoadingSegmentsTotal())
                     .build();
 
             responseObserver.onNext(response);
@@ -272,6 +274,8 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                         .setVectorCount(d.getVectorCount())
                         .setStatus(nullToEmpty(d.getStatus()))
                         .setSegmentCount(d.getSegmentCount())
+                        .setLoadingSegmentsDone(d.getLoadingSegmentsDone())
+                        .setLoadingSegmentsTotal(d.getLoadingSegmentsTotal())
                         .build());
             }
             responseObserver.onNext(builder.build());

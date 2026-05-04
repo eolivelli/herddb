@@ -72,6 +72,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -776,6 +777,34 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final AtomicInteger deferralEvents = new AtomicInteger();
     private final AtomicLong currentDeferredVectors = new AtomicLong();
     private final AtomicLong totalDeferredVectors = new AtomicLong();
+
+    // -------------------------------------------------------------------------
+    // Recovery loading-progress counters (issue #381)
+    //
+    // Set during loadMultiSegmentFormat() so that gRPC callers (GetIndexStatus,
+    // ListIndexes, DescribeIndex) can report loading progress to operators and
+    // to the wait_for_indexes barrier instead of showing "0 vectors / 0 segments
+    // / status=missing" for the entire cold-start window.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Number of segments that have been fully loaded (map downloaded + HNSW graph
+     * opened) during the current or most recent {@link #loadMultiSegmentFormat} run.
+     * 0 while no load is in progress or before the first segment completes.
+     */
+    private final AtomicInteger loadingSegmentsDone = new AtomicInteger(0);
+
+    /**
+     * Total number of segments to be loaded during the current or most recent
+     * {@link #loadMultiSegmentFormat} run. 0 when no load is/was in progress.
+     */
+    private final AtomicInteger loadingSegmentsTotal = new AtomicInteger(0);
+
+    /**
+     * {@code true} while {@link #loadMultiSegmentFormat} is running; {@code false}
+     * once loading completes (successfully or with an error).
+     */
+    private volatile boolean loadingFromStatus = false;
 
     /** Current IndexStatus generation; 0 if no checkpoint has ever been persisted. */
     public long getCurrentIndexStatusGeneration() {
@@ -1777,6 +1806,33 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     public LogSequenceNumber getLoadedLsn() {
         return loadedLsn;
+    }
+
+    /**
+     * Returns the number of segments fully loaded so far during the current or
+     * most recent {@link #loadMultiSegmentFormat} call. When
+     * {@link #isLoadingFromStatus()} is {@code false} this reflects the final
+     * loaded segment count of the last completed load (or 0 if none).
+     */
+    public int getLoadingSegmentsDone() {
+        return loadingSegmentsDone.get();
+    }
+
+    /**
+     * Returns the total number of segments to be loaded during the current or
+     * most recent {@link #loadMultiSegmentFormat} call. 0 when no load has ever
+     * been initiated.
+     */
+    public int getLoadingSegmentsTotal() {
+        return loadingSegmentsTotal.get();
+    }
+
+    /**
+     * Returns {@code true} while {@link #loadMultiSegmentFormat} is executing.
+     * Cleared to {@code false} once loading completes (successfully or with an error).
+     */
+    public boolean isLoadingFromStatus() {
+        return loadingFromStatus;
     }
 
     /**
@@ -4928,8 +4984,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
             return;
         }
 
-        int maxSegId = -1;
-        long maxGeneration = loadedGeneration;
+        // ----------------------------------------------------------------
+        // Phase 1 (serial): parse all segment metadata from the binary
+        // stream — this is fast (no I/O) and must be done in order.
+        // ----------------------------------------------------------------
+        List<VectorSegment> segList = new ArrayList<>(numSegments);
         for (int s = 0; s < numSegments; s++) {
             int segId;
             long estimatedSize;
@@ -4954,7 +5013,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
             } catch (IOException e) {
                 throw new DataStorageManagerException("Failed to read segment metadata", e);
             }
-
             VectorSegment seg = new VectorSegment(segId);
             seg.estimatedSizeBytes = estimatedSize;
             seg.graphFilePath = graphFilePath;
@@ -4966,16 +5024,120 @@ public class PersistentVectorStore extends AbstractVectorStore {
             if (segmentUuid != null) {
                 segmentedV2Cached = true;
             }
+            segList.add(seg);
+        }
 
-            Path mapFile = readMultipartMapDataToTempFile(seg);
-            loadFusedPQSegment(seg, mapFile, dim, savedNextNodeId);
-
-            segments.add(seg);
-            if (segId > maxSegId) {
-                maxSegId = segId;
+        // ----------------------------------------------------------------
+        // Phase 2 (parallel): download each segment's map file and open
+        // its on-disk graph. Tasks are submitted to CHECKPOINT_POOL so
+        // that the existing thread budget controls parallelism — no extra
+        // threads are created. Each segment is independent; shared state
+        // (loadingSegmentsDone, the counter below) is updated atomically.
+        //
+        // Publication order invariant (for gRPC GetIndexStatus consumers):
+        //   loadingSegmentsTotal and loadingSegmentsDone are set BEFORE
+        //   loadingFromStatus is flipped to true, so any reader who observes
+        //   isLoadingFromStatus()==true is guaranteed to also see a non-zero
+        //   loadingSegmentsTotal. The reverse order would allow a brief window
+        //   where loading=true but total=0.
+        //
+        // Failure semantics: if any segment fails to load, ALL previously
+        // opened BLinks (seg.onDiskPkToNode) for segments in segList are
+        // closed and none are registered into the segments list (all-or-nothing).
+        // This is a deliberate choice: partial state after a storage error is
+        // harder to reason about than a clean failure that forces a full retry
+        // on the next start(). start() callers are expected to handle this
+        // exception by propagating it up and allowing the service to restart.
+        // ----------------------------------------------------------------
+        loadingSegmentsTotal.set(numSegments);   // set counters BEFORE the flag (invariant above)
+        loadingSegmentsDone.set(0);
+        loadingFromStatus = true;
+        LOGGER.log(Level.INFO,
+                "loading vector store {0}: {1} segments, direct-S3={2}",
+                new Object[]{indexName, numSegments,
+                        dataStorageManager.supportsDirectMultipartDownload()});
+        Throwable loadingFailure = null;
+        try {
+            List<Future<?>> futures = new ArrayList<>(numSegments);
+            for (VectorSegment seg : segList) {
+                Future<?> f = CHECKPOINT_POOL.submit((Callable<Void>) () -> {
+                    Path mapFile = readMultipartMapDataToTempFile(seg);
+                    loadFusedPQSegment(seg, mapFile, dim, savedNextNodeId);
+                    int done = loadingSegmentsDone.incrementAndGet();
+                    if (done == 1 || done % 100 == 0 || done == numSegments) {
+                        LOGGER.log(Level.INFO,
+                                "loading vector store {0}: {1}/{2} segments loaded",
+                                new Object[]{indexName, done, numSegments});
+                    }
+                    return null;
+                });
+                futures.add(f);
             }
-            if (generation > maxGeneration) {
-                maxGeneration = generation;
+            // Collect results. On the first failure, cancel all remaining pending
+            // tasks (so they don't consume pool threads after we've given up),
+            // then collect per-task failures to log before rethrowing.
+            for (int i = 0; i < futures.size(); i++) {
+                Future<?> f = futures.get(i);
+                try {
+                    f.get();
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                    LOGGER.log(Level.WARNING,
+                            "segment load failed for store {0} segment index {1}: {2}",
+                            new Object[]{indexName, i, cause});
+                    if (loadingFailure == null) {
+                        loadingFailure = cause;
+                        // Cancel all remaining futures; already-running tasks are
+                        // interrupted where possible.
+                        for (Future<?> g : futures) {
+                            g.cancel(true);
+                        }
+                    }
+                } catch (CancellationException ignored) {
+                    // Expected: after the first failure triggers g.cancel(true), subsequent
+                    // f.get() calls on already-cancelled futures throw CancellationException.
+                    // Continue draining so the original loadingFailure is rethrown below
+                    // as an IOException/DataStorageManagerException, not as an opaque
+                    // CancellationException.
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while loading segments", e);
+                }
+            }
+        } finally {
+            loadingFromStatus = false;
+            // All-or-nothing cleanup: if loading failed, close every BLink that
+            // was opened in phase 2 to avoid leaking paged-storage pages. None of
+            // these segments are registered in this.segments yet, so closing them
+            // here is safe and does not affect search.
+            if (loadingFailure != null) {
+                for (VectorSegment seg : segList) {
+                    seg.close();
+                }
+            }
+        }
+        if (loadingFailure instanceof IOException) {
+            throw (IOException) loadingFailure;
+        }
+        if (loadingFailure instanceof DataStorageManagerException) {
+            throw (DataStorageManagerException) loadingFailure;
+        }
+        if (loadingFailure != null) {
+            throw new DataStorageManagerException("Segment load failed", loadingFailure);
+        }
+
+        // ----------------------------------------------------------------
+        // Phase 3 (serial): register segments and update counters.
+        // ----------------------------------------------------------------
+        int maxSegId = -1;
+        long maxGeneration = loadedGeneration;
+        for (VectorSegment seg : segList) {
+            segments.add(seg);
+            if (seg.segmentId > maxSegId) {
+                maxSegId = seg.segmentId;
+            }
+            if (seg.generation > maxGeneration) {
+                maxGeneration = seg.generation;
             }
         }
         nextSegmentId.set(maxSegId + 1);
@@ -5323,8 +5485,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     /**
      * Downloads the map data for a multipart segment into a local temp file.
-     * Uses the storage manager's multipart reader supplier to read the map file.
-     * The caller is responsible for deleting the returned file.
+     *
+     * <p>When {@link DataStorageManager#supportsDirectMultipartDownload()} is
+     * {@code true}, the download is issued directly to object storage (e.g. GCS),
+     * bypassing the gRPC file-server round-trips that dominate cold-start recovery
+     * time (issue #381). Otherwise, falls back to the original path through the
+     * multipart reader supplier.
+     *
+     * <p>The caller is responsible for deleting the returned file.
      */
     private Path readMultipartMapDataToTempFile(VectorSegment seg)
             throws IOException, DataStorageManagerException {
@@ -5332,27 +5500,43 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // Empty or missing map — return an empty temp file
             return Files.createTempFile(tmpDirectory, "herddb-vector-map-empty-", ".tmp");
         }
-        io.github.jbellis.jvector.disk.ReaderSupplier supplier =
-                dataStorageManager.multipartIndexReaderSupplier(
+        Path tempFile = Files.createTempFile(tmpDirectory, "herddb-vector-map-", ".tmp");
+        boolean success = false;
+        try {
+            if (dataStorageManager.supportsDirectMultipartDownload()) {
+                // Fast path: download blocks directly from object storage, skipping the
+                // file-server gRPC hops. The map-file data is never cached (it is written
+                // to a temp file and deleted immediately after loading), so there is no
+                // benefit to routing through the SegmentBlockCache.
+                dataStorageManager.downloadMultipartIndexFile(
                         tableSpaceUUID,
                         indexUUID + "_seg" + seg.segmentId,
                         "map",
-                        seg.mapFileSize);
-        Path tempFile = Files.createTempFile(tmpDirectory, "herddb-vector-map-", ".tmp");
-        boolean success = false;
-        try (io.github.jbellis.jvector.disk.RandomAccessReader reader = supplier.get();
-             FileOutputStream fos = new FileOutputStream(tempFile.toFile());
-             BufferedOutputStream bos = new BufferedOutputStream(fos, CHUNK_SIZE)) {
-            reader.seek(0);
-            // Read in chunks to avoid large allocations
-            byte[] buf = new byte[CHUNK_SIZE];
-            long remaining = seg.mapFileSize;
-            while (remaining > 0) {
-                int toRead = (int) Math.min(buf.length, remaining);
-                byte[] readBuf = toRead == buf.length ? buf : new byte[toRead];
-                reader.readFully(readBuf);
-                bos.write(readBuf, 0, toRead);
-                remaining -= toRead;
+                        seg.mapFileSize,
+                        tempFile);
+            } else {
+                // Fallback: sequential read via the RemoteRandomAccessReader /
+                // SegmentBlockCache pipeline (original gRPC path).
+                io.github.jbellis.jvector.disk.ReaderSupplier supplier =
+                        dataStorageManager.multipartIndexReaderSupplier(
+                                tableSpaceUUID,
+                                indexUUID + "_seg" + seg.segmentId,
+                                "map",
+                                seg.mapFileSize);
+                try (io.github.jbellis.jvector.disk.RandomAccessReader reader = supplier.get();
+                     FileOutputStream fos = new FileOutputStream(tempFile.toFile());
+                     BufferedOutputStream bos = new BufferedOutputStream(fos, CHUNK_SIZE)) {
+                    reader.seek(0);
+                    byte[] buf = new byte[CHUNK_SIZE];
+                    long remaining = seg.mapFileSize;
+                    while (remaining > 0) {
+                        int toRead = (int) Math.min(buf.length, remaining);
+                        byte[] readBuf = toRead == buf.length ? buf : new byte[toRead];
+                        reader.readFully(readBuf);
+                        bos.write(readBuf, 0, toRead);
+                        remaining -= toRead;
+                    }
+                }
             }
             success = true;
             return tempFile;

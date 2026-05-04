@@ -265,6 +265,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private volatile Future<?> inflightCheckpoint;
 
     /**
+     * Pending {@code DROP_INDEX} / {@code DROP_TABLE} cleanup tasks submitted to
+     * {@link #checkpointExecutor} so they are serialised after any in-flight
+     * {@link #checkpointAndSaveWatermark()}. Tracked here so that tests
+     * (and {@link #close()}) can wait for the storage cleanup to finish before
+     * asserting that the index data has been removed.
+     *
+     * <p>Submitting through {@code checkpointExecutor} avoids closing a vector
+     * store while a concurrent checkpoint cycle still holds a reference to it
+     * (issue #383).
+     */
+    private final java.util.List<Future<?>> pendingDropTasks =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
+    /**
      * Wall-clock time at which {@link #start()} finished, used by the
      * admin CLI to compute engine uptime.
      */
@@ -1142,6 +1156,152 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
     }
 
+    /**
+     * Submits the post-DROP cleanup of a vector store ({@code store.close()}
+     * + {@link DataStorageManager#dropIndex} for the store's storage UUID)
+     * to the {@link #checkpointExecutor} so it serialises after any in-flight
+     * checkpoint cycle. Closing a store synchronously from the tailer thread
+     * could race with a concurrent {@link #checkpointAndSaveWatermark()} that
+     * still holds a reference to it (issue #383).
+     *
+     * <p>Best-effort: a failure to drop the on-storage data is logged at
+     * WARNING but never propagates — re-running DROP on a future restart is
+     * idempotent because the engine no longer tracks the store.
+     *
+     * <p>Skipped silently when the executor is null (engine never reached
+     * {@link #start()}, e.g. tests that only build but don't start an engine)
+     * or already shut down (engine is closing); in both cases the close +
+     * dropIndex run synchronously on the calling thread so the data is still
+     * released.
+     */
+    private void submitVectorStoreDeletion(String storeKeyForLog, AbstractVectorStore store) {
+        if (store == null) {
+            return;
+        }
+        Runnable task = () -> {
+            String storeUUID = null;
+            try {
+                storeUUID = store.getStoreUUID();
+            } catch (RuntimeException e) {
+                // Reading the UUID is a trivial accessor; if it throws there
+                // is nothing useful we can do beyond logging — proceed to
+                // close and skip the storage drop.
+                LOGGER.log(Level.WARNING,
+                        "DROP cleanup for " + storeKeyForLog
+                                + ": failed to read store UUID, skipping storage cleanup",
+                        e);
+            }
+            try {
+                store.close();
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING,
+                        "DROP cleanup for " + storeKeyForLog
+                                + ": failed to close vector store; resources may leak",
+                        e);
+            }
+            if (storeUUID != null && dataStorageManager != null && tableSpaceUUID != null) {
+                try {
+                    dataStorageManager.dropIndex(tableSpaceUUID, storeUUID);
+                    LOGGER.log(Level.INFO,
+                            "DROP cleanup for {0}: removed on-storage data for store UUID {1}",
+                            new Object[]{storeKeyForLog, storeUUID});
+                } catch (herddb.storage.DataStorageManagerException e) {
+                    // Non-fatal: leaves orphan data behind but the engine no
+                    // longer references it. A future call to dropIndex against
+                    // the same UUID is idempotent so a retry on next restart
+                    // can clean up any residual state.
+                    LOGGER.log(Level.WARNING,
+                            "DROP cleanup for " + storeKeyForLog
+                                    + ": failed to drop on-storage data for UUID " + storeUUID,
+                            e);
+                }
+            }
+        };
+
+        ExecutorService exec = checkpointExecutor;
+        if (exec == null || exec.isShutdown()) {
+            // Engine never started its checkpoint executor (test path) or
+            // is closing — run inline so the data is still released.
+            task.run();
+            return;
+        }
+        try {
+            Future<?> f = exec.submit(task);
+            // Prune already-completed entries and add the new one under
+            // the same lock used by awaitPendingDeletionsForTest, so a
+            // test waiting on the snapshot never observes a partially-
+            // pruned state. Pruning prevents unbounded growth under
+            // workloads that DROP many indexes — each retained Future
+            // would otherwise pin its captured AbstractVectorStore
+            // (issue #383 review).
+            synchronized (pendingDropTasks) {
+                pendingDropTasks.removeIf(Future::isDone);
+                pendingDropTasks.add(f);
+            }
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // Executor shut down between the isShutdown() probe and submit()
+            // — fall back to inline execution.
+            task.run();
+        }
+    }
+
+    /**
+     * Test hook: drains the shadow reload executor so any reload tasks
+     * already enqueued have completed before the caller observes
+     * {@link #getShadowReloadCount()} or {@link #getShadowLoadedLsn()}.
+     * Submitted as a no-op task that {@code get()}s after every queued
+     * reload finishes, because the executor is single-threaded.
+     *
+     * <p>No-op when not running as a shadow.
+     */
+    public void awaitShadowReloadsForTest() {
+        ExecutorService exec = shadowReloadExecutor;
+        if (exec == null) {
+            return;
+        }
+        try {
+            exec.submit(() -> {
+            }).get(30, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted awaiting shadow reload", e);
+        } catch (ExecutionException e) {
+            throw new RuntimeException("Shadow reload barrier task failed", e.getCause());
+        } catch (java.util.concurrent.TimeoutException e) {
+            throw new RuntimeException("Timed out awaiting shadow reload barrier", e);
+        }
+    }
+
+    /**
+     * Test hook: blocks until every {@code DROP_INDEX} / {@code DROP_TABLE}
+     * cleanup task submitted via {@link #submitVectorStoreDeletion} has
+     * completed. Used by tests that assert on the on-storage state right
+     * after applying a DROP entry.
+     *
+     * <p>Public (rather than package-private) because the full-cluster
+     * integration tests live in {@code herddb-services} and need to wait
+     * for DROP cleanup to settle before asserting on the file-server
+     * disk layout.
+     */
+    public void awaitPendingDeletionsForTest() {
+        java.util.List<Future<?>> snapshot;
+        synchronized (pendingDropTasks) {
+            snapshot = new ArrayList<>(pendingDropTasks);
+        }
+        for (Future<?> f : snapshot) {
+            try {
+                f.get(30, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted awaiting DROP cleanup", e);
+            } catch (ExecutionException e) {
+                throw new RuntimeException("DROP cleanup task failed", e.getCause());
+            } catch (java.util.concurrent.TimeoutException e) {
+                throw new RuntimeException("Timed out awaiting DROP cleanup", e);
+            }
+        }
+    }
+
     private static boolean isDmlType(short type) {
         return type == LogEntryType.INSERT
                 || type == LogEntryType.UPDATE
@@ -1230,17 +1390,88 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 schemaTracker.applyEntry(entry);
                 break;
 
-            case LogEntryType.DROP_TABLE:
-            case LogEntryType.TRUNCATE_TABLE:
+            case LogEntryType.DROP_TABLE: {
                 schemaTracker.applyEntry(entry);
-                // Remove all vector stores for this table
+                // Remove all vector stores for this table AND release their
+                // remote/local persistent state.  Without the dropIndex()
+                // call below, every per-segment graph + map file would
+                // linger on the file server / S3 forever, causing the
+                // bucket to grow without bound under a CREATE/DROP
+                // workload (issue #383).
                 String droppedTable = entry.tableName;
-                vectorStores.entrySet().removeIf(e -> e.getKey().startsWith(droppedTable + "."));
+                String droppedTablePrefix = droppedTable + ".";
+                java.util.List<Map.Entry<String, AbstractVectorStore>> toClose =
+                        new ArrayList<>();
+                vectorStores.entrySet().removeIf(e -> {
+                    if (e.getKey().startsWith(droppedTablePrefix)) {
+                        toClose.add(e);
+                        return true;
+                    }
+                    return false;
+                });
                 // Keep vectorStoreIndexUuids in sync so a future CREATE_INDEX with the same
                 // (table, name) key does not mis-fire the "different UUID" guard and silently
                 // refuse to create the new store (issue #368 review).
-                vectorStoreIndexUuids.entrySet().removeIf(e -> e.getKey().startsWith(droppedTable + "."));
+                vectorStoreIndexUuids.entrySet().removeIf(e -> e.getKey().startsWith(droppedTablePrefix));
+                for (Map.Entry<String, AbstractVectorStore> dropped : toClose) {
+                    submitVectorStoreDeletion(dropped.getKey(), dropped.getValue());
+                }
                 break;
+            }
+
+            case LogEntryType.TRUNCATE_TABLE: {
+                // TRUNCATE_TABLE keeps the table + every vector index
+                // *registered* in SchemaTracker (TRUNCATE has no
+                // SchemaTracker case) — the table and its indexes are
+                // expected to keep accepting INSERT/UPDATE/DELETE after
+                // the truncate. Release the in-memory live shards and
+                // wipe the on-storage data, then re-create a fresh
+                // PersistentVectorStore against a NEW storage UUID so
+                // subsequent DML lands cleanly. Erasing the on-storage
+                // data without re-creating the store would silently
+                // drop every later INSERT for that index (issue #383
+                // review).
+                String truncatedTable = entry.tableName;
+                String truncatedTablePrefix = truncatedTable + ".";
+                java.util.List<Index> toRefresh = new ArrayList<>();
+                for (Index idx : schemaTracker.getAllIndexes()) {
+                    if (Index.TYPE_VECTOR.equals(idx.type)
+                            && truncatedTable.equals(idx.table)) {
+                        toRefresh.add(idx);
+                    }
+                }
+                java.util.List<Map.Entry<String, AbstractVectorStore>> toClose =
+                        new ArrayList<>();
+                vectorStores.entrySet().removeIf(e -> {
+                    if (e.getKey().startsWith(truncatedTablePrefix)) {
+                        toClose.add(e);
+                        return true;
+                    }
+                    return false;
+                });
+                vectorStoreIndexUuids.entrySet().removeIf(
+                        e -> e.getKey().startsWith(truncatedTablePrefix));
+                for (Map.Entry<String, AbstractVectorStore> dropped : toClose) {
+                    submitVectorStoreDeletion(dropped.getKey(), dropped.getValue());
+                }
+                // Re-create each vector store with a fresh storage UUID.
+                // Critical: strip any pre-existing PROP_IS_STORE_UUID
+                // before serialising, otherwise the factory's
+                // savedUUID branch (start() line ~620) reuses the OLD
+                // store UUID — which the async submitVectorStoreDeletion
+                // task above is about to wipe. That race silently
+                // deletes the freshly-truncated index's writes (issue
+                // #383 review). Stripping the property forces the
+                // factory's fresh-nanoTime branch.
+                for (Index idx : toRefresh) {
+                    Index rebuilt = rebuildIndexWithoutStoreUuid(idx);
+                    LogEntry synth = new LogEntry(System.currentTimeMillis(),
+                            LogEntryType.CREATE_INDEX, 0L, rebuilt.table, null,
+                            herddb.utils.Bytes.from_array(rebuilt.serialize()));
+                    createVectorStoreIfNeeded(synth);
+                }
+                break;
+            }
 
             case LogEntryType.CREATE_INDEX:
                 schemaTracker.applyEntry(entry);
@@ -1253,8 +1484,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 Index idx = schemaTracker.getIndex(indexName);
                 if (idx != null && Index.TYPE_VECTOR.equals(idx.type)) {
                     String k = storeKey(idx.table, idx.name);
-                    vectorStores.remove(k);
+                    AbstractVectorStore removed = vectorStores.remove(k);
                     vectorStoreIndexUuids.remove(k);
+                    if (removed != null) {
+                        // Close the store and drop its on-storage data
+                        // (graph/map segments + IndexStatus markers).
+                        // Without this, every per-segment graph + map file
+                        // would linger on the file server / S3 forever
+                        // (issue #383).
+                        submitVectorStoreDeletion(k, removed);
+                    }
                     LOGGER.log(Level.INFO, "Removed vector store for index {0}", indexName);
                 }
                 schemaTracker.applyEntry(entry);
@@ -1569,6 +1808,36 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             schemaTracker.applyEntry(synth);
             createVectorStoreIfNeeded(synth);
         }
+    }
+
+    /**
+     * Returns a copy of {@code idx} with {@link #PROP_IS_STORE_UUID}
+     * stripped while every other property is preserved. Used by the
+     * TRUNCATE_TABLE handler before re-creating the vector store, to
+     * force {@link #createVectorStoreIfNeeded} (and the engine's
+     * factory) down the fresh-nanoTime UUID branch — without this the
+     * snapshot-restored {@code Index} still carries the OLD store UUID
+     * and the freshly-truncated store would race the in-flight DROP
+     * cleanup of that same UUID, silently wiping its writes (issue
+     * #383 review).
+     */
+    private static Index rebuildIndexWithoutStoreUuid(Index idx) {
+        if (!idx.properties.containsKey(PROP_IS_STORE_UUID)) {
+            return idx;
+        }
+        Index.Builder b = Index.builder()
+                .uuid(idx.uuid)
+                .name(idx.name)
+                .table(idx.table)
+                .tablespace(idx.tablespace)
+                .type(idx.type)
+                .column(idx.columnNames[0], idx.columns[0].type);
+        for (Map.Entry<String, String> e : idx.properties.entrySet()) {
+            if (!PROP_IS_STORE_UUID.equals(e.getKey())) {
+                b.property(e.getKey(), e.getValue());
+            }
+        }
+        return b.build();
     }
 
     /** Test- and diagnostics-only accessor for the engine lifecycle state. */
@@ -2056,8 +2325,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         AbstractVectorStore store = vectorStores.get(storeKey(table, index));
         long vectorCount = store != null ? store.size() : 0;
         int segmentCount = 1;
+        int loadingSegmentsDone = 0;
+        int loadingSegmentsTotal = 0;
+        String status = "tailing";
         if (store instanceof PersistentVectorStore) {
-            segmentCount = ((PersistentVectorStore) store).getSegmentCount();
+            PersistentVectorStore pvs = (PersistentVectorStore) store;
+            segmentCount = pvs.getSegmentCount();
+            if (pvs.isLoadingFromStatus()) {
+                loadingSegmentsDone = pvs.getLoadingSegmentsDone();
+                loadingSegmentsTotal = pvs.getLoadingSegmentsTotal();
+                status = "loading";
+            }
         }
         // Snapshot both LSNs together so the response is internally consistent.
         // Server-side retention pins on durable_lsn_*; tailer_lsn_* is exposed
@@ -2069,7 +2347,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 tailerSnap != null ? tailerSnap.offset : -1,
                 durableSnap != null ? durableSnap.ledgerId : -1,
                 durableSnap != null ? durableSnap.offset : -1,
-                "tailing");
+                status,
+                loadingSegmentsDone, loadingSegmentsTotal);
     }
 
     /**
@@ -2126,10 +2405,22 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             AbstractVectorStore store = vectorStores.get(storeKey(idx.table, idx.name));
             long vectorCount = store != null ? store.size() : 0;
             String status = store != null ? "tailing" : "missing";
-            int segmentCount = (store instanceof PersistentVectorStore)
-                    ? ((PersistentVectorStore) store).getSegmentCount()
-                    : (store != null ? 1 : 0);
-            out.add(new IndexDescriptor(idx.tablespace, idx.table, idx.name, vectorCount, status, segmentCount));
+            int segmentCount = 0;
+            int loadingDone = 0;
+            int loadingTotal = 0;
+            if (store instanceof PersistentVectorStore) {
+                PersistentVectorStore pvs = (PersistentVectorStore) store;
+                segmentCount = pvs.getSegmentCount();
+                if (pvs.isLoadingFromStatus()) {
+                    loadingDone = pvs.getLoadingSegmentsDone();
+                    loadingTotal = pvs.getLoadingSegmentsTotal();
+                    status = "loading";
+                }
+            } else if (store != null) {
+                segmentCount = 1;
+            }
+            out.add(new IndexDescriptor(idx.tablespace, idx.table, idx.name, vectorCount, status,
+                    segmentCount, loadingDone, loadingTotal));
         }
         return out;
     }
@@ -3131,6 +3422,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             }
             checkpointExecutor = null;
             inflightCheckpoint = null;
+            // Pending DROP cleanup tasks have either completed (executor
+            // drained on shutdown) or were cancelled by shutdownNow(); either
+            // way, drop our references so the futures (and the captured
+            // AbstractVectorStore instances) are eligible for GC.
+            pendingDropTasks.clear();
             LOGGER.info("Checkpoint executor shut down");
         }
 
@@ -3222,11 +3518,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         private final long durableLsnLedger;
         private final long durableLsnOffset;
         private final String status;
+        private final int loadingSegmentsDone;
+        private final int loadingSegmentsTotal;
 
         public IndexStatusInfo(long vectorCount, int segmentCount,
                                long tailerLsnLedger, long tailerLsnOffset,
                                long durableLsnLedger, long durableLsnOffset,
-                               String status) {
+                               String status,
+                               int loadingSegmentsDone, int loadingSegmentsTotal) {
             this.vectorCount = vectorCount;
             this.segmentCount = segmentCount;
             this.tailerLsnLedger = tailerLsnLedger;
@@ -3234,6 +3533,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             this.durableLsnLedger = durableLsnLedger;
             this.durableLsnOffset = durableLsnOffset;
             this.status = status;
+            this.loadingSegmentsDone = loadingSegmentsDone;
+            this.loadingSegmentsTotal = loadingSegmentsTotal;
         }
 
         public long getVectorCount() {
@@ -3263,6 +3564,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         public String getStatus() {
             return status;
         }
+
+        /** Segments loaded so far during recovery; 0 when not loading. */
+        public int getLoadingSegmentsDone() {
+            return loadingSegmentsDone;
+        }
+
+        /** Total segments to load during recovery; 0 when not loading. */
+        public int getLoadingSegmentsTotal() {
+            return loadingSegmentsTotal;
+        }
     }
 
     /**
@@ -3275,15 +3586,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         private final long vectorCount;
         private final String status;
         private final int segmentCount;
+        private final int loadingSegmentsDone;
+        private final int loadingSegmentsTotal;
 
         public IndexDescriptor(String tablespace, String table, String index,
-                               long vectorCount, String status, int segmentCount) {
+                               long vectorCount, String status, int segmentCount,
+                               int loadingSegmentsDone, int loadingSegmentsTotal) {
             this.tablespace = tablespace;
             this.table = table;
             this.index = index;
             this.vectorCount = vectorCount;
             this.status = status;
             this.segmentCount = segmentCount;
+            this.loadingSegmentsDone = loadingSegmentsDone;
+            this.loadingSegmentsTotal = loadingSegmentsTotal;
         }
 
         public String getTablespace() {
@@ -3308,6 +3624,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
         public int getSegmentCount() {
             return segmentCount;
+        }
+
+        /** Segments loaded so far during recovery; 0 when not loading. */
+        public int getLoadingSegmentsDone() {
+            return loadingSegmentsDone;
+        }
+
+        /** Total segments to load during recovery; 0 when not loading. */
+        public int getLoadingSegmentsTotal() {
+            return loadingSegmentsTotal;
         }
     }
 

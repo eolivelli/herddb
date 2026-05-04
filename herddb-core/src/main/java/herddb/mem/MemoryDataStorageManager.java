@@ -631,6 +631,21 @@ public class MemoryDataStorageManager extends DataStorageManager {
                 }
             }
         }
+        // Erase all on-storage data for this index: index pages, IndexStatus
+        // markers and multipart blob files. The file/remote DSMs already
+        // implement the equivalent erase by removing the index directory
+        // or remote prefix.  We must widen the multipart prefix match to
+        // also include {tablespace}/{name}_segN/... and similar sibling
+        // UUIDs derived by PersistentVectorStore for per-segment storage —
+        // otherwise the segment graph + map blobs leak forever
+        // (issue #383).
+        final String entryPrefix = tablespace + "." + name + "_";
+        indexpages.keySet().removeIf(k -> k.startsWith(entryPrefix));
+        indexStatuses.keySet().removeIf(k -> k.startsWith(entryPrefix));
+        final String multipartParentPrefix = tablespace + "/" + name + "/";
+        final String multipartSegmentPrefix = tablespace + "/" + name + "_";
+        multipartFiles.keySet().removeIf(k ->
+                k.startsWith(multipartParentPrefix) || k.startsWith(multipartSegmentPrefix));
     }
 
     @Override

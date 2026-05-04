@@ -90,6 +90,13 @@ message GetIndexStatusResponse {
     // callers MUST treat that as LogSequenceNumber.START_OF_TIME.
     int64 durable_lsn_ledger = 6;
     int64 durable_lsn_offset = 7;
+    // Cold-start recovery progress (issue #381). Both fields are 0 when the
+    // index is not currently loading from disk. When loading,
+    // loading_segments_total > 0 and loading_segments_done advances from 0
+    // to loading_segments_total. Operators and the wait_for_indexes barrier
+    // can use the ratio to estimate remaining recovery time.
+    int32 loading_segments_done = 8;
+    int32 loading_segments_total = 9;
 }
 
 // ---- Diagnostic RPCs ----
@@ -103,6 +110,9 @@ message IndexDescriptor {
     // Number of on-disk segments held by the vector index.
     // Populated from PersistentVectorStore.getSegmentCount() (issue #285).
     int32 segment_count = 6;
+    // Cold-start recovery progress (issue #381). Both fields are 0 when not loading.
+    int32 loading_segments_done = 7;
+    int32 loading_segments_total = 8;
 }
 
 message ListIndexesRequest {
