@@ -13,14 +13,21 @@ This matches what `.github/workflows/pr-validation.yml` runs in CI (checkstyle, 
 
 For any change related to indexes, checkpoints, or concurrency, also run every
 subclass of `DirectMultipleConcurrentUpdatesSuite` (in
-`herddb-core/src/test/java/herddb/server/hammer/`) and make sure they all pass:
+`herddb-core/src/test/java/herddb/server/hammer/`) plus the BLink-level
+concurrent search/insert hammer (`BLinkConcurrentSearchInsertTest` in
+`herddb-utils/src/test/java/herddb/index/blink/`), and make sure they all pass:
 ```
 mvn -pl herddb-core -Dtest='DirectMultipleConcurrentUpdatesSuiteNoIndexesTest,DirectMultipleConcurrentUpdatesSuiteWithNonUniqueIndexesTest,DirectMultipleConcurrentUpdatesSuiteWithUniqueIndexesTest' test
+mvn -pl herddb-utils -Dtest='BLinkConcurrentSearchInsertTest' test
 ```
-These hammer tests exercise concurrent DML with periodic checkpoints and
-recovery, so they are the main regression gate for the primary-key index, the
-checkpoint pipeline, and transaction isolation. Run them multiple times when
-the first pass is green to reduce the chance of a flake masking a real bug.
+The `DirectMultipleConcurrentUpdatesSuite` tests exercise concurrent DML with
+periodic checkpoints and recovery, so they are the main regression gate for
+the primary-key index, the checkpoint pipeline, and transaction isolation.
+`BLinkConcurrentSearchInsertTest` hammers the lower-level BLink with many
+concurrent searches against fewer concurrent writers on overlapping keys,
+catching regressions in the per-node and anchor lock primitives that drive
+every primary-key lookup. Run them multiple times when the first pass is
+green to reduce the chance of a flake masking a real bug.
 
 ## Test Categories
 Tests that require ZooKeeper/BookKeeper infrastructure (cluster mode) must be annotated with

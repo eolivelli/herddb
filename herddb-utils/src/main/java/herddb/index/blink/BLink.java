@@ -1741,6 +1741,17 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
      * the same observable behaviour as {@link StampedLock#unlockRead(long)} called
      * with an invalid stamp.
      * </p>
+     * <p>
+     * <b>Important:</b> the unstamped {@code tryUnlockRead/Write} primitives do
+     * <i>not</i> verify that the releasing thread is the one that originally
+     * acquired the lock. This helper therefore relies on BLink's strict
+     * same-thread acquire/release pairing — every operation that locks a node
+     * or the anchor must release that same lock on the same thread. Any future
+     * caller that hands a held lock off to another thread for release would
+     * silently corrupt the lock state and must instead use the stamped
+     * {@link StampedLock#unlockRead(long)} / {@link StampedLock#unlockWrite(long)}
+     * primitives directly.
+     * </p>
      */
     private void unlock(StampedLock lock, int locktype) {
         if (locktype == READ_LOCK) {

@@ -39,6 +39,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import org.junit.Test;
 
 /**
@@ -62,16 +64,24 @@ import org.junit.Test;
  * <p>The non-reentrancy of {@link java.util.concurrent.locks.StampedLock} would
  * surface here as deadlock or {@link IllegalMonitorStateException}; mismatched
  * stamps would surface as cross-key visibility errors.
+ *
+ * <p>Each writer thread owns a disjoint shard of the writer key range so two
+ * writers never touch the same key — that keeps the in-test bookkeeping race
+ * free from "T1 inserts then T2 inserts then T2 records then T1 records"
+ * inversions and lets the post-run reconciliation be deterministic.
  */
 public class BLinkConcurrentSearchInsertTest {
+
+    private static final Logger LOGGER = Logger.getLogger(BLinkConcurrentSearchInsertTest.class.getName());
 
     @Test
     public void searchHeavyConcurrentLoad() throws Exception {
 
         final int snapshotKeys = 4000;
-        final int writerKeys = 4000;
-        final int searchThreads = 12;
         final int writerThreads = 4;
+        final int writerKeysPerThread = 1000; // disjoint shards
+        final int writerKeys = writerThreads * writerKeysPerThread;
+        final int searchThreads = 12;
         final int searchIterations = 200;
         final int writerIterations = 1500;
         final long timeoutSeconds = 120;
@@ -96,7 +106,8 @@ public class BLinkConcurrentSearchInsertTest {
             }
             assertEquals(snapshotKeys, blink.size());
 
-            // Writer key range starts above the snapshot range.
+            // Writer key range starts above the snapshot range and is sharded
+            // across writer threads so two writers never touch the same key.
             final long writerKeyBase = snapshotKeys;
             final ConcurrentHashMap<Long, Long> writerExpected = new ConcurrentHashMap<>();
 
@@ -105,131 +116,155 @@ public class BLinkConcurrentSearchInsertTest {
             final List<Long> snapshotKeysReadOnly = Collections.unmodifiableList(snapshotKeysList);
 
             final ExecutorService pool = Executors.newFixedThreadPool(searchThreads + writerThreads);
-            final CountDownLatch ready = new CountDownLatch(searchThreads + writerThreads);
-            final CountDownLatch start = new CountDownLatch(1);
-            final AtomicReference<Throwable> firstFailure = new AtomicReference<>();
-            final AtomicLong searches = new AtomicLong();
-            final AtomicLong writes = new AtomicLong();
-            final AtomicLong deletes = new AtomicLong();
+            try {
+                final CountDownLatch ready = new CountDownLatch(searchThreads + writerThreads);
+                final CountDownLatch start = new CountDownLatch(1);
+                final AtomicReference<Throwable> firstFailure = new AtomicReference<>();
+                final AtomicLong searches = new AtomicLong();
+                final AtomicLong writes = new AtomicLong();
+                final AtomicLong deletes = new AtomicLong();
 
-            final List<Future<?>> futures = new ArrayList<>();
+                final List<Future<?>> futures = new ArrayList<>();
 
-            for (int t = 0; t < searchThreads; t++) {
-                final long seed = 1_000L + t;
-                futures.add(pool.submit(() -> {
-                    Random rnd = new Random(seed);
-                    ready.countDown();
-                    try {
-                        start.await();
-                        for (int i = 0; i < searchIterations; i++) {
-                            // Spot-check a random subset of snapshot keys per iteration:
-                            // keep the work per iteration bounded so the writer threads
-                            // get plenty of overlap rather than spending all their time
-                            // queued behind a single long search round.
-                            int probes = 32;
-                            for (int p = 0; p < probes; p++) {
-                                long k = snapshotKeysReadOnly.get(
-                                        rnd.nextInt(snapshotKeysReadOnly.size()));
-                                Long expected = snapshot.get(k);
-                                Long actual = blink.search(Sized.valueOf(k));
-                                assertNotNull("snapshot key " + k + " disappeared during run",
-                                        actual);
-                                assertEquals("snapshot key " + k + " value drift",
-                                        expected, actual);
+                for (int t = 0; t < searchThreads; t++) {
+                    final long seed = 1_000L + t;
+                    futures.add(pool.submit(() -> {
+                        Random rnd = new Random(seed);
+                        ready.countDown();
+                        try {
+                            start.await();
+                            for (int i = 0; i < searchIterations; i++) {
+                                // Spot-check a random subset of snapshot keys per iteration:
+                                // keep the work per iteration bounded so the writer threads
+                                // get plenty of overlap rather than spending all their time
+                                // queued behind a single long search round.
+                                int probes = 32;
+                                for (int p = 0; p < probes; p++) {
+                                    long k = snapshotKeysReadOnly.get(
+                                            rnd.nextInt(snapshotKeysReadOnly.size()));
+                                    Long expected = snapshot.get(k);
+                                    Long actual = blink.search(Sized.valueOf(k));
+                                    assertNotNull("snapshot key " + k + " disappeared during run",
+                                            actual);
+                                    assertEquals("snapshot key " + k + " value drift",
+                                            expected, actual);
+                                    searches.incrementAndGet();
+                                }
+                                // Also probe writer-range keys to exercise the read path
+                                // against keys that may or may not exist concurrently with
+                                // writers; result is allowed to be null but must not throw.
+                                long wk = writerKeyBase + rnd.nextInt(writerKeys);
+                                blink.search(Sized.valueOf(wk));
                                 searches.incrementAndGet();
                             }
-                            // Also probe writer-range keys to exercise the read path
-                            // against keys that may or may not exist concurrently with
-                            // writers; result is allowed to be null but must not throw.
-                            long wk = writerKeyBase + rnd.nextInt(writerKeys);
-                            blink.search(Sized.valueOf(wk));
-                            searches.incrementAndGet();
+                            // Broad catch: this is a top-level executor worker. We have to
+                            // surface every Throwable (including AssertionError raised by the
+                            // assertNotNull/assertEquals above and any unchecked exception
+                            // thrown by BLink) to the main thread, otherwise the executor
+                            // would silently swallow it and the test would falsely pass.
+                        } catch (Throwable err) {
+                            firstFailure.compareAndSet(null, err);
                         }
-                    } catch (Throwable err) {
-                        firstFailure.compareAndSet(null, err);
-                    }
-                }));
-            }
-
-            for (int t = 0; t < writerThreads; t++) {
-                final long seed = 2_000L + t;
-                futures.add(pool.submit(() -> {
-                    Random rnd = new Random(seed);
-                    ready.countDown();
-                    try {
-                        start.await();
-                        for (int i = 0; i < writerIterations; i++) {
-                            long k = writerKeyBase + rnd.nextInt(writerKeys);
-                            int op = rnd.nextInt(10);
-                            if (op < 8) {
-                                // 80 % insert/update
-                                long v = rnd.nextLong();
-                                if (v == 0L) {
-                                    v = 1L; // reserve 0 as "deleted" sentinel
-                                }
-                                blink.insert(Sized.valueOf(k), v);
-                                writerExpected.put(k, v);
-                                writes.incrementAndGet();
-                            } else {
-                                // 20 % delete
-                                blink.delete(Sized.valueOf(k));
-                                writerExpected.put(k, 0L);
-                                deletes.incrementAndGet();
-                            }
-                        }
-                    } catch (Throwable err) {
-                        firstFailure.compareAndSet(null, err);
-                    }
-                }));
-            }
-
-            // Synchronize start so all threads contend together.
-            assertTrue("workers never reached the start barrier",
-                    ready.await(30, TimeUnit.SECONDS));
-            start.countDown();
-
-            for (Future<?> f : futures) {
-                f.get(timeoutSeconds, TimeUnit.SECONDS);
-            }
-            pool.shutdown();
-            assertTrue("thread pool did not shut down cleanly",
-                    pool.awaitTermination(30, TimeUnit.SECONDS));
-
-            if (firstFailure.get() != null) {
-                fail("worker thread failed: " + firstFailure.get());
-            }
-
-            // Re-verify the snapshot keys: every one of them must still be present
-            // with the original value.
-            for (long k = 0; k < snapshotKeys; k++) {
-                Long actual = blink.search(Sized.valueOf(k));
-                assertNotNull("post-run: snapshot key " + k + " missing", actual);
-                assertEquals("post-run: snapshot key " + k + " drifted",
-                        snapshot.get(k), actual);
-            }
-
-            // Verify writer-range keys match the latest writer expectation.
-            int finalLiveWriterKeys = 0;
-            for (long k = writerKeyBase; k < writerKeyBase + writerKeys; k++) {
-                Long expected = writerExpected.get(k);
-                Long actual = blink.search(Sized.valueOf(k));
-                if (expected == null || expected == 0L) {
-                    assertNull("post-run: writer key " + k + " should be absent but found "
-                            + actual, actual);
-                } else {
-                    assertEquals("post-run: writer key " + k + " value mismatch",
-                            expected, actual);
-                    finalLiveWriterKeys++;
+                    }));
                 }
+
+                for (int t = 0; t < writerThreads; t++) {
+                    final long seed = 2_000L + t;
+                    final long shardBase = writerKeyBase + (long) t * writerKeysPerThread;
+                    final int shardSize = writerKeysPerThread;
+                    futures.add(pool.submit(() -> {
+                        Random rnd = new Random(seed);
+                        ready.countDown();
+                        try {
+                            start.await();
+                            for (int i = 0; i < writerIterations; i++) {
+                                long k = shardBase + rnd.nextInt(shardSize);
+                                int op = rnd.nextInt(10);
+                                if (op < 8) {
+                                    // 80 % insert/update
+                                    long v = rnd.nextLong();
+                                    if (v == 0L) {
+                                        v = 1L; // reserve 0 as "deleted" sentinel
+                                    }
+                                    blink.insert(Sized.valueOf(k), v);
+                                    writerExpected.put(k, v);
+                                    writes.incrementAndGet();
+                                } else {
+                                    // 20 % delete
+                                    blink.delete(Sized.valueOf(k));
+                                    writerExpected.put(k, 0L);
+                                    deletes.incrementAndGet();
+                                }
+                            }
+                            // Broad catch: top-level executor worker boundary, see the
+                            // search-thread block above for the rationale.
+                        } catch (Throwable err) {
+                            firstFailure.compareAndSet(null, err);
+                        }
+                    }));
+                }
+
+                // Synchronize start so all threads contend together.
+                assertTrue("workers never reached the start barrier",
+                        ready.await(30, TimeUnit.SECONDS));
+                start.countDown();
+
+                for (Future<?> f : futures) {
+                    f.get(timeoutSeconds, TimeUnit.SECONDS);
+                }
+
+                if (firstFailure.get() != null) {
+                    fail("worker thread failed: " + firstFailure.get());
+                }
+
+                // Re-verify the snapshot keys: every one of them must still be present
+                // with the original value.
+                for (long k = 0; k < snapshotKeys; k++) {
+                    Long actual = blink.search(Sized.valueOf(k));
+                    assertNotNull("post-run: snapshot key " + k + " missing", actual);
+                    assertEquals("post-run: snapshot key " + k + " drifted",
+                            snapshot.get(k), actual);
+                }
+
+                // Verify writer-range keys match the latest writer expectation.
+                // Because each writer owns a disjoint shard, writerExpected has the
+                // last-write-wins value for each key with no inter-thread races.
+                int finalLiveWriterKeys = 0;
+                for (long k = writerKeyBase; k < writerKeyBase + writerKeys; k++) {
+                    Long expected = writerExpected.get(k);
+                    Long actual = blink.search(Sized.valueOf(k));
+                    if (expected == null || expected == 0L) {
+                        assertNull("post-run: writer key " + k + " should be absent but found "
+                                + actual, actual);
+                    } else {
+                        assertEquals("post-run: writer key " + k + " value mismatch",
+                                expected, actual);
+                        finalLiveWriterKeys++;
+                    }
+                }
+
+                assertEquals("tree size mismatch after concurrent run",
+                        snapshotKeys + finalLiveWriterKeys, blink.size());
+
+                if (LOGGER.isLoggable(Level.INFO)) {
+                    LOGGER.log(Level.INFO,
+                            "BLinkConcurrentSearchInsertTest done - searches={0} writes={1}"
+                                    + " deletes={2} liveWriterKeys={3}",
+                            new Object[]{
+                                searches.get(),
+                                writes.get(),
+                                deletes.get(),
+                                finalLiveWriterKeys
+                            });
+                }
+            } finally {
+                // Shut down aggressively: if any worker is still alive (e.g. a deadlock
+                // we're meant to detect) this surfaces it as a clean test failure
+                // rather than a leaked non-daemon thread polluting the surefire fork.
+                pool.shutdownNow();
+                assertTrue("thread pool did not shut down cleanly",
+                        pool.awaitTermination(30, TimeUnit.SECONDS));
             }
-
-            assertEquals("tree size mismatch after concurrent run",
-                    snapshotKeys + finalLiveWriterKeys, blink.size());
-
-            System.out.println("BLinkConcurrentSearchInsertTest done — searches="
-                    + searches.get() + " writes=" + writes.get()
-                    + " deletes=" + deletes.get()
-                    + " liveWriterKeys=" + finalLiveWriterKeys);
         }
     }
 }
