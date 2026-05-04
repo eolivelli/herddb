@@ -625,22 +625,64 @@ public class DropTableIndexCleanupTest {
         Path logDir = folder.newFolder("log").toPath();
         Path dataDir = folder.newFolder("data").toPath();
 
-        IndexingServiceEngine engine = new IndexingServiceEngine(
-                logDir, dataDir, configuration());
-        engine.setMetadataStorageManager(newMeta());
-
         MemoryDataStorageManager backing = new MemoryDataStorageManager();
-        RecordingDataStorageManager dsm = new RecordingDataStorageManager(backing);
-        engine.setDataStorageManager(dsm);
+        // Don't recycle dsm across two engines — engine.close() closes
+        // its DSM, so we wrap with NonClosingDataStorageManager-style
+        // guard via a tiny inline subclass.
+        DataStorageManager sharedDsm = new ForwardingDataStorageManager(backing) {
+            @Override
+            public void close() {
+                // no-op — backing is owned by the test fixture
+            }
+        };
+        RecordingDataStorageManager dsm = new RecordingDataStorageManager(sharedDsm);
         MemoryManager mm = new MemoryManager(
                 64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+        MemoryMetadataStorageManager meta = newMeta();
 
+        // Captures the snapshot saved by engine A so engine B can
+        // load it on restart — this is what puts PROP_IS_STORE_UUID
+        // into engine B's SchemaTracker via installSchemaFromSnapshot.
+        java.util.concurrent.atomic.AtomicReference<WatermarkSnapshot> savedSnapshot =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        WatermarkStore watermarkStore = new WatermarkStore() {
+            @Override
+            public WatermarkSnapshot load() {
+                WatermarkSnapshot s = savedSnapshot.get();
+                return s != null ? s : WatermarkSnapshot.START_OF_TIME;
+            }
+
+            @Override
+            public void save(WatermarkSnapshot snapshot) throws IOException {
+                savedSnapshot.set(snapshot);
+            }
+        };
+
+        Table table = buildTable("ttable");
+        Index ix = buildVectorIndex("vidx", "ttable");
+        Random rng = new Random(31);
+
+        // ---- Engine A: CREATE + ingest + checkpoint ----
+        IndexingServiceEngine engineA = new IndexingServiceEngine(
+                logDir, dataDir, configuration());
+        engineA.setMetadataStorageManager(meta);
+        engineA.setDataStorageManager(dsm);
+        // Factory mirroring production: honours PROP_IS_STORE_UUID when
+        // present in indexProperties (snapshot-restored Index objects).
+        // Without honouring it, the test factory cannot detect the
+        // UUID-reuse race the TRUNCATE handler must avoid.
         List<String> createdUuids = new ArrayList<>();
-        engine.setVectorStoreFactory((indexName, tableName, vectorColumnName,
-                                       dataDirectory, indexProperties) -> {
+        VectorStoreFactory factoryA = (indexName, tableName, vectorColumnName,
+                                        dataDirectory, indexProperties) -> {
+            String savedUuid = indexProperties != null
+                    ? indexProperties.get(IndexingServiceEngine.PROP_IS_STORE_UUID)
+                    : null;
+            String effectiveUuid = (savedUuid != null && !savedUuid.isEmpty())
+                    ? savedUuid
+                    : indexName + "_" + tableName + "_" + System.nanoTime();
             PersistentVectorStore real = new PersistentVectorStore(
-                    indexName, tableName, engine.getTableSpaceUUID(), vectorColumnName,
-                    dataDirectory, dsm, mm,
+                    indexName, tableName, engineA.getTableSpaceUUID(), vectorColumnName,
+                    effectiveUuid, dataDirectory, dsm, mm,
                     16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
                     Long.MAX_VALUE,
                     VectorSimilarityFunction.EUCLIDEAN);
@@ -653,88 +695,133 @@ public class DropTableIndexCleanupTest {
                 createdUuids.add(real.getStoreUUID());
             }
             return real;
-        });
-        engine.setWatermarkStore(new WatermarkStore() {
-            @Override
-            public WatermarkSnapshot load() {
-                return WatermarkSnapshot.START_OF_TIME;
-            }
-
-            @Override
-            public void save(WatermarkSnapshot snapshot) throws IOException {
-            }
-        });
-
-        Table table = buildTable("ttable");
-        Index ix = buildVectorIndex("vidx", "ttable");
-        Random rng = new Random(31);
-
+        };
+        engineA.setVectorStoreFactory(factoryA);
+        engineA.setWatermarkStore(watermarkStore);
         try {
-            engine.start();
-            engine.applyEntry(new LogSequenceNumber(1, 1),
+            engineA.start();
+            engineA.applyEntry(new LogSequenceNumber(1, 1),
                     LogEntryFactory.createTable(table, null));
-            engine.applyEntry(new LogSequenceNumber(1, 2),
+            engineA.applyEntry(new LogSequenceNumber(1, 2),
                     LogEntryFactory.createIndex(ix, null));
-
-            // Pre-truncate: ingest 30 vectors and verify they are searchable.
             LogSequenceNumber last = null;
             for (int i = 0; i < 30; i++) {
                 Record rec = RecordSerializer.makeRecord(table,
                         "pk", "pre_" + i, "vec", randomVec(rng));
                 last = new LogSequenceNumber(1, 100 + i);
-                engine.applySingleEntryForTest(last,
+                engineA.applySingleEntryForTest(last,
                         LogEntryFactory.insert(table, rec.key, rec.value, null));
             }
-            engine.awaitPendingWorkForTest();
-            engine.setLastProcessedLsnForTest(last);
-            engine.forceCheckpointAndSaveWatermark();
-            assertEquals("pre-truncate inserts must be searchable",
-                    5, engine.search("default", "ttable", "vidx",
-                            randomVec(new Random(1)), 5).size());
+            engineA.awaitPendingWorkForTest();
+            engineA.setLastProcessedLsnForTest(last);
+            engineA.forceCheckpointAndSaveWatermark();
+        } finally {
+            engineA.close();
+        }
 
-            // ---- TRUNCATE_TABLE ----
-            engine.applyEntry(new LogSequenceNumber(1, 500),
+        // The saved snapshot must now carry PROP_IS_STORE_UUID — this
+        // is what installSchemaFromSnapshot will inject into engine B's
+        // SchemaTracker, and what the TRUNCATE handler must strip.
+        WatermarkSnapshot snap = savedSnapshot.get();
+        assertNotNull("checkpoint must save a snapshot", snap);
+        assertTrue("snapshot must carry schema", snap.hasSchema());
+        String snapshotUuid = snap.vectorIndexes.get(0).properties
+                .get(IndexingServiceEngine.PROP_IS_STORE_UUID);
+        assertNotNull("snapshot must embed PROP_IS_STORE_UUID for the vector index",
+                snapshotUuid);
+        assertEquals("snapshot UUID must equal the create UUID",
+                createdUuids.get(0), snapshotUuid);
+
+        // ---- Engine B: restart from snapshot, then TRUNCATE ----
+        // Engine B's installSchemaFromSnapshot puts the saved
+        // PROP_IS_STORE_UUID-bearing Index into SchemaTracker. The
+        // TRUNCATE handler then iterates schemaTracker.getAllIndexes()
+        // and serialises those Index instances — so the stripping of
+        // PROP_IS_STORE_UUID must happen exactly there.
+        IndexingServiceEngine engineB = new IndexingServiceEngine(
+                logDir, dataDir, configuration());
+        engineB.setMetadataStorageManager(meta);
+        engineB.setDataStorageManager(dsm);
+        VectorStoreFactory factoryB = (indexName, tableName, vectorColumnName,
+                                        dataDirectory, indexProperties) -> {
+            String savedUuid = indexProperties != null
+                    ? indexProperties.get(IndexingServiceEngine.PROP_IS_STORE_UUID)
+                    : null;
+            String effectiveUuid = (savedUuid != null && !savedUuid.isEmpty())
+                    ? savedUuid
+                    : indexName + "_" + tableName + "_" + System.nanoTime();
+            PersistentVectorStore real = new PersistentVectorStore(
+                    indexName, tableName, engineB.getTableSpaceUUID(), vectorColumnName,
+                    effectiveUuid, dataDirectory, dsm, mm,
+                    16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                    Long.MAX_VALUE,
+                    VectorSimilarityFunction.EUCLIDEAN);
+            try {
+                real.start();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            synchronized (createdUuids) {
+                createdUuids.add(real.getStoreUUID());
+            }
+            return real;
+        };
+        engineB.setVectorStoreFactory(factoryB);
+        engineB.setWatermarkStore(watermarkStore);
+        try {
+            engineB.start();
+            // engine B re-created the store at the SAME UUID via
+            // installSchemaFromSnapshot's PROP_IS_STORE_UUID branch.
+            String engineBInitialUuid;
+            synchronized (createdUuids) {
+                engineBInitialUuid = createdUuids.get(createdUuids.size() - 1);
+            }
+            assertEquals("engine B must re-attach to the snapshot's store UUID",
+                    snapshotUuid, engineBInitialUuid);
+
+            // ---- TRUNCATE_TABLE on engine B ----
+            engineB.applyEntry(new LogSequenceNumber(2, 1),
                     LogEntryFactory.truncate(table, null));
-            engine.awaitPendingWorkForTest();
-            engine.awaitPendingDeletionsForTest();
+            engineB.awaitPendingWorkForTest();
+            engineB.awaitPendingDeletionsForTest();
 
-            // Index is still tracked (TRUNCATE keeps schema).
             assertEquals("TRUNCATE_TABLE must keep the index registered in the engine",
-                    1, engine.listIndexes().size());
+                    1, engineB.listIndexes().size());
 
-            // The store has been re-created with a fresh UUID.
-            String preTruncateUuid;
+            // The TRUNCATE refresh MUST have produced a NEW UUID
+            // distinct from snapshotUuid — otherwise the in-flight
+            // DROP cleanup of snapshotUuid races the freshly-created
+            // store's writes (issue #383 review).
             String postTruncateUuid;
             synchronized (createdUuids) {
-                assertEquals("vector store factory must have been invoked twice "
-                                + "(initial create + post-truncate refresh)",
-                        2, createdUuids.size());
-                preTruncateUuid = createdUuids.get(0);
-                postTruncateUuid = createdUuids.get(1);
+                postTruncateUuid = createdUuids.get(createdUuids.size() - 1);
             }
-            assertFalse("post-truncate store UUID must differ from the pre-truncate one",
-                    preTruncateUuid.equals(postTruncateUuid));
+            assertFalse(
+                    "post-truncate store UUID must differ from the snapshot's "
+                            + "PROP_IS_STORE_UUID; otherwise the async DROP cleanup of the "
+                            + "old store wipes the freshly-truncated store's writes "
+                            + "(issue #383 review)",
+                    snapshotUuid.equals(postTruncateUuid));
 
-            // Search returns zero hits — the data was wiped, but the
-            // store is responsive (no exception, no NULL store warning).
+            // Search returns zero hits — the data was wiped — and the
+            // store is responsive (no exception, no NULL-store warning).
             assertEquals("post-truncate search must return zero hits",
-                    0, engine.search("default", "ttable", "vidx",
+                    0, engineB.search("default", "ttable", "vidx",
                             randomVec(new Random(1)), 5).size());
 
             // Refill: subsequent INSERTs land normally and are searchable.
             for (int i = 0; i < 7; i++) {
                 Record rec = RecordSerializer.makeRecord(table,
                         "pk", "post_" + i, "vec", randomVec(rng));
-                last = new LogSequenceNumber(1, 1000 + i);
-                engine.applySingleEntryForTest(last,
+                engineB.applySingleEntryForTest(new LogSequenceNumber(2, 1000 + i),
                         LogEntryFactory.insert(table, rec.key, rec.value, null));
             }
-            engine.awaitPendingWorkForTest();
+            engineB.awaitPendingWorkForTest();
             assertEquals("post-truncate inserts must land in the refreshed store",
-                    7, engine.search("default", "ttable", "vidx",
+                    7, engineB.search("default", "ttable", "vidx",
                             randomVec(new Random(1)), 100).size());
         } finally {
-            engine.close();
+            engineB.close();
         }
     }
 

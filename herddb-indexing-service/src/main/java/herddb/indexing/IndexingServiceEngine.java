@@ -1208,14 +1208,18 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             return;
         }
         try {
-            // Prune already-completed entries first so the list does not
-            // grow without bound under workloads that DROP many indexes
-            // over the engine's lifetime — each retained Future would
-            // otherwise pin its captured AbstractVectorStore (issue #383
-            // review).
-            pendingDropTasks.removeIf(Future::isDone);
             Future<?> f = exec.submit(task);
-            pendingDropTasks.add(f);
+            // Prune already-completed entries and add the new one under
+            // the same lock used by awaitPendingDeletionsForTest, so a
+            // test waiting on the snapshot never observes a partially-
+            // pruned state. Pruning prevents unbounded growth under
+            // workloads that DROP many indexes — each retained Future
+            // would otherwise pin its captured AbstractVectorStore
+            // (issue #383 review).
+            synchronized (pendingDropTasks) {
+                pendingDropTasks.removeIf(Future::isDone);
+                pendingDropTasks.add(f);
+            }
         } catch (java.util.concurrent.RejectedExecutionException e) {
             // Executor shut down between the isShutdown() probe and submit()
             // — fall back to inline execution.
@@ -1223,17 +1227,6 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
     }
 
-    /**
-     * Test hook: blocks until every {@code DROP_INDEX} / {@code DROP_TABLE}
-     * cleanup task submitted via {@link #submitVectorStoreDeletion} has
-     * completed. Used by tests that assert on the on-storage state right
-     * after applying a DROP entry.
-     *
-     * <p>Public (rather than package-private) because the full-cluster
-     * integration tests live in {@code herddb-services} and need to wait
-     * for DROP cleanup to settle before asserting on the file-server
-     * disk layout.
-     */
     /**
      * Test hook: drains the shadow reload executor so any reload tasks
      * already enqueued have completed before the caller observes
@@ -1261,6 +1254,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
     }
 
+    /**
+     * Test hook: blocks until every {@code DROP_INDEX} / {@code DROP_TABLE}
+     * cleanup task submitted via {@link #submitVectorStoreDeletion} has
+     * completed. Used by tests that assert on the on-storage state right
+     * after applying a DROP entry.
+     *
+     * <p>Public (rather than package-private) because the full-cluster
+     * integration tests live in {@code herddb-services} and need to wait
+     * for DROP cleanup to settle before asserting on the file-server
+     * disk layout.
+     */
     public void awaitPendingDeletionsForTest() {
         java.util.List<Future<?>> snapshot;
         synchronized (pendingDropTasks) {
@@ -1432,14 +1436,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 for (Map.Entry<String, AbstractVectorStore> dropped : toClose) {
                     submitVectorStoreDeletion(dropped.getKey(), dropped.getValue());
                 }
-                // Re-create each vector store with a fresh storage UUID
-                // (createVectorStoreIfNeeded delegates to the factory,
-                // which derives a fresh nanoTime-based UUID when no
-                // PROP_IS_STORE_UUID is present in the index properties).
+                // Re-create each vector store with a fresh storage UUID.
+                // Critical: strip any pre-existing PROP_IS_STORE_UUID
+                // before serialising, otherwise the factory's
+                // savedUUID branch (start() line ~620) reuses the OLD
+                // store UUID — which the async submitVectorStoreDeletion
+                // task above is about to wipe. That race silently
+                // deletes the freshly-truncated index's writes (issue
+                // #383 review). Stripping the property forces the
+                // factory's fresh-nanoTime branch.
                 for (Index idx : toRefresh) {
+                    Index rebuilt = rebuildIndexWithoutStoreUuid(idx);
                     LogEntry synth = new LogEntry(System.currentTimeMillis(),
-                            LogEntryType.CREATE_INDEX, 0L, idx.table, null,
-                            herddb.utils.Bytes.from_array(idx.serialize()));
+                            LogEntryType.CREATE_INDEX, 0L, rebuilt.table, null,
+                            herddb.utils.Bytes.from_array(rebuilt.serialize()));
                     createVectorStoreIfNeeded(synth);
                 }
                 break;
@@ -1780,6 +1790,36 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             schemaTracker.applyEntry(synth);
             createVectorStoreIfNeeded(synth);
         }
+    }
+
+    /**
+     * Returns a copy of {@code idx} with {@link #PROP_IS_STORE_UUID}
+     * stripped while every other property is preserved. Used by the
+     * TRUNCATE_TABLE handler before re-creating the vector store, to
+     * force {@link #createVectorStoreIfNeeded} (and the engine's
+     * factory) down the fresh-nanoTime UUID branch — without this the
+     * snapshot-restored {@code Index} still carries the OLD store UUID
+     * and the freshly-truncated store would race the in-flight DROP
+     * cleanup of that same UUID, silently wiping its writes (issue
+     * #383 review).
+     */
+    private static Index rebuildIndexWithoutStoreUuid(Index idx) {
+        if (!idx.properties.containsKey(PROP_IS_STORE_UUID)) {
+            return idx;
+        }
+        Index.Builder b = Index.builder()
+                .uuid(idx.uuid)
+                .name(idx.name)
+                .table(idx.table)
+                .tablespace(idx.tablespace)
+                .type(idx.type)
+                .column(idx.columnNames[0], idx.columns[0].type);
+        for (Map.Entry<String, String> e : idx.properties.entrySet()) {
+            if (!PROP_IS_STORE_UUID.equals(e.getKey())) {
+                b.property(e.getKey(), e.getValue());
+            }
+        }
+        return b.build();
     }
 
     /** Test- and diagnostics-only accessor for the engine lifecycle state. */
