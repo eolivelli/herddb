@@ -22,6 +22,7 @@ package herddb.cluster.bookkeeper;
 import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import static herddb.core.TestUtils.scan;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import herddb.cluster.BookkeeperCommitLog;
@@ -32,6 +33,7 @@ import herddb.core.TableSpaceManager;
 import herddb.model.ColumnTypes;
 import herddb.model.DataScanner;
 import herddb.model.StatementEvaluationContext;
+import herddb.model.StatementExecutionException;
 import herddb.model.Table;
 import herddb.model.TableSpace;
 import herddb.model.TransactionContext;
@@ -45,12 +47,15 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.logging.Logger;
 import org.apache.bookkeeper.client.BookKeeper;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
 @Category(ClusterTest.class)
 public class LedgerClosedTest extends BookkeeperFailuresBase {
+
+    private static final Logger LOGGER = Logger.getLogger(LedgerClosedTest.class.getName());
 
     @Test
     public void testLedgerClosedError() throws Exception {
@@ -95,9 +100,34 @@ public class LedgerClosedTest extends BookkeeperFailuresBase {
             // this may happen internally in BK in case of internal errors
             log.getWriter().getOut().close();
 
-            // we should recover
-            server.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1", RecordSerializer.
-                    makeRecord(table, "c", 4)), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+            // Without the old synchronized out.isClosed() pre-check in isWritable()
+            // (removed in issue #385 to eliminate lock contention), the closed handle
+            // is now detected ONLY when a write actually reaches BK and gets back a
+            // BKLedgerClosedException.  That first write fails asynchronously.
+            // BKLedgerClosedException does NOT mark the log as permanently failed
+            // (only BKLedgerFencedException and non-BKException do that), so the next
+            // write triggers rotation to a new ledger and succeeds.
+            try {
+                server.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1",
+                        RecordSerializer.makeRecord(table, "c", 4)),
+                        StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                        TransactionContext.NO_TRANSACTION);
+            } catch (StatementExecutionException firstFail) {
+                // Expected: the first write was sent to the now-closed BK handle and
+                // bounced back as BKLedgerClosedException before the rotation could happen.
+                LOGGER.info("testLedgerClosedError: first write after unexpected BK close failed"
+                        + " as expected: " + firstFail.getMessage());
+            }
+
+            // The log must NOT be permanently failed — BKLedgerClosedException allows rotation.
+            assertFalse("log must not be permanently failed after BKLedgerClosedException", log.isFailed());
+
+            // The second write triggers rotation (isWritable()==false due to errorOccurredDuringWrite),
+            // openNewLedger() is allowed (BKLedgerClosedException is not in the rotation guard),
+            // and the write goes to the new ledger.
+            server.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1",
+                    RecordSerializer.makeRecord(table, "c", 4)),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
                     TransactionContext.NO_TRANSACTION);
 
             assertNotEquals(ledgerId, log.getWriter().getOut().getId());

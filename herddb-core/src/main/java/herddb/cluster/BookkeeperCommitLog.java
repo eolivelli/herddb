@@ -141,6 +141,26 @@ public class BookkeeperCommitLog extends CommitLog {
         private final AtomicLong pendingAdds = new AtomicLong();
         private final AtomicReference<Throwable> writeError = new AtomicReference<>();
 
+        /**
+         * Local cache of the ledger's closed state. Set to {@code true} in
+         * {@link #close()} (always called under the outer write lock) so that
+         * {@link #isWritable()} can check closure without acquiring the
+         * intrinsic {@code synchronized} lock on the BookKeeper
+         * {@link WriteHandle} instance, eliminating monitor contention under
+         * concurrent ingest (issue #385).
+         */
+        private volatile boolean outClosed = false;
+
+        /**
+         * Running count of serialised bytes sent to BookKeeper, used in place
+         * of {@link WriteHandle#getLength()} (which is {@code synchronized} on
+         * the {@link WriteHandle} instance) in the hot {@link #isWritable()}
+         * check. Incremented <em>before</em> each {@code appendAsync} so the
+         * ledger is rolled conservatively (slightly early) rather than after the
+         * fact. Rolling early is safe: it just opens a new ledger.
+         */
+        private final AtomicLong localLength = new AtomicLong(0);
+
         private CommitFileWriter() throws LogNotAvailableException {
             try {
                 Map<String, byte[]> metadata = new HashMap<>();
@@ -268,9 +288,25 @@ public class BookkeeperCommitLog extends CommitLog {
             errorOccurredDuringWrite = true;
         }
 
+        // Visible for testing
+        public boolean isOutClosed() {
+            return outClosed;
+        }
+
+        // Visible for testing
+        public long getLocalLength() {
+            return localLength.get();
+        }
+
         public CompletableFuture<LogSequenceNumber> writeEntry(LogEntry edit) {
             // BK will release the buffer after handling the entry
             ByteBuf serialize = edit.serializeAsByteBuf();
+            // Capture size before appendAsync: BK releases the buffer after
+            // processing it, so readableBytes() would return 0 in the callback.
+            // We accumulate into localLength to avoid calling the synchronized
+            // WriteHandle.getLength() in isWritable() (issue #385).
+            int entryBytes = serialize.readableBytes();
+            localLength.addAndGet(entryBytes);
             pendingAdds.incrementAndGet();
             final CompletableFuture<LogSequenceNumber> res = this.out.appendAsync(serialize)
                     .handle((offset, error) -> {
@@ -310,6 +346,11 @@ public class BookkeeperCommitLog extends CommitLog {
         }
 
         public void close() throws LogNotAvailableException {
+            // Mark closed before the async call so that any concurrent
+            // isWritable() check (under the read lock) immediately sees the
+            // writer as non-writable, without entering the synchronized
+            // WriteHandle.isClosed() (issue #385).
+            outClosed = true;
             try {
                 LOGGER.log(Level.INFO, "{0} closing ledger {1}, with LastAddConfirmed={2}, LastAddPushed={3} length={4}, errorOccurred:{5}",
                         new Object[]{tableSpaceDescription(), out.getId(), out.getLastAddConfirmed(), out.getLastAddPushed(), out.getLength(), errorOccurredDuringWrite});
@@ -352,14 +393,17 @@ public class BookkeeperCommitLog extends CommitLog {
         }
 
         private boolean isWritable() {
+            // Use locally cached fields instead of the synchronized
+            // WriteHandle.isClosed() / WriteHandle.getLength() to avoid
+            // intrinsic-lock contention under concurrent ingest (issue #385).
             return !errorOccurredDuringWrite
-                    && !out.isClosed()
-                    && maxLedgerSizeBytes >= out.getLength();
+                    && !outClosed
+                    && maxLedgerSizeBytes >= localLength.get();
         }
 
         @Override
         public String toString() {
-            return "CommitFileWriter{" + "ledgerId=" + ledgerId + ", size=" + out.getLength() + ", errorOccurredDuringWrite=" + errorOccurredDuringWrite + ", pendingAdds=" + pendingAdds + '}';
+            return "CommitFileWriter{" + "ledgerId=" + ledgerId + ", size=" + localLength.get() + ", errorOccurredDuringWrite=" + errorOccurredDuringWrite + ", pendingAdds=" + pendingAdds + '}';
         }
 
     }
@@ -534,15 +578,17 @@ public class BookkeeperCommitLog extends CommitLog {
         LOGGER.log(Level.SEVERE, "bookkeeper async failure on tablespace " + tableSpaceDescription()
                 + " while writing entry " + edit, cause);
         if (cause instanceof BKException.BKLedgerClosedException) {
-            // BKLedgerClosedException on a write callback means the ledger was sealed by
-            // an external agent (e.g. full recovery open by another node).  A server-initiated
-            // close always drains pending adds before sealing, so it never produces a
-            // BKLedgerClosedException on the write path.  Treat this as a permanent failure:
-            // creating a new ledger here would allow writes to proceed on a potentially
-            // split-brained log.
-            LOGGER.log(Level.SEVERE, "ledger has been closed externally for tablespace "
-                    + tableSpaceDescription() + " — marking log as failed", cause);
-            signalLogFailed();
+            // BKLedgerClosedException on a write callback means BK has sealed the ledger.
+            // This typically happens when BK internally closes the handle due to an error
+            // (e.g. the local JVM-in-process bookie is stopped), NOT when another HerdDB
+            // leader takes over — leadership change goes through full recovery which uses
+            // fencing and produces BKLedgerFencedException, not BKLedgerClosedException.
+            // We do NOT mark the log as permanently failed here: rotation to a new ledger
+            // is safe and is the correct recovery path (issue #385).
+            // signalLogFailed() is intentionally omitted so that the next write attempt
+            // can call openNewLedger() and recover.
+            LOGGER.log(Level.SEVERE, "ledger has been closed by BK for tablespace "
+                    + tableSpaceDescription() + " — will rotate to a new ledger", cause);
         } else if (cause instanceof BKException.BKLedgerFencedException) {
             LOGGER.log(Level.SEVERE, "this server was fenced for tablespace " + tableSpaceDescription() + " !", cause);
             signalLogFailed();
@@ -568,16 +614,19 @@ public class BookkeeperCommitLog extends CommitLog {
                 throw new LogNotAvailableException("this log has is not allowed to write");
             }
             // Guard: if the current writer's write error indicates an unsafe rotation, abort.
-            // Three categories of write errors make rotation unsafe:
+            // Two categories of write errors make rotation unsafe:
             //   1. Non-BKException (e.g. RuntimeException from the JVM-local transport): the
             //      bookie's state is unknown; an external agent may have fenced us.
-            //   2. BKLedgerClosedException: the ledger was sealed by an external agent (a
-            //      server-initiated close always drains pending adds first and never produces
-            //      this error on a write callback).
-            //   3. BKLedgerFencedException: another leader has taken over the tablespace.
-            // In all three cases creating a new ledger would silently reset `failed=false`
-            // and allow writes to proceed on a potentially split-brained log.  Abort so the
-            // tablespace activator can perform a clean recovery.
+            //   2. BKLedgerFencedException: another HerdDB leader has taken over the tablespace
+            //      via full recovery (fencing).
+            // In both cases creating a new ledger would reset `failed=false` and allow writes
+            // to proceed on a potentially split-brained log.
+            //
+            // BKLedgerClosedException is intentionally NOT blocked here: it is raised when BK
+            // seals the ledger internally (e.g. internal error, or the test directly calling
+            // out.close()). Leadership change always goes through BK fencing which produces
+            // BKLedgerFencedException, NOT BKLedgerClosedException. Rotation is safe here.
+            //
             // Note: unwrap one layer of CompletionException / LogNotAvailableException
             // (same as handleBookKeeperFailure) before checking the exception type.
             if (writer != null && writer.errorOccurredDuringWrite) {
@@ -591,13 +640,12 @@ public class BookkeeperCommitLog extends CommitLog {
                         unwrapped = unwrapped.getCause();
                     }
                     if (!(unwrapped instanceof BKException)
-                            || unwrapped instanceof BKException.BKLedgerClosedException
                             || unwrapped instanceof BKException.BKLedgerFencedException) {
                         signalLogFailed();
                         throw new LogNotAvailableException(tableSpaceDescription()
                                 + ": aborting ledger rotation — previous ledger had a write error"
-                                + " indicating external fencing or closure, ledger state is"
-                                + " unknown: " + prevError);
+                                + " indicating external fencing or an unknown transport error,"
+                                + " ledger state is unknown: " + prevError);
                     }
                 }
             }
@@ -1040,10 +1088,11 @@ public class BookkeeperCommitLog extends CommitLog {
                     // by another node).  That would mean another leader has taken over and we
                     // must stop immediately to prevent split-brain — do not swallow it.
                     //
-                    // Note: BKLedgerClosedException and BKLedgerFencedException write-callback
-                    // errors are now blocked upstream in openNewLedger() (they indicate external
-                    // fencing/closure and make rotation unsafe), so we only ever reach this
-                    // branch for other transient BK write errors.
+                    // Note: BKLedgerFencedException write-callback errors are blocked upstream
+                    // in openNewLedger() (they indicate external fencing and make rotation
+                    // unsafe). BKLedgerClosedException is NOT blocked (it allows rotation;
+                    // see openNewLedger() comment). We only ever reach this branch for
+                    // transient BK write errors where closeAsync() also fails.
                     LOGGER.log(Level.INFO,
                             "{0} ignoring error closing an already-errored ledger (will open a new one): {1}",
                             new Object[]{tableSpaceDescription(), err.toString()});
