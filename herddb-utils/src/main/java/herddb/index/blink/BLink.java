@@ -57,6 +57,7 @@ import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.StampedLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
@@ -1710,19 +1711,46 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
         unlock(n.lock, locktype);
     }
 
-    private void lock(ReadWriteLock lock, int locktype) {
+    /**
+     * Acquire {@code lock} in the requested mode.
+     * <p>
+     * The {@link StampedLock#readLock()} / {@link StampedLock#writeLock()} stamps are
+     * intentionally discarded: BLink's per-node and anchor locks always follow a strict
+     * acquire-then-release pattern within the same operation, with no same-thread
+     * re-entrancy on the same lock instance and no read→write upgrade. The companion
+     * {@link #unlock(StampedLock, int)} releases via {@link StampedLock#tryUnlockRead()} /
+     * {@link StampedLock#tryUnlockWrite()}, which do not require the stamp.
+     * </p>
+     */
+    private void lock(StampedLock lock, int locktype) {
         if (locktype == READ_LOCK) {
-            lock.readLock().lock();
+            lock.readLock();
         } else {
-            lock.writeLock().lock();
+            lock.writeLock();
         }
     }
 
-    private void unlock(ReadWriteLock lock, int locktype) {
+    /**
+     * Release one hold of {@code lock} in the requested mode.
+     * <p>
+     * Uses the unstamped {@link StampedLock#tryUnlockRead()} /
+     * {@link StampedLock#tryUnlockWrite()} primitives so we don't have to thread
+     * stamps through every BLink call site. They release exactly one hold of the
+     * matching mode and return {@code false} if no such hold exists; we promote that
+     * to {@link IllegalMonitorStateException} so misuse is caught at the call site —
+     * the same observable behaviour as {@link StampedLock#unlockRead(long)} called
+     * with an invalid stamp.
+     * </p>
+     */
+    private void unlock(StampedLock lock, int locktype) {
         if (locktype == READ_LOCK) {
-            lock.readLock().unlock();
+            if (!lock.tryUnlockRead()) {
+                throw new IllegalMonitorStateException("read lock not held");
+            }
         } else {
-            lock.writeLock().unlock();
+            if (!lock.tryUnlockWrite()) {
+                throw new IllegalMonitorStateException("write lock not held");
+            }
         }
     }
 
@@ -1868,7 +1896,14 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
 //  end;
     private static class Anchor<X extends Comparable<X>, Y> {
 
-        final ReadWriteLock lock;
+        /**
+         * Anchor access lock. {@link StampedLock} is used instead of
+         * {@link ReentrantReadWriteLock} to drop the AQS {@code HoldCounter}
+         * {@link ThreadLocal} and shrink per-acquisition state transitions on
+         * the very hot anchor read path (every BLink {@code search} /
+         * {@code locate_leaf} reads the anchor).
+         */
+        final StampedLock lock;
 
         /*
          * Next fields won't need to be volatile. They are written only during write lock AND no other thread
@@ -1898,7 +1933,7 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
             this.topheight = topheight;
             this.first = first;
 
-            lock = new ReentrantReadWriteLock(false);
+            lock = new StampedLock();
         }
 
         public void reset(Node<X, Y> root) {
@@ -1925,15 +1960,19 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
         /**
          * Estimated constant memory overhead for a BLink Node object.
          * <p>
-         * Includes the Node instance itself, one TreeMap, and two ReentrantReadWriteLocks.
+         * Includes the Node instance itself, one TreeMap, one {@link StampedLock}
+         * (the per-node access lock) and one {@link ReentrantReadWriteLock}
+         * (the per-node load lock).
          * <p>
          * With compressed oops:
-         *   Node instance: 88 bytes, TreeMap: 48 bytes, 2x ReadWriteLock: 240 bytes = 376 bytes
+         *   Node instance: 88 bytes, TreeMap: 48 bytes,
+         *   StampedLock: ~64 bytes, ReentrantReadWriteLock: ~120 bytes = 320 bytes
          * <p>
          * Without compressed oops:
-         *   Node instance: 136 bytes, TreeMap: 64 bytes, 2x ReadWriteLock: 384 bytes = 584 bytes
+         *   Node instance: 136 bytes, TreeMap: 64 bytes,
+         *   StampedLock: ~96 bytes, ReentrantReadWriteLock: ~192 bytes = 488 bytes
          */
-        static final long NODE_CONSTANT_SIZE = ObjectSizeUtils.COMPRESSED_OOPS ? 376L : 584L;
+        static final long NODE_CONSTANT_SIZE = ObjectSizeUtils.COMPRESSED_OOPS ? 320L : 488L;
 
         /**
          * Estimated size of a single TreeMap.Entry (Red-Black tree node).
@@ -1957,9 +1996,18 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
         final boolean leaf;
 
         /**
-         * Node access lock
+         * Node access lock.
+         * <p>
+         * {@link StampedLock} is used instead of {@link ReentrantReadWriteLock}
+         * to drop the AQS {@code HoldCounter} {@link ThreadLocal} and shrink
+         * per-acquisition state transitions on the BLink search path, which
+         * acquires this read lock on every node along the descent. BLink locks
+         * each node with a strict acquire/release pattern (no same-thread
+         * re-entrancy on the same node), so the non-reentrant
+         * {@link StampedLock} is a safe drop-in.
+         * </p>
          */
-        final ReadWriteLock lock;
+        final StampedLock lock;
 
         /**
          * Node data load/unload lock ({@link #map})
@@ -2006,7 +2054,7 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
 
             this.rightsep = rightsep;
 
-            this.lock = new ReentrantReadWriteLock(false);
+            this.lock = new StampedLock();
             this.loadLock = new ReentrantReadWriteLock(false);
 
             this.map = newNodeMap();
@@ -2044,7 +2092,7 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
 
             this.rightsep = metadata.rightsep;
 
-            this.lock = new ReentrantReadWriteLock(false);
+            this.lock = new StampedLock();
             this.loadLock = new ReentrantReadWriteLock(false);
 
             this.map = newNodeMap();
