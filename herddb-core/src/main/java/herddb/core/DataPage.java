@@ -51,6 +51,10 @@ public class DataPage extends Page<TableManager> {
         return Record.estimateSize(key, value) + DataPage.CONSTANT_ENTRY_BYTE_SIZE;
     }
 
+    public static long estimateEntrySize(Bytes key, Bytes value) {
+        return Record.estimateSize(key, value) + DataPage.CONSTANT_ENTRY_BYTE_SIZE;
+    }
+
     public static long estimateEntrySize(Record record) {
         return record.getEstimatedSize() + DataPage.CONSTANT_ENTRY_BYTE_SIZE;
     }

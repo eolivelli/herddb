@@ -1466,9 +1466,9 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
          the insert will update the 'maxKey' for auto_increment primary keys
          */
         Bytes key;
-        byte[] value;
+        Bytes value;
         try {
-            key = Bytes.from_array(insert.getKeyFunction().computeNewValue(null, context, tableContext));
+            key = insert.getKeyFunction().computeNewValue(null, context, tableContext);
             value = insert.getValuesFunction().computeNewValue(new Record(key, null), context, tableContext);
         } catch (StatementExecutionException validationError) {
             return Futures.exception(validationError);
@@ -1479,7 +1479,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         Map<String, AbstractIndexManager> indexes = tableSpaceManager.getIndexesOnTable(table.name);
         if (indexes != null || table.foreignKeys != null) {
             try {
-                DataAccessor values = new Record(key, Bytes.from_array(value)).getDataAccessor(table);
+                DataAccessor values = new Record(key, value).getDataAccessor(table);
                 if (table.foreignKeys != null) {
                     for (ForeignKeyDef fk : table.foreignKeys) {
                         checkForeignKeyConstraintsAsChildTable(fk, values, context, transaction);
@@ -1567,15 +1567,15 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         if (res == null) {
             LogEntry entry;
             if (fallbackToUpsert) {
-                entry = LogEntryFactory.update(table, key, Bytes.from_array(value), transaction);
+                entry = LogEntryFactory.update(table, key, value, transaction);
             } else {
-                entry = LogEntryFactory.insert(table, key, Bytes.from_array(value), transaction);
+                entry = LogEntryFactory.insert(table, key, value, transaction);
             }
             CommitLogResult pos = log.log(entry, entry.transactionId <= 0);
             res = pos.logSequenceNumber.thenApplyAsync((lsn) -> {
                 apply(pos, entry, false);
                 return new DMLStatementExecutionResult(entry.transactionId, 1, key,
-                        insert.isReturnValues() ? Bytes.from_array(value) : null);
+                        insert.isReturnValues() ? value : null);
             }, tableSpaceManager.getCallbacksExecutor());
         }
         if (uniqueIndexes != null) {
@@ -1861,7 +1861,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 //        LOGGER.log(Level.SEVERE, "executeUpdateAsync, " + update + ", transaction " + transaction);
         AtomicInteger updateCount = new AtomicInteger();
         Holder<Bytes> lastKey = new Holder<>();
-        Holder<byte[]> lastValue = new Holder<>();
+        Holder<Bytes> lastValue = new Holder<>();
         /*
          an update can succeed only if the row is valid, the key is contains in the "keys" structure
          the update will simply override the value of the row, assigning a null page to the row
@@ -1881,7 +1881,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 public void accept(Record current, LockHandle lockHandle) throws StatementExecutionException, LogNotAvailableException, DataStorageManagerException {
 
                     List<UniqueIndexLockReference> uniqueIndexes = null;
-                    byte[] newValue;
+                    Bytes newValue;
                     try {
                         if (childrenTables != null) {
                             DataAccessor currentValues = current.getDataAccessor(table);
@@ -1891,7 +1891,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                         }
                         newValue = function.computeNewValue(current, context, tableContext);
                         if (indexes != null || table.foreignKeys != null) {
-                            DataAccessor values = new Record(current.key, Bytes.from_array(newValue)).getDataAccessor(table);
+                            DataAccessor values = new Record(current.key, newValue).getDataAccessor(table);
                             if (table.foreignKeys != null) {
                                 for (ForeignKeyDef fk : table.foreignKeys) {
                                     checkForeignKeyConstraintsAsChildTable(fk, values, context, transaction);
@@ -1946,7 +1946,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                         return;
                     }
 
-                    LogEntry entry = LogEntryFactory.update(table, current.key, Bytes.from_array(newValue), transaction);
+                    LogEntry entry = LogEntryFactory.update(table, current.key, newValue, transaction);
                     CommitLogResult pos = log.log(entry, entry.transactionId <= 0);
                     final List<UniqueIndexLockReference> _uniqueIndexes = uniqueIndexes;
                     writes.add(pos.logSequenceNumber.thenApply(lsn -> new PendingLogEntryWork(entry, pos, lockHandle, _uniqueIndexes)));
@@ -1980,7 +1980,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                     }, tableSpaceManager.getCallbacksExecutor())
                     .thenApply((pending) -> {
                         return new DMLStatementExecutionResult(transactionId, updateCount.get(), lastKey.value,
-                                update.isReturnValues() ? (lastValue.value != null ? Bytes.from_array(lastValue.value) : null) : null);
+                                update.isReturnValues() ? lastValue.value : null);
                     });
         } else {
             return Futures
@@ -2000,7 +2000,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                     }, tableSpaceManager.getCallbacksExecutor())
                     .thenApply((pendings) -> {
                         return new DMLStatementExecutionResult(transactionId, updateCount.get(), lastKey.value,
-                                update.isReturnValues() ? (lastValue.value != null ? Bytes.from_array(lastValue.value) : null) : null);
+                                update.isReturnValues() ? lastValue.value : null);
                     });
         }
 
@@ -3049,7 +3049,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     ) {
         Bytes key;
         try {
-            key = Bytes.from_nullable_array(get.getKey().computeNewValue(null, context, tableContext));
+            key = get.getKey().computeNewValue(null, context, tableContext);
         } catch (StatementExecutionException validationError) {
             return Futures.exception(validationError);
         }
@@ -4528,7 +4528,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                     // this is the most common case for UPDATE-BY-PK and SELECT-BY-PK
                     // no need to craete and use Streams
                     PrimaryIndexSeek seek = (PrimaryIndexSeek) indexOperation;
-                    Bytes value = Bytes.from_array(seek.value.computeNewValue(null, context, tableContext));
+                    Bytes value = seek.value.computeNewValue(null, context, tableContext);
                     Long page = keyToPage.get(value);
                     if (page != null) {
                         Map.Entry<Bytes, Long> singleEntry =

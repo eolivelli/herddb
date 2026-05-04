@@ -102,18 +102,18 @@ public class ReplaceOp implements PlannerOp {
                     transactionContext = new TransactionContext(transactionId);
                 }
                 Bytes oldKey = RecordSerializer.serializeIndexKey(row, table, table.getPrimaryKey());
-                byte[] oldValue = RecordSerializer.serializeValueRaw(row.toMap(), table, -1);
+                Bytes oldValue = RecordSerializer.serializeValueRaw(row.toMap(), table, -1);
 
                 DMLStatement deleteStatement = new DeleteStatement(tableSpace, tableName, oldKey, null);
                 statements.add(deleteStatement);
 
-                Record oldRecord = new Record(oldKey, Bytes.from_array(oldValue));
+                Record oldRecord = new Record(oldKey, oldValue);
 
-                byte[] newKey = this.keyFunction.computeNewValue(oldRecord, context, tableContext);
-                byte[] newValue = this.recordFunction.computeNewValue(oldRecord, context, tableContext);
+                Bytes newKey = this.keyFunction.computeNewValue(oldRecord, context, tableContext);
+                Bytes newValue = this.recordFunction.computeNewValue(oldRecord, context, tableContext);
 
                 DMLStatement insertStatement = new InsertStatement(tableSpace, tableName,
-                        new Record(Bytes.from_array(newKey), Bytes.from_array(newValue)))
+                        new Record(newKey, newValue))
                         .setReturnValues(returnValues);
 
                 statements.add(insertStatement);
