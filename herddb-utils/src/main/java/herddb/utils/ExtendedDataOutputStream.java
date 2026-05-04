@@ -24,6 +24,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Objects;
 
 /**
  * Extended version of DataInputStream
@@ -153,6 +154,7 @@ public final class ExtendedDataOutputStream extends DataOutputStream {
      * @param str string to encode (must not be {@code null})
      */
     public void writeUtf8String(String str) throws IOException {
+        Objects.requireNonNull(str, "str");
         byte[] bytes = str.getBytes(StandardCharsets.UTF_8);
         writeVInt(bytes.length);
         write(bytes);

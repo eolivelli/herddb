@@ -71,14 +71,20 @@ public class LogEntry {
 
     public ByteBuf serializeAsByteBuf() {
         ByteBuf buffer = PooledByteBufAllocator.DEFAULT.directBuffer(DEFAULT_BUFFER_SIZE);
+        boolean handedOff = false;
         try {
             serializeTo(buffer);
+            handedOff = true;
             return buffer;
-        } catch (RuntimeException err) {
+        } finally {
             // Plug a latent leak: release the pooled buffer if encoding fails
-            // (e.g. an unsupported entry type).
-            buffer.release();
-            throw err;
+            // (e.g. an unsupported entry type, or an Error such as OOM while
+            // the buffer is being grown by Netty). The previous implementation
+            // wrapped only IOException and leaked the buffer on every other
+            // throwable.
+            if (!handedOff) {
+                buffer.release();
+            }
         }
     }
 

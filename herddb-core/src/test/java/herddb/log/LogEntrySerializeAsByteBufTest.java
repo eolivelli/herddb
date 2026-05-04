@@ -296,4 +296,105 @@ public class LogEntrySerializeAsByteBufTest {
             // ok
         }
     }
+
+    /**
+     * Truncating a serialized entry at <em>any</em> offset must surface as an
+     * {@link EOFException} (or, for cuts that land mid-{@code vint}, as
+     * {@link EOFException}/{@link RuntimeException}/{@link IllegalArgumentException}
+     * depending on which field was truncated) — never as a silently-decoded
+     * garbage entry. Recovery relies on this contract to detect a partial
+     * trailing entry on a crashed log file. Exercises every cut point from 1
+     * byte up to {@code N - 1} bytes.
+     */
+    @Test
+    public void testTruncatedBufferAtEveryOffset() {
+        LogEntry entry = new LogEntry(1L, LogEntryType.INSERT, 1L, "t1", b("k"), b("v"));
+        byte[] full = entry.serialize();
+        for (int len = 1; len < full.length; len++) {
+            byte[] truncated = new byte[len];
+            System.arraycopy(full, 0, truncated, 0, len);
+            try {
+                LogEntry.deserialize(truncated);
+                fail("expected EOFException/RuntimeException/IllegalArgumentException for truncation at len="
+                        + len + " (full=" + full.length + ")");
+            } catch (EOFException expected) {
+                // ok — surfaced as EOF, recovery treats this as the end of the log
+            // CHECKSTYLE.OFF: IllegalCatch — IllegalArgumentException can be thrown
+            // by the type-switch when a vint cut lands mid-bytes and produces a
+            // bogus type code; RuntimeException is thrown by deserialize when
+            // readArray reads a negative length other than -1 (mid-vint cut).
+            // Both of these behaviours are acceptable: the test asserts that
+            // truncation never silently decodes to a valid LogEntry.
+            } catch (IllegalArgumentException expected) {
+                // ok
+            } catch (RuntimeException expected) {
+                // ok — wraps the underlying I/O error from a mid-vint cut
+            }
+            // CHECKSTYLE.ON: IllegalCatch
+        }
+    }
+
+    /**
+     * A {@code Bytes} key/value containing every byte value 0x00..0xFF must
+     * round-trip cleanly. Particularly important because the new wire format
+     * uses negative vint values (specifically -1) to encode null arrays, so a
+     * payload with an embedded 0xFF byte must not be confused with a length
+     * prefix.
+     */
+    @Test
+    public void testKeyAndValueWithAllByteValues() throws Exception {
+        byte[] all = new byte[256];
+        for (int i = 0; i < 256; i++) {
+            all[i] = (byte) i;
+        }
+        Bytes key = Bytes.from_array(all);
+        Bytes value = Bytes.from_array(all.clone());
+        LogEntry entry = new LogEntry(1L, LogEntryType.INSERT, 1L, "t1", key, value);
+        assertRoundTrip(entry);
+
+        // Also via the Stream-writer path:
+        byte[] streamBytes = entry.serialize();
+        LogEntry decoded = LogEntry.deserialize(streamBytes);
+        assertArrayEquals("key bytes must round-trip exactly", all, decoded.key.to_array());
+        assertArrayEquals("value bytes must round-trip exactly", all, decoded.value.to_array());
+    }
+
+    /**
+     * Asserts that {@code LogEntry.serialize()} (the Stream-based byte[] write
+     * path) produces output that {@code LogEntry.deserialize(byte[])} decodes
+     * into an equal entry, for every {@link LogEntryType}. The other tests in
+     * this class compare the ByteBuf path against the Stream path (proving they
+     * agree byte-for-byte), but none of them prove the Stream path's bytes are
+     * actually decodable end-to-end. This test closes that gap.
+     */
+    @Test
+    public void testStreamWritePathRoundTripsForEveryType() throws Exception {
+        List<LogEntry> all = new ArrayList<>();
+        all.add(new LogEntry(1L, LogEntryType.INSERT, 1L, "t1", b("k"), b("v")));
+        all.add(new LogEntry(1L, LogEntryType.UPDATE, 1L, "t1", b("k"), b("v")));
+        all.add(new LogEntry(1L, LogEntryType.DELETE, 1L, "t1", b("k"), null));
+        all.add(new LogEntry(1L, LogEntryType.CREATE_TABLE, 0L, "t1", null, b("def")));
+        all.add(new LogEntry(1L, LogEntryType.ALTER_TABLE, 0L, "t1", null, b("def")));
+        all.add(new LogEntry(1L, LogEntryType.CREATE_INDEX, 0L, "t1", null, b("idef")));
+        all.add(new LogEntry(1L, LogEntryType.DROP_TABLE, 0L, "t1", null, null));
+        all.add(new LogEntry(1L, LogEntryType.TRUNCATE_TABLE, 0L, "t1", null, null));
+        all.add(new LogEntry(1L, LogEntryType.DROP_INDEX, 0L, null, null, b("ix1")));
+        all.add(new LogEntry(1L, LogEntryType.BEGINTRANSACTION, 7L, null, null, null));
+        all.add(new LogEntry(1L, LogEntryType.COMMITTRANSACTION, 7L, null, null, null));
+        all.add(new LogEntry(1L, LogEntryType.ROLLBACKTRANSACTION, 7L, null, null, null));
+        all.add(new LogEntry(1L, LogEntryType.NOOP, 0L, null, null, null));
+        all.add(new LogEntry(1L, LogEntryType.TABLE_CONSISTENCY_CHECK, 0L, "t1", null, b("checksum")));
+        all.add(new LogEntry(1L, LogEntryType.INDEXING_SERVICE_REBALANCE, 0L, null, null, b("payload")));
+
+        for (LogEntry entry : all) {
+            byte[] bytes = entry.serialize();
+            LogEntry decoded = LogEntry.deserialize(bytes);
+            assertEquals("type for " + entry, entry.type, decoded.type);
+            assertEquals("transactionId for " + entry, entry.transactionId, decoded.transactionId);
+            assertEquals("timestamp for " + entry, entry.timestamp, decoded.timestamp);
+            assertEquals("tableName for " + entry, entry.tableName, decoded.tableName);
+            assertBytesEqual("key for " + entry, entry.key, decoded.key);
+            assertBytesEqual("value for " + entry, entry.value, decoded.value);
+        }
+    }
 }

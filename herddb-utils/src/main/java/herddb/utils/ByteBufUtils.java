@@ -24,6 +24,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Utilities for write variable length values on {@link ByteBuf}.
@@ -107,6 +108,7 @@ public class ByteBufUtils {
      * @param str    string to encode (must not be {@code null})
      */
     public static void writeUtf8String(ByteBuf buffer, String str) {
+        Objects.requireNonNull(str, "str");
         int utf8Length = ByteBufUtil.utf8Bytes(str);
         writeVInt(buffer, utf8Length);
         ByteBufUtil.writeUtf8(buffer, str);
