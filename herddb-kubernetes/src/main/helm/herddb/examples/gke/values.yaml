@@ -433,15 +433,21 @@ indexingService:
     # Reuse the same Kubernetes Secret as the file server (S3_ACCESS_KEY / S3_SECRET_KEY).
     credentialsSecret: "herddb-gcs-credentials"
   resources:
-    # Bumped from 36 Gi to 40 Gi alongside the heap bump 24 g → 28 g (issue #360).
-    # Budget: 28 g heap + 10 g direct + 1 g JVM overhead = 39 g (< 40 GiB; 1 GiB headroom).
+    # Bumped from 40 Gi to 63 Gi (2026-05-01) after IS-1 was OOMKilled at the 40 GiB
+    # cgroup limit during a bigann 1B ingest run. The configured budget (28 g heap +
+    # 10 g direct + 1 g JVM overhead = 39 g) had only 1 GiB headroom under the cgroup
+    # ceiling — insufficient to absorb off-heap growth (Netty PoolArena fragmentation,
+    # native HNSW allocations, glibc arena overhead, jvector graph bytes underreported
+    # vs. the 15 GiB indexing.memory.vector.limit per issue #360). 63 GiB gives ~24 GiB
+    # headroom above the JVM-tracked 39 g budget, comfortably fitting on the
+    # c3-standard-22 nodes (86 GiB allocatable) currently provisioned by GKE Autopilot.
     # 2 replicas × 16 CPUs: each IS handles 4 of the 8 index shards (~500 M vectors/IS
     # for the bigann 1 B run).
     requests:
-      memory: "40Gi"
+      memory: "63Gi"
       cpu: "16"
     limits:
-      memory: "40Gi"
+      memory: "63Gi"
       cpu: "16"
 
 tools:
