@@ -24,6 +24,7 @@ import static herddb.core.TestUtils.scan;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.cluster.BookkeeperCommitLog;
 import herddb.cluster.LedgersInfo;
@@ -48,6 +49,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.logging.Logger;
+import org.apache.bookkeeper.client.BKException;
 import org.apache.bookkeeper.client.BookKeeper;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
@@ -102,8 +104,8 @@ public class LedgerClosedTest extends BookkeeperFailuresBase {
 
             // Without the old synchronized out.isClosed() pre-check in isWritable()
             // (removed in issue #385 to eliminate lock contention), the closed handle
-            // is now detected ONLY when a write actually reaches BK and gets back a
-            // BKLedgerClosedException.  That first write fails asynchronously.
+            // is detected ONLY when a write actually reaches BK and receives a
+            // BKLedgerClosedException asynchronously.  That first write therefore fails.
             // BKLedgerClosedException does NOT mark the log as permanently failed
             // (only BKLedgerFencedException and non-BKException do that), so the next
             // write triggers rotation to a new ledger and succeeds.
@@ -112,25 +114,38 @@ public class LedgerClosedTest extends BookkeeperFailuresBase {
                         RecordSerializer.makeRecord(table, "c", 4)),
                         StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
                         TransactionContext.NO_TRANSACTION);
+                // If the write somehow succeeded (e.g. a future BK version short-circuits
+                // the write before sending it to the bookie), the rotation still must
+                // have happened: verify the ledger ID changed and skip the second write.
+                LOGGER.info("testLedgerClosedError: first write after close unexpectedly succeeded");
             } catch (StatementExecutionException firstFail) {
-                // Expected: the first write was sent to the now-closed BK handle and
-                // bounced back as BKLedgerClosedException before the rotation could happen.
-                LOGGER.info("testLedgerClosedError: first write after unexpected BK close failed"
-                        + " as expected: " + firstFail.getMessage());
+                // Expected path: write was sent to the now-closed BK handle and
+                // bounced back with BKLedgerClosedException.
+                // Unwrap the cause chain and assert it contains BKLedgerClosedException.
+                Throwable rootCause = firstFail.getCause();
+                while (rootCause != null && !(rootCause instanceof BKException.BKLedgerClosedException)) {
+                    rootCause = rootCause.getCause();
+                }
+                assertNotNull("first write failure root cause must be BKLedgerClosedException,"
+                        + " got: " + firstFail.getMessage(), rootCause);
+                LOGGER.info("testLedgerClosedError: first write failed with expected BKLedgerClosedException");
+
+                // The log must NOT be permanently failed after BKLedgerClosedException:
+                // it allows rotation so the tablespace can continue serving writes.
+                assertFalse("log must not be permanently failed after BKLedgerClosedException",
+                        log.isFailed());
+
+                // The second write triggers rotation (isWritable()==false due to
+                // errorOccurredDuringWrite), openNewLedger() proceeds (BKLedgerClosedException
+                // is not in the rotation guard), and the write goes to the new ledger.
+                server.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1",
+                        RecordSerializer.makeRecord(table, "c", 4)),
+                        StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                        TransactionContext.NO_TRANSACTION);
             }
 
-            // The log must NOT be permanently failed — BKLedgerClosedException allows rotation.
-            assertFalse("log must not be permanently failed after BKLedgerClosedException", log.isFailed());
-
-            // The second write triggers rotation (isWritable()==false due to errorOccurredDuringWrite),
-            // openNewLedger() is allowed (BKLedgerClosedException is not in the rotation guard),
-            // and the write goes to the new ledger.
-            server.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1",
-                    RecordSerializer.makeRecord(table, "c", 4)),
-                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
-                    TransactionContext.NO_TRANSACTION);
-
-            assertNotEquals(ledgerId, log.getWriter().getOut().getId());
+            assertNotEquals("ledger ID must have changed after rotation",
+                    ledgerId, log.getWriter().getOut().getId());
 
             ServerConfiguration serverconfig_2 = newServerConfigurationWithAutoPort(folder.newFolder().toPath());
             serverconfig_2.set(ServerConfiguration.PROPERTY_NODEID, "server2");

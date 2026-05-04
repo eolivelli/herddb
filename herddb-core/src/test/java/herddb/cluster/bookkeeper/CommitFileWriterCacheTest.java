@@ -114,9 +114,13 @@ public class CommitFileWriterCacheTest {
     /**
      * Verifies that the {@code localLength} counter drives the ledger-roll
      * threshold.  We set {@code maxLedgerSizeBytes} to a small value and keep
-     * writing until the ledger ID changes, then assert that the new writer
-     * starts with a fresh (zero) {@code localLength} and that the previous
-     * writer had accumulated enough bytes to exceed the threshold.
+     * writing until the ledger ID changes, then assert that:
+     * <ul>
+     *   <li>the old writer's {@code localLength} crossed {@code maxLedgerSizeBytes}
+     *       (proving it was the size check that triggered the roll, not some
+     *       unrelated condition), and</li>
+     *   <li>the new writer starts with a fresh, smaller {@code localLength}.</li>
+     * </ul>
      */
     @Test
     public void testLocalLengthTriggersLedgerRoll() throws Exception {
@@ -141,6 +145,9 @@ public class CommitFileWriterCacheTest {
                 log.startWriting(1);
 
                 long initialLedgerId = log.getWriter().getLedgerId();
+                // Capture the initial writer reference before rotation so we can
+                // inspect its final localLength after the roll has happened.
+                BookkeeperCommitLog.CommitFileWriter initialWriter = log.getWriter();
                 long rolledLedgerId = initialLedgerId;
 
                 // Keep writing until the ledger rolls (new ledger ID)
@@ -155,14 +162,22 @@ public class CommitFileWriterCacheTest {
                 assertNotEquals("ledger should have rolled once localLength exceeded maxLedgerSizeBytes",
                         initialLedgerId, rolledLedgerId);
 
-                // The current (new) writer must start with a localLength < maxSize
-                // (it may already have received a few entries from concurrent writes,
-                //  but it must be much smaller than the old ledger's accumulated size).
+                // The initial writer's localLength must be > maxSize: this is what
+                // made isWritable() return false and triggered the roll.
+                // localLength counts requested (pre-acknowledgement) bytes, so it can
+                // slightly over-count, but it must be at least maxSize.
+                assertTrue("initial writer localLength must be >= maxLedgerSizeBytes at rotation,"
+                        + " got: " + initialWriter.getLocalLength(),
+                        initialWriter.getLocalLength() >= maxSize);
+
+                // The current (new) writer starts accumulating from zero, so its
+                // localLength is well below the old ledger's accumulated size.
                 BookkeeperCommitLog.CommitFileWriter newWriter = log.getWriter();
-                assertTrue("new writer localLength should be less than maxLedgerSizeBytes * 2",
+                assertTrue("new writer localLength should be less than maxLedgerSizeBytes * 2,"
+                        + " got: " + newWriter.getLocalLength(),
                         newWriter.getLocalLength() < maxSize * 2);
 
-                // The previous writer (outClosed) is gone, but the new one is open
+                // The new writer must be open (not closed)
                 assertFalse("new writer must not be closed", newWriter.isOutClosed());
             }
         }
