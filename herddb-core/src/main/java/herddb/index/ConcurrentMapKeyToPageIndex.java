@@ -179,8 +179,8 @@ public class ConcurrentMapKeyToPageIndex implements KeyToPageIndex {
                 key = null;
             }
             if (key == null) {
-                    return Stream.empty();
-                }
+                return Stream.empty();
+            }
             Long pageId = map.get(key);
             if (pageId == null) {
                 return Stream.empty();

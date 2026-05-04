@@ -143,10 +143,18 @@ public class SQLRecordKeyFunction extends RecordFunction {
                 statementEvaluationContext.cacheConstant(this, result);
             }
             return result;
-        } catch (IllegalArgumentException err) {
-            // serializePrimaryKeyRaw throws IllegalArgumentException when the
-            // PK contains a null column or a SQLTranslator mismatch; re-wrap
-            // with the user-friendly message used elsewhere.
+        } catch (RuntimeException err) {
+            // SQL/codec boundary: serializePrimaryKeyRaw may surface several
+            // unchecked exception types depending on the user input —
+            // IllegalArgumentException for null PK columns / SQLTranslator
+            // mismatches, ClassCastException for wrong-typed values cast
+            // inside RecordSerializer.serializeTo (e.g. an Integer where a
+            // BYTEARRAY is expected), and RuntimeException wrapping any
+            // IOException raised by the underlying ExtendedDataOutputStream.
+            // We deliberately catch the broad RuntimeException here so any
+            // codec-level failure surfaces at the JDBC layer as a
+            // user-friendly StatementExecutionException rather than a raw
+            // server-side exception.
             throw new StatementExecutionException("error while converting primary key " + pk + ": " + err, err);
         }
     }

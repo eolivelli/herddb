@@ -904,4 +904,56 @@ public class RecordSerializerTest {
         }
     }
 
+    /**
+     * Issue #391: {@link RecordSerializer#toRecord(Map, Table)} calls
+     * {@code serializePrimaryKey(...)} and {@code serializeValue(...)} as the
+     * two arguments to {@code new Record(...)}. With a multi-PK table both
+     * calls steal the {@code TL_BUFFER} inside a single statement, relying on
+     * Java's left-to-right argument evaluation order to keep the key bytes
+     * intact while the value bytes are being produced. This regression test
+     * pins that contract by calling {@code toRecord} twice in a row on the
+     * same thread (forcing TL_BUFFER reuse) and asserting the first record's
+     * key and value bytes are unchanged after the second call.
+     */
+    @Test
+    public void testToRecordOnMultiPkTableProducesIndependentKeyAndValueBytes() {
+        Table table = Table.builder()
+                .name("t")
+                .column("pk1", ColumnTypes.STRING)
+                .column("pk2", ColumnTypes.INTEGER)
+                .column("v1", ColumnTypes.STRING)
+                .column("v2", ColumnTypes.LONG)
+                .primaryKey("pk1")
+                .primaryKey("pk2")
+                .build();
+
+        Map<String, Object> r1 = new HashMap<>();
+        r1.put("pk1", "first");
+        r1.put("pk2", 11);
+        r1.put("v1", "alpha");
+        r1.put("v2", 1000L);
+        Record record1 = RecordSerializer.toRecord(r1, table);
+        // Snapshot the bytes immediately so we can detect later mutation.
+        byte[] key1Snapshot = record1.key.to_array();
+        byte[] value1Snapshot = record1.value.to_array();
+
+        Map<String, Object> r2 = new HashMap<>();
+        r2.put("pk1", "secondx");                    // different size from r1.pk1
+        r2.put("pk2", 9999);
+        r2.put("v1", "betagammadelta");              // different size from r1.v1
+        r2.put("v2", 2000L);
+        Record record2 = RecordSerializer.toRecord(r2, table);
+
+        // record1 key/value bytes must be intact even though record2's
+        // construction stole and replaced TL_BUFFER twice.
+        assertArrayEquals(key1Snapshot, record1.key.to_array());
+        assertArrayEquals(value1Snapshot, record1.value.to_array());
+        // record2 must round-trip through the codec.
+        Map<String, Object> r2Decoded = RecordSerializer.toBean(record2, table);
+        assertEquals("secondx", r2Decoded.get("pk1").toString());
+        assertEquals(9999, r2Decoded.get("pk2"));
+        assertEquals("betagammadelta", r2Decoded.get("v1").toString());
+        assertEquals(2000L, r2Decoded.get("v2"));
+    }
+
 }

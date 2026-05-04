@@ -151,4 +151,36 @@ public class VisibleByteArrayOutputStreamTest {
         }
     }
 
+    /**
+     * Issue #391: calling {@code stealBytes()} twice in a row — once on a
+     * stream with content, then again on the now-empty stream — must yield
+     * (a) the originally-written content, and (b) a fresh 0-length view
+     * over the just-installed replacement buffer (NOT the previously-stolen
+     * one). This pins down the contract that consecutive steals never alias
+     * each other's backing arrays.
+     */
+    @Test
+    public void testStealBytesIdempotentOnEmptyStream() throws Exception {
+        try (VisibleByteArrayOutputStream oo = new VisibleByteArrayOutputStream(64)) {
+            byte[] payload = "abcd".getBytes(StandardCharsets.UTF_8);
+            oo.write(payload);
+            Bytes firstSteal = oo.stealBytes();
+            byte[] firstStealBuffer = firstSteal.getBuffer();
+            assertArrayEquals(payload, firstSteal.to_array());
+
+            // Stream is now empty; a second steal must return a 0-length
+            // Bytes that does NOT alias the previously-stolen buffer.
+            byte[] replacementBufferBefore = oo.getBuffer();
+            Bytes secondSteal = oo.stealBytes();
+            assertEquals(0, secondSteal.getLength());
+            assertNotSame("second steal must not alias the first",
+                    firstStealBuffer, secondSteal.getBuffer());
+            assertSame("second steal aliases the just-installed replacement buffer",
+                    replacementBufferBefore, secondSteal.getBuffer());
+
+            // First-steal content remains intact.
+            assertArrayEquals(payload, firstSteal.to_array());
+        }
+    }
+
 }

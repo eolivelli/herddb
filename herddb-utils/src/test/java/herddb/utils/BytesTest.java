@@ -246,14 +246,24 @@ public class BytesTest {
 
         // Equivalence with the pre-existing byte[] overload: identical
         // truth-value for every input we can construct from the same arrays.
-        // (We deliberately do NOT test the "prefix longer than value" case
-        // because the legacy semantics return true there, by short-circuiting
-        // when the receiver is exhausted; that is the contract we preserve.)
         byte[] receiver = "foobar".getBytes(StandardCharsets.UTF_8);
         byte[] shortPrefix = "foo".getBytes(StandardCharsets.UTF_8);
         Bytes legacyView = Bytes.from_array(receiver);
         assertEquals(legacyView.startsWith(shortPrefix.length, shortPrefix),
                      legacyView.startsWith(Bytes.from_array(shortPrefix)));
+
+        // Legacy semantics that prefix-scan callers rely on: when the receiver
+        // is shorter than (or equal in size to) the prefix, the loop short-
+        // circuits when the receiver is exhausted and returns true if every
+        // byte compared so far matched. This is the existing contract of
+        // startsWith(int, byte[]) — pinned here so a future refactor cannot
+        // silently change prefix-scan behaviour in MemoryHashIndexManager
+        // and ConcurrentMapKeyToPageIndex.
+        Bytes shortReceiver = Bytes.from_array("foo".getBytes(StandardCharsets.UTF_8));
+        Bytes longerPrefix = Bytes.from_array("foobar".getBytes(StandardCharsets.UTF_8));
+        assertTrue("legacy semantics: receiver shorter than prefix returns true when "
+                + "every available byte matches",
+                shortReceiver.startsWith(longerPrefix));
 
         // Shared prefix view (extra slack at the tail, only the first 3 bytes
         // are in scope). Must compare against the in-scope window only.
