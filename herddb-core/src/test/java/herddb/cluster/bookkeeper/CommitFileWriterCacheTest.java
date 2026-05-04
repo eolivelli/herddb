@@ -44,10 +44,10 @@ import org.junit.rules.TemporaryFolder;
 /**
  * Verifies the local-cache optimisation introduced in issue #385:
  * {@code CommitFileWriter} caches the closed state in a {@code volatile boolean
- * outClosed} and tracks written bytes in an {@code AtomicLong localLength} so
- * that {@code isWritable()} never needs to acquire the intrinsic
- * {@code synchronized} lock on the BookKeeper {@link
- * org.apache.bookkeeper.client.api.WriteHandle} instance.
+ * outClosed} and tracks requested bytes in an {@code AtomicLong localLength}
+ * (incremented before each {@code appendAsync} call) so that {@code isWritable()}
+ * never needs to acquire the intrinsic {@code synchronized} lock on the BookKeeper
+ * {@link org.apache.bookkeeper.client.api.WriteHandle} instance.
  */
 @Category(ClusterTest.class)
 public class CommitFileWriterCacheTest {
@@ -162,9 +162,9 @@ public class CommitFileWriterCacheTest {
                 assertNotEquals("ledger should have rolled once localLength exceeded maxLedgerSizeBytes",
                         initialLedgerId, rolledLedgerId);
 
-                // The initial writer's localLength must be > maxSize: this is what
+                // The initial writer's localLength must be >= maxSize: this is what
                 // made isWritable() return false and triggered the roll.
-                // localLength counts requested (pre-acknowledgement) bytes, so it can
+                // localLength counts requested (pre-acknowledgement) bytes so it can
                 // slightly over-count, but it must be at least maxSize.
                 assertTrue("initial writer localLength must be >= maxLedgerSizeBytes at rotation,"
                         + " got: " + initialWriter.getLocalLength(),

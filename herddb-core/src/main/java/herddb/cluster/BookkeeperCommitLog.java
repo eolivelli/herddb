@@ -152,15 +152,17 @@ public class BookkeeperCommitLog extends CommitLog {
         private volatile boolean outClosed = false;
 
         /**
-         * Running count of serialised bytes <em>requested</em> to BookKeeper
-         * (pre-acknowledgement), used in place of
-         * {@link WriteHandle#getLength()} (which is {@code synchronized} on the
-         * {@link WriteHandle} instance) in the hot {@link #isWritable()} check.
-         * Incremented <em>before</em> each {@code appendAsync} — before BK
-         * acknowledges or rejects the entry — so it counts requested bytes, not
-         * durably-written bytes.  On write failure the counter is NOT decremented:
-         * the ledger will roll slightly earlier than if BK-tracked length were
-         * used, which is safe (rolling early just opens a new ledger).
+         * Running count of serialised bytes <em>requested</em> to BookKeeper,
+         * used in place of {@link WriteHandle#getLength()} (which is
+         * {@code synchronized} on the {@link WriteHandle} instance) in the hot
+         * {@link #isWritable()} check, eliminating monitor contention under
+         * concurrent ingest (issue #385).
+         * Incremented <em>before</em> each {@code appendAsync} call so that
+         * size-based ledger rotation fires promptly even when writes are submitted
+         * faster than BK acknowledges them (e.g. in tight async-write loops).
+         * On write failure the counter is NOT decremented: the ledger rolls
+         * slightly earlier than if BK-tracked length were used, which is safe
+         * (rolling early just opens a new ledger).
          */
         private final AtomicLong localLength = new AtomicLong(0);
 
@@ -306,9 +308,10 @@ public class BookkeeperCommitLog extends CommitLog {
             ByteBuf serialize = edit.serializeAsByteBuf();
             // Capture size before appendAsync: BK releases the buffer after
             // processing it, so readableBytes() would return 0 in the callback.
-            // We accumulate into localLength to avoid calling the synchronized
-            // WriteHandle.getLength() in isWritable() (issue #385).
-            int entryBytes = serialize.readableBytes();
+            // localLength is incremented here (pre-acknowledgement) so that
+            // size-based rotation fires promptly even when writes are submitted
+            // faster than BK acknowledges them (e.g. in tight async-write loops).
+            final int entryBytes = serialize.readableBytes();
             localLength.addAndGet(entryBytes);
             pendingAdds.incrementAndGet();
             final CompletableFuture<LogSequenceNumber> res = this.out.appendAsync(serialize)
@@ -1064,8 +1067,7 @@ public class BookkeeperCommitLog extends CommitLog {
 
     private void closeCurrentWriter(boolean waitForPendingAdds) throws LogNotAvailableException {
         if (writer != null) {
-            // Capture error state before nulling the writer reference so we can decide
-            // below whether a close failure is ignorable or fatal.
+            // Initial error snapshot — used as the baseline, but may be refreshed below.
             boolean hadWriteError = writer.errorOccurredDuringWrite;
             // Fencing (BKLedgerFencedException) is always fatal: another leader has taken
             // over the tablespace and this node must stop writing permanently.  We must NOT
@@ -1078,6 +1080,15 @@ public class BookkeeperCommitLog extends CommitLog {
                 }
                 writer.close();
             } catch (LogNotAvailableException err) {
+                // Re-read the error state: writes that were in-flight when size-based
+                // rotation called closeCurrentWriter(true) may have failed inside
+                // waitForAllPendingWrites(), setting errorOccurredDuringWrite=true
+                // after we captured the initial hadWriteError=false snapshot above.
+                // Treat such errors the same way we treat pre-existing write errors:
+                // a transient BK failure (not fencing) is safe to swallow here so
+                // that openNewLedger() can create a fresh, healthy ledger.
+                hadWriteError = writer.errorOccurredDuringWrite;
+                wasFenced = hadWriteError && containsFencingError(writer.writeError.get());
                 if (hadWriteError && !wasFenced && !containsFencingError(err)) {
                     // The ledger had a transient BK write error (e.g. BKNotEnoughBookiesException
                     // during a brief bookie outage).  The BK client may have internally sealed
