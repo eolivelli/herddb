@@ -39,6 +39,7 @@ import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -612,6 +613,230 @@ public class DropTableIndexCleanupTest {
     }
 
     /**
+     * {@code TRUNCATE_TABLE} must keep every vector index registered and
+     * responsive. Pre-issue-#383 the engine grouped TRUNCATE_TABLE with
+     * DROP_TABLE and erased the on-storage data without re-creating the
+     * in-memory store, so any subsequent INSERT was silently dropped.
+     * The fix splits the two paths and re-creates each store with a
+     * fresh storage UUID after TRUNCATE.
+     */
+    @Test
+    public void truncateTableKeepsIndexResponsiveAfterRefill() throws Exception {
+        Path logDir = folder.newFolder("log").toPath();
+        Path dataDir = folder.newFolder("data").toPath();
+
+        IndexingServiceEngine engine = new IndexingServiceEngine(
+                logDir, dataDir, configuration());
+        engine.setMetadataStorageManager(newMeta());
+
+        MemoryDataStorageManager backing = new MemoryDataStorageManager();
+        RecordingDataStorageManager dsm = new RecordingDataStorageManager(backing);
+        engine.setDataStorageManager(dsm);
+        MemoryManager mm = new MemoryManager(
+                64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+
+        List<String> createdUuids = new ArrayList<>();
+        engine.setVectorStoreFactory((indexName, tableName, vectorColumnName,
+                                       dataDirectory, indexProperties) -> {
+            PersistentVectorStore real = new PersistentVectorStore(
+                    indexName, tableName, engine.getTableSpaceUUID(), vectorColumnName,
+                    dataDirectory, dsm, mm,
+                    16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                    Long.MAX_VALUE,
+                    VectorSimilarityFunction.EUCLIDEAN);
+            try {
+                real.start();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            synchronized (createdUuids) {
+                createdUuids.add(real.getStoreUUID());
+            }
+            return real;
+        });
+        engine.setWatermarkStore(new WatermarkStore() {
+            @Override
+            public WatermarkSnapshot load() {
+                return WatermarkSnapshot.START_OF_TIME;
+            }
+
+            @Override
+            public void save(WatermarkSnapshot snapshot) throws IOException {
+            }
+        });
+
+        Table table = buildTable("ttable");
+        Index ix = buildVectorIndex("vidx", "ttable");
+        Random rng = new Random(31);
+
+        try {
+            engine.start();
+            engine.applyEntry(new LogSequenceNumber(1, 1),
+                    LogEntryFactory.createTable(table, null));
+            engine.applyEntry(new LogSequenceNumber(1, 2),
+                    LogEntryFactory.createIndex(ix, null));
+
+            // Pre-truncate: ingest 30 vectors and verify they are searchable.
+            LogSequenceNumber last = null;
+            for (int i = 0; i < 30; i++) {
+                Record rec = RecordSerializer.makeRecord(table,
+                        "pk", "pre_" + i, "vec", randomVec(rng));
+                last = new LogSequenceNumber(1, 100 + i);
+                engine.applySingleEntryForTest(last,
+                        LogEntryFactory.insert(table, rec.key, rec.value, null));
+            }
+            engine.awaitPendingWorkForTest();
+            engine.setLastProcessedLsnForTest(last);
+            engine.forceCheckpointAndSaveWatermark();
+            assertEquals("pre-truncate inserts must be searchable",
+                    5, engine.search("default", "ttable", "vidx",
+                            randomVec(new Random(1)), 5).size());
+
+            // ---- TRUNCATE_TABLE ----
+            engine.applyEntry(new LogSequenceNumber(1, 500),
+                    LogEntryFactory.truncate(table, null));
+            engine.awaitPendingWorkForTest();
+            engine.awaitPendingDeletionsForTest();
+
+            // Index is still tracked (TRUNCATE keeps schema).
+            assertEquals("TRUNCATE_TABLE must keep the index registered in the engine",
+                    1, engine.listIndexes().size());
+
+            // The store has been re-created with a fresh UUID.
+            String preTruncateUuid;
+            String postTruncateUuid;
+            synchronized (createdUuids) {
+                assertEquals("vector store factory must have been invoked twice "
+                                + "(initial create + post-truncate refresh)",
+                        2, createdUuids.size());
+                preTruncateUuid = createdUuids.get(0);
+                postTruncateUuid = createdUuids.get(1);
+            }
+            assertFalse("post-truncate store UUID must differ from the pre-truncate one",
+                    preTruncateUuid.equals(postTruncateUuid));
+
+            // Search returns zero hits — the data was wiped, but the
+            // store is responsive (no exception, no NULL store warning).
+            assertEquals("post-truncate search must return zero hits",
+                    0, engine.search("default", "ttable", "vidx",
+                            randomVec(new Random(1)), 5).size());
+
+            // Refill: subsequent INSERTs land normally and are searchable.
+            for (int i = 0; i < 7; i++) {
+                Record rec = RecordSerializer.makeRecord(table,
+                        "pk", "post_" + i, "vec", randomVec(rng));
+                last = new LogSequenceNumber(1, 1000 + i);
+                engine.applySingleEntryForTest(last,
+                        LogEntryFactory.insert(table, rec.key, rec.value, null));
+            }
+            engine.awaitPendingWorkForTest();
+            assertEquals("post-truncate inserts must land in the refreshed store",
+                    7, engine.search("default", "ttable", "vidx",
+                            randomVec(new Random(1)), 100).size());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * DROP_INDEX after a CREATE_INDEX whose (table, index) keypair has
+     * pre-existing on-storage data that the engine never tracked. This
+     * happens when an indexing-service pod restarts with a fresh
+     * SchemaTracker but the previous incarnation's segment files are
+     * still on remote storage. The DROP_INDEX path must erase those too —
+     * otherwise the leak survives every restart.
+     *
+     * <p>Implemented by pre-seeding the backing DSM with synthetic
+     * multipart files keyed at a previously-issued storeUUID, then
+     * forcing the engine to use that same UUID via the snapshot
+     * recovery path's {@code PROP_IS_STORE_UUID} property. After
+     * DROP_INDEX, those pre-seeded files must be gone.
+     */
+    @Test
+    public void dropIndexErasesPreExistingDataAfterRestart() throws Exception {
+        Path logDir = folder.newFolder("log").toPath();
+        Path dataDir = folder.newFolder("data").toPath();
+
+        IndexingServiceEngine engine = new IndexingServiceEngine(
+                logDir, dataDir, configuration());
+        engine.setMetadataStorageManager(newMeta());
+
+        MemoryDataStorageManager backing = new MemoryDataStorageManager();
+        RecordingDataStorageManager dsm = new RecordingDataStorageManager(backing);
+        engine.setDataStorageManager(dsm);
+        MemoryManager mm = new MemoryManager(
+                64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+
+        // Pin the storage UUID so the test can pre-seed the backing
+        // DSM with data at the same UUID before CREATE_INDEX runs.
+        final String pinnedUuid = "pre-existing-uuid-collision";
+
+        engine.setVectorStoreFactory((indexName, tableName, vectorColumnName,
+                                       dataDirectory, indexProperties) -> {
+            PersistentVectorStore real = new PersistentVectorStore(
+                    indexName, tableName, engine.getTableSpaceUUID(), vectorColumnName,
+                    pinnedUuid, dataDirectory, dsm, mm,
+                    16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                    Long.MAX_VALUE,
+                    VectorSimilarityFunction.EUCLIDEAN);
+            try {
+                real.start();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            return real;
+        });
+        engine.setWatermarkStore(new WatermarkStore() {
+            @Override
+            public WatermarkSnapshot load() {
+                return WatermarkSnapshot.START_OF_TIME;
+            }
+
+            @Override
+            public void save(WatermarkSnapshot snapshot) throws IOException {
+            }
+        });
+
+        try {
+            engine.start();
+
+            // Pre-seed the backing DSM with a fake multipart file
+            // keyed at pinnedUuid + a derived seg UUID. This simulates
+            // residual data from a previous incarnation of the index.
+            Path tmp = folder.newFolder().toPath().resolve("pre.bin");
+            Files.write(tmp, new byte[]{1, 2, 3, 4, 5});
+            String presetSegUuid = pinnedUuid + "_seg99";
+            backing.writeMultipartIndexFile(engine.getTableSpaceUUID(),
+                    presetSegUuid, "graph", tmp, null);
+            assertTrue("pre-seeded data must be visible before CREATE_INDEX",
+                    countBackingEntries(backing, pinnedUuid) > 0);
+
+            Table table = buildTable("tcoll");
+            Index ix = buildVectorIndex("vidx", "tcoll");
+
+            engine.applyEntry(new LogSequenceNumber(1, 1),
+                    LogEntryFactory.createTable(table, null));
+            engine.applyEntry(new LogSequenceNumber(1, 2),
+                    LogEntryFactory.createIndex(ix, null));
+
+            // ---- DROP_INDEX ----
+            engine.applyEntry(new LogSequenceNumber(1, 999),
+                    LogEntryFactory.dropIndex("vidx", null));
+            engine.awaitPendingWorkForTest();
+            engine.awaitPendingDeletionsForTest();
+
+            // The pre-seeded data must be gone — without the issue #383
+            // dropIndex widening, the segUUID-suffixed entry would
+            // survive forever.
+            assertEquals("DROP_INDEX must erase even pre-existing data at sibling UUIDs; survivors="
+                            + listBackingEntries(backing, pinnedUuid),
+                    0, countBackingEntries(backing, pinnedUuid));
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
      * Counts every on-storage entry (page, IndexStatus marker, multipart
      * blob) the backing {@link MemoryDataStorageManager} holds for a given
      * vector-store UUID. Used by the cleanup tests to assert "zero residual
@@ -647,12 +872,15 @@ public class DropTableIndexCleanupTest {
             }
             for (Object key : map.keySet()) {
                 String s = key.toString();
-                // page key:    "<tableSpace>.<storeUUID>_..."
-                // status key:  "<tableSpace>.<storeUUID>_..."
-                // multipart:   "<tableSpace>/<storeUUID>/..."
+                // page key:        "<tableSpace>.<storeUUID>_..."
+                // status key:      "<tableSpace>.<storeUUID>_..."
+                // multipart:       "<tableSpace>/<storeUUID>/..."
+                // multipart (seg): "<tableSpace>/<storeUUID>_seg<N>/..."
+                //                  "<tableSpace>/<storeUUID>_tmp_pkset_*/..."
                 if (s.endsWith(storeUUID)
                         || s.contains("." + storeUUID + "_")
-                        || s.contains("/" + storeUUID + "/")) {
+                        || s.contains("/" + storeUUID + "/")
+                        || s.contains("/" + storeUUID + "_")) {
                     hits.add(f.getName() + ": " + s);
                 }
             }

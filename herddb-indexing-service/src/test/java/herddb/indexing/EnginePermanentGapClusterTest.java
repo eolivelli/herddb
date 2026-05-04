@@ -257,25 +257,18 @@ public class EnginePermanentGapClusterTest {
                     // resume safely (issue #364).
                     assertEquals(watermarkLsn, engine.getLastDurableLsn());
 
-                    // Give the BK tailer a moment to detect the gap and
-                    // settle. We deliberately use a generous deadline so
-                    // slow CI environments do not flake — what we really
-                    // care about is that the engine does not block
-                    // forever (the negative case the test guards against).
-                    long deadline = System.currentTimeMillis() + 15_000L;
-                    while (System.currentTimeMillis() < deadline) {
-                        Thread.sleep(100);
-                        // No assertions inside the loop: we just want to
-                        // give the tailer time to do its work without
-                        // failing the test if it has not stopped yet.
-                    }
-
-                    // Whether the tailer is still trying to attach (it
-                    // will keep retrying with backoff in some
-                    // configurations) or has already stopped, the
-                    // engine MUST still be responsive: schema visible,
-                    // listIndexes works, durable LSN unchanged.
-                    assertEquals("schema must remain visible while tailer reacts to the gap",
+                    // The engine MUST stay responsive even while the BK
+                    // tailer is reacting to the permanent ledger gap:
+                    // schema visible, listIndexes works, durable LSN
+                    // unchanged. We assert these invariants immediately
+                    // after start() — they hold synchronously because
+                    // the snapshot-recovery path runs before start()
+                    // returns. (The slow path of "tailer eventually
+                    // detects the gap and stops" is exercised by
+                    // BookKeeperCommitLogTailerPermanentGapTest at the
+                    // tailer level; here we only need to prove the
+                    // engine itself does not block on it.)
+                    assertEquals("schema must remain visible after start with a gapped tailer",
                             1, engine.listIndexes().size());
                     assertEquals("durable LSN must not move backwards",
                             watermarkLsn, engine.getLastDurableLsn());

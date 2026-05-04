@@ -1208,6 +1208,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             return;
         }
         try {
+            // Prune already-completed entries first so the list does not
+            // grow without bound under workloads that DROP many indexes
+            // over the engine's lifetime — each retained Future would
+            // otherwise pin its captured AbstractVectorStore (issue #383
+            // review).
+            pendingDropTasks.removeIf(Future::isDone);
             Future<?> f = exec.submit(task);
             pendingDropTasks.add(f);
         } catch (java.util.concurrent.RejectedExecutionException e) {
@@ -1228,6 +1234,33 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * for DROP cleanup to settle before asserting on the file-server
      * disk layout.
      */
+    /**
+     * Test hook: drains the shadow reload executor so any reload tasks
+     * already enqueued have completed before the caller observes
+     * {@link #getShadowReloadCount()} or {@link #getShadowLoadedLsn()}.
+     * Submitted as a no-op task that {@code get()}s after every queued
+     * reload finishes, because the executor is single-threaded.
+     *
+     * <p>No-op when not running as a shadow.
+     */
+    public void awaitShadowReloadsForTest() {
+        ExecutorService exec = shadowReloadExecutor;
+        if (exec == null) {
+            return;
+        }
+        try {
+            exec.submit(() -> {
+            }).get(30, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted awaiting shadow reload", e);
+        } catch (ExecutionException e) {
+            throw new RuntimeException("Shadow reload barrier task failed", e.getCause());
+        } catch (java.util.concurrent.TimeoutException e) {
+            throw new RuntimeException("Timed out awaiting shadow reload barrier", e);
+        }
+    }
+
     public void awaitPendingDeletionsForTest() {
         java.util.List<Future<?>> snapshot;
         synchronized (pendingDropTasks) {
@@ -1335,8 +1368,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 schemaTracker.applyEntry(entry);
                 break;
 
-            case LogEntryType.DROP_TABLE:
-            case LogEntryType.TRUNCATE_TABLE: {
+            case LogEntryType.DROP_TABLE: {
                 schemaTracker.applyEntry(entry);
                 // Remove all vector stores for this table AND release their
                 // remote/local persistent state.  Without the dropIndex()
@@ -1361,6 +1393,54 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 vectorStoreIndexUuids.entrySet().removeIf(e -> e.getKey().startsWith(droppedTablePrefix));
                 for (Map.Entry<String, AbstractVectorStore> dropped : toClose) {
                     submitVectorStoreDeletion(dropped.getKey(), dropped.getValue());
+                }
+                break;
+            }
+
+            case LogEntryType.TRUNCATE_TABLE: {
+                // TRUNCATE_TABLE keeps the table + every vector index
+                // *registered* in SchemaTracker (TRUNCATE has no
+                // SchemaTracker case) — the table and its indexes are
+                // expected to keep accepting INSERT/UPDATE/DELETE after
+                // the truncate. Release the in-memory live shards and
+                // wipe the on-storage data, then re-create a fresh
+                // PersistentVectorStore against a NEW storage UUID so
+                // subsequent DML lands cleanly. Erasing the on-storage
+                // data without re-creating the store would silently
+                // drop every later INSERT for that index (issue #383
+                // review).
+                String truncatedTable = entry.tableName;
+                String truncatedTablePrefix = truncatedTable + ".";
+                java.util.List<Index> toRefresh = new ArrayList<>();
+                for (Index idx : schemaTracker.getAllIndexes()) {
+                    if (Index.TYPE_VECTOR.equals(idx.type)
+                            && truncatedTable.equals(idx.table)) {
+                        toRefresh.add(idx);
+                    }
+                }
+                java.util.List<Map.Entry<String, AbstractVectorStore>> toClose =
+                        new ArrayList<>();
+                vectorStores.entrySet().removeIf(e -> {
+                    if (e.getKey().startsWith(truncatedTablePrefix)) {
+                        toClose.add(e);
+                        return true;
+                    }
+                    return false;
+                });
+                vectorStoreIndexUuids.entrySet().removeIf(
+                        e -> e.getKey().startsWith(truncatedTablePrefix));
+                for (Map.Entry<String, AbstractVectorStore> dropped : toClose) {
+                    submitVectorStoreDeletion(dropped.getKey(), dropped.getValue());
+                }
+                // Re-create each vector store with a fresh storage UUID
+                // (createVectorStoreIfNeeded delegates to the factory,
+                // which derives a fresh nanoTime-based UUID when no
+                // PROP_IS_STORE_UUID is present in the index properties).
+                for (Index idx : toRefresh) {
+                    LogEntry synth = new LogEntry(System.currentTimeMillis(),
+                            LogEntryType.CREATE_INDEX, 0L, idx.table, null,
+                            herddb.utils.Bytes.from_array(idx.serialize()));
+                    createVectorStoreIfNeeded(synth);
                 }
                 break;
             }

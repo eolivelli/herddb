@@ -1210,7 +1210,9 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * </ul>
      */
     private void deleteAllRemoteArtefactsForIndex(String tableSpace, String uuid) {
-        client.deleteByPrefix(remoteIndexPrefix(tableSpace, uuid));
+        // {tableSpace}/{uuid}/ already covers {tableSpace}/{uuid}/index/
+        // (the legacy remoteIndexPrefix), so deleting both would issue a
+        // redundant network round-trip on every DROP/TRUNCATE.
         client.deleteByPrefix(tableSpace + "/" + uuid + "/");
         client.deleteByPrefix(tableSpace + "/" + uuid + "_");
         client.deleteByPrefix(tableSpace + "/_metadata/" + uuid + ".");

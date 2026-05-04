@@ -265,18 +265,27 @@ public class RestartUnreachableStartOfTimeTest {
     }
 
     /**
-     * Restart with a snapshot that includes schema must NOT replay the
-     * pre-watermark portion of the log even when the log directory does
-     * contain those files (the trimmed-history simulation goes the other
-     * way: even with files present, the watermark is the single source of
-     * truth and we resume from it). Concretely: feed entries with LSNs
-     * BEFORE the watermark and verify they are dropped, then feed entries
-     * AFTER the watermark and verify they land. This proves the engine
-     * uses the watermark as the start-of-tailing position, not the log
-     * file's start.
+     * Restart with a snapshot that includes schema: the durable-LSN
+     * floor (the LSN that the server's commit-log retention pins
+     * against — issue #364) must NEVER move backwards even when entries
+     * with LSNs BEFORE the watermark arrive at the engine. After a
+     * post-watermark checkpoint, the floor advances cleanly to the new
+     * high-watermark.
+     *
+     * <p>Note: this test does not prove that pre-watermark entries are
+     * dropped on the apply path —
+     * {@link IndexingServiceEngine#applySingleEntryForTest} bypasses the
+     * tailer's watermark gate, so any entry handed to it (pre- or
+     * post-watermark) lands in the engine's in-memory store. That
+     * watermark gate is the BookKeeper / file tailer's responsibility
+     * and is covered by the sister tests
+     * {@code BookKeeperCommitLogTailerPermanentGapTest} (tailer level)
+     * and {@code EnginePermanentGapClusterTest} (engine + real BK). The
+     * invariant pinned here is the one the issue #364 fix introduced
+     * and the one the server's retention machinery actually depends on.
      */
     @Test
-    public void engineDropsPreWatermarkEntriesAfterRestart() throws Exception {
+    public void durableLsnFloorNeverMovesBackwardsAcrossRestart() throws Exception {
         Path logDir = folder.newFolder("log").toPath();
         Path dataDir = folder.newFolder("data").toPath();
 
