@@ -24,6 +24,7 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Extended version of DataInputStream
@@ -240,6 +241,21 @@ public class ExtendedDataInputStream extends DataInputStream {
     @SuppressFBWarnings(value = "SR_NOT_CHECKED")
     public void skipBoolean() throws IOException {
         skip(1);
+    }
+
+    /**
+     * Reads a vint-prefixed standard UTF-8 string written by
+     * {@link ExtendedDataOutputStream#writeUtf8String(String)} or by
+     * {@link ByteBufUtils#writeUtf8String(io.netty.buffer.ByteBuf, String)}.
+     */
+    public String readUtf8String() throws IOException {
+        int len = ExtendedDataInputStream.this.readVInt();
+        if (len == 0) {
+            return "";
+        }
+        byte[] bytes = new byte[len];
+        readFully(bytes);
+        return new String(bytes, StandardCharsets.UTF_8);
     }
 
 }

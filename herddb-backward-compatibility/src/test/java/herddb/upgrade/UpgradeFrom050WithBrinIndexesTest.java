@@ -48,6 +48,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
+import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -62,11 +63,22 @@ public class UpgradeFrom050WithBrinIndexesTest {
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
 
+    // Disabled: issue #387 changed the LogEntry on-disk wire format —
+    // the v0.2-compat empty-tablespace-uuid prefix was removed and the
+    // tableName encoding was switched from modified UTF-8 (DataOutputStream
+    // .writeUTF, with a 16-bit length cap) to a vint-prefixed standard
+    // UTF-8 sequence. Replaying a 0.5.0 txlog with the new deserializer
+    // produces garbage. Backward compatibility was explicitly waived; the
+    // 0.5.0 snapshot zips are kept in resources for any future explicit
+    // upgrade-path test.
+    @Ignore
     @Test
     public void testWithoutCheckpoint() throws Exception {
         test("dbdata_0.5.0_brin_indexes_nevercheckpointed.zip");
     }
 
+    // Disabled: see testWithoutCheckpoint above (issue #387).
+    @Ignore
     @Test
     public void testWithCheckpoint() throws Exception {
         test("dbdata_0.5.0_brin_indexes_after_checkpoint.zip");

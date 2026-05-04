@@ -293,7 +293,10 @@ public class FileCommitLogTest {
 
             // this number really depends on disk format
             // this test in the future will be updated when we change the format
-            assertEquals(145L, statsLogger.scope("aa").getCounter("newfiles").get().longValue());
+            // updated for issue #387: dropped the v0.2 empty-tablespace-uuid prefix
+            // and switched tableName encoding from modified-UTF-8 (DataOutputStream.writeUTF)
+            // to vint-prefixed standard UTF-8, shrinking each entry by a few bytes.
+            assertEquals(136L, statsLogger.scope("aa").getCounter("newfiles").get().longValue());
         }
     }
 
@@ -345,7 +348,10 @@ public class FileCommitLogTest {
 
             // this number really depends on disk format
             // this test in the future will be updated when we change the format
-            assertEquals(145L, statsLogger.scope("aa").getCounter("newfiles").get().longValue());
+            // updated for issue #387: dropped the v0.2 empty-tablespace-uuid prefix
+            // and switched tableName encoding from modified-UTF-8 (DataOutputStream.writeUTF)
+            // to vint-prefixed standard UTF-8, shrinking each entry by a few bytes.
+            assertEquals(136L, statsLogger.scope("aa").getCounter("newfiles").get().longValue());
         }
     }
 
