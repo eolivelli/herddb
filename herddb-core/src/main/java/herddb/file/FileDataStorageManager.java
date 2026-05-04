@@ -1672,6 +1672,29 @@ public class FileDataStorageManager extends DataStorageManager {
         LOGGER.log(Level.INFO, "dropIndex {0}.{1} in {2}", new Object[]{tablespace, name, tableDir});
         try {
             deleteDirectory(tableDir);
+            // Vector indexes additionally store per-segment data and
+            // per-checkpoint temp BLink storages under sibling directories
+            // named "<name>_segN.index" and "<name>_tmp_pkset_*.index"
+            // (see PersistentVectorStore.encodeMultipartPath /
+            // createTempPagedPkSet). dropIndex must wipe those too — without
+            // this, every per-segment graph + map blob lingers on local
+            // disk forever after a DROP under storage.type=file (issue #383).
+            Path tablespaceDir = getTablespaceDirectory(tablespace);
+            if (Files.isDirectory(tablespaceDir)) {
+                String prefix = name + "_";
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(tablespaceDir)) {
+                    for (Path sibling : stream) {
+                        Path filename = sibling.getFileName();
+                        if (filename == null) {
+                            continue;
+                        }
+                        String s = filename.toString();
+                        if (s.startsWith(prefix) && s.endsWith(".index")) {
+                            deleteDirectory(sibling);
+                        }
+                    }
+                }
+            }
         } catch (IOException ex) {
             throw new DataStorageManagerException(ex);
         }
