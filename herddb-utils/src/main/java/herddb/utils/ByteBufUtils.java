@@ -21,6 +21,7 @@
 package herddb.utils;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 
@@ -58,6 +59,23 @@ public class ByteBufUtils {
         buffer.writeBytes(array.getBuffer(), array.getOffset(), array.getLength());
     }
 
+    /**
+     * Writes a {@link Bytes} payload with the same wire format as
+     * {@link ExtendedDataOutputStream#writeArray(Bytes)}: a vint length prefix
+     * (-1 for {@code null}) followed by the raw bytes when non-null.
+     *
+     * <p>Use this overload from hot paths that must round-trip with the existing
+     * {@link ExtendedDataOutputStream}-based serializers.
+     */
+    public static void writeArrayOrNull(ByteBuf buffer, Bytes array) {
+        if (array == null) {
+            writeVInt(buffer, -1);
+        } else {
+            writeVInt(buffer, array.getLength());
+            buffer.writeBytes(array.getBuffer(), array.getOffset(), array.getLength());
+        }
+    }
+
     public static void writeArray(ByteBuf buffer, byte[] array, int offset, int length) {
         writeVInt(buffer, length);
         buffer.writeBytes(array, offset, length);
@@ -69,6 +87,29 @@ public class ByteBufUtils {
 
     public static void writeRawString(ByteBuf buffer, RawString string) {
         writeArray(buffer, string.getData(), string.getOffset(), string.getLength());
+    }
+
+    /**
+     * Writes a {@link String} as a vint-prefixed standard UTF-8 byte sequence.
+     *
+     * <p>Unlike {@link #writeString(ByteBuf, String)}, this overload does not
+     * allocate an intermediary {@code byte[]}: the byte length is computed via
+     * {@link ByteBufUtil#utf8Bytes(CharSequence)} and the bytes are written
+     * directly to {@code buffer} via {@link ByteBufUtil#writeUtf8(ByteBuf,
+     * CharSequence)}. This makes it suitable for serialization hot paths.
+     *
+     * <p>The encoding is standard UTF-8 (4 bytes for supplementary code points,
+     * NOT modified UTF-8 / CESU-8). Read back with
+     * {@link #readString(ByteBuf)} or
+     * {@link ExtendedDataInputStream#readUtf8String()}.
+     *
+     * @param buffer destination buffer
+     * @param str    string to encode (must not be {@code null})
+     */
+    public static void writeUtf8String(ByteBuf buffer, String str) {
+        int utf8Length = ByteBufUtil.utf8Bytes(str);
+        writeVInt(buffer, utf8Length);
+        ByteBufUtil.writeUtf8(buffer, str);
     }
 
     public static byte[] readArray(ByteBuf buffer) {

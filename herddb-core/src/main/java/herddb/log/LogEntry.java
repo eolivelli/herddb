@@ -21,13 +21,13 @@
 package herddb.log;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import herddb.utils.ByteBufUtils;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataInputStream;
 import herddb.utils.ExtendedDataOutputStream;
 import herddb.utils.SimpleByteArrayInputStream;
 import herddb.utils.SystemProperties;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufOutputStream;
 import io.netty.buffer.PooledByteBufAllocator;
 import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
@@ -40,24 +40,6 @@ import java.io.IOException;
  */
 @SuppressFBWarnings("EI_EXPOSE_REP2")
 public class LogEntry {
-
-    private static final int EMPTY_STRING_LEN;
-    private static final byte[] EMPTY_STRING_SERIALIZED;
-
-    static {
-        try (ByteArrayOutputStream oo = new ByteArrayOutputStream()) {
-            try (ExtendedDataOutputStream doo = new ExtendedDataOutputStream(oo)) {
-                doo.writeUTF("");
-            }
-            EMPTY_STRING_LEN = oo.size();
-            EMPTY_STRING_SERIALIZED = oo.toByteArray();
-        } catch (IOException impossible) {
-            throw new RuntimeException(impossible);
-        }
-
-    }
-
-    private static final int WRITE_UTF_HEADER_LEN = EMPTY_STRING_LEN;
 
     public final short type;
     public final long transactionId;
@@ -89,12 +71,78 @@ public class LogEntry {
 
     public ByteBuf serializeAsByteBuf() {
         ByteBuf buffer = PooledByteBufAllocator.DEFAULT.directBuffer(DEFAULT_BUFFER_SIZE);
-        try (ExtendedDataOutputStream doo =
-                     new ExtendedDataOutputStream(new ByteBufOutputStream(buffer))) {
-            serialize(doo);
+        try {
+            serializeTo(buffer);
             return buffer;
-        } catch (IOException err) {
-            throw new RuntimeException(err);
+        } catch (RuntimeException err) {
+            // Plug a latent leak: release the pooled buffer if encoding fails
+            // (e.g. an unsupported entry type).
+            buffer.release();
+            throw err;
+        }
+    }
+
+    /**
+     * Writes this entry directly into {@code buffer} using vint-prefixed standard
+     * UTF-8 strings. This avoids the per-call {@code DataOutputStream} /
+     * {@code ByteBufOutputStream} wrapper allocations and the modified-UTF-8
+     * {@code byte[]} temporary that {@code DataOutputStream.writeUTF} allocates
+     * internally — both of which show up at the top of the allocation profile on
+     * the commit-log hot path. Wire-compatible with
+     * {@link #serialize(ExtendedDataOutputStream)} so a single
+     * {@link #deserialize(ExtendedDataInputStream)} reads both write paths.
+     */
+    private void serializeTo(ByteBuf buffer) {
+        buffer.writeLong(timestamp); // 8
+        buffer.writeShort(type);     // 2
+        buffer.writeLong(transactionId); // 8
+        switch (type) {
+            case LogEntryType.UPDATE:
+            case LogEntryType.INSERT:
+                ByteBufUtils.writeUtf8String(buffer, tableName);
+                ByteBufUtils.writeArrayOrNull(buffer, key);
+                ByteBufUtils.writeArrayOrNull(buffer, value);
+                break;
+            case LogEntryType.DELETE:
+                ByteBufUtils.writeUtf8String(buffer, tableName);
+                ByteBufUtils.writeArrayOrNull(buffer, key);
+                break;
+            case LogEntryType.CREATE_TABLE:
+            case LogEntryType.ALTER_TABLE:
+                // value contains the table definition
+                ByteBufUtils.writeUtf8String(buffer, tableName);
+                ByteBufUtils.writeArrayOrNull(buffer, value);
+                break;
+            case LogEntryType.CREATE_INDEX:
+                // value contains the index definition
+                ByteBufUtils.writeUtf8String(buffer, tableName);
+                ByteBufUtils.writeArrayOrNull(buffer, value);
+                break;
+            case LogEntryType.DROP_TABLE:
+            case LogEntryType.TRUNCATE_TABLE:
+                ByteBufUtils.writeUtf8String(buffer, tableName);
+                break;
+            case LogEntryType.DROP_INDEX:
+                ByteBufUtils.writeArrayOrNull(buffer, this.value);
+                break;
+            case LogEntryType.BEGINTRANSACTION:
+            case LogEntryType.COMMITTRANSACTION:
+            case LogEntryType.ROLLBACKTRANSACTION:
+                break;
+            case LogEntryType.NOOP:
+                break;
+            case LogEntryType.TABLE_CONSISTENCY_CHECK:
+                ByteBufUtils.writeUtf8String(buffer, tableName);
+                //value contains checksum and query
+                ByteBufUtils.writeArrayOrNull(buffer, value);
+                break;
+            case LogEntryType.INDEXING_SERVICE_REBALANCE:
+                // value contains a serialized IndexingServiceRebalanceDescriptor;
+                // tableName/key are unused.
+                ByteBufUtils.writeArrayOrNull(buffer, value);
+                break;
+            default:
+                throw new IllegalArgumentException("unsupported type " + type);
         }
     }
 
@@ -108,36 +156,31 @@ public class LogEntry {
         doo.writeLong(timestamp); // 8
         doo.writeShort(type);  // 2
         doo.writeLong(transactionId); // 8
-        doo.write(EMPTY_STRING_SERIALIZED); // keep compatibility with v 0.2
         switch (type) {
             case LogEntryType.UPDATE:
-                doo.writeUTF(tableName);
-                doo.writeArray(key);
-                doo.writeArray(value);
-                break;
             case LogEntryType.INSERT:
-                doo.writeUTF(tableName);
+                doo.writeUtf8String(tableName);
                 doo.writeArray(key);
                 doo.writeArray(value);
                 break;
             case LogEntryType.DELETE:
-                doo.writeUTF(tableName);
+                doo.writeUtf8String(tableName);
                 doo.writeArray(key);
                 break;
             case LogEntryType.CREATE_TABLE:
             case LogEntryType.ALTER_TABLE:
                 // value contains the table definition
-                doo.writeUTF(tableName);
+                doo.writeUtf8String(tableName);
                 doo.writeArray(value);
                 break;
             case LogEntryType.CREATE_INDEX:
                 // value contains the index definition
-                doo.writeUTF(tableName);
+                doo.writeUtf8String(tableName);
                 doo.writeArray(value);
                 break;
             case LogEntryType.DROP_TABLE:
             case LogEntryType.TRUNCATE_TABLE:
-                doo.writeUTF(tableName);
+                doo.writeUtf8String(tableName);
                 break;
             case LogEntryType.DROP_INDEX:
                 doo.writeArray(this.value);
@@ -149,7 +192,7 @@ public class LogEntry {
             case LogEntryType.NOOP:
                 break;
             case LogEntryType.TABLE_CONSISTENCY_CHECK:
-                doo.writeUTF(tableName);
+                doo.writeUtf8String(tableName);
                 //value contains checksum and query
                 doo.writeArray(value);
                 break;
@@ -175,41 +218,36 @@ public class LogEntry {
             long timestamp = dis.readLong();
             short type = dis.readShort();
             long transactionId = dis.readLong();
-            dis.readUTF(); // in 0.2 it was 'tablespace uuid'
 
             Bytes key = null;
             Bytes value = null;
             String tableName = null;
             switch (type) {
                 case LogEntryType.UPDATE:
-                    tableName = dis.readUTF();
-                    key = dis.readBytes();
-                    value = dis.readBytes();
-                    break;
                 case LogEntryType.INSERT:
-                    tableName = dis.readUTF();
+                    tableName = dis.readUtf8String();
                     key = dis.readBytes();
                     value = dis.readBytes();
                     break;
                 case LogEntryType.DELETE:
-                    tableName = dis.readUTF();
+                    tableName = dis.readUtf8String();
                     key = dis.readBytes();
                     break;
                 case LogEntryType.DROP_TABLE:
                 case LogEntryType.TRUNCATE_TABLE:
-                    tableName = dis.readUTF();
+                    tableName = dis.readUtf8String();
                     break;
                 case LogEntryType.DROP_INDEX:
                     value = dis.readBytes();
                     break;
                 case LogEntryType.CREATE_INDEX:
-                    tableName = dis.readUTF();
+                    tableName = dis.readUtf8String();
                     value = dis.readBytes();
                     break;
                 case LogEntryType.CREATE_TABLE:
                 case LogEntryType.ALTER_TABLE:
                     // value contains the table definition
-                    tableName = dis.readUTF();
+                    tableName = dis.readUtf8String();
                     value = dis.readBytes();
                     break;
                 case LogEntryType.BEGINTRANSACTION:
@@ -219,7 +257,7 @@ public class LogEntry {
                 case LogEntryType.NOOP:
                     break;
                 case LogEntryType.TABLE_CONSISTENCY_CHECK:
-                    tableName = dis.readUTF();
+                    tableName = dis.readUtf8String();
                     value = dis.readBytes();
                     break;
                 case LogEntryType.INDEXING_SERVICE_REBALANCE:

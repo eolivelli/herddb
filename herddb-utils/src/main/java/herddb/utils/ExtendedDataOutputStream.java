@@ -23,6 +23,7 @@ package herddb.utils;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Extended version of DataInputStream
@@ -141,6 +142,20 @@ public final class ExtendedDataOutputStream extends DataOutputStream {
     public void writeArray(byte[] data, int offset, int len) throws IOException {
         writeVInt(len);
         write(data, offset, len);
+    }
+
+    /**
+     * Writes {@code str} as a vint-prefixed standard UTF-8 byte sequence,
+     * matching the wire format produced by
+     * {@link ByteBufUtils#writeUtf8String(io.netty.buffer.ByteBuf, String)} so
+     * that the two write paths can feed into a single deserializer.
+     *
+     * @param str string to encode (must not be {@code null})
+     */
+    public void writeUtf8String(String str) throws IOException {
+        byte[] bytes = str.getBytes(StandardCharsets.UTF_8);
+        writeVInt(bytes.length);
+        write(bytes);
     }
 
 }
