@@ -631,6 +631,17 @@ public class MemoryDataStorageManager extends DataStorageManager {
                 }
             }
         }
+        // Erase all on-storage data for this index: index pages, IndexStatus
+        // markers and multipart blob files. Without this, calling dropIndex
+        // would leak both pages and multipart files in the in-memory store
+        // (issue #383). The file/remote DSMs already implement the equivalent
+        // erase by removing the index directory or remote prefix.
+        final String pagePrefix = tablespace + "." + name + "_";
+        indexpages.keySet().removeIf(k -> k.startsWith(pagePrefix));
+        final String statusPrefix = tablespace + "." + name + "_";
+        indexStatuses.keySet().removeIf(k -> k.startsWith(statusPrefix));
+        final String multipartPrefix = tablespace + "/" + name + "/";
+        multipartFiles.keySet().removeIf(k -> k.startsWith(multipartPrefix));
     }
 
     @Override

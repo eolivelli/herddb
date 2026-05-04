@@ -265,6 +265,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private volatile Future<?> inflightCheckpoint;
 
     /**
+     * Pending {@code DROP_INDEX} / {@code DROP_TABLE} cleanup tasks submitted to
+     * {@link #checkpointExecutor} so they are serialised after any in-flight
+     * {@link #checkpointAndSaveWatermark()}. Tracked here so that tests
+     * (and {@link #close()}) can wait for the storage cleanup to finish before
+     * asserting that the index data has been removed.
+     *
+     * <p>Submitting through {@code checkpointExecutor} avoids closing a vector
+     * store while a concurrent checkpoint cycle still holds a reference to it
+     * (issue #383).
+     */
+    private final java.util.List<Future<?>> pendingDropTasks =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
+    /**
      * Wall-clock time at which {@link #start()} finished, used by the
      * admin CLI to compute engine uptime.
      */
@@ -1124,6 +1138,115 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
     }
 
+    /**
+     * Submits the post-DROP cleanup of a vector store ({@code store.close()}
+     * + {@link DataStorageManager#dropIndex} for the store's storage UUID)
+     * to the {@link #checkpointExecutor} so it serialises after any in-flight
+     * checkpoint cycle. Closing a store synchronously from the tailer thread
+     * could race with a concurrent {@link #checkpointAndSaveWatermark()} that
+     * still holds a reference to it (issue #383).
+     *
+     * <p>Best-effort: a failure to drop the on-storage data is logged at
+     * WARNING but never propagates — re-running DROP on a future restart is
+     * idempotent because the engine no longer tracks the store.
+     *
+     * <p>Skipped silently when the executor is null (engine never reached
+     * {@link #start()}, e.g. tests that only build but don't start an engine)
+     * or already shut down (engine is closing); in both cases the close +
+     * dropIndex run synchronously on the calling thread so the data is still
+     * released.
+     */
+    private void submitVectorStoreDeletion(String storeKeyForLog, AbstractVectorStore store) {
+        if (store == null) {
+            return;
+        }
+        Runnable task = () -> {
+            String storeUUID = null;
+            try {
+                storeUUID = store.getStoreUUID();
+            } catch (RuntimeException e) {
+                // Reading the UUID is a trivial accessor; if it throws there
+                // is nothing useful we can do beyond logging — proceed to
+                // close and skip the storage drop.
+                LOGGER.log(Level.WARNING,
+                        "DROP cleanup for " + storeKeyForLog
+                                + ": failed to read store UUID, skipping storage cleanup",
+                        e);
+            }
+            try {
+                store.close();
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING,
+                        "DROP cleanup for " + storeKeyForLog
+                                + ": failed to close vector store; resources may leak",
+                        e);
+            }
+            if (storeUUID != null && dataStorageManager != null && tableSpaceUUID != null) {
+                try {
+                    dataStorageManager.dropIndex(tableSpaceUUID, storeUUID);
+                    LOGGER.log(Level.INFO,
+                            "DROP cleanup for {0}: removed on-storage data for store UUID {1}",
+                            new Object[]{storeKeyForLog, storeUUID});
+                } catch (herddb.storage.DataStorageManagerException e) {
+                    // Non-fatal: leaves orphan data behind but the engine no
+                    // longer references it. A future call to dropIndex against
+                    // the same UUID is idempotent so a retry on next restart
+                    // can clean up any residual state.
+                    LOGGER.log(Level.WARNING,
+                            "DROP cleanup for " + storeKeyForLog
+                                    + ": failed to drop on-storage data for UUID " + storeUUID,
+                            e);
+                }
+            }
+        };
+
+        ExecutorService exec = checkpointExecutor;
+        if (exec == null || exec.isShutdown()) {
+            // Engine never started its checkpoint executor (test path) or
+            // is closing — run inline so the data is still released.
+            task.run();
+            return;
+        }
+        try {
+            Future<?> f = exec.submit(task);
+            pendingDropTasks.add(f);
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // Executor shut down between the isShutdown() probe and submit()
+            // — fall back to inline execution.
+            task.run();
+        }
+    }
+
+    /**
+     * Test hook: blocks until every {@code DROP_INDEX} / {@code DROP_TABLE}
+     * cleanup task submitted via {@link #submitVectorStoreDeletion} has
+     * completed. Used by tests that assert on the on-storage state right
+     * after applying a DROP entry.
+     *
+     * <p>Public (rather than package-private) because the full-cluster
+     * integration tests live in {@code herddb-services} and need to wait
+     * for DROP cleanup to settle before asserting on the file-server
+     * disk layout.
+     */
+    public void awaitPendingDeletionsForTest() {
+        java.util.List<Future<?>> snapshot;
+        synchronized (pendingDropTasks) {
+            snapshot = new ArrayList<>(pendingDropTasks);
+        }
+        for (Future<?> f : snapshot) {
+            try {
+                f.get(30, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted awaiting DROP cleanup", e);
+            } catch (ExecutionException e) {
+                throw new RuntimeException("DROP cleanup task failed", e.getCause());
+            } catch (java.util.concurrent.TimeoutException e) {
+                throw new RuntimeException("Timed out awaiting DROP cleanup", e);
+            }
+        }
+    }
+
     private static boolean isDmlType(short type) {
         return type == LogEntryType.INSERT
                 || type == LogEntryType.UPDATE
@@ -1213,16 +1336,34 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 break;
 
             case LogEntryType.DROP_TABLE:
-            case LogEntryType.TRUNCATE_TABLE:
+            case LogEntryType.TRUNCATE_TABLE: {
                 schemaTracker.applyEntry(entry);
-                // Remove all vector stores for this table
+                // Remove all vector stores for this table AND release their
+                // remote/local persistent state.  Without the dropIndex()
+                // call below, every per-segment graph + map file would
+                // linger on the file server / S3 forever, causing the
+                // bucket to grow without bound under a CREATE/DROP
+                // workload (issue #383).
                 String droppedTable = entry.tableName;
-                vectorStores.entrySet().removeIf(e -> e.getKey().startsWith(droppedTable + "."));
+                String droppedTablePrefix = droppedTable + ".";
+                java.util.List<Map.Entry<String, AbstractVectorStore>> toClose =
+                        new ArrayList<>();
+                vectorStores.entrySet().removeIf(e -> {
+                    if (e.getKey().startsWith(droppedTablePrefix)) {
+                        toClose.add(e);
+                        return true;
+                    }
+                    return false;
+                });
                 // Keep vectorStoreIndexUuids in sync so a future CREATE_INDEX with the same
                 // (table, name) key does not mis-fire the "different UUID" guard and silently
                 // refuse to create the new store (issue #368 review).
-                vectorStoreIndexUuids.entrySet().removeIf(e -> e.getKey().startsWith(droppedTable + "."));
+                vectorStoreIndexUuids.entrySet().removeIf(e -> e.getKey().startsWith(droppedTablePrefix));
+                for (Map.Entry<String, AbstractVectorStore> dropped : toClose) {
+                    submitVectorStoreDeletion(dropped.getKey(), dropped.getValue());
+                }
                 break;
+            }
 
             case LogEntryType.CREATE_INDEX:
                 schemaTracker.applyEntry(entry);
@@ -1235,8 +1376,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 Index idx = schemaTracker.getIndex(indexName);
                 if (idx != null && Index.TYPE_VECTOR.equals(idx.type)) {
                     String k = storeKey(idx.table, idx.name);
-                    vectorStores.remove(k);
+                    AbstractVectorStore removed = vectorStores.remove(k);
                     vectorStoreIndexUuids.remove(k);
+                    if (removed != null) {
+                        // Close the store and drop its on-storage data
+                        // (graph/map segments + IndexStatus markers).
+                        // Without this, every per-segment graph + map file
+                        // would linger on the file server / S3 forever
+                        // (issue #383).
+                        submitVectorStoreDeletion(k, removed);
+                    }
                     LOGGER.log(Level.INFO, "Removed vector store for index {0}", indexName);
                 }
                 schemaTracker.applyEntry(entry);
@@ -3113,6 +3262,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             }
             checkpointExecutor = null;
             inflightCheckpoint = null;
+            // Pending DROP cleanup tasks have either completed (executor
+            // drained on shutdown) or were cancelled by shutdownNow(); either
+            // way, drop our references so the futures (and the captured
+            // AbstractVectorStore instances) are eligible for GC.
+            pendingDropTasks.clear();
             LOGGER.info("Checkpoint executor shut down");
         }
 

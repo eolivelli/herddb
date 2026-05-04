@@ -1171,7 +1171,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     @Override
     public void dropIndex(String tableSpace, String uuid) throws DataStorageManagerException {
         localMetadataManager.dropIndex(tableSpace, uuid);
-        client.deleteByPrefix(remoteIndexPrefix(tableSpace, uuid));
+        deleteAllRemoteArtefactsForIndex(tableSpace, uuid);
         String key = tableSpace + "/" + uuid;
         lastCheckpointedIndexPages.remove(key);
         pendingIndexDeletions.remove(key);
@@ -1180,10 +1180,40 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     @Override
     public void truncateIndex(String tableSpace, String uuid) throws DataStorageManagerException {
         localMetadataManager.truncateIndex(tableSpace, uuid);
-        client.deleteByPrefix(remoteIndexPrefix(tableSpace, uuid));
+        deleteAllRemoteArtefactsForIndex(tableSpace, uuid);
         String key = tableSpace + "/" + uuid;
         lastCheckpointedIndexPages.remove(key);
         pendingIndexDeletions.remove(key);
+    }
+
+    /**
+     * Deletes every remote-storage object that belongs to a logical
+     * vector index identified by {@code (tableSpace, uuid)}. This must
+     * cover three distinct path families that the various writers use
+     * for the same logical index — without all three, segments / index
+     * status markers leak forever after a DROP (issue #383):
+     * <ul>
+     *   <li>{@code {tableSpace}/{uuid}/...} — index pages and the parent
+     *       index dir written by {@code writeIndexPage} /
+     *       {@code indexCheckpoint};</li>
+     *   <li>{@code {tableSpace}/{uuid}_*} — per-segment multipart files
+     *       (graph, map) and any per-checkpoint temp BLink storages.
+     *       {@link herddb.index.vector.PersistentVectorStore} derives
+     *       fresh storage UUIDs of the form {@code {parentUuid}_seg{N}}
+     *       and {@code {parentUuid}_tmp_pkset_*} from the parent index
+     *       UUID, so a prefix match limited to {@code {uuid}/} would
+     *       leave them orphaned;</li>
+     *   <li>{@code {tableSpace}/_metadata/{uuid}.*} — the per-LSN
+     *       {@code .indexstatus} markers written by
+     *       {@link SharedCheckpointMetadataManager} for shared-storage
+     *       read replicas.</li>
+     * </ul>
+     */
+    private void deleteAllRemoteArtefactsForIndex(String tableSpace, String uuid) {
+        client.deleteByPrefix(remoteIndexPrefix(tableSpace, uuid));
+        client.deleteByPrefix(tableSpace + "/" + uuid + "/");
+        client.deleteByPrefix(tableSpace + "/" + uuid + "_");
+        client.deleteByPrefix(tableSpace + "/_metadata/" + uuid + ".");
     }
 
     @Override
