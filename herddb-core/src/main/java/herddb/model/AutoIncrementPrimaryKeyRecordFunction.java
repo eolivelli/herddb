@@ -20,6 +20,8 @@
 
 package herddb.model;
 
+import herddb.utils.Bytes;
+
 /**
  * Calculates the new primary key value
  *
@@ -32,8 +34,9 @@ public class AutoIncrementPrimaryKeyRecordFunction extends RecordFunction {
     }
 
     @Override
-    public byte[] computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext) {
-        return tableContext.computeNewPrimaryKeyValue();
+    public Bytes computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext) {
+        // tableContext still hands back a byte[]; wrap once at the boundary.
+        return Bytes.from_array(tableContext.computeNewPrimaryKeyValue());
     }
 
 }

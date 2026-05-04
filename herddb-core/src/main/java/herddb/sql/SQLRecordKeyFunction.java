@@ -32,6 +32,7 @@ import herddb.model.StatementEvaluationContext;
 import herddb.model.StatementExecutionException;
 import herddb.model.TableContext;
 import herddb.sql.expressions.CompiledSQLExpression;
+import herddb.utils.Bytes;
 import herddb.utils.DataAccessor;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -90,10 +91,10 @@ public class SQLRecordKeyFunction extends RecordFunction {
 
     @Override
     @SuppressFBWarnings("BC_UNCONFIRMED_CAST")
-    public byte[] computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext) throws StatementExecutionException {
+    public Bytes computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext) throws StatementExecutionException {
         SQLStatementEvaluationContext statementEvaluationContext = (SQLStatementEvaluationContext) context;
         if (isConstant) {
-            byte[] cachedResult = statementEvaluationContext.getConstant(this);
+            Bytes cachedResult = statementEvaluationContext.getConstant(this);
             if (cachedResult != null) {
                 return cachedResult;
             }
@@ -111,7 +112,9 @@ public class SQLRecordKeyFunction extends RecordFunction {
             } catch (StatementExecutionException err) {
                 throw new StatementExecutionException("error on column " + c.name + " (" + ColumnTypes.typeToString(c.type) + "):" + err.getMessage(), err);
             }
-            byte[] result = RecordSerializer.serialize(value, c.type);
+            // RecordSerializer.serialize still returns byte[] for the leaf
+            // type-specific encoders; wrap once at the boundary.
+            Bytes result = Bytes.from_array(RecordSerializer.serialize(value, c.type));
             if (isConstant) {
                 statementEvaluationContext.cacheConstant(this, result);
             }
@@ -135,12 +138,23 @@ public class SQLRecordKeyFunction extends RecordFunction {
         }
         try {
             // maybe this is only a partial primary key
-            byte[] result = RecordSerializer.serializePrimaryKeyRaw(pk, table, pkColumnNames);
+            Bytes result = RecordSerializer.serializePrimaryKeyRaw(pk, table, pkColumnNames);
             if (isConstant) {
                 statementEvaluationContext.cacheConstant(this, result);
             }
             return result;
-        } catch (Exception err) {
+        } catch (RuntimeException err) {
+            // SQL/codec boundary: serializePrimaryKeyRaw may surface several
+            // unchecked exception types depending on the user input —
+            // IllegalArgumentException for null PK columns / SQLTranslator
+            // mismatches, ClassCastException for wrong-typed values cast
+            // inside RecordSerializer.serializeTo (e.g. an Integer where a
+            // BYTEARRAY is expected), and RuntimeException wrapping any
+            // IOException raised by the underlying ExtendedDataOutputStream.
+            // We deliberately catch the broad RuntimeException here so any
+            // codec-level failure surfaces at the JDBC layer as a
+            // user-friendly StatementExecutionException rather than a raw
+            // server-side exception.
             throw new StatementExecutionException("error while converting primary key " + pk + ": " + err, err);
         }
     }

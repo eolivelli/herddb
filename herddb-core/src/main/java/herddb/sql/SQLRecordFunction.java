@@ -29,6 +29,7 @@ import herddb.model.StatementExecutionException;
 import herddb.model.Table;
 import herddb.model.TableContext;
 import herddb.sql.expressions.CompiledSQLExpression;
+import herddb.utils.Bytes;
 import herddb.utils.DataAccessor;
 import java.util.HashMap;
 import java.util.List;
@@ -55,7 +56,7 @@ public class SQLRecordFunction extends RecordFunction {
     }
 
     @Override
-    public byte[] computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext) throws StatementExecutionException {
+    public Bytes computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext) throws StatementExecutionException {
         try {
             if (previous != null) {
                 Map<String, Object> asMap = previous.toBean(table);

@@ -175,6 +175,9 @@ mvn -pl <module> -Dtest='<TestClass>' \
 mvn -pl herddb-core \
     -Dtest='DirectMultipleConcurrentUpdatesSuiteNoIndexesTest,DirectMultipleConcurrentUpdatesSuiteWithNonUniqueIndexesTest,DirectMultipleConcurrentUpdatesSuiteWithUniqueIndexesTest' \
     -Dmaven.repo.local=$MAVEN_REPO test
+mvn -pl herddb-utils \
+    -Dtest='BLinkConcurrentSearchInsertTest' \
+    -Dmaven.repo.local=$MAVEN_REPO test
 ```
 
 **Pre-PR validation:**

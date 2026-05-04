@@ -20,6 +20,7 @@
 
 package herddb.model;
 
+import herddb.utils.Bytes;
 import herddb.utils.ObjectSizeUtils;
 
 /**
@@ -29,7 +30,16 @@ import herddb.utils.ObjectSizeUtils;
  */
 public abstract class RecordFunction {
 
-    public abstract byte[] computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext) throws StatementExecutionException;
+    /**
+     * Computes the new value (key or record body) for the row being inserted /
+     * updated / scanned.
+     *
+     * <p>Returns a {@link Bytes} view rather than a raw {@code byte[]} so that
+     * the underlying serialiser can zero-copy hand off its working buffer
+     * (issue #391). May return {@code null} when the computation legitimately
+     * has no value (e.g. an unbounded scan boundary).</p>
+     */
+    public abstract Bytes computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext) throws StatementExecutionException;
 
     /**
      * Estimate Object size for the PlanCache.

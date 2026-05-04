@@ -138,6 +138,37 @@ public class VisibleByteArrayOutputStream extends OutputStream {
         return Arrays.copyOf(buf, count);
     }
 
+    /**
+     * Floor for the buffer that replaces the stolen one. Avoids degenerate
+     * tiny allocations after a no-op or zero-byte caller.
+     */
+    private static final int MIN_STOLEN_BUFFER_SIZE = 32;
+
+    /**
+     * Returns a {@link Bytes} view over the bytes written so far AND installs
+     * a fresh internal buffer, transferring exclusive ownership of the previous
+     * buffer to the caller. Trailing slack bytes in the stolen buffer are
+     * harmless because the returned {@code Bytes} carries an explicit
+     * {@code (offset, length)}.
+     *
+     * <p>This is the zero-copy hand-off used by the record-serialisation hot
+     * path (issue #391): subsequent writes target a brand-new buffer and never
+     * overwrite bytes the caller is still holding.</p>
+     *
+     * <p>The replacement buffer is sized to {@code Math.max(count, 32)}: for
+     * fixed-schema bulk INSERTs this lets the next call hit the same buffer
+     * length without any further {@code grow()}.</p>
+     *
+     * @return a {@code Bytes} view over the just-written content (offset 0,
+     *         length equal to the previous {@link #size()})
+     */
+    public Bytes stealBytes() {
+        Bytes result = Bytes.from_array(buf, 0, count);
+        buf = new byte[Math.max(count, MIN_STOLEN_BUFFER_SIZE)];
+        count = 0;
+        return result;
+    }
+
     public int size() {
         return count;
     }
