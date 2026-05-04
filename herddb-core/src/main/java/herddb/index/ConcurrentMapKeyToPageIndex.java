@@ -172,16 +172,15 @@ public class ConcurrentMapKeyToPageIndex implements KeyToPageIndex {
 
         if (operation instanceof PrimaryIndexSeek) {
             PrimaryIndexSeek seek = (PrimaryIndexSeek) operation;
-            byte[] seekValue;
+            Bytes key;
             try {
-                seekValue = seek.value.computeNewValue(null, context, tableContext);
+                key = seek.value.computeNewValue(null, context, tableContext);
             } catch (InvalidNullValueForKeyException nullKey) {
-                seekValue = null;
+                key = null;
             }
-            if (seekValue == null) {
+            if (key == null) {
                     return Stream.empty();
                 }
-            Bytes key = Bytes.from_array(seekValue);
             Long pageId = map.get(key);
             if (pageId == null) {
                 return Stream.empty();
@@ -199,7 +198,7 @@ public class ConcurrentMapKeyToPageIndex implements KeyToPageIndex {
             return baseStream;
         } else if (operation instanceof PrimaryIndexPrefixScan) {
             PrimaryIndexPrefixScan scan = (PrimaryIndexPrefixScan) operation;
-            byte[] prefix;
+            Bytes prefix;
             try {
                 prefix = scan.value.computeNewValue(null, context, tableContext);
             } catch (InvalidNullValueForKeyException err) {
@@ -209,7 +208,7 @@ public class ConcurrentMapKeyToPageIndex implements KeyToPageIndex {
             }
             Predicate<Map.Entry<Bytes, Long>> predicate = (Map.Entry<Bytes, Long> t) -> {
                 Bytes fullrecordKey = t.getKey();
-                return fullrecordKey.startsWith(prefix.length, prefix);
+                return fullrecordKey.startsWith(prefix);
             };
             Stream<Map.Entry<Bytes, Long>> baseStream = map.entrySet().stream();
             return baseStream.filter(predicate);
@@ -219,7 +218,7 @@ public class ConcurrentMapKeyToPageIndex implements KeyToPageIndex {
             PrimaryIndexRangeScan sis = (PrimaryIndexRangeScan) operation;
             SQLRecordKeyFunction minKey = sis.minValue;
             if (minKey != null) {
-                refminvalue = Bytes.from_nullable_array(minKey.computeNewValue(null, context, tableContext));
+                refminvalue = minKey.computeNewValue(null, context, tableContext);
             } else {
                 refminvalue = null;
             }
@@ -227,7 +226,7 @@ public class ConcurrentMapKeyToPageIndex implements KeyToPageIndex {
             Bytes refmaxvalue;
             SQLRecordKeyFunction maxKey = sis.maxValue;
             if (maxKey != null) {
-                refmaxvalue = Bytes.from_nullable_array(maxKey.computeNewValue(null, context, tableContext));
+                refmaxvalue = maxKey.computeNewValue(null, context, tableContext);
             } else {
                 refmaxvalue = null;
             }

@@ -482,6 +482,28 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         return true;
     }
 
+    /**
+     * Variant of {@link #startsWith(byte[], int, int, int, byte[])} that takes
+     * an explicit offset into the right-hand prefix array. Used by the
+     * {@link #startsWith(Bytes)} overload to avoid copying a {@code Bytes}
+     * value into a fresh {@code byte[]} when comparing prefixes.
+     */
+    public static boolean startsWith(byte[] left, int leftOffset, int leftLength,
+                                     int max, byte[] right, int rightOffset, int rightLength) {
+        int endleft = leftOffset + leftLength;
+        int endmax = leftOffset + max;
+        int endright = rightOffset + rightLength;
+        for (int i = leftOffset, j = rightOffset;
+             i < endleft && j < endright && i < endmax;
+             i++, j++) {
+            if (left[i] != right[j]) {
+                return false;
+            }
+        }
+        // equality
+        return true;
+    }
+
     public int getLength() {
         return length;
     }
@@ -560,6 +582,18 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
 
     public boolean startsWith(int length, byte[] prefix) {
         return Bytes.startsWith(this.buffer, this.offset, this.length, length, prefix);
+    }
+
+    /**
+     * Returns {@code true} if this value starts with the bytes carried by
+     * {@code prefix}. Zero-copy: neither side is materialised into a fresh
+     * {@code byte[]}, which lets the prefix-scan code paths consume a
+     * {@code Bytes} produced by {@code RecordFunction.computeNewValue} without
+     * any intermediate allocation.
+     */
+    public boolean startsWith(Bytes prefix) {
+        return Bytes.startsWith(this.buffer, this.offset, this.length,
+                prefix.length, prefix.buffer, prefix.offset, prefix.length);
     }
 
     /**

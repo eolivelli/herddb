@@ -806,4 +806,102 @@ public class RecordSerializerTest {
         }
     }
 
+    /**
+     * Issue #391: {@code buildRecord}, {@code serializeValueRaw}, and the
+     * multi-PK branch of {@code serializePrimaryKeyRaw} all share a
+     * {@link ThreadLocal} {@link VisibleByteArrayOutputStream}. After moving
+     * to the steal-the-buffer model, we must verify that calling these methods
+     * back-to-back on the same thread yields {@link Bytes} values that:
+     *   - decode to the expected per-call payload, and
+     *   - are NOT mutated by subsequent calls (no shared-state leak).
+     */
+    @Test
+    public void testBuildRecordRepeatedCallsAreIndependent() throws Exception {
+        Table table = Table.builder()
+                .name("t1")
+                .column("pk", ColumnTypes.STRING)
+                .column("a", ColumnTypes.INTEGER)
+                .column("b", ColumnTypes.STRING)
+                .primaryKey("pk")
+                .build();
+
+        // Build several records of varying sizes — the buffer in the
+        // ThreadLocal will grow / steady-state through these calls.
+        int[] aValues = {1, 2, 3, 100, 12345};
+        String[] bValues = {"x", "yy", "zzz", "wwwwwww", "v".repeat(200)};
+        java.util.List<Bytes> results = new java.util.ArrayList<>();
+        for (int i = 0; i < aValues.length; i++) {
+            int aValue = aValues[i];
+            String bValue = bValues[i];
+            Bytes bytes = RecordSerializer.buildRecord(0, table, columnName -> {
+                switch (columnName) {
+                    case "a":
+                        return aValue;
+                    case "b":
+                        return bValue;
+                    default:
+                        return null;
+                }
+            });
+            results.add(bytes);
+        }
+
+        // Now decode each result and verify (a) it matches its own per-call
+        // payload, and (b) it has not been mutated by subsequent calls.
+        for (int i = 0; i < aValues.length; i++) {
+            Map<String, Object> decoded = RecordSerializer.toBean(
+                    new Record(Bytes.from_string("k" + i), results.get(i)),
+                    table);
+            assertEquals("call " + i + " value 'a'", aValues[i], decoded.get("a"));
+            assertEquals("call " + i + " value 'b'", bValues[i], decoded.get("b").toString());
+        }
+
+        // Same regression check for serializeValueRaw.
+        java.util.List<Bytes> rawResults = new java.util.ArrayList<>();
+        for (int i = 0; i < aValues.length; i++) {
+            Map<String, Object> rec = new HashMap<>();
+            rec.put("pk", "k" + i);
+            rec.put("a", aValues[i]);
+            rec.put("b", bValues[i]);
+            rawResults.add(RecordSerializer.serializeValueRaw(rec, table, 0));
+        }
+        for (int i = 0; i < aValues.length; i++) {
+            Map<String, Object> decoded = RecordSerializer.toBean(
+                    new Record(Bytes.from_string("k" + i), rawResults.get(i)),
+                    table);
+            assertEquals("raw call " + i + " value 'a'", aValues[i], decoded.get("a"));
+            assertEquals("raw call " + i + " value 'b'", bValues[i], decoded.get("b").toString());
+        }
+
+        // And for the multi-PK branch of serializePrimaryKeyRaw.
+        Table multiPkTable = Table.builder()
+                .name("t2")
+                .column("pk1", ColumnTypes.STRING)
+                .column("pk2", ColumnTypes.INTEGER)
+                .column("v", ColumnTypes.LONG)
+                .primaryKey("pk1")
+                .primaryKey("pk2")
+                .build();
+        java.util.List<Bytes> pkResults = new java.util.ArrayList<>();
+        for (int i = 0; i < aValues.length; i++) {
+            Map<String, Object> pk = new HashMap<>();
+            pk.put("pk1", "k" + i);
+            pk.put("pk2", aValues[i]);
+            pkResults.add(RecordSerializer.serializePrimaryKeyRaw(pk,
+                    multiPkTable, multiPkTable.getPrimaryKey()));
+        }
+        // Each PK encoding has been observed to be deterministic: re-encode
+        // and compare to ensure the previously-stolen buffers were NOT mutated
+        // by later calls.
+        for (int i = 0; i < aValues.length; i++) {
+            Map<String, Object> pk = new HashMap<>();
+            pk.put("pk1", "k" + i);
+            pk.put("pk2", aValues[i]);
+            Bytes reEncoded = RecordSerializer.serializePrimaryKeyRaw(pk,
+                    multiPkTable, multiPkTable.getPrimaryKey());
+            assertArrayEquals("multi-PK call " + i + " unchanged",
+                    reEncoded.to_array(), pkResults.get(i).to_array());
+        }
+    }
+
 }

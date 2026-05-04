@@ -393,14 +393,13 @@ public class BRINIndexManager extends AbstractIndexManager {
         if (operation instanceof SecondaryIndexSeek) {
             SecondaryIndexSeek sis = (SecondaryIndexSeek) operation;
             SQLRecordKeyFunction value = sis.value;
-            byte[] refvalue = value.computeNewValue(null, context, tableContext);
-            return data.query(Bytes.from_array(refvalue));
+            Bytes refvalue = value.computeNewValue(null, context, tableContext);
+            return data.query(refvalue);
 
         } else if (operation instanceof SecondaryIndexPrefixScan) {
             SecondaryIndexPrefixScan sis = (SecondaryIndexPrefixScan) operation;
             SQLRecordKeyFunction value = sis.value;
-            byte[] refvalue = value.computeNewValue(null, context, tableContext);
-            Bytes firstKey = Bytes.from_array(refvalue);
+            Bytes firstKey = value.computeNewValue(null, context, tableContext);
             Bytes lastKey = firstKey.next();
             return data.query(firstKey, lastKey);
 
@@ -412,14 +411,12 @@ public class BRINIndexManager extends AbstractIndexManager {
             SecondaryIndexRangeScan sis = (SecondaryIndexRangeScan) operation;
             SQLRecordKeyFunction minKey = sis.minValue;
             if (minKey != null) {
-                byte[] refminvalue = minKey.computeNewValue(null, context, tableContext);
-                firstKey = Bytes.from_array(refminvalue);
+                firstKey = minKey.computeNewValue(null, context, tableContext);
             }
 
             SQLRecordKeyFunction maxKey = sis.maxValue;
             if (maxKey != null) {
-                byte[] refmaxvalue = maxKey.computeNewValue(null, context, tableContext);
-                lastKey = Bytes.from_array(refmaxvalue);
+                lastKey = maxKey.computeNewValue(null, context, tableContext);
             }
             LOGGER.log(Level.FINE, "range scan on {0}.{1}, from {2} to {1}", new Object[]{index.table, index.name, firstKey, lastKey});
             return data.query(firstKey, lastKey);

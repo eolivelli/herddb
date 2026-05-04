@@ -876,10 +876,10 @@ public final class RecordSerializer {
     }
 
     public static Bytes serializePrimaryKey(Map<String, Object> record, ColumnsList table, String[] columns) {
-        return Bytes.from_array(serializePrimaryKeyRaw(record, table, columns));
+        return serializePrimaryKeyRaw(record, table, columns);
     }
 
-    public static byte[] serializePrimaryKeyRaw(Map<String, Object> record, ColumnsList table, String[] columns) {
+    public static Bytes serializePrimaryKeyRaw(Map<String, Object> record, ColumnsList table, String[] columns) {
         String[] primaryKey = table.getPrimaryKey();
         if (primaryKey.length == 1) {
             String pkColumn = primaryKey[0];
@@ -891,7 +891,7 @@ public final class RecordSerializer {
             if (v == null) {
                 throw new IllegalArgumentException("key field " + pkColumn + " cannot be null. Record data: " + record);
             }
-            return serialize(v, c.type);
+            return Bytes.from_array(serialize(v, c.type));
         } else {
             VisibleByteArrayOutputStream key = TL_BUFFER.get();
             key.reset();
@@ -913,7 +913,10 @@ public final class RecordSerializer {
             } catch (IOException err) {
                 throw new RuntimeException(err);
             }
-            return key.toByteArray();
+            // Issue #391: hand the freshly-stolen buffer to the caller as a
+            // zero-copy Bytes view; the TL_BUFFER is replaced with a fresh
+            // array so subsequent calls cannot overwrite the returned bytes.
+            return key.stealBytes();
         }
     }
 
@@ -1128,10 +1131,10 @@ public final class RecordSerializer {
     }
 
     public static Bytes serializeValue(Map<String, Object> record, Table table) {
-        return Bytes.from_array(serializeValueRaw(record, table, 0));
+        return serializeValueRaw(record, table, 0);
     }
 
-    public static byte[] serializeValueRaw(Map<String, Object> record, Table table, int expectedSize) {
+    public static Bytes serializeValueRaw(Map<String, Object> record, Table table, int expectedSize) {
         VisibleByteArrayOutputStream value = TL_BUFFER.get();
         value.reset();
         try (ExtendedDataOutputStream doo = new ExtendedDataOutputStream(value)) {
@@ -1146,10 +1149,11 @@ public final class RecordSerializer {
             throw new RuntimeException(err);
         }
 
-        return value.toByteArray();
+        // Issue #391: zero-copy hand-off of the TL_BUFFER as a Bytes view.
+        return value.stealBytes();
     }
 
-    public static byte[] buildRecord(
+    public static Bytes buildRecord(
             int expectedSize, Table table,
             Function<String, Object> evaluator
     ) {
@@ -1169,7 +1173,8 @@ public final class RecordSerializer {
             throw new RuntimeException(err);
         }
 
-        return value.toByteArray();
+        // Issue #391: zero-copy hand-off of the TL_BUFFER as a Bytes view.
+        return value.stealBytes();
     }
 
     public static Record toRecord(Map<String, Object> record, Table table) {

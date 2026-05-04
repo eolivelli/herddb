@@ -100,13 +100,18 @@ class TmpMapImpl<K, V> implements TmpMap<K, V> {
         RecordFunction keyFunction = new RecordFunction() {
             @Override
             @SuppressFBWarnings("BC_UNCONFIRMED_CAST")
-            public byte[] computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext)
+            public Bytes computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext)
                     throws StatementExecutionException {
                 try {
                     K key = ((PutStatementEvaluationContext<K, V>) context).getKey();
-                    return keySerializer.apply(key);
+                    return Bytes.from_array(keySerializer.apply(key));
                 } catch (StatementExecutionException err) {
                     throw err;
+                // The keySerializer is a user-supplied Function<K, byte[]>; it
+                // can throw arbitrary checked/unchecked exceptions and we must
+                // convert all of them into StatementExecutionException to keep
+                // the JDBC contract upstream. Narrow catches are not possible
+                // at this plugin boundary.
                 } catch (Exception err) {
                     throw new StatementExecutionException(err);
                 }
@@ -115,13 +120,15 @@ class TmpMapImpl<K, V> implements TmpMap<K, V> {
         RecordFunction valuesFunction = new RecordFunction() {
             @Override
             @SuppressFBWarnings("BC_UNCONFIRMED_CAST")
-            public byte[] computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext)
+            public Bytes computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext)
                     throws StatementExecutionException {
                 try {
                     V value = ((PutStatementEvaluationContext<K, V>) context).getValue();
-                    return valuesSerializer.serialize(value);
+                    return Bytes.from_array(valuesSerializer.serialize(value));
                 } catch (StatementExecutionException err) {
                     throw err;
+                // valuesSerializer is a user-supplied serializer; same plugin
+                // boundary rationale as the keyFunction above.
                 } catch (Exception err) {
                     throw new StatementExecutionException(err);
                 }
@@ -306,7 +313,7 @@ class TmpMapImpl<K, V> implements TmpMap<K, V> {
         @Override
         public PrimaryKeyMatchOutcome matchesRawPrimaryKey(Bytes key, StatementEvaluationContext context) throws
                 StatementExecutionException {
-            if (key.equals(Bytes.from_array(keyFunction.computeNewValue(null, context, null)))) {
+            if (key.equals(keyFunction.computeNewValue(null, context, null))) {
                 return PrimaryKeyMatchOutcome.FULL_CONDITION_VERIFIED;
             } else {
                 return PrimaryKeyMatchOutcome.FAILED;

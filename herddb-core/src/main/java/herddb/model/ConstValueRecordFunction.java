@@ -31,18 +31,18 @@ import herddb.utils.Bytes;
 @SuppressFBWarnings({"EI_EXPOSE_REP2", "EI_EXPOSE_REP"})
 public class ConstValueRecordFunction extends RecordFunction {
 
-    private final byte[] value;
+    private final Bytes value;
 
     public ConstValueRecordFunction(byte[] value) {
-        this.value = value;
+        this.value = Bytes.from_array(value);
     }
 
     public ConstValueRecordFunction(Bytes value) {
-        this.value = value.to_array();
+        this.value = value;
     }
 
     @Override
-    public byte[] computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext) {
+    public Bytes computeNewValue(Record previous, StatementEvaluationContext context, TableContext tableContext) {
         return value;
     }
 

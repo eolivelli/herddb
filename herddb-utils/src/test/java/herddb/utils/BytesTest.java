@@ -22,6 +22,7 @@ package herddb.utils;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import java.nio.charset.StandardCharsets;
 import java.util.Random;
@@ -217,6 +218,66 @@ public class BytesTest {
         for (int i = 0; i < in.length; i++) {
             assertEquals(Float.floatToRawIntBits(in[i]), Float.floatToRawIntBits(out[i]));
         }
+    }
+
+    /**
+     * Issue #391: the {@code startsWith(Bytes)} overload preserves the exact
+     * semantics of the pre-existing {@code startsWith(int, byte[])} method
+     * (compare up to {@code prefix.length} bytes; loop terminates when either
+     * side is exhausted). The new overload must additionally respect the
+     * {@link Bytes} prefix's {@code offset+length} so a shared view of a
+     * larger backing buffer is compared correctly without leaking the slack
+     * bytes.
+     */
+    @Test
+    public void testStartsWithBytesOverload() {
+        Bytes value = Bytes.from_array("foobar".getBytes(StandardCharsets.UTF_8));
+
+        // Matching prefix.
+        assertTrue(value.startsWith(Bytes.from_array("foo".getBytes(StandardCharsets.UTF_8))));
+        // Full equality counts as a "startsWith".
+        assertTrue(value.startsWith(Bytes.from_array("foobar".getBytes(StandardCharsets.UTF_8))));
+        // Empty prefix matches everything.
+        assertTrue(value.startsWith(Bytes.from_array(new byte[0])));
+        // Mismatched bytes.
+        assertFalse(value.startsWith(Bytes.from_array("bar".getBytes(StandardCharsets.UTF_8))));
+        // Mismatch detected before either side runs out.
+        assertFalse(value.startsWith(Bytes.from_array("foox".getBytes(StandardCharsets.UTF_8))));
+
+        // Equivalence with the pre-existing byte[] overload: identical
+        // truth-value for every input we can construct from the same arrays.
+        // (We deliberately do NOT test the "prefix longer than value" case
+        // because the legacy semantics return true there, by short-circuiting
+        // when the receiver is exhausted; that is the contract we preserve.)
+        byte[] receiver = "foobar".getBytes(StandardCharsets.UTF_8);
+        byte[] shortPrefix = "foo".getBytes(StandardCharsets.UTF_8);
+        Bytes legacyView = Bytes.from_array(receiver);
+        assertEquals(legacyView.startsWith(shortPrefix.length, shortPrefix),
+                     legacyView.startsWith(Bytes.from_array(shortPrefix)));
+
+        // Shared prefix view (extra slack at the tail, only the first 3 bytes
+        // are in scope). Must compare against the in-scope window only.
+        byte[] sharedBuffer = "fooXXXX".getBytes(StandardCharsets.UTF_8);
+        Bytes sharedPrefix = Bytes.from_array(sharedBuffer, 0, 3);
+        assertTrue(value.startsWith(sharedPrefix));
+
+        // Shared prefix with non-zero offset.
+        byte[] withLeadingSlack = "ZZfooZZ".getBytes(StandardCharsets.UTF_8);
+        Bytes offsetPrefix = Bytes.from_array(withLeadingSlack, 2, 3);
+        assertTrue(value.startsWith(offsetPrefix));
+
+        // Negative case across an offset prefix: "bar" buffered with leading
+        // slack must not match "foobar".
+        byte[] withLeadingSlack2 = "ZZbarZZ".getBytes(StandardCharsets.UTF_8);
+        Bytes offsetMismatch = Bytes.from_array(withLeadingSlack2, 2, 3);
+        assertFalse(value.startsWith(offsetMismatch));
+
+        // Shared *value* view (the receiver), to confirm both sides handle
+        // offset+length correctly.
+        byte[] valueWithSlack = "ZZZfoobarZZ".getBytes(StandardCharsets.UTF_8);
+        Bytes sharedValue = Bytes.from_array(valueWithSlack, 3, 6);
+        assertTrue(sharedValue.startsWith(Bytes.from_array("foo".getBytes(StandardCharsets.UTF_8))));
+        assertFalse(sharedValue.startsWith(Bytes.from_array("bar".getBytes(StandardCharsets.UTF_8))));
     }
 
     private static void assertOrderMatches(int a, int b) {

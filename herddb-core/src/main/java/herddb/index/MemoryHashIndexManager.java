@@ -153,8 +153,8 @@ public class MemoryHashIndexManager extends AbstractIndexManager {
         if (operation instanceof SecondaryIndexSeek) {
             SecondaryIndexSeek sis = (SecondaryIndexSeek) operation;
             SQLRecordKeyFunction value = sis.value;
-            byte[] refvalue = value.computeNewValue(null, context, tableContext);
-            List<Bytes> result = data.get(Bytes.from_array(refvalue));
+            Bytes refvalue = value.computeNewValue(null, context, tableContext);
+            List<Bytes> result = data.get(refvalue);
             if (result != null) {
                 return result.stream();
             } else {
@@ -163,10 +163,10 @@ public class MemoryHashIndexManager extends AbstractIndexManager {
         } else if (operation instanceof SecondaryIndexPrefixScan) {
             SecondaryIndexPrefixScan sis = (SecondaryIndexPrefixScan) operation;
             SQLRecordKeyFunction value = sis.value;
-            byte[] refvalue = value.computeNewValue(null, context, tableContext);
+            Bytes refvalue = value.computeNewValue(null, context, tableContext);
             Predicate<Map.Entry<Bytes, List<Bytes>>> predicate = (Map.Entry<Bytes, List<Bytes>> entry) -> {
                 Bytes recordValue = entry.getKey();
-                return recordValue.startsWith(refvalue.length, refvalue);
+                return recordValue.startsWith(refvalue);
             };
             return data
                     .entrySet()
@@ -181,7 +181,7 @@ public class MemoryHashIndexManager extends AbstractIndexManager {
             SecondaryIndexRangeScan sis = (SecondaryIndexRangeScan) operation;
             SQLRecordKeyFunction minKey = sis.minValue;
             if (minKey != null) {
-                refminvalue = Bytes.from_nullable_array(minKey.computeNewValue(null, context, tableContext));
+                refminvalue = minKey.computeNewValue(null, context, tableContext);
             } else {
                 refminvalue = null;
             }
@@ -189,7 +189,7 @@ public class MemoryHashIndexManager extends AbstractIndexManager {
             Bytes refmaxvalue;
             SQLRecordKeyFunction maxKey = sis.maxValue;
             if (maxKey != null) {
-                refmaxvalue = Bytes.from_nullable_array(maxKey.computeNewValue(null, context, tableContext));
+                refmaxvalue = maxKey.computeNewValue(null, context, tableContext);
             } else {
                 refmaxvalue = null;
             }

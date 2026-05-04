@@ -56,6 +56,10 @@ public final class Record implements SizeAwareObject {
         return key.getEstimatedSize() + Bytes.estimateSize(value) + CONSTANT_BYTE_SIZE;
     }
 
+    public static long estimateSize(Bytes key, Bytes value) {
+        return key.getEstimatedSize() + value.getEstimatedSize() + CONSTANT_BYTE_SIZE;
+    }
+
     public final Bytes key;
     public final Bytes value;
     private WeakReference<Map<String, Object>> cache;

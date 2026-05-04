@@ -223,11 +223,10 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
     ) throws DataStorageManagerException, StatementExecutionException {
         if (operation instanceof PrimaryIndexSeek) {
             PrimaryIndexSeek seek = (PrimaryIndexSeek) operation;
-            byte[] seekValue = computeKeyValue(seek.value, context, tableContext);
-            if (seekValue == null) {
+            Bytes key = computeKeyValue(seek.value, context, tableContext);
+            if (key == null) {
                 return Stream.empty();
             }
-            Bytes key = Bytes.from_array(seekValue);
             Long pageId = getTree().search(key);
             if (pageId == null) {
                 return Stream.empty();
@@ -239,11 +238,10 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
 
             PrimaryIndexPrefixScan scan = (PrimaryIndexPrefixScan) operation;
 //            SQLRecordKeyFunction value = sis.value;
-            byte[] refvalue = computeKeyValue(scan.value, context, tableContext);
-            if (refvalue == null) {
+            Bytes firstKey = computeKeyValue(scan.value, context, tableContext);
+            if (firstKey == null) {
                 return Stream.empty();
             }
-            Bytes firstKey = Bytes.from_array(refvalue);
             Bytes lastKey = firstKey.next();
 
             return getTree().scan(firstKey, lastKey);
@@ -264,14 +262,14 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
             PrimaryIndexRangeScan sis = (PrimaryIndexRangeScan) operation;
             SQLRecordKeyFunction minKey = sis.minValue;
             if (minKey != null) {
-                refminvalue = Bytes.from_array(minKey.computeNewValue(null, context, tableContext));
+                refminvalue = minKey.computeNewValue(null, context, tableContext);
             } else {
                 refminvalue = null;
             }
             Bytes refmaxvalue;
             SQLRecordKeyFunction maxKey = sis.maxValue;
             if (maxKey != null) {
-                refmaxvalue = Bytes.from_array(maxKey.computeNewValue(null, context, tableContext));
+                refmaxvalue = maxKey.computeNewValue(null, context, tableContext);
             } else {
                 refmaxvalue = null;
             }
@@ -282,7 +280,7 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
 
     }
 
-    private static byte[] computeKeyValue(RecordFunction keyFun, StatementEvaluationContext context, TableContext tableContext) throws StatementExecutionException {
+    private static Bytes computeKeyValue(RecordFunction keyFun, StatementEvaluationContext context, TableContext tableContext) throws StatementExecutionException {
         try {
             return keyFun.computeNewValue(null, context, tableContext);
         } catch (InvalidNullValueForKeyException invalidKeyValueException) {
