@@ -301,8 +301,10 @@ class IngestThreadsAdminApiTest {
         int extra = targetThreads - initialThreads;
 
         BlockingQueue<float[]> queue = new ArrayBlockingQueue<>(128);
-        // A latch to know when newly spawned workers are live.
-        CountDownLatch spawnLatch = new CountDownLatch(extra);
+        // The factory is shared by both initial and newly-spawned workers, so
+        // we count down from targetThreads (not extra) — the latch reaches zero
+        // only when ALL targetThreads workers (initial + newly-spawned) are live.
+        CountDownLatch spawnLatch = new CountDownLatch(targetThreads);
 
         ExecutorService pool = new ThreadPoolExecutor(
                 initialThreads, BenchRuntime.MAX_INGEST_THREADS,
