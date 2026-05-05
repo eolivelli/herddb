@@ -98,6 +98,11 @@ server:
     # expiry (30 s default) + pod restart, not by addEntry timeout.
     bookkeeper.addEntryTimeoutSec: "3600"
     bookkeeper.addEntryQuorumTimeoutSec: "7200"
+    # BookKeeper V2 wire protocol (no protobuf framing on addEntry / readEntries).
+    # Code-level default since issue #392; kept here explicitly for parity with the
+    # GKE example so operators can see the effective value at a glance. Set to
+    # "false" to fall back to V3.
+    bookkeeper.useV2WireProtocol: "true"
   resources:
     requests:
       memory: "19Gi"
@@ -315,6 +320,10 @@ indexingService:
     # proportion to the direct-memory pressure they impose. Lower this
     # (e.g. "134217728" = 128 MiB) on tighter bench profiles.
     remote.file.client.max.inflight.read.bytes: "268435456"
+    # BookKeeper V2 wire protocol for the IS commit-log tailer (no protobuf framing
+    # on readEntries). Code-level default since issue #392; kept here explicitly
+    # for parity with the GKE example. Set to "false" to fall back to V3.
+    bookkeeper.useV2WireProtocol: "true"
   resources:
     requests:
       memory: "20Gi"

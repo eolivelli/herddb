@@ -75,6 +75,23 @@ public class BookkeeperCommitLogManager extends CommitLogManager {
      */
     static final int DEFAULT_ZK_TIMEOUT_MS = 40_000;
 
+    /**
+     * Default BK client {@code useV2WireProtocol} applied by HerdDB. The BookKeeper
+     * built-in default is {@code false} (V3 with protobuf framing on every
+     * {@code addEntry} / {@code readEntries} call). V2 keeps a fixed binary frame
+     * and skips the protobuf serialise/deserialise pass on the hot write/read path,
+     * which measurably reduces CPU usage and short-lived object allocation for
+     * sustained ledger traffic — both on the HerdDB server (commit-log writer) and
+     * on the indexing-service tailer (commit-log reader). The bookie auto-negotiates
+     * V2 on receipt, so no bookie-side configuration change is required (issue #392).
+     *
+     * <p>Operators can opt out per deployment by setting
+     * {@code bookkeeper.useV2WireProtocol=false} in {@code server.properties} (or
+     * the equivalent indexing-service properties); the explicit value is applied
+     * after this default by the {@code bookkeeper.*} passthrough loop below.
+     */
+    static final boolean DEFAULT_USE_V2_WIRE_PROTOCOL = true;
+
     private final ZookeeperMetadataStorageManager metadataStorageManager;
     private int ensemble = 1;
     private int writeQuorumSize = 1;
@@ -112,6 +129,14 @@ public class BookkeeperCommitLogManager extends CommitLogManager {
         // in the server configuration still win.
         config.setAddEntryTimeout(DEFAULT_ADD_ENTRY_TIMEOUT_SEC);
         config.setAddEntryQuorumTimeout(DEFAULT_ADD_ENTRY_QUORUM_TIMEOUT_SEC);
+
+        // Prefer the BookKeeper V2 wire protocol on the HerdDB hot path: it skips
+        // the per-RPC protobuf framing required by V3, lowering CPU usage and GC
+        // pressure on every addEntry / readEntries call. Bookies auto-negotiate
+        // V2, so no bookie-side change is required (issue #392). Applied before
+        // the bookkeeper.* passthrough loop so operators can still opt out by
+        // setting bookkeeper.useV2WireProtocol=false in server.properties.
+        config.setUseV2WireProtocol(DEFAULT_USE_V2_WIRE_PROTOCOL);
 
         /* Setups values from configuration */
         for (String key : serverConfiguration.keys()) {
@@ -280,6 +305,9 @@ public class BookkeeperCommitLogManager extends CommitLogManager {
                 ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT));
         config.setEnableParallelRecoveryRead(true);
         config.setEnableDigestTypeAutodetection(true);
+        // Mirror the live-server default so the CLI scan tool talks to bookies
+        // with the same wire protocol as the running cluster (issue #392).
+        config.setUseV2WireProtocol(DEFAULT_USE_V2_WIRE_PROTOCOL);
 
         try (org.apache.bookkeeper.client.api.BookKeeper bookKeeper = org.apache.bookkeeper.client.api.BookKeeper.newBuilder(config).build();) {
             try (ReadHandle lh = bookKeeper

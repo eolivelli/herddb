@@ -21,6 +21,8 @@
 package herddb.cluster;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import herddb.server.ServerConfiguration;
 import org.apache.bookkeeper.conf.ClientConfiguration;
 import org.apache.bookkeeper.stats.NullStatsLogger;
@@ -65,6 +67,42 @@ public class BookkeeperCommitLogManagerConfigTest {
             ClientConfiguration config = manager.getClientConfiguration();
             assertEquals(11, config.getAddEntryTimeout());
             assertEquals(22, config.getAddEntryQuorumTimeout());
+        }
+    }
+
+    /**
+     * Issue #392: V2 must be the baked-in default so every HerdDB deployment
+     * (server commit-log writer + indexing-service tailer) skips the per-RPC
+     * protobuf framing without relying on operator action.
+     */
+    @Test
+    public void appliesDefaultUseV2WireProtocol() {
+        ServerConfiguration serverConfiguration = new ServerConfiguration();
+        try (BookkeeperCommitLogManager manager = new BookkeeperCommitLogManager(
+                fakeMetadata(), serverConfiguration, NullStatsLogger.INSTANCE)) {
+            ClientConfiguration config = manager.getClientConfiguration();
+            assertTrue("BookkeeperCommitLogManager must default to V2 wire protocol",
+                    config.getUseV2WireProtocol());
+            assertEquals(BookkeeperCommitLogManager.DEFAULT_USE_V2_WIRE_PROTOCOL,
+                    config.getUseV2WireProtocol());
+        }
+    }
+
+    /**
+     * Issue #392: operators must still be able to fall back to V3 by setting
+     * {@code bookkeeper.useV2WireProtocol=false} — verifies the explicit value
+     * supplied via the {@code bookkeeper.*} passthrough loop wins over the
+     * code-level default.
+     */
+    @Test
+    public void explicitUseV2WireProtocolOverridesDefault() {
+        ServerConfiguration serverConfiguration = new ServerConfiguration();
+        serverConfiguration.set("bookkeeper.useV2WireProtocol", "false");
+        try (BookkeeperCommitLogManager manager = new BookkeeperCommitLogManager(
+                fakeMetadata(), serverConfiguration, NullStatsLogger.INSTANCE)) {
+            ClientConfiguration config = manager.getClientConfiguration();
+            assertFalse("operator-supplied bookkeeper.useV2WireProtocol=false must win",
+                    config.getUseV2WireProtocol());
         }
     }
 }
