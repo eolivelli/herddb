@@ -2801,8 +2801,18 @@ public class TableSpaceManager {
                 lastCheckpointStartTs = System.currentTimeMillis();
                 try {
                     List<AbstractTableManager> tablesToCheckpoint;
+                    Collection<Transaction> currentTransactions;
+                    List<Table> tablelistSnapshot;
+                    List<Index> indexlistSnapshot;
 
-                    /* *** Phase A: brief write lock *** */
+                    /*
+                     * Phase A: brief write lock — capture in-memory snapshots only.
+                     * Issue #403: shared-storage publishing of transactions and table
+                     * schemas (which can take seconds against remote storage) is
+                     * deferred to "Phase A-persist" below, after the generalLock has
+                     * been released, so DML / commits / scans on this tablespace are
+                     * not blocked by remote I/O.
+                     */
                     long lockStamp = acquireWriteLock("checkpoint");
                     try {
                         logSequenceNumber = log.getLastSequenceNumber();
@@ -2816,15 +2826,28 @@ public class TableSpaceManager {
                             throw new DataStorageManagerException("actualLogSequenceNumber cannot be null");
                         }
                         // TODO: transactions checkpoint is not atomic
-                        Collection<Transaction> currentTransactions = new ArrayList<>(transactions.values());
+                        currentTransactions = new ArrayList<>(transactions.values());
                         for (Transaction t : currentTransactions) {
                             LogSequenceNumber txLsn = t.lastSequenceNumber;
                             if (txLsn != null && txLsn.after(logSequenceNumber)) {
                                 LOGGER.log(Level.SEVERE, "Found transaction {0} with LSN {1} in the future", new Object[]{t.transactionId, txLsn});
                             }
                         }
-                        actions.addAll(dataStorageManager.writeTransactionsAtCheckpoint(tableSpaceUUID, logSequenceNumber, currentTransactions));
-                        actions.addAll(writeTablesOnDataStorageManager(new CommitLogResult(logSequenceNumber, false, true), true));
+
+                        // Snapshot the table/index schema lists under the lock so
+                        // concurrent DDL after this point cannot tear the lists we
+                        // hand to writeTables(...) below. The persistence call runs
+                        // after the lock is released — see issue #403.
+                        tablelistSnapshot = new ArrayList<>();
+                        for (AbstractTableManager tableManager : tables.values()) {
+                            if (!tableManager.isSystemTable()) {
+                                tablelistSnapshot.add(tableManager.getTable());
+                            }
+                        }
+                        indexlistSnapshot = new ArrayList<>();
+                        for (AbstractIndexManager indexManager : indexes.values()) {
+                            indexlistSnapshot.add(indexManager.getIndex());
+                        }
 
                         // Snapshot tables now so Phase B iterates a stable list; concurrent DDL that creates/drops
                         // tables after this point is handled: new tables replay from logSequenceNumber on recovery;
@@ -2834,6 +2857,17 @@ public class TableSpaceManager {
                         releaseWriteLock(lockStamp, "checkpoint");
                         // DML can proceed from here
                     }
+
+                    /*
+                     * Phase A-persist: NO tablespace lock — write the transactions
+                     * snapshot and table/index schemas to the data-storage manager
+                     * (and shared metadata storage on multi-node deployments).
+                     * The slow remote-storage write does not block DML. See #403.
+                     */
+                    actions.addAll(dataStorageManager.writeTransactionsAtCheckpoint(
+                            tableSpaceUUID, logSequenceNumber, currentTransactions));
+                    actions.addAll(dataStorageManager.writeTables(
+                            tableSpaceUUID, logSequenceNumber, tablelistSnapshot, indexlistSnapshot, true));
 
                     /* *** Phase B: per-table checkpoint — no tablespace write lock held *** */
                     for (AbstractTableManager tableManager : tablesToCheckpoint) {

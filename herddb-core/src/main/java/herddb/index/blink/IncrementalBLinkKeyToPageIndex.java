@@ -25,6 +25,7 @@ import herddb.core.HerdDBInternalException;
 import herddb.core.MemoryManager;
 import herddb.core.PostCheckpointAction;
 import herddb.index.IndexOperation;
+import herddb.index.KeyToPageCheckpointSnapshot;
 import herddb.index.KeyToPageIndex;
 import herddb.index.PrimaryIndexPrefixScan;
 import herddb.index.PrimaryIndexRangeScan;
@@ -505,38 +506,77 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
     @Override
     public List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin)
             throws DataStorageManagerException {
-        try {
-            final BLink<Bytes, Long> t = this.tree;
-            if (t == null) {
-                return Collections.emptyList();
-            }
+        // Single-phase entry point: kept for callers that do not opt into the
+        // fuzzy two-phase protocol. Production callers in TableManager Phase C
+        // use prepareCheckpoint + persistCheckpoint directly so the slow
+        // remote I/O runs outside the checkpoint write lock (issue #403).
+        KeyToPageCheckpointSnapshot snapshot = prepareCheckpoint(sequenceNumber, pin);
+        return persistCheckpoint(snapshot);
+    }
 
-            /*
-             * Install a per-checkpoint batch so BLink node-page writes go
-             * through writeIndexPageAsync and run concurrently up to
-             * CHECKPOINT_FLUSH_PARALLELISM in flight. The legacy
-             * BLinkKeyToPageIndex already does this (issue #202); replicating
-             * it here is the fix for issue #396, where Phase C duration was
-             * dominated by serial round-trips to remote storage. The BLink
-             * tree traversal itself remains sequential. All futures are joined
-             * by awaitBatch() before we persist the manifest, so the
-             * IndexStatus marker never references a page whose bytes are not
-             * yet durable.
-             */
-            AsyncIndexWriteBatch batch = new AsyncIndexWriteBatch(CHECKPOINT_FLUSH_PARALLELISM);
-            BLinkMetadata<Bytes> metadata;
-            currentBatch = batch;
-            try {
-                metadata = t.checkpoint();
-            } finally {
-                currentBatch = null;
-            }
+    @Override
+    public KeyToPageCheckpointSnapshot prepareCheckpoint(LogSequenceNumber sequenceNumber, boolean pin)
+            throws DataStorageManagerException {
+        final BLink<Bytes, Long> t = this.tree;
+        if (t == null) {
+            return new IncrementalBLinkCheckpointSnapshot(sequenceNumber, pin, /*empty*/ true,
+                    null, null);
+        }
+
+        /*
+         * Install a per-checkpoint batch so BLink node-page writes go
+         * through writeIndexPageAsync and run concurrently up to
+         * CHECKPOINT_FLUSH_PARALLELISM in flight. The legacy
+         * BLinkKeyToPageIndex already does this (issue #202); replicating
+         * it here is the fix for issue #396, where Phase C duration was
+         * dominated by serial round-trips to remote storage. The BLink
+         * tree traversal itself remains sequential. All futures are joined
+         * inside persistCheckpoint, before we write any manifest bytes,
+         * so the IndexStatus marker never references a page whose bytes
+         * are not yet durable.
+         *
+         * Issue #403: the tree traversal mutates per-node "dirty" flags and
+         * therefore must run while the caller still excludes DML
+         * (TableManager's checkpointLock write). Everything below — including
+         * the awaitBatch call and the snapshot/delta writes — runs outside
+         * the lock inside persistCheckpoint.
+         */
+        AsyncIndexWriteBatch batch = new AsyncIndexWriteBatch(CHECKPOINT_FLUSH_PARALLELISM);
+        BLinkMetadata<Bytes> metadata;
+        currentBatch = batch;
+        try {
+            metadata = t.checkpoint();
+        } catch (IOException err) {
+            throw new DataStorageManagerException(err);
+        } finally {
+            currentBatch = null;
+        }
+
+        return new IncrementalBLinkCheckpointSnapshot(sequenceNumber, pin, /*empty*/ false,
+                metadata, batch);
+    }
+
+    @Override
+    public List<PostCheckpointAction> persistCheckpoint(KeyToPageCheckpointSnapshot snapshot)
+            throws DataStorageManagerException {
+        IncrementalBLinkCheckpointSnapshot s = (IncrementalBLinkCheckpointSnapshot) snapshot;
+        if (s.empty) {
+            return Collections.emptyList();
+        }
+        try {
             // Join the BLink node-page writes BEFORE we persist any manifest
             // bytes. The snapshot chunks / delta pages below are written
             // synchronously via writeIndexPage and durable on return, but the
             // BLink node-page bytes referenced by storeId fields inside the
             // metadata must be durable before the manifest naming them is.
-            awaitBatch(batch);
+            //
+            // Issue #403: this wait runs OUTSIDE the TableManager.checkpointLock
+            // write lock — concurrent DML on the table proceeds while the
+            // remote node-page writes drain.
+            awaitBatch(s.pendingNodeWrites);
+
+            BLinkMetadata<Bytes> metadata = s.metadata;
+            LogSequenceNumber sequenceNumber = s.sequenceNumber();
 
             Map<Long, BLinkNodeMetadata<Bytes>> newByNodeId = new LinkedHashMap<>(metadata.nodes.size());
             for (BLinkNodeMetadata<Bytes> node : metadata.nodes) {
@@ -602,7 +642,7 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
                     newPageId.get(), preserve, manifestBytes);
 
             List<PostCheckpointAction> result = new ArrayList<>(
-                    dataStorageManager.indexCheckpoint(tableSpace, indexName, indexStatus, pin));
+                    dataStorageManager.indexCheckpoint(tableSpace, indexName, indexStatus, s.pin));
 
             currentManifest = nextManifest;
             lastPreserveSet = preserve;
@@ -619,6 +659,35 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
             return result;
         } catch (IOException err) {
             throw new DataStorageManagerException(err);
+        }
+    }
+
+    /**
+     * Snapshot taken under the caller's exclusion window in
+     * {@link #prepareCheckpoint(LogSequenceNumber, boolean)} and consumed
+     * outside the lock by
+     * {@link #persistCheckpoint(KeyToPageCheckpointSnapshot)}. See issue #403.
+     */
+    static final class IncrementalBLinkCheckpointSnapshot implements KeyToPageCheckpointSnapshot {
+
+        private final LogSequenceNumber sequenceNumber;
+        final boolean pin;
+        final boolean empty;
+        final BLinkMetadata<Bytes> metadata;
+        final AsyncIndexWriteBatch pendingNodeWrites;
+
+        IncrementalBLinkCheckpointSnapshot(LogSequenceNumber sequenceNumber, boolean pin, boolean empty,
+                BLinkMetadata<Bytes> metadata, AsyncIndexWriteBatch pendingNodeWrites) {
+            this.sequenceNumber = sequenceNumber;
+            this.pin = pin;
+            this.empty = empty;
+            this.metadata = metadata;
+            this.pendingNodeWrites = pendingNodeWrites;
+        }
+
+        @Override
+        public LogSequenceNumber sequenceNumber() {
+            return sequenceNumber;
         }
     }
 

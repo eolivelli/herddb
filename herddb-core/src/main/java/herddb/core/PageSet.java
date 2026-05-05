@@ -62,7 +62,9 @@ public final class PageSet {
             this.dirt = new LongAdder();
         }
 
-        // package-private — constructed from raw fields in tests (same package)
+        // package-private — constructed from raw fields by tests in the same
+        // package and by TableManager.checkpoint() to deep-copy the dirt
+        // counter into the LSN-consistent TableStatus snapshot (issue #403).
         DataPageMetaData(long size, long avgRecordSize, long dirt) {
             super();
             this.size = size;

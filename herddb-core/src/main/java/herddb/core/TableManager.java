@@ -26,6 +26,7 @@ import herddb.codec.RecordSerializer;
 import herddb.core.PageSet.DataPageMetaData;
 import herddb.core.stats.TableManagerStats;
 import herddb.index.IndexOperation;
+import herddb.index.KeyToPageCheckpointSnapshot;
 import herddb.index.KeyToPageIndex;
 import herddb.index.PrimaryIndexSeek;
 import herddb.log.CommitLog;
@@ -200,6 +201,27 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     private volatile boolean started = false;
 
     private volatile boolean checkPointRunning = false;
+
+    /**
+     * Per-table mutex that serializes <em>entire</em> {@code checkpoint(...)}
+     * invocations on this {@link TableManager}. Guarantees that two concurrent
+     * callers of {@link #checkpoint(boolean)} / {@link #fullCheckpoint(boolean)}
+     * — e.g. an admin-triggered tablespace checkpoint racing with the
+     * activator-thread-driven {@code TableSpaceManager.runLocalTableCheckPoints()}
+     * — never overlap their Phase B / Phase C-persist work on the same table.
+     *
+     * <p>Without this mutex, the two invocations could interleave their
+     * mutations of {@code pageSet}, {@code newPages}, {@code nextPageId},
+     * the BLink {@code currentManifest} / {@code previousByNodeId} state, and
+     * the persisted {@code IndexStatus} / {@code TableStatus} blobs, leading
+     * to silent data loss (e.g. preserve sets disagreeing with the surviving
+     * manifest, or epoch numbers reused across two manifests).</p>
+     *
+     * <p>This is independent from {@link #checkpointLock}, which serializes
+     * checkpoint vs. concurrent DML/commits but does NOT guard against two
+     * checkpoint invocations on the same table. See issue #403 review.</p>
+     */
+    private final ReentrantLock checkpointSerializerLock = new ReentrantLock();
 
     /**
      * Test-only hook fired inside {@link #checkpoint(double, double, long, long, long, boolean, long)}
@@ -3629,6 +3651,34 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             double dirtyThreshold, double fillThreshold,
             long checkpointTargetTime, long cleanupTargetTime, long compactionTargetTime, boolean pin
     ) throws DataStorageManagerException {
+        // Issue #403: serialize concurrent checkpoint(...) invocations on this
+        // table. Without this lock the activator-thread-driven
+        // runLocalTableCheckPoints could overlap with an admin-triggered
+        // tableSpaceManager.checkpoint(...) on the same table, racing through
+        // Phase B (cleanAndCompactPages, indexManager.checkpoint,
+        // drainPendingNewPages) and Phase C-persist (BLink persistCheckpoint
+        // mutating currentManifest / previousByNodeId / lastPreserveSet, plus
+        // dataStorageManager.tableCheckpoint writing the TableStatus blob),
+        // producing a torn manifest or a TableStatus that disagrees with the
+        // surviving IndexStatus.
+        //
+        // The lock wraps the ENTIRE checkpoint body, including both Phase A
+        // (under checkpointLock write) and the fuzzy Phase B / Phase C-persist
+        // (no checkpointLock). It does NOT block DML (which acquires
+        // checkpointLock.readLock instead) — only other checkpoint callers.
+        checkpointSerializerLock.lock();
+        try {
+            return doCheckpoint(dirtyThreshold, fillThreshold,
+                    checkpointTargetTime, cleanupTargetTime, compactionTargetTime, pin);
+        } finally {
+            checkpointSerializerLock.unlock();
+        }
+    }
+
+    private TableCheckpoint doCheckpoint(
+            double dirtyThreshold, double fillThreshold,
+            long checkpointTargetTime, long cleanupTargetTime, long compactionTargetTime, boolean pin
+    ) throws DataStorageManagerException {
         LOGGER.log(Level.FINE, "tableCheckpoint dirtyThreshold: " + dirtyThreshold + ", {0}.{1} (pin: {2})", new Object[]{tableSpaceUUID, table.name, pin});
         if (createdInTransaction > 0) {
             LOGGER.log(Level.FINE, "checkpoint for table " + table.name + " skipped,"
@@ -3652,6 +3702,20 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         final List<PostCheckpointAction> actions = new ArrayList<>();
 
         TableCheckpoint result;
+
+        /*
+         * Outer try/finally for issue #403 (and pre-existing Phase B leak):
+         * guarantees {@code checkPointRunning} is cleared whether the failure
+         * originates inside Phase A (under checkpointLock write), Phase B (no
+         * lock — cleanAndCompactPages, frozen page flush, indexManager.checkpoint,
+         * drainPendingNewPages), the under-lock part of Phase C, or the
+         * out-of-lock Phase C-persist. A leaked {@code checkPointRunning=true}
+         * permanently breaks {@code TRUNCATE TABLE} on this table (see
+         * {@link #applyTruncate}'s assertion at line ~2188), so the wrap MUST
+         * cover every step that can throw after {@code checkPointRunning = true}
+         * is set in Phase A.
+         */
+        try {
 
         /* ====================================================== */
         /* === PHASE A: Brief write lock — snapshot page state === */
@@ -3916,7 +3980,10 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
 
         /* ================================================================== */
-        /* === PHASE C: Brief write lock — finalize metadata and PK index === */
+        /* === PHASE C: Brief write lock — snapshot finalize state         === */
+        /* === then RELEASE the lock and persist (BLink + tableStatus)     === */
+        /* === outside the lock so DML / commits proceed concurrently      === */
+        /* === with the slow remote I/O. See issue #403.                   === */
         /* ================================================================== */
 
         boolean lockAcquiredC;
@@ -3928,6 +3995,13 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         if (!lockAcquiredC) {
             throw new DataStorageManagerException("timed out while waiting for checkpoint lock (Phase C), write lock " + checkpointLock.writeLock());
         }
+
+        // State that flows from "under-lock snapshot" into "after-lock persistence".
+        final LogSequenceNumber postFlushSequenceNumber;
+        final TableStatus tableStatus;
+        final KeyToPageCheckpointSnapshot pkIndexSnapshot;
+        final long keyToPageStart;
+
         try {
 
             /* *** Remaining spare data handling *** */
@@ -3950,7 +4024,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
              * drain, plus any pages concurrent DML allocated between unlock-of-drain and
              * acquire-of-Phase-C-write-lock (typically one partially-filled page).
              *
-             * We still MUST run this pass: keyToPage.checkpoint() below requires newPages
+             * We still MUST run this pass: keyToPage.prepareCheckpoint() below requires newPages
              * empty, else it records mappings to pages missing from activePages and storage,
              * and recovery fails with "no record in memory for K" (issue #46).
              *
@@ -4019,7 +4093,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
              * Phase B are correctly skipped on recovery — because those applies updated
              * lastAppliedSequenceNumber before Phase C read it.
              */
-            final LogSequenceNumber postFlushSequenceNumber = lastAppliedSequenceNumber.get();
+            postFlushSequenceNumber = lastAppliedSequenceNumber.get();
             if (LOGGER.isLoggable(Level.FINE)) {
                 LOGGER.log(Level.FINE,
                         "issue-157 phase-C LSN: table {0}.{1} phaseA={2} postFlush={3} flushedDirty={4} flushedSmall={5} flushedNew={6} newPagesLeft={7}",
@@ -4028,44 +4102,45 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
 
             /*
-             * Checkpoint the primary key index (BLink tree).
-             * The write lock guarantees no threads are modifying the index concurrently,
-             * which is required by BLink's checkpoint() contract.
+             * Snapshot the primary key index (BLink tree) state under the lock — this
+             * traverses the tree and clears per-node "dirty" flags, which requires
+             * exclusive access. The actual remote node-page writes are dispatched but
+             * NOT awaited here; the heavy I/O completes outside the lock inside
+             * persistCheckpoint below. See issue #403.
              */
-            final long keyToPageStart = System.currentTimeMillis();
+            keyToPageStart = System.currentTimeMillis();
             LOGGER.log(Level.INFO,
-                    "checkpoint {0}.{1} Phase C: checkpointing PK index at {2} ({3} active pages)",
+                    "checkpoint {0}.{1} Phase C: snapshotting PK index at {2} ({3} active pages)",
                     new Object[]{table.tablespace, table.name, postFlushSequenceNumber,
                             pageSet.getActivePagesCount()});
-            actions.addAll(keyToPage.checkpoint(postFlushSequenceNumber, pin));
-            maybeWarnOnActionAccumulation(actions);
-            keytopagecheckpoint = System.currentTimeMillis();
-            LOGGER.log(Level.INFO,
-                    "checkpoint {0}.{1} Phase C: PK index checkpoint done in {2} ms",
-                    new Object[]{table.tablespace, table.name, keytopagecheckpoint - keyToPageStart});
+            pkIndexSnapshot = keyToPage.prepareCheckpoint(postFlushSequenceNumber, pin);
 
             pageSet.checkpointDone(flushedPages);
 
             /*
-             * Use a live unmodifiable view of pageSet.activePages here — no defensive
-             * copy. Safe because Phase C holds the checkpoint write lock for the
-             * entire lifetime of `tableStatus` (it is consumed by
-             * dataStorageManager.tableCheckpoint below and discarded).
+             * Build a defensive deep snapshot of pageSet.activePages here — we are
+             * about to release the checkpoint write lock, after which concurrent DML
+             * may add or remove activePages entries AND mutate the per-page
+             * {@link PageSet.DataPageMetaData#dirt} {@link java.util.concurrent.atomic.LongAdder}
+             * via {@code setPageDirty}. A shallow copy would let a {@code dirt.sum()}
+             * read inside {@code TableStatus.serialize(...)} include dirt accumulated
+             * AFTER {@code postFlushSequenceNumber}, producing on-disk dirt counts
+             * that disagree with the persisted LSN. Cloning each metadata into a
+             * fresh {@code DataPageMetaData} with the dirt sum captured here keeps
+             * the on-disk state strictly LSN-consistent. The snapshot is consumed by
+             * dataStorageManager.tableCheckpoint below, which serializes it into the
+             * TableStatus blob written to remote storage. See issue #403.
              */
-            TableStatus tableStatus = new TableStatus(table.name, postFlushSequenceNumber,
+            Map<Long, PageSet.DataPageMetaData> activePagesSnapshot = new HashMap<>();
+            for (Entry<Long, PageSet.DataPageMetaData> e : pageSet.getActivePagesView().entrySet()) {
+                PageSet.DataPageMetaData live = e.getValue();
+                activePagesSnapshot.put(e.getKey(),
+                        new PageSet.DataPageMetaData(live.getSize(), live.getAverageRecordSize(),
+                                live.getDirtBytes()));
+            }
+            tableStatus = new TableStatus(table.name, postFlushSequenceNumber,
                     Bytes.longToByteArray(nextPrimaryKeyValue.get()), nextPageId,
-                    pageSet.getActivePagesView());
-
-            final long tableStatusStart = System.currentTimeMillis();
-            LOGGER.log(Level.INFO,
-                    "checkpoint {0}.{1} Phase C: writing table status to storage ({2} active pages)",
-                    new Object[]{table.tablespace, table.name, pageSet.getActivePagesCount()});
-            actions.addAll(dataStorageManager.tableCheckpoint(tableSpaceUUID, table.uuid, tableStatus, pin));
-            maybeWarnOnActionAccumulation(actions);
-            tablecheckpoint = System.currentTimeMillis();
-            LOGGER.log(Level.INFO,
-                    "checkpoint {0}.{1} Phase C: table status written in {2} ms",
-                    new Object[]{table.tablespace, table.name, tablecheckpoint - tableStatusStart});
+                    activePagesSnapshot);
 
             /*
              * Can happen when at checkpoint start all pages are set as dirty or immutable (immutable or
@@ -4076,27 +4151,57 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 allocateLivePage(currentDirtyRecordsPage.get());
             }
 
-            checkPointRunning = false;
+        } finally {
+            // The checkpoint is still "running" until persistence below completes;
+            // do NOT clear checkPointRunning here. Release the lock so commits and DML
+            // can proceed concurrently with the slow remote I/O performed below.
+            checkpointLock.asWriteLock().unlock();
+        }
 
-            result = new TableCheckpoint(table.name, postFlushSequenceNumber, actions);
+        /* ============================================================== */
+        /* === PHASE C-persist: NO checkpoint lock — slow remote I/O   === */
+        /* === runs concurrently with DML / commits.   See issue #403. === */
+        /* ============================================================== */
+        actions.addAll(keyToPage.persistCheckpoint(pkIndexSnapshot));
+        maybeWarnOnActionAccumulation(actions);
+        keytopagecheckpoint = System.currentTimeMillis();
+        LOGGER.log(Level.INFO,
+                "checkpoint {0}.{1} Phase C: PK index checkpoint done in {2} ms",
+                new Object[]{table.tablespace, table.name, keytopagecheckpoint - keyToPageStart});
 
-            end = System.currentTimeMillis();
-            if (flushedRecords > 0) {
-                LOGGER.log(Level.INFO, "checkpoint {0} finished, logpos {1}, {2} active pages, {3} dirty pages, "
-                        + "flushed {4} records, total time {5} ms",
-                        new Object[]{table.name, sequenceNumber, pageSet.getActivePagesCount(),
-                            pageSet.getDirtyPagesCount(), flushedRecords, Long.toString(end - start)});
-            }
+        final long tableStatusStart = System.currentTimeMillis();
+        LOGGER.log(Level.INFO,
+                "checkpoint {0}.{1} Phase C: writing table status to storage ({2} active pages)",
+                new Object[]{table.tablespace, table.name, tableStatus.activePages.size()});
+        actions.addAll(dataStorageManager.tableCheckpoint(tableSpaceUUID, table.uuid, tableStatus, pin));
+        maybeWarnOnActionAccumulation(actions);
+        tablecheckpoint = System.currentTimeMillis();
+        LOGGER.log(Level.INFO,
+                "checkpoint {0}.{1} Phase C: table status written in {2} ms",
+                new Object[]{table.tablespace, table.name, tablecheckpoint - tableStatusStart});
 
-            if (LOGGER.isLoggable(Level.FINE)) {
-                LOGGER.log(Level.FINE, "checkpoint {0} finished, logpos {1}, pageSet: {2}",
-                        new Object[]{table.name, sequenceNumber, pageSet.toString()});
-            }
+        result = new TableCheckpoint(table.name, postFlushSequenceNumber, actions);
+
+        end = System.currentTimeMillis();
+        if (flushedRecords > 0) {
+            LOGGER.log(Level.INFO, "checkpoint {0} finished, logpos {1}, {2} active pages, {3} dirty pages, "
+                    + "flushed {4} records, total time {5} ms",
+                    new Object[]{table.name, sequenceNumber, pageSet.getActivePagesCount(),
+                        pageSet.getDirtyPagesCount(), flushedRecords, Long.toString(end - start)});
+        }
+
+        if (LOGGER.isLoggable(Level.FINE)) {
+            LOGGER.log(Level.FINE, "checkpoint {0} finished, logpos {1}, pageSet: {2}",
+                    new Object[]{table.name, sequenceNumber, pageSet.toString()});
+        }
 
         } finally {
-            // Ensure checkPointRunning is cleared even on exception during Phase C
+            // Outer finally for issue #403: clears checkPointRunning whether
+            // the failure originates inside Phase A (the inner Phase A finally
+            // releases the write lock), Phase B (no lock), the under-lock part
+            // of Phase C (its inner finally releases the lock), or the
+            // out-of-lock Phase C-persist block.
             checkPointRunning = false;
-            checkpointLock.asWriteLock().unlock();
         }
 
         long delta = end - start;
