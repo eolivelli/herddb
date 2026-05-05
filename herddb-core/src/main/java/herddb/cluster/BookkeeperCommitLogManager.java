@@ -89,6 +89,20 @@ public class BookkeeperCommitLogManager extends CommitLogManager {
      * {@code bookkeeper.useV2WireProtocol=false} in {@code server.properties} (or
      * the equivalent indexing-service properties); the explicit value is applied
      * after this default by the {@code bookkeeper.*} passthrough loop below.
+     * The CLI {@code scanRawLedger} path honours the same key on its supplied
+     * {@code herddb.client.ClientConfiguration}.
+     *
+     * <p>Trade-off note: BookKeeper's V2 wire protocol does not implement the
+     * long-poll variant of {@code READ_ENTRY}, so a {@code readLastAddConfirmedAndEntry}
+     * call that would otherwise block on the bookie until a new entry is available
+     * returns immediately under V2 with the current LAC. Follower paths that loop
+     * tightly on long-poll reads (the cluster {@code FollowerThread} in
+     * {@link herddb.core.TableSpaceManager} and the indexing-service
+     * {@link BookKeeperCommitLogTailer}) therefore consume more CPU on idle
+     * ledgers under V2 than under V3. This is the trade-off behind enabling V2 by
+     * default — measured wins on write-heavy workloads were judged to outweigh
+     * the idle-follower cost. Set the override to {@code false} on deployments
+     * where idle-follower CPU matters more than steady-state CPU/GC.
      */
     static final boolean DEFAULT_USE_V2_WIRE_PROTOCOL = true;
 
@@ -136,6 +150,9 @@ public class BookkeeperCommitLogManager extends CommitLogManager {
         // V2, so no bookie-side change is required (issue #392). Applied before
         // the bookkeeper.* passthrough loop so operators can still opt out by
         // setting bookkeeper.useV2WireProtocol=false in server.properties.
+        // NOTE: V2 does not implement the long-poll variant of READ_ENTRY — see
+        // the Javadoc on DEFAULT_USE_V2_WIRE_PROTOCOL for the idle-follower
+        // trade-off this default accepts.
         config.setUseV2WireProtocol(DEFAULT_USE_V2_WIRE_PROTOCOL);
 
         /* Setups values from configuration */
@@ -306,8 +323,11 @@ public class BookkeeperCommitLogManager extends CommitLogManager {
         config.setEnableParallelRecoveryRead(true);
         config.setEnableDigestTypeAutodetection(true);
         // Mirror the live-server default so the CLI scan tool talks to bookies
-        // with the same wire protocol as the running cluster (issue #392).
-        config.setUseV2WireProtocol(DEFAULT_USE_V2_WIRE_PROTOCOL);
+        // with the same wire protocol as the running cluster, while still
+        // honouring an explicit bookkeeper.useV2WireProtocol=false override
+        // supplied by the caller's ClientConfiguration (issue #392).
+        config.setUseV2WireProtocol(clientConfiguration.getBoolean(
+                "bookkeeper.useV2WireProtocol", DEFAULT_USE_V2_WIRE_PROTOCOL));
 
         try (org.apache.bookkeeper.client.api.BookKeeper bookKeeper = org.apache.bookkeeper.client.api.BookKeeper.newBuilder(config).build();) {
             try (ReadHandle lh = bookKeeper

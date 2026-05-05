@@ -105,4 +105,23 @@ public class BookkeeperCommitLogManagerConfigTest {
                     config.getUseV2WireProtocol());
         }
     }
+
+    /**
+     * Issue #392: a future regression that re-applies the code-level default
+     * <em>after</em> the {@code bookkeeper.*} passthrough loop would silently
+     * ignore an explicit {@code true} from the operator. Asserting the
+     * positive-explicit case alongside the negative override and the bare
+     * default catches that class of bug.
+     */
+    @Test
+    public void explicitUseV2WireProtocolTrueIsHonoured() {
+        ServerConfiguration serverConfiguration = new ServerConfiguration();
+        serverConfiguration.set("bookkeeper.useV2WireProtocol", "true");
+        try (BookkeeperCommitLogManager manager = new BookkeeperCommitLogManager(
+                fakeMetadata(), serverConfiguration, NullStatsLogger.INSTANCE)) {
+            ClientConfiguration config = manager.getClientConfiguration();
+            assertTrue("operator-supplied bookkeeper.useV2WireProtocol=true must be honoured",
+                    config.getUseV2WireProtocol());
+        }
+    }
 }
