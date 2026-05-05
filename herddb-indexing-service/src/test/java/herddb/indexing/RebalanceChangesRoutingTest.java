@@ -428,7 +428,7 @@ public class RebalanceChangesRoutingTest {
                         "vec", new float[]{i, i, i});
                 processAll(services, new LogSequenceNumber(1, 110 + i),
                         new herddb.log.LogEntry(System.currentTimeMillis(),
-                                herddb.log.LogEntryType.INSERT, txA, t.name,
+                                herddb.log.LogEntryType.INSERT, txA, t.tableId,
                                 rec.key, rec.value));
             }
             processAll(services, new LogSequenceNumber(1, 200),
@@ -452,7 +452,7 @@ public class RebalanceChangesRoutingTest {
                         "vec", new float[]{i, i, i});
                 processAll(services, new LogSequenceNumber(1, 310 + i),
                         new herddb.log.LogEntry(System.currentTimeMillis(),
-                                herddb.log.LogEntryType.INSERT, txB, t.name,
+                                herddb.log.LogEntryType.INSERT, txB, t.tableId,
                                 rec.key, rec.value));
             }
 
@@ -476,7 +476,7 @@ public class RebalanceChangesRoutingTest {
                         "vec", new float[]{i + 5000, i, i});
                 processAll(services, new LogSequenceNumber(1, 410 + i),
                         new herddb.log.LogEntry(System.currentTimeMillis(),
-                                herddb.log.LogEntryType.INSERT, txB, t.name,
+                                herddb.log.LogEntryType.INSERT, txB, t.tableId,
                                 rec.key, rec.value));
             }
             processAll(services, new LogSequenceNumber(1, 500),
@@ -515,7 +515,7 @@ public class RebalanceChangesRoutingTest {
                         "vec", new float[]{i + 9000, i, i});
                 processAll(services, new LogSequenceNumber(1, 610 + i),
                         new herddb.log.LogEntry(System.currentTimeMillis(),
-                                herddb.log.LogEntryType.INSERT, txC, t.name,
+                                herddb.log.LogEntryType.INSERT, txC, t.tableId,
                                 rec.key, rec.value));
             }
             processAll(services, new LogSequenceNumber(1, 700),
@@ -535,7 +535,7 @@ public class RebalanceChangesRoutingTest {
                         "vec", new float[]{0, 0, 0});
                 processAll(services, new LogSequenceNumber(1, 810 + i),
                         new herddb.log.LogEntry(System.currentTimeMillis(),
-                                herddb.log.LogEntryType.DELETE, txD, t.name,
+                                herddb.log.LogEntryType.DELETE, txD, t.tableId,
                                 rec.key, null));
             }
             processAll(services, new LogSequenceNumber(1, 900),

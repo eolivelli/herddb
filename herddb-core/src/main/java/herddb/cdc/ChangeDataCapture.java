@@ -134,6 +134,27 @@ public class ChangeDataCapture implements AutoCloseable {
          * @return the schema
          */
         Table fetchSchema(LogSequenceNumber lsn, String tableName);
+
+        /**
+         * Optional id → name resolver used by the CDC to translate a
+         * commit-log {@code tableId} (issue #408 — entries no longer carry
+         * the table name) back into a name when the in-memory id → name
+         * cache is empty (e.g. CDC restarts at an LSN past the relevant
+         * {@code CREATE_TABLE} entry).
+         * <p>
+         * The default implementation returns {@code null}, preserving
+         * source / binary compatibility with existing implementations:
+         * callers that hit the {@code null} fall back to whatever name
+         * they have observed on the in-flight commit-log stream. Storage
+         * implementations that index stored schemas by id can override
+         * this to expose the mapping across CDC restarts.
+         *
+         * @param tableId per-tablespace integer id from a {@link LogEntry}
+         * @return the table name if known, or {@code null}
+         */
+        default String resolveTableName(int tableId) {
+            return null;
+        }
     }
 
     private final ClientConfiguration configuration;
@@ -150,8 +171,24 @@ public class ChangeDataCapture implements AutoCloseable {
 
     private static class TransactionHolder {
         private List<Mutation> mutations = new ArrayList<>();
-        private Map<String, Table> tablesDefinitions = new HashMap<>();
+        // Issue #408: keyed by Table#tableId — the in-flight transaction's
+        // schema overrides for CREATE/ALTER/DROP TABLE entries that have not
+        // yet been COMMITted, so DML inside the same transaction can resolve
+        // its target without consulting the persistent schema history.
+        // The public TableSchemaHistoryStorage API is name-keyed; this map
+        // is the CDC's private translation layer.
+        private Map<Integer, Table> tablesDefinitions = new HashMap<>();
     }
+
+    /**
+     * Issue #408: the WAL no longer encodes the table name on each entry.
+     * The CDC translates {@code entry.tableId → tableName} via this map (kept
+     * up to date from {@code CREATE_TABLE} / {@code ALTER_TABLE} entries seen
+     * in the stream) before invoking the user-provided
+     * {@link TableSchemaHistoryStorage#fetchSchema(LogSequenceNumber, String)},
+     * preserving the historical name-keyed public API.
+     */
+    private final Map<Integer, String> tableIdToName = new HashMap<>();
 
     public ChangeDataCapture(String tableSpaceUUID, ClientConfiguration configuration, MutationListener listener, LogSequenceNumber startingPosition, TableSchemaHistoryStorage tableSchemaHistoryStorage) {
         this.configuration = configuration;
@@ -225,13 +262,28 @@ public class ChangeDataCapture implements AutoCloseable {
     }
 
     private Table lookupTable(LogSequenceNumber lsn, LogEntry entry) {
-        String tableName = entry.tableName;
+        int tableId = entry.tableId;
         if (entry.transactionId > 0) {
             TransactionHolder transaction = transactions.get(entry.transactionId);
-            Table table = transaction.tablesDefinitions.get(tableName);
+            Table table = transaction.tablesDefinitions.get(tableId);
             if (table != null) {
                 return table;
             }
+        }
+        // Translate id → name and delegate to the user-provided history
+        // storage (name-keyed public API). The map is populated from
+        // CREATE_TABLE / ALTER_TABLE entries observed in the stream;
+        // when the CDC starts past a CREATE_TABLE (e.g. resuming from a
+        // mid-log LSN after a restart) the cache is empty for that id —
+        // we then ask the storage's optional resolveTableName(id) hook
+        // before giving up.
+        String tableName = tableIdToName.get(tableId);
+        if (tableName == null) {
+            tableName = tableSchemaHistoryStorage.resolveTableName(tableId);
+            if (tableName == null) {
+                return null;
+            }
+            tableIdToName.put(tableId, tableName);
         }
         return tableSchemaHistoryStorage.fetchSchema(lsn, tableName);
     }
@@ -247,7 +299,7 @@ public class ChangeDataCapture implements AutoCloseable {
                 if (entry.transactionId > 0) {
                     TransactionHolder transaction = transactions.get(entry.transactionId);
                     // set null to mark the table as DROPPED
-                    transaction.tablesDefinitions.put(entry.tableName, null);
+                    transaction.tablesDefinitions.put(entry.tableId, null);
                 }
 
                 fire(new Mutation(table, MutationType.DROP_TABLE, null, lsn, entry.timestamp), entry.transactionId);
@@ -255,9 +307,13 @@ public class ChangeDataCapture implements AutoCloseable {
             break;
             case LogEntryType.CREATE_TABLE: {
                 Table table = Table.deserialize(entry.value.to_array());
+                // Track the id → name mapping so future DML entries (which
+                // only carry the integer id) can resolve back to the
+                // user-provided name-keyed schema-history storage.
+                tableIdToName.put(table.tableId, table.name);
                 if (entry.transactionId > 0) {
                     TransactionHolder transaction = transactions.get(entry.transactionId);
-                    transaction.tablesDefinitions.put(entry.tableName, table);
+                    transaction.tablesDefinitions.put(entry.tableId, table);
                 } else {
                     tableSchemaHistoryStorage.storeSchema(lsn, table);
                 }
@@ -266,9 +322,14 @@ public class ChangeDataCapture implements AutoCloseable {
             break;
             case LogEntryType.ALTER_TABLE: {
                 Table table = Table.deserialize(entry.value.to_array());
+                // ALTER may rename the table (same tableId, new name); refresh
+                // the local id → name map so subsequent DML resolves to the
+                // current name. The Table's id is preserved by
+                // Table#applyAlterTable on the leader.
+                tableIdToName.put(table.tableId, table.name);
                 if (entry.transactionId > 0) {
                     TransactionHolder transaction = transactions.get(entry.transactionId);
-                    transaction.tablesDefinitions.put(entry.tableName, table);
+                    transaction.tablesDefinitions.put(entry.tableId, table);
                 } else {
                     tableSchemaHistoryStorage.storeSchema(lsn, table);
                 }
@@ -299,7 +360,7 @@ public class ChangeDataCapture implements AutoCloseable {
             break;
             case LogEntryType.COMMITTRANSACTION: {
                 TransactionHolder transaction = transactions.remove(entry.transactionId);
-                transaction.tablesDefinitions.forEach((tableName, tableDef) -> {
+                transaction.tablesDefinitions.forEach((tableId, tableDef) -> {
                     if (tableDef == null) { // DROP TABLE
 
                     } else { // CREATE/ALTER

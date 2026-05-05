@@ -136,11 +136,11 @@ public class IndexingServiceRebalanceDescriptorTest {
     @Test
     public void otherEntryTypesUnchangedRegression() throws Exception {
         Table t = makeTable("t1");
-        LogEntry insert = new LogEntry(123L, LogEntryType.INSERT, 0L, "t1",
+        LogEntry insert = new LogEntry(123L, LogEntryType.INSERT, 0L, 7,
                 Bytes.from_string("k1"), Bytes.from_string("v1"));
         LogEntry restored = LogEntry.deserialize(insert.serialize());
         assertEquals(LogEntryType.INSERT, restored.type);
-        assertEquals("t1", restored.tableName);
+        assertEquals(7, restored.tableId);
         assertEquals(Bytes.from_string("k1"), restored.key);
         assertEquals(Bytes.from_string("v1"), restored.value);
 

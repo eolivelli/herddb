@@ -51,6 +51,63 @@ public class TableTest {
     }
 
     @Test
+    public void testSerializePreservesTableId() {
+        // Issue #408: a Table built with an explicit tableId must round-trip
+        // through serialize/deserialize and preserve the id. This is the
+        // core invariant the commit-log relies on (the Table value blob in a
+        // CREATE_TABLE entry carries its tableId so followers and recovery
+        // recover the leader's allocation).
+        Table instance = Table
+                .builder()
+                .name("tt")
+                .primaryKey("n1", true)
+                .column("k1", ColumnTypes.STRING)
+                .column("n1", ColumnTypes.INTEGER)
+                .tableId(42)
+                .build();
+        assertEquals(42, instance.tableId);
+        Table deserialize = Table.deserialize(instance.serialize());
+        assertEquals(42, deserialize.tableId);
+        assertEquals(deserialize, instance);
+    }
+
+    @Test
+    public void testSerializeDefaultTableIdIsZero() {
+        // Tables built without an explicit tableId carry id 0 — the
+        // "no real id assigned" sentinel used by system tables and tests.
+        Table instance = Table
+                .builder()
+                .name("tt")
+                .primaryKey("n1", true)
+                .column("k1", ColumnTypes.STRING)
+                .column("n1", ColumnTypes.INTEGER)
+                .build();
+        assertEquals(0, instance.tableId);
+        Table deserialize = Table.deserialize(instance.serialize());
+        assertEquals(0, deserialize.tableId);
+        assertEquals(deserialize, instance);
+    }
+
+    @Test
+    public void testWithTableIdReturnsCopyWithNewId() {
+        // Issue #408: the leader uses Table#withTableId to stamp a fresh id
+        // onto the user-supplied Table just before writing CREATE_TABLE. The
+        // returned instance must equal the original except for tableId.
+        Table base = Table
+                .builder()
+                .name("tt")
+                .primaryKey("n1", true)
+                .column("n1", ColumnTypes.INTEGER)
+                .build();
+        Table stamped = base.withTableId(7);
+        assertEquals(0, base.tableId);
+        assertEquals(7, stamped.tableId);
+        assertEquals(base.name, stamped.name);
+        assertEquals(base.uuid, stamped.uuid);
+        assertEquals(base.tablespace, stamped.tablespace);
+    }
+
+    @Test
     public void testSerializeWithDefaults() {
         Table instance = Table
                 .builder()

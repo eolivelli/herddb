@@ -264,7 +264,14 @@ public class SimpleCDCTest {
                 assertEquals(ChangeDataCapture.MutationType.CREATE_TABLE, m1.getMutationType());
                 Table tableFromM1 = m1.getTable();
                 assertNotNull(tableFromM1);
-                assertEquals(table, tableFromM1);
+                // Issue #408: the leader stamps a fresh tableId on every
+                // CREATE_TABLE; the test's locally-built Table has tableId=0.
+                // Compare on the user-visible identity (name + structure)
+                // and assert the CDC carried a non-zero, valid id.
+                assertEquals(table.name, tableFromM1.name);
+                assertEquals(table.uuid, tableFromM1.uuid);
+                assertTrue("CDC must report a leader-assigned tableId, got " + tableFromM1.tableId,
+                        tableFromM1.tableId > 0);
                 ChangeDataCapture.Mutation m2 = mutations.get(i++);
                 assertEquals(ChangeDataCapture.MutationType.INSERT, m2.getMutationType());
                 assertEquals(m2.getTable(), tableFromM1);
@@ -378,12 +385,22 @@ public class SimpleCDCTest {
     private static class InMemoryTableHistoryStorage implements ChangeDataCapture.TableSchemaHistoryStorage {
 
         private Map<String, SortedMap<LogSequenceNumber, Table>> definitions = new ConcurrentHashMap<>();
+        // Issue #408: side-index for the optional id → name resolver hook
+        // exercised by the CDC across restart boundaries. The CDC needs
+        // to translate an integer tableId to a name even when its own
+        // in-memory cache is empty (e.g. resumed from an LSN past the
+        // matching CREATE_TABLE). Side-indexing here keeps the public
+        // schema API name-keyed.
+        private Map<Integer, String> idToName = new ConcurrentHashMap<>();
 
         @Override
         public void storeSchema(LogSequenceNumber lsn, Table table) {
             LOG.log(Level.INFO, "storeSchema {0} {1}", new Object[] {lsn, table.name});
             SortedMap<LogSequenceNumber, Table> tableHistory = definitions.computeIfAbsent(table.name, (n)-> Collections.synchronizedSortedMap(new TreeMap<>()));
             tableHistory.put(lsn, table);
+            if (table.tableId != 0) {
+                idToName.put(table.tableId, table.name);
+            }
         }
 
         @Override
@@ -395,6 +412,11 @@ public class SimpleCDCTest {
                 return after.get(tableHistory.lastKey());
             }
             return after.values().iterator().next();
+        }
+
+        @Override
+        public String resolveTableName(int tableId) {
+            return idToName.get(tableId);
         }
     }
 }
