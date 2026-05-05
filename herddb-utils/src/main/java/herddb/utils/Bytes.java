@@ -412,6 +412,19 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      * </pre>
      * Concurrent reads racing against {@code release()} are undefined
      * behaviour and must be prevented by the slab owner.
+     *
+     * <p><b>The same quiescence requirement applies to any heap-accessor
+     * call</b> on an off-heap-backed {@code Bytes}, because such a call may
+     * trigger {@link #materialiseFromOffHeap()} which itself releases the
+     * slice. A reader inside {@link #writeTo(ByteBuf)} / {@link #writeTo(OutputStream)}
+     * / {@link #compareTo(Bytes)} / {@link #equals(Object)} / {@link #hashCode()}
+     * snapshots {@code offHeap} into a local; if a sibling thread runs
+     * {@link #getBuffer()} (or any other on-heap accessor) concurrently and
+     * the slab returned to the pool while the snapshot is still in use, the
+     * reader observes a use-after-free. The slab owner must therefore ensure
+     * single-threaded access (or external synchronisation) before triggering
+     * a materialising read on a {@code Bytes} that other threads may still
+     * hold off-heap-backed references to.
      */
     public synchronized void release() {
         ByteBuf local = offHeap;
@@ -424,6 +437,12 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     /**
      * Lazily materialises the off-heap bytes into a fresh {@code byte[]}
      * cached in {@link #buffer}, then releases the slice. Idempotent.
+     *
+     * <p>This call counts as an internal {@link #release()} of the slice from
+     * the slab-owner's point of view: it is subject to the same quiescence
+     * contract documented on {@link #release()}. Concurrent threads holding
+     * off-heap-backed snapshots of this {@code Bytes} must be drained by the
+     * slab owner before any thread invokes a heap accessor.
      *
      * @throws IllegalStateException if {@link #release()} ran before
      *         materialisation: the bytes are no longer reachable.
@@ -766,6 +785,15 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         } else if (o == POSITIVE_INFINITY) {
             return -1;
         }
+        // Reject released receivers / arguments before short-circuiting on
+        // length, otherwise a released zero-length Bytes would silently
+        // compare equal to its sibling (length - o.length == 0).
+        if (this.buffer == null && this.offHeap == null) {
+            throw new IllegalStateException("Bytes already released");
+        }
+        if (o.buffer == null && o.offHeap == null) {
+            throw new IllegalStateException("Bytes already released");
+        }
         // Hot path: both sides have on-heap byte[] (either natively or after
         // lazy materialisation). Snapshot fields once so the volatile reads
         // are folded by the JIT.
@@ -958,13 +986,19 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     public boolean isShared() {
-        // Off-heap-backed (not yet materialised) is considered shared because
-        // it points into a shared off-heap slab managed by the caller; nonShared()
-        // will materialise it into a private byte[].
-        if (buffer == null && offHeap != null) {
-            return true;
+        byte[] data = buffer;
+        if (data == null) {
+            // Off-heap-backed (not yet materialised) is considered shared
+            // because it points into a shared off-heap slab managed by the
+            // caller; nonShared() will materialise into a private byte[].
+            if (offHeap != null) {
+                return true;
+            }
+            // released without materialising — surface the released state
+            // consistently with every other byte-reading accessor.
+            throw new IllegalStateException("Bytes already released");
         }
-        return this.offset != 0 || this.length != buffer.length;
+        return this.offset != 0 || this.length != data.length;
     }
 
 }

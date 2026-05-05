@@ -316,19 +316,57 @@ public class BytesOffHeapTest {
     }
 
     /**
+     * Allocates an off-heap-backed {@code Bytes} of the requested length so
+     * the typed accessors ({@code to_long} requires length 8 etc.) can be
+     * exercised on the off-heap path.
+     */
+    private static Bytes newOffHeapOfLength(int len) {
+        ByteBuf slice = HerdDBByteBufAllocators.dataPagesAllocator().directBuffer(len);
+        for (int i = 0; i < len; i++) {
+            slice.writeByte(0);
+        }
+        return Bytes.fromOffHeap(slice);
+    }
+
+    /**
      * After {@link Bytes#release()} without prior materialisation, every
      * accessor must throw {@link IllegalStateException} so the failure is
      * localised and actionable instead of surfacing as an NPE deep inside
      * a downstream codec.
+     *
+     * <p>Excluded from this test (designed to be safe after release):
+     * {@code getLength()}, {@code isOffHeap()}, {@code release()},
+     * {@code toString()} (used by debuggers — must not throw and may
+     * legitimately return "null"-like text). Every other byte-reading
+     * accessor must throw.
      */
     @Test
     public void accessAfterReleaseThrowsIllegalStateException() {
+        // 1024-byte payload: covers getBuffer/getOffset/to_array/writeTo/
+        // hashCode/equals/compareTo/nonShared/isShared/next/startsWith/
+        // newCursor/newByteBufCursor/to_string/to_RawString/to_float_array.
         Bytes off = newOffHeap();
         off.release();
         assertFalse(off.isOffHeap());
+
+        // byte[] / view accessors
         assertThrows(IllegalStateException.class, off::getBuffer);
         assertThrows(IllegalStateException.class, off::getOffset);
         assertThrows(IllegalStateException.class, off::to_array);
+        assertThrows(IllegalStateException.class, off::to_string);
+        assertThrows(IllegalStateException.class, off::to_RawString);
+        assertThrows(IllegalStateException.class, off::to_float_array);
+
+        // structural / lifecycle accessors
+        assertThrows(IllegalStateException.class, off::isShared);
+        assertThrows(IllegalStateException.class, off::nonShared);
+        assertThrows(IllegalStateException.class, off::next);
+        assertThrows(IllegalStateException.class, () -> off.startsWith(1, new byte[]{1}));
+        assertThrows(IllegalStateException.class, () -> off.startsWith(Bytes.from_string("x")));
+        assertThrows(IllegalStateException.class, off::newCursor);
+        assertThrows(IllegalStateException.class, off::newByteBufCursor);
+
+        // wire / stream output
         assertThrows(IllegalStateException.class, () -> off.writeTo(Unpooled.buffer(8)));
         assertThrows(IllegalStateException.class, () -> {
             try {
@@ -337,18 +375,106 @@ public class BytesOffHeapTest {
                 throw new AssertionError("unexpected IOException", e);
             }
         });
-        // hashCode must throw too — a silently-zero hash would corrupt every
-        // ConcurrentHashMap that previously held the key.
+
+        // hashCode / equals / compareTo — corrupting these would silently
+        // break every ConcurrentHashMap and every BLink / BRIN comparator.
         assertThrows(IllegalStateException.class, off::hashCode);
-        // equals against any other Bytes triggers a byteAt() read which
-        // throws; we accept either IllegalStateException or false (null/length
-        // mismatch) — but our path must throw.
         Bytes other = newOffHeap();
         try {
             assertThrows(IllegalStateException.class, () -> off.equals(other));
+            assertThrows(IllegalStateException.class, () -> off.compareTo(other));
         } finally {
             other.release();
         }
+
+        // Typed accessors of the right length, also released, must throw.
+        Bytes off8 = newOffHeapOfLength(8);
+        off8.release();
+        assertThrows(IllegalStateException.class, off8::to_long);
+        assertThrows(IllegalStateException.class, off8::to_double);
+        assertThrows(IllegalStateException.class, off8::to_timestamp);
+        Bytes off4 = newOffHeapOfLength(4);
+        off4.release();
+        assertThrows(IllegalStateException.class, off4::to_int);
+        Bytes off1 = newOffHeapOfLength(1);
+        off1.release();
+        assertThrows(IllegalStateException.class, off1::to_boolean);
+
+        // After release, length and isOffHeap are deliberately safe (used by
+        // debug logging and lifecycle checks). Confirm the contract.
+        assertEquals("getLength must remain safe after release",
+                payload.length, off.getLength());
+        assertFalse("isOffHeap must remain safe after release",
+                off.isOffHeap());
+        // toString is allowed to render "null" (the documented test-only
+        // behaviour); just verify it does not throw.
+        assertEquals("null", off.toString());
+    }
+
+    /**
+     * Positive coverage for typed accessors invoked on an off-heap-backed
+     * {@code Bytes} of the appropriate fixed length. Verifies the value
+     * round-trips through lazy materialisation and matches the on-heap
+     * baseline.
+     */
+    @Test
+    public void typedAccessorsRoundTripFromOffHeap() {
+        // to_long / to_double / to_timestamp share a length-8 payload
+        long encodedLong = 0x0123_4567_89ab_cdefL;
+        Bytes onLong = Bytes.from_long(encodedLong);
+        Bytes offLong = newOffHeapMatching(onLong);
+        try {
+            assertEquals(encodedLong, offLong.to_long());
+        } finally {
+            offLong.release();
+        }
+        // to_int
+        int encodedInt = 0x1234_5678;
+        Bytes onInt = Bytes.from_int(encodedInt);
+        Bytes offInt = newOffHeapMatching(onInt);
+        try {
+            assertEquals(encodedInt, offInt.to_int());
+        } finally {
+            offInt.release();
+        }
+        // to_double
+        double encodedDouble = Math.PI;
+        Bytes onDouble = Bytes.from_double(encodedDouble);
+        Bytes offDouble = newOffHeapMatching(onDouble);
+        try {
+            assertEquals(encodedDouble, offDouble.to_double(), 0.0);
+        } finally {
+            offDouble.release();
+        }
+        // to_boolean
+        Bytes onBool = Bytes.from_boolean(true);
+        Bytes offBool = newOffHeapMatching(onBool);
+        try {
+            assertTrue(offBool.to_boolean());
+        } finally {
+            offBool.release();
+        }
+        // to_string / to_RawString
+        Bytes onStr = Bytes.from_string("hello-off-heap");
+        Bytes offStr = newOffHeapMatching(onStr);
+        try {
+            assertEquals("hello-off-heap", offStr.to_string());
+        } finally {
+            offStr.release();
+        }
+        Bytes offRaw = newOffHeapMatching(onStr);
+        try {
+            assertEquals("hello-off-heap", offRaw.to_RawString().toString());
+        } finally {
+            offRaw.release();
+        }
+    }
+
+    private static Bytes newOffHeapMatching(Bytes onHeapValue) {
+        ByteBuf slice = HerdDBByteBufAllocators.dataPagesAllocator()
+                .directBuffer(onHeapValue.getLength());
+        slice.writeBytes(onHeapValue.getBuffer(), onHeapValue.getOffset(), onHeapValue.getLength());
+        return Bytes.fromOffHeap(slice);
     }
 
     /**
