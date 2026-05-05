@@ -132,6 +132,50 @@ public class DataPageOffHeapValueSlabTest {
         assertArrayEquals(expected, java.util.Arrays.copyOf(materialised, expected.length));
         assertEquals("slab refcount must NOT be touched by per-record materialisation",
                 1, page.slabRefCntForTesting());
+        assertTrue("offHeap field must stay non-null after shared-slab materialisation"
+                + " so the slabOwner GC anchor remains active",
+                r.value.isOffHeap());
+    }
+
+    /**
+     * Mixed zero-length and non-zero-length values inside the same page
+     * — the slab-pack writer emits no bytes for empty values and slices
+     * the next non-empty value at the right offset. Locks in the corner
+     * case explicitly called out in the step-3 review.
+     */
+    @Test
+    public void slabPackedPageHandlesMixedZeroAndNonZeroLengthValues() {
+        List<Record> records = new ArrayList<>();
+        records.add(new Record(Bytes.from_long(0), Bytes.from_array(payloadOf(512, 0xa))));
+        records.add(new Record(Bytes.from_long(1), Bytes.EMPTY_ARRAY));
+        records.add(new Record(Bytes.from_long(2), Bytes.from_array(payloadOf(512, 0xb))));
+        records.add(new Record(Bytes.from_long(3), Bytes.EMPTY_ARRAY));
+        records.add(new Record(Bytes.from_long(4), Bytes.from_array(payloadOf(3 * 1024, 0xc))));
+        DataPage page = DataPage.buildSlabPackedImmutable(null, 6L, 1024L * 1024L, records);
+        assertTrue("aggregate values exceed the 4 KiB threshold", page.hasOffHeapValueSlab());
+
+        for (Record original : records) {
+            Record packed = page.get(original.key);
+            assertNotNull("missing key " + original.key, packed);
+            assertEquals("value length round-trip for key " + original.key,
+                    original.value.getLength(), packed.value.getLength());
+            assertEquals("value bytes round-trip for key " + original.key,
+                    original.value, packed.value);
+            if (original.value.getLength() == 0) {
+                // Empty values produce a zero-length shared-slab Bytes.
+                assertTrue(packed.value.isOffHeap());
+                assertEquals(Bytes.EMPTY_ARRAY, packed.value);
+            }
+        }
+        assertEquals(1, page.slabRefCntForTesting());
+    }
+
+    private static byte[] payloadOf(int length, int seed) {
+        byte[] out = new byte[length];
+        for (int i = 0; i < length; i++) {
+            out[i] = (byte) ((i * 31 + seed) & 0xff);
+        }
+        return out;
     }
 
     @Test

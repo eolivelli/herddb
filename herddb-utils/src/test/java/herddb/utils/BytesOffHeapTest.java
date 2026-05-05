@@ -535,4 +535,102 @@ public class BytesOffHeapTest {
             off.release();
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Step-3 fromSharedSlab coverage
+    // ---------------------------------------------------------------------
+
+    /**
+     * Shared-slab Bytes wraps a {@code slab.slice(off, len)} view whose
+     * lifecycle is owned by an external {@code slabOwner}. {@code release()}
+     * must NOT decrement the slab's refcount — that would invalidate every
+     * sibling slice. The slab owner releases the slab once when its
+     * Cleaner fires.
+     */
+    @Test
+    public void sharedSlabReleaseIsNoOpAndDoesNotTouchSlabRefCnt() {
+        Object owner = new Object();
+        ByteBuf slab = HerdDBByteBufAllocators.dataPagesAllocator()
+                .directBuffer(payload.length);
+        try {
+            slab.writeBytes(payload);
+            assertEquals(1, slab.refCnt());
+            Bytes shared = Bytes.fromSharedSlab(slab, 0, payload.length, owner);
+            // release() on shared-slab Bytes is a no-op
+            shared.release();
+            shared.release();
+            assertEquals("slab refcount must not change after Bytes.release()",
+                    1, slab.refCnt());
+            // The Bytes is still readable — release was a no-op.
+            assertEquals(onHeap.hashCode(), shared.hashCode());
+            assertEquals(onHeap, shared);
+        } finally {
+            slab.release();
+        }
+    }
+
+    /**
+     * Lazy materialisation on a shared-slab Bytes copies into a fresh
+     * byte[] but must NOT release the slice (slab owner keeps the slab).
+     * The {@code offHeap} field stays non-null so the {@code slabOwner}
+     * GC anchor remains active for any sibling reader.
+     */
+    @Test
+    public void sharedSlabGetBufferMaterialisesButKeepsSlabAlive() {
+        Object owner = new Object();
+        ByteBuf slab = HerdDBByteBufAllocators.dataPagesAllocator()
+                .directBuffer(payload.length);
+        try {
+            slab.writeBytes(payload);
+            Bytes shared = Bytes.fromSharedSlab(slab, 0, payload.length, owner);
+            byte[] copy = shared.getBuffer();
+            assertArrayEquals(payload, copy);
+            assertEquals("slab refcount unchanged by materialisation", 1, slab.refCnt());
+            assertTrue("offHeap field stays non-null so slabOwner anchor remains active",
+                    shared.isOffHeap());
+            // Subsequent getBuffer is O(1) and returns the cached array.
+            assertTrue(copy == shared.getBuffer());
+        } finally {
+            slab.release();
+        }
+    }
+
+    @Test
+    public void sharedSlabRejectsNullArguments() {
+        Object owner = new Object();
+        ByteBuf slab = HerdDBByteBufAllocators.dataPagesAllocator()
+                .directBuffer(payload.length);
+        try {
+            slab.writeBytes(payload);
+            assertThrows(NullPointerException.class,
+                    () -> Bytes.fromSharedSlab((ByteBuf) null, 0, 1, owner));
+            assertThrows(NullPointerException.class,
+                    () -> Bytes.fromSharedSlab(slab, 0, 1, null));
+            ByteBuf slice = slab.slice(0, 1);
+            assertThrows(NullPointerException.class,
+                    () -> Bytes.fromSharedSlab((ByteBuf) null, owner));
+            assertThrows(NullPointerException.class,
+                    () -> Bytes.fromSharedSlab(slice, null));
+        } finally {
+            slab.release();
+        }
+    }
+
+    @Test
+    public void sharedSlabZeroLengthSliceRoundTrips() {
+        Object owner = new Object();
+        ByteBuf slab = HerdDBByteBufAllocators.dataPagesAllocator().directBuffer(8);
+        try {
+            slab.writeBytes(new byte[]{1, 2, 3, 4, 5, 6, 7, 8});
+            Bytes shared = Bytes.fromSharedSlab(slab, 0, 0, owner);
+            assertEquals(0, shared.getLength());
+            assertEquals("zero-length shared-slab Bytes equals EMPTY_ARRAY",
+                    Bytes.EMPTY_ARRAY, shared);
+            assertEquals(Bytes.EMPTY_ARRAY.hashCode(), shared.hashCode());
+            assertArrayEquals(new byte[0], shared.getBuffer());
+            assertEquals("slab refcount unchanged", 1, slab.refCnt());
+        } finally {
+            slab.release();
+        }
+    }
 }

@@ -20,6 +20,7 @@
 
 package herddb.core;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import herddb.model.Record;
 import herddb.utils.Bytes;
 import herddb.utils.HerdDBByteBufAllocators;
@@ -52,10 +53,12 @@ import java.util.logging.Logger;
  * <p>Lifecycle (Cleaner-anchored):
  * <ul>
  *   <li>{@code DataPage} owns one refcount on the slab.</li>
- *   <li>Each shared-slab {@code Bytes} retains a strong reference to
- *       {@code this} (the {@code slabOwner} anchor) so the JDK
- *       {@code Cleaner} attached to the page does not run while any reader
- *       still holds a {@code Record} extracted from the page.</li>
+ *   <li>Each shared-slab {@code Bytes} retains a strong reference to a
+ *       {@code DataPageHolder} that transitively references this page;
+ *       this is the {@code slabOwner} GC anchor. As long as any reader
+ *       holds a {@code Record} extracted from the page, the holder (and
+ *       thus the page) stay reachable, so the JDK {@code Cleaner}
+ *       attached to the page cannot run.</li>
  *   <li>When {@code DataPage} and every {@code Bytes} on its slab become
  *       unreachable, the {@code Cleanable} releases the slab once and the
  *       memory returns to the pooled allocator.</li>
@@ -173,7 +176,8 @@ public class DataPage extends Page<TableManager> {
                 } else if (LOGGER.isLoggable(Level.FINE)) {
                     LOGGER.log(Level.FINE,
                             "DataPage slab cleanup observed already-released slab; "
-                                    + "this is benign if releaseSlabEagerly() ran first");
+                                    + "this is benign only if a future eager-release path"
+                                    + " ran first — investigate if it appears unexpectedly.");
                 }
             });
         } else {
@@ -239,8 +243,12 @@ public class DataPage extends Page<TableManager> {
             holder.page = page;
             return page;
         } catch (RuntimeException t) {
-            // Allocation succeeded; subsequent failure must release the slab
-            // so we don't leak pooled memory.
+            // Narrow catch (per CLAUDE.md): everything inside the try can
+            // only throw unchecked exceptions — slab.writeBytes (IOOBE on
+            // capacity miscalculation), Bytes.fromSharedSlab (NPE on bad
+            // arguments), HashMap.put (none expected). Allocation succeeded;
+            // subsequent failure must release the slab so we don't leak
+            // pooled memory.
             slab.release();
             throw t;
         }
@@ -271,8 +279,12 @@ public class DataPage extends Page<TableManager> {
      * {@code Bytes} references it, and the holder transitively keeps the
      * {@code DataPage} alive.
      */
+    @SuppressFBWarnings("URF_UNREAD_FIELD")
     private static final class DataPageHolder {
-        // package-private to allow read by tests if needed.
+        // The `page` field is written but never read on the production code
+        // path; its sole purpose is the same GC-anchor role as
+        // Bytes.slabOwner: as long as any Bytes references the holder, GC
+        // keeps the DataPage reachable and the Cleaner does not run.
         volatile DataPage page;
     }
 
