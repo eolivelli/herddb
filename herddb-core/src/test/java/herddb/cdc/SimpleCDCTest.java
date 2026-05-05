@@ -361,17 +361,25 @@ public class SimpleCDCTest {
     }
 
     /**
-     * Issue #408 review — verifies that a ROLLBACKed ALTER TABLE on a
-     * pre-existing committed table does NOT evict the (id → name)
-     * mapping from {@code ChangeDataCapture#tableIdToName}: subsequent
-     * INSERTs for that committed table must still resolve to a
-     * non-null {@link Table} on the {@link ChangeDataCapture.Mutation}.
-     * Catches the regression that an over-broad rollback scrub of
-     * {@code TransactionHolder#tablesDefinitions.keySet()} would have
-     * introduced.
+     * Issue #408 review (3) — verifies that a {@code ROLLBACK} of a
+     * transaction that issued a {@code DROP TABLE} on a pre-existing
+     * committed table does NOT evict the {@code (id → name)} mapping
+     * from {@code ChangeDataCapture#tableIdToName}. {@code DROP TABLE}
+     * inside a transaction is the only DDL path in this codebase that
+     * does NOT auto-commit (see
+     * {@code TableSpaceManager#dropTable}), so it produces a real
+     * {@code DROP_TABLE (txn>0)} entry followed by a real
+     * {@code ROLLBACKTRANSACTION (txn>0)} entry — exactly the path
+     * the rollback scrub touches.
+     *
+     * <p>This test would FAIL against an over-broad rollback scrub of
+     * {@code TransactionHolder#tablesDefinitions.keySet()} (which
+     * evicts the mapping for the rolled-back DROP target even though
+     * the DROP never committed) and PASSES with the
+     * {@code newlyCreatedTableIds}-only scrub.
      */
     @Test
-    public void testCDCRollbackOfAlterDoesNotEvictExistingMapping() throws Exception {
+    public void testCDCRollbackOfDropDoesNotEvictExistingMapping() throws Exception {
         ServerConfiguration serverconfig_1 = newServerConfigurationWithAutoPort(folder.newFolder().toPath());
         serverconfig_1.set(ServerConfiguration.PROPERTY_NODEID, "server1");
         serverconfig_1.set(ServerConfiguration.PROPERTY_MODE, ServerConfiguration.PROPERTY_MODE_CLUSTER);
@@ -388,7 +396,8 @@ public class SimpleCDCTest {
         try (Server server_1 = new Server(serverconfig_1)) {
             server_1.start();
             server_1.waitForStandaloneBoot();
-            // Phase 1: create + commit table T (autocommit).
+
+            // Phase 1: create + commit table T (autocommit), insert one row.
             Table table = Table.builder()
                     .name("t1")
                     .column("c", ColumnTypes.INTEGER)
@@ -401,62 +410,85 @@ public class SimpleCDCTest {
                     RecordSerializer.makeRecord(table, "c", 1, "d", 2)),
                     StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
 
-            // Phase 2: BEGIN; ALTER T add column; ROLLBACK.
+            // Phase 2: BEGIN; DROP TABLE t1; ROLLBACK. DROP TABLE keeps
+            // the transaction open (verified at
+            // TableSpaceManager#dropTable line 2569), so the WAL really
+            // contains a `DROP_TABLE (txn=tx)` entry that populates
+            // `transaction.tablesDefinitions` (but NOT
+            // `newlyCreatedTableIds`) followed by a
+            // `ROLLBACKTRANSACTION (txn=tx)` entry.
             long tx = TestUtils.beginTransaction(server_1.getManager(), TableSpace.DEFAULT);
-            server_1.getManager().executeStatement(new AlterTableStatement(
-                            java.util.Arrays.asList(Column.column("e", ColumnTypes.INTEGER)),
-                            java.util.Collections.emptyList(),
-                            java.util.Collections.emptyList(),
-                            null, table.name, TableSpace.DEFAULT, null,
-                            java.util.Collections.emptyList(),
-                            java.util.Collections.emptyList()),
+            server_1.getManager().executeStatement(
+                    new herddb.model.commands.DropTableStatement(TableSpace.DEFAULT, "t1", false),
                     StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), new TransactionContext(tx));
-            // ALTER TABLE in this codebase implicitly auto-commits the
-            // transaction (see TableSpaceManager#alterTable). To stress
-            // the ROLLBACKTRANSACTION code path explicitly we instead
-            // route the ALTER through an isolated transaction whose
-            // commit we then rollback by aborting the connection;
-            // however since the helper APIs do not expose that
-            // directly here, the auto-commit semantics ensure the
-            // committed mapping survives — which is what we need to
-            // assert anyway.
+            server_1.getManager().executeStatement(
+                    new herddb.model.commands.RollbackTransactionStatement(TableSpace.DEFAULT, tx),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
 
-            // Phase 3: INSERT into T outside any transaction.
+            // Phase 3: INSERT into t1 outside any transaction — t1 still
+            // exists because the DROP was rolled back.
             server_1.getManager().executeUpdate(new InsertStatement(TableSpace.DEFAULT, "t1",
                     RecordSerializer.makeRecord(table, "c", 99, "d", 99)),
                     StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
 
             server_1.close();
 
-            // Phase 4: capture every mutation through the CDC and verify
-            // every INSERT after the rolled-back ALTER carries a
-            // non-null Table.
+            // Phase 4: drive the CDC across the whole stream with a
+            // schema history whose `resolveTableName(int)` is forced to
+            // return null. The ONLY way the post-rollback INSERT can
+            // surface with a non-null Table is via the `tableIdToName`
+            // in-memory cache — the very cache the buggy scrub used to
+            // evict.
             List<ChangeDataCapture.Mutation> mutations = new ArrayList<>();
+            InMemoryTableHistoryStorage storage = new InMemoryTableHistoryStorage();
+            ChangeDataCapture.TableSchemaHistoryStorage idObliviousStorage =
+                    new ChangeDataCapture.TableSchemaHistoryStorage() {
+                        @Override
+                        public void storeSchema(LogSequenceNumber lsn, Table t) {
+                            storage.storeSchema(lsn, t);
+                        }
+
+                        @Override
+                        public Table fetchSchema(LogSequenceNumber lsn, String tableName) {
+                            return storage.fetchSchema(lsn, tableName);
+                        }
+                        // Deliberately does NOT override
+                        // resolveTableName(int) — default returns null,
+                        // forcing the listener to rely solely on the
+                        // CDC's in-memory id → name cache.
+                    };
             try (final ChangeDataCapture cdc = new ChangeDataCapture(
                     server_1.getManager().getTableSpaceManager(TableSpace.DEFAULT).getTableSpaceUUID(),
                     client_configuration,
-                    new ChangeDataCapture.MutationListener() {
-                        @Override
-                        public void accept(ChangeDataCapture.Mutation mutation) {
-                            mutations.add(mutation);
-                        }
-                    },
+                    mutations::add,
                     LogSequenceNumber.START_OF_TIME,
-                    new InMemoryTableHistoryStorage())) {
+                    idObliviousStorage)) {
                 cdc.start();
                 cdc.run();
             }
-            // Every INSERT mutation must have a non-null Table named "t1".
+
+            // The post-rollback INSERT (c=99, d=99) MUST surface with a
+            // non-null Table named "t1". A rollback scrub that evicted
+            // the mapping for the rolled-back DROP target would deliver
+            // this Mutation with table == null, failing this assertion.
             int inserts = 0;
+            ChangeDataCapture.Mutation postRollbackInsert = null;
             for (ChangeDataCapture.Mutation m : mutations) {
                 if (m.getMutationType() == ChangeDataCapture.MutationType.INSERT) {
                     inserts++;
-                    assertNotNull("INSERT mutation must have a non-null Table — the rolled-back ALTER must not "
-                            + "evict the (id → name) mapping for the pre-existing committed table", m.getTable());
-                    assertEquals("t1", m.getTable().name);
+                    if (m.getRecord() != null
+                            && Integer.valueOf(99).equals(m.getRecord().get("c"))) {
+                        postRollbackInsert = m;
+                    }
                 }
             }
             assertTrue("expected at least 2 INSERTs in the captured stream, got " + inserts, inserts >= 2);
+            assertNotNull("expected an INSERT for c=99 after the rolled-back DROP, captured "
+                    + mutations.size() + " mutations total", postRollbackInsert);
+            assertNotNull("post-rollback INSERT must carry a non-null Table — a rolled-back DROP "
+                    + "must NOT evict the (id → name) mapping for the still-existing committed table",
+                    postRollbackInsert.getTable());
+            assertEquals("t1", postRollbackInsert.getTable().name);
         }
     }
 

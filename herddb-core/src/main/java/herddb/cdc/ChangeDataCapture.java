@@ -40,8 +40,10 @@ import herddb.model.Table;
 import herddb.server.ServerConfiguration;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.apache.bookkeeper.stats.NullStatsLogger;
 
 /**
@@ -179,12 +181,13 @@ public class ChangeDataCapture implements AutoCloseable {
         // is the CDC's private translation layer.
         private Map<Integer, Table> tablesDefinitions = new HashMap<>();
         // Subset of {@link #tablesDefinitions} ids that this transaction
-        // freshly CREATEd (not ALTERed). Only these ids must be scrubbed
-        // from the global {@link ChangeDataCapture#tableIdToName} cache on
-        // ROLLBACK — a rolled-back ALTER TABLE on a pre-existing committed
-        // table must NOT evict the (id → name) mapping that committed
-        // tables still rely on.
-        private java.util.Set<Integer> newlyCreatedTableIds = new java.util.HashSet<>();
+        // freshly CREATEd (not ALTERed, not DROPped). Only these ids must
+        // be scrubbed from the global
+        // {@link ChangeDataCapture#tableIdToName} cache on ROLLBACK — a
+        // rolled-back ALTER or DROP on a pre-existing committed table
+        // must NOT evict the (id → name) mapping that committed tables
+        // still rely on.
+        private Set<Integer> newlyCreatedTableIds = new HashSet<>();
     }
 
     /**
