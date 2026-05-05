@@ -45,6 +45,23 @@ public class SchemaTrackerTest {
         tracker = new SchemaTracker();
     }
 
+    /**
+     * Issue #408 — derive a deterministic non-zero tableId from the name so
+     * synthetic CREATE_TABLE / DROP_TABLE entries in this test file resolve
+     * to distinct ids in the {@link SchemaTracker}'s id → name index.
+     * Without a non-zero id, two synthetic tables collide on the {@code 0}
+     * sentinel and a subsequent DROP_TABLE drops the wrong table.
+     *
+     * <p>The previous version used {@code Math.abs(hashCode) | 1}, which
+     * silently overflows to a negative value when {@code hashCode() ==
+     * Integer.MIN_VALUE}. The replacement uses a sign-overflow-safe mask
+     * to clear the sign bit and then forces the result to be non-zero.
+     */
+    private static int deterministicTableId(String name) {
+        int h = name.hashCode() & 0x7FFFFFFF; // strip sign without overflow
+        return h == 0 ? 1 : h;
+    }
+
     private static Table buildTable(String name) {
         return Table.builder()
                 .tablespace("default")
@@ -52,6 +69,7 @@ public class SchemaTrackerTest {
                 .column("id", ColumnTypes.LONG)
                 .column("data", ColumnTypes.STRING)
                 .primaryKey("id")
+                .tableId(deterministicTableId(name))
                 .build();
     }
 
@@ -62,6 +80,7 @@ public class SchemaTrackerTest {
                 .column("id", ColumnTypes.LONG)
                 .column("embedding", ColumnTypes.FLOATARRAY)
                 .primaryKey("id")
+                .tableId(deterministicTableId(name))
                 .build();
     }
 
@@ -112,7 +131,7 @@ public class SchemaTrackerTest {
         tracker.applyEntry(LogEntryFactory.createTable(table, null));
         assertNotNull(tracker.getTable("mytable"));
 
-        LogEntry dropEntry = LogEntryFactory.dropTable("mytable", null);
+        LogEntry dropEntry = LogEntryFactory.dropTable(table, null);
         tracker.applyEntry(dropEntry);
 
         assertNull(tracker.getTable("mytable"));
@@ -185,7 +204,7 @@ public class SchemaTrackerTest {
 
         assertEquals(1, tracker.getVectorIndexesForTable("mytable").size());
 
-        tracker.applyEntry(LogEntryFactory.dropTable("mytable", null));
+        tracker.applyEntry(LogEntryFactory.dropTable(table, null));
         // After DROP_TABLE, the index entry still lives in SchemaTracker's
         // indexes map — this mirrors pre-cache behavior. What matters is
         // that the cache was evicted, so the next lookup recomputes.
@@ -253,7 +272,7 @@ public class SchemaTrackerTest {
         assertEquals(2, tracker.getAllTables().size());
 
         // After DROP_TABLE, the dropped table is removed
-        tracker.applyEntry(LogEntryFactory.dropTable("t1", null));
+        tracker.applyEntry(LogEntryFactory.dropTable(t, null));
         assertEquals(1, tracker.getAllTables().size());
         assertEquals("t2", tracker.getAllTables().iterator().next().name);
     }

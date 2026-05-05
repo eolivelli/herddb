@@ -1373,14 +1373,21 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 break;
 
             case LogEntryType.DROP_TABLE: {
+                // Issue #408: resolve the dropped table's name BEFORE
+                // applying the schema-tracker mutation — the tracker drops
+                // the id → name mapping as part of applying DROP_TABLE.
+                String droppedTable = schemaTracker.getTableNameById(entry.tableId);
                 schemaTracker.applyEntry(entry);
+                if (droppedTable == null) {
+                    // No locally tracked table for this id — nothing to clean up.
+                    break;
+                }
                 // Remove all vector stores for this table AND release their
                 // remote/local persistent state.  Without the dropIndex()
                 // call below, every per-segment graph + map file would
                 // linger on the file server / S3 forever, causing the
                 // bucket to grow without bound under a CREATE/DROP
                 // workload (issue #383).
-                String droppedTable = entry.tableName;
                 String droppedTablePrefix = droppedTable + ".";
                 java.util.List<Map.Entry<String, AbstractVectorStore>> toClose =
                         new ArrayList<>();
@@ -1413,7 +1420,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 // data without re-creating the store would silently
                 // drop every later INSERT for that index (issue #383
                 // review).
-                String truncatedTable = entry.tableName;
+                // Issue #408: TRUNCATE_TABLE entries carry only the integer
+                // tableId; resolve the table name via SchemaTracker.
+                String truncatedTable = schemaTracker.getTableNameById(entry.tableId);
+                if (truncatedTable == null) {
+                    // The tracker has not seen a CREATE_TABLE for this id yet
+                    // (e.g. cold start replay before the matching schema
+                    // entry); nothing to truncate locally.
+                    break;
+                }
                 String truncatedTablePrefix = truncatedTable + ".";
                 java.util.List<Index> toRefresh = new ArrayList<>();
                 for (Index idx : schemaTracker.getAllIndexes()) {
@@ -1448,7 +1463,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 for (Index idx : toRefresh) {
                     Index rebuilt = rebuildIndexWithoutStoreUuid(idx);
                     LogEntry synth = new LogEntry(System.currentTimeMillis(),
-                            LogEntryType.CREATE_INDEX, 0L, rebuilt.table, null,
+                            LogEntryType.CREATE_INDEX, 0L, 0, null,
                             herddb.utils.Bytes.from_array(rebuilt.serialize()));
                     createVectorStoreIfNeeded(synth);
                 }
@@ -1580,7 +1595,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     }
 
     private void applyInsert(LogEntry entry) {
-        String tableName = entry.tableName;
+        // Issue #408: DML entries carry only the integer tableId; resolve
+        // the name once via SchemaTracker for the rest of this hot-path
+        // method (no second lookup per index).
+        String tableName = schemaTracker.getTableNameById(entry.tableId);
+        if (tableName == null) {
+            return;
+        }
         Collection<Index> vectorIndexes = schemaTracker.getVectorIndexesForTable(tableName);
         if (vectorIndexes.isEmpty()) {
             return;
@@ -1611,7 +1632,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     }
 
     private void applyUpdate(LogEntry entry) {
-        String tableName = entry.tableName;
+        String tableName = schemaTracker.getTableNameById(entry.tableId);
+        if (tableName == null) {
+            return;
+        }
         Collection<Index> vectorIndexes = schemaTracker.getVectorIndexesForTable(tableName);
         if (vectorIndexes.isEmpty()) {
             return;
@@ -1645,7 +1669,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     }
 
     private void applyDelete(LogEntry entry) {
-        String tableName = entry.tableName;
+        String tableName = schemaTracker.getTableNameById(entry.tableId);
+        if (tableName == null) {
+            return;
+        }
         Collection<Index> vectorIndexes = schemaTracker.getVectorIndexesForTable(tableName);
         if (vectorIndexes.isEmpty()) {
             return;
@@ -1751,14 +1778,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private void installSchemaFromDescriptor(IndexingServiceRebalanceDescriptor descriptor) {
         for (Table t : descriptor.tables) {
             byte[] blob = t.serialize();
+            // Issue #408: synthetic CREATE_TABLE — pass the table's own
+            // tableId so SchemaTracker registers the id → name mapping that
+            // later DML / DROP_TABLE / TRUNCATE_TABLE entries rely on.
             schemaTracker.applyEntry(new LogEntry(System.currentTimeMillis(),
-                    LogEntryType.CREATE_TABLE, 0L, t.name, null,
+                    LogEntryType.CREATE_TABLE, 0L, t.tableId, null,
                     herddb.utils.Bytes.from_array(blob)));
         }
         for (Index ix : descriptor.vectorIndexes) {
             byte[] blob = ix.serialize();
             LogEntry synth = new LogEntry(System.currentTimeMillis(),
-                    LogEntryType.CREATE_INDEX, 0L, ix.table, null,
+                    LogEntryType.CREATE_INDEX, 0L, 0, null,
                     herddb.utils.Bytes.from_array(blob));
             schemaTracker.applyEntry(synth);
             createVectorStoreIfNeeded(synth);
@@ -1779,13 +1809,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         for (Table t : snapshot.tables) {
             byte[] blob = t.serialize();
             schemaTracker.applyEntry(new LogEntry(System.currentTimeMillis(),
-                    LogEntryType.CREATE_TABLE, 0L, t.name, null,
+                    LogEntryType.CREATE_TABLE, 0L, t.tableId, null,
                     herddb.utils.Bytes.from_array(blob)));
         }
         for (Index ix : snapshot.vectorIndexes) {
             byte[] blob = ix.serialize();
             LogEntry synth = new LogEntry(System.currentTimeMillis(),
-                    LogEntryType.CREATE_INDEX, 0L, ix.table, null,
+                    LogEntryType.CREATE_INDEX, 0L, 0, null,
                     herddb.utils.Bytes.from_array(blob));
             schemaTracker.applyEntry(synth);
             createVectorStoreIfNeeded(synth);

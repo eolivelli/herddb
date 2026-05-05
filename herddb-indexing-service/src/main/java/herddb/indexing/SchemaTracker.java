@@ -44,6 +44,14 @@ public class SchemaTracker {
     private static final Logger LOGGER = Logger.getLogger(SchemaTracker.class.getName());
 
     private final Map<String, Table> tables = new HashMap<>();
+    /**
+     * Issue #408 — the WAL no longer carries the table name on each entry,
+     * only the per-tablespace integer {@code tableId}. The tracker keeps a
+     * tableId → name map populated from {@code CREATE_TABLE} / {@code
+     * ALTER_TABLE} entries so {@code DROP_TABLE} (and other id-only entries)
+     * can resolve the corresponding name without changing the public API.
+     */
+    private final Map<Integer, String> tableIdToName = new HashMap<>();
     private final Map<String, Index> indexes = new HashMap<>();
 
     /**
@@ -70,6 +78,10 @@ public class SchemaTracker {
             case LogEntryType.CREATE_TABLE: {
                 Table table = Table.deserialize(entry.value.to_array());
                 tables.put(table.name, table);
+                // Track the id → name mapping unconditionally so synthetic
+                // / test entries (which often use tableId == 0) round-trip
+                // consistently with their matching DROP_TABLE entries.
+                tableIdToName.put(table.tableId, table.name);
                 vectorIndexesByTable.remove(table.name);
                 LOGGER.log(Level.INFO, "CREATE_TABLE: {0}", table.name);
                 break;
@@ -77,15 +89,20 @@ public class SchemaTracker {
             case LogEntryType.ALTER_TABLE: {
                 Table table = Table.deserialize(entry.value.to_array());
                 tables.put(table.name, table);
+                tableIdToName.put(table.tableId, table.name);
                 vectorIndexesByTable.remove(table.name);
                 LOGGER.log(Level.INFO, "ALTER_TABLE: {0}", table.name);
                 break;
             }
             case LogEntryType.DROP_TABLE: {
-                String tableName = entry.tableName;
-                tables.remove(tableName);
-                vectorIndexesByTable.remove(tableName);
-                LOGGER.log(Level.INFO, "DROP_TABLE: {0}", tableName);
+                // Issue #408: DROP_TABLE entries carry only the integer
+                // tableId; resolve the name via the tracked id → name map.
+                String tableName = tableIdToName.remove(entry.tableId);
+                if (tableName != null) {
+                    tables.remove(tableName);
+                    vectorIndexesByTable.remove(tableName);
+                }
+                LOGGER.log(Level.INFO, "DROP_TABLE: {0} (tableId={1})", new Object[]{tableName, entry.tableId});
                 break;
             }
             case LogEntryType.CREATE_INDEX: {
@@ -118,6 +135,16 @@ public class SchemaTracker {
      */
     public Table getTable(String tableName) {
         return tables.get(tableName);
+    }
+
+    /**
+     * Returns the table name for the given per-tablespace {@code tableId}, or
+     * {@code null} if the tracker has not yet observed a {@code CREATE_TABLE}
+     * for that id. Issue #408 — used by callers that receive an id from a
+     * commit-log entry and need to resolve it back to a name.
+     */
+    public String getTableNameById(int tableId) {
+        return tableIdToName.get(tableId);
     }
 
     /**

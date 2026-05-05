@@ -76,6 +76,18 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
     private final Set<String> primaryKeyColumns;
     public final int maxSerialPosition;
     public final ForeignKeyDef[] foreignKeys;
+    /**
+     * Per-tablespace integer identifier of this table. Issued by the leader at
+     * {@code CREATE TABLE} time (a fresh id every time, including after
+     * {@code DROP}+{@code CREATE} of the same name) and persisted in the
+     * serialized form so every reader of the commit log can resolve a
+     * {@link herddb.log.LogEntry#tableId} back to its {@link Table}.
+     * <p>
+     * {@code 0} is a sentinel meaning "not yet assigned" — used for system
+     * tables, transient builder objects, and entries that do not belong to a
+     * specific table (e.g. {@code BEGINTRANSACTION}, {@code NOOP}).
+     */
+    public final int tableId;
 
     /**
      * Best case:
@@ -90,7 +102,7 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
      */
     public final boolean physicalLayoutLikeLogicalLayout;
 
-    private Table(String uuid, String name, Column[] columns, String[] primaryKey, String tablespace, boolean auto_increment, int maxSerialPosition, ForeignKeyDef[] foreignKeys) {
+    private Table(String uuid, String name, Column[] columns, String[] primaryKey, String tablespace, boolean auto_increment, int maxSerialPosition, ForeignKeyDef[] foreignKeys, int tableId) {
         this.uuid = uuid;
         this.name = name;
         this.columns = columns;
@@ -98,6 +110,7 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
         this.foreignKeys = foreignKeys;
         this.primaryKey = primaryKey;
         this.tablespace = tablespace;
+        this.tableId = tableId;
         this.columnsByName = new HashMap<>();
         this.columnsBySerialPosition = new HashMap<>();
         this.auto_increment = auto_increment;
@@ -188,6 +201,7 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
             String tablespace = dii.readUTF();
             String name = dii.readUTF();
             String uuid = dii.readUTF();
+            int tableId = dii.readVInt();
             boolean auto_increment = dii.readByte() > 0;
             int maxSerialPosition = dii.readVInt();
             byte pkcols = dii.readByte();
@@ -241,7 +255,7 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
                     }
                 }
             }
-            return new Table(uuid, name, columns, primaryKey, tablespace, auto_increment, maxSerialPosition, foreignKeys);
+            return new Table(uuid, name, columns, primaryKey, tablespace, auto_increment, maxSerialPosition, foreignKeys, tableId);
         } catch (IOException err) {
             throw new IllegalArgumentException(err);
         }
@@ -255,6 +269,7 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
             doo.writeUTF(tablespace);
             doo.writeUTF(name);
             doo.writeUTF(uuid);
+            doo.writeVInt(tableId);
             doo.writeByte(auto_increment ? 1 : 0);
             doo.writeVInt(maxSerialPosition);
             doo.writeByte(primaryKey.length);
@@ -334,7 +349,8 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
         Builder builder = builder()
                 .name(newTableName)
                 .uuid(this.uuid)
-                .tablespace(this.tablespace);
+                .tablespace(this.tablespace)
+                .tableId(this.tableId);
 
         List<String> dropColumns = alterTableStatement.getDropColumns().stream().map(String::toLowerCase)
                 .collect(Collectors.toList());
@@ -451,7 +467,8 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder();
-        sb.append("Table [name=").append(name).append(", tablespace=").append(tablespace).append("]");
+        sb.append("Table [name=").append(name).append(", tablespace=").append(tablespace)
+                .append(", tableId=").append(tableId).append("]");
         return sb.toString();
     }
 
@@ -459,7 +476,18 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
         if (this.foreignKeys != null) {
             throw new IllegalStateException();
         }
-        return new Table(uuid, name, columns, primaryKey, tablespace, auto_increment, maxSerialPosition, foreignKeys);
+        return new Table(uuid, name, columns, primaryKey, tablespace, auto_increment, maxSerialPosition, foreignKeys, tableId);
+    }
+
+    /**
+     * Returns a copy of this {@link Table} with {@code tableId} replaced by the
+     * given value. The leader uses this when assigning a fresh id at
+     * {@code CREATE TABLE} time before writing the {@code CREATE_TABLE} entry
+     * to the commit log; the rest of the table definition is preserved
+     * byte-for-byte.
+     */
+    public Table withTableId(int tableId) {
+        return new Table(uuid, name, columns, primaryKey, tablespace, auto_increment, maxSerialPosition, foreignKeys, tableId);
     }
 
     public static class Builder {
@@ -474,6 +502,7 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
         private boolean auto_increment;
         // CHECKSTYLE.ON: MemberName
         private int maxSerialPosition = 0;
+        private int tableId = 0;
 
         private Builder() {
         }
@@ -490,6 +519,11 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
 
         public Builder maxSerialPosition(int maxSerialPosition) {
             this.maxSerialPosition = maxSerialPosition;
+            return this;
+        }
+
+        public Builder tableId(int tableId) {
+            this.tableId = tableId;
             return this;
         }
 
@@ -574,7 +608,8 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
 
             return new Table(uuid, name,
                     columns.toArray(new Column[columns.size()]), primaryKey.toArray(new String[primaryKey.size()]),
-                    tablespace, auto_increment, maxSerialPosition, foreignKeys.isEmpty() ? null : foreignKeys.toArray(new ForeignKeyDef[foreignKeys.size()]));
+                    tablespace, auto_increment, maxSerialPosition, foreignKeys.isEmpty() ? null : foreignKeys.toArray(new ForeignKeyDef[foreignKeys.size()]),
+                    tableId);
         }
 
         /**
@@ -609,6 +644,7 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
             this.tablespace = tableSchema.tablespace;
             this.auto_increment = tableSchema.auto_increment;
             this.maxSerialPosition = tableSchema.maxSerialPosition;
+            this.tableId = tableSchema.tableId;
             if (tableSchema.foreignKeys != null) {
                 this.foreignKeys.addAll(Arrays.asList(tableSchema.foreignKeys));
             }
@@ -639,6 +675,9 @@ public class Table implements ColumnsList, BindableTableScanColumnNameResolver {
             return false;
         }
         if (this.maxSerialPosition != other.maxSerialPosition) {
+            return false;
+        }
+        if (this.tableId != other.tableId) {
             return false;
         }
         if (!Objects.equals(this.uuid, other.uuid)) {

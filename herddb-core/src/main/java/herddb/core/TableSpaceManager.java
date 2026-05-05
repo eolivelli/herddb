@@ -139,6 +139,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.StampedLock;
@@ -181,6 +182,39 @@ public class TableSpaceManager {
     private final String nodeId;
     private final ConcurrentSkipListSet<String> tablesNeedingCheckPoint = new ConcurrentSkipListSet<>();
     private final ConcurrentHashMap<String, AbstractTableManager> tables = new ConcurrentHashMap<>();
+    /**
+     * Per-tablespace index of {@link AbstractTableManager} keyed by the
+     * integer {@code tableId} stored in the table metadata. Issue #408 —
+     * every commit-log entry that targets a specific table carries the
+     * small integer {@code tableId}, and every apply / replay / WAL hot
+     * path resolves the manager through this index.
+     * <p>
+     * Implemented as a {@code volatile AbstractTableManager[]} indexed by
+     * {@code tableId} rather than a {@code ConcurrentHashMap<Integer, …>}
+     * so the apply hot path does <em>zero</em> autoboxing per WAL entry
+     * — a {@code Map<Integer, …>.get(int)} would box the argument once
+     * per call (every realistic deployment overflows the JDK
+     * {@code Integer} cache after a handful of CREATE/DROP cycles).
+     * <p>
+     * Writes are serialised under the tablespace write lock (or under
+     * {@link #recoveryInProgress}) so the array's length and slot
+     * contents are always observed consistently from the cooperating
+     * apply paths. Reads are lock-free: the {@code volatile} reference
+     * publishes the current array, slot reads then load
+     * {@code AbstractTableManager} references that {@code bootTable} /
+     * {@code disposeTable} writes under the lock.
+     */
+    private volatile AbstractTableManager[] tablesById = new AbstractTableManager[8];
+    /**
+     * Per-tablespace counter that hands out fresh {@code tableId} values at
+     * {@code CREATE TABLE} time on the leader. {@code DROP}+{@code CREATE} of
+     * the same name yields a different (larger) id. Reconstructed at boot
+     * from {@code max(loaded table.tableId) + 1}; further bumped during WAL
+     * replay so followers stay in sync with the leader's allocation. Starts
+     * at {@code 1} because {@code 0} is the "no table" sentinel used by
+     * control entries (BEGIN/COMMIT/ROLLBACK/NOOP/...).
+     */
+    private final AtomicInteger nextTableId = new AtomicInteger(1);
     private final ConcurrentHashMap<String, AbstractIndexManager> indexes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Map<String, AbstractIndexManager>> indexesByTable = new ConcurrentHashMap<>();
     private final StampedLock generalLock = new StampedLock();
@@ -640,19 +674,33 @@ public class TableSpaceManager {
             }
             break;
             case LogEntryType.DROP_TABLE: {
-                String tableName = entry.tableName;
+                AbstractTableManager manager = getTableManagerById(entry.tableId);
+                String tableName = manager != null ? manager.getTable().name : null;
                 if (entry.transactionId > 0) {
                     long id = entry.transactionId;
                     Transaction transaction = transactions.get(id);
-                    transaction.registerDropTable(tableName, position);
+                    if (tableName != null) {
+                        transaction.registerDropTable(tableName, position);
+                    } else {
+                        // No locally tracked manager for this id — surface
+                        // it loudly. A silent skip on a data-affecting
+                        // entry is the kind of failure the "no silent
+                        // data loss" rule was written to prevent.
+                        LOGGER.log(recovery ? Level.WARNING : Level.SEVERE,
+                                "DROP_TABLE for unknown tableId={0} in transaction {1} on tablespace {2} — skipping local apply",
+                                new Object[]{entry.tableId, entry.transactionId, tableSpaceName});
+                    }
                 } else {
-                    AbstractTableManager manager = tables.get(tableName);
                     if (manager != null) {
                         disposeTable(manager);
                         Map<String, AbstractIndexManager> indexes = indexesByTable.get(tableName);
                         if (indexes != null && !indexes.isEmpty()) {
                             LOGGER.log(Level.SEVERE, "It looks like we are dropping a table " + tableName + " with these indexes " + indexes);
                         }
+                    } else {
+                        LOGGER.log(recovery ? Level.WARNING : Level.SEVERE,
+                                "DROP_TABLE for unknown tableId={0} on tablespace {1} — nothing to dispose locally",
+                                new Object[]{entry.tableId, tableSpaceName});
                     }
                 }
 
@@ -699,15 +747,14 @@ public class TableSpaceManager {
                     TableChecksum check = MAPPER.readValue(entry.value.to_array(), TableChecksum.class);
                     String tableSpace = check.getTableSpaceName();
                     String query = check.getQuery();
-                    String tableName = entry.tableName;
+                    AbstractTableManager byId = getTableManagerById(entry.tableId);
+                    String tableName = byId != null ? byId.getTable().name : null;
                     //In the entry type = 14, the follower will have to run the query on the transaction log
                     if (!isLeader()) {
-                        AbstractTableManager tablemanager = this.getTableManager(tableName);
-                        DBManager manager = this.getDbmanager();
-
-                        if (tablemanager == null || tablemanager.getCreatedInTransaction() > 0) {
-                            throw new TableDoesNotExistException(String.format("Table %s does not exist.", tablemanager));
+                        if (byId == null || byId.getCreatedInTransaction() > 0) {
+                            throw new TableDoesNotExistException(String.format("Table id=%d does not exist.", entry.tableId));
                         }
+                        DBManager manager = this.getDbmanager();
                         /*
                             scan = true
                             allowCache = false
@@ -728,7 +775,7 @@ public class TableSpaceManager {
                         }
                     } else {
                         long digest = check.getDigest();
-                        LOGGER.log(Level.INFO, "Created checksum {0}  for table {1} in tablespace {2} on node {3}", new Object[]{digest, entry.tableName, tableSpace, this.getDbmanager().getNodeId()});
+                        LOGGER.log(Level.INFO, "Created checksum {0}  for table {1} in tablespace {2} on node {3}", new Object[]{digest, tableName, tableSpace, this.getDbmanager().getNodeId()});
                     }
                 } catch (IOException | DataScannerException ex) {
                     LOGGER.log(Level.SEVERE, "Error during table consistency check ", ex);
@@ -740,13 +787,13 @@ public class TableSpaceManager {
                 break;
         }
 
-        if (entry.tableName != null
+        if (entry.tableId != 0
                 && entry.type != LogEntryType.CREATE_TABLE
                 && entry.type != LogEntryType.CREATE_INDEX
                 && entry.type != LogEntryType.ALTER_TABLE
                 && entry.type != LogEntryType.DROP_TABLE
                 && entry.type != LogEntryType.TABLE_CONSISTENCY_CHECK) {
-            AbstractTableManager tableManager = tables.get(entry.tableName);
+            AbstractTableManager tableManager = getTableManagerById(entry.tableId);
             tableManager.apply(position, entry, recovery);
         }
 
@@ -756,6 +803,94 @@ public class TableSpaceManager {
         manager.dropTableData();
         manager.close();
         tables.remove(manager.getTable().name);
+        removeTableManagerById(manager.getTable().tableId, manager);
+    }
+
+    /**
+     * Atomically bumps {@link #nextTableId} so that it strictly exceeds the
+     * given {@code observedId}. Used during recovery / WAL replay to keep the
+     * leader's id allocator monotonic across the maximum id observed in
+     * loaded {@link Table} metadata or in {@code CREATE_TABLE} entries
+     * replayed from the commit log.
+     */
+    private void bumpNextTableId(int observedId) {
+        nextTableId.accumulateAndGet(observedId + 1, Math::max);
+    }
+
+    /**
+     * Returns the {@link AbstractTableManager} for {@code tableId}, or
+     * {@code null} if the id is unknown or the slot has been cleared.
+     * Hot path on every WAL apply — must avoid autoboxing
+     * (issue #408 review).
+     */
+    private AbstractTableManager getTableManagerById(int tableId) {
+        if (tableId <= 0) {
+            return null;
+        }
+        AbstractTableManager[] arr = tablesById;
+        if (tableId >= arr.length) {
+            return null;
+        }
+        return arr[tableId];
+    }
+
+    /**
+     * Stores {@code manager} under {@code tableId} in {@link #tablesById},
+     * growing the underlying array if necessary. Must be invoked with the
+     * tablespace write lock held (or during {@code recoveryInProgress})
+     * so that concurrent writers do not lose updates.
+     */
+    private void putTableManagerById(int tableId, AbstractTableManager manager) {
+        if (tableId <= 0) {
+            return;
+        }
+        AbstractTableManager[] arr = tablesById;
+        if (tableId >= arr.length) {
+            int newLen = arr.length;
+            while (newLen <= tableId) {
+                newLen <<= 1;
+            }
+            AbstractTableManager[] grown = new AbstractTableManager[newLen];
+            System.arraycopy(arr, 0, grown, 0, arr.length);
+            grown[tableId] = manager;
+            tablesById = grown;
+        } else {
+            arr[tableId] = manager;
+        }
+    }
+
+    /**
+     * Clears the slot for {@code tableId} only if the current entry is
+     * the given {@code expected} manager — mirrors
+     * {@code ConcurrentMap#remove(K, V)} semantics so that a concurrent
+     * re-boot of the same id does not race-clobber the new entry. Must
+     * be invoked with the tablespace write lock held.
+     */
+    private void removeTableManagerById(int tableId, AbstractTableManager expected) {
+        if (tableId <= 0) {
+            return;
+        }
+        AbstractTableManager[] arr = tablesById;
+        if (tableId < arr.length && arr[tableId] == expected) {
+            arr[tableId] = null;
+        }
+    }
+
+    /**
+     * Test-/diagnostics-only mirror of the dense id index as a
+     * {@code Map<Integer, AbstractTableManager>}. Only includes non-null
+     * slots. Used by tests that previously relied on a {@code Map}
+     * shape; not invoked from any hot path.
+     */
+    Map<Integer, AbstractTableManager> tablesByIdSnapshot() {
+        AbstractTableManager[] arr = tablesById;
+        Map<Integer, AbstractTableManager> out = new HashMap<>();
+        for (int i = 1; i < arr.length; i++) {
+            if (arr[i] != null) {
+                out.put(i, arr[i]);
+            }
+        }
+        return out;
     }
 
     private void disposeIndexManager(AbstractIndexManager indexManager) throws DataStorageManagerException {
@@ -1117,6 +1252,16 @@ public class TableSpaceManager {
             manager.close();
         }
         tables.clear();
+        // Issue #408: reset the per-tablespace id-keyed index and the id
+        // allocator together with `tables`. The fresh tables that
+        // `beginRestoreTable` is about to boot will register themselves
+        // under their downloaded ids via `bootTable` (which also bumps
+        // the allocator), so leaving stale entries here would either
+        // leak references to closed managers or — more dangerously —
+        // let `nextTableId` start from `1` and collide with the
+        // downloaded ids on the very first leader CREATE TABLE.
+        tablesById = new AbstractTableManager[8];
+        nextTableId.set(1);
 
         // this map should be empty
         for (AbstractIndexManager manager : indexes.values()) {
@@ -1834,6 +1979,10 @@ public class TableSpaceManager {
                         // Close the table manager (but don't drop remote data — we don't own it)
                         tm.close();
                         tables.remove(tableName);
+                        // Issue #408: keep the id-keyed index in sync. A
+                        // stale entry here would NPE on first WAL apply
+                        // after this replica is promoted to leader.
+                        removeTableManagerById(tm.getTable().tableId, tm);
                         // Remove associated indexes
                         Map<String, AbstractIndexManager> tableIndexes = indexesByTable.remove(tableName);
                         if (tableIndexes != null) {
@@ -1853,6 +2002,11 @@ public class TableSpaceManager {
                     if (tm != null) {
                         tm.close();
                         tables.remove(tableName);
+                        // The fresh manager booted below replaces this id
+                        // unconditionally; clear the stale entry so a
+                        // crash between close() and the rebuild loop
+                        // cannot leave a dead reference behind.
+                        removeTableManagerById(tm.getTable().tableId, tm);
                     }
                 }
             }
@@ -1870,9 +2024,17 @@ public class TableSpaceManager {
                     TableManager tableManager = new TableManager(
                             table, log, dbmanager.getMemoryManager(), dataStorageManager, this, tableSpaceUUID, 0);
                     tables.put(table.name, tableManager);
+                    if (table.tableId != 0) {
+                        // Issue #408: register the freshly-booted table
+                        // under its checkpoint-loaded id, and bump the
+                        // leader's id allocator so a future leader
+                        // promotion does not re-issue this id.
+                        putTableManagerById(table.tableId, tableManager);
+                        bumpNextTableId(table.tableId);
+                    }
                     tableManager.start(false);
-                    LOGGER.log(Level.FINE, "refreshFromCheckpoint: booted table {0}.{1}",
-                            new Object[]{tableSpaceName, table.name});
+                    LOGGER.log(Level.FINE, "refreshFromCheckpoint: booted table {0}.{1} tableId={2}",
+                            new Object[]{tableSpaceName, table.name, table.tableId});
                 } catch (Exception err) {
                     LOGGER.log(Level.SEVERE, "refreshFromCheckpoint: failed to boot table " + table.name, err);
                 }
@@ -2298,7 +2460,13 @@ public class TableSpaceManager {
                     }
                 }
             }
-            LogEntry entry = LogEntryFactory.createTable(statement.getTableDefinition(), transaction);
+            // Issue #408: assign a fresh per-tablespace integer id to this table
+            // before writing the CREATE_TABLE entry. The id is persisted inside
+            // the serialized Table value of the entry, so followers / future
+            // recoveries see exactly the same id without needing their own
+            // counter.
+            Table tableWithId = statement.getTableDefinition().withTableId(nextTableId.getAndIncrement());
+            LogEntry entry = LogEntryFactory.createTable(tableWithId, transaction);
             CommitLogResult pos = log.log(entry, entry.transactionId <= 0);
             apply(pos, entry, false);
 
@@ -2398,7 +2566,7 @@ public class TableSpaceManager {
                 }
             }
 
-            LogEntry entry = LogEntryFactory.dropTable(tableNameNormalized, transaction);
+            LogEntry entry = LogEntryFactory.dropTable(table, transaction);
             CommitLogResult pos = log.log(entry, entry.transactionId <= 0);
             apply(pos, entry, false);
 
@@ -2457,7 +2625,7 @@ public class TableSpaceManager {
     TableManager bootTable(Table table, long transaction, LogSequenceNumber dumpLogSequenceNumber, boolean freshNew) throws DataStorageManagerException {
         long _start = System.currentTimeMillis();
         if (!freshNew) {
-            LOGGER.log(Level.INFO, "bootTable {0} {1}.{2}", new Object[]{nodeId, tableSpaceName, table.name});
+            LOGGER.log(Level.INFO, "bootTable {0} {1}.{2} tableId={3}", new Object[]{nodeId, tableSpaceName, table.name, table.tableId});
         }
         AbstractTableManager prevTableManager = tables.remove(table.name);
         if (prevTableManager != null) {
@@ -2465,6 +2633,7 @@ public class TableSpaceManager {
                 // restoring a table already booted in a previous life
                 LOGGER.log(Level.INFO, "bootTable {0} {1}.{2} already exists on this tablespace. It will be truncated", new Object[]{nodeId, tableSpaceName, table.name});
                 prevTableManager.dropTableData();
+                removeTableManagerById(prevTableManager.getTable().tableId, prevTableManager);
             } else {
                 LOGGER.log(Level.INFO, "bootTable {0} {1}.{2} already exists on this tablespace", new Object[]{nodeId, tableSpaceName, table.name});
                 throw new DataStorageManagerException("Table " + table.name + " already present in tableSpace " + tableSpaceName);
@@ -2481,6 +2650,13 @@ public class TableSpaceManager {
             tableManager.prepareForRestore(dumpLogSequenceNumber);
         }
         tables.put(table.name, tableManager);
+        if (table.tableId != 0) {
+            putTableManagerById(table.tableId, tableManager);
+            // Bump the per-tablespace counter so the next CREATE TABLE on the leader
+            // never collides with this id, regardless of the path that booted the
+            // table (loadTables / WAL replay / dump restore / leader CREATE).
+            bumpNextTableId(table.tableId);
+        }
         tableManager.start(freshNew);
         if (!freshNew) {
             LOGGER.log(Level.INFO, "bootTable {0} {1}.{2} time {3} ms", new Object[]{nodeId, tableSpaceName, table.name, (System.currentTimeMillis() - _start) + ""});
@@ -2697,7 +2873,7 @@ public class TableSpaceManager {
             byte[] serialize = MAPPER.writeValueAsBytes(scanResult);
 
             Bytes value = Bytes.from_array(serialize);
-            LogEntry entry = LogEntryFactory.dataConsistency(tableName, value);
+            LogEntry entry = LogEntryFactory.dataConsistency(tablemanager.getTable(), value);
             pos = log.log(entry, false);
             apply(pos, entry, false);
             return scanResult;

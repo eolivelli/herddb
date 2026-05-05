@@ -915,6 +915,7 @@ public class SimpleRecoveryTest {
 
         String nodeId = "localhost";
         String tablespaceUUID = null;
+        int tableId = 0;
         try (DBManager manager = new DBManager("localhost",
                 new FileMetadataStorageManager(metadataPath),
                 new FileDataStorageManager(dataPath),
@@ -940,6 +941,10 @@ public class SimpleRecoveryTest {
             manager.checkpoint();
 
             tablespaceUUID = manager.getTableSpaceManager("tblspace1").getTableSpaceUUID();
+            // Issue #408: capture the per-tablespace tableId assigned by the
+            // leader so we can write a raw INSERT entry that resolves to "t1"
+            // during recovery.
+            tableId = manager.getTableSpaceManager("tblspace1").getTableManager("t1").getTable().tableId;
 
         }
 
@@ -953,7 +958,7 @@ public class SimpleRecoveryTest {
                 log.startWriting(1);
 
                 /* Insert an entry for a unknown transaction id */
-                LogEntry entry = new LogEntry(System.currentTimeMillis(), LogEntryType.INSERT, 1024, "t1", key, value);
+                LogEntry entry = new LogEntry(System.currentTimeMillis(), LogEntryType.INSERT, 1024, tableId, key, value);
                 log.log(entry, true).getLogSequenceNumber();
 
             }
@@ -996,6 +1001,7 @@ public class SimpleRecoveryTest {
 
         String nodeId = "localhost";
         String tablespaceUUID = null;
+        int tableId = 0;
         try (DBManager manager = new DBManager("localhost",
                 new FileMetadataStorageManager(metadataPath),
                 new FileDataStorageManager(dataPath),
@@ -1024,6 +1030,7 @@ public class SimpleRecoveryTest {
             assertEquals(1, manager.executeUpdate(insert, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION).getUpdateCount());
 
             tablespaceUUID = manager.getTableSpaceManager("tblspace1").getTableSpaceUUID();
+            tableId = manager.getTableSpaceManager("tblspace1").getTableManager("t1").getTable().tableId;
 
         }
 
@@ -1037,7 +1044,7 @@ public class SimpleRecoveryTest {
                 log.startWriting(1);
 
                 /* Insert an entry for a unknown transaction id */
-                LogEntry entry = new LogEntry(System.currentTimeMillis(), LogEntryType.DELETE, 1024, "t1", key, null);
+                LogEntry entry = new LogEntry(System.currentTimeMillis(), LogEntryType.DELETE, 1024, tableId, key, null);
                 log.log(entry, true).getLogSequenceNumber();
 
             }
@@ -1082,6 +1089,7 @@ public class SimpleRecoveryTest {
 
         String nodeId = "localhost";
         String tablespaceUUID = null;
+        int tableId = 0;
         try (DBManager manager = new DBManager("localhost",
                 new FileMetadataStorageManager(metadataPath),
                 new FileDataStorageManager(dataPath),
@@ -1110,6 +1118,7 @@ public class SimpleRecoveryTest {
             assertEquals(1, manager.executeUpdate(insert, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION).getUpdateCount());
 
             tablespaceUUID = manager.getTableSpaceManager("tblspace1").getTableSpaceUUID();
+            tableId = manager.getTableSpaceManager("tblspace1").getTableManager("t1").getTable().tableId;
 
         }
 
@@ -1123,7 +1132,7 @@ public class SimpleRecoveryTest {
                 log.startWriting(1);
 
                 /* Insert an entry for a unknown transaction id */
-                LogEntry entry = new LogEntry(System.currentTimeMillis(), LogEntryType.UPDATE, 1024, "t1", key, value2);
+                LogEntry entry = new LogEntry(System.currentTimeMillis(), LogEntryType.UPDATE, 1024, tableId, key, value2);
                 log.log(entry, true).getLogSequenceNumber();
 
             }

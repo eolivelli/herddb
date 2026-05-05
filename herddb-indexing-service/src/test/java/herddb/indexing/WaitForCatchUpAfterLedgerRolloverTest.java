@@ -63,7 +63,7 @@ public class WaitForCatchUpAfterLedgerRolloverTest {
             for (int i = 0; i < count; i++) {
                 long seqNumber = startOffset + i;
                 LogEntry entry = new LogEntry(System.currentTimeMillis(), LogEntryType.INSERT,
-                        0, "mytable", Bytes.from_string("key" + seqNumber), Bytes.from_string("val" + seqNumber));
+                        0, 0, Bytes.from_string("key" + seqNumber), Bytes.from_string("val" + seqNumber));
                 out.writeByte(ENTRY_START);
                 out.writeLong(seqNumber);
                 entry.serialize(out);
