@@ -22,8 +22,9 @@ package herddb.server;
 
 import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import herddb.storage.DataStorageManagerException;
 import herddb.utils.HerdDBByteBufAllocators;
 import java.lang.management.ManagementFactory;
 import org.junit.Rule;
@@ -93,10 +94,8 @@ public class ServerConfigurationDirectMemoryBudgetTest {
     public void invalidSourceIsRejected() throws Exception {
         try (Server server = new Server(newServerConfigurationWithAutoPort(folder.newFolder().toPath())
                 .set(ServerConfiguration.PROPERTY_MEMORY_LIMIT_REFERENCE_SOURCE, "totally-bogus"))) {
-            server.start();
-            fail("server.start() should have rejected the invalid source value");
-        } catch (Exception expected) {
-            String message = expected.getMessage();
+            DataStorageManagerException ex = assertThrows(DataStorageManagerException.class, server::start);
+            String message = ex.getMessage();
             assertTrue("error message should mention the invalid value (got: " + message + ")",
                     message != null && message.contains("totally-bogus"));
         }

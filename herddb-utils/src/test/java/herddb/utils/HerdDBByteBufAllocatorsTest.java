@@ -28,6 +28,7 @@ import static org.junit.Assert.assertTrue;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.PooledByteBufAllocatorMetric;
+import java.util.function.LongSupplier;
 import org.junit.Test;
 
 public class HerdDBByteBufAllocatorsTest {
@@ -101,5 +102,71 @@ public class HerdDBByteBufAllocatorsTest {
         assertTrue("maxDirectMemoryBytes must be positive on a normal JVM, got " + first, first > 0L);
         long second = HerdDBByteBufAllocators.maxDirectMemoryBytes();
         assertEquals("repeated calls must return the cached value", first, second);
+    }
+
+    /**
+     * Strong invariant the rest of issue #399's series depends on: an
+     * allocation from the dedicated data-pool must NOT show up on the
+     * {@link PooledByteBufAllocator#DEFAULT} metric. Without this guarantee
+     * the dedicated pools would be a no-op rebrand of the default arena.
+     */
+    @Test
+    public void allocationsBypassNettyDefaultPool() {
+        PooledByteBufAllocatorMetric defaultMetric = PooledByteBufAllocator.DEFAULT.metric();
+        PooledByteBufAllocatorMetric dataMetric = HerdDBByteBufAllocators.dataPagesMetric();
+
+        long defaultDirectBefore = defaultMetric.usedDirectMemory();
+        long defaultHeapBefore = defaultMetric.usedHeapMemory();
+        long dataDirectBefore = dataMetric.usedDirectMemory();
+        long dataHeapBefore = dataMetric.usedHeapMemory();
+
+        // Allocate one direct and one heap buffer of distinctly different
+        // sizes from the data pool so the deltas are non-zero on either path
+        // regardless of the JVM's preferDirect default.
+        ByteBuf direct = HerdDBByteBufAllocators.dataPagesAllocator().directBuffer(64 * 1024);
+        ByteBuf heap = HerdDBByteBufAllocators.dataPagesAllocator().heapBuffer(64 * 1024);
+        try {
+            assertSame("direct buffer must be owned by the data pool",
+                    HerdDBByteBufAllocators.dataPagesAllocator(), direct.alloc());
+            assertSame("heap buffer must be owned by the data pool",
+                    HerdDBByteBufAllocators.dataPagesAllocator(), heap.alloc());
+
+            long defaultDirectAfter = defaultMetric.usedDirectMemory();
+            long defaultHeapAfter = defaultMetric.usedHeapMemory();
+            long dataDirectAfter = dataMetric.usedDirectMemory();
+            long dataHeapAfter = dataMetric.usedHeapMemory();
+
+            assertEquals("DEFAULT direct memory must NOT move when allocating from the data pool",
+                    defaultDirectBefore, defaultDirectAfter);
+            assertEquals("DEFAULT heap memory must NOT move when allocating from the data pool",
+                    defaultHeapBefore, defaultHeapAfter);
+            assertTrue("data pool used memory must move (direct " + dataDirectBefore + "->" + dataDirectAfter
+                            + ", heap " + dataHeapBefore + "->" + dataHeapAfter + ")",
+                    dataDirectAfter > dataDirectBefore || dataHeapAfter > dataHeapBefore);
+        } finally {
+            direct.release();
+            heap.release();
+        }
+    }
+
+    /**
+     * Drive {@link HerdDBByteBufAllocators#resolveMaxDirectMemoryBytes(LongSupplier)}
+     * with a stub Netty probe so the JDK-internal / {@link Runtime#maxMemory()}
+     * fallback chain is reachable. On a normal JVM the reflective branch
+     * succeeds; on hardened runtimes the {@code Runtime.maxMemory()} branch
+     * fires. Either way the resolver must return a positive value.
+     */
+    @Test
+    public void fallbackChainReturnsPositiveWhenNettyProbeFailsOrReportsZero() {
+        LongSupplier nettyReportsZero = () -> 0L;
+        long resolved = HerdDBByteBufAllocators.resolveMaxDirectMemoryBytes(nettyReportsZero);
+        assertTrue("fallback chain must return a positive limit, got " + resolved, resolved > 0L);
+
+        LongSupplier nettyThrows = () -> {
+            throw new UnsupportedOperationException("simulated hardened runtime");
+        };
+        long resolvedThrowing = HerdDBByteBufAllocators.resolveMaxDirectMemoryBytes(nettyThrows);
+        assertTrue("fallback chain must catch UnsupportedOperationException, got " + resolvedThrowing,
+                resolvedThrowing > 0L);
     }
 }

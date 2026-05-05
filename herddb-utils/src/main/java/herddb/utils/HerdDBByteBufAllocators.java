@@ -24,6 +24,7 @@ import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.PooledByteBufAllocatorMetric;
 import io.netty.util.internal.PlatformDependent;
 import java.lang.reflect.Method;
+import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -71,8 +72,21 @@ public final class HerdDBByteBufAllocators {
     private static final String PROP_PREFIX_DATA = "herddb.allocator.data.";
     private static final String PROP_PREFIX_INDEX = "herddb.allocator.index.";
 
-    private static final PooledByteBufAllocator DATA_PAGES = build(PROP_PREFIX_DATA);
-    private static final PooledByteBufAllocator INDEX_PAGES = build(PROP_PREFIX_INDEX);
+    /**
+     * Initialization-on-Demand Holder for the data-pages pool. A bad system
+     * property surfaces as a clean {@link RuntimeException} from the
+     * {@link #dataPagesAllocator()} accessor instead of a
+     * {@link NoClassDefFoundError} at first use of any other constant in this
+     * class.
+     */
+    private static final class DataPagesHolder {
+        static final PooledByteBufAllocator INSTANCE = build(PROP_PREFIX_DATA);
+    }
+
+    /** Initialization-on-Demand Holder for the index-pages pool. */
+    private static final class IndexPagesHolder {
+        static final PooledByteBufAllocator INSTANCE = build(PROP_PREFIX_INDEX);
+    }
 
     /**
      * Cached result of {@link #maxDirectMemoryBytes()}. Resolved lazily on first
@@ -92,7 +106,7 @@ public final class HerdDBByteBufAllocators {
      *         {@link PooledByteBufAllocator#DEFAULT}.
      */
     public static PooledByteBufAllocator dataPagesAllocator() {
-        return DATA_PAGES;
+        return DataPagesHolder.INSTANCE;
     }
 
     /**
@@ -103,21 +117,21 @@ public final class HerdDBByteBufAllocators {
      *         {@link #dataPagesAllocator()} and {@link PooledByteBufAllocator#DEFAULT}.
      */
     public static PooledByteBufAllocator indexPagesAllocator() {
-        return INDEX_PAGES;
+        return IndexPagesHolder.INSTANCE;
     }
 
     /**
      * Metric snapshot for the data-pages pool.
      */
     public static PooledByteBufAllocatorMetric dataPagesMetric() {
-        return DATA_PAGES.metric();
+        return DataPagesHolder.INSTANCE.metric();
     }
 
     /**
      * Metric snapshot for the index-pages pool.
      */
     public static PooledByteBufAllocatorMetric indexPagesMetric() {
-        return INDEX_PAGES.metric();
+        return IndexPagesHolder.INSTANCE.metric();
     }
 
     /**
@@ -145,7 +159,7 @@ public final class HerdDBByteBufAllocators {
         if (cached > 0L) {
             return cached;
         }
-        long resolved = resolveMaxDirectMemoryBytes();
+        long resolved = resolveMaxDirectMemoryBytes(PlatformDependentMaxDirectMemoryProbe.INSTANCE);
         cachedMaxDirectMemoryBytes = resolved;
         return resolved;
     }
@@ -158,10 +172,15 @@ public final class HerdDBByteBufAllocators {
         cachedMaxDirectMemoryBytes = -1L;
     }
 
-    private static long resolveMaxDirectMemoryBytes() {
+    /**
+     * Package-private resolver that lets tests inject a probe other than
+     * Netty's {@link PlatformDependent#maxDirectMemory()} so the reflective /
+     * {@link Runtime#maxMemory()} fallback branches are reachable.
+     */
+    static long resolveMaxDirectMemoryBytes(LongSupplier nettyProbe) {
         long fromNetty;
         try {
-            fromNetty = PlatformDependent.maxDirectMemory();
+            fromNetty = nettyProbe.getAsLong();
         } catch (UnsupportedOperationException e) {
             // PlatformDependent throws on JVMs where the limit cannot be observed
             // (e.g. some hardened runtimes). Fall through to the reflective path.
@@ -180,10 +199,21 @@ public final class HerdDBByteBufAllocators {
                         + " sun.misc.VM; falling back to Runtime.maxMemory()={0} bytes for"
                         + " HerdDB memory-budget defaults. Set -XX:MaxDirectMemorySize=<bytes>"
                         + " explicitly for predictable budgets.",
-                fallback);
+                Long.toString(fallback));
         return fallback;
     }
 
+    /**
+     * Returns a positive long when {@code className.maxDirectMemory()} is
+     * reachable, or {@code -1L} otherwise. JDK 17+ may throw
+     * {@link InaccessibleObjectException} (a {@link RuntimeException}) when
+     * {@code java.base/jdk.internal.misc} is not opened to the unnamed module,
+     * and a hardened JVM may install a {@link SecurityManager} that throws
+     * {@link SecurityException} on reflective access; both are caught so the
+     * resolver falls through to {@link Runtime#maxMemory()} instead of
+     * crashing server boot. The broad catch is intentional and limited to a
+     * tiny diagnostic helper.
+     */
     private static long reflectVmMaxDirectMemory() {
         for (String className : new String[]{"sun.misc.VM", "jdk.internal.misc.VM"}) {
             try {
@@ -198,9 +228,30 @@ public final class HerdDBByteBufAllocators {
             } catch (ReflectiveOperationException e) {
                 LOGGER.log(Level.FINE, "Reflective access to {0}.maxDirectMemory failed: {1}",
                         new Object[]{className, e.toString()});
+            } catch (RuntimeException e) {
+                // Broad catch required to handle InaccessibleObjectException
+                // (JDK 17+ module encapsulation) and SecurityException on
+                // hardened runtimes — both are RuntimeException subtypes that
+                // are not part of ReflectiveOperationException's hierarchy.
+                LOGGER.log(Level.FINE, "Reflective access to {0}.maxDirectMemory blocked: {1}",
+                        new Object[]{className, e.toString()});
             }
         }
         return -1L;
+    }
+
+    /**
+     * Default {@link LongSupplier} that delegates to
+     * {@link PlatformDependent#maxDirectMemory()}. Extracted as a singleton so
+     * the resolver lambda allocation only happens at static-init time.
+     */
+    private enum PlatformDependentMaxDirectMemoryProbe implements LongSupplier {
+        INSTANCE;
+
+        @Override
+        public long getAsLong() {
+            return PlatformDependent.maxDirectMemory();
+        }
     }
 
     private static PooledByteBufAllocator build(String prefix) {
