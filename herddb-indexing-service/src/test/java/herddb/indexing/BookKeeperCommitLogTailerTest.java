@@ -179,6 +179,65 @@ public class BookKeeperCommitLogTailerTest {
     }
 
     @Test
+    public void testV2WireProtocolEnabledByDefault() throws Exception {
+        // Issue #392: the indexing-service tailer must default to BK V2
+        // (no protobuf framing on readEntries) — verifies the default flows
+        // through the BookKeeperCommitLogTailer entry point, not just the
+        // BookkeeperCommitLogManager constructor.
+        BookKeeperCommitLogTailer tailer = new BookKeeperCommitLogTailer(
+                testEnv.getAddress(),
+                testEnv.getTimeout(),
+                testEnv.getPath(),
+                ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT,
+                "test-ts-v2-defaults",
+                LogSequenceNumber.START_OF_TIME,
+                (lsn, entry) -> { /* no-op */ }
+        );
+        Thread t = new Thread(tailer, "test-bk-tailer-v2-defaults");
+        t.setDaemon(true);
+        t.start();
+        try {
+            ClientConfiguration cfg = waitForClientConfig(tailer);
+            assertTrue("IS tailer must default to V2 wire protocol",
+                    cfg.getUseV2WireProtocol());
+        } finally {
+            tailer.close();
+            t.join(5_000);
+        }
+    }
+
+    @Test
+    public void testV2WireProtocolOperatorOverride() throws Exception {
+        // Issue #392: an operator must still be able to fall back to V3 by
+        // setting bookkeeper.useV2WireProtocol=false on the IS tailer's
+        // bookkeeper-client properties.
+        Properties bkProps = new Properties();
+        bkProps.setProperty("bookkeeper.useV2WireProtocol", "false");
+
+        BookKeeperCommitLogTailer tailer = new BookKeeperCommitLogTailer(
+                testEnv.getAddress(),
+                testEnv.getTimeout(),
+                testEnv.getPath(),
+                ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT,
+                "test-ts-v2-override",
+                LogSequenceNumber.START_OF_TIME,
+                (lsn, entry) -> { /* no-op */ },
+                bkProps
+        );
+        Thread t = new Thread(tailer, "test-bk-tailer-v2-override");
+        t.setDaemon(true);
+        t.start();
+        try {
+            ClientConfiguration cfg = waitForClientConfig(tailer);
+            assertFalse("operator-supplied bookkeeper.useV2WireProtocol=false must win on IS tailer",
+                    cfg.getUseV2WireProtocol());
+        } finally {
+            tailer.close();
+            t.join(5_000);
+        }
+    }
+
+    @Test
     public void testBookkeeperPropertiesArePassedThrough() throws Exception {
         // Issue #180: the bookkeeper.* prefix must reach the BK client. A
         // non-default value for firstSpeculativeReadTimeout confirms both
