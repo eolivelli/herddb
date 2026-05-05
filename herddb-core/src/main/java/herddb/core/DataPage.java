@@ -271,6 +271,88 @@ public class DataPage extends Page<TableManager> {
     }
 
     /**
+     * Issue #409: rebuild a mutable page's {@link Record} map onto a
+     * dedicated off-heap value slab as part of {@link #toImmutable()}.
+     *
+     * <p>Returns a slab-packed immutable {@code DataPage} when the records'
+     * aggregate value bytes meet {@link #OFFHEAP_VALUE_BYTES_THRESHOLD} and
+     * fit a 32-bit {@code ByteBuf} capacity. Returns {@code null} otherwise
+     * to signal that the caller should keep the on-heap representation.
+     *
+     * <p>The {@code Record}s in the new page are fresh objects whose values
+     * are non-owning {@link Bytes#fromSharedSlab} views into the slab,
+     * anchored against the new {@link DataPageHolder} so the JDK
+     * {@link Cleaner} releases the slab once the page (and every shared-slab
+     * {@code Bytes} extracted from it) becomes GC-unreachable. The original
+     * mutable page's on-heap {@code byte[]}-backed {@code Record}s remain
+     * untouched and are eligible for GC as soon as the caller drops its
+     * references to them — exactly the same lifecycle invariant that
+     * already held for the legacy on-heap {@code toImmutable()}.
+     *
+     * <p>Key {@code Bytes} are reused as-is (unchanged identity, unchanged
+     * representation) — only the value bytes are repacked onto the slab.
+     *
+     * @param owner       the {@link TableManager} that will own the new page.
+     * @param pageId      page id to copy onto the new immutable page.
+     * @param maxSize     {@code maxSize} of the source mutable page.
+     * @param sourceData  the source mutable page's record map; iterated once
+     *                    to size the slab and once to pack values.
+     * @return a new immutable, slab-packed {@code DataPage}, or {@code null}
+     *         when the records do not warrant a slab (tiny aggregate bytes
+     *         or pathological size).
+     */
+    static DataPage buildSlabPackedFromMutableData(TableManager owner, long pageId, long maxSize,
+                                                    Map<Bytes, Record> sourceData) {
+        long totalValueBytes = 0L;
+        for (Record r : sourceData.values()) {
+            totalValueBytes += r.value.getLength();
+        }
+        if (totalValueBytes < OFFHEAP_VALUE_BYTES_THRESHOLD || totalValueBytes > Integer.MAX_VALUE) {
+            // Stay on-heap when the slab overhead would dominate (tiny pages)
+            // or when a 32-bit ByteBuf cannot hold the aggregate (pathological).
+            return null;
+        }
+
+        PooledByteBufAllocator allocator = HerdDBByteBufAllocators.dataPagesAllocator();
+        // The slab's refcount is 1 here; the Cleanable in the constructor below
+        // releases it exactly once when the page (and every shared-slab Bytes
+        // anchored to it) becomes GC-unreachable.
+        ByteBuf slab = allocator.directBuffer((int) totalValueBytes);
+        try {
+            Map<Bytes, Record> map = new HashMap<>(sourceData.size());
+            DataPageHolder holder = new DataPageHolder();
+            int writePos = 0;
+            long estimatedPageSize = 0L;
+            for (Record r : sourceData.values()) {
+                int valueLen = r.value.getLength();
+                if (valueLen > 0) {
+                    // Reading from the source value triggers lazy materialisation
+                    // for off-heap-backed sources, but on the toImmutable() path
+                    // sources are mutable on-heap pages so this is a plain
+                    // byte[] read.
+                    slab.writeBytes(r.value.getBuffer(), r.value.getOffset(), valueLen);
+                }
+                Bytes offHeapValue = Bytes.fromSharedSlab(slab, writePos, valueLen, holder);
+                Record packed = new Record(r.key, offHeapValue);
+                map.put(packed.key, packed);
+                estimatedPageSize += DataPage.estimateEntrySize(packed);
+                writePos += valueLen;
+            }
+            DataPage page = new DataPage(owner, pageId, maxSize, estimatedPageSize, map, true, slab);
+            holder.page = page;
+            return page;
+        } catch (RuntimeException t) {
+            // Narrow catch (per CLAUDE.md): everything inside the try can only
+            // throw unchecked exceptions — slab.writeBytes (IOOBE on capacity
+            // miscalculation), Bytes.fromSharedSlab (NPE on bad arguments),
+            // HashMap.put (none expected). Allocation succeeded; subsequent
+            // failure must release the slab so we don't leak pooled memory.
+            slab.release();
+            throw t;
+        }
+    }
+
+    /**
      * Holder that lets {@link #buildSlabPackedImmutable} hand each
      * shared-slab {@code Bytes} a reference that resolves to the
      * {@code DataPage} once construction completes. The {@code Bytes} only
@@ -322,6 +404,13 @@ public class DataPage extends Page<TableManager> {
      * before checking).
      * </p>
      *
+     * <p><b>Issue #409 — off-heap value slab</b>: when the aggregate
+     * {@code Record.value} bytes meet {@link #OFFHEAP_VALUE_BYTES_THRESHOLD}
+     * the converter rebuilds the records onto a dedicated off-heap slab via
+     * {@link #buildSlabPackedFromMutableData}, so ingest-resident immutable
+     * pages stop pinning their value bytes on the JVM heap. Tiny / pathological
+     * pages keep the legacy on-heap layout.
+     *
      * @return immutable data page version
      */
     DataPage toImmutable() {
@@ -334,6 +423,15 @@ public class DataPage extends Page<TableManager> {
             throw new IllegalStateException("page " + pageId + " cannot be converted to immutable because still writable!");
         }
 
+        // Issue #409: pack value bytes into a dedicated DATA_PAGES off-heap
+        // slab when the aggregate exceeds the slab threshold. Falls back to
+        // the legacy on-heap layout for tiny / pathological pages so we keep
+        // the pre-#409 behaviour where the slab's per-record overhead would
+        // outweigh the savings.
+        DataPage slabPacked = buildSlabPackedFromMutableData(owner, pageId, maxSize, data);
+        if (slabPacked != null) {
+            return slabPacked;
+        }
         return new DataPage(owner, pageId, maxSize, usedMemory.get(), data, true);
 
     }
