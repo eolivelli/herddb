@@ -25,14 +25,10 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.core.PostCheckpointAction;
-import herddb.index.blink.BLink;
 import herddb.log.LogSequenceNumber;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.utils.Bytes;
-import java.lang.reflect.Field;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentMap;
 import org.junit.After;
 import org.junit.Test;
 
@@ -106,7 +102,7 @@ public class BLinkOffHeapKeysTest {
         // is off-heap. This is the strong invariant: without it the
         // step-4 slab-pack path could regress silently.
         assertTrue("at least one BLink node key must be off-heap-backed",
-                anyKeyOffHeap(idx));
+                BLinkTestReflection.anyKeyOffHeap(idx));
     }
 
     @Test
@@ -134,37 +130,6 @@ public class BLinkOffHeapKeysTest {
             assertEquals(Long.valueOf(i), idx.get(Bytes.from_int(i)));
         }
         assertEquals(4L, idx.size());
-    }
-
-    /**
-     * Reflectively iterates BLink internals and returns {@code true} as
-     * soon as any node's TreeMap key reports {@link Bytes#isOffHeap()}.
-     * Used to assert step-4's slab-pack invariant from outside the
-     * generic BLink machinery.
-     */
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    private static boolean anyKeyOffHeap(BLinkKeyToPageIndex index) throws Exception {
-        Field tree = BLinkKeyToPageIndex.class.getDeclaredField("tree");
-        tree.setAccessible(true);
-        BLink<Bytes, Long> blink = (BLink<Bytes, Long>) tree.get(index);
-        Field nodes = BLink.class.getDeclaredField("nodes");
-        nodes.setAccessible(true);
-        ConcurrentMap<Long, ?> nodeMap = (ConcurrentMap<Long, ?>) nodes.get(blink);
-        for (Object node : nodeMap.values()) {
-            Field mapField = node.getClass().getDeclaredField("map");
-            mapField.setAccessible(true);
-            Object mapObj = mapField.get(node);
-            if (!(mapObj instanceof Map)) {
-                continue;
-            }
-            Map<?, ?> map = (Map<?, ?>) mapObj;
-            for (Object k : map.keySet()) {
-                if (k instanceof Bytes && ((Bytes) k).isOffHeap()) {
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     private static byte[] makeKey(int i) {

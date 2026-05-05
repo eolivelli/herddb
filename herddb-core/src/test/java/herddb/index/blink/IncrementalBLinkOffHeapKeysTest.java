@@ -22,6 +22,7 @@ package herddb.index.blink;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.core.PostCheckpointAction;
 import herddb.log.LogSequenceNumber;
@@ -86,6 +87,12 @@ public class IncrementalBLinkOffHeapKeysTest {
             assertEquals(Long.valueOf(i), v);
         }
         assertEquals((long) n, idx.size());
+
+        // Strong invariant the mirror exists to enforce: a regression in
+        // IncrementalBLinkKeyToPageIndex.loadPage that drops the slab branch
+        // would leave the round-trip working but the keys back on heap.
+        assertTrue("at least one IncrementalBLink node key must be off-heap-backed",
+                BLinkTestReflection.anyKeyOffHeap(idx));
     }
 
     @Test

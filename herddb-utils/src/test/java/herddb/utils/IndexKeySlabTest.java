@@ -139,7 +139,10 @@ public class IndexKeySlabTest {
     public void appendValidatesArgumentsBeforeWriting() {
         IndexKeySlab owner = new IndexKeySlab(16L,
                 HerdDBByteBufAllocators.indexPagesAllocator());
+        // 1-arg overload: NPE flows from the implicit `key.length` access.
         assertThrows(NullPointerException.class, () -> owner.append(null));
+        // 3-arg overload: explicit null guard before any field deref.
+        assertThrows(NullPointerException.class, () -> owner.append((byte[]) null, 0, 0));
         byte[] k = new byte[]{1, 2, 3, 4};
         assertThrows(IndexOutOfBoundsException.class, () -> owner.append(k, -1, 1));
         assertThrows(IndexOutOfBoundsException.class, () -> owner.append(k, 0, -1));

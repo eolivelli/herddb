@@ -700,11 +700,15 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      * Byte-for-byte comparison that handles all four (on/off)-heap × (on/off)-heap
      * combinations. Lengths must already match.
      *
-     * <p>Off-heap branches use a one-shot bulk {@link ByteBuf#getBytes(int, byte[], int, int)}
-     * to copy into a stack-local byte[] and then dispatch to the SIMD-style
-     * {@link CompareBytesUtils#arraysEquals} path. This is an order of
-     * magnitude cheaper than a length-many per-byte virtual {@code getByte}
-     * loop on BLink lookups (issue #399 step-4 review).
+     * <p>Off-heap branches snapshot {@code offHeap} and the slice's
+     * {@code readerIndex()} once at method entry and walk both sides byte
+     * by byte using direct {@code slice.getByte(baseIdx + i)} calls. An
+     * earlier round used a one-shot bulk {@link ByteBuf#getBytes(int, byte[], int, int)}
+     * copy into a stack-local byte[] before dispatching to
+     * {@link CompareBytesUtils#arraysEquals}, but for the small index keys
+     * typical of BLink lookups (8-24 bytes) the per-call byte[] allocation
+     * dominated and the snapshot-and-loop variant ended up faster
+     * (issue #399 step-4 review).
      *
      * @throws IllegalStateException if either side has been {@link #release()}d
      *         without a preceding lazy materialisation.
