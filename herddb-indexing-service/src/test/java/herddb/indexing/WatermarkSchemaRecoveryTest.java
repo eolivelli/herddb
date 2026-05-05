@@ -89,12 +89,19 @@ public class WatermarkSchemaRecoveryTest {
     // ---------- helpers -----------------------------------------------------
 
     private static Table buildTable() {
+        // Issue #408: use a deterministic non-zero tableId so synthetic
+        // CREATE_TABLE entries from this helper do not collide on the
+        // tableId == 0 sentinel with sibling tables (e.g. "t2") that
+        // some tests build inline. Without this, both tables would be
+        // indexed under id 0 in SchemaTracker and DML for one would
+        // route to the other.
         return Table.builder()
                 .name("t1")
                 .tablespace("default")
                 .column("pk", ColumnTypes.STRING)
                 .column("vec", ColumnTypes.FLOATARRAY)
                 .primaryKey("pk")
+                .tableId(1001)
                 .build();
     }
 
@@ -375,6 +382,11 @@ public class WatermarkSchemaRecoveryTest {
                 .column("pk", ColumnTypes.STRING)
                 .column("v2", ColumnTypes.FLOATARRAY)
                 .primaryKey("pk")
+                // Issue #408: a distinct non-zero tableId — otherwise t1
+                // and t2 would alias on the tableId == 0 sentinel inside
+                // SchemaTracker's id → name index and DML for t1 would
+                // route to t2 (or vice versa).
+                .tableId(1002)
                 .build();
         Index  idx1 = buildVectorIndex();                    // vidx  on t1
         Index  idx2 = Index.builder()
