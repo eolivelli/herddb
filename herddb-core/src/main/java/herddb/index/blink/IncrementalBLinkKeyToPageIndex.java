@@ -862,6 +862,10 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
                     switch (block) {
                         case NODE_PAGE_KEY_VALUE_BLOCK: {
                             byte[] k = in.readArray();
+                            if (k == null) {
+                                throw new IOException("corrupted index page "
+                                        + pageId + ": null key");
+                            }
                             long v = in.readVLong();
                             keyBytesList.add(k);
                             valueList.add(v);

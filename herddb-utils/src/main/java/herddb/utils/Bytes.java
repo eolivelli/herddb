@@ -683,18 +683,28 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      * Used by the off-heap-backed equals/hashCode path so cross-comparison
      * between an off-heap and an on-heap {@code Bytes} with identical bytes
      * round-trips correctly.
+     *
+     * <p>Bulk-copies the slice into a stack-local byte[] so the inner hash
+     * loop matches the well-optimised on-heap path (issue #399 step-4 review).
      */
     private static int hashCodeFromByteBuf(ByteBuf buf, int start, int len) {
-        int h = 1;
-        for (int i = 0; i < len; i++) {
-            h = 31 * h + buf.getByte(start + i);
+        if (len == 0) {
+            return CompareBytesUtils.hashCode(new byte[0], 0, 0);
         }
-        return h;
+        byte[] copy = new byte[len];
+        buf.getBytes(start, copy, 0, len);
+        return CompareBytesUtils.hashCode(copy, 0, len);
     }
 
     /**
      * Byte-for-byte comparison that handles all four (on/off)-heap × (on/off)-heap
-     * combinations without forcing materialisation. Lengths must already match.
+     * combinations. Lengths must already match.
+     *
+     * <p>Off-heap branches use a one-shot bulk {@link ByteBuf#getBytes(int, byte[], int, int)}
+     * to copy into a stack-local byte[] and then dispatch to the SIMD-style
+     * {@link CompareBytesUtils#arraysEquals} path. This is an order of
+     * magnitude cheaper than a length-many per-byte virtual {@code getByte}
+     * loop on BLink lookups (issue #399 step-4 review).
      *
      * @throws IllegalStateException if either side has been {@link #release()}d
      *         without a preceding lazy materialisation.
@@ -708,11 +718,26 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
             return CompareBytesUtils.arraysEquals(aBuf, a.offset, a.offset + a.length,
                     bBuf, b.offset, b.offset + b.length);
         }
-        // At least one side is off-heap: compare via byte accessors. byteAt
-        // re-snapshots the local fields each call; for hot off-heap paths
-        // step 3+ will switch to a bulk getBytes copy.
+        // Off-heap-aware path with the same snapshot-and-loop optimization
+        // as compareTo (avoids per-byte volatile + virtual-call cost; cheaper
+        // than a bulk byte[] copy for the small keys typical of index hot
+        // paths). Fail fast on a released side.
+        ByteBuf aSlice = a.offHeap;
+        ByteBuf bSlice = b.offHeap;
+        if (aBuf == null && aSlice == null) {
+            throw new IllegalStateException("Bytes already released");
+        }
+        if (bBuf == null && bSlice == null) {
+            throw new IllegalStateException("Bytes already released");
+        }
+        int aBaseIdx = aSlice == null ? 0 : aSlice.readerIndex();
+        int bBaseIdx = bSlice == null ? 0 : bSlice.readerIndex();
+        int aOff = a.offset;
+        int bOff = b.offset;
         for (int i = 0; i < a.length; i++) {
-            if (a.byteAt(i) != b.byteAt(i)) {
+            byte ai = aBuf != null ? aBuf[aOff + i] : aSlice.getByte(aBaseIdx + i);
+            byte bi = bBuf != null ? bBuf[bOff + i] : bSlice.getByte(bBaseIdx + i);
+            if (ai != bi) {
                 return false;
             }
         }
@@ -923,11 +948,22 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
             return CompareBytesUtils.compare(aBuf, this.offset, this.offset + length,
                     bBuf, o.offset, o.offset + o.length);
         }
-        // Off-heap-aware path: byte-by-byte unsigned comparison via byteAt().
+        // Off-heap-aware path. We snapshot offHeap and the slice's reader
+        // index once at the start so the inner loop avoids the per-byte
+        // volatile + virtual-call cost of byteAt(). For small index keys
+        // (8-24 bytes typical for BLink) this is faster than a bulk
+        // getBytes() copy because the per-call byte[] allocation dominates
+        // for tiny payloads (issue #399 step-4 review).
+        ByteBuf aSlice = this.offHeap;
+        ByteBuf bSlice = o.offHeap;
+        int aBaseIdx = aSlice == null ? 0 : aSlice.readerIndex();
+        int bBaseIdx = bSlice == null ? 0 : bSlice.readerIndex();
+        int aOff = this.offset;
+        int bOff = o.offset;
         int min = Math.min(this.length, o.length);
         for (int i = 0; i < min; i++) {
-            int a = this.byteAt(i) & 0xff;
-            int b = o.byteAt(i) & 0xff;
+            int a = (aBuf != null ? aBuf[aOff + i] : aSlice.getByte(aBaseIdx + i)) & 0xff;
+            int b = (bBuf != null ? bBuf[bOff + i] : bSlice.getByte(bBaseIdx + i)) & 0xff;
             if (a != b) {
                 return a - b;
             }

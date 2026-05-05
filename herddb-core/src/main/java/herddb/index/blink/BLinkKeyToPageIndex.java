@@ -889,6 +889,17 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
 
                         case NODE_PAGE_KEY_VALUE_BLOCK: {
                             byte[] k = in.readArray();
+                            if (k == null) {
+                                // Defensive: writer never emits a null array
+                                // (it always passes a non-null byte[] to
+                                // out.writeArray), so this means the on-disk
+                                // page is corrupted. Fail fast — the previous
+                                // map.put(in.readBytes(), …) path would have
+                                // NPEd inside the TreeMap; this is more
+                                // actionable.
+                                throw new IOException("corrupted index page "
+                                        + pageId + ": null key");
+                            }
                             long v = in.readVLong();
                             keyBytesList.add(k);
                             valueList.add(v);

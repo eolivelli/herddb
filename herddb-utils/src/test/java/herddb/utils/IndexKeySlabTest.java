@@ -110,4 +110,51 @@ public class IndexKeySlabTest {
         Bytes b = owner.wrap(0, 0);
         assertEquals(Bytes.EMPTY_ARRAY, b);
     }
+
+    /**
+     * Edge case: caller computes a zero total-key-bytes (degenerate empty
+     * page). The slab is allocated with capacity 0; the Cleaner releases
+     * it cleanly when the owner becomes unreachable.
+     */
+    @Test
+    public void constructorAcceptsZeroTotalAndDoesNotLeak() throws Exception {
+        IndexKeySlab owner = new IndexKeySlab(0L,
+                HerdDBByteBufAllocators.indexPagesAllocator());
+        assertEquals(0, owner.slabCapacity());
+        Field f = IndexKeySlab.class.getDeclaredField("slab");
+        f.setAccessible(true);
+        ByteBuf slab = (ByteBuf) f.get(owner);
+        assertEquals(1, slab.refCnt());
+        owner = null;
+
+        long deadline = System.currentTimeMillis() + 10_000L;
+        while (slab.refCnt() > 0 && System.currentTimeMillis() < deadline) {
+            System.gc();
+            Thread.sleep(50);
+        }
+        assertEquals("zero-capacity slab must still be released", 0, slab.refCnt());
+    }
+
+    @Test
+    public void appendValidatesArgumentsBeforeWriting() {
+        IndexKeySlab owner = new IndexKeySlab(16L,
+                HerdDBByteBufAllocators.indexPagesAllocator());
+        assertThrows(NullPointerException.class, () -> owner.append(null));
+        byte[] k = new byte[]{1, 2, 3, 4};
+        assertThrows(IndexOutOfBoundsException.class, () -> owner.append(k, -1, 1));
+        assertThrows(IndexOutOfBoundsException.class, () -> owner.append(k, 0, -1));
+        assertThrows(IndexOutOfBoundsException.class, () -> owner.append(k, 0, 5));
+        assertThrows(IndexOutOfBoundsException.class, () -> owner.append(k, 3, 2));
+    }
+
+    @Test
+    public void appendRejectsSlabOverflow() {
+        IndexKeySlab owner = new IndexKeySlab(8L,
+                HerdDBByteBufAllocators.indexPagesAllocator());
+        owner.append(new byte[]{1, 2, 3, 4, 5, 6, 7, 8});
+        // No more room — the next append must fail before touching Netty's
+        // capacity-grow path.
+        assertThrows(IndexOutOfBoundsException.class,
+                () -> owner.append(new byte[]{0}));
+    }
 }

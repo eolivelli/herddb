@@ -58,8 +58,21 @@ import java.util.logging.Logger;
  *       map.put(offHeapKey, value);
  *   }
  * </pre>
+ *
+ * <h3>Known limitation: long-lived separator keys pin the slab</h3>
+ * If a key from this slab ends up surviving its owning index page
+ * (e.g. it becomes a BLink {@code rightsep} after a node split and the
+ * source node is then evicted), that single key still anchors the entire
+ * slab via its {@link Bytes#fromSharedSlab} reference, so the whole
+ * direct-memory capacity stays pinned to keep one separator alive. The
+ * impact is bounded because separator keys are typically the boundary
+ * key of the donating page (one per split), and the slab is at most a
+ * few KiB. A future step may add a {@code Bytes.materialiseAndDetach()}
+ * helper that callers can invoke at the BLink split-key handoff to
+ * defensively copy the separator into a private {@code byte[]} and break
+ * the anchor. Until then the regression is acknowledged in the
+ * step-4 review of issue #399 and tracked for a follow-up.
  */
-@SuppressFBWarnings("URF_UNREAD_FIELD")
 public final class IndexKeySlab {
 
     private static final Logger LOGGER = Logger.getLogger(IndexKeySlab.class.getName());
@@ -86,9 +99,13 @@ public final class IndexKeySlab {
     /**
      * Cleanup hook released by the JDK {@link Cleaner} when this
      * {@code IndexKeySlab} (and every shared-slab {@code Bytes} that
-     * anchors it) becomes GC-unreachable. Field is unread on the
-     * production code path; SpotBugs annotation justifies it.
+     * anchors it) becomes GC-unreachable. The field is unread on the
+     * production code path: assigning it is the entire point — keeping a
+     * strong reference to the {@link Cleaner.Cleanable} from this
+     * instance prevents the Cleanable itself from being GC'd before the
+     * anchor (this) is reclaimed.
      */
+    @SuppressFBWarnings("URF_UNREAD_FIELD")
     private final Cleaner.Cleanable cleanable;
 
     private int writePos;
@@ -138,8 +155,26 @@ public final class IndexKeySlab {
 
     /**
      * Appends {@code length} bytes from {@code key} starting at {@code offset}.
+     *
+     * @throws IndexOutOfBoundsException if {@code offset}/{@code length} are
+     *         out of {@code key}'s bounds, or if {@code writePos + length}
+     *         would exceed the slab's capacity (over-running the slab would
+     *         force Netty to grow the underlying chunk, defeating the entire
+     *         point of pre-sizing).
      */
     public int append(byte[] key, int offset, int length) {
+        if (key == null) {
+            throw new NullPointerException("key");
+        }
+        if (offset < 0 || length < 0 || offset > key.length - length) {
+            throw new IndexOutOfBoundsException(
+                    "offset=" + offset + ", length=" + length + ", key.length=" + key.length);
+        }
+        if ((long) writePos + (long) length > (long) slab.capacity()) {
+            throw new IndexOutOfBoundsException(
+                    "slab overflow: writePos=" + writePos + ", length=" + length
+                            + ", capacity=" + slab.capacity());
+        }
         int writtenAt = writePos;
         if (length > 0) {
             slab.writeBytes(key, offset, length);
