@@ -64,6 +64,46 @@ public interface KeyToPageIndex extends AutoCloseable {
     List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin) throws DataStorageManagerException;
 
     /**
+     * Two-phase checkpoint, fuzzy-friendly. Implementations that own a
+     * concurrent data structure (e.g. a BLink tree) capture all in-memory
+     * state in {@link #prepareCheckpoint(LogSequenceNumber, boolean)} —
+     * which the caller invokes while holding the per-table checkpoint write
+     * lock — and defer the slow remote-storage I/O to
+     * {@link #persistCheckpoint(KeyToPageCheckpointSnapshot)} which runs
+     * <strong>outside</strong> the write lock. The default fallback runs
+     * the legacy single-phase {@link #checkpoint(LogSequenceNumber, boolean)}
+     * inside the persist phase, which is correct for in-memory-only
+     * implementations (e.g. {@code ConcurrentMapKeyToPageIndex}) where
+     * checkpoint is a no-op anyway.
+     *
+     * <p>Issue #403: shrinks the {@code TableManager} Phase-C exclusive
+     * window from "BLink traversal + remote I/O" to "BLink traversal only",
+     * eliminating multi-second commit-latency spikes during checkpoints
+     * against remote storage.</p>
+     *
+     * @param sequenceNumber the post-flush LSN being snapshotted
+     * @param pin            whether the resulting checkpoint must be pinned
+     *                       on storage (prevents reclamation by GC)
+     * @return an opaque snapshot to be passed to
+     *         {@link #persistCheckpoint(KeyToPageCheckpointSnapshot)}
+     */
+    default KeyToPageCheckpointSnapshot prepareCheckpoint(
+            LogSequenceNumber sequenceNumber, boolean pin) throws DataStorageManagerException {
+        return new SinglePhaseCheckpointSnapshot(sequenceNumber, pin);
+    }
+
+    /**
+     * Persist a snapshot produced by
+     * {@link #prepareCheckpoint(LogSequenceNumber, boolean)}.
+     * Runs the slow remote I/O outside the per-table checkpoint write lock.
+     */
+    default List<PostCheckpointAction> persistCheckpoint(KeyToPageCheckpointSnapshot snapshot)
+            throws DataStorageManagerException {
+        SinglePhaseCheckpointSnapshot s = (SinglePhaseCheckpointSnapshot) snapshot;
+        return checkpoint(s.sequenceNumber(), s.pin);
+    }
+
+    /**
      * Unpin a previously pinned checkpont (see
      * {@link #checkpoint(LogSequenceNumber, boolean)})
      *
