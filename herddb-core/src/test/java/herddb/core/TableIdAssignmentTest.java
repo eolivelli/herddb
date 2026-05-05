@@ -188,6 +188,14 @@ public class TableIdAssignmentTest {
             int idT1 = manager.getTableSpaceManager("tblspace1").getTableManager("t1").getTable().tableId;
             assertTrue("a transactionally-created table must carry a non-zero id post-commit, got " + idT1,
                     idT1 > 0);
+            // Issue #408 review: also verify the manager is reachable
+            // through the id-keyed lookup that the WAL apply hot path
+            // uses — a name-only check would miss a regression that
+            // forgot to populate `tablesById` for transactional CREATE.
+            java.util.Map<Integer, AbstractTableManager> idIndex =
+                    manager.getTableSpaceManager("tblspace1").tablesByIdSnapshot();
+            assertEquals("transactional CREATE must register the table under its id",
+                    "t1", idIndex.get(idT1).getTable().name);
         }
     }
 
@@ -229,6 +237,17 @@ public class TableIdAssignmentTest {
             // coordinated change to recovery.)
             assertEquals("rolled-back CREATE must not leave a name binding",
                     null, manager.getTableSpaceManager("tblspace1").getTableManager("t1"));
+            // Issue #408 review: also assert the id-keyed index is
+            // clean of any reference for any id this transaction
+            // touched. A regression that left a stale entry would
+            // NPE the WAL apply hot path on the next DML.
+            java.util.Map<Integer, AbstractTableManager> idIndex =
+                    manager.getTableSpaceManager("tblspace1").tablesByIdSnapshot();
+            for (java.util.Map.Entry<Integer, AbstractTableManager> e : idIndex.entrySet()) {
+                assertTrue("rolled-back CREATE must not leave a stale id-keyed entry, got "
+                                + e.getKey() + " → " + e.getValue().getTable().name,
+                        !"t1".equals(e.getValue().getTable().name));
+            }
 
             // A fresh CREATE for the same name must succeed and carry a
             // strictly larger id than the rolled-back attempt would

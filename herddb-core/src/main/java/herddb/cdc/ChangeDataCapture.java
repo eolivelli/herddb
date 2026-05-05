@@ -178,6 +178,13 @@ public class ChangeDataCapture implements AutoCloseable {
         // The public TableSchemaHistoryStorage API is name-keyed; this map
         // is the CDC's private translation layer.
         private Map<Integer, Table> tablesDefinitions = new HashMap<>();
+        // Subset of {@link #tablesDefinitions} ids that this transaction
+        // freshly CREATEd (not ALTERed). Only these ids must be scrubbed
+        // from the global {@link ChangeDataCapture#tableIdToName} cache on
+        // ROLLBACK — a rolled-back ALTER TABLE on a pre-existing committed
+        // table must NOT evict the (id → name) mapping that committed
+        // tables still rely on.
+        private java.util.Set<Integer> newlyCreatedTableIds = new java.util.HashSet<>();
     }
 
     /**
@@ -326,6 +333,11 @@ public class ChangeDataCapture implements AutoCloseable {
                 if (entry.transactionId > 0) {
                     TransactionHolder transaction = transactions.get(entry.transactionId);
                     transaction.tablesDefinitions.put(entry.tableId, table);
+                    // Mark this id as freshly CREATEd by this transaction
+                    // so a ROLLBACK can scrub exactly its (id → name)
+                    // entries from {@link #tableIdToName}, leaving any
+                    // pre-existing committed mappings intact.
+                    transaction.newlyCreatedTableIds.add(entry.tableId);
                 } else {
                     tableSchemaHistoryStorage.storeSchema(lsn, table);
                 }
@@ -396,11 +408,17 @@ public class ChangeDataCapture implements AutoCloseable {
                 // CREATEs and leaving the CDC's view of the id space
                 // out of sync with the leader.
                 if (rolled != null) {
-                    // Remove via the boxed key — the cache itself is
-                    // Integer-keyed, so deboxing here would only force
-                    // a re-box at the call site (caught by SpotBugs
-                    // BX_UNBOXING_IMMEDIATELY_REBOXED).
-                    for (Integer id : rolled.tablesDefinitions.keySet()) {
+                    // Scrub ONLY the ids the rolled-back transaction
+                    // freshly CREATEd. A rolled-back ALTER TABLE on a
+                    // pre-existing committed table must keep its
+                    // (id → name) entry intact, otherwise subsequent
+                    // DML entries for that committed table would fall
+                    // through to the storage's optional
+                    // resolveTableName(int) hook and — if it returns
+                    // null — the CDC would deliver a Mutation with
+                    // table == null even though the table still
+                    // exists.
+                    for (Integer id : rolled.newlyCreatedTableIds) {
                         if (id != null) {
                             tableIdToName.remove(id);
                         }
