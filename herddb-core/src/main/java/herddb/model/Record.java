@@ -130,6 +130,26 @@ public final class Record implements SizeAwareObject {
         cache = null;
     }
 
+    /**
+     * Releases any off-heap memory held by {@link #key} or {@link #value}.
+     * Safe to call exactly once when the {@code Record} is no longer
+     * reachable from any reader (e.g. when the owning {@code DataPage} is
+     * being evicted). Idempotent for on-heap-backed values: this is a no-op
+     * when neither the key nor the value carry an off-heap slice.
+     *
+     * <p>Step-2 baseline: {@code Record} construction still uses on-heap
+     * {@code Bytes}, so this method is a no-op in production. It exists so
+     * the slab-eviction path added in step 3 can call it uniformly.
+     */
+    public void release() {
+        if (key != null) {
+            key.release();
+        }
+        if (value != null) {
+            value.release();
+        }
+    }
+
     @Override
     public int hashCode() {
         int hash = 3;

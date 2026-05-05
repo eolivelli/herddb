@@ -21,7 +21,10 @@
 package herddb.utils;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.netty.buffer.ByteBuf;
 import io.netty.util.internal.PlatformDependent;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 
@@ -69,10 +72,23 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         return value.length + CONSTANT_BYTE_SIZE;
     }
 
-    private final byte[] buffer;
-    private final int offset;
+    /**
+     * On-heap backing array. Lazily materialised when this {@code Bytes} was
+     * constructed off-heap and a byte[] accessor is invoked. Once materialised
+     * the off-heap reference is released and {@code buffer} stays cached so
+     * subsequent reads are O(1).
+     */
+    private byte[] buffer;
+    private int offset;
     private final int length;
     private int hashCode = -1;
+
+    /**
+     * Off-heap backing slice when this {@code Bytes} was constructed via
+     * {@link #fromOffHeap(ByteBuf)}. {@code null} for on-heap-backed
+     * instances and after {@link #release()} or after lazy materialisation.
+     */
+    private ByteBuf offHeap;
 
     public Object deserialized;
 
@@ -143,6 +159,9 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     public byte[] to_array() {
+        if (buffer == null && offHeap != null) {
+            materialiseFromOffHeap();
+        }
         if (offset == 0 && buffer.length == length) {
             return buffer;
         } else {
@@ -153,7 +172,7 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     public float[] to_float_array() {
-        return to_float_array(buffer, offset, length);
+        return to_float_array(getBuffer(), getOffset(), length);
     }
 
     public static float[] to_float_array(byte[] buffer, int offset, int length) {
@@ -219,20 +238,20 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
 
     public long to_long() {
         assert length == 8;
-        return toLong(buffer, offset);
+        return toLong(getBuffer(), getOffset());
     }
 
     public RawString to_RawString() {
-        return RawString.newUnpooledRawString(buffer, offset, length);
+        return RawString.newUnpooledRawString(getBuffer(), getOffset(), length);
     }
 
     public int to_int() {
         assert length == 4;
-        return toInt(buffer, offset);
+        return toInt(getBuffer(), getOffset());
     }
 
     public String to_string() {
-        return new String(buffer, offset, length, StandardCharsets.UTF_8);
+        return new String(getBuffer(), getOffset(), length, StandardCharsets.UTF_8);
     }
 
     public static String to_string(byte[] data) {
@@ -245,17 +264,17 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
 
     public java.sql.Timestamp to_timestamp() {
         assert length == 8;
-        return toTimestamp(buffer, offset);
+        return toTimestamp(getBuffer(), getOffset());
     }
 
     public boolean to_boolean() {
         assert length == 1;
-        return toBoolean(buffer, offset);
+        return toBoolean(getBuffer(), getOffset());
     }
 
     public double to_double() {
         assert length == 8;
-        return toDouble(buffer, offset);
+        return toDouble(getBuffer(), getOffset());
     }
 
     private Bytes(byte[] data) {
@@ -270,10 +289,141 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         this.length = length;
     }
 
+    /**
+     * Constructs an off-heap-backed {@code Bytes} that takes ownership of one
+     * refcount on {@code slice}. The slice's {@code readableBytes()} is the
+     * value's length; {@code readerIndex()} is the start.
+     *
+     * <p>Callers must not retain or read the slice after this constructor
+     * returns; lifecycle ownership transfers to this {@code Bytes}.
+     */
+    private Bytes(ByteBuf slice) {
+        this.buffer = null;
+        this.offset = 0;
+        this.length = slice.readableBytes();
+        this.offHeap = slice;
+    }
+
+    /**
+     * Wraps an off-heap {@link ByteBuf} slice into a {@code Bytes}, taking
+     * ownership of one refcount on the slice. The intended workflow is:
+     * <pre>
+     *   ByteBuf slab = HerdDBByteBufAllocators.dataPagesAllocator()
+     *       .directBuffer(totalSize);
+     *   slab.writeBytes(payload);
+     *   ByteBuf slice = slab.retainedSlice(off, len); // bump slab refcount
+     *   Bytes b = Bytes.fromOffHeap(slice);
+     * </pre>
+     * After {@link #release()} the underlying off-heap memory is returned to
+     * its pool. Subsequent on-heap accessors ({@link #getBuffer()},
+     * {@link #to_array()}, etc.) on a not-yet-released instance lazily
+     * materialise the bytes into a fresh {@code byte[]} and release the slice;
+     * after such materialisation the {@code Bytes} behaves like an on-heap one.
+     *
+     * @throws NullPointerException if {@code slice} is null.
+     */
+    public static Bytes fromOffHeap(ByteBuf slice) {
+        if (slice == null) {
+            throw new NullPointerException("slice");
+        }
+        return new Bytes(slice);
+    }
+
+    /**
+     * Returns {@code true} if this {@code Bytes} is currently backed by an
+     * off-heap {@link ByteBuf} slice (i.e. {@link #fromOffHeap(ByteBuf)} was
+     * used to construct it and neither {@link #release()} nor lazy
+     * materialisation has run yet).
+     */
+    public boolean isOffHeap() {
+        return offHeap != null;
+    }
+
+    /**
+     * Releases the underlying off-heap slice if any. Idempotent: calling
+     * {@code release()} more than once, or on an on-heap-backed
+     * {@code Bytes}, is a no-op.
+     *
+     * <p>After {@code release()} the bytes are no longer reachable through any
+     * accessor: callers must guarantee no further reads. The owner of the
+     * surrounding slab (typically a {@code DataPage} or BLink/BRIN node) is
+     * responsible for ensuring no stale {@code Bytes} reference is in use
+     * before invoking {@code release()}.
+     */
+    public synchronized void release() {
+        ByteBuf local = offHeap;
+        if (local != null) {
+            offHeap = null;
+            local.release();
+        }
+    }
+
+    /**
+     * Lazily materialises the off-heap bytes into a fresh {@code byte[]}
+     * cached in {@link #buffer}, then releases the slice. Idempotent.
+     */
+    private synchronized void materialiseFromOffHeap() {
+        if (buffer != null) {
+            return;
+        }
+        ByteBuf local = offHeap;
+        if (local == null) {
+            // already released without materialising — leave buffer null;
+            // callers will dereference and surface the bug as NPE.
+            return;
+        }
+        byte[] copy = new byte[length];
+        if (length > 0) {
+            local.getBytes(local.readerIndex(), copy, 0, length);
+        }
+        buffer = copy;
+        offset = 0;
+        offHeap = null;
+        local.release();
+    }
+
+    /**
+     * Writes the value bytes directly into {@code dst} without materialising a
+     * heap {@code byte[]}. Off-heap-backed instances copy slice → dst with no
+     * intermediate allocation; on-heap-backed instances delegate to the
+     * existing {@code writeBytes(byte[], int, int)} path.
+     */
+    public void writeTo(ByteBuf dst) {
+        ByteBuf local = offHeap;
+        if (local != null && buffer == null) {
+            dst.writeBytes(local, local.readerIndex(), length);
+            return;
+        }
+        // Force materialisation if not already done so the byte[] path is safe.
+        byte[] data = getBuffer();
+        dst.writeBytes(data, getOffset(), length);
+    }
+
+    /**
+     * Writes the value bytes directly into {@code out}. Off-heap-backed
+     * instances copy via a single {@link ByteBuf#getBytes(int, OutputStream, int)}
+     * call (no allocation); on-heap-backed instances delegate to
+     * {@link OutputStream#write(byte[], int, int)}.
+     */
+    public void writeTo(OutputStream out) throws IOException {
+        ByteBuf local = offHeap;
+        if (local != null && buffer == null) {
+            local.getBytes(local.readerIndex(), out, length);
+            return;
+        }
+        byte[] data = getBuffer();
+        out.write(data, getOffset(), length);
+    }
+
     @Override
     public int hashCode() {
         if (hashCode == -1) {
-            this.hashCode = CompareBytesUtils.hashCode(buffer, offset, length);
+            ByteBuf local = offHeap;
+            if (local != null && buffer == null) {
+                this.hashCode = hashCodeFromByteBuf(local, local.readerIndex(), length);
+            } else {
+                this.hashCode = CompareBytesUtils.hashCode(buffer, offset, length);
+            }
         }
         return hashCode;
 
@@ -292,11 +442,63 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
             if (other.hashCode() != this.hashCode()) {
                 return false;
             }
-            return CompareBytesUtils.arraysEquals(buffer, offset, offset + length,
-                    other.buffer, other.offset, other.offset + other.length);
+            return bytesEqual(this, other);
         } catch (ClassCastException otherClass) {
             return false;
         }
+    }
+
+    /**
+     * {@code Arrays.hashCode}-compatible hash over a {@link ByteBuf} slice that
+     * matches {@link CompareBytesUtils#hashCode(byte[], int, int)} byte-for-byte.
+     * Used by the off-heap-backed equals/hashCode path so cross-comparison
+     * between an off-heap and an on-heap {@code Bytes} with identical bytes
+     * round-trips correctly.
+     */
+    private static int hashCodeFromByteBuf(ByteBuf buf, int start, int len) {
+        int h = 1;
+        for (int i = 0; i < len; i++) {
+            h = 31 * h + buf.getByte(start + i);
+        }
+        return h;
+    }
+
+    /**
+     * Byte-for-byte comparison that handles all four (on/off)-heap × (on/off)-heap
+     * combinations without forcing materialisation. Lengths must already match.
+     */
+    private static boolean bytesEqual(Bytes a, Bytes b) {
+        // Hot path: both on-heap (or already materialised).
+        ByteBuf aOff = a.offHeap;
+        ByteBuf bOff = b.offHeap;
+        if ((aOff == null || a.buffer != null) && (bOff == null || b.buffer != null)) {
+            return CompareBytesUtils.arraysEquals(a.buffer, a.offset, a.offset + a.length,
+                    b.buffer, b.offset, b.offset + b.length);
+        }
+        // At least one side is off-heap: compare via byte accessors.
+        for (int i = 0; i < a.length; i++) {
+            if (a.byteAt(i) != b.byteAt(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Returns the {@code i}-th byte of the value, reading from whichever
+     * representation is currently live (on-heap byte[] or off-heap slice).
+     */
+    private byte byteAt(int i) {
+        byte[] data = buffer;
+        if (data != null) {
+            return data[offset + i];
+        }
+        ByteBuf local = offHeap;
+        if (local != null) {
+            return local.getByte(local.readerIndex() + i);
+        }
+        // released without materialising — surface as IOOBE-like behaviour.
+        throw new IndexOutOfBoundsException("Bytes already released");
     }
 
     /**
@@ -466,8 +668,23 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         } else if (o == POSITIVE_INFINITY) {
             return -1;
         }
-        return CompareBytesUtils.compare(buffer, offset, offset + length,
-                o.buffer, o.offset, o.offset + o.length);
+        // Hot path: both sides have on-heap byte[] (either natively or after
+        // lazy materialisation). Off-heap-aware path falls back to byte-by-byte
+        // unsigned comparison via byteAt().
+        if ((this.offHeap == null || this.buffer != null)
+                && (o.offHeap == null || o.buffer != null)) {
+            return CompareBytesUtils.compare(buffer, offset, offset + length,
+                    o.buffer, o.offset, o.offset + o.length);
+        }
+        int min = Math.min(this.length, o.length);
+        for (int i = 0; i < min; i++) {
+            int a = this.byteAt(i) & 0xff;
+            int b = o.byteAt(i) & 0xff;
+            if (a != b) {
+                return a - b;
+            }
+        }
+        return this.length - o.length;
     }
 
     public static boolean startsWith(byte[] left, int offset, int bufferlen, int max, byte[] right) {
@@ -508,21 +725,33 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         return length;
     }
 
+    /**
+     * Returns the on-heap backing array. For an off-heap-backed instance this
+     * triggers a lazy copy of the slice into a fresh {@code byte[]} and then
+     * releases the slice. After the call this {@code Bytes} behaves like an
+     * on-heap one (subsequent {@code getBuffer()} calls are O(1)).
+     */
     public byte[] getBuffer() {
+        if (buffer == null && offHeap != null) {
+            materialiseFromOffHeap();
+        }
         return buffer;
     }
 
     public int getOffset() {
+        if (buffer == null && offHeap != null) {
+            materialiseFromOffHeap();
+        }
         return offset;
     }
 
     @Override
     public String toString() {
-        if (buffer == null) {
+        if (buffer == null && offHeap == null) {
             return "null";
         }
         // ONLY FOR TESTS
-        return arraytohexstring(buffer, offset, length);
+        return arraytohexstring(getBuffer(), getOffset(), length);
     }
 
     public static String arraytohexstring(byte[] buffer, int offset, int length) {
@@ -536,11 +765,11 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     public ByteArrayCursor newCursor() {
-        return ByteArrayCursor.wrap(buffer, offset, length);
+        return ByteArrayCursor.wrap(getBuffer(), getOffset(), length);
     }
 
     public ByteBufCursor newByteBufCursor() {
-        return ByteBufCursor.wrap(buffer, offset, length);
+        return ByteBufCursor.wrap(getBuffer(), getOffset(), length);
     }
 
     /**
@@ -556,8 +785,10 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      */
     public Bytes next() {
 
+        final byte[] src = getBuffer();
+        final int srcOffset = getOffset();
         final byte[] dst = new byte[length];
-        System.arraycopy(buffer, offset, dst, 0, length);
+        System.arraycopy(src, srcOffset, dst, 0, length);
 
         int idx = length - 1;
 
@@ -581,19 +812,18 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     public boolean startsWith(int length, byte[] prefix) {
-        return Bytes.startsWith(this.buffer, this.offset, this.length, length, prefix);
+        return Bytes.startsWith(this.getBuffer(), this.getOffset(), this.length, length, prefix);
     }
 
     /**
      * Returns {@code true} if this value starts with the bytes carried by
-     * {@code prefix}. Zero-copy: neither side is materialised into a fresh
-     * {@code byte[]}, which lets the prefix-scan code paths consume a
-     * {@code Bytes} produced by {@code RecordFunction.computeNewValue} without
-     * any intermediate allocation.
+     * {@code prefix}. Zero-copy when both sides are on-heap (or already
+     * materialised); off-heap-backed instances trigger lazy materialisation
+     * via {@link #getBuffer()} so the existing static helper keeps working.
      */
     public boolean startsWith(Bytes prefix) {
-        return Bytes.startsWith(this.buffer, this.offset, this.length,
-                prefix.length, prefix.buffer, prefix.offset, prefix.length);
+        return Bytes.startsWith(this.getBuffer(), this.getOffset(), this.length,
+                prefix.length, prefix.getBuffer(), prefix.getOffset(), prefix.length);
     }
 
     /**
@@ -603,14 +833,22 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      */
     public Bytes nonShared() {
         if (isShared()) {
+            byte[] src = getBuffer();
+            int srcOffset = getOffset();
             byte[] array = new byte[this.length];
-            System.arraycopy(buffer, offset, array, 0, length);
+            System.arraycopy(src, srcOffset, array, 0, length);
             return new Bytes(array, 0, length);
         }
         return this;
     }
 
     public boolean isShared() {
+        // Off-heap-backed (not yet materialised) is considered shared because
+        // it points into a shared off-heap slab managed by the caller; nonShared()
+        // will materialise it into a private byte[].
+        if (buffer == null && offHeap != null) {
+            return true;
+        }
         return this.offset != 0 || this.length != buffer.length;
     }
 
