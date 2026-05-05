@@ -29,12 +29,14 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 // Note: setting a new rate via setIngestMaxOps / setQueryMaxOps replaces the
-// underlying RateLimiter with a fresh instance. This is deliberate — Guava's
-// SmoothBursty uses pay-forward reservation semantics, so a large multi-permit
-// acquire at a low rate reserves far into the future and would keep blocking
-// subsequent callers even after the rate is raised. Swapping the reference
-// means any *new* acquire() picks up the fresh limiter without that baggage,
-// so an admin-issued rate raise unblocks queued workers on their next call.
+// underlying RateLimiter with a fresh instance (queries) or pushes the new
+// rate into every per-thread limiter and unparks each parked worker (ingest).
+// This is deliberate — Guava's SmoothBursty uses pay-forward reservation
+// semantics, so a large multi-permit acquire at a low rate reserves far into
+// the future and would keep blocking subsequent callers even after the rate
+// is raised. Resetting the deadline / swapping the reference means any *new*
+// acquire() picks up the fresh limiter without that baggage, so an
+// admin-issued rate raise unblocks queued workers on their next call.
 
 /**
  * Shared mutable state exposed to the admin HTTP API.
@@ -64,7 +66,12 @@ public class BenchRuntime {
     public static final int MAX_INGEST_THREADS = 1024;
 
     private final Config config;
-    private final AtomicReference<RateLimiter> ingestRateLimiterRef;
+    /**
+     * Per-thread rate limiters for ingestion (issue #402): the global rate is
+     * split across N children to remove the inter-thread serialisation that a
+     * shared Guava limiter caused.
+     */
+    private final IngestRateLimiterGroup ingestRateLimiterGroup;
     private final AtomicReference<RateLimiter> queryRateLimiterRef;
     private final AtomicReference<Supplier<Map<String, Object>>> statusSupplier =
             new AtomicReference<>(() -> Collections.singletonMap("phase", "idle"));
@@ -94,8 +101,13 @@ public class BenchRuntime {
     public BenchRuntime(Config config) {
         this.config = config;
         this.targetIngestThreads = config.ingestThreads;
-        this.ingestRateLimiterRef = new AtomicReference<>(RateLimiter.create(
-                config.ingestMaxOpsPerSecond > 0 ? config.ingestMaxOpsPerSecond : UNLIMITED_RATE));
+        double initialRate = config.ingestMaxOpsPerSecond > 0
+                ? config.ingestMaxOpsPerSecond
+                : 0.0; // 0 = unlimited; the group maps to UNLIMITED_RATE
+        // Allocate enough per-thread limiters for the configured worker count;
+        // grown later if setIngestThreads adds workers at runtime.
+        this.ingestRateLimiterGroup = new IngestRateLimiterGroup(
+                Math.max(1, config.ingestThreads), initialRate);
         this.queryRateLimiterRef = new AtomicReference<>(RateLimiter.create(
                 config.queryMaxOpsPerSecond > 0 ? config.queryMaxOpsPerSecond : UNLIMITED_RATE));
     }
@@ -104,8 +116,12 @@ public class BenchRuntime {
         return config;
     }
 
-    public RateLimiter ingestRateLimiter() {
-        return ingestRateLimiterRef.get();
+    /**
+     * Returns the per-thread ingest rate-limiter group. Workers acquire from
+     * their own slot via {@link IngestRateLimiterGroup#acquire(int, int)}.
+     */
+    public IngestRateLimiterGroup ingestRateLimiterGroup() {
+        return ingestRateLimiterGroup;
     }
 
     public RateLimiter queryRateLimiter() {
@@ -114,16 +130,29 @@ public class BenchRuntime {
 
     /**
      * Update the ingest rate. {@code 0} means unlimited (maps to
-     * {@link #UNLIMITED_RATE} on the underlying limiter). Creates a fresh
-     * limiter so no prior pay-forward reservation from the old rate carries
-     * over — raising the rate unblocks queued workers on their next call.
+     * {@link #UNLIMITED_RATE} on the underlying limiter). Pushes the new
+     * rate into every per-thread limiter and unparks all registered worker
+     * threads, so a sleeping worker takes the new rate immediately rather
+     * than after its old sleep elapses (issue #402).
+     *
+     * <p>Also enforces the safety invariant
+     * {@code effectiveTransactionSize <= ingestMaxOps} when finite. The
+     * config is left untouched on rejection.
      */
     public void setIngestMaxOps(int opsPerSecond) {
         if (opsPerSecond < 0) {
             throw new IllegalArgumentException("ingest-max-ops must be >= 0, got " + opsPerSecond);
         }
-        double rate = opsPerSecond > 0 ? opsPerSecond : UNLIMITED_RATE;
-        ingestRateLimiterRef.set(RateLimiter.create(rate));
+        if (opsPerSecond > 0) {
+            int effectiveTxn = config.effectiveTransactionSize();
+            if (effectiveTxn > opsPerSecond) {
+                throw new IllegalArgumentException(
+                        "ingest-max-ops (" + opsPerSecond + ") must be >= effective transaction-size ("
+                                + effectiveTxn + "). Lower batch-size/transaction-size first.");
+            }
+        }
+        double rate = opsPerSecond > 0 ? opsPerSecond : 0.0;
+        ingestRateLimiterGroup.setEffectiveRate(rate);
         config.ingestMaxOpsPerSecond = opsPerSecond;
     }
 
@@ -145,6 +174,70 @@ public class BenchRuntime {
             throw new IllegalArgumentException("top-k must be > 0");
         }
         config.topK = topK;
+    }
+
+    /**
+     * Update {@link Config#batchSize}. Validates first, writes last:
+     * <ul>
+     *   <li>{@code newBatchSize >= 1}</li>
+     *   <li>{@code newBatchSize <= currentTransactionSize} (when transactionSize is set)</li>
+     *   <li>{@code currentEffectiveTransactionSize (post-update) <= ingestMaxOps}
+     *       when {@code ingestMaxOps > 0}. Because lowering batch-size cannot raise
+     *       the effective transaction size, this only matters when transactionSize
+     *       is unset (so effective == batch); we still re-check defensively.</li>
+     * </ul>
+     * The config is left untouched on rejection.
+     */
+    public void setBatchSize(int newBatchSize) {
+        if (newBatchSize < 1) {
+            throw new IllegalArgumentException("batch-size must be >= 1, got " + newBatchSize);
+        }
+        int txn = config.transactionSize;
+        if (txn > 0 && newBatchSize > txn) {
+            throw new IllegalArgumentException(
+                    "batch-size (" + newBatchSize + ") must be <= transaction-size ("
+                            + txn + "). Raise transaction-size first or pick a smaller batch-size.");
+        }
+        // Effective transaction size after the change.
+        int effectiveTxn = txn > 0 ? txn : newBatchSize;
+        int rate = config.ingestMaxOpsPerSecond;
+        if (rate > 0 && effectiveTxn > rate) {
+            throw new IllegalArgumentException(
+                    "effective transaction-size (" + effectiveTxn
+                            + ") would exceed ingest-max-ops (" + rate
+                            + "). Raise ingest-max-ops or lower transaction-size/batch-size.");
+        }
+        config.batchSize = newBatchSize;
+    }
+
+    /**
+     * Update {@link Config#transactionSize}. Validates first, writes last:
+     * <ul>
+     *   <li>{@code newTransactionSize >= 1}</li>
+     *   <li>{@code newTransactionSize >= currentBatchSize}</li>
+     *   <li>{@code newTransactionSize <= ingestMaxOps} when {@code ingestMaxOps > 0}</li>
+     * </ul>
+     * The config is left untouched on rejection.
+     */
+    public void setTransactionSize(int newTransactionSize) {
+        if (newTransactionSize < 1) {
+            throw new IllegalArgumentException(
+                    "transaction-size must be >= 1, got " + newTransactionSize);
+        }
+        int batch = config.batchSize;
+        if (newTransactionSize < batch) {
+            throw new IllegalArgumentException(
+                    "transaction-size (" + newTransactionSize + ") must be >= batch-size ("
+                            + batch + "). Lower batch-size first or pick a larger transaction-size.");
+        }
+        int rate = config.ingestMaxOpsPerSecond;
+        if (rate > 0 && newTransactionSize > rate) {
+            throw new IllegalArgumentException(
+                    "transaction-size (" + newTransactionSize
+                            + ") must be <= ingest-max-ops (" + rate
+                            + "). Raise ingest-max-ops first or lower transaction-size.");
+        }
+        config.transactionSize = newTransactionSize;
     }
 
     public Supplier<Map<String, Object>> getStatusSupplier() {
@@ -199,6 +292,9 @@ public class BenchRuntime {
      * initial workers. If the ingest context is not yet set, the spawn is
      * skipped and only the config is updated.
      *
+     * <p>Also resizes the {@link IngestRateLimiterGroup} so the global ingest
+     * rate is redistributed across the new worker count.
+     *
      * @param newThreads target thread count; must be between 1 and
      *                   {@value #MAX_INGEST_THREADS} inclusive
      * @throws IllegalArgumentException if the value is out of range
@@ -230,6 +326,18 @@ public class BenchRuntime {
             for (int i = 0; i < toSpawn; i++) {
                 pool.submit(factory.get());
             }
+        }
+
+        // Resize the per-thread limiter group so the global rate is re-split.
+        // The group preserves existing children so already-attached workers
+        // remain associated with their slot. We only grow the group; shrinking
+        // would invalidate child slots for any worker still attached to a
+        // truncated index. When new == current or new < current, just
+        // rebalance the children's per-share rate.
+        if (newThreads > ingestRateLimiterGroup.size()) {
+            ingestRateLimiterGroup.resize(newThreads);
+        } else {
+            ingestRateLimiterGroup.setEffectiveRate(ingestRateLimiterGroup.getEffectiveRate());
         }
 
         config.ingestThreads = newThreads;
