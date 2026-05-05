@@ -3225,13 +3225,10 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     }
 
     private DataPage buildImmutableDataPage(long pageId, List<Record> page) {
-        Map<Bytes, Record> newPageMap = new HashMap<>(page.size());
-        long estimatedPageSize = 0;
-        for (Record r : page) {
-            newPageMap.put(r.key, r);
-            estimatedPageSize += DataPage.estimateEntrySize(r);
-        }
-        return new DataPage(this, pageId, maxLogicalPageSize, estimatedPageSize, newPageMap, true);
+        // Issue #399: pack record values into a dedicated DATA_PAGES slab so
+        // their bytes live off-heap. The factory falls back to the on-heap
+        // path for tiny pages whose slab overhead would dominate.
+        return DataPage.buildSlabPackedImmutable(this, pageId, maxLogicalPageSize, page);
     }
 
     @Override

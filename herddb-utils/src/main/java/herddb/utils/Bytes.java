@@ -101,15 +101,17 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      * <p>
      * With compressed oops (heap &lt; 32GB):
      * header(12) + buffer ref(4) + offset(4) + length(4) + hashCode(4)
-     * + offHeap ref(4) + deserialized ref(4) = 36 bytes → padded to 40
+     * + offHeap ref(4) + ownsSlice byte+pad(4) + slabOwner ref(4)
+     * + deserialized ref(4) = 44 → padded to 48
      * <p>
      * Without compressed oops (heap &gt;= 32GB):
      * header(16) + buffer ref(8) + offset(4) + length(4) + hashCode(4)
-     * + offHeap ref(8) + deserialized ref(8) + padding(4) = 56 bytes
+     * + offHeap ref(8) + ownsSlice byte+pad(8) + slabOwner ref(8)
+     * + deserialized ref(8) = 76 → padded to 80
      */
     private static final int CONSTANT_BYTE_SIZE = ObjectSizeUtils.COMPRESSED_OOPS
-            ? 40
-            : 56;
+            ? 48
+            : 80;
 
     public static long estimateSize(byte[] value) {
         return value.length + CONSTANT_BYTE_SIZE;
@@ -129,12 +131,40 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
 
     /**
      * Off-heap backing slice when this {@code Bytes} was constructed via
-     * {@link #fromOffHeap(ByteBuf)}. {@code null} for on-heap-backed
-     * instances and after {@link #release()} or after lazy materialisation.
-     * {@code volatile} so a reader observes a consistent
-     * {@code (offHeap, buffer)} pair across the materialisation transition.
+     * {@link #fromOffHeap(ByteBuf)} or {@link #fromSharedSlab(ByteBuf, int, int, Object)}.
+     * {@code null} for on-heap-backed instances and after {@link #release()}
+     * or after lazy materialisation. {@code volatile} so a reader observes a
+     * consistent {@code (offHeap, buffer)} pair across the materialisation
+     * transition.
      */
     private volatile ByteBuf offHeap;
+
+    /**
+     * When {@code true}, {@link #release()} and {@link #materialiseFromOffHeap()}
+     * decrement the slice's refcount; this is the {@link #fromOffHeap(ByteBuf)}
+     * lifecycle where each {@code Bytes} owns one refcount on its slice.
+     *
+     * <p>When {@code false}, the {@code Bytes} is a non-owning view into a
+     * larger slab whose lifecycle is managed by an external owner (typically
+     * a {@code DataPage} via a {@link java.lang.ref.Cleaner}); see
+     * {@link #fromSharedSlab(ByteBuf, int, int, Object)}. {@code release()}
+     * is a no-op and lazy materialisation copies bytes without touching the
+     * slab's refcount.
+     */
+    private final boolean ownsSlice;
+
+    /**
+     * Strong reference held to anchor the slab-owner against premature GC,
+     * for {@code Bytes} produced by {@link #fromSharedSlab(ByteBuf, int, int, Object)}.
+     * {@code null} for owned slices and on-heap-backed instances.
+     *
+     * <p>This is the standard JDK {@code Cleaner} anchor pattern: as long as
+     * any {@code Bytes} references its slab owner, the owner stays
+     * GC-reachable and its {@code Cleanable} does not release the slab,
+     * preventing a use-after-free for in-flight readers.
+     */
+    @SuppressFBWarnings("URF_UNREAD_FIELD")
+    private final Object slabOwner;
 
     public Object deserialized;
 
@@ -325,12 +355,16 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         this.buffer = data;
         this.offset = 0;
         this.length = buffer.length;
+        this.ownsSlice = false;
+        this.slabOwner = null;
     }
 
     private Bytes(byte[] data, int offset, int length) {
         this.buffer = data;
         this.offset = offset;
         this.length = length;
+        this.ownsSlice = false;
+        this.slabOwner = null;
     }
 
     /** Internal off-heap constructor; see {@link #fromOffHeap(ByteBuf)}. */
@@ -339,6 +373,21 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         this.offset = 0;
         this.length = slice.readableBytes();
         this.offHeap = slice;
+        this.ownsSlice = true;
+        this.slabOwner = null;
+    }
+
+    /**
+     * Internal shared-slab constructor; see
+     * {@link #fromSharedSlab(ByteBuf, int, int, Object)}.
+     */
+    private Bytes(ByteBuf sharedSlice, Object owner) {
+        this.buffer = null;
+        this.offset = 0;
+        this.length = sharedSlice.readableBytes();
+        this.offHeap = sharedSlice;
+        this.ownsSlice = false;
+        this.slabOwner = owner;
     }
 
     /**
@@ -378,6 +427,64 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
             throw new NullPointerException("slice");
         }
         return new Bytes(slice);
+    }
+
+    /**
+     * Wraps a non-owning slice of an externally-managed slab into a
+     * {@code Bytes}. Used by {@code DataPage}, BLink and BRIN slab-packing
+     * paths where many records share a single off-heap slab whose lifecycle
+     * is governed by the slab owner (typically via a JDK {@link java.lang.ref.Cleaner}).
+     *
+     * <p>Semantics that differ from {@link #fromOffHeap(ByteBuf)}:
+     * <ul>
+     *   <li>{@link #release()} on this {@code Bytes} is a <b>no-op</b> — the
+     *       caller must not release the slice, because it shares the slab's
+     *       refcount and a premature decrement would invalidate every other
+     *       slice on the same slab. The slab owner releases the slab once
+     *       (decrementing the shared refcount) when its lifecycle ends.</li>
+     *   <li>{@link #getBuffer()} (and any byte[] accessor) still copies the
+     *       slice into a fresh {@code byte[]}, but does <b>not</b> release
+     *       the slice for the same reason. After materialisation the
+     *       {@code Bytes} behaves exactly like an on-heap one.</li>
+     *   <li>The {@code Bytes} retains a strong reference to {@code owner}
+     *       (typically the {@code DataPage} or BLink/BRIN node holding the
+     *       slab) so the JDK {@code Cleaner} attached to {@code owner} does
+     *       not run while any reader still holds this {@code Bytes}. This is
+     *       the standard {@code Cleaner} anchor pattern; without it a
+     *       reader could observe a use-after-free.</li>
+     * </ul>
+     *
+     * @param slice  a non-owning slice (typically {@code slab.slice(off, len)});
+     *               the returned {@code Bytes} reads bytes via the slice but
+     *               never releases it.
+     * @param owner  the slab owner whose {@code Cleaner.Cleanable} releases
+     *               the slab; must be the object the {@code Cleaner} is
+     *               attached to so that GC keeps it alive while readers
+     *               exist.
+     * @throws NullPointerException if {@code slice} or {@code owner} is null.
+     */
+    public static Bytes fromSharedSlab(ByteBuf slice, Object owner) {
+        if (slice == null) {
+            throw new NullPointerException("slice");
+        }
+        if (owner == null) {
+            throw new NullPointerException("owner");
+        }
+        return new Bytes(slice, owner);
+    }
+
+    /**
+     * Convenience overload that takes the slab plus an explicit
+     * {@code (offset, length)} window. Internally builds {@code slab.slice(offset, length)}.
+     */
+    public static Bytes fromSharedSlab(ByteBuf slab, int offset, int length, Object owner) {
+        if (slab == null) {
+            throw new NullPointerException("slab");
+        }
+        if (owner == null) {
+            throw new NullPointerException("owner");
+        }
+        return new Bytes(slab.slice(offset, length), owner);
     }
 
     /**
@@ -428,10 +535,17 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      */
     public synchronized void release() {
         ByteBuf local = offHeap;
-        if (local != null) {
+        if (local == null) {
+            return;
+        }
+        if (ownsSlice) {
             offHeap = null;
             local.release();
         }
+        // Shared-slab Bytes does NOT release: the slab owner (anchored by
+        // slabOwner) owns the single refcount on the shared slab and will
+        // release it via its Cleaner. We deliberately keep `offHeap` alive
+        // here so the bytes remain readable for the slab's lifetime.
     }
 
     /**
@@ -465,8 +579,14 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         }
         buffer = copy;
         offset = 0;
-        offHeap = null;
-        local.release();
+        if (ownsSlice) {
+            offHeap = null;
+            local.release();
+        }
+        // Shared-slab Bytes: keep the slice reference alive for any concurrent
+        // off-heap reader (the slab owner's quiescence contract excludes
+        // races, but losing the field would also break the slabOwner GC
+        // anchor). The slab will be released by the slab owner's Cleaner.
     }
 
     /**
