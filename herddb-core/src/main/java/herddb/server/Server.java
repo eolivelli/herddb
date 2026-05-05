@@ -486,20 +486,8 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                         configuration.getBoolean(
                                 ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
                                 ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT));
-                int cleanupBatchSize = configuration.getInt(
-                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
-                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT);
-                if (cleanupBatchSize > ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_MAX_RECOMMENDED) {
-                    LOGGER.log(Level.WARNING,
-                            "{0}={1} exceeds the recommended ceiling of {2}; very large batches "
-                                    + "may push the gRPC frame past the inbound message size limit",
-                            new Object[]{
-                                    ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
-                                    cleanupBatchSize,
-                                    ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_MAX_RECOMMENDED});
-                }
                 dsmConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
-                        cleanupBatchSize);
+                        readAndValidateCleanupBatchSize());
                 DataStorageManager dsm = factory.createDataStorageManager(
                         dataDirectory, tmpDirectory, diskswapThreshold, client, dsmConfig,
                         statsLogger.scope("remote_storage"));
@@ -542,6 +530,29 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
             default:
                 throw new RuntimeException("invalid " + ServerConfiguration.PROPERTY_STORAGE_MODE + "=" + storageMode);
         }
+    }
+
+    /**
+     * Reads the configured remote-file cleanup batch size, emitting a
+     * {@code WARNING} (but otherwise honouring the value) when it exceeds
+     * {@link ServerConfiguration#PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_MAX_RECOMMENDED}.
+     * Used by both the standalone-remote and shared-storage code paths so the
+     * advisory check fires in either deployment mode.
+     */
+    private int readAndValidateCleanupBatchSize() {
+        int cleanupBatchSize = configuration.getInt(
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT);
+        if (cleanupBatchSize > ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_MAX_RECOMMENDED) {
+            LOGGER.log(Level.WARNING,
+                    "{0}={1} exceeds the recommended ceiling of {2}; very large batches "
+                            + "may push the gRPC frame past the inbound message size limit",
+                    new Object[]{
+                            ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
+                            cleanupBatchSize,
+                            ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_MAX_RECOMMENDED});
+        }
+        return cleanupBatchSize;
     }
 
     private DataStorageManager buildSharedStorageDataManager(String nodeId) {
@@ -611,9 +622,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                         ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
                         ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT));
         sharedConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
-                configuration.getInt(
-                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
-                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT));
+                readAndValidateCleanupBatchSize());
         return factory.createPromotableDataStorageManager(
                 client, metaMgr, dataDirectory, tmpDirectory, diskswapThreshold, sharedConfig,
                 statsLogger.scope("remote_storage"));

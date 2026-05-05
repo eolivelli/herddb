@@ -21,10 +21,13 @@ package herddb.remote;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -165,53 +168,42 @@ public class RemoteFileServiceClientBatchDeleteTest {
     }
 
     @Test
-    public void surviesPartialFailureWhenOneServerStops() throws Exception {
-        try (RemoteFileServer server2 = new RemoteFileServer(0, folder.newFolder("rfs2").toPath())) {
-            server2.start();
-            RemoteFileServiceClient multiClient = new RemoteFileServiceClient(Arrays.asList(
-                    "localhost:" + server.getPort(),
-                    "localhost:" + server2.getPort()));
-            try {
-                int total = 40;
-                List<String> paths = new ArrayList<>(total);
-                int onServer1 = 0;
-                int onServer2 = 0;
-                for (int i = 0; i < total; i++) {
-                    String path = "partial/key-" + i + ".page";
-                    multiClient.writeFile(path, new byte[]{(byte) i});
-                    paths.add(path);
-                    String routed = multiClient.getServerForPath(path);
-                    if (routed.endsWith(":" + server.getPort())) {
-                        onServer1++;
-                    } else if (routed.endsWith(":" + server2.getPort())) {
-                        onServer2++;
-                    }
+    public void survivesPartialFailureWhenOneServerStops() throws Exception {
+        RemoteFileServer server2 = new RemoteFileServer(0, folder.newFolder("rfs2").toPath());
+        server2.start();
+        RemoteFileServiceClient multiClient = new RemoteFileServiceClient(Arrays.asList(
+                "localhost:" + server.getPort(),
+                "localhost:" + server2.getPort()));
+        try {
+            int total = 40;
+            List<String> paths = new ArrayList<>(total);
+            int onServer1 = 0;
+            int onServer2 = 0;
+            for (int i = 0; i < total; i++) {
+                String path = "partial/key-" + i + ".page";
+                multiClient.writeFile(path, new byte[]{(byte) i});
+                paths.add(path);
+                String routed = multiClient.getServerForPath(path);
+                if (routed.endsWith(":" + server.getPort())) {
+                    onServer1++;
+                } else if (routed.endsWith(":" + server2.getPort())) {
+                    onServer2++;
                 }
-                assertTrue("test setup: router must split across both servers",
-                        onServer1 > 0 && onServer2 > 0);
-                // Stop server2 so its sub-batch will fail. The surviving sub-batch
-                // (server1) must still report its deletion count.
-                server2.stop();
-
-                int deleted;
-                try {
-                    deleted = multiClient.deleteFiles(paths);
-                } catch (RuntimeException ex) {
-                    // The retry loop may surface the failure from server2 if its
-                    // last attempt completes after the server1 sub-batch has
-                    // returned. That's acceptable — but the absence of an
-                    // exception is the more interesting partial-success case
-                    // we're documenting; mark it explicitly here so the test is
-                    // self-explanatory.
-                    deleted = -1;
-                }
-                if (deleted >= 0) {
-                    assertEquals("partial-success should at least surface the surviving server's count",
-                            onServer1, deleted);
-                }
-            } finally {
-                multiClient.close();
             }
+            assertTrue("test setup: router must split across both servers",
+                    onServer1 > 0 && onServer2 > 0);
+            // Stop server2 so its sub-batch will fail. The surviving sub-batch
+            // (server1) must still report its deletion count without needing a
+            // retry — there is no per-sub-batch retry, only an
+            // all-sub-batches-failed retry.
+            server2.stop();
+
+            int deleted = multiClient.deleteFiles(paths);
+            assertEquals("partial-success must surface the surviving server's count",
+                    onServer1, deleted);
+        } finally {
+            multiClient.close();
+            // server2 already stopped above; close() / a second stop() is a no-op.
         }
     }
 
@@ -230,7 +222,7 @@ public class RemoteFileServiceClientBatchDeleteTest {
             server = null;
             try {
                 fastFailClient.deleteFiles(Arrays.asList("dead/k1", "dead/k2"));
-                org.junit.Assert.fail("expected RuntimeException when every sub-batch fails");
+                fail("expected RuntimeException when every sub-batch fails");
             } catch (RuntimeException expected) {
                 // ok
             }
@@ -238,7 +230,7 @@ public class RemoteFileServiceClientBatchDeleteTest {
     }
 
     private RemoteFileServiceClient newClientWithoutRetries() {
-        java.util.Map<String, Object> cfg = new java.util.HashMap<>();
+        Map<String, Object> cfg = new HashMap<>();
         cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_RETRIES, 0);
         cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_TIMEOUT, 5L); // 5s deadline
         return new RemoteFileServiceClient(
