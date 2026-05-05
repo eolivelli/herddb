@@ -24,8 +24,11 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.UnsafeByteOperations;
 import herddb.remote.proto.DeleteByPrefixRequest;
 import herddb.remote.proto.DeleteByPrefixResponse;
+import herddb.remote.proto.DeleteFileOutcome;
 import herddb.remote.proto.DeleteFileRequest;
 import herddb.remote.proto.DeleteFileResponse;
+import herddb.remote.proto.DeleteFilesRequest;
+import herddb.remote.proto.DeleteFilesResponse;
 import herddb.remote.proto.ListFilesEntry;
 import herddb.remote.proto.ListFilesRequest;
 import herddb.remote.proto.ReadFileRangeRequest;
@@ -58,6 +61,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -1112,6 +1116,119 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
     public CompletableFuture<Integer> deleteByPrefixAsync(String prefix) {
         return retryAsync(() -> doDeleteByPrefixAsync(prefix), "deleteByPrefix", prefix, 0);
+    }
+
+    /**
+     * Batch logical-file deletion (issue #398). Groups the input paths by their
+     * consistent-hash target server and dispatches one {@code DeleteFiles} RPC per
+     * server in parallel. Returns the total number of paths that the server reported
+     * as actually deleted ({@code deleted=true} outcomes).
+     *
+     * <p>Per-path errors surface as a {@link RuntimeException} on the returned
+     * future only if <em>every</em> sub-batch failed — partial failures are tolerated
+     * and the count reflects only what was confirmed deleted, so callers can retry
+     * the remainder. Per-path {@code deleted=false} is not an error (matches
+     * {@link #deleteFile} semantics: deleting a missing path is a no-op).
+     */
+    public CompletableFuture<Integer> deleteFilesAsync(List<String> paths) {
+        if (paths == null || paths.isEmpty()) {
+            return CompletableFuture.completedFuture(0);
+        }
+        return retryAsync(() -> doDeleteFilesAsync(paths), "deleteFiles",
+                "[" + paths.size() + " paths]", 0);
+    }
+
+    private CompletableFuture<Integer> doDeleteFilesAsync(List<String> paths) {
+        return runDetached(() -> {
+            ServerSnapshot s = this.snapshot;
+            // Group paths by their target write-plane server so one server handles
+            // exactly one DeleteFiles RPC per call. The server has no way to forward
+            // a path to a different node, so misrouted paths would fail with
+            // NoSuchKey on disk.
+            Map<String, List<String>> byServer = new HashMap<>();
+            for (String path : paths) {
+                String server = s.router.getServer(path);
+                byServer.computeIfAbsent(server, k -> new ArrayList<>()).add(path);
+            }
+            List<CompletableFuture<Integer>> futures = new ArrayList<>(byServer.size());
+            List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
+            for (Map.Entry<String, List<String>> entry : byServer.entrySet()) {
+                String server = entry.getKey();
+                List<String> serverPaths = entry.getValue();
+                RemoteFileServiceGrpc.RemoteFileServiceStub stub = writeStubForServer(server);
+                CompletableFuture<Integer> serverFuture = new CompletableFuture<>();
+                stub.deleteFiles(
+                        DeleteFilesRequest.newBuilder().addAllPaths(serverPaths).build(),
+                        new StreamObserver<DeleteFilesResponse>() {
+                            private int deletedCount;
+
+                            @Override
+                            public void onNext(DeleteFilesResponse response) {
+                                int deleted = 0;
+                                for (DeleteFileOutcome outcome : response.getOutcomesList()) {
+                                    if (outcome.getDeleted()) {
+                                        deleted++;
+                                    } else if (!outcome.getError().isEmpty()) {
+                                        // Per-path failures are logged at FINE; the
+                                        // caller drives retry by counting deletions.
+                                        LOGGER.log(Level.FINE,
+                                                "deleteFiles per-path error path={0} error={1}",
+                                                new Object[]{outcome.getPath(), outcome.getError()});
+                                    }
+                                }
+                                deletedCount = deleted;
+                            }
+
+                            @Override
+                            public void onError(Throwable t) {
+                                errors.add(t);
+                                serverFuture.completeExceptionally(t);
+                            }
+
+                            @Override
+                            public void onCompleted() {
+                                serverFuture.complete(deletedCount);
+                            }
+                        });
+                futures.add(serverFuture);
+            }
+            CompletableFuture<Integer> all = new CompletableFuture<>();
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .whenComplete((v, t) -> {
+                        // Sum successful sub-batches even if some failed; only
+                        // surface an exception when every sub-batch failed (no data
+                        // to report on at all).
+                        int total = 0;
+                        for (CompletableFuture<Integer> f : futures) {
+                            if (!f.isCompletedExceptionally()) {
+                                try {
+                                    total += f.getNow(0);
+                                } catch (CompletionException ignored) {
+                                    // already counted as exceptional above
+                                }
+                            }
+                        }
+                        if (errors.size() == futures.size() && !errors.isEmpty()) {
+                            // Surface the first cause and attach the rest as
+                            // suppressed so the operator can diagnose all
+                            // simultaneous server-side failures (e.g. one server
+                            // returns UNAVAILABLE while another returns
+                            // RESOURCE_EXHAUSTED) rather than only one.
+                            Throwable primary = errors.get(0);
+                            for (int i = 1; i < errors.size(); i++) {
+                                primary.addSuppressed(errors.get(i));
+                            }
+                            all.completeExceptionally(primary);
+                        } else {
+                            all.complete(total);
+                        }
+                    });
+            return all;
+        });
+    }
+
+    public int deleteFiles(List<String> paths) {
+        return getUnchecked(deleteFilesAsync(paths));
     }
 
     private CompletableFuture<Integer> doDeleteByPrefixAsync(String prefix) {

@@ -69,7 +69,9 @@ import java.util.function.Function;
 import java.util.function.LongConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.apache.bookkeeper.stats.Counter;
 import org.apache.bookkeeper.stats.NullStatsLogger;
+import org.apache.bookkeeper.stats.OpStatsLogger;
 import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
@@ -196,13 +198,41 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      */
     private final boolean pageHashChecksEnabled;
 
+    /**
+     * Maximum number of paths sent in a single {@code DeleteFiles} RPC during
+     * {@link #cleanupAfterTableBoot}. Configured via
+     * {@link ServerConfiguration#PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE}.
+     */
+    private final int cleanupBatchSize;
+
+    /**
+     * Counter incremented once per {@code cleanupAfterTableBoot} batch RPC.
+     * Always non-null; defaults to a {@link NullStatsLogger}-backed no-op
+     * counter when no stats logger is wired in.
+     */
+    private final Counter cleanupBatchesCounter;
+
+    /**
+     * Counter of stale pages actually deleted by {@code cleanupAfterTableBoot}.
+     * Always non-null.
+     */
+    private final Counter cleanupDeletionsCounter;
+
+    /**
+     * Latency (microseconds) of each batch RPC issued by
+     * {@code cleanupAfterTableBoot}. Always non-null.
+     */
+    private final OpStatsLogger cleanupBatchLatency;
+
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
             RemoteFileServiceClient client) {
         this(localMetadataDir, tmpDir, swapThreshold, client, new LazyValueCache(0L),
                 ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT,
                 ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT,
-                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT,
+                NullStatsLogger.INSTANCE);
     }
 
     public RemoteFileDataStorageManager(
@@ -211,7 +241,9 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         this(localMetadataDir, tmpDir, swapThreshold, client, lazyValueCache,
                 ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT,
                 ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT,
-                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT,
+                NullStatsLogger.INSTANCE);
     }
 
     public RemoteFileDataStorageManager(
@@ -221,7 +253,9 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         this(localMetadataDir, tmpDir, swapThreshold, client, lazyValueCache,
                 blockUploadParallelism,
                 ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT,
-                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT,
+                NullStatsLogger.INSTANCE);
     }
 
     public RemoteFileDataStorageManager(
@@ -229,6 +263,18 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             RemoteFileServiceClient client, LazyValueCache lazyValueCache,
             int blockUploadParallelism,
             boolean pageHashWritesEnabled, boolean pageHashChecksEnabled) {
+        this(localMetadataDir, tmpDir, swapThreshold, client, lazyValueCache,
+                blockUploadParallelism, pageHashWritesEnabled, pageHashChecksEnabled,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT,
+                NullStatsLogger.INSTANCE);
+    }
+
+    public RemoteFileDataStorageManager(
+            Path localMetadataDir, Path tmpDir, int swapThreshold,
+            RemoteFileServiceClient client, LazyValueCache lazyValueCache,
+            int blockUploadParallelism,
+            boolean pageHashWritesEnabled, boolean pageHashChecksEnabled,
+            int cleanupBatchSize, StatsLogger statsLogger) {
         this.tmpDir = tmpDir;
         this.swapThreshold = swapThreshold;
         this.client = client;
@@ -236,6 +282,11 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         this.blockUploadParallelism = Math.max(1, blockUploadParallelism);
         this.pageHashWritesEnabled = pageHashWritesEnabled;
         this.pageHashChecksEnabled = pageHashChecksEnabled;
+        this.cleanupBatchSize = Math.max(1, cleanupBatchSize);
+        StatsLogger scope = (statsLogger == null ? NullStatsLogger.INSTANCE : statsLogger).scope("cleanup");
+        this.cleanupBatchesCounter = scope.getCounter("batches");
+        this.cleanupDeletionsCounter = scope.getCounter("deletions");
+        this.cleanupBatchLatency = scope.getOpStatsLogger("batch_latency");
         this.localMetadataManager = new FileDataStorageManager(
                 localMetadataDir, tmpDir, swapThreshold,
                 false, false, false, false, false,
@@ -1351,15 +1402,90 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     @Override
     public void cleanupAfterTableBoot(String tableSpace, String uuid, Set<Long> activePagesAtBoot)
             throws DataStorageManagerException {
-        // Delete stale remote pages not in the active set
+        // Build the stale-page list from the remote listing.
+        long listStartNanos = System.nanoTime();
         List<String> remotePages = client.listFiles(remoteDataPrefix(tableSpace, uuid));
+        List<String> stalePaths = new ArrayList<>();
         for (String remotePath : remotePages) {
             long pageId = pageIdFromRemotePath(remotePath);
             if (pageId > 0 && !activePagesAtBoot.contains(pageId)) {
-                LOGGER.log(Level.FINE, "cleanupAfterTableBoot: deleting stale remote page {0}", remotePath);
-                client.deleteFile(remotePath);
+                stalePaths.add(remotePath);
             }
         }
+        long listElapsedMs = (System.nanoTime() - listStartNanos) / 1_000_000L;
+        if (stalePaths.isEmpty()) {
+            LOGGER.log(Level.INFO,
+                    "cleanupAfterTableBoot[{0}/{1}]: nothing to delete "
+                            + "(scanned {2} remote pages, active={3}, listMs={4})",
+                    new Object[]{tableSpace, uuid, remotePages.size(), activePagesAtBoot.size(),
+                            listElapsedMs});
+            return;
+        }
+        int totalToDelete = stalePaths.size();
+        int batchSize = cleanupBatchSize;
+        int totalBatches = (totalToDelete + batchSize - 1) / batchSize;
+        LOGGER.log(Level.INFO,
+                "cleanupAfterTableBoot[{0}/{1}]: deleting {2} stale remote pages "
+                        + "in {3} batches of up to {4} (active={5}, listMs={6})",
+                new Object[]{tableSpace, uuid, totalToDelete, totalBatches, batchSize,
+                        activePagesAtBoot.size(), listElapsedMs});
+        long cumulativeNanos = 0L;
+        long lastProgressLogNanos = System.nanoTime();
+        int totalDeleted = 0;
+        for (int offset = 0, batchIdx = 1; offset < totalToDelete; offset += batchSize, batchIdx++) {
+            int end = Math.min(offset + batchSize, totalToDelete);
+            List<String> batch = stalePaths.subList(offset, end);
+            long batchStartNanos = System.nanoTime();
+            int deleted;
+            try {
+                deleted = client.deleteFiles(batch);
+            } catch (RuntimeException ex) {
+                long batchElapsedMicros = (System.nanoTime() - batchStartNanos) / 1_000L;
+                cleanupBatchLatency.registerFailedEvent(batchElapsedMicros,
+                        java.util.concurrent.TimeUnit.MICROSECONDS);
+                LOGGER.log(Level.WARNING,
+                        "cleanupAfterTableBoot[" + tableSpace + "/" + uuid + "]: batch "
+                                + batchIdx + "/" + totalBatches + " of size " + batch.size()
+                                + " failed; aborting cleanup. " + totalDeleted + "/" + totalToDelete
+                                + " deleted so far (cumulativeMs="
+                                + (cumulativeNanos / 1_000_000L) + ")",
+                        ex);
+                throw ex;
+            }
+            long batchElapsedNanos = System.nanoTime() - batchStartNanos;
+            cumulativeNanos += batchElapsedNanos;
+            cleanupBatchesCounter.inc();
+            cleanupDeletionsCounter.addCount(deleted);
+            cleanupBatchLatency.registerSuccessfulEvent(batchElapsedNanos / 1_000L,
+                    java.util.concurrent.TimeUnit.MICROSECONDS);
+            totalDeleted += deleted;
+            // Rate-limit per-batch progress lines: always log the first batch, the
+            // final batch, every 100 batches, and at most once every 30 seconds.
+            // For small cleanups (e.g. a few batches) this prints every batch.
+            boolean isFirst = batchIdx == 1;
+            boolean isLast = batchIdx == totalBatches;
+            boolean every100 = (batchIdx % 100) == 0;
+            long sinceLastLogMs = (System.nanoTime() - lastProgressLogNanos) / 1_000_000L;
+            boolean every30s = sinceLastLogMs >= 30_000L;
+            if (isFirst || isLast || every100 || every30s) {
+                LOGGER.log(Level.INFO,
+                        "cleanupAfterTableBoot[{0}/{1}]: batch {2}/{3} size={4} "
+                                + "deleted={5} totalDeleted={6}/{7} "
+                                + "batchMs={8} cumulativeMs={9}",
+                        new Object[]{tableSpace, uuid, batchIdx, totalBatches, batch.size(),
+                                deleted, totalDeleted, totalToDelete,
+                                batchElapsedNanos / 1_000_000L,
+                                cumulativeNanos / 1_000_000L});
+                lastProgressLogNanos = System.nanoTime();
+            }
+        }
+        LOGGER.log(Level.INFO,
+                "cleanupAfterTableBoot[{0}/{1}]: complete. "
+                        + "deleted={2}/{3} batches={4} batchSize={5} "
+                        + "totalMs={6} avgBatchMs={7}",
+                new Object[]{tableSpace, uuid, totalDeleted, totalToDelete, totalBatches,
+                        batchSize, cumulativeNanos / 1_000_000L,
+                        totalBatches > 0 ? (cumulativeNanos / 1_000_000L) / totalBatches : 0L});
     }
 
     // -------------------------------------------------------------------------

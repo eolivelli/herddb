@@ -41,6 +41,8 @@ import java.util.Set;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.apache.bookkeeper.stats.NullStatsLogger;
+import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
  * DataStorageManager that starts in read-only mode (delegating to {@link ReadReplicaDataStorageManager})
@@ -64,6 +66,22 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
     private final int swapThreshold;
     private final boolean pageHashWritesEnabled;
     private final boolean pageHashChecksEnabled;
+    /**
+     * Batch size for {@code DeleteFiles} RPCs issued by the writable delegate's
+     * {@code cleanupAfterTableBoot} (issue #398). Forwarded into the
+     * {@link RemoteFileDataStorageManager} created by {@link #promoteToWritable()}
+     * so a promoted shared-storage replica honours the same configurable batch
+     * size as the regular write path. Never negative.
+     */
+    private final int cleanupBatchSize;
+    /**
+     * Stats logger forwarded into the writable delegate at promotion time so the
+     * post-failover boot-cleanup metrics ({@code remote_storage_cleanup_*}) are
+     * actually wired to Prometheus on the promoted node — otherwise the new
+     * Grafana panels would read zero on every promoted shared-storage replica.
+     * Always non-null (defaults to {@link NullStatsLogger#INSTANCE}).
+     */
+    private final StatsLogger statsLogger;
 
     private volatile DataStorageManager activeDelegate;
     private volatile boolean promoted = false;
@@ -77,7 +95,9 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
             int swapThreshold) {
         this(readOnlyDelegate, client, metadataManager, dataDirectory, tmpDirectory, swapThreshold,
                 herddb.server.ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT,
-                herddb.server.ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
+                herddb.server.ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT,
+                herddb.server.ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT,
+                NullStatsLogger.INSTANCE);
     }
 
     public PromotableRemoteFileDataStorageManager(
@@ -89,6 +109,23 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
             int swapThreshold,
             boolean pageHashWritesEnabled,
             boolean pageHashChecksEnabled) {
+        this(readOnlyDelegate, client, metadataManager, dataDirectory, tmpDirectory, swapThreshold,
+                pageHashWritesEnabled, pageHashChecksEnabled,
+                herddb.server.ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT,
+                NullStatsLogger.INSTANCE);
+    }
+
+    public PromotableRemoteFileDataStorageManager(
+            ReadReplicaDataStorageManager readOnlyDelegate,
+            RemoteFileServiceClient client,
+            SharedCheckpointMetadataManager metadataManager,
+            Path dataDirectory,
+            Path tmpDirectory,
+            int swapThreshold,
+            boolean pageHashWritesEnabled,
+            boolean pageHashChecksEnabled,
+            int cleanupBatchSize,
+            StatsLogger statsLogger) {
         this.readOnlyDelegate = readOnlyDelegate;
         this.client = client;
         this.metadataManager = metadataManager;
@@ -97,6 +134,8 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
         this.swapThreshold = swapThreshold;
         this.pageHashWritesEnabled = pageHashWritesEnabled;
         this.pageHashChecksEnabled = pageHashChecksEnabled;
+        this.cleanupBatchSize = Math.max(1, cleanupBatchSize);
+        this.statsLogger = statsLogger == null ? NullStatsLogger.INSTANCE : statsLogger;
         this.activeDelegate = readOnlyDelegate;
     }
 
@@ -115,7 +154,8 @@ public class PromotableRemoteFileDataStorageManager extends DataStorageManager {
                 dataDirectory, tmpDirectory, swapThreshold, client,
                 new LazyValueCache(0L),
                 herddb.server.ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT,
-                pageHashWritesEnabled, pageHashChecksEnabled);
+                pageHashWritesEnabled, pageHashChecksEnabled,
+                cleanupBatchSize, statsLogger);
         writableDelegate.setSharedCheckpointMetadataManager(metadataManager);
         writableDelegate.start();
 

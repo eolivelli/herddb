@@ -29,6 +29,7 @@ service RemoteFileService {
     rpc ReadFile (ReadFileRequest) returns (ReadFileResponse);
     rpc ReadFileRange (ReadFileRangeRequest) returns (ReadFileRangeResponse);
     rpc DeleteFile (DeleteFileRequest) returns (DeleteFileResponse);
+    rpc DeleteFiles (DeleteFilesRequest) returns (DeleteFilesResponse);
     rpc ListFiles (ListFilesRequest) returns (stream ListFilesEntry);
     rpc DeleteByPrefix (DeleteByPrefixRequest) returns (DeleteByPrefixResponse);
 }
@@ -79,6 +80,28 @@ message DeleteFileRequest {
 
 message DeleteFileResponse {
     bool deleted = 1;
+}
+
+// Batch logical-file deletion (issue #398). All paths in a single request must
+// route to the SAME server (the client groups paths by consistent-hash router
+// before dispatch). Each path is processed independently; the response carries
+// per-path outcomes so the client can compute success/failure totals without a
+// second round trip. A path that does not exist is reported with deleted=false
+// and is NOT considered an error (matches DeleteFile semantics).
+message DeleteFilesRequest {
+    repeated string paths = 1;
+}
+
+message DeleteFilesResponse {
+    repeated DeleteFileOutcome outcomes = 1;
+}
+
+message DeleteFileOutcome {
+    string path = 1;
+    bool deleted = 2;
+    // Empty when the per-path delete succeeded (or returned deleted=false).
+    // Populated with the exception message when the per-path delete failed.
+    string error = 3;
 }
 
 message ListFilesRequest {

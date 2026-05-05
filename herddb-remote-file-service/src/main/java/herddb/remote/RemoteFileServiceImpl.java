@@ -23,8 +23,11 @@ package herddb.remote;
 import com.google.protobuf.UnsafeByteOperations;
 import herddb.remote.proto.DeleteByPrefixRequest;
 import herddb.remote.proto.DeleteByPrefixResponse;
+import herddb.remote.proto.DeleteFileOutcome;
 import herddb.remote.proto.DeleteFileRequest;
 import herddb.remote.proto.DeleteFileResponse;
+import herddb.remote.proto.DeleteFilesRequest;
+import herddb.remote.proto.DeleteFilesResponse;
 import herddb.remote.proto.ListFilesEntry;
 import herddb.remote.proto.ListFilesRequest;
 import herddb.remote.proto.ReadFileRangeRequest;
@@ -40,9 +43,11 @@ import herddb.remote.storage.ObjectStorage;
 import herddb.remote.storage.ReadResult;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -78,6 +83,12 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
     private final Counter deleteRequests;
     private final Counter deleteErrors;
     private final OpStatsLogger deleteLatency;
+
+    private final Counter deleteFilesRequests;
+    private final Counter deleteFilesErrors;
+    private final Counter deleteFilesPathsTotal;
+    private final Counter deleteFilesPathsDeleted;
+    private final OpStatsLogger deleteFilesLatency;
 
     private final Counter listRequests;
     private final Counter listErrors;
@@ -138,6 +149,12 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
         this.deleteRequests = scope.getCounter("delete_requests");
         this.deleteErrors = scope.getCounter("delete_errors");
         this.deleteLatency = scope.getOpStatsLogger("delete_latency");
+
+        this.deleteFilesRequests = scope.getCounter("deletefiles_requests");
+        this.deleteFilesErrors = scope.getCounter("deletefiles_errors");
+        this.deleteFilesPathsTotal = scope.getCounter("deletefiles_paths_total");
+        this.deleteFilesPathsDeleted = scope.getCounter("deletefiles_paths_deleted");
+        this.deleteFilesLatency = scope.getOpStatsLogger("deletefiles_latency");
 
         this.listRequests = scope.getCounter("list_requests");
         this.listErrors = scope.getCounter("list_errors");
@@ -346,6 +363,87 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
                         responseObserver.onCompleted();
                     }
                 });
+    }
+
+    @Override
+    public void deleteFiles(DeleteFilesRequest request, StreamObserver<DeleteFilesResponse> responseObserver) {
+        runOnLane(writeExecutor, () -> deleteFilesImpl(request, responseObserver));
+    }
+
+    private void deleteFilesImpl(DeleteFilesRequest request,
+                                 StreamObserver<DeleteFilesResponse> responseObserver) {
+        long start = System.nanoTime();
+        deleteFilesRequests.inc();
+        List<String> paths = request.getPathsList();
+        int total = paths.size();
+        deleteFilesPathsTotal.addCount(total);
+        if (total == 0) {
+            deleteFilesLatency.registerSuccessfulEvent(
+                    TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start), TimeUnit.MICROSECONDS);
+            responseObserver.onNext(DeleteFilesResponse.newBuilder().build());
+            responseObserver.onCompleted();
+            return;
+        }
+        DeleteFilesResponse.Builder responseBuilder = DeleteFilesResponse.newBuilder();
+        // Pre-size the outcomes list so the index for each path is fixed at dispatch
+        // time. The completion order of the per-path futures is unpredictable, but
+        // each callback writes back to its own slot via setOutcomes(idx, ...).
+        for (int i = 0; i < total; i++) {
+            responseBuilder.addOutcomes(DeleteFileOutcome.getDefaultInstance());
+        }
+        AtomicInteger remaining = new AtomicInteger(total);
+        AtomicInteger deletedTrue = new AtomicInteger();
+        AtomicInteger deletedFalse = new AtomicInteger();
+        AtomicInteger errors = new AtomicInteger();
+        for (int i = 0; i < total; i++) {
+            final int idx = i;
+            final String path = paths.get(i);
+            attachCallback(storage.deleteLogical(path), writeExecutor, (deleted, t) -> {
+                DeleteFileOutcome.Builder outcome = DeleteFileOutcome.newBuilder().setPath(path);
+                if (t != null) {
+                    errors.incrementAndGet();
+                    String msg = t.getMessage();
+                    outcome.setError(msg == null ? t.getClass().getSimpleName() : msg);
+                } else {
+                    if (Boolean.TRUE.equals(deleted)) {
+                        deletedTrue.incrementAndGet();
+                        outcome.setDeleted(true);
+                    } else {
+                        deletedFalse.incrementAndGet();
+                    }
+                }
+                synchronized (responseBuilder) {
+                    responseBuilder.setOutcomes(idx, outcome.build());
+                }
+                if (remaining.decrementAndGet() == 0) {
+                    finishDeleteFiles(start, total, deletedTrue.get(), deletedFalse.get(),
+                            errors.get(), responseBuilder, responseObserver);
+                }
+            });
+        }
+    }
+
+    private void finishDeleteFiles(long start, int total, int deletedTrue, int deletedFalse,
+                                   int errors, DeleteFilesResponse.Builder responseBuilder,
+                                   StreamObserver<DeleteFilesResponse> responseObserver) {
+        long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
+        long elapsedMs = elapsedMs(start);
+        deleteFilesPathsDeleted.addCount(deletedTrue);
+        if (errors > 0) {
+            deleteFilesErrors.inc();
+            deleteFilesLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+        } else {
+            deleteFilesLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+        }
+        LOGGER.log(Level.INFO,
+                "deleteFiles count={0} deletedTrue={1} deletedFalse={2} errors={3} time={4}ms",
+                new Object[]{total, deletedTrue, deletedFalse, errors, elapsedMs});
+        DeleteFilesResponse response;
+        synchronized (responseBuilder) {
+            response = responseBuilder.build();
+        }
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
     }
 
     @Override
