@@ -1081,6 +1081,11 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                  * (page.metadata == null). Pages that were added by allocateLivePage when they filled up
                  * already have metadata set; adding the immutable copy again would throw "Added a page twice".
                  */
+                // Issue #409: toImmutable() repacks values into an off-heap
+                // slab (HerdDBByteBufAllocators.dataPagesAllocator()) when the
+                // aggregate value bytes exceed OFFHEAP_VALUE_BYTES_THRESHOLD,
+                // so the new immutablePage no longer pins record byte[]s on
+                // the JVM heap.
                 final DataPage immutablePage = pages.computeIfPresent(page.pageId, (i, p) -> p.toImmutable());
                 if (immutablePage != null && page.metadata == null) {
                     final Page.Metadata unloadMeta = pageReplacementPolicy.add(immutablePage);
@@ -1392,6 +1397,12 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
             if (keepPageInMemory) {
                 /* If we must keep the page in memory we "covert" the page to immutable */
+                // Issue #409: see DataPage.toImmutable() — value bytes are
+                // now repacked into an off-heap slab when the page is large
+                // enough to warrant the per-record slice overhead. The flush
+                // above (writePage at line ~1386) already consumed the
+                // mutable page's records, so swapping in a slab-packed copy
+                // here doesn't affect persistence.
                 pages.put(page.pageId, page.toImmutable());
 
                 /*
