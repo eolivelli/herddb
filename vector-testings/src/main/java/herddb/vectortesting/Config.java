@@ -44,7 +44,22 @@ public class Config {
     DatasetLoader.DatasetPreset dataset = DatasetLoader.DatasetPreset.SIFT1M;
     long numRows = 100_000L;
     int ingestThreads = 4;
-    int batchSize = 500;
+    /**
+     * Rows per JDBC {@code executeBatch()} flush. {@code volatile} so a
+     * value updated from a Jetty admin handler thread is visible to ingest
+     * worker threads on their next per-row check.
+     */
+    volatile int batchSize = 500;
+    /**
+     * Rows per JDBC commit (a "transaction"). When {@code 0} (the default),
+     * the worker uses {@link #batchSize} as the commit unit — preserving the
+     * pre-issue-#401 behaviour of one flush per commit. When set to a value
+     * {@code >= batchSize}, each commit accumulates multiple
+     * {@code executeBatch()} flushes on the same JDBC connection before
+     * committing once at the transaction boundary. {@code volatile} for
+     * cross-thread visibility from the admin API.
+     */
+    volatile int transactionSize = 0;
     int queryThreads = 4;
     int queryCount = 1000;
     volatile int topK = 10;
@@ -89,7 +104,15 @@ public class Config {
         opts.addOption(null, "dataset-url", true, "Override dataset download URL");
         opts.addOption("n", "rows", true, "Number of rows to ingest (default: 100000, cycles dataset if larger)");
         opts.addOption(null, "ingest-threads", true, "Ingestion parallelism (default: 4)");
-        opts.addOption(null, "batch-size", true, "Commit after N inserts (default: 500)");
+        opts.addOption(null, "batch-size", true,
+                "Rows per JDBC executeBatch() flush (default: 500). When --transaction-size "
+                        + "is unset, this is also the commit unit (one flush per commit, "
+                        + "preserving the legacy behaviour). Runtime-tunable via the admin API.");
+        opts.addOption(null, "transaction-size", true,
+                "Rows per JDBC commit (default: same as --batch-size). When set, each commit "
+                        + "accumulates multiple --batch-size flushes on the same JDBC connection "
+                        + "before committing once at the transaction boundary. Must be >= --batch-size "
+                        + "and <= --ingest-max-ops (when finite). Runtime-tunable via the admin API.");
         opts.addOption(null, "query-threads", true, "Query parallelism (default: 4)");
         opts.addOption(null, "queries", true, "Number of ANN queries to execute (default: 1000)");
         opts.addOption("k", null, true, "LIMIT K for ANN queries (default: 10)");
@@ -184,6 +207,9 @@ public class Config {
         if (cmd.hasOption("batch-size")) {
             cfg.batchSize = Integer.parseInt(cmd.getOptionValue("batch-size"));
         }
+        if (cmd.hasOption("transaction-size")) {
+            cfg.transactionSize = Integer.parseInt(cmd.getOptionValue("transaction-size"));
+        }
         if (cmd.hasOption("query-threads")) {
             cfg.queryThreads = Integer.parseInt(cmd.getOptionValue("query-threads"));
         }
@@ -258,6 +284,11 @@ public class Config {
             cfg.statusIntervalSeconds = Integer.parseInt(cmd.getOptionValue("status-interval-seconds"));
         }
 
+        // Validate batch/transaction/ingest-max-ops invariants. We surface these as
+        // ParseException because they are user-supplied configuration errors and
+        // the rest of parse() also throws ParseException for input issues.
+        validateBatchAndTransactionInvariants(cfg);
+
         // Env var fallbacks (only applied when the CLI flag was not set).
         if (!cmd.hasOption("no-progress") && !cfg.noProgress) {
             String envNoProgress = System.getenv("VECTOR_BENCH_NO_PROGRESS");
@@ -320,6 +351,9 @@ public class Config {
         }
         if (props.containsKey("batch-size")) {
             batchSize = Integer.parseInt(props.getProperty("batch-size"));
+        }
+        if (props.containsKey("transaction-size")) {
+            transactionSize = Integer.parseInt(props.getProperty("transaction-size"));
         }
         if (props.containsKey("query-threads")) {
             queryThreads = Integer.parseInt(props.getProperty("query-threads"));
@@ -425,6 +459,52 @@ public class Config {
         return v.equals("1") || v.equals("true") || v.equals("yes") || v.equals("on");
     }
 
+    /**
+     * Returns the effective transaction size: {@link #transactionSize} when set
+     * to a positive value, otherwise {@link #batchSize}. The default of {@code 0}
+     * preserves the legacy behaviour of one flush per commit.
+     */
+    public int effectiveTransactionSize() {
+        int t = transactionSize;
+        return t > 0 ? t : batchSize;
+    }
+
+    /**
+     * Validates the joint invariants between {@link #batchSize},
+     * {@link #transactionSize}, and {@link #ingestMaxOpsPerSecond}.
+     *
+     * <ul>
+     *   <li>{@code batchSize >= 1}</li>
+     *   <li>If {@code transactionSize > 0}, then {@code transactionSize >= batchSize}</li>
+     *   <li>If {@code ingestMaxOpsPerSecond > 0}, then
+     *       {@code effectiveTransactionSize() <= ingestMaxOpsPerSecond}.
+     *       The rate limiter is acquired per commit, so the safety bound applies
+     *       to the commit unit (not the per-flush batch).</li>
+     * </ul>
+     *
+     * @throws ParseException if any invariant is violated, with a message that
+     *         names the offending values.
+     */
+    static void validateBatchAndTransactionInvariants(Config cfg) throws ParseException {
+        if (cfg.batchSize <= 0) {
+            throw new ParseException("--batch-size must be >= 1, got " + cfg.batchSize);
+        }
+        if (cfg.transactionSize < 0) {
+            throw new ParseException("--transaction-size must be >= 0, got " + cfg.transactionSize);
+        }
+        if (cfg.transactionSize > 0 && cfg.transactionSize < cfg.batchSize) {
+            throw new ParseException("--transaction-size (" + cfg.transactionSize
+                    + ") must be >= --batch-size (" + cfg.batchSize + ")");
+        }
+        int effectiveTxn = cfg.effectiveTransactionSize();
+        if (cfg.ingestMaxOpsPerSecond > 0 && effectiveTxn > cfg.ingestMaxOpsPerSecond) {
+            throw new ParseException("effective transaction size (" + effectiveTxn
+                    + ") must be <= --ingest-max-ops (" + cfg.ingestMaxOpsPerSecond
+                    + "). Either lower --batch-size/--transaction-size or raise --ingest-max-ops "
+                    + "(or set --ingest-max-ops 0 for unlimited).");
+        }
+    }
+
     /** Returns the similarity function: CLI override if set, otherwise dataset default. */
     String effectiveSimilarity() {
         return similarity != null ? similarity : dataset.similarity;
@@ -461,6 +541,7 @@ public class Config {
                 + ", rows=" + numRows
                 + ", ingestThreads=" + ingestThreads
                 + ", batchSize=" + batchSize
+                + ", transactionSize=" + effectiveTransactionSize()
                 + ", queryThreads=" + queryThreads
                 + ", queries=" + queryCount
                 + ", topK=" + topK

@@ -348,12 +348,25 @@ public class VectorBench {
                     config.ingestThreads, BenchRuntime.MAX_INGEST_THREADS,
                     60L, TimeUnit.SECONDS, new SynchronousQueue<>());
 
+            // Each spawned worker gets a fresh slot index in the rate-limiter
+            // group; the AtomicInteger lets setIngestThreads grow the index
+            // monotonically as new workers are submitted at runtime.
+            final java.util.concurrent.atomic.AtomicInteger nextRateLimiterIndex =
+                    new java.util.concurrent.atomic.AtomicInteger(0);
             // Factory captures all shared state so setIngestThreads can spawn
             // additional workers with the same queue and accumulators.
-            Supplier<Runnable> ingestWorkerFactory = () -> new IngestionWorker(
-                    config, ingestQueue, producerDone, rowId,
-                    ingestMetrics, ingestStatus, ingestStart, commitsTotal, commitsRecovered, rowsCommitted,
-                    runtime::ingestRateLimiter, runtime);
+            Supplier<Runnable> ingestWorkerFactory = () -> {
+                int idx = nextRateLimiterIndex.getAndIncrement();
+                // Ensure the rate-limiter group has a slot for this worker.
+                if (idx >= runtime.ingestRateLimiterGroup().size()) {
+                    runtime.ingestRateLimiterGroup().resize(idx + 1);
+                }
+                return new IngestionWorker(
+                        config, ingestQueue, producerDone, rowId,
+                        ingestMetrics, ingestStatus, ingestStart,
+                        commitsTotal, commitsRecovered, rowsCommitted,
+                        runtime.ingestRateLimiterGroup(), idx, runtime);
+            };
 
             runtime.setIngestContext(ingestQueue, ingestPool, ingestWorkerFactory);
 
@@ -539,7 +552,9 @@ public class VectorBench {
                 System.out.printf("=== INGESTION RESULTS ===%n");
                 System.out.printf("Rows: %d | Wall time: %.1fs | Throughput: %.0f ops/s%n",
                         ingestionRows, ingestSecs, ingestionThroughput);
-                System.out.printf("Threads: %d | Batch size: %d | Max ops/s: %s%n", config.ingestThreads, config.batchSize,
+                System.out.printf(
+                        "Threads: %d | Batch size: %d | Transaction size: %d | Max ops/s: %s%n",
+                        config.ingestThreads, config.batchSize, config.effectiveTransactionSize(),
                         config.ingestMaxOpsPerSecond > 0 ? config.ingestMaxOpsPerSecond : "unlimited");
                 ingestionLatency.print("INGESTION LATENCY");
             }
@@ -771,6 +786,7 @@ public class VectorBench {
             f.put("throughput_ops", round0(ingestionThroughput));
             f.put("threads", config.ingestThreads);
             f.put("batch_size", config.batchSize);
+            f.put("transaction_size", config.effectiveTransactionSize());
             f.put("latency_mean_ms", round2(ingestionLatency.meanNanos() / 1e6));
             f.put("latency_p50_ms", round2(ingestionLatency.p50Nanos() / 1e6));
             f.put("latency_p95_ms", round2(ingestionLatency.p95Nanos() / 1e6));

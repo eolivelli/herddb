@@ -416,6 +416,7 @@ abstract class BenchOutput {
             m.put("rows", config.numRows);
             m.put("ingest_threads", config.ingestThreads);
             m.put("batch_size", config.batchSize);
+            m.put("transaction_size", config.effectiveTransactionSize());
             m.put("query_threads", config.queryThreads);
             m.put("queries", config.queryCount);
             m.put("top_k", config.topK);
