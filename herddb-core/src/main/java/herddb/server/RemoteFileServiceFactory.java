@@ -24,6 +24,7 @@ import herddb.storage.DataStorageManager;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
  * Factory for constructing {@code herddb-remote-file-service} components
@@ -76,6 +77,18 @@ public interface RemoteFileServiceFactory {
             Path dataDirectory, Path tmpDirectory, int swapThreshold,
             RemoteFileClient client, Map<String, Object> config) {
         return createDataStorageManager(dataDirectory, tmpDirectory, swapThreshold, client);
+    }
+
+    /**
+     * Stats-aware overload (issue #398). Implementations that surface internal
+     * counters (e.g. boot-time cleanup deletions) should override this and
+     * scope-register them under {@code statsLogger}. The default delegates to
+     * the config-only overload so callers without a stats logger keep working.
+     */
+    default DataStorageManager createDataStorageManager(
+            Path dataDirectory, Path tmpDirectory, int swapThreshold,
+            RemoteFileClient client, Map<String, Object> config, StatsLogger statsLogger) {
+        return createDataStorageManager(dataDirectory, tmpDirectory, swapThreshold, client, config);
     }
 
     /**

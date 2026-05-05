@@ -486,8 +486,13 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                         configuration.getBoolean(
                                 ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
                                 ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT));
+                dsmConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
+                        configuration.getInt(
+                                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
+                                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT));
                 DataStorageManager dsm = factory.createDataStorageManager(
-                        dataDirectory, tmpDirectory, diskswapThreshold, client, dsmConfig);
+                        dataDirectory, tmpDirectory, diskswapThreshold, client, dsmConfig,
+                        statsLogger.scope("remote_storage"));
 
                 // Optionally enable checkpoint metadata publication to S3 for read replicas
                 boolean publishToRemote = configuration.getBoolean(

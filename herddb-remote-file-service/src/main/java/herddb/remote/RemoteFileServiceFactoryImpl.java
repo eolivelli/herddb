@@ -28,6 +28,8 @@ import herddb.storage.DataStorageManager;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import org.apache.bookkeeper.stats.NullStatsLogger;
+import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
  * Default {@link RemoteFileServiceFactory} implementation. Lives in
@@ -61,6 +63,14 @@ public class RemoteFileServiceFactoryImpl implements RemoteFileServiceFactory {
     public DataStorageManager createDataStorageManager(
             Path dataDirectory, Path tmpDirectory, int swapThreshold,
             RemoteFileClient client, Map<String, Object> config) {
+        return createDataStorageManager(dataDirectory, tmpDirectory, swapThreshold, client, config,
+                NullStatsLogger.INSTANCE);
+    }
+
+    @Override
+    public DataStorageManager createDataStorageManager(
+            Path dataDirectory, Path tmpDirectory, int swapThreshold,
+            RemoteFileClient client, Map<String, Object> config, StatsLogger statsLogger) {
         long valueCacheBytes = readLong(config,
                 ServerConfiguration.PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES,
                 ServerConfiguration.PROPERTY_REMOTE_LAZY_VALUE_CACHE_BYTES_DEFAULT);
@@ -73,11 +83,16 @@ public class RemoteFileServiceFactoryImpl implements RemoteFileServiceFactory {
         boolean hashChecksEnabled = readBoolean(config,
                 ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
                 ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
+        int cleanupBatchSize = readInt(config,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT);
         LazyValueCache cache = new LazyValueCache(valueCacheBytes);
         return new RemoteFileDataStorageManager(
                 dataDirectory, tmpDirectory, swapThreshold,
                 (RemoteFileServiceClient) client, cache, blockParallelism,
-                hashWritesEnabled, hashChecksEnabled);
+                hashWritesEnabled, hashChecksEnabled,
+                cleanupBatchSize,
+                statsLogger == null ? NullStatsLogger.INSTANCE : statsLogger);
     }
 
     private static long readLong(Map<String, Object> config, String key, long defaultValue) {

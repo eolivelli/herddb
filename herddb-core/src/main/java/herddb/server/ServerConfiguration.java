@@ -125,6 +125,20 @@ public final class ServerConfiguration {
     public static final int PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT = 8;
 
     /**
+     * Maximum number of stale page paths sent in a single {@code DeleteFiles}
+     * batch RPC during {@code RemoteFileDataStorageManager.cleanupAfterTableBoot}
+     * (issue #398). Each batch crosses the network once, so larger values cut the
+     * boot-time cleanup duration roughly proportionally on GCS-backed deployments
+     * where each individual delete costs ~100 ms. Keep small enough that one
+     * batch's RPC frame and per-path latency tail stay bounded — 100 paths per
+     * batch keeps the request well under typical gRPC frame caps and keeps
+     * progress visible in the server logs without flooding them.
+     */
+    public static final String PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE =
+            "server.remote.cleanup.batch.size";
+    public static final int PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT = 100;
+
+    /**
      * Maximum number of concurrent page/index-page writes to remote storage
      * during a single checkpoint flush (e.g. parallel BLink node writes in
      * {@code BLinkKeyToPageIndex.checkpoint}). Bounds the global fan-out so a
