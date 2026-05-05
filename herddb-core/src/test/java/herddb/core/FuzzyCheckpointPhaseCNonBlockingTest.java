@@ -104,6 +104,9 @@ public class FuzzyCheckpointPhaseCNonBlockingTest {
                 try {
                     manager.checkpoint();
                 } catch (Throwable t) {
+                    // Broad catch: this runs on a worker thread; any failure
+                    // (checked or unchecked) must be surfaced to the main thread
+                    // so the test reports it cleanly. CLAUDE.md compliance.
                     ckptError.set(t);
                 }
             }, "fuzzy-ckpt");

@@ -3938,6 +3938,14 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         final TableStatus tableStatus;
         final KeyToPageCheckpointSnapshot pkIndexSnapshot;
         final long keyToPageStart;
+
+        // Outer try/finally: guarantees checkPointRunning is cleared whether the
+        // failure originates inside the under-lock block (lock release in inner
+        // finally) or inside the persist block. Without this wrapper a throw in
+        // the under-lock block would leave checkPointRunning=true forever and
+        // permanently break TRUNCATE TABLE on this table (see applyTruncate's
+        // assertion). Issue #403 review.
+        try {
         try {
 
             /* *** Remaining spare data handling *** */
@@ -4054,15 +4062,29 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             pageSet.checkpointDone(flushedPages);
 
             /*
-             * Build a defensive HashMap snapshot of pageSet.activePages here — we are
+             * Build a defensive deep snapshot of pageSet.activePages here — we are
              * about to release the checkpoint write lock, after which concurrent DML
-             * may add or remove activePages entries. The snapshot is consumed by
+             * may add or remove activePages entries AND mutate the per-page
+             * {@link PageSet.DataPageMetaData#dirt} {@link java.util.concurrent.atomic.LongAdder}
+             * via {@code setPageDirty}. A shallow copy would let a {@code dirt.sum()}
+             * read inside {@code TableStatus.serialize(...)} include dirt accumulated
+             * AFTER {@code postFlushSequenceNumber}, producing on-disk dirt counts
+             * that disagree with the persisted LSN. Cloning each metadata into a
+             * fresh {@code DataPageMetaData} with the dirt sum captured here keeps
+             * the on-disk state strictly LSN-consistent. The snapshot is consumed by
              * dataStorageManager.tableCheckpoint below, which serializes it into the
              * TableStatus blob written to remote storage. See issue #403.
              */
+            Map<Long, PageSet.DataPageMetaData> activePagesSnapshot = new HashMap<>();
+            for (Entry<Long, PageSet.DataPageMetaData> e : pageSet.getActivePagesView().entrySet()) {
+                PageSet.DataPageMetaData live = e.getValue();
+                activePagesSnapshot.put(e.getKey(),
+                        new PageSet.DataPageMetaData(live.getSize(), live.getAverageRecordSize(),
+                                live.getDirtBytes()));
+            }
             tableStatus = new TableStatus(table.name, postFlushSequenceNumber,
                     Bytes.longToByteArray(nextPrimaryKeyValue.get()), nextPageId,
-                    pageSet.getActivePages());
+                    activePagesSnapshot);
 
             /*
              * Can happen when at checkpoint start all pages are set as dirty or immutable (immutable or
@@ -4084,42 +4106,43 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         /* === PHASE C-persist: NO checkpoint lock — slow remote I/O   === */
         /* === runs concurrently with DML / commits.   See issue #403. === */
         /* ============================================================== */
-        try {
-            actions.addAll(keyToPage.persistCheckpoint(pkIndexSnapshot));
-            maybeWarnOnActionAccumulation(actions);
-            keytopagecheckpoint = System.currentTimeMillis();
-            LOGGER.log(Level.INFO,
-                    "checkpoint {0}.{1} Phase C: PK index checkpoint done in {2} ms",
-                    new Object[]{table.tablespace, table.name, keytopagecheckpoint - keyToPageStart});
+        actions.addAll(keyToPage.persistCheckpoint(pkIndexSnapshot));
+        maybeWarnOnActionAccumulation(actions);
+        keytopagecheckpoint = System.currentTimeMillis();
+        LOGGER.log(Level.INFO,
+                "checkpoint {0}.{1} Phase C: PK index checkpoint done in {2} ms",
+                new Object[]{table.tablespace, table.name, keytopagecheckpoint - keyToPageStart});
 
-            final long tableStatusStart = System.currentTimeMillis();
-            LOGGER.log(Level.INFO,
-                    "checkpoint {0}.{1} Phase C: writing table status to storage ({2} active pages)",
-                    new Object[]{table.tablespace, table.name, tableStatus.activePages.size()});
-            actions.addAll(dataStorageManager.tableCheckpoint(tableSpaceUUID, table.uuid, tableStatus, pin));
-            maybeWarnOnActionAccumulation(actions);
-            tablecheckpoint = System.currentTimeMillis();
-            LOGGER.log(Level.INFO,
-                    "checkpoint {0}.{1} Phase C: table status written in {2} ms",
-                    new Object[]{table.tablespace, table.name, tablecheckpoint - tableStatusStart});
+        final long tableStatusStart = System.currentTimeMillis();
+        LOGGER.log(Level.INFO,
+                "checkpoint {0}.{1} Phase C: writing table status to storage ({2} active pages)",
+                new Object[]{table.tablespace, table.name, tableStatus.activePages.size()});
+        actions.addAll(dataStorageManager.tableCheckpoint(tableSpaceUUID, table.uuid, tableStatus, pin));
+        maybeWarnOnActionAccumulation(actions);
+        tablecheckpoint = System.currentTimeMillis();
+        LOGGER.log(Level.INFO,
+                "checkpoint {0}.{1} Phase C: table status written in {2} ms",
+                new Object[]{table.tablespace, table.name, tablecheckpoint - tableStatusStart});
 
-            result = new TableCheckpoint(table.name, postFlushSequenceNumber, actions);
+        result = new TableCheckpoint(table.name, postFlushSequenceNumber, actions);
 
-            end = System.currentTimeMillis();
-            if (flushedRecords > 0) {
-                LOGGER.log(Level.INFO, "checkpoint {0} finished, logpos {1}, {2} active pages, {3} dirty pages, "
-                        + "flushed {4} records, total time {5} ms",
-                        new Object[]{table.name, sequenceNumber, pageSet.getActivePagesCount(),
-                            pageSet.getDirtyPagesCount(), flushedRecords, Long.toString(end - start)});
-            }
+        end = System.currentTimeMillis();
+        if (flushedRecords > 0) {
+            LOGGER.log(Level.INFO, "checkpoint {0} finished, logpos {1}, {2} active pages, {3} dirty pages, "
+                    + "flushed {4} records, total time {5} ms",
+                    new Object[]{table.name, sequenceNumber, pageSet.getActivePagesCount(),
+                        pageSet.getDirtyPagesCount(), flushedRecords, Long.toString(end - start)});
+        }
 
-            if (LOGGER.isLoggable(Level.FINE)) {
-                LOGGER.log(Level.FINE, "checkpoint {0} finished, logpos {1}, pageSet: {2}",
-                        new Object[]{table.name, sequenceNumber, pageSet.toString()});
-            }
+        if (LOGGER.isLoggable(Level.FINE)) {
+            LOGGER.log(Level.FINE, "checkpoint {0} finished, logpos {1}, pageSet: {2}",
+                    new Object[]{table.name, sequenceNumber, pageSet.toString()});
+        }
 
         } finally {
-            // Ensure checkPointRunning is cleared whether persistence succeeded or failed.
+            // Outer finally for issue #403: clears checkPointRunning whether the
+            // failure originated inside the under-lock block (where the inner
+            // finally above releases the lock) or inside the persist block.
             checkPointRunning = false;
         }
 

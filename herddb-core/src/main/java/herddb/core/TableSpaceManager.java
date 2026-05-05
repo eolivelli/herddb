@@ -235,20 +235,6 @@ public class TableSpaceManager {
         this.afterTableCheckPointAction = afterTableCheckPointAction;
     }
 
-    /**
-     * Test-only hook fired in {@link #checkpoint(boolean, boolean, boolean)} immediately
-     * <strong>after</strong> Phase A releases {@code generalLock} but
-     * <strong>before</strong> Phase B starts iterating tables. Used by issue #403
-     * regression tests to deterministically assert that DML proceeds while the
-     * remote-storage publishing of transactions/schemas is still running.
-     * {@code null} in production.
-     */
-    private volatile Runnable afterPhaseAReleasedAction;
-
-    public void setAfterPhaseAReleasedAction(Runnable afterPhaseAReleasedAction) {
-        this.afterPhaseAReleasedAction = afterPhaseAReleasedAction;
-    }
-
     public String getTableSpaceName() {
         return tableSpaceName;
     }
@@ -2882,9 +2868,6 @@ public class TableSpaceManager {
                             tableSpaceUUID, logSequenceNumber, currentTransactions));
                     actions.addAll(dataStorageManager.writeTables(
                             tableSpaceUUID, logSequenceNumber, tablelistSnapshot, indexlistSnapshot, true));
-                    if (afterPhaseAReleasedAction != null) {
-                        afterPhaseAReleasedAction.run();
-                    }
 
                     /* *** Phase B: per-table checkpoint — no tablespace write lock held *** */
                     for (AbstractTableManager tableManager : tablesToCheckpoint) {
