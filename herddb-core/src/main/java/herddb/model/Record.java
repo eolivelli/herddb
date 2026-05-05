@@ -130,6 +130,30 @@ public final class Record implements SizeAwareObject {
         cache = null;
     }
 
+    /**
+     * Releases any off-heap memory held by {@link #key} or {@link #value}.
+     * Idempotent: safe to call any number of times — both
+     * {@code Bytes.release()} calls are themselves idempotent and treat
+     * on-heap-backed {@code Bytes} as a no-op.
+     *
+     * <p>Callers must respect the {@code Bytes.release()} quiescence
+     * contract: invoke this method only when the {@code Record} (and the
+     * surrounding {@code DataPage}) are no longer reachable from any reader,
+     * typically as part of eviction.
+     *
+     * <p>Step-2 baseline: {@code Record} construction still uses on-heap
+     * {@code Bytes}, so this method is a no-op in production. It exists so
+     * the slab-eviction path added in step 3 can call it uniformly.
+     */
+    public void release() {
+        if (key != null) {
+            key.release();
+        }
+        if (value != null) {
+            value.release();
+        }
+    }
+
     @Override
     public int hashCode() {
         int hash = 3;

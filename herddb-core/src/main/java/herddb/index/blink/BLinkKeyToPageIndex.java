@@ -45,6 +45,8 @@ import herddb.storage.IndexStatus;
 import herddb.utils.ByteArrayCursor;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataOutputStream;
+import herddb.utils.HerdDBByteBufAllocators;
+import herddb.utils.IndexKeySlab;
 import herddb.utils.SystemProperties;
 import herddb.utils.VisibleByteArrayOutputStream;
 import java.io.IOException;
@@ -869,24 +871,71 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
                     throw new IOException("Wrong page type " + rtype + " expected " + type);
                 }
 
+                // Issue #399 step 4: collect all (key bytes, value) pairs
+                // first so we can size and allocate a single off-heap slab
+                // from HerdDBByteBufAllocators.indexPagesAllocator() and
+                // pack every key into it. Below the threshold we keep the
+                // legacy on-heap path to avoid the slab overhead on tiny
+                // pages.
+                List<byte[]> keyBytesList = new ArrayList<>();
+                List<Long> valueList = new ArrayList<>();
+                List<Long> infiniteValueList = new ArrayList<>();
+                long totalKeyBytes = 0L;
+
                 byte block;
                 while ((block = in.readByte()) != NODE_PAGE_END_BLOCK) {
 
                     switch (block) {
 
-                        case NODE_PAGE_KEY_VALUE_BLOCK:
-                            map.put(in.readBytes(),
-                                    in.readVLong());
+                        case NODE_PAGE_KEY_VALUE_BLOCK: {
+                            byte[] k = in.readArray();
+                            if (k == null) {
+                                // Defensive: writer never emits a null array
+                                // (it always passes a non-null byte[] to
+                                // out.writeArray), so this means the on-disk
+                                // page is corrupted. Fail fast — the previous
+                                // map.put(in.readBytes(), …) path would have
+                                // NPEd inside the TreeMap; this is more
+                                // actionable.
+                                throw new IOException("corrupted index page "
+                                        + pageId + ": null key");
+                            }
+                            long v = in.readVLong();
+                            keyBytesList.add(k);
+                            valueList.add(v);
+                            totalKeyBytes += (long) k.length;
                             break;
+                        }
 
                         case NODE_PAGE_INF_BLOCK:
-                            map.put(Bytes.POSITIVE_INFINITY, in.readVLong());
+                            infiniteValueList.add(in.readVLong());
                             break;
 
                         default:
                             throw new IOException("Wrong node block type " + block);
 
                     }
+                }
+
+                if (totalKeyBytes >= IndexKeySlab.OFFHEAP_KEY_BYTES_THRESHOLD
+                        && totalKeyBytes <= (long) Integer.MAX_VALUE) {
+                    IndexKeySlab slabOwner = new IndexKeySlab(totalKeyBytes,
+                            HerdDBByteBufAllocators.indexPagesAllocator());
+                    for (int i = 0; i < keyBytesList.size(); i++) {
+                        byte[] k = keyBytesList.get(i);
+                        int off = slabOwner.append(k);
+                        map.put(slabOwner.wrap(off, k.length), valueList.get(i));
+                    }
+                } else {
+                    // On-heap fallback: total below the threshold, or the
+                    // theoretical >2 GiB upper bound we cannot fit into one
+                    // ByteBuf — keep the original behaviour.
+                    for (int i = 0; i < keyBytesList.size(); i++) {
+                        map.put(Bytes.from_array(keyBytesList.get(i)), valueList.get(i));
+                    }
+                }
+                for (Long v : infiniteValueList) {
+                    map.put(Bytes.POSITIVE_INFINITY, v);
                 }
 
                 return map;

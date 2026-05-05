@@ -48,6 +48,8 @@ import herddb.utils.ByteBufCursor;
 import herddb.utils.Bytes;
 import herddb.utils.DataAccessor;
 import herddb.utils.ExtendedDataOutputStream;
+import herddb.utils.HerdDBByteBufAllocators;
+import herddb.utils.IndexKeySlab;
 import herddb.utils.SystemProperties;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -92,7 +94,12 @@ public class BRINIndexManager extends AbstractIndexManager {
                 storageLayer);
     }
 
-    private static class PageContents {
+    /**
+     * Package-private (was {@code private}) so {@code BRINOffHeapKeysTest}
+     * can drive {@link #deserialize(byte[])} with a synthetic page and
+     * assert that loaded keys are slab-packed off-heap (issue #399 step 5).
+     */
+    static class PageContents {
 
         public static final int TYPE_METADATA = 9;
         public static final int TYPE_BLOCKDATA = 10;
@@ -100,6 +107,31 @@ public class BRINIndexManager extends AbstractIndexManager {
         private int type;
         private List<Map.Entry<Bytes, Bytes>> pageData;
         private List<BlockRangeIndexMetadata.BlockMetadata<Bytes>> metadata;
+
+        // Test-only accessors for issue #399 step-5 assertions.
+        int getType() {
+            return type;
+        }
+
+        List<Map.Entry<Bytes, Bytes>> getPageData() {
+            return pageData;
+        }
+
+        List<BlockRangeIndexMetadata.BlockMetadata<Bytes>> getMetadata() {
+            return metadata;
+        }
+
+        void setType(int type) {
+            this.type = type;
+        }
+
+        void setPageData(List<Map.Entry<Bytes, Bytes>> pageData) {
+            this.pageData = pageData;
+        }
+
+        void setMetadata(List<BlockRangeIndexMetadata.BlockMetadata<Bytes>> metadata) {
+            this.metadata = metadata;
+        }
 
         byte[] serialize() throws IOException {
             try (ByteArrayOutputStream out = new ByteArrayOutputStream(1024);
@@ -177,49 +209,120 @@ public class BRINIndexManager extends AbstractIndexManager {
             result.type = in.readVInt();
             switch (result.type) {
                 case TYPE_METADATA:
-                    int blocks = in.readVInt();
-                    result.metadata = new ArrayList<>();
-                    for (int i = 0; i < blocks; i++) {
-                        byte blockFlags = in.readByte();
-                        Bytes firstKey;
-                        if ((blockFlags & BlockMetadata.HEAD) > 0) {
-                            /* Is HEAD */
-                            /* First key is null if is the head block */
-                            firstKey = null;
-                        } else {
-                            firstKey = in.readBytesNoCopy();
-                        }
-
-                        long blockId = in.readZLong();
-                        long size = in.readVLong();
-                        long pageId = in.readVLong();
-
-                        Long nextBlockId;
-                        if ((blockFlags & BlockMetadata.TAIL) > 0) {
-                            /* Is TAIL */
-                            /* Next block is null if is the tail block */
-                            nextBlockId = null;
-                        } else {
-                            nextBlockId = in.readZLong();
-                        }
-
-                        BlockRangeIndexMetadata.BlockMetadata<Bytes> md = new BlockRangeIndexMetadata.BlockMetadata<>(firstKey, blockId, size, pageId, nextBlockId);
-                        result.metadata.add(md);
-                    }
+                    deserializeMetadata(in, result);
                     break;
                 case TYPE_BLOCKDATA:
-                    int values = in.readVInt();
-                    result.pageData = new ArrayList<>(values);
-                    for (int i = 0; i < values; i++) {
-                        Bytes key = in.readBytesNoCopy();
-                        Bytes value = in.readBytesNoCopy();
-                        result.pageData.add(new AbstractMap.SimpleImmutableEntry<>(key, value));
-                    }
+                    deserializeBlockData(in, result);
                     break;
                 default:
                     throw new IOException("bad index page type " + result.type);
             }
             return result;
+        }
+
+        /**
+         * Issue #399 step 5: TYPE_METADATA pages carry one (small)
+         * {@code firstKey} per block. We collect the raw bytes first, then
+         * either pack them into a single off-heap slab from the index-pages
+         * pool (when total ≥ 4 KiB) or fall back to on-heap Bytes for tiny
+         * pages where the slab overhead would dominate.
+         */
+        private static void deserializeMetadata(ByteBufCursor in, PageContents result) throws IOException {
+            int blocks = in.readVInt();
+            result.metadata = new ArrayList<>(blocks);
+
+            // First pass: read raw bytes + bookkeeping per block.
+            byte[] flagsArr = new byte[blocks];
+            byte[][] firstKeyBytes = new byte[blocks][];
+            long[] blockIds = new long[blocks];
+            long[] sizes = new long[blocks];
+            long[] pageIds = new long[blocks];
+            Long[] nextBlockIds = new Long[blocks];
+            long totalKeyBytes = 0L;
+
+            for (int i = 0; i < blocks; i++) {
+                byte blockFlags = in.readByte();
+                flagsArr[i] = blockFlags;
+                if ((blockFlags & BlockMetadata.HEAD) == 0) {
+                    byte[] k = in.readArray();
+                    if (k == null) {
+                        throw new IOException("corrupted BRIN metadata page: null firstKey");
+                    }
+                    firstKeyBytes[i] = k;
+                    totalKeyBytes += k.length;
+                }
+                blockIds[i] = in.readZLong();
+                sizes[i] = in.readVLong();
+                pageIds[i] = in.readVLong();
+                nextBlockIds[i] = ((blockFlags & BlockMetadata.TAIL) == 0)
+                        ? in.readZLong() : null;
+            }
+
+            IndexKeySlab slabOwner = (totalKeyBytes >= IndexKeySlab.OFFHEAP_KEY_BYTES_THRESHOLD
+                    && totalKeyBytes <= (long) Integer.MAX_VALUE)
+                    ? new IndexKeySlab(totalKeyBytes,
+                            HerdDBByteBufAllocators.indexPagesAllocator())
+                    : null;
+
+            for (int i = 0; i < blocks; i++) {
+                Bytes firstKey;
+                if ((flagsArr[i] & BlockMetadata.HEAD) != 0) {
+                    firstKey = null;
+                } else if (slabOwner != null) {
+                    int off = slabOwner.append(firstKeyBytes[i]);
+                    firstKey = slabOwner.wrap(off, firstKeyBytes[i].length);
+                } else {
+                    firstKey = Bytes.from_array(firstKeyBytes[i]);
+                }
+                result.metadata.add(new BlockRangeIndexMetadata.BlockMetadata<>(
+                        firstKey, blockIds[i], sizes[i], pageIds[i], nextBlockIds[i]));
+            }
+        }
+
+        /**
+         * Issue #399 step 5: TYPE_BLOCKDATA pages carry many (key, value)
+         * pairs. Both sides are slab-packed when the aggregate exceeds the
+         * threshold; below the threshold we keep the legacy on-heap Bytes
+         * path.
+         */
+        private static void deserializeBlockData(ByteBufCursor in, PageContents result) throws IOException {
+            int values = in.readVInt();
+            result.pageData = new ArrayList<>(values);
+
+            byte[][] keyBytesArr = new byte[values][];
+            byte[][] valueBytesArr = new byte[values][];
+            long totalBytes = 0L;
+            for (int i = 0; i < values; i++) {
+                byte[] k = in.readArray();
+                byte[] v = in.readArray();
+                if (k == null || v == null) {
+                    throw new IOException("corrupted BRIN data page: null key or value");
+                }
+                keyBytesArr[i] = k;
+                valueBytesArr[i] = v;
+                totalBytes += (long) k.length + (long) v.length;
+            }
+
+            IndexKeySlab slabOwner = (totalBytes >= IndexKeySlab.OFFHEAP_KEY_BYTES_THRESHOLD
+                    && totalBytes <= (long) Integer.MAX_VALUE)
+                    ? new IndexKeySlab(totalBytes,
+                            HerdDBByteBufAllocators.indexPagesAllocator())
+                    : null;
+
+            for (int i = 0; i < values; i++) {
+                Bytes key;
+                Bytes value;
+                if (slabOwner != null) {
+                    int kOff = slabOwner.append(keyBytesArr[i]);
+                    key = slabOwner.wrap(kOff, keyBytesArr[i].length);
+                    int vOff = slabOwner.append(valueBytesArr[i]);
+                    value = slabOwner.wrap(vOff, valueBytesArr[i].length);
+                } else {
+                    key = Bytes.from_array(keyBytesArr[i]);
+                    value = Bytes.from_array(valueBytesArr[i]);
+                }
+                result.pageData.add(new AbstractMap.SimpleImmutableEntry<>(key, value));
+            }
         }
 
         static PageContents deserialize(byte[] pagedata) throws IOException {

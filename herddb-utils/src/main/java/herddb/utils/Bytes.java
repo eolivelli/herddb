@@ -21,16 +21,60 @@
 package herddb.utils;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.netty.buffer.ByteBuf;
 import io.netty.util.internal.PlatformDependent;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 
 /**
- * A wrapper for byte[], in order to use it as keys on HashMaps
+ * A wrapper for byte[], in order to use it as keys on HashMaps.
+ *
+ * <h3>Storage modes</h3>
+ * Two backing representations are supported:
+ * <ul>
+ *   <li><b>On-heap</b> (the default): {@code buffer + offset + length} hold a
+ *       {@code byte[]} slice. Effectively immutable; safely publishable by any
+ *       constructor that initialises {@link #buffer} and {@link #offset}.</li>
+ *   <li><b>Off-heap</b> (via {@link #fromOffHeap(ByteBuf)}, used by issue #399's
+ *       slab owners): {@code offHeap} holds a Netty {@link ByteBuf} slice into
+ *       a pooled direct-memory slab. The on-heap fields stay {@code null}/0
+ *       until the first {@code byte[]} accessor lazily materialises the bytes
+ *       and releases the slice.</li>
+ * </ul>
+ *
+ * <h3>Lifecycle of off-heap-backed instances</h3>
+ * {@code release()} returns the slice to its pool. After {@code release()}
+ * (without a preceding lazy materialisation) every accessor that reads bytes
+ * throws {@link IllegalStateException}. The slab owner must guarantee
+ * <em>quiescence</em> (no other thread can be inside any read path on this
+ * {@code Bytes}) before calling {@code release()} — the standard discipline
+ * for pooled buffers. In practice the pattern is:
+ * <pre>
+ *   1) remove the {@code Bytes} (and the surrounding {@code Record} / index node)
+ *      from every {@code ConcurrentHashMap} / scan structure that could expose it;
+ *   2) wait for any in-flight reader (e.g. drain a page-level read lock);
+ *   3) call {@code release()}.
+ * </pre>
+ *
+ * <h3>Thread-safety</h3>
+ * Concurrent readers of an on-heap-backed {@code Bytes} need no synchronisation:
+ * {@link #buffer}, {@link #offset}, {@link #offHeap} and {@link #hashCode} are
+ * declared {@code volatile} so that reads observe the constructor-time writes
+ * via the JLS happens-before edge, even though {@code buffer} and {@code offset}
+ * lost their {@code final} modifier to support the off-heap path's lazy
+ * materialisation. Off-heap-backed reads remain safe under the quiescence
+ * contract above; cross-thread reads concurrent with {@code release()} are
+ * undefined and are the slab owner's bug.
  *
  * @author enrico.olivelli
  */
-@SuppressFBWarnings(value = {"EI_EXPOSE_REP2", "EI_EXPOSE_REP", "UUF_UNUSED_PUBLIC_OR_PROTECTED_FIELD"})
+@SuppressFBWarnings(value = {"EI_EXPOSE_REP2", "EI_EXPOSE_REP", "UUF_UNUSED_PUBLIC_OR_PROTECTED_FIELD",
+        // synchronized writers (release / materialiseFromOffHeap) vs. unsynchronized
+        // readers — tolerated under the quiescence contract documented on
+        // release(); volatile fields provide the necessary visibility.
+        "IS2_INCONSISTENT_SYNC"})
 public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
 
     public static final Bytes POSITIVE_INFINITY = new Bytes(new byte[0]);
@@ -56,23 +100,71 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      * Estimated size of a Bytes instance (excluding the data array contents).
      * <p>
      * With compressed oops (heap &lt; 32GB):
-     * header(12) + buffer ref(4) + offset(4) + length(4) + hashCode(4) + deserialized ref(4) = 32 bytes
+     * header(12) + buffer ref(4) + offset(4) + length(4) + hashCode(4)
+     * + offHeap ref(4) + ownsSlice byte+pad(4) + slabOwner ref(4)
+     * + deserialized ref(4) = 44 → padded to 48
      * <p>
      * Without compressed oops (heap &gt;= 32GB):
-     * header(16) + buffer ref(8) + offset(4) + length(4) + hashCode(4) + deserialized ref(8) + padding(4) = 48 bytes
+     * header(16) + buffer ref(8) + offset(4) + length(4) + hashCode(4)
+     * + offHeap ref(8) + ownsSlice byte+pad(8) + slabOwner ref(8)
+     * + deserialized ref(8) = 76 → padded to 80
      */
     private static final int CONSTANT_BYTE_SIZE = ObjectSizeUtils.COMPRESSED_OOPS
-            ? 32
-            : 48;
+            ? 48
+            : 80;
 
     public static long estimateSize(byte[] value) {
         return value.length + CONSTANT_BYTE_SIZE;
     }
 
-    private final byte[] buffer;
-    private final int offset;
+    /**
+     * On-heap backing array. Lazily materialised when this {@code Bytes} was
+     * constructed off-heap and a byte[] accessor is invoked. Once materialised
+     * the off-heap reference is released and {@code buffer} stays cached so
+     * subsequent reads are O(1). {@code volatile} so a reader on another core
+     * sees the materialised value without acquiring the instance monitor.
+     */
+    private volatile byte[] buffer;
+    private volatile int offset;
     private final int length;
-    private int hashCode = -1;
+    private volatile int hashCode = -1;
+
+    /**
+     * Off-heap backing slice when this {@code Bytes} was constructed via
+     * {@link #fromOffHeap(ByteBuf)} or {@link #fromSharedSlab(ByteBuf, int, int, Object)}.
+     * {@code null} for on-heap-backed instances and after {@link #release()}
+     * or after lazy materialisation. {@code volatile} so a reader observes a
+     * consistent {@code (offHeap, buffer)} pair across the materialisation
+     * transition.
+     */
+    private volatile ByteBuf offHeap;
+
+    /**
+     * When {@code true}, {@link #release()} and {@link #materialiseFromOffHeap()}
+     * decrement the slice's refcount; this is the {@link #fromOffHeap(ByteBuf)}
+     * lifecycle where each {@code Bytes} owns one refcount on its slice.
+     *
+     * <p>When {@code false}, the {@code Bytes} is a non-owning view into a
+     * larger slab whose lifecycle is managed by an external owner (typically
+     * a {@code DataPage} via a {@link java.lang.ref.Cleaner}); see
+     * {@link #fromSharedSlab(ByteBuf, int, int, Object)}. {@code release()}
+     * is a no-op and lazy materialisation copies bytes without touching the
+     * slab's refcount.
+     */
+    private final boolean ownsSlice;
+
+    /**
+     * Strong reference held to anchor the slab-owner against premature GC,
+     * for {@code Bytes} produced by {@link #fromSharedSlab(ByteBuf, int, int, Object)}.
+     * {@code null} for owned slices and on-heap-backed instances.
+     *
+     * <p>This is the standard JDK {@code Cleaner} anchor pattern: as long as
+     * any {@code Bytes} references its slab owner, the owner stays
+     * GC-reachable and its {@code Cleanable} does not release the slab,
+     * preventing a use-after-free for in-flight readers.
+     */
+    @SuppressFBWarnings("URF_UNREAD_FIELD")
+    private final Object slabOwner;
 
     public Object deserialized;
 
@@ -143,17 +235,18 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     public byte[] to_array() {
-        if (offset == 0 && buffer.length == length) {
-            return buffer;
-        } else {
-            byte[] copy = new byte[length];
-            System.arraycopy(buffer, offset, copy, 0, length);
-            return copy;
+        byte[] data = getBuffer();
+        int srcOffset = offset;
+        if (srcOffset == 0 && data.length == length) {
+            return data;
         }
+        byte[] copy = new byte[length];
+        System.arraycopy(data, srcOffset, copy, 0, length);
+        return copy;
     }
 
     public float[] to_float_array() {
-        return to_float_array(buffer, offset, length);
+        return to_float_array(getBuffer(), getOffset(), length);
     }
 
     public static float[] to_float_array(byte[] buffer, int offset, int length) {
@@ -219,20 +312,20 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
 
     public long to_long() {
         assert length == 8;
-        return toLong(buffer, offset);
+        return toLong(getBuffer(), getOffset());
     }
 
     public RawString to_RawString() {
-        return RawString.newUnpooledRawString(buffer, offset, length);
+        return RawString.newUnpooledRawString(getBuffer(), getOffset(), length);
     }
 
     public int to_int() {
         assert length == 4;
-        return toInt(buffer, offset);
+        return toInt(getBuffer(), getOffset());
     }
 
     public String to_string() {
-        return new String(buffer, offset, length, StandardCharsets.UTF_8);
+        return new String(getBuffer(), getOffset(), length, StandardCharsets.UTF_8);
     }
 
     public static String to_string(byte[] data) {
@@ -245,38 +338,324 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
 
     public java.sql.Timestamp to_timestamp() {
         assert length == 8;
-        return toTimestamp(buffer, offset);
+        return toTimestamp(getBuffer(), getOffset());
     }
 
     public boolean to_boolean() {
         assert length == 1;
-        return toBoolean(buffer, offset);
+        return toBoolean(getBuffer(), getOffset());
     }
 
     public double to_double() {
         assert length == 8;
-        return toDouble(buffer, offset);
+        return toDouble(getBuffer(), getOffset());
     }
 
     private Bytes(byte[] data) {
         this.buffer = data;
         this.offset = 0;
         this.length = buffer.length;
+        this.ownsSlice = false;
+        this.slabOwner = null;
     }
 
     private Bytes(byte[] data, int offset, int length) {
         this.buffer = data;
         this.offset = offset;
         this.length = length;
+        this.ownsSlice = false;
+        this.slabOwner = null;
+    }
+
+    /** Internal off-heap constructor; see {@link #fromOffHeap(ByteBuf)}. */
+    private Bytes(ByteBuf slice) {
+        this.buffer = null;
+        this.offset = 0;
+        this.length = slice.readableBytes();
+        this.offHeap = slice;
+        this.ownsSlice = true;
+        this.slabOwner = null;
+    }
+
+    /**
+     * Internal shared-slab constructor; see
+     * {@link #fromSharedSlab(ByteBuf, int, int, Object)}.
+     */
+    private Bytes(ByteBuf sharedSlice, Object owner) {
+        this.buffer = null;
+        this.offset = 0;
+        this.length = sharedSlice.readableBytes();
+        this.offHeap = sharedSlice;
+        this.ownsSlice = false;
+        this.slabOwner = owner;
+    }
+
+    /**
+     * Wraps a {@link ByteBuf} slice into a {@code Bytes}, taking ownership of
+     * one refcount on the slice. The slice's {@link ByteBuf#readableBytes()}
+     * is the value's length; {@link ByteBuf#readerIndex()} is the start.
+     *
+     * <p>The intended workflow is:
+     * <pre>
+     *   ByteBuf slab = HerdDBByteBufAllocators.dataPagesAllocator()
+     *       .directBuffer(totalSize);
+     *   slab.writeBytes(payload);
+     *   ByteBuf slice = slab.retainedSlice(off, len); // bump slab refcount
+     *   Bytes b = Bytes.fromOffHeap(slice);
+     * </pre>
+     *
+     * <p>The slice may be backed by direct or heap memory: this method does
+     * not enforce the storage class. Issue-#399 callers always pass a direct
+     * slice from {@code HerdDBByteBufAllocators.dataPagesAllocator()} or
+     * {@code .indexPagesAllocator()}.
+     *
+     * <p>After {@link #release()} the underlying memory is returned to its
+     * pool. Subsequent on-heap accessors ({@link #getBuffer()},
+     * {@link #to_array()}, etc.) on a not-yet-released instance lazily
+     * materialise the bytes into a fresh {@code byte[]} and release the
+     * slice; after such materialisation the {@code Bytes} behaves like an
+     * on-heap one and {@link #isShared()} returns {@code false} (the
+     * materialised array is private and exactly {@code length} bytes long).
+     *
+     * <p>Callers must not retain or read the slice after this method returns;
+     * lifecycle ownership transfers to the returned {@code Bytes}.
+     *
+     * @throws NullPointerException if {@code slice} is null.
+     */
+    public static Bytes fromOffHeap(ByteBuf slice) {
+        if (slice == null) {
+            throw new NullPointerException("slice");
+        }
+        return new Bytes(slice);
+    }
+
+    /**
+     * Wraps a non-owning slice of an externally-managed slab into a
+     * {@code Bytes}. Used by {@code DataPage}, BLink and BRIN slab-packing
+     * paths where many records share a single off-heap slab whose lifecycle
+     * is governed by the slab owner (typically via a JDK {@link java.lang.ref.Cleaner}).
+     *
+     * <p>Semantics that differ from {@link #fromOffHeap(ByteBuf)}:
+     * <ul>
+     *   <li>{@link #release()} on this {@code Bytes} is a <b>no-op</b> — the
+     *       caller must not release the slice, because it shares the slab's
+     *       refcount and a premature decrement would invalidate every other
+     *       slice on the same slab. The slab owner releases the slab once
+     *       (decrementing the shared refcount) when its lifecycle ends.</li>
+     *   <li>{@link #getBuffer()} (and any byte[] accessor) still copies the
+     *       slice into a fresh {@code byte[]}, but does <b>not</b> release
+     *       the slice for the same reason. After materialisation the
+     *       {@code Bytes} behaves exactly like an on-heap one.</li>
+     *   <li>The {@code Bytes} retains a strong reference to {@code owner}
+     *       (typically the {@code DataPage} or BLink/BRIN node holding the
+     *       slab) so the JDK {@code Cleaner} attached to {@code owner} does
+     *       not run while any reader still holds this {@code Bytes}. This is
+     *       the standard {@code Cleaner} anchor pattern; without it a
+     *       reader could observe a use-after-free.</li>
+     * </ul>
+     *
+     * @param slice  a non-owning slice (typically {@code slab.slice(off, len)});
+     *               the returned {@code Bytes} reads bytes via the slice but
+     *               never releases it.
+     * @param owner  the slab owner whose {@code Cleaner.Cleanable} releases
+     *               the slab; must be the object the {@code Cleaner} is
+     *               attached to so that GC keeps it alive while readers
+     *               exist.
+     * @throws NullPointerException if {@code slice} or {@code owner} is null.
+     */
+    public static Bytes fromSharedSlab(ByteBuf slice, Object owner) {
+        if (slice == null) {
+            throw new NullPointerException("slice");
+        }
+        if (owner == null) {
+            throw new NullPointerException("owner");
+        }
+        return new Bytes(slice, owner);
+    }
+
+    /**
+     * Convenience overload that takes the slab plus an explicit
+     * {@code (offset, length)} window. Internally builds {@code slab.slice(offset, length)}.
+     */
+    public static Bytes fromSharedSlab(ByteBuf slab, int offset, int length, Object owner) {
+        if (slab == null) {
+            throw new NullPointerException("slab");
+        }
+        if (owner == null) {
+            throw new NullPointerException("owner");
+        }
+        return new Bytes(slab.slice(offset, length), owner);
+    }
+
+    /**
+     * Returns {@code true} if this {@code Bytes} is currently backed by an
+     * off-heap {@link ByteBuf} slice (i.e. {@link #fromOffHeap(ByteBuf)} was
+     * used to construct it and neither {@link #release()} nor lazy
+     * materialisation has run yet).
+     */
+    public boolean isOffHeap() {
+        return offHeap != null;
+    }
+
+    /**
+     * Releases the underlying off-heap slice if any. Idempotent: calling
+     * {@code release()} more than once, on an on-heap-backed {@code Bytes},
+     * or after lazy materialisation is a no-op.
+     *
+     * <p><b>Quiescence contract</b>: after {@code release()} every accessor
+     * that reads bytes (including {@link #getBuffer()}, {@link #to_array()},
+     * {@link #to_long()}, {@link #equals(Object)}, {@link #hashCode()},
+     * {@link #compareTo(Bytes)}, {@link #writeTo(ByteBuf)}, etc.) throws
+     * {@link IllegalStateException}. The slab owner is responsible for
+     * guaranteeing that no other thread is inside any read path on this
+     * {@code Bytes} when {@code release()} is invoked. The standard pattern
+     * — used by issue #399's slab owners — is:
+     * <pre>
+     *   1) remove the {@code Bytes} (and the surrounding {@code Record} or
+     *      index node) from every map / scan structure that could expose it;
+     *   2) drain any in-flight reader (e.g. acquire the page-level read
+     *      lock, or wait for the slab's grace period);
+     *   3) call {@code release()}.
+     * </pre>
+     * Concurrent reads racing against {@code release()} are undefined
+     * behaviour and must be prevented by the slab owner.
+     *
+     * <p><b>The same quiescence requirement applies to any heap-accessor
+     * call</b> on an off-heap-backed {@code Bytes}, because such a call may
+     * trigger {@link #materialiseFromOffHeap()} which itself releases the
+     * slice. A reader inside {@link #writeTo(ByteBuf)} / {@link #writeTo(OutputStream)}
+     * / {@link #compareTo(Bytes)} / {@link #equals(Object)} / {@link #hashCode()}
+     * snapshots {@code offHeap} into a local; if a sibling thread runs
+     * {@link #getBuffer()} (or any other on-heap accessor) concurrently and
+     * the slab returned to the pool while the snapshot is still in use, the
+     * reader observes a use-after-free. The slab owner must therefore ensure
+     * single-threaded access (or external synchronisation) before triggering
+     * a materialising read on a {@code Bytes} that other threads may still
+     * hold off-heap-backed references to.
+     */
+    public synchronized void release() {
+        ByteBuf local = offHeap;
+        if (local == null) {
+            return;
+        }
+        if (ownsSlice) {
+            offHeap = null;
+            local.release();
+        }
+        // Shared-slab Bytes does NOT release: the slab owner (anchored by
+        // slabOwner) owns the single refcount on the shared slab and will
+        // release it via its Cleaner. We deliberately keep `offHeap` alive
+        // here so the bytes remain readable for the slab's lifetime.
+    }
+
+    /**
+     * Lazily materialises the off-heap bytes into a fresh {@code byte[]}
+     * cached in {@link #buffer}, then releases the slice. Idempotent.
+     *
+     * <p>This call counts as an internal {@link #release()} of the slice from
+     * the slab-owner's point of view: it is subject to the same quiescence
+     * contract documented on {@link #release()}. Concurrent threads holding
+     * off-heap-backed snapshots of this {@code Bytes} must be drained by the
+     * slab owner before any thread invokes a heap accessor.
+     *
+     * @throws IllegalStateException if {@link #release()} ran before
+     *         materialisation: the bytes are no longer reachable.
+     */
+    private synchronized void materialiseFromOffHeap() {
+        if (buffer != null) {
+            return;
+        }
+        ByteBuf local = offHeap;
+        if (local == null) {
+            // release() ran without a preceding lazy materialisation. The
+            // bytes are gone — surface as an IllegalStateException so callers
+            // see a localised, actionable failure instead of a silent NPE
+            // downstream.
+            throw new IllegalStateException("Bytes already released");
+        }
+        byte[] copy = new byte[length];
+        if (length > 0) {
+            local.getBytes(local.readerIndex(), copy, 0, length);
+        }
+        buffer = copy;
+        offset = 0;
+        if (ownsSlice) {
+            offHeap = null;
+            local.release();
+        }
+        // Shared-slab Bytes: keep the slice reference alive for any concurrent
+        // off-heap reader (the slab owner's quiescence contract excludes
+        // races, but losing the field would also break the slabOwner GC
+        // anchor). The slab will be released by the slab owner's Cleaner.
+    }
+
+    /**
+     * Writes the value bytes directly into {@code dst} without materialising a
+     * heap {@code byte[]}. Off-heap-backed instances copy slice → dst with no
+     * intermediate allocation; on-heap-backed instances delegate to
+     * {@link ByteBuf#writeBytes(byte[], int, int)}.
+     *
+     * @throws IllegalStateException if this {@code Bytes} was released without
+     *         a preceding lazy materialisation.
+     */
+    public void writeTo(ByteBuf dst) {
+        ByteBuf local = offHeap;
+        byte[] data = buffer;
+        if (data != null) {
+            dst.writeBytes(data, offset, length);
+            return;
+        }
+        if (local != null) {
+            dst.writeBytes(local, local.readerIndex(), length);
+            return;
+        }
+        throw new IllegalStateException("Bytes already released");
+    }
+
+    /**
+     * Writes the value bytes directly into {@code out}. Off-heap-backed
+     * instances copy via a single {@link ByteBuf#getBytes(int, OutputStream, int)}
+     * call (no allocation); on-heap-backed instances delegate to
+     * {@link OutputStream#write(byte[], int, int)}.
+     *
+     * @throws IllegalStateException if this {@code Bytes} was released without
+     *         a preceding lazy materialisation.
+     */
+    public void writeTo(OutputStream out) throws IOException {
+        ByteBuf local = offHeap;
+        byte[] data = buffer;
+        if (data != null) {
+            out.write(data, offset, length);
+            return;
+        }
+        if (local != null) {
+            local.getBytes(local.readerIndex(), out, length);
+            return;
+        }
+        throw new IllegalStateException("Bytes already released");
     }
 
     @Override
     public int hashCode() {
-        if (hashCode == -1) {
-            this.hashCode = CompareBytesUtils.hashCode(buffer, offset, length);
+        int h = hashCode;
+        if (h != -1) {
+            return h;
         }
-        return hashCode;
-
+        // Snapshot the on-heap field first; if it's non-null we're done. Only
+        // when the heap representation is missing do we fall to the off-heap
+        // path, which has its own post-release check.
+        byte[] data = buffer;
+        if (data != null) {
+            h = CompareBytesUtils.hashCode(data, offset, length);
+        } else {
+            ByteBuf local = offHeap;
+            if (local == null) {
+                throw new IllegalStateException("Bytes already released");
+            }
+            h = hashCodeFromByteBuf(local, local.readerIndex(), length);
+        }
+        this.hashCode = h;
+        return h;
     }
 
     @Override
@@ -292,11 +671,100 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
             if (other.hashCode() != this.hashCode()) {
                 return false;
             }
-            return CompareBytesUtils.arraysEquals(buffer, offset, offset + length,
-                    other.buffer, other.offset, other.offset + other.length);
+            return bytesEqual(this, other);
         } catch (ClassCastException otherClass) {
             return false;
         }
+    }
+
+    /**
+     * {@code Arrays.hashCode}-compatible hash over a {@link ByteBuf} slice that
+     * matches {@link CompareBytesUtils#hashCode(byte[], int, int)} byte-for-byte.
+     * Used by the off-heap-backed equals/hashCode path so cross-comparison
+     * between an off-heap and an on-heap {@code Bytes} with identical bytes
+     * round-trips correctly.
+     *
+     * <p>Bulk-copies the slice into a stack-local byte[] so the inner hash
+     * loop matches the well-optimised on-heap path (issue #399 step-4 review).
+     */
+    private static int hashCodeFromByteBuf(ByteBuf buf, int start, int len) {
+        if (len == 0) {
+            return CompareBytesUtils.hashCode(new byte[0], 0, 0);
+        }
+        byte[] copy = new byte[len];
+        buf.getBytes(start, copy, 0, len);
+        return CompareBytesUtils.hashCode(copy, 0, len);
+    }
+
+    /**
+     * Byte-for-byte comparison that handles all four (on/off)-heap × (on/off)-heap
+     * combinations. Lengths must already match.
+     *
+     * <p>Off-heap branches snapshot {@code offHeap} and the slice's
+     * {@code readerIndex()} once at method entry and walk both sides byte
+     * by byte using direct {@code slice.getByte(baseIdx + i)} calls. An
+     * earlier round used a one-shot bulk {@link ByteBuf#getBytes(int, byte[], int, int)}
+     * copy into a stack-local byte[] before dispatching to
+     * {@link CompareBytesUtils#arraysEquals}, but for the small index keys
+     * typical of BLink lookups (8-24 bytes) the per-call byte[] allocation
+     * dominated and the snapshot-and-loop variant ended up faster
+     * (issue #399 step-4 review).
+     *
+     * @throws IllegalStateException if either side has been {@link #release()}d
+     *         without a preceding lazy materialisation.
+     */
+    private static boolean bytesEqual(Bytes a, Bytes b) {
+        // Hot path: both on-heap (or already materialised). Snapshot the
+        // fields once into locals so the JIT eliminates the volatile reads.
+        byte[] aBuf = a.buffer;
+        byte[] bBuf = b.buffer;
+        if (aBuf != null && bBuf != null) {
+            return CompareBytesUtils.arraysEquals(aBuf, a.offset, a.offset + a.length,
+                    bBuf, b.offset, b.offset + b.length);
+        }
+        // Off-heap-aware path with the same snapshot-and-loop optimization
+        // as compareTo (avoids per-byte volatile + virtual-call cost; cheaper
+        // than a bulk byte[] copy for the small keys typical of index hot
+        // paths). Fail fast on a released side.
+        ByteBuf aSlice = a.offHeap;
+        ByteBuf bSlice = b.offHeap;
+        if (aBuf == null && aSlice == null) {
+            throw new IllegalStateException("Bytes already released");
+        }
+        if (bBuf == null && bSlice == null) {
+            throw new IllegalStateException("Bytes already released");
+        }
+        int aBaseIdx = aSlice == null ? 0 : aSlice.readerIndex();
+        int bBaseIdx = bSlice == null ? 0 : bSlice.readerIndex();
+        int aOff = a.offset;
+        int bOff = b.offset;
+        for (int i = 0; i < a.length; i++) {
+            byte ai = aBuf != null ? aBuf[aOff + i] : aSlice.getByte(aBaseIdx + i);
+            byte bi = bBuf != null ? bBuf[bOff + i] : bSlice.getByte(bBaseIdx + i);
+            if (ai != bi) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Returns the {@code i}-th byte of the value, reading from whichever
+     * representation is currently live (on-heap byte[] or off-heap slice).
+     *
+     * @throws IllegalStateException if {@link #release()} ran before
+     *         materialisation: the bytes are no longer reachable.
+     */
+    private byte byteAt(int i) {
+        byte[] data = buffer;
+        if (data != null) {
+            return data[offset + i];
+        }
+        ByteBuf local = offHeap;
+        if (local != null) {
+            return local.getByte(local.readerIndex() + i);
+        }
+        throw new IllegalStateException("Bytes already released");
     }
 
     /**
@@ -466,8 +934,45 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         } else if (o == POSITIVE_INFINITY) {
             return -1;
         }
-        return CompareBytesUtils.compare(buffer, offset, offset + length,
-                o.buffer, o.offset, o.offset + o.length);
+        // Reject released receivers / arguments before short-circuiting on
+        // length, otherwise a released zero-length Bytes would silently
+        // compare equal to its sibling (length - o.length == 0).
+        if (this.buffer == null && this.offHeap == null) {
+            throw new IllegalStateException("Bytes already released");
+        }
+        if (o.buffer == null && o.offHeap == null) {
+            throw new IllegalStateException("Bytes already released");
+        }
+        // Hot path: both sides have on-heap byte[] (either natively or after
+        // lazy materialisation). Snapshot fields once so the volatile reads
+        // are folded by the JIT.
+        byte[] aBuf = this.buffer;
+        byte[] bBuf = o.buffer;
+        if (aBuf != null && bBuf != null) {
+            return CompareBytesUtils.compare(aBuf, this.offset, this.offset + length,
+                    bBuf, o.offset, o.offset + o.length);
+        }
+        // Off-heap-aware path. We snapshot offHeap and the slice's reader
+        // index once at the start so the inner loop avoids the per-byte
+        // volatile + virtual-call cost of byteAt(). For small index keys
+        // (8-24 bytes typical for BLink) this is faster than a bulk
+        // getBytes() copy because the per-call byte[] allocation dominates
+        // for tiny payloads (issue #399 step-4 review).
+        ByteBuf aSlice = this.offHeap;
+        ByteBuf bSlice = o.offHeap;
+        int aBaseIdx = aSlice == null ? 0 : aSlice.readerIndex();
+        int bBaseIdx = bSlice == null ? 0 : bSlice.readerIndex();
+        int aOff = this.offset;
+        int bOff = o.offset;
+        int min = Math.min(this.length, o.length);
+        for (int i = 0; i < min; i++) {
+            int a = (aBuf != null ? aBuf[aOff + i] : aSlice.getByte(aBaseIdx + i)) & 0xff;
+            int b = (bBuf != null ? bBuf[bOff + i] : bSlice.getByte(bBaseIdx + i)) & 0xff;
+            if (a != b) {
+                return a - b;
+            }
+        }
+        return this.length - o.length;
     }
 
     public static boolean startsWith(byte[] left, int offset, int bufferlen, int max, byte[] right) {
@@ -508,21 +1013,48 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         return length;
     }
 
+    /**
+     * Returns the on-heap backing array. For an off-heap-backed instance this
+     * triggers a lazy copy of the slice into a fresh {@code byte[]} and then
+     * releases the slice. After the call this {@code Bytes} behaves like an
+     * on-heap one (subsequent {@code getBuffer()} calls are O(1)).
+     *
+     * @throws IllegalStateException if {@link #release()} ran before
+     *         materialisation: the bytes are no longer reachable.
+     */
     public byte[] getBuffer() {
+        byte[] data = buffer;
+        if (data != null) {
+            return data;
+        }
+        // materialiseFromOffHeap throws IllegalStateException if released.
+        materialiseFromOffHeap();
         return buffer;
     }
 
+    /**
+     * Returns the byte offset within {@link #getBuffer()} where this value's
+     * bytes start. Triggers lazy materialisation if needed; after that, the
+     * offset for an off-heap-materialised instance is always 0.
+     *
+     * @throws IllegalStateException if {@link #release()} ran before
+     *         materialisation.
+     */
     public int getOffset() {
+        if (buffer != null) {
+            return offset;
+        }
+        materialiseFromOffHeap();
         return offset;
     }
 
     @Override
     public String toString() {
-        if (buffer == null) {
+        if (buffer == null && offHeap == null) {
             return "null";
         }
         // ONLY FOR TESTS
-        return arraytohexstring(buffer, offset, length);
+        return arraytohexstring(getBuffer(), getOffset(), length);
     }
 
     public static String arraytohexstring(byte[] buffer, int offset, int length) {
@@ -536,11 +1068,11 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     public ByteArrayCursor newCursor() {
-        return ByteArrayCursor.wrap(buffer, offset, length);
+        return ByteArrayCursor.wrap(getBuffer(), getOffset(), length);
     }
 
     public ByteBufCursor newByteBufCursor() {
-        return ByteBufCursor.wrap(buffer, offset, length);
+        return ByteBufCursor.wrap(getBuffer(), getOffset(), length);
     }
 
     /**
@@ -556,8 +1088,10 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      */
     public Bytes next() {
 
+        final byte[] src = getBuffer();
+        final int srcOffset = getOffset();
         final byte[] dst = new byte[length];
-        System.arraycopy(buffer, offset, dst, 0, length);
+        System.arraycopy(src, srcOffset, dst, 0, length);
 
         int idx = length - 1;
 
@@ -581,19 +1115,18 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     public boolean startsWith(int length, byte[] prefix) {
-        return Bytes.startsWith(this.buffer, this.offset, this.length, length, prefix);
+        return Bytes.startsWith(this.getBuffer(), this.getOffset(), this.length, length, prefix);
     }
 
     /**
      * Returns {@code true} if this value starts with the bytes carried by
-     * {@code prefix}. Zero-copy: neither side is materialised into a fresh
-     * {@code byte[]}, which lets the prefix-scan code paths consume a
-     * {@code Bytes} produced by {@code RecordFunction.computeNewValue} without
-     * any intermediate allocation.
+     * {@code prefix}. Zero-copy when both sides are on-heap (or already
+     * materialised); off-heap-backed instances trigger lazy materialisation
+     * via {@link #getBuffer()} so the existing static helper keeps working.
      */
     public boolean startsWith(Bytes prefix) {
-        return Bytes.startsWith(this.buffer, this.offset, this.length,
-                prefix.length, prefix.buffer, prefix.offset, prefix.length);
+        return Bytes.startsWith(this.getBuffer(), this.getOffset(), this.length,
+                prefix.length, prefix.getBuffer(), prefix.getOffset(), prefix.length);
     }
 
     /**
@@ -603,15 +1136,29 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      */
     public Bytes nonShared() {
         if (isShared()) {
+            byte[] src = getBuffer();
+            int srcOffset = getOffset();
             byte[] array = new byte[this.length];
-            System.arraycopy(buffer, offset, array, 0, length);
+            System.arraycopy(src, srcOffset, array, 0, length);
             return new Bytes(array, 0, length);
         }
         return this;
     }
 
     public boolean isShared() {
-        return this.offset != 0 || this.length != buffer.length;
+        byte[] data = buffer;
+        if (data == null) {
+            // Off-heap-backed (not yet materialised) is considered shared
+            // because it points into a shared off-heap slab managed by the
+            // caller; nonShared() will materialise into a private byte[].
+            if (offHeap != null) {
+                return true;
+            }
+            // released without materialising — surface the released state
+            // consistently with every other byte-reading accessor.
+            throw new IllegalStateException("Bytes already released");
+        }
+        return this.offset != 0 || this.length != data.length;
     }
 
 }

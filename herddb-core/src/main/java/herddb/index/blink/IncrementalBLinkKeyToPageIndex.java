@@ -42,6 +42,8 @@ import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
 import herddb.utils.Bytes;
+import herddb.utils.HerdDBByteBufAllocators;
+import herddb.utils.IndexKeySlab;
 import herddb.utils.SystemProperties;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -848,18 +850,51 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
                 if (rtype != type) {
                     throw new IOException("Wrong page type " + rtype + " expected " + type);
                 }
+                // Issue #399 step 4: collect all (key bytes, value) pairs
+                // first so we can size and allocate a single off-heap slab
+                // and pack every key into it, mirroring BLinkKeyToPageIndex.
+                List<byte[]> keyBytesList = new ArrayList<>();
+                List<Long> valueList = new ArrayList<>();
+                List<Long> infiniteValueList = new ArrayList<>();
+                long totalKeyBytes = 0L;
                 byte block;
                 while ((block = in.readByte()) != NODE_PAGE_END_BLOCK) {
                     switch (block) {
-                        case NODE_PAGE_KEY_VALUE_BLOCK:
-                            map.put(in.readBytes(), in.readVLong());
+                        case NODE_PAGE_KEY_VALUE_BLOCK: {
+                            byte[] k = in.readArray();
+                            if (k == null) {
+                                throw new IOException("corrupted index page "
+                                        + pageId + ": null key");
+                            }
+                            long v = in.readVLong();
+                            keyBytesList.add(k);
+                            valueList.add(v);
+                            totalKeyBytes += (long) k.length;
                             break;
+                        }
                         case NODE_PAGE_INF_BLOCK:
-                            map.put(Bytes.POSITIVE_INFINITY, in.readVLong());
+                            infiniteValueList.add(in.readVLong());
                             break;
                         default:
                             throw new IOException("Wrong node block type " + block);
                     }
+                }
+                if (totalKeyBytes >= IndexKeySlab.OFFHEAP_KEY_BYTES_THRESHOLD
+                        && totalKeyBytes <= (long) Integer.MAX_VALUE) {
+                    IndexKeySlab slabOwner = new IndexKeySlab(totalKeyBytes,
+                            HerdDBByteBufAllocators.indexPagesAllocator());
+                    for (int i = 0; i < keyBytesList.size(); i++) {
+                        byte[] k = keyBytesList.get(i);
+                        int off = slabOwner.append(k);
+                        map.put(slabOwner.wrap(off, k.length), valueList.get(i));
+                    }
+                } else {
+                    for (int i = 0; i < keyBytesList.size(); i++) {
+                        map.put(Bytes.from_array(keyBytesList.get(i)), valueList.get(i));
+                    }
+                }
+                for (Long v : infiniteValueList) {
+                    map.put(Bytes.POSITIVE_INFINITY, v);
                 }
                 return map;
             });

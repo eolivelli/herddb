@@ -287,7 +287,12 @@ public class CheckpointTest {
         /* Force dirty rebuilt */
         config.set(ServerConfiguration.PROPERTY_DIRTY_PAGE_THRESHOLD, 0.0D);
 
-        final long pageSize = 350;
+        // Issue #399 step 2: Bytes grew by an off-heap-slice reference, so
+        // each Record now reports ~16 extra estimated bytes (two Bytes per
+        // record). The pageSize was originally 350 to fit exactly two
+        // small Records; bump to keep the same "two records per page"
+        // intent under the new accounting.
+        final long pageSize = 500;
         config.set(ServerConfiguration.PROPERTY_MAX_LOGICAL_PAGE_SIZE, pageSize);
 
 
@@ -376,7 +381,12 @@ public class CheckpointTest {
         /* Force dirty rebuilt */
         config.set(ServerConfiguration.PROPERTY_DIRTY_PAGE_THRESHOLD, 0.0D);
 
-        final long pageSize = 350;
+        // Issue #399 step 2: Bytes grew by an off-heap-slice reference, so
+        // each Record now reports ~16 extra estimated bytes (two Bytes per
+        // record). The pageSize was originally 350 to fit exactly two
+        // small Records; bump to keep the same "two records per page"
+        // intent under the new accounting.
+        final long pageSize = 500;
         config.set(ServerConfiguration.PROPERTY_MAX_LOGICAL_PAGE_SIZE, pageSize);
 
 
