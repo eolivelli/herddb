@@ -203,6 +203,27 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     private volatile boolean checkPointRunning = false;
 
     /**
+     * Per-table mutex that serializes <em>entire</em> {@code checkpoint(...)}
+     * invocations on this {@link TableManager}. Guarantees that two concurrent
+     * callers of {@link #checkpoint(boolean)} / {@link #fullCheckpoint(boolean)}
+     * — e.g. an admin-triggered tablespace checkpoint racing with the
+     * activator-thread-driven {@code TableSpaceManager.runLocalTableCheckPoints()}
+     * — never overlap their Phase B / Phase C-persist work on the same table.
+     *
+     * <p>Without this mutex, the two invocations could interleave their
+     * mutations of {@code pageSet}, {@code newPages}, {@code nextPageId},
+     * the BLink {@code currentManifest} / {@code previousByNodeId} state, and
+     * the persisted {@code IndexStatus} / {@code TableStatus} blobs, leading
+     * to silent data loss (e.g. preserve sets disagreeing with the surviving
+     * manifest, or epoch numbers reused across two manifests).</p>
+     *
+     * <p>This is independent from {@link #checkpointLock}, which serializes
+     * checkpoint vs. concurrent DML/commits but does NOT guard against two
+     * checkpoint invocations on the same table. See issue #403 review.</p>
+     */
+    private final ReentrantLock checkpointSerializerLock = new ReentrantLock();
+
+    /**
      * Test-only hook fired inside {@link #checkpoint(double, double, long, long, long, boolean, long)}
      * after Phase A releases the checkpoint write lock and before Phase B starts flushing pages.
      * Used by the regression tests for issue #145 to deterministically drive DML that commits
@@ -3630,6 +3651,34 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             double dirtyThreshold, double fillThreshold,
             long checkpointTargetTime, long cleanupTargetTime, long compactionTargetTime, boolean pin
     ) throws DataStorageManagerException {
+        // Issue #403: serialize concurrent checkpoint(...) invocations on this
+        // table. Without this lock the activator-thread-driven
+        // runLocalTableCheckPoints could overlap with an admin-triggered
+        // tableSpaceManager.checkpoint(...) on the same table, racing through
+        // Phase B (cleanAndCompactPages, indexManager.checkpoint,
+        // drainPendingNewPages) and Phase C-persist (BLink persistCheckpoint
+        // mutating currentManifest / previousByNodeId / lastPreserveSet, plus
+        // dataStorageManager.tableCheckpoint writing the TableStatus blob),
+        // producing a torn manifest or a TableStatus that disagrees with the
+        // surviving IndexStatus.
+        //
+        // The lock wraps the ENTIRE checkpoint body, including both Phase A
+        // (under checkpointLock write) and the fuzzy Phase B / Phase C-persist
+        // (no checkpointLock). It does NOT block DML (which acquires
+        // checkpointLock.readLock instead) — only other checkpoint callers.
+        checkpointSerializerLock.lock();
+        try {
+            return doCheckpoint(dirtyThreshold, fillThreshold,
+                    checkpointTargetTime, cleanupTargetTime, compactionTargetTime, pin);
+        } finally {
+            checkpointSerializerLock.unlock();
+        }
+    }
+
+    private TableCheckpoint doCheckpoint(
+            double dirtyThreshold, double fillThreshold,
+            long checkpointTargetTime, long cleanupTargetTime, long compactionTargetTime, boolean pin
+    ) throws DataStorageManagerException {
         LOGGER.log(Level.FINE, "tableCheckpoint dirtyThreshold: " + dirtyThreshold + ", {0}.{1} (pin: {2})", new Object[]{tableSpaceUUID, table.name, pin});
         if (createdInTransaction > 0) {
             LOGGER.log(Level.FINE, "checkpoint for table " + table.name + " skipped,"
@@ -3653,6 +3702,20 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         final List<PostCheckpointAction> actions = new ArrayList<>();
 
         TableCheckpoint result;
+
+        /*
+         * Outer try/finally for issue #403 (and pre-existing Phase B leak):
+         * guarantees {@code checkPointRunning} is cleared whether the failure
+         * originates inside Phase A (under checkpointLock write), Phase B (no
+         * lock — cleanAndCompactPages, frozen page flush, indexManager.checkpoint,
+         * drainPendingNewPages), the under-lock part of Phase C, or the
+         * out-of-lock Phase C-persist. A leaked {@code checkPointRunning=true}
+         * permanently breaks {@code TRUNCATE TABLE} on this table (see
+         * {@link #applyTruncate}'s assertion at line ~2188), so the wrap MUST
+         * cover every step that can throw after {@code checkPointRunning = true}
+         * is set in Phase A.
+         */
+        try {
 
         /* ====================================================== */
         /* === PHASE A: Brief write lock — snapshot page state === */
@@ -3939,13 +4002,6 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         final KeyToPageCheckpointSnapshot pkIndexSnapshot;
         final long keyToPageStart;
 
-        // Outer try/finally: guarantees checkPointRunning is cleared whether the
-        // failure originates inside the under-lock block (lock release in inner
-        // finally) or inside the persist block. Without this wrapper a throw in
-        // the under-lock block would leave checkPointRunning=true forever and
-        // permanently break TRUNCATE TABLE on this table (see applyTruncate's
-        // assertion). Issue #403 review.
-        try {
         try {
 
             /* *** Remaining spare data handling *** */
@@ -4140,9 +4196,11 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         }
 
         } finally {
-            // Outer finally for issue #403: clears checkPointRunning whether the
-            // failure originated inside the under-lock block (where the inner
-            // finally above releases the lock) or inside the persist block.
+            // Outer finally for issue #403: clears checkPointRunning whether
+            // the failure originates inside Phase A (the inner Phase A finally
+            // releases the write lock), Phase B (no lock), the under-lock part
+            // of Phase C (its inner finally releases the lock), or the
+            // out-of-lock Phase C-persist block.
             checkPointRunning = false;
         }
 
