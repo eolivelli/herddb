@@ -95,12 +95,19 @@ public class DropTableIndexCleanupTest {
     private static final int DIM = 4;
 
     private static Table buildTable(String name) {
+        // Issue #408: use a deterministic non-zero tableId so synthetic
+        // CREATE_TABLE / DROP_TABLE entries do not collide on the
+        // tableId == 0 sentinel. Without this, two tables built from
+        // the same helper would alias under id 0 and a DROP_TABLE for
+        // one would silently drop the other.
+        int h = name.hashCode() & 0x7FFFFFFF;
         return Table.builder()
                 .name(name)
                 .tablespace("default")
                 .column("pk", ColumnTypes.STRING)
                 .column("vec", ColumnTypes.FLOATARRAY)
                 .primaryKey("pk")
+                .tableId(h == 0 ? 1 : h)
                 .build();
     }
 
@@ -467,7 +474,7 @@ public class DropTableIndexCleanupTest {
 
             // ---- DROP_TABLE ----
             engine.applyEntry(new LogSequenceNumber(1, 999),
-                    LogEntryFactory.dropTable("t2", null));
+                    LogEntryFactory.dropTable(table, null));
             engine.awaitPendingWorkForTest();
             engine.awaitPendingDeletionsForTest();
 

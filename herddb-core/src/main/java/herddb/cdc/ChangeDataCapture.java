@@ -281,12 +281,24 @@ public class ChangeDataCapture implements AutoCloseable {
         if (tableName == null) {
             tableName = tableSchemaHistoryStorage.resolveTableName(tableId);
             if (tableName == null) {
+                // Surface the gap loudly so operators can see that the
+                // CDC cannot translate this id (no matching CREATE_TABLE
+                // observed since startup, and the storage's optional
+                // hook has no record either). The Mutation will be
+                // delivered with table == null, mirroring the historical
+                // behaviour for an unknown name.
+                LOG.log(java.util.logging.Level.WARNING,
+                        "CDC could not resolve tableId={0} at lsn={1} — mutation will carry a null Table",
+                        new Object[]{tableId, lsn});
                 return null;
             }
             tableIdToName.put(tableId, tableName);
         }
         return tableSchemaHistoryStorage.fetchSchema(lsn, tableName);
     }
+
+    private static final java.util.logging.Logger LOG =
+            java.util.logging.Logger.getLogger(ChangeDataCapture.class.getName());
 
     private void applyEntry(LogEntry entry, LogSequenceNumber lsn) throws Exception {
         switch (entry.type) {
@@ -372,9 +384,30 @@ public class ChangeDataCapture implements AutoCloseable {
                 }
             }
             break;
-            case LogEntryType.ROLLBACKTRANSACTION:
-                transactions.remove(entry.transactionId);
+            case LogEntryType.ROLLBACKTRANSACTION: {
+                TransactionHolder rolled = transactions.remove(entry.transactionId);
+                // Issue #408 review: scrub the per-id mapping for any
+                // CREATE_TABLE / ALTER_TABLE that this transaction
+                // stamped — its id never committed and must not leak
+                // into the in-memory id → name cache. Without this,
+                // a BEGIN; CREATE TABLE; ROLLBACK sequence keeps a
+                // stale (rolledBackId → name) entry forever, growing
+                // the cache linearly in the number of rolled-back
+                // CREATEs and leaving the CDC's view of the id space
+                // out of sync with the leader.
+                if (rolled != null) {
+                    // Remove via the boxed key — the cache itself is
+                    // Integer-keyed, so deboxing here would only force
+                    // a re-box at the call site (caught by SpotBugs
+                    // BX_UNBOXING_IMMEDIATELY_REBOXED).
+                    for (Integer id : rolled.tablesDefinitions.keySet()) {
+                        if (id != null) {
+                            tableIdToName.remove(id);
+                        }
+                    }
+                }
                 break;
+            }
             default:
                 // discard unknown entry types
                 break;

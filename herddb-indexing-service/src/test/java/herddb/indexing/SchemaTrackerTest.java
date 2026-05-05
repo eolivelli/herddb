@@ -51,9 +51,15 @@ public class SchemaTrackerTest {
      * to distinct ids in the {@link SchemaTracker}'s id → name index.
      * Without a non-zero id, two synthetic tables collide on the {@code 0}
      * sentinel and a subsequent DROP_TABLE drops the wrong table.
+     *
+     * <p>The previous version used {@code Math.abs(hashCode) | 1}, which
+     * silently overflows to a negative value when {@code hashCode() ==
+     * Integer.MIN_VALUE}. The replacement uses a sign-overflow-safe mask
+     * to clear the sign bit and then forces the result to be non-zero.
      */
     private static int deterministicTableId(String name) {
-        return Math.abs(name.hashCode()) | 1; // never 0
+        int h = name.hashCode() & 0x7FFFFFFF; // strip sign without overflow
+        return h == 0 ? 1 : h;
     }
 
     private static Table buildTable(String name) {

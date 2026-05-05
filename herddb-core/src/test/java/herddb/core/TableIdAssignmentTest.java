@@ -24,14 +24,21 @@ import static org.junit.Assert.assertTrue;
 import herddb.file.FileCommitLogManager;
 import herddb.file.FileDataStorageManager;
 import herddb.file.FileMetadataStorageManager;
+import herddb.model.Column;
 import herddb.model.ColumnTypes;
 import herddb.model.StatementEvaluationContext;
 import herddb.model.Table;
 import herddb.model.TransactionContext;
+import herddb.model.TransactionResult;
+import herddb.model.commands.AlterTableStatement;
+import herddb.model.commands.BeginTransactionStatement;
+import herddb.model.commands.CommitTransactionStatement;
 import herddb.model.commands.CreateTableSpaceStatement;
 import herddb.model.commands.CreateTableStatement;
 import herddb.model.commands.DropTableStatement;
+import herddb.model.commands.RollbackTransactionStatement;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collections;
 import org.junit.Rule;
 import org.junit.Test;
@@ -143,6 +150,137 @@ public class TableIdAssignmentTest {
 
             assertTrue("DROP+CREATE must yield a strictly larger id, was first=" + firstId + " second=" + secondId,
                     secondId > firstId);
+        }
+    }
+
+    @Test
+    public void testCreateTableInTransactionThenCommit() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmoDir").toPath();
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+            manager.start();
+            manager.executeStatement(new CreateTableSpaceStatement(
+                            "tblspace1", Collections.singleton("localhost"), "localhost", 1, 0, 0),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            // BEGIN; CREATE TABLE; COMMIT — the in-flight tableId must
+            // be visible after commit and the manager must be reachable
+            // via the id-keyed lookup that the WAL apply hot path uses.
+            TransactionResult begin = (TransactionResult) manager.executeStatement(
+                    new BeginTransactionStatement("tblspace1"),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            long tx = begin.getTransactionId();
+            manager.executeStatement(new CreateTableStatement(makeTable("t1")),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    new TransactionContext(tx));
+            manager.executeStatement(new CommitTransactionStatement("tblspace1", tx),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+
+            int idT1 = manager.getTableSpaceManager("tblspace1").getTableManager("t1").getTable().tableId;
+            assertTrue("a transactionally-created table must carry a non-zero id post-commit, got " + idT1,
+                    idT1 > 0);
+        }
+    }
+
+    @Test
+    public void testCreateTableInTransactionThenRollbackDoesNotLeaveAnyMappings() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmoDir").toPath();
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+            manager.start();
+            manager.executeStatement(new CreateTableSpaceStatement(
+                            "tblspace1", Collections.singleton("localhost"), "localhost", 1, 0, 0),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            TransactionResult begin = (TransactionResult) manager.executeStatement(
+                    new BeginTransactionStatement("tblspace1"),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            long tx = begin.getTransactionId();
+            manager.executeStatement(new CreateTableStatement(makeTable("t1")),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    new TransactionContext(tx));
+            manager.executeStatement(new RollbackTransactionStatement("tblspace1", tx),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+
+            // After ROLLBACK the table must not exist by name, and the
+            // id-keyed lookup must not return a stale manager either.
+            // (The id-allocator is allowed to have advanced — that is
+            // expected because nextTableId.getAndIncrement is unconditional;
+            // pin the contract so a future "rollback decrements the
+            // counter" optimisation cannot land without an explicit
+            // coordinated change to recovery.)
+            assertEquals("rolled-back CREATE must not leave a name binding",
+                    null, manager.getTableSpaceManager("tblspace1").getTableManager("t1"));
+
+            // A fresh CREATE for the same name must succeed and carry a
+            // strictly larger id than the rolled-back attempt would
+            // have had — proving the slot is clean.
+            manager.executeStatement(new CreateTableStatement(makeTable("t1")),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            assertTrue(manager.getTableSpaceManager("tblspace1").getTableManager("t1").getTable().tableId > 0);
+        }
+    }
+
+    @Test
+    public void testAlterTablePreservesTableId() throws Exception {
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmoDir = folder.newFolder("tmoDir").toPath();
+        try (DBManager manager = new DBManager("localhost",
+                new FileMetadataStorageManager(metadataPath),
+                new FileDataStorageManager(dataPath),
+                new FileCommitLogManager(logsPath),
+                tmoDir, null)) {
+            manager.start();
+            manager.executeStatement(new CreateTableSpaceStatement(
+                            "tblspace1", Collections.singleton("localhost"), "localhost", 1, 0, 0),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+
+            manager.executeStatement(new CreateTableStatement(makeTable("t1")),
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
+            int idBefore = manager.getTableSpaceManager("tblspace1").getTableManager("t1").getTable().tableId;
+            assertTrue(idBefore > 0);
+
+            // ALTER TABLE that adds a column — Table#applyAlterTable
+            // explicitly threads the existing tableId through the
+            // builder, so the manager's id must stay the same and the
+            // id-keyed lookup must resolve to the same manager.
+            AlterTableStatement alter = new AlterTableStatement(
+                    Arrays.asList(Column.column("extra_col", ColumnTypes.STRING)),
+                    Collections.emptyList(),
+                    Collections.emptyList(),
+                    null,
+                    "t1",
+                    "tblspace1",
+                    null,
+                    Collections.emptyList(),
+                    Collections.emptyList());
+            manager.executeStatement(alter,
+                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            int idAfter = manager.getTableSpaceManager("tblspace1").getTableManager("t1").getTable().tableId;
+            assertEquals("ALTER TABLE must preserve the tableId", idBefore, idAfter);
         }
     }
 

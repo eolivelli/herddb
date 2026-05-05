@@ -227,7 +227,7 @@ public class IndexingServiceParallelApplyTest {
             }
 
             // DDL via applySingleEntryForTest drains pending DML before applying
-            LogEntry dropTable = LogEntryFactory.dropTable("mytable", null);
+            LogEntry dropTable = LogEntryFactory.dropTable(table, null);
             engine.applySingleEntryForTest(new LogSequenceNumber(1, 100), dropTable);
 
             // After DDL, all inserts were applied before the drop
