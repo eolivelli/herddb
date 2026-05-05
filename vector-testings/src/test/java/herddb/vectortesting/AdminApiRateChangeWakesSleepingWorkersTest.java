@@ -99,10 +99,23 @@ class AdminApiRateChangeWakesSleepingWorkersTest {
         worker.start();
 
         assertTrue(workerStarted.await(2, TimeUnit.SECONDS), "worker should have started");
-        // Give the worker a moment to enter park().
-        Thread.sleep(200);
 
-        // POST a high rate. The worker must wake within ~500 ms.
+        // Wait until the worker is actually parked inside acquire() before
+        // issuing the admin POST. Polling Thread.getState() rather than
+        // Thread.sleep() avoids the race where the POST lands before the
+        // worker has entered parkNanos and the unpark would be queued for a
+        // subsequent (immediate) park rather than waking the current one.
+        long deadline = System.currentTimeMillis() + 5000;
+        while (worker.getState() != Thread.State.TIMED_WAITING
+                && worker.getState() != Thread.State.WAITING
+                && System.currentTimeMillis() < deadline) {
+            Thread.yield();
+        }
+        assertTrue(worker.getState() == Thread.State.TIMED_WAITING
+                        || worker.getState() == Thread.State.WAITING,
+                "worker should have entered parked state; was " + worker.getState());
+
+        // POST a high rate. The worker must wake within ~1.5 s.
         long t0 = System.nanoTime();
         HttpResponse<String> resp = postJson("/ingestion/config/ingest-max-ops",
                 "{\"value\": 100000}");

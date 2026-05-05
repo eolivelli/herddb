@@ -467,7 +467,7 @@ public class IngestionWorker implements Runnable {
         // front so that workers spread out at transaction boundaries; their
         // commits then overlap during the commit_ms window instead of
         // serialising on a shared post-commit acquire.
-        int permitsReservedForNextTxn = preAcquireForNextTransaction(0);
+        preAcquireForNextTransaction();
 
         while (true) {
             float[] vec = queue.poll(100, TimeUnit.MILLISECONDS);
@@ -518,10 +518,12 @@ public class IngestionWorker implements Runnable {
                 rowsInCurrentSubBatch = 0;
                 lastCommitTime = now;
 
-                // Next pre-commit acquire: pace entry into the next transaction
-                // using the permits we already reserved (if any) plus the
-                // current effective transaction size.
-                permitsReservedForNextTxn = preAcquireForNextTransaction(permitsReservedForNextTxn);
+                // Next pre-commit acquire: pace entry into the next
+                // transaction. The PerThreadRateLimiter's deadline already
+                // accumulates across calls, so each per-transaction acquire
+                // contributes its own pacing — we must call this on every
+                // transaction boundary, not just the first.
+                preAcquireForNextTransaction();
             }
 
             if (rowsIngested % 10_000 == 0 && rowsIngested > 0) {
@@ -557,10 +559,7 @@ public class IngestionWorker implements Runnable {
     }
 
     /**
-     * Acquire enough permits to cover the next transaction. Returns the
-     * number of permits actually acquired, which may differ from the
-     * requested permits if the caller pre-reserved some via a previous call
-     * (in which case the difference is acquired here).
+     * Acquire enough permits to cover the next transaction.
      *
      * <p>Pre-commit acquire (issue #402, proposed fix B): reserving permits
      * before we start buffering rows for the next transaction spreads
@@ -568,17 +567,20 @@ public class IngestionWorker implements Runnable {
      * {@code commit_ms} window, rather than serialising behind a shared
      * post-commit acquire.
      *
+     * <p>The {@link PerThreadRateLimiter}'s deadline accumulates across
+     * calls (each {@code acquire(N)} pushes the deadline forward by
+     * {@code N × nanosPerPermit}), so calling this method on every
+     * transaction boundary correctly paces every transaction at the
+     * configured per-thread rate. Skipping the call would silently disable
+     * rate limiting for all subsequent transactions.
+     *
      * <p>If the rate limiter is unset (e.g. unit tests), this is a no-op.
      */
-    private int preAcquireForNextTransaction(int alreadyReserved) throws InterruptedException {
+    private void preAcquireForNextTransaction() throws InterruptedException {
         if (rateLimiterGroup == null) {
-            return 0;
+            return;
         }
         int wanted = Math.max(1, config.effectiveTransactionSize());
-        int toAcquire = Math.max(0, wanted - alreadyReserved);
-        if (toAcquire > 0) {
-            rateLimiterGroup.acquire(rateLimiterIndex, toAcquire);
-        }
-        return wanted;
+        rateLimiterGroup.acquire(rateLimiterIndex, wanted);
     }
 }

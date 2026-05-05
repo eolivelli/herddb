@@ -132,8 +132,13 @@ public final class PerThreadRateLimiter {
      * the park loop so an admin-issued rate change wakes the call promptly.
      *
      * <p>Unlike Guava's {@code acquire}, this method respects thread
-     * interruption: if the thread is interrupted while parked, it returns
-     * the consumed reservation and re-raises {@link InterruptedException}.
+     * interruption: if the thread is interrupted while parked, it raises
+     * {@link InterruptedException}. Note that the deadline reservation
+     * already advanced by this acquire is <em>not</em> rolled back — in
+     * the bench an interrupt always means shutdown, so the abandoned
+     * reservation is moot. The next caller (if any) of the same limiter
+     * will see the abandoned slot via the deadline and park accordingly,
+     * which is harmless.
      *
      * @param permits number of permits to acquire; must be {@code >= 0}
      * @throws InterruptedException if the thread is interrupted while parked

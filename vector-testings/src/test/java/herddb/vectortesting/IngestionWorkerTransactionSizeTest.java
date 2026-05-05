@@ -251,6 +251,95 @@ class IngestionWorkerTransactionSizeTest {
         }
     }
 
+    /**
+     * Reviewer follow-up #5: partial-success thrown from {@code flushSubBatchNoCommit}
+     * called <em>directly from {@code runIngestLoop}</em> (i.e. a mid-transaction
+     * sub-batch, not the final commit-time flush) must:
+     *   (a) not increment {@code rowsCommitted},
+     *   (b) not increment {@code commitsTotal},
+     *   (c) roll back the connection exactly once,
+     *   (d) propagate the {@link IngestionWorker.BatchPartialSuccessException}
+     *       without retrying (replaying would PK-collide).
+     */
+    @Test
+    void partialSuccessOnNonFinalSubBatchDoesNotRetryAndDoesNotIncrementRowsCommitted() {
+        Config cfg = new Config();
+        cfg.batchSize = 100;
+        cfg.transactionSize = 400; // 4 flushes per transaction
+        cfg.ingestCommitRetries = 5; // plenty of retries; none should fire
+
+        CallTrace trace = new CallTrace();
+        LinkedBlockingQueue<float[]> queue = new LinkedBlockingQueue<>();
+        for (int i = 0; i < 400; i++) {
+            queue.add(new float[]{(float) i});
+        }
+        queue.add(new float[0]);
+
+        AtomicLong commitsTotal = new AtomicLong(0);
+        AtomicLong commitsRecovered = new AtomicLong(0);
+        AtomicLong rowsCommitted = new AtomicLong(0);
+        IngestionWorker worker = new IngestionWorker(
+                cfg, queue, new AtomicBoolean(true), new AtomicLong(0),
+                new MetricsCollector(), new AtomicReference<>(""), System.nanoTime(),
+                commitsTotal, commitsRecovered, rowsCommitted);
+        worker.backoffBaseMillis = 0L;
+
+        // Drop a row on the very first sub-flush — mid-transaction, well before commit.
+        FakePs ps = new FakePs(trace) {
+            int flushCount = 0;
+
+            @Override
+            public CompletableFuture<int[]> executeBatchAsync() {
+                flushCount++;
+                trace.flushSizes.add(trace.rowsInPs);
+                int reported = trace.rowsInPs;
+                if (flushCount == 1) {
+                    reported = trace.rowsInPs - 1; // drop one row on first sub-flush
+                }
+                int[] counts = new int[trace.rowsInPs];
+                int filled = 0;
+                for (int i = 0; i < trace.rowsInPs && filled < reported; i++) {
+                    counts[i] = 1;
+                    filled++;
+                }
+                trace.rowsInPs = 0;
+                return CompletableFuture.completedFuture(counts);
+            }
+        };
+        FakeConn conn = new FakeConn(trace);
+
+        RuntimeException ex = assertThrows(RuntimeException.class,
+                () -> {
+                    try {
+                        worker.runIngestLoop(conn, ps);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
+        // (a) rowsCommitted must stay 0 — no transaction reached commit.
+        assertEquals(0L, rowsCommitted.get(), "rowsCommitted must be 0 on mid-transaction partial success");
+        // (b) commitsTotal must stay 0.
+        assertEquals(0L, commitsTotal.get(), "commitsTotal must be 0 on mid-transaction partial success");
+        // commitsRecovered must also stay 0.
+        assertEquals(0L, commitsRecovered.get(), "commitsRecovered must be 0 — no recovery happened");
+        // (c) connection rolled back at least once (flushSubBatchNoCommit's own rollback).
+        // We don't assert exactly-once because clearBatch / commit attempts may roll back too.
+        // (d) only ONE flush attempt happened — no retry was done.
+        assertEquals(1, trace.flushSizes.size(),
+                "non-retry: exactly 1 flush attempt; retries would PK-collide on the rows the server accepted");
+        // No commit happened.
+        assertEquals(List.of(), trace.commitSizes);
+        // Cause chain contains BatchPartialSuccessException.
+        Throwable cause = ex.getCause();
+        while (cause != null && !(cause instanceof IngestionWorker.BatchPartialSuccessException)) {
+            cause = cause.getCause();
+        }
+        if (cause == null) {
+            throw new AssertionError("Expected BatchPartialSuccessException in cause chain; got: " + ex);
+        }
+    }
+
     // ---- (7) live decrease of batch-size mid-transaction ----
 
     @Test

@@ -82,6 +82,27 @@ class IngestRateLimiterGroupTest {
         assertThrows(IndexOutOfBoundsException.class, () -> g.limiterFor(4));
     }
 
+    /**
+     * Reviewer follow-up #2: when the worker count shrinks, each surviving
+     * child must get the new {@code totalRate / newSize} share — not
+     * {@code totalRate / oldSize}, which would silently halve aggregate
+     * throughput.
+     */
+    @Test
+    void shrinkingActiveCountRebalancesPerThreadRate() {
+        IngestRateLimiterGroup g = new IngestRateLimiterGroup(8, 1000.0);
+        // Initially: 8 children at 1000/8 = 125 each.
+        for (int i = 0; i < 8; i++) {
+            assertEquals(125.0, g.limiterFor(i).getRate(), 1e-3);
+        }
+        // Shrink to 4: each survivor should now be at 1000/4 = 250.
+        g.resize(4);
+        for (int i = 0; i < 4; i++) {
+            assertEquals(250.0, g.limiterFor(i).getRate(), 1e-3,
+                    "post-shrink child " + i + " must be totalRate / newSize, not totalRate / oldSize");
+        }
+    }
+
     @Test
     void resizeRejectsZeroOrNegative() {
         IngestRateLimiterGroup g = new IngestRateLimiterGroup(4, 1000.0);

@@ -129,6 +129,17 @@ public class BenchRuntime {
     }
 
     /**
+     * Lock guarding the joint invariant
+     * {@code batch-size <= effective transaction-size <= ingest-max-ops}.
+     * {@link #setBatchSize}, {@link #setTransactionSize} and
+     * {@link #setIngestMaxOps} all hold this lock for their entire
+     * read-validate-write sequence so two concurrent admin POSTs cannot
+     * each pass against the old value of the other field and then commit
+     * writes that violate the invariant.
+     */
+    private final Object ingestionConfigLock = new Object();
+
+    /**
      * Update the ingest rate. {@code 0} means unlimited (maps to
      * {@link #UNLIMITED_RATE} on the underlying limiter). Pushes the new
      * rate into every per-thread limiter and unparks all registered worker
@@ -143,17 +154,19 @@ public class BenchRuntime {
         if (opsPerSecond < 0) {
             throw new IllegalArgumentException("ingest-max-ops must be >= 0, got " + opsPerSecond);
         }
-        if (opsPerSecond > 0) {
-            int effectiveTxn = config.effectiveTransactionSize();
-            if (effectiveTxn > opsPerSecond) {
-                throw new IllegalArgumentException(
-                        "ingest-max-ops (" + opsPerSecond + ") must be >= effective transaction-size ("
-                                + effectiveTxn + "). Lower batch-size/transaction-size first.");
+        synchronized (ingestionConfigLock) {
+            if (opsPerSecond > 0) {
+                int effectiveTxn = config.effectiveTransactionSize();
+                if (effectiveTxn > opsPerSecond) {
+                    throw new IllegalArgumentException(
+                            "ingest-max-ops (" + opsPerSecond + ") must be >= effective transaction-size ("
+                                    + effectiveTxn + "). Lower batch-size/transaction-size first.");
+                }
             }
+            double rate = opsPerSecond > 0 ? opsPerSecond : 0.0;
+            ingestRateLimiterGroup.setEffectiveRate(rate);
+            config.ingestMaxOpsPerSecond = opsPerSecond;
         }
-        double rate = opsPerSecond > 0 ? opsPerSecond : 0.0;
-        ingestRateLimiterGroup.setEffectiveRate(rate);
-        config.ingestMaxOpsPerSecond = opsPerSecond;
     }
 
     public void setQueryMaxOps(int opsPerSecond) {
@@ -192,22 +205,24 @@ public class BenchRuntime {
         if (newBatchSize < 1) {
             throw new IllegalArgumentException("batch-size must be >= 1, got " + newBatchSize);
         }
-        int txn = config.transactionSize;
-        if (txn > 0 && newBatchSize > txn) {
-            throw new IllegalArgumentException(
-                    "batch-size (" + newBatchSize + ") must be <= transaction-size ("
-                            + txn + "). Raise transaction-size first or pick a smaller batch-size.");
+        synchronized (ingestionConfigLock) {
+            int txn = config.transactionSize;
+            if (txn > 0 && newBatchSize > txn) {
+                throw new IllegalArgumentException(
+                        "batch-size (" + newBatchSize + ") must be <= transaction-size ("
+                                + txn + "). Raise transaction-size first or pick a smaller batch-size.");
+            }
+            // Effective transaction size after the change.
+            int effectiveTxn = txn > 0 ? txn : newBatchSize;
+            int rate = config.ingestMaxOpsPerSecond;
+            if (rate > 0 && effectiveTxn > rate) {
+                throw new IllegalArgumentException(
+                        "effective transaction-size (" + effectiveTxn
+                                + ") would exceed ingest-max-ops (" + rate
+                                + "). Raise ingest-max-ops or lower transaction-size/batch-size.");
+            }
+            config.batchSize = newBatchSize;
         }
-        // Effective transaction size after the change.
-        int effectiveTxn = txn > 0 ? txn : newBatchSize;
-        int rate = config.ingestMaxOpsPerSecond;
-        if (rate > 0 && effectiveTxn > rate) {
-            throw new IllegalArgumentException(
-                    "effective transaction-size (" + effectiveTxn
-                            + ") would exceed ingest-max-ops (" + rate
-                            + "). Raise ingest-max-ops or lower transaction-size/batch-size.");
-        }
-        config.batchSize = newBatchSize;
     }
 
     /**
@@ -224,20 +239,22 @@ public class BenchRuntime {
             throw new IllegalArgumentException(
                     "transaction-size must be >= 1, got " + newTransactionSize);
         }
-        int batch = config.batchSize;
-        if (newTransactionSize < batch) {
-            throw new IllegalArgumentException(
-                    "transaction-size (" + newTransactionSize + ") must be >= batch-size ("
-                            + batch + "). Lower batch-size first or pick a larger transaction-size.");
+        synchronized (ingestionConfigLock) {
+            int batch = config.batchSize;
+            if (newTransactionSize < batch) {
+                throw new IllegalArgumentException(
+                        "transaction-size (" + newTransactionSize + ") must be >= batch-size ("
+                                + batch + "). Lower batch-size first or pick a larger transaction-size.");
+            }
+            int rate = config.ingestMaxOpsPerSecond;
+            if (rate > 0 && newTransactionSize > rate) {
+                throw new IllegalArgumentException(
+                        "transaction-size (" + newTransactionSize
+                                + ") must be <= ingest-max-ops (" + rate
+                                + "). Raise ingest-max-ops first or lower transaction-size.");
+            }
+            config.transactionSize = newTransactionSize;
         }
-        int rate = config.ingestMaxOpsPerSecond;
-        if (rate > 0 && newTransactionSize > rate) {
-            throw new IllegalArgumentException(
-                    "transaction-size (" + newTransactionSize
-                            + ") must be <= ingest-max-ops (" + rate
-                            + "). Raise ingest-max-ops first or lower transaction-size.");
-        }
-        config.transactionSize = newTransactionSize;
     }
 
     public Supplier<Map<String, Object>> getStatusSupplier() {
@@ -328,17 +345,14 @@ public class BenchRuntime {
             }
         }
 
-        // Resize the per-thread limiter group so the global rate is re-split.
-        // The group preserves existing children so already-attached workers
-        // remain associated with their slot. We only grow the group; shrinking
-        // would invalidate child slots for any worker still attached to a
-        // truncated index. When new == current or new < current, just
-        // rebalance the children's per-share rate.
-        if (newThreads > ingestRateLimiterGroup.size()) {
-            ingestRateLimiterGroup.resize(newThreads);
-        } else {
-            ingestRateLimiterGroup.setEffectiveRate(ingestRateLimiterGroup.getEffectiveRate());
-        }
+        // Resize the per-thread limiter group so the per-worker rate share
+        // (totalRate / newThreads) reflects the actual active worker count
+        // — otherwise a 8 → 4 shrink would leave child rates at total/8 and
+        // the aggregate throughput would be total/2. Growing appends new
+        // children; shrinking drops the truncated tail (those workers have
+        // already exited via the poison-pill path) and rebalances the
+        // survivors to the new (larger) share.
+        ingestRateLimiterGroup.resize(newThreads);
 
         config.ingestThreads = newThreads;
         targetIngestThreads = newThreads;

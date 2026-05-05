@@ -151,12 +151,14 @@ public final class IngestRateLimiterGroup {
 
     /**
      * Resize the group to {@code newSize} children, redistributing the
-     * configured rate. Existing children retain their identity (so attached
-     * threads stay attached) and only their per-child rate is updated.
+     * configured rate so each child gets {@code currentTotalRate / newSize}.
+     * Existing children retain their identity (so attached threads stay
+     * attached).
      *
      * <p>Growing appends new {@link PerThreadRateLimiter} instances at the
-     * end. Shrinking truncates the tail; truncated workers are expected to
-     * have already exited (poison-pill semantics in
+     * end. Shrinking truncates the tail and rebalances the remaining
+     * children to the new (larger) per-child share. Truncated workers are
+     * expected to have already exited (poison-pill semantics in
      * {@link BenchRuntime#setIngestThreads(int)}).
      */
     public synchronized void resize(int newSize) {
@@ -164,21 +166,26 @@ public final class IngestRateLimiterGroup {
             throw new IllegalArgumentException("newSize must be > 0, got " + newSize);
         }
         double share = perChildRate(currentTotalRate, newSize);
-        // Update existing children first so any in-flight acquire sees the new rate.
-        for (PerThreadRateLimiter c : children) {
-            c.setRate(share);
-        }
-        if (newSize > children.size()) {
+        if (newSize >= children.size()) {
+            // Grow or no-op: rebalance existing children, then append new ones.
+            for (PerThreadRateLimiter c : children) {
+                c.setRate(share);
+            }
             for (int i = children.size(); i < newSize; i++) {
                 children.add(new PerThreadRateLimiter(share));
             }
-        } else if (newSize < children.size()) {
-            // Wake parked workers in the truncated tail so they don't miss
-            // a shutdown signal while sitting in setRate's reset.
+        } else {
+            // Shrink: rebalance the surviving children to the new share, then
+            // drop the tail. Wake any thread parked in a truncated child so it
+            // doesn't sit on a stale deadline (the worker should have exited
+            // via the poison-pill path before we got here, but defence-in-depth).
             for (int i = newSize; i < children.size(); i++) {
                 children.get(i).setRate(share);
             }
             children.subList(newSize, children.size()).clear();
+            for (PerThreadRateLimiter c : children) {
+                c.setRate(share);
+            }
         }
     }
 
