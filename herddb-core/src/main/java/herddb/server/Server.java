@@ -486,10 +486,20 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                         configuration.getBoolean(
                                 ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
                                 ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT));
+                int cleanupBatchSize = configuration.getInt(
+                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
+                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT);
+                if (cleanupBatchSize > ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_MAX_RECOMMENDED) {
+                    LOGGER.log(Level.WARNING,
+                            "{0}={1} exceeds the recommended ceiling of {2}; very large batches "
+                                    + "may push the gRPC frame past the inbound message size limit",
+                            new Object[]{
+                                    ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
+                                    cleanupBatchSize,
+                                    ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_MAX_RECOMMENDED});
+                }
                 dsmConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
-                        configuration.getInt(
-                                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
-                                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT));
+                        cleanupBatchSize);
                 DataStorageManager dsm = factory.createDataStorageManager(
                         dataDirectory, tmpDirectory, diskswapThreshold, client, dsmConfig,
                         statsLogger.scope("remote_storage"));
@@ -600,8 +610,13 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 configuration.getBoolean(
                         ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
                         ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT));
+        sharedConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
+                configuration.getInt(
+                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
+                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT));
         return factory.createPromotableDataStorageManager(
-                client, metaMgr, dataDirectory, tmpDirectory, diskswapThreshold, sharedConfig);
+                client, metaMgr, dataDirectory, tmpDirectory, diskswapThreshold, sharedConfig,
+                statsLogger.scope("remote_storage"));
     }
 
     protected CommitLogManager buildCommitLogManager() {

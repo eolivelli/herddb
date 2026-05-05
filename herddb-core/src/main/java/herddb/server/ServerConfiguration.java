@@ -139,6 +139,15 @@ public final class ServerConfiguration {
     public static final int PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT = 100;
 
     /**
+     * Soft upper-bound on {@link #PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE}.
+     * Larger values trigger a startup {@code WARNING} because the resulting
+     * {@code DeleteFiles} request frame may approach the gRPC inbound message
+     * size limit (each path is a string of ~50–200 bytes, so 10,000 paths is
+     * ~0.5–2 MiB on the wire).
+     */
+    public static final int PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_MAX_RECOMMENDED = 10_000;
+
+    /**
      * Maximum number of concurrent page/index-page writes to remote storage
      * during a single checkpoint flush (e.g. parallel BLink node writes in
      * {@code BLinkKeyToPageIndex.checkpoint}). Bounds the global fan-out so a

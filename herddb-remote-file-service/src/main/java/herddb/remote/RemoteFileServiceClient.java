@@ -1209,7 +1209,16 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                             }
                         }
                         if (errors.size() == futures.size() && !errors.isEmpty()) {
-                            all.completeExceptionally(errors.get(0));
+                            // Surface the first cause and attach the rest as
+                            // suppressed so the operator can diagnose all
+                            // simultaneous server-side failures (e.g. one server
+                            // returns UNAVAILABLE while another returns
+                            // RESOURCE_EXHAUSTED) rather than only one.
+                            Throwable primary = errors.get(0);
+                            for (int i = 1; i < errors.size(); i++) {
+                                primary.addSuppressed(errors.get(i));
+                            }
+                            all.completeExceptionally(primary);
                         } else {
                             all.complete(total);
                         }

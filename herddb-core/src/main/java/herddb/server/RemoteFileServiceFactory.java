@@ -120,6 +120,26 @@ public interface RemoteFileServiceFactory {
     }
 
     /**
+     * Stats-aware overload (issue #398). Plumbs a {@link StatsLogger} into the
+     * promotable manager so the writable delegate created by
+     * {@code promoteToWritable()} can register the boot-cleanup metrics
+     * ({@code remote_storage_cleanup_*}) — otherwise a promoted shared-storage
+     * replica would silently drop those metrics. The default delegates to the
+     * config-only overload.
+     */
+    default DataStorageManager createPromotableDataStorageManager(
+            RemoteFileClient client,
+            SharedCheckpointMetadata metadata,
+            Path dataDirectory,
+            Path tmpDirectory,
+            int swapThreshold,
+            Map<String, Object> config,
+            StatsLogger statsLogger) {
+        return createPromotableDataStorageManager(client, metadata, dataDirectory, tmpDirectory,
+                swapThreshold, config);
+    }
+
+    /**
      * Creates a strictly read-only data storage manager for indexing-service
      * shadow replicas. Unlike the promotable variant, this one never transitions
      * to writable and throws {@link UnsupportedOperationException} on any

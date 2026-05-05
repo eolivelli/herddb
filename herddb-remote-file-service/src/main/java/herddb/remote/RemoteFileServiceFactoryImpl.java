@@ -155,6 +155,19 @@ public class RemoteFileServiceFactoryImpl implements RemoteFileServiceFactory {
             Path tmpDirectory,
             int swapThreshold,
             Map<String, Object> config) {
+        return createPromotableDataStorageManager(client, metadata, dataDirectory, tmpDirectory,
+                swapThreshold, config, NullStatsLogger.INSTANCE);
+    }
+
+    @Override
+    public DataStorageManager createPromotableDataStorageManager(
+            RemoteFileClient client,
+            SharedCheckpointMetadata metadata,
+            Path dataDirectory,
+            Path tmpDirectory,
+            int swapThreshold,
+            Map<String, Object> config,
+            StatsLogger statsLogger) {
         RemoteFileServiceClient concreteClient = (RemoteFileServiceClient) client;
         SharedCheckpointMetadataManager concreteMetadata = (SharedCheckpointMetadataManager) metadata;
         boolean hashWritesEnabled = readBoolean(config,
@@ -163,12 +176,17 @@ public class RemoteFileServiceFactoryImpl implements RemoteFileServiceFactory {
         boolean hashChecksEnabled = readBoolean(config,
                 ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED,
                 ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
+        int cleanupBatchSize = readInt(config,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT);
         ReadReplicaDataStorageManager readReplica = new ReadReplicaDataStorageManager(
                 concreteClient, concreteMetadata, tmpDirectory, swapThreshold);
         return new PromotableRemoteFileDataStorageManager(
                 readReplica, concreteClient, concreteMetadata,
                 dataDirectory, tmpDirectory, swapThreshold,
-                hashWritesEnabled, hashChecksEnabled);
+                hashWritesEnabled, hashChecksEnabled,
+                cleanupBatchSize,
+                statsLogger == null ? NullStatsLogger.INSTANCE : statsLogger);
     }
 
     @Override
