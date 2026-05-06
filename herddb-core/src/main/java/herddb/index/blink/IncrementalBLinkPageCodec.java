@@ -63,6 +63,17 @@ final class IncrementalBLinkPageCodec {
     private static final byte RIGHTSEP_INF = 0;
     private static final byte RIGHTSEP_BYTES = 1;
 
+    /**
+     * Defensive upper bound on the per-chunk node count read from disk.
+     * The default {@code DEFAULT_SNAPSHOT_CHUNK_SIZE} in
+     * {@link IncrementalBLinkKeyToPageIndex} is 50,000 nodes; this cap is
+     * orders of magnitude above any plausible legitimate value, so it
+     * never trips on a healthy page but blocks a corrupted {@code vint}
+     * count from triggering eight separate large-array allocations
+     * inside {@link #readNodeMetadataArray} (issue #411 review).
+     */
+    static final int MAX_NODES_PER_CHUNK = 1 << 22; // ~4.2M
+
     private IncrementalBLinkPageCodec() {
     }
 
@@ -229,6 +240,19 @@ final class IncrementalBLinkPageCodec {
      */
     private static BLinkNodeMetadata<Bytes>[] readNodeMetadataArray(ByteBufCursor in, int count)
             throws IOException {
+        if (count < 0) {
+            throw new IOException("corrupted node-metadata array: negative count " + count);
+        }
+        if (count > MAX_NODES_PER_CHUNK) {
+            // Refuse before we allocate eight scratch arrays of size `count`.
+            // A healthy chunk is bounded by DEFAULT_SNAPSHOT_CHUNK_SIZE
+            // (50,000 nodes); anything beyond MAX_NODES_PER_CHUNK is almost
+            // certainly a corrupted vint that would otherwise blow up the
+            // GC at allocation time.
+            throw new IOException("node-metadata array count " + count
+                    + " exceeds MAX_NODES_PER_CHUNK (" + MAX_NODES_PER_CHUNK
+                    + "); page is corrupted");
+        }
         if (count == 0) {
             return newArray(0);
         }

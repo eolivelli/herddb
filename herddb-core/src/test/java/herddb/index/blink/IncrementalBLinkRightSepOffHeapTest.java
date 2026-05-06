@@ -102,24 +102,37 @@ public class IncrementalBLinkRightSepOffHeapTest {
         }
         assertEquals((long) n, idx.size());
 
-        // Strong invariant: at least one rightsep loaded from the snapshot
-        // chunk is off-heap-backed. Without issue #411's slab-pack at
-        // IncrementalBLinkPageCodec, every rightsep would arrive on-heap.
-        assertTrue(
-                "issue #411: at least one rightsep loaded from the incremental codec must be off-heap",
-                BLinkTestReflection.anyRightSepOffHeap(idx));
+        // Stronger invariant: EVERY non-INFINITY rightsep loaded from the
+        // snapshot must be off-heap-backed. A regression where the second
+        // pass slab-packed only a fraction of rightseps (e.g. an off-by-one
+        // or partial loop) would still satisfy "at least one off-heap" but
+        // be caught here.
+        int onHeapNonInfIdx = BLinkTestReflection.firstOnHeapNonInfRightSep(idx);
+        assertEquals(
+                "issue #411: every non-INFINITY rightsep loaded from the codec must be"
+                        + " off-heap-backed when the aggregate exceeds the slab threshold"
+                        + " (offending node index=" + onHeapNonInfIdx + ")",
+                -1, onHeapNonInfIdx);
+        // Also assert at least one was non-INF, otherwise the test is vacuous.
+        assertTrue("test must observe ≥ 1 non-INF rightsep to be meaningful",
+                BLinkTestReflection.countNonInfRightSeps(idx) >= 1);
     }
 
     @Test
     public void smallSnapshotFallsBackToHeap() throws Exception {
-        // 4 tiny keys, well below the 4 KiB rightsep slab threshold.
-        // The slab-pack path must NOT fire; rightseps come back on-heap.
-        MemoryManager mem = new MemoryManager(5 * (1L << 20), 0, 10 * (128L << 10), (128L << 10));
+        // We need a non-trivial number of leaves (so several non-INF
+        // rightseps are persisted) but the aggregate rightsep bytes must
+        // stay BELOW the 4 KiB slab threshold. With 4-byte keys (~96 B
+        // per BLink entry) and a 1 KiB page (~7 entries/leaf) we can fit
+        // ~7 leaves with 50 keys total ⇒ ~6 non-INF rightseps × 4 B ≈
+        // 24 B aggregate ≪ 4 KiB. The codec must take the on-heap path.
+        final int n = 50;
+        MemoryManager mem = new MemoryManager(5 * (1L << 20), 0, 10 * (128L << 10), 1024L);
         ds = new MemoryDataStorageManager();
         idx = new IncrementalBLinkKeyToPageIndex("tblspc", "tbl", mem, ds);
         idx.init();
         idx.start(LogSequenceNumber.START_OF_TIME, true);
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < n; i++) {
             idx.put(Bytes.from_int(i), (long) i);
         }
         List<PostCheckpointAction> actions = idx.checkpoint(new LogSequenceNumber(1L, 1L), false);
@@ -131,13 +144,21 @@ public class IncrementalBLinkRightSepOffHeapTest {
         idx = new IncrementalBLinkKeyToPageIndex("tblspc", "tbl", mem, ds);
         idx.init();
         idx.start(new LogSequenceNumber(1L, 1L), false);
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < n; i++) {
             assertEquals(Long.valueOf(i), idx.get(Bytes.from_int(i)));
         }
-        assertEquals(4L, idx.size());
+        assertEquals((long) n, idx.size());
 
-        // No off-heap rightseps under the threshold (the only rightsep is
-        // the root's POSITIVE_INFINITY anyway, but the helper handles that).
+        // Pre-condition: the test setup must produce real (non-INF) rightseps,
+        // otherwise the assertion below is vacuous (a single-leaf tree has
+        // only POSITIVE_INFINITY, which the on-heap helper skips).
+        int nonInf = BLinkTestReflection.countNonInfRightSeps(idx);
+        assertTrue("test setup must produce ≥ 1 non-INF rightsep so the on-heap"
+                + " fallback assertion is meaningful (got " + nonInf + ")",
+                nonInf >= 1);
+
+        // Below-threshold invariant: NO non-INFINITY rightsep is off-heap;
+        // the codec must have taken the on-heap fallback path.
         assertEquals("below-threshold codec must not pack rightseps off-heap",
                 -1, BLinkTestReflection.firstOffHeapRightSep(idx));
     }

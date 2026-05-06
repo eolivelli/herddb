@@ -596,12 +596,23 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
     }
 
     /**
-     * Eagerly copies the off-heap bytes into a private on-heap {@code byte[]}
-     * and breaks every link to the underlying slab. After this call the
-     * {@code Bytes} behaves exactly like an instance built via
-     * {@link #from_array(byte[])}: {@link #isOffHeap()} returns {@code false},
-     * {@link #isShared()} returns {@code false}, no {@link IndexKeySlab} is
-     * pinned, and equality / hashing semantics are unchanged.
+     * <b>Restricted-use API.</b> This method is intended <em>only</em> for
+     * the BLink split / half-merge separator-handoff sites in
+     * {@code herddb-utils}'s {@code BLink} (via the
+     * {@code SizeEvaluator.detachSeparator} hook). Do not call it from
+     * request-serving code or anywhere a sibling thread might be inside
+     * a read path on this {@code Bytes}: the same quiescence contract
+     * documented on {@link #release()} applies, and a violating concurrent
+     * reader can observe an {@link IllegalStateException} or — for owned
+     * slices — a use-after-free.
+     *
+     * <p>Eagerly copies the off-heap bytes into a private on-heap
+     * {@code byte[]} and breaks every link to the underlying slab. After
+     * this call the {@code Bytes} behaves exactly like an instance built
+     * via {@link #from_array(byte[])}: {@link #isOffHeap()} returns
+     * {@code false}, {@link #isShared()} returns {@code false}, no
+     * {@link IndexKeySlab} is pinned, and equality / hashing semantics
+     * are unchanged.
      *
      * <h3>Use case (issue #411)</h3>
      * BLink {@code Node.split()} promotes one of its keys to become the new

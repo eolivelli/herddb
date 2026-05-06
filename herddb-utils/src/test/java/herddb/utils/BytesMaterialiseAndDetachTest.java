@@ -159,6 +159,35 @@ public class BytesMaterialiseAndDetachTest {
                 0, detached.compareTo(onHeap));
     }
 
+    /**
+     * After {@link Bytes#release()} runs on an owned-slice off-heap Bytes
+     * (without an intervening lazy materialisation), the underlying bytes
+     * are no longer reachable. {@code materialiseAndDetach()} on such an
+     * instance must surface this via {@link IllegalStateException} rather
+     * than silently producing a zero-length / corrupted byte[]. Covers the
+     * fail-fast {@code throw new IllegalStateException("Bytes already released")}
+     * branch that no other test exercises.
+     */
+    @Test
+    public void releaseThenDetachThrows() {
+        ByteBuf slice = HerdDBByteBufAllocators.dataPagesAllocator()
+                .directBuffer(16);
+        slice.writeBytes(new byte[]{1, 2, 3, 4});
+        Bytes b = Bytes.fromOffHeap(slice);
+        b.release();
+        // After release, the slice is back in the pool; reading bytes is
+        // undefined. The detach helper must fail-fast.
+        try {
+            b.materialiseAndDetach();
+            org.junit.Assert.fail("expected IllegalStateException after release()");
+        } catch (IllegalStateException expected) {
+            org.junit.Assert.assertTrue(
+                    "exception message must mention release, got: " + expected.getMessage(),
+                    expected.getMessage() != null
+                            && expected.getMessage().contains("released"));
+        }
+    }
+
     @Test
     public void zeroLengthDetachWorks() {
         IndexKeySlab slab = new IndexKeySlab(0L,

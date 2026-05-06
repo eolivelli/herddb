@@ -129,4 +129,59 @@ final class BLinkTestReflection {
         Object v = rs.get(node);
         return (v instanceof Bytes) ? (Bytes) v : null;
     }
+
+    /**
+     * Returns the number of live nodes in the BLink. Used by the
+     * {@code BLinkSeparatorDetachTest} to fail loudly if the test's page
+     * size is so generous that no splits actually fired (in which case
+     * the rightsep invariant is vacuous).
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    static int nodeCount(Object indexInstance) throws Exception {
+        Field treeField = indexInstance.getClass().getDeclaredField("tree");
+        treeField.setAccessible(true);
+        BLink<Bytes, Long> blink = (BLink<Bytes, Long>) treeField.get(indexInstance);
+        Field nodes = BLink.class.getDeclaredField("nodes");
+        nodes.setAccessible(true);
+        ConcurrentMap<Long, ?> nodeMap = (ConcurrentMap<Long, ?>) nodes.get(blink);
+        return nodeMap.size();
+    }
+
+    /**
+     * Iterates every loaded BLink node and returns the index of the first
+     * non-INFINITY rightsep that satisfies {@code !isOffHeap()}, or -1 if
+     * every non-INF rightsep is off-heap. Used by the issue #411 codec
+     * slab-pack test to assert that a partial regression where only a
+     * fraction of rightseps go off-heap is caught.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    static int firstOnHeapNonInfRightSep(Object indexInstance) throws Exception {
+        int idx = 0;
+        for (Object node : nodeIterable(indexInstance)) {
+            Bytes rs = rightSepOf(node);
+            if (rs != null && rs != Bytes.POSITIVE_INFINITY && !rs.isOffHeap()) {
+                return idx;
+            }
+            idx++;
+        }
+        return -1;
+    }
+
+    /**
+     * Counts loaded BLink nodes whose rightsep is a non-INFINITY
+     * {@link Bytes}. Used to make the issue #411 below-threshold codec
+     * test verify that a non-trivial number of real separators were
+     * exercised (not just the root's POSITIVE_INFINITY).
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    static int countNonInfRightSeps(Object indexInstance) throws Exception {
+        int n = 0;
+        for (Object node : nodeIterable(indexInstance)) {
+            Bytes rs = rightSepOf(node);
+            if (rs != null && rs != Bytes.POSITIVE_INFINITY) {
+                n++;
+            }
+        }
+        return n;
+    }
 }

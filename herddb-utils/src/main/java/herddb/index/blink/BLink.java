@@ -2359,8 +2359,11 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
             owner.usedMemory.add(NODE_CONSTANT_SIZE);
 
             // if n and new are leaves, their separators are set equal to the largest keys in them.
-            // The pre-existing rightsep is already detached (see invariant note below); just
-            // transfer the reference to the new right node.
+            // No detach needed for this transfer: the pre-existing rightsep is either heap-detached
+            // (split / half_merge previously ran on it, or it came from the legacy on-heap codec
+            // BLinkKeyToPageIndex.MetadataSerializer), or it anchors the IncrementalBLink codec's
+            // shared snapshot slab. In neither case does it pin a per-page IndexKeySlab, so
+            // forwarding the reference to the new right node is safe.
             right.rightsep = rightsep;
 
             // Issue #411: lastKey came from THIS node's per-page IndexKeySlab. Promoting it

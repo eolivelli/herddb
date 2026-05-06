@@ -68,12 +68,19 @@ public class BLinkSeparatorDetachTest {
 
     @Test
     public void noRightsepStaysOffHeapAfterSplits() throws Exception {
-        // 1024 keys × ~24 bytes each = ~24 KiB → many leaf splits. Each split
-        // promotes the donor leaf's lastKey to rightsep; without the detach
-        // hook, those rightseps would all be off-heap-backed (slab-anchored
-        // to the donor's page slab).
+        // To exercise the issue #411 detach hook against an off-heap lastKey
+        // we need (a) multiple leaves (so splits actually fire) and (b) each
+        // leaf's aggregate key bytes ≥ IndexKeySlab.OFFHEAP_KEY_BYTES_THRESHOLD
+        // (so BLinkIndexDataStorageImpl.loadPage slab-packs the keys, making
+        // lastKey off-heap at split time). 64-byte keys + 32 KiB pages ⇒
+        // ~178 entries/leaf; after a leaf split each half holds ~89 entries
+        // × 64 B = ~5.7 KiB worth of keys, well above the 4 KiB slab
+        // threshold ⇒ slab-pack fires per leaf on reload. With 1024 initial
+        // keys we get ~6 leaves; after reload we add 512 more keys so
+        // post-reload splits fire on leaves already populated with off-heap
+        // shared-slab keys, exercising detachSeparator's off-heap branch.
         final int n = 1024;
-        MemoryManager mem = new MemoryManager(5 * (1L << 20), 0, 10 * (128L << 10), (128L << 10));
+        MemoryManager mem = new MemoryManager(5 * (1L << 20), 0, 10 * (128L << 10), 32L * 1024L);
         ds = new MemoryDataStorageManager();
         idx = new BLinkKeyToPageIndex("tblspc", "tbl", mem, ds);
         idx.init();
@@ -87,12 +94,13 @@ public class BLinkSeparatorDetachTest {
         }
         idx.close();
 
-        // Reload — disk-load path repopulates rightseps via metadata. The
-        // detach hook fires later only on subsequent splits; on a fresh load
-        // rightseps come straight off the metadata which (with this build)
-        // does NOT slab-pack them (BLinkMetadata.MetadataSerializer emits
-        // each rightsep as its own on-heap byte[]). They stay on-heap
-        // throughout this test, which is exactly what we assert.
+        // Reload — disk-load path repopulates rightseps via the legacy
+        // BLinkMetadata.MetadataSerializer (which emits each rightsep as
+        // an on-heap byte[]). LEAF KEYS, however, come back off-heap from
+        // BLinkIndexDataStorageImpl.loadPage when the per-page key bytes
+        // exceed the slab threshold — so post-reload splits will see an
+        // off-heap lastKey at the rightsep handoff site, exercising
+        // detachSeparator's off-heap branch.
         idx = new BLinkKeyToPageIndex("tblspc", "tbl", mem, ds);
         idx.init();
         idx.start(new LogSequenceNumber(1L, 1L), false);
@@ -112,9 +120,20 @@ public class BLinkSeparatorDetachTest {
         for (int i = n; i < n + n / 2; i++) {
             idx.put(Bytes.from_array(makeKey(i)), (long) i);
         }
+
+        // The test's invariant only means anything if splits actually fired
+        // — guard against a too-generous future page size silently making
+        // this test vacuous (one leaf ⇒ no rightseps ⇒ -1 trivially passes).
+        int loadedNodes = BLinkTestReflection.nodeCount(idx);
+        assertTrue("test setup must produce splits so detachSeparator runs (got "
+                + loadedNodes + " loaded nodes; need ≥ 2)",
+                loadedNodes >= 2);
+
         // Sanity: at least one Bytes key in the tree is off-heap (the keys
         // themselves still live in their per-page slabs — we are NOT
-        // detaching every key, only the separators).
+        // detaching every key, only the separators). This also confirms
+        // the lastKey at split time was off-heap, which is the only
+        // configuration where detachSeparator's branch is meaningful.
         assertTrue("expected some leaf key to remain off-heap-backed",
                 BLinkTestReflection.anyKeyOffHeap(idx));
 
@@ -128,9 +147,12 @@ public class BLinkSeparatorDetachTest {
     }
 
     private static byte[] makeKey(int i) {
-        // Deterministic 24-byte key matching BLinkOffHeapKeysTest's helper
-        // so we share the same ~6 KiB-per-page slab profile.
-        byte[] out = new byte[24];
+        // Deterministic 64-byte key. The 4-byte big-endian int prefix
+        // controls sort order; the trailing bytes pad each key out so a
+        // 32 KiB leaf fills with enough raw key bytes (~89 keys × 64 B
+        // ≈ 5.7 KiB) for BLinkIndexDataStorageImpl.loadPage to slab-pack
+        // on reload.
+        byte[] out = new byte[64];
         out[0] = (byte) (i >>> 24);
         out[1] = (byte) (i >>> 16);
         out[2] = (byte) (i >>> 8);
