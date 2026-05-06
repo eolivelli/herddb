@@ -812,13 +812,25 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     /**
      * Fetches a single record value from a v2 page, consulting the value
      * cache first and issuing a byte-range read against remote storage on
-     * miss. Returns a freshly-owned {@code byte[]}.
+     * miss.
+     *
+     * <p><b>Issue #411 — off-heap return</b>: returns a direct
+     * {@link io.netty.buffer.ByteBuf} retained slice from the
+     * {@link LazyValueCache}'s pool. The caller owns one refcount and
+     * <b>must</b> release it (typically by handing the slice to
+     * {@link herddb.utils.Bytes#fromOffHeap(io.netty.buffer.ByteBuf)} whose
+     * own lifecycle returns the refcount to the pool on
+     * {@link herddb.utils.Bytes#release()} or on lazy materialisation).
+     *
+     * <p>For zero-length values the returned buffer is the empty
+     * {@link io.netty.buffer.Unpooled#EMPTY_BUFFER}; releasing it is a
+     * no-op so callers do not need to special-case empty values.
      */
-    byte[] readPageValue(String tableSpace, String uuid, long pageId,
+    io.netty.buffer.ByteBuf readPageValue(String tableSpace, String uuid, long pageId,
             LazyDataPageFormat.FixedHeader h, long valueOffset, int valueLength)
             throws DataStorageManagerException {
         if (valueLength == 0) {
-            return new byte[0];
+            return io.netty.buffer.Unpooled.EMPTY_BUFFER;
         }
         LazyValueCache.ValueKey key = new LazyValueCache.ValueKey(
                 tableSpace, uuid, pageId, valueOffset);

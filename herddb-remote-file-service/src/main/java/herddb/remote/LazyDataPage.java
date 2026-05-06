@@ -136,9 +136,19 @@ public final class LazyDataPage extends DataPage {
             return null;
         }
         try {
-            byte[] value = dsm.readPageValue(tableSpace, uuid, pageId,
+            // Issue #411: the cache returns a direct ByteBuf retained slice
+            // (caller owns one refcount). Hand ownership to a Bytes.fromOffHeap
+            // wrapper whose lifecycle (release on Bytes.release(), or on lazy
+            // materialisation by an on-heap accessor) returns the refcount to
+            // the pool. Zero-length values short-circuit to Bytes.EMPTY_ARRAY
+            // because Unpooled.EMPTY_BUFFER has no refcount to manage and the
+            // downstream consumer can avoid the off-heap wrapper.
+            if (m.valueLength == 0) {
+                return new Record(key, Bytes.EMPTY_ARRAY);
+            }
+            io.netty.buffer.ByteBuf slice = dsm.readPageValue(tableSpace, uuid, pageId,
                     header, m.valueOffset, m.valueLength);
-            return new Record(key, Bytes.from_array(value));
+            return new Record(key, Bytes.fromOffHeap(slice));
         } catch (DataStorageManagerException e) {
             throw new LazyValueFetchException("Failed to fetch value for key "
                     + key + " from " + tableSpace + "/" + uuid + "#" + pageId, e);

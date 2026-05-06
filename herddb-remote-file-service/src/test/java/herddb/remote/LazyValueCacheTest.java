@@ -25,9 +25,9 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import herddb.remote.LazyValueCache.ValueKey;
+import io.netty.buffer.ByteBuf;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -38,221 +38,275 @@ import org.junit.Test;
 
 public class LazyValueCacheTest {
 
+    /**
+     * Test helper: copies a slice's bytes into a fresh {@code byte[]} and
+     * releases the slice's refcount. Mirrors what a real consumer
+     * ({@code Bytes.fromOffHeap(slice).getBuffer()}) does on first heap access.
+     */
+    private static byte[] consumeAndRelease(ByteBuf slice) {
+        try {
+            byte[] out = new byte[slice.readableBytes()];
+            slice.getBytes(slice.readerIndex(), out);
+            return out;
+        } finally {
+            slice.release();
+        }
+    }
+
     @Test
     public void hitCountedOnSecondCall() {
         LazyValueCache cache = new LazyValueCache(1024 * 1024);
         AtomicInteger loaderCalls = new AtomicInteger();
         ValueKey k = new ValueKey("ts", "uuid", 1L, 0L);
 
-        byte[] first = cache.getOrFetch(k, () -> {
+        ByteBuf firstSlice = cache.getOrFetch(k, () -> {
             loaderCalls.incrementAndGet();
             return new byte[]{1, 2, 3};
         });
-        byte[] second = cache.getOrFetch(k, () -> {
+        ByteBuf secondSlice = cache.getOrFetch(k, () -> {
             loaderCalls.incrementAndGet();
             return new byte[]{9, 9, 9};
         });
 
-        assertEquals(1, loaderCalls.get());
-        assertArrayEquals(new byte[]{1, 2, 3}, first);
-        assertSame("cached reference should be reused", first, second);
+        try {
+            assertEquals(1, loaderCalls.get());
+            byte[] firstBytes = new byte[firstSlice.readableBytes()];
+            byte[] secondBytes = new byte[secondSlice.readableBytes()];
+            firstSlice.getBytes(firstSlice.readerIndex(), firstBytes);
+            secondSlice.getBytes(secondSlice.readerIndex(), secondBytes);
+            assertArrayEquals(new byte[]{1, 2, 3}, firstBytes);
+            assertArrayEquals("second hit must serve the cached bytes", firstBytes, secondBytes);
+        } finally {
+            firstSlice.release();
+            secondSlice.release();
+            cache.close();
+        }
     }
 
     @Test
     public void zeroBudgetDisablesCache() {
         LazyValueCache cache = new LazyValueCache(0L);
-        assertFalse(cache.isEnabled());
-        AtomicInteger loaderCalls = new AtomicInteger();
-        ValueKey k = new ValueKey("ts", "uuid", 1L, 0L);
+        try {
+            assertFalse(cache.isEnabled());
+            AtomicInteger loaderCalls = new AtomicInteger();
+            ValueKey k = new ValueKey("ts", "uuid", 1L, 0L);
 
-        cache.getOrFetch(k, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{1};
-        });
-        cache.getOrFetch(k, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{1};
-        });
+            ByteBuf firstSlice = cache.getOrFetch(k, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{1};
+            });
+            ByteBuf secondSlice = cache.getOrFetch(k, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{1};
+            });
 
-        assertEquals("every call must hit the loader when cache is disabled",
-                2, loaderCalls.get());
-        assertEquals(0L, cache.estimatedSize());
+            assertEquals("every call must hit the loader when cache is disabled",
+                    2, loaderCalls.get());
+            assertEquals(0L, cache.estimatedSize());
+            firstSlice.release();
+            secondSlice.release();
+        } finally {
+            cache.close();
+        }
     }
 
     @Test
     public void weightBoundedEviction() {
         // 256-byte budget should evict older entries when the total exceeds the cap.
         LazyValueCache cache = new LazyValueCache(256L);
-        AtomicInteger loaderCalls = new AtomicInteger();
-        // Insert 16 entries of 64 bytes each (total 1024 — well over 256).
-        for (int i = 0; i < 16; i++) {
-            final int idx = i;
-            ValueKey k = new ValueKey("ts", "uuid", idx, 0L);
-            cache.getOrFetch(k, () -> {
-                loaderCalls.incrementAndGet();
-                return new byte[64];
-            });
+        try {
+            AtomicInteger loaderCalls = new AtomicInteger();
+            // Insert 16 entries of 64 bytes each (total 1024 — well over 256).
+            for (int i = 0; i < 16; i++) {
+                final int idx = i;
+                ValueKey k = new ValueKey("ts", "uuid", idx, 0L);
+                ByteBuf slice = cache.getOrFetch(k, () -> {
+                    loaderCalls.incrementAndGet();
+                    return new byte[64];
+                });
+                slice.release();
+            }
+            assertEquals(16, loaderCalls.get());
+            // Caffeine weight-based eviction flows through an async write buffer;
+            // drain it before refetching so the test does not race the maintenance
+            // thread on CI.
+            cache.cleanUp();
+            // Now fetch the very first keys again; some must have been evicted
+            // and re-loaded. We don't pin down exactly which ones are resident
+            // (Caffeine's TinyLFU makes no such guarantee), only that the cache
+            // does not blow past its budget.
+            loaderCalls.set(0);
+            for (int i = 0; i < 16; i++) {
+                final int idx = i;
+                ValueKey k = new ValueKey("ts", "uuid", idx, 0L);
+                ByteBuf slice = cache.getOrFetch(k, () -> {
+                    loaderCalls.incrementAndGet();
+                    return new byte[64];
+                });
+                slice.release();
+            }
+            assertTrue("some entries should have been evicted and reloaded; got "
+                    + loaderCalls.get() + " reloads", loaderCalls.get() > 0);
+        } finally {
+            cache.close();
         }
-        assertEquals(16, loaderCalls.get());
-        // Caffeine weight-based eviction flows through an async write buffer;
-        // drain it before refetching so the test does not race the maintenance
-        // thread on CI.
-        cache.cleanUp();
-        // Now fetch the very first keys again; some must have been evicted
-        // and re-loaded. We don't pin down exactly which ones are resident
-        // (Caffeine's TinyLFU makes no such guarantee), only that the cache
-        // does not blow past its budget.
-        loaderCalls.set(0);
-        for (int i = 0; i < 16; i++) {
-            final int idx = i;
-            ValueKey k = new ValueKey("ts", "uuid", idx, 0L);
-            cache.getOrFetch(k, () -> {
-                loaderCalls.incrementAndGet();
-                return new byte[64];
-            });
-        }
-        assertTrue("some entries should have been evicted and reloaded; got "
-                + loaderCalls.get() + " reloads", loaderCalls.get() > 0);
     }
 
     @Test
     public void concurrentMissesShareSingleLoaderInvocation() throws Exception {
         LazyValueCache cache = new LazyValueCache(1024 * 1024);
-        ValueKey k = new ValueKey("ts", "uuid", 1L, 0L);
-        final int threads = 16;
-        final CountDownLatch start = new CountDownLatch(1);
-        final CountDownLatch allStarted = new CountDownLatch(threads);
-        final AtomicInteger loaderCalls = new AtomicInteger();
-        ExecutorService exec = Executors.newFixedThreadPool(threads);
         try {
-            Future<?>[] futures = new Future<?>[threads];
-            for (int i = 0; i < threads; i++) {
-                futures[i] = exec.submit(() -> {
-                    allStarted.countDown();
-                    try {
-                        start.await(5, TimeUnit.SECONDS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    }
-                    cache.getOrFetch(k, () -> {
-                        loaderCalls.incrementAndGet();
-                        // slow loader so contending threads actually pile up
+            ValueKey k = new ValueKey("ts", "uuid", 1L, 0L);
+            final int threads = 16;
+            final CountDownLatch start = new CountDownLatch(1);
+            final CountDownLatch allStarted = new CountDownLatch(threads);
+            final AtomicInteger loaderCalls = new AtomicInteger();
+            ExecutorService exec = Executors.newFixedThreadPool(threads);
+            try {
+                Future<?>[] futures = new Future<?>[threads];
+                for (int i = 0; i < threads; i++) {
+                    futures[i] = exec.submit(() -> {
+                        allStarted.countDown();
                         try {
-                            Thread.sleep(50);
-                        } catch (InterruptedException ie) {
+                            start.await(5, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
+                            return;
                         }
-                        return new byte[]{42};
+                        ByteBuf slice = cache.getOrFetch(k, () -> {
+                            loaderCalls.incrementAndGet();
+                            // slow loader so contending threads actually pile up
+                            try {
+                                Thread.sleep(50);
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                            }
+                            return new byte[]{42};
+                        });
+                        slice.release();
                     });
-                });
+                }
+                allStarted.await(5, TimeUnit.SECONDS);
+                start.countDown();
+                for (Future<?> f : futures) {
+                    f.get(10, TimeUnit.SECONDS);
+                }
+            } finally {
+                exec.shutdownNow();
             }
-            allStarted.await(5, TimeUnit.SECONDS);
-            start.countDown();
-            for (Future<?> f : futures) {
-                f.get(10, TimeUnit.SECONDS);
-            }
+            assertEquals("Caffeine.get(k, loader) must serialise concurrent misses",
+                    1, loaderCalls.get());
         } finally {
-            exec.shutdownNow();
+            cache.close();
         }
-        assertEquals("Caffeine.get(k, loader) must serialise concurrent misses",
-                1, loaderCalls.get());
     }
 
     @Test
     public void invalidateForPageDropsOnlyThatPage() {
         LazyValueCache cache = new LazyValueCache(1024 * 1024);
-        ValueKey k1 = new ValueKey("ts", "uuid", 1L, 0L);
-        ValueKey k2 = new ValueKey("ts", "uuid", 1L, 100L);
-        ValueKey k3 = new ValueKey("ts", "uuid", 2L, 0L);
-        AtomicInteger loaderCalls = new AtomicInteger();
-        cache.getOrFetch(k1, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{1};
-        });
-        cache.getOrFetch(k2, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{2};
-        });
-        cache.getOrFetch(k3, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{3};
-        });
-        assertEquals(3, loaderCalls.get());
+        try {
+            ValueKey k1 = new ValueKey("ts", "uuid", 1L, 0L);
+            ValueKey k2 = new ValueKey("ts", "uuid", 1L, 100L);
+            ValueKey k3 = new ValueKey("ts", "uuid", 2L, 0L);
+            AtomicInteger loaderCalls = new AtomicInteger();
+            cache.getOrFetch(k1, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{1};
+            }).release();
+            cache.getOrFetch(k2, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{2};
+            }).release();
+            cache.getOrFetch(k3, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{3};
+            }).release();
+            assertEquals(3, loaderCalls.get());
 
-        cache.invalidateForPage("ts", "uuid", 1L);
+            cache.invalidateForPage("ts", "uuid", 1L);
 
-        // Page 1 entries should reload; page 2 entry should hit
-        cache.getOrFetch(k1, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{1};
-        });
-        cache.getOrFetch(k2, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{2};
-        });
-        cache.getOrFetch(k3, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{3};
-        });
-        assertEquals("expected 2 reloads after invalidate, got " + loaderCalls.get(),
-                5, loaderCalls.get());
+            // Page 1 entries should reload; page 2 entry should hit
+            cache.getOrFetch(k1, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{1};
+            }).release();
+            cache.getOrFetch(k2, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{2};
+            }).release();
+            cache.getOrFetch(k3, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{3};
+            }).release();
+            assertEquals("expected 2 reloads after invalidate, got " + loaderCalls.get(),
+                    5, loaderCalls.get());
+        } finally {
+            cache.close();
+        }
     }
 
     @Test
     public void invalidateForTableDropsOnlyThatTable() {
         LazyValueCache cache = new LazyValueCache(1024 * 1024);
-        ValueKey a = new ValueKey("ts", "ta", 1L, 0L);
-        ValueKey b = new ValueKey("ts", "tb", 1L, 0L);
-        AtomicInteger loaderCalls = new AtomicInteger();
-        cache.getOrFetch(a, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{1};
-        });
-        cache.getOrFetch(b, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{1};
-        });
-        assertEquals(2, loaderCalls.get());
+        try {
+            ValueKey a = new ValueKey("ts", "ta", 1L, 0L);
+            ValueKey b = new ValueKey("ts", "tb", 1L, 0L);
+            AtomicInteger loaderCalls = new AtomicInteger();
+            cache.getOrFetch(a, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{1};
+            }).release();
+            cache.getOrFetch(b, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{1};
+            }).release();
+            assertEquals(2, loaderCalls.get());
 
-        cache.invalidateForTable("ts", "ta");
+            cache.invalidateForTable("ts", "ta");
 
-        cache.getOrFetch(a, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{1};
-        });
-        cache.getOrFetch(b, () -> {
-            loaderCalls.incrementAndGet();
-            return new byte[]{1};
-        });
-        assertEquals(3, loaderCalls.get()); // only "ta" reloaded
+            cache.getOrFetch(a, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{1};
+            }).release();
+            cache.getOrFetch(b, () -> {
+                loaderCalls.incrementAndGet();
+                return new byte[]{1};
+            }).release();
+            assertEquals(3, loaderCalls.get()); // only "ta" reloaded
+        } finally {
+            cache.close();
+        }
     }
 
     @Test
     public void invalidateForTablespaceDropsEverythingUnder() {
         LazyValueCache cache = new LazyValueCache(1024 * 1024);
-        ValueKey a = new ValueKey("ts1", "t", 1L, 0L);
-        ValueKey b = new ValueKey("ts1", "t", 2L, 0L);
-        ValueKey c = new ValueKey("ts2", "t", 1L, 0L);
-        AtomicInteger loaderCalls = new AtomicInteger();
-        for (ValueKey k : new ValueKey[]{a, b, c}) {
-            cache.getOrFetch(k, () -> {
-                loaderCalls.incrementAndGet();
-                return new byte[]{1};
-            });
-        }
-        assertEquals(3, loaderCalls.get());
+        try {
+            ValueKey a = new ValueKey("ts1", "t", 1L, 0L);
+            ValueKey b = new ValueKey("ts1", "t", 2L, 0L);
+            ValueKey c = new ValueKey("ts2", "t", 1L, 0L);
+            AtomicInteger loaderCalls = new AtomicInteger();
+            for (ValueKey k : new ValueKey[]{a, b, c}) {
+                cache.getOrFetch(k, () -> {
+                    loaderCalls.incrementAndGet();
+                    return new byte[]{1};
+                }).release();
+            }
+            assertEquals(3, loaderCalls.get());
 
-        cache.invalidateForTablespace("ts1");
+            cache.invalidateForTablespace("ts1");
 
-        for (ValueKey k : new ValueKey[]{a, b, c}) {
-            cache.getOrFetch(k, () -> {
-                loaderCalls.incrementAndGet();
-                return new byte[]{1};
-            });
+            for (ValueKey k : new ValueKey[]{a, b, c}) {
+                cache.getOrFetch(k, () -> {
+                    loaderCalls.incrementAndGet();
+                    return new byte[]{1};
+                }).release();
+            }
+            // ts1/a and ts1/b reloaded; ts2/c hit the cache.
+            assertEquals(5, loaderCalls.get());
+        } finally {
+            cache.close();
         }
-        // ts1/a and ts1/b reloaded; ts2/c hit the cache.
-        assertEquals(5, loaderCalls.get());
     }
 
     @Test
@@ -278,12 +332,34 @@ public class LazyValueCacheTest {
     @Test
     public void statsReflectHitsAndMisses() {
         LazyValueCache cache = new LazyValueCache(1024);
-        ValueKey k = new ValueKey("ts", "uuid", 1L, 0L);
-        cache.getOrFetch(k, () -> new byte[]{1}); // miss
-        cache.getOrFetch(k, () -> new byte[]{1}); // hit
-        cache.getOrFetch(k, () -> new byte[]{1}); // hit
-        assertNotNull(cache.stats());
-        assertEquals(1, cache.stats().missCount());
-        assertEquals(2, cache.stats().hitCount());
+        try {
+            ValueKey k = new ValueKey("ts", "uuid", 1L, 0L);
+            cache.getOrFetch(k, () -> new byte[]{1}).release(); // miss
+            cache.getOrFetch(k, () -> new byte[]{1}).release(); // hit
+            cache.getOrFetch(k, () -> new byte[]{1}).release(); // hit
+            assertNotNull(cache.stats());
+            assertEquals(1, cache.stats().missCount());
+            assertEquals(2, cache.stats().hitCount());
+        } finally {
+            cache.close();
+        }
+    }
+
+    @Test
+    public void zeroLengthValueRoundTrips() {
+        // A loader returning an empty byte[] is a real case (zero-length
+        // blob columns). The cache must allocate a 0-capacity direct
+        // buffer, not throw, and the slice must be readable as an empty
+        // byte sequence.
+        LazyValueCache cache = new LazyValueCache(1024);
+        try {
+            ValueKey k = new ValueKey("ts", "uuid", 1L, 0L);
+            ByteBuf slice = cache.getOrFetch(k, () -> new byte[0]);
+            assertEquals(0, slice.readableBytes());
+            byte[] consumed = consumeAndRelease(slice);
+            assertEquals(0, consumed.length);
+        } finally {
+            cache.close();
+        }
     }
 }
