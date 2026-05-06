@@ -36,6 +36,9 @@ import herddb.model.TransactionContext;
 import herddb.server.Server;
 import herddb.server.ServerConfiguration;
 import herddb.utils.DataAccessor;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -49,6 +52,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.Rule;
 import org.junit.rules.TemporaryFolder;
@@ -177,7 +181,14 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
                     ));
                 }
                 for (Future f : futures) {
-                    f.get(120, TimeUnit.SECONDS);
+                    // On TimeoutException emit a full thread dump before rethrowing so
+                    // that the CI surefire report captures the lock-holder context (issue #417).
+                    try {
+                        f.get(120, TimeUnit.SECONDS);
+                    } catch (TimeoutException e) {
+                        dumpAllThreads("DirectMultipleConcurrentUpdatesSuite: future timed out after 120 s");
+                        throw e;
+                    }
                 }
 
                 System.out.println("stats::updates:" + updates);
@@ -268,5 +279,24 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
             }
         }
         System.out.println("=== end issue-157 diagnostics [" + stage + "] ===");
+    }
+
+    /**
+     * Dumps all JVM threads (with locked monitors and synchronizers) to stderr,
+     * prefixed with a context label. Also runs deadlock detection. Called when a
+     * per-future timeout fires so the surefire report captures the lock-holder
+     * context for issue #417 triage.
+     */
+    static void dumpAllThreads(String context) {
+        System.err.println("=== Thread dump [" + context + "] ===");
+        ThreadMXBean tmx = ManagementFactory.getThreadMXBean();
+        long[] deadlocked = tmx.findDeadlockedThreads();
+        if (deadlocked != null) {
+            System.err.println("DEADLOCKED THREAD IDs: " + Arrays.toString(deadlocked));
+        }
+        for (ThreadInfo ti : tmx.dumpAllThreads(true, true)) {
+            System.err.print(ti);
+        }
+        System.err.println("=== End thread dump [" + context + "] ===");
     }
 }

@@ -36,6 +36,9 @@ import herddb.server.Server;
 import herddb.server.ServerConfiguration;
 import herddb.server.StaticClientSideMetadataProvider;
 import herddb.utils.RawString;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -48,6 +51,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.Assert;
 import org.junit.Rule;
@@ -70,42 +74,44 @@ public class MultipleConcurrentUpdatesTest {
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
 
-    @Test
+    @Test(timeout = 120_000)
     public void test() throws Exception {
         performTest(false, 0, false);
     }
 
-    @Test
+    @Test(timeout = 120_000)
     public void testWithTransactions() throws Exception {
         performTest(true, 0, false);
     }
 
-    @Test
+    // Checkpoint variants may block on slow CI I/O; 240 s is well above any
+    // healthy runtime while still cutting the 900 s CI hangs to ~240 s.
+    @Test(timeout = 240_000)
     public void testWithCheckpoints() throws Exception {
         performTest(false, 2000, false);
     }
 
-    @Test
+    @Test(timeout = 240_000)
     public void testWithTransactionsWithCheckpoints() throws Exception {
         performTest(true, 2000, false);
     }
 
-    @Test
+    @Test(timeout = 120_000)
     public void testWithIndexes() throws Exception {
         performTest(false, 0, true);
     }
 
-    @Test
+    @Test(timeout = 120_000)
     public void testWithTransactionsAndIndexes() throws Exception {
         performTest(true, 0, true);
     }
 
-    @Test
+    @Test(timeout = 240_000)
     public void testWithCheckpointsAndIndexes() throws Exception {
         performTest(false, 2000, true);
     }
 
-    @Test
+    @Test(timeout = 240_000)
     public void testWithTransactionsWithCheckpointsAndIndexes() throws Exception {
         performTest(true, 2000, true);
     }
@@ -230,7 +236,14 @@ public class MultipleConcurrentUpdatesTest {
                         // 600 s matches the client timeout set above; prevents an infinite
                         // hang in case a future becomes truly stuck (e.g. thread pool
                         // exhaustion or undetected deadlock). Mirrors DirectMultipleConcurrentUpdatesSuite.
-                        f.get(600, TimeUnit.SECONDS);
+                        // On TimeoutException we emit a full thread dump before rethrowing so
+                        // that the CI surefire report captures the lock-holder context (issue #417).
+                        try {
+                            f.get(600, TimeUnit.SECONDS);
+                        } catch (TimeoutException e) {
+                            dumpAllThreads("MultipleConcurrentUpdatesTest: future timed out after 600 s");
+                            throw e;
+                        }
                     }
 
                     System.out.println("stats::updates:" + updates);
@@ -285,5 +298,24 @@ public class MultipleConcurrentUpdatesTest {
                 }
             }
         }
+    }
+
+    /**
+     * Dumps all JVM threads (with locked monitors and synchronizers) to stderr,
+     * prefixed with a context label. Also runs deadlock detection. Called when a
+     * per-future timeout fires so the surefire report captures the lock-holder
+     * context for issue #417 triage.
+     */
+    private static void dumpAllThreads(String context) {
+        System.err.println("=== Thread dump [" + context + "] ===");
+        ThreadMXBean tmx = ManagementFactory.getThreadMXBean();
+        long[] deadlocked = tmx.findDeadlockedThreads();
+        if (deadlocked != null) {
+            System.err.println("DEADLOCKED THREAD IDs: " + Arrays.toString(deadlocked));
+        }
+        for (ThreadInfo ti : tmx.dumpAllThreads(true, true)) {
+            System.err.print(ti);
+        }
+        System.err.println("=== End thread dump [" + context + "] ===");
     }
 }

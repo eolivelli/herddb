@@ -24,22 +24,24 @@ import org.junit.Test;
 
 public class DirectMultipleConcurrentUpdatesSuiteNoIndexesTest extends DirectMultipleConcurrentUpdatesSuite {
 
-    @Test
+    @Test(timeout = 120_000)
     public void test() throws Exception {
         performTest(false, 0, false, false);
     }
 
-    @Test
+    @Test(timeout = 120_000)
     public void testWithTransactions() throws Exception {
         performTest(true, 0, false, false);
     }
 
-    @Test
+    // Checkpoint variants may block on slow CI I/O; 240 s is well above any
+    // healthy runtime while still cutting the 300 s+ CI hangs down (issue #417).
+    @Test(timeout = 240_000)
     public void testWithCheckpoints() throws Exception {
         performTest(false, 2000, false, false);
     }
 
-    @Test
+    @Test(timeout = 240_000)
     public void testWithTransactionsWithCheckpoints() throws Exception {
         performTest(true, 2000, false, false);
     }
