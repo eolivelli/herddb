@@ -59,19 +59,15 @@ import java.util.logging.Logger;
  *   }
  * </pre>
  *
- * <h3>Known limitation: long-lived separator keys pin the slab</h3>
+ * <h3>Long-lived separator keys (issue #411)</h3>
  * If a key from this slab ends up surviving its owning index page
  * (e.g. it becomes a BLink {@code rightsep} after a node split and the
- * source node is then evicted), that single key still anchors the entire
- * slab via its {@link Bytes#fromSharedSlab} reference, so the whole
- * direct-memory capacity stays pinned to keep one separator alive. The
- * impact is bounded because separator keys are typically the boundary
- * key of the donating page (one per split), and the slab is at most a
- * few KiB. A future step may add a {@code Bytes.materialiseAndDetach()}
- * helper that callers can invoke at the BLink split-key handoff to
- * defensively copy the separator into a private {@code byte[]} and break
- * the anchor. Until then the regression is acknowledged in the
- * step-4 review of issue #399 and tracked for a follow-up.
+ * source node is then evicted), the separator is defensively copied into
+ * a private on-heap {@code byte[]} via {@link Bytes#materialiseAndDetach()}
+ * at the handoff site so it no longer anchors the donor's slab. The
+ * BLink split / half-merge promotions invoke the
+ * {@code SizeEvaluator.detachSeparator} hook, which the Bytes-keyed
+ * evaluators delegate to {@code materialiseAndDetach()}; see issue #411.
  */
 public final class IndexKeySlab {
 

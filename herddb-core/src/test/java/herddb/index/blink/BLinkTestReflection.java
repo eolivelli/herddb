@@ -69,4 +69,64 @@ final class BLinkTestReflection {
         }
         return false;
     }
+
+    /**
+     * Iterates every loaded BLink node and returns {@code true} as soon as
+     * any non-INFINITY {@code rightsep} satisfies {@link Bytes#isOffHeap()}.
+     * Used by the issue #411 codec slab-pack test to assert rightseps loaded
+     * from the on-disk snapshot do live off-heap when the aggregate exceeds
+     * the {@link herddb.utils.IndexKeySlab#OFFHEAP_KEY_BYTES_THRESHOLD}.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    static boolean anyRightSepOffHeap(Object indexInstance) throws Exception {
+        for (Object node : nodeIterable(indexInstance)) {
+            Bytes rs = rightSepOf(node);
+            if (rs != null && rs != Bytes.POSITIVE_INFINITY && rs.isOffHeap()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Asserts the issue #411 invariant that no BLink {@code rightsep} is
+     * off-heap-backed. After {@code SizeEvaluator.detachSeparator} fires at
+     * every split / half-merge, every promoted separator should be on-heap
+     * (the only off-heap rightseps left would come straight off the
+     * {@code IncrementalBLinkPageCodec} load path, which carries its own
+     * dedicated slab and is intentionally separate from per-page slabs).
+     *
+     * @return the index of the first off-heap rightsep encountered, or -1
+     *         if every rightsep is on-heap (or POSITIVE_INFINITY).
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    static int firstOffHeapRightSep(Object indexInstance) throws Exception {
+        int idx = 0;
+        for (Object node : nodeIterable(indexInstance)) {
+            Bytes rs = rightSepOf(node);
+            if (rs != null && rs != Bytes.POSITIVE_INFINITY && rs.isOffHeap()) {
+                return idx;
+            }
+            idx++;
+        }
+        return -1;
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Iterable<?> nodeIterable(Object indexInstance) throws Exception {
+        Field treeField = indexInstance.getClass().getDeclaredField("tree");
+        treeField.setAccessible(true);
+        BLink<Bytes, Long> blink = (BLink<Bytes, Long>) treeField.get(indexInstance);
+        Field nodes = BLink.class.getDeclaredField("nodes");
+        nodes.setAccessible(true);
+        ConcurrentMap<Long, ?> nodeMap = (ConcurrentMap<Long, ?>) nodes.get(blink);
+        return nodeMap.values();
+    }
+
+    private static Bytes rightSepOf(Object node) throws Exception {
+        Field rs = node.getClass().getDeclaredField("rightsep");
+        rs.setAccessible(true);
+        Object v = rs.get(node);
+        return (v instanceof Bytes) ? (Bytes) v : null;
+    }
 }
