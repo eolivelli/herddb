@@ -309,11 +309,11 @@ public class RequestStatsTest {
      *
      * <p>The client retries {@link herddb.client.impl.LeaderChangedException}
      * up to {@code Integer.MAX_VALUE} times (it overrides
-     * {@code getMaxRetry()} unconditionally) so the call would loop forever on
-     * its own. We bound the wait by running the doomed call on a separate
-     * thread with a 2-second cap and asserting the metric immediately after —
-     * by then the very first PREPARE PDU has already been processed and
-     * recorded as a failure.</p>
+     * {@code getMaxRetry()} unconditionally) so the call would loop forever
+     * on its own. We bound the wait by running the doomed call on a separate
+     * thread, polling the failure metric for up to 30 seconds, and cancelling
+     * the doomed call once the very first PREPARE PDU has been processed and
+     * recorded.</p>
      */
     @Test
     public void testPrepareStatementFailureRecorded() throws Exception {
@@ -446,17 +446,6 @@ public class RequestStatsTest {
                         + ", success=" + logger.getSuccessCount()
                         + " failure=" + logger.getFailureCount(),
                 logger.getFailureCount() >= 1);
-    }
-
-    private static void assertNoEvents(TestStatsProvider provider, String fullPath) {
-        TestOpStatsLogger logger = provider.getOpStatsLogger(fullPath);
-        if (logger == null) {
-            return;
-        }
-        assertEquals("expected no successful events for " + fullPath,
-                0L, logger.getSuccessCount());
-        assertEquals("expected no failed events for " + fullPath,
-                0L, logger.getFailureCount());
     }
 
     private static void awaitSuccess(TestStatsProvider provider, String fullPath,
