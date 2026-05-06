@@ -373,6 +373,55 @@ public class IndexingServiceEngineLagTimestampsTest {
     }
 
     /**
+     * The {@code entry.timestamp > 0} guard inside
+     * {@code processEntry()} must skip the volatile write when an entry
+     * carries an unknown ({@code 0}) or negative timestamp, so the previous
+     * "best known freshness" is preserved instead of silently regressing
+     * to 0 / unknown. Without this guard, a single test fixture or a
+     * historical entry with a missing timestamp would briefly clobber the
+     * lag dashboard.
+     */
+    @Test
+    public void tailerTimestampLeavesPriorValueWhenEntryTimestampIsZero() throws Exception {
+        FailableWatermarkStore watermark =
+                new FailableWatermarkStore(WatermarkSnapshot.START_OF_TIME);
+        IndexingServiceEngine engine = buildEngine(watermark);
+        try {
+            engine.start();
+
+            Table table = createTable();
+            // First, a normal entry with a real timestamp.
+            long realTs = 1_700_000_010_000L;
+            LogEntry create = LogEntryFactory.createTable(table, null);
+            LogEntry stamped = new LogEntry(realTs,
+                    create.type, create.transactionId, create.tableId,
+                    create.key, create.value);
+            engine.processEntryForTest(new LogSequenceNumber(1, 1), stamped);
+            assertEquals("real timestamp recorded",
+                    realTs, engine.getLastProcessedEntryTimestamp());
+
+            // Now replay an entry with timestamp=0 (synthetic / pre-#423
+            // replay). The engine must NOT regress the freshness clock.
+            LogEntry zeroStamped = new LogEntry(0L,
+                    create.type, create.transactionId, create.tableId,
+                    create.key, create.value);
+            engine.processEntryForTest(new LogSequenceNumber(1, 2), zeroStamped);
+            assertEquals("timestamp=0 must NOT clobber prior freshness",
+                    realTs, engine.getLastProcessedEntryTimestamp());
+
+            // Same for a negative timestamp (defense-in-depth).
+            LogEntry negStamped = new LogEntry(-5L,
+                    create.type, create.transactionId, create.tableId,
+                    create.key, create.value);
+            engine.processEntryForTest(new LogSequenceNumber(1, 3), negStamped);
+            assertEquals("negative timestamp must NOT clobber prior freshness",
+                    realTs, engine.getLastProcessedEntryTimestamp());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
      * Issue #423 + #364: a restarting engine must re-hydrate the durable
      * freshness from the persisted watermark snapshot — otherwise dashboards
      * would briefly show a "0 (unknown)" durable lag every time a pod

@@ -291,4 +291,148 @@ public class ShadowLoadedEntryTimestampTest {
             primary.close();
         }
     }
+
+    /**
+     * Issue #423: when the primary publishes a new state but the matching
+     * IndexStatus bytes have NOT been re-written on disk (e.g. write
+     * failure between the IndexStatus upload and the ZK publish, or a
+     * test scenario where the shadow can only see stale segments), the
+     * shadow must still propagate the primary's advertised timestamp
+     * after a successful reload pass — operators care about "how stale
+     * is the freshest data this primary acknowledged?" more than they
+     * care about whether the IndexStatus has rolled over yet.
+     *
+     * <p>This test asserts the simpler half of that contract: after a
+     * watch event followed by a successful reload, the shadow's freshness
+     * matches the primary's advertised timestamp regardless of whether
+     * the reload actually loaded new bytes. Combined with the
+     * watch-callback-only-updates-LSN invariant (verified by code
+     * inspection — the callback at
+     * {@code IndexingServiceEngine#startAsShadow} explicitly does NOT
+     * touch {@code shadowLoadedEntryTimestamp}), this lets shadows
+     * surface a meaningful freshness signal without reintroducing the
+     * reload-window inconsistency the original reviewer flagged.
+     */
+    @Test
+    public void watchEventThenReloadPropagatesPrimaryTimestamp() throws Exception {
+        ShadowAwareMemoryMetadata metadata = new ShadowAwareMemoryMetadata();
+        metadata.start();
+        metadata.ensureDefaultTableSpace("local", "local", 0, 1);
+
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+
+        // --- Build a primary that publishes one checkpoint, then a shadow.
+        Path primaryLogDir = folder.newFolder("primary-log").toPath();
+        Path primaryDataDir = folder.newFolder("primary-data").toPath();
+        Properties primaryProps = new Properties();
+        primaryProps.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "memory");
+        IndexingServerConfiguration primaryConfig = new IndexingServerConfiguration(primaryProps);
+        IndexingServiceEngine primary = new IndexingServiceEngine(
+                primaryLogDir, primaryDataDir, primaryConfig);
+        primary.setMetadataStorageManager(metadata);
+        MemoryManager mm = new MemoryManager(128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+        final String stableUuid = "shadow-no-advance-uuid";
+        primary.setVectorStoreFactory((indexName, tableName, vectorColumnName,
+                                        dataDir, indexProperties) -> {
+            PersistentVectorStore pvs = new PersistentVectorStore(
+                    indexName, tableName, primary.getTableSpaceUUID(), vectorColumnName,
+                    stableUuid, dataDir, dsm, mm,
+                    16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                    Long.MAX_VALUE,
+                    VectorSimilarityFunction.EUCLIDEAN);
+            try {
+                pvs.start();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            return pvs;
+        });
+        primary.start();
+
+        Table t = createTable();
+        primary.applyEntry(new LogSequenceNumber(1, 1), LogEntryFactory.createTable(t, null));
+        Index idx = createIndex(stableUuid);
+        primary.applyEntry(new LogSequenceNumber(1, 2), LogEntryFactory.createIndex(idx, null));
+
+        Random rng = new Random(11);
+        int dim = 16;
+        LogSequenceNumber lastLsn = null;
+        for (int i = 0; i < 256; i++) {
+            Record r = RecordSerializer.makeRecord(t,
+                    "pk", "k" + i, "vec", randomVector(rng, dim));
+            LogEntry ins = LogEntryFactory.insert(t, r.key, r.value, null);
+            lastLsn = new LogSequenceNumber(1, 100 + i);
+            primary.applySingleEntryForTest(lastLsn, ins);
+        }
+        primary.awaitPendingWorkForTest();
+        primary.setLastProcessedLsnForTest(lastLsn);
+        long firstTs = 1_700_000_100_000L;
+        primary.setLastProcessedEntryTimestampForTest(firstTs);
+        primary.forceCheckpointAndSaveWatermark();
+
+        dsm.writeTables(
+                primary.getTableSpaceUUID(), LogSequenceNumber.START_OF_TIME,
+                java.util.Arrays.asList(t),
+                java.util.Arrays.asList(idx), false);
+
+        // --- Boot a shadow on the same DSM.
+        Path shadowLogDir = folder.newFolder("shadow-log").toPath();
+        Path shadowDataDir = folder.newFolder("shadow-data").toPath();
+        Properties shadowProps = new Properties();
+        shadowProps.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "memory");
+        shadowProps.setProperty(IndexingServerConfiguration.PROPERTY_ROLE,
+                IndexingServerConfiguration.ROLE_SHADOW);
+        shadowProps.setProperty(IndexingServerConfiguration.PROPERTY_SHADOW_OF, "0");
+        shadowProps.setProperty(IndexingServerConfiguration.PROPERTY_NUM_INSTANCES, "1");
+        IndexingServerConfiguration shadowConfig = new IndexingServerConfiguration(shadowProps);
+        IndexingServiceEngine shadow = new IndexingServiceEngine(
+                shadowLogDir, shadowDataDir, shadowConfig);
+        shadow.setMetadataStorageManager(metadata);
+        shadow.setDataStorageManager(dsm);
+        shadow.setMemoryManager(mm);
+
+        try {
+            shadow.start();
+            assertTrue("shadow ready after initial reload", shadow.isShadowReady());
+            assertEquals("shadow's initial freshness must match the primary's first checkpoint",
+                    firstTs, shadow.getShadowLoadedEntryTimestamp());
+            LogSequenceNumber loadedAfterFirst = shadow.getShadowLoadedLsn();
+            assertNotNull(loadedAfterFirst);
+
+            // --- The primary publishes a NEW state advertising a higher
+            // timestamp. We do NOT write any new IndexStatus bytes to
+            // the DSM. The shadow's reload runs, reads the ORIGINAL
+            // IndexStatus, but the post-reload write inside
+            // doShadowReload() refreshes shadowLoadedEntryTimestamp from
+            // the primary's currently-advertised state — picking up the
+            // new timestamp.
+            long futureTs = firstTs + 60_000L;
+            metadata.publishIndexingServiceCheckpointState(
+                    new herddb.metadata.IndexingServiceCheckpointState(
+                            0,
+                            loadedAfterFirst.ledgerId,
+                            loadedAfterFirst.offset + 1000L,
+                            1,
+                            System.currentTimeMillis(),
+                            futureTs));
+
+            // Wait for the reload to have processed the watch event.
+            long beforeReloads = 1L;
+            long deadline = System.currentTimeMillis() + 5_000L;
+            while (shadow.getShadowReloadCount() <= beforeReloads
+                    && System.currentTimeMillis() < deadline) {
+                Thread.sleep(20);
+            }
+            assertTrue("shadow reload must have processed the watch event",
+                    shadow.getShadowReloadCount() > beforeReloads);
+
+            // After the reload, shadow freshness must match the primary's
+            // latest advertised timestamp.
+            assertEquals("shadowLoadedEntryTimestamp must match primary's advertised value",
+                    futureTs, shadow.getShadowLoadedEntryTimestamp());
+        } finally {
+            shadow.close();
+            primary.close();
+        }
+    }
 }

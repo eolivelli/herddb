@@ -154,6 +154,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * inside {@link #processEntry(LogSequenceNumber, LogEntry)}. {@code 0}
      * means "no entries processed yet". Issue #423: surfaced via
      * {@code GetIndexStatus.tailer_lsn_timestamp}.
+     *
+     * <p><b>Caveat:</b> {@link LogEntry#timestamp} is a wall-clock value
+     * stamped by whichever cluster writer produced the entry. Different
+     * writers may have skewed clocks, so this field can <em>regress</em>
+     * between adjacent entries when the tailer crosses a writer boundary.
+     * Use it as an indicative freshness signal for dashboards
+     * ({@code now - lastProcessedEntryTimestamp ≈ "how far behind real
+     * time the IS is"}), not as a monotonic clock.
      */
     private volatile long lastProcessedEntryTimestamp;
     /**
@@ -2234,8 +2242,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         if (primaryState != null) {
             this.primaryAdvertisedLsn = primaryState.toLogSequenceNumber();
             // Pre-seed the shadow freshness clock from the primary's
-            // advertised state so the very first GetShadowStatus call after
-            // boot already carries a meaningful timestamp (issue #423).
+            // advertised state so the very first GetShadowStatus call
+            // after boot already carries a meaningful timestamp, even if
+            // doShadowReload() is racing with us (issue #423).
             this.shadowLoadedEntryTimestamp = primaryState.getLastEntryTimestampMillis();
         }
         boolean initialReloadOk = doShadowReload();
@@ -2246,11 +2255,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             try {
                 metadataStorageManager.watchIndexingServiceCheckpointState(shadowOf, state -> {
                     this.primaryAdvertisedLsn = state.toLogSequenceNumber();
-                    // Track the primary's freshness as soon as the watch
-                    // fires; doShadowReload() will refresh it again after
-                    // the on-disk state has actually been re-loaded into
-                    // each ReadOnlyVectorStore (issue #423).
-                    this.shadowLoadedEntryTimestamp = state.getLastEntryTimestampMillis();
+                    // Issue #423: do NOT update shadowLoadedEntryTimestamp
+                    // here. The proto contract on
+                    // GetShadowStatus.loaded_entry_timestamp_ms says it is
+                    // the timestamp of the LogEntry at loaded_ledger_id /
+                    // loaded_offset. Advancing the timestamp BEFORE
+                    // doShadowReload() actually replays the new on-disk
+                    // state into each ReadOnlyVectorStore would expose an
+                    // inconsistent (LSN_old, ts_new) pair while the reload
+                    // executor is still running. The post-reload write
+                    // inside doShadowReload() is the only place the
+                    // freshness is published.
                     enqueueShadowReload();
                 });
             } catch (MetadataStorageManagerException e) {
@@ -2331,6 +2346,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     }
                 }
             } catch (Exception e) {
+                // Per-store failure isolation: a single ReadOnlyVectorStore
+                // failing its reload (corrupt segment file, transient I/O)
+                // must not abort the whole reload pass for the other stores
+                // this shadow holds. The failed store keeps serving its
+                // previously-loaded view; allOk=false makes the pass
+                // non-final so shadowLastReloadTimestampMs is not advanced.
                 LOGGER.log(Level.WARNING, "Shadow reload failed for index " + ro, e);
                 allOk = false;
             }
@@ -2340,9 +2361,23 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             // Capture the primary's advertised LogEntry timestamp at the
             // moment of the reload so GetShadowStatus can report the
             // freshness of the data this shadow can serve (issue #423).
-            // Read fresh from ZK rather than relying on the cached
-            // primaryAdvertisedLsn timestamp, because the watch-fired path
-            // may have updated only the LSN.
+            //
+            // Caveats:
+            //   * shadowLoadedLsn is set BEFORE this read so the visible
+            //     pair is at worst (LSN_n, timestamp_{n+1}) — never
+            //     (LSN_n, timestamp_{n-1}). The watch-callback path
+            //     deliberately does NOT touch shadowLoadedEntryTimestamp,
+            //     leaving this method as the single writer.
+            //   * IndexStatus on disk currently always carries
+            //     sequenceNumber=START_OF_TIME (PersistentVectorStore does
+            //     not yet stamp it with the real checkpoint LSN), so we do
+            //     NOT condition the timestamp write on
+            //     maxLsn.equals(primary.toLogSequenceNumber()) — that
+            //     check would never pass and shadow freshness reporting
+            //     would be permanently broken. Instead we trust that the
+            //     primary's published state is internally consistent
+            //     (LSN + timestamp written together in
+            //     publishCheckpointStateBestEffort).
             try {
                 IndexingServiceCheckpointState primary =
                         metadataStorageManager != null
@@ -2482,11 +2517,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 status = "loading";
             }
         }
-        // Snapshot both LSNs (and matching freshness timestamps) together so
-        // the response is internally consistent.
-        // Server-side retention pins on durable_lsn_*; tailer_lsn_* is exposed
-        // for diagnostics only (issue #364). Timestamps are diagnostic-only
-        // (issue #423).
+        // Snapshot both LSNs and the matching freshness timestamps together.
+        // The pair is approximately consistent: in the worst case a reader
+        // can observe (LSN_n, timestamp_{n+1}) — i.e. the timestamp is one
+        // entry newer than the LSN — because the writes in processEntry()
+        // are not atomic across the two volatile fields. Acceptable for a
+        // diagnostic measured in seconds; locking would impose hot-path
+        // cost for no operational benefit.
+        // Server-side retention pins on durable_lsn_*; tailer_lsn_* is
+        // exposed for diagnostics only (issue #364). Timestamps are
+        // diagnostic-only (issue #423).
         LogSequenceNumber tailerSnap = lastProcessedLsn;
         long tailerTsSnap = lastProcessedEntryTimestamp;
         LogSequenceNumber durableSnap = lastDurableLsn;

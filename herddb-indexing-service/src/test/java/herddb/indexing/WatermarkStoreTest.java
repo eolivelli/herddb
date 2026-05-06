@@ -212,6 +212,7 @@ public class WatermarkStoreTest {
             dos.writeLong(1L);                   // ledgerId
             dos.writeLong(100L);                 // offset
             dos.writeInt(2);                     // numInstances
+            dos.writeLong(0L);                   // lastEntryTimestamp (issue #423)
             dos.writeInt(Integer.MAX_VALUE);     // corrupt tableCount
         }
 
@@ -235,6 +236,7 @@ public class WatermarkStoreTest {
             dos.writeLong(1L);      // ledgerId
             dos.writeLong(100L);    // offset
             dos.writeInt(1);        // numInstances
+            dos.writeLong(0L);      // lastEntryTimestamp (issue #423)
             dos.writeInt(1);        // tableCount = 1
             dos.writeInt(-7);       // corrupt blob length (negative)
         }
@@ -259,6 +261,7 @@ public class WatermarkStoreTest {
             dos.writeLong(1L);              // ledgerId
             dos.writeLong(100L);            // offset
             dos.writeInt(1);                // numInstances
+            dos.writeLong(0L);              // lastEntryTimestamp (issue #423)
             dos.writeInt(0);                // tableCount = 0 (valid)
             dos.writeInt(Integer.MAX_VALUE); // corrupt indexCount
         }
@@ -285,6 +288,7 @@ public class WatermarkStoreTest {
             dos.writeLong(1L);         // ledgerId
             dos.writeLong(100L);       // offset
             dos.writeInt(1);           // numInstances
+            dos.writeLong(0L);         // lastEntryTimestamp (issue #423)
             dos.writeInt(1);           // tableCount = 1
             dos.writeInt(oversizedLen); // blob length far above MAX_BLOB_BYTES
             // No actual blob data — the bounds check must fire before readFully.

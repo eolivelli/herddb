@@ -83,6 +83,13 @@ public final class WatermarkSnapshot {
      * Issue #423: surfaced in {@code GetIndexStatus} as
      * {@code durable_lsn_timestamp} so dashboards can report
      * {@code durable_lag_ms = now - lastEntryTimestamp}.
+     *
+     * <p><b>Caveat:</b> {@link herddb.log.LogEntry#timestamp} is a
+     * wall-clock value stamped by whichever cluster writer produced the
+     * entry. Different writers may have skewed clocks, so this field is
+     * <em>not</em> guaranteed to grow monotonically between checkpoints
+     * when the tailer crosses a writer boundary. Use it as an indicative
+     * freshness signal, not as a monotonic clock.
      */
     public final long lastEntryTimestamp;
 
