@@ -27,6 +27,7 @@ import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import herddb.utils.HerdDBByteBufAllocators;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.util.IllegalReferenceCountException;
 import java.util.Objects;
 import java.util.function.Supplier;
 
@@ -73,15 +74,24 @@ public final class LazyValueCache implements AutoCloseable {
     private final long maxBytes;
     private final Cache<ValueKey, ByteBuf> cache;
     private final PooledByteBufAllocator allocator;
+    /**
+     * Set to {@code true} by {@link #close()} so subsequent {@link #getOrFetch}
+     * calls bypass the (now-empty) cache and behave as the disabled-cache
+     * path: a one-shot direct allocation, owned by the caller. Without this
+     * guard a {@code getOrFetch} racing with {@code close()} could repopulate
+     * the cache and leak the new entry to the pool until JVM exit. See
+     * BLOCK-2 of the issue #411 PR review.
+     */
+    private volatile boolean closed;
 
     public LazyValueCache(long maxBytes) {
         this(maxBytes, HerdDBByteBufAllocators.dataPagesAllocator());
     }
 
     /**
-     * Test-only constructor that lets a test inject a different allocator
-     * (typically {@link io.netty.buffer.UnpooledByteBufAllocator#DEFAULT}
-     * to keep direct-memory accounting deterministic across tests).
+     * Test-only constructor that lets a test inject a different
+     * {@link PooledByteBufAllocator} instance (e.g. a per-test pool whose
+     * direct-memory accounting can be observed in isolation).
      */
     LazyValueCache(long maxBytes, PooledByteBufAllocator allocator) {
         this.maxBytes = maxBytes;
@@ -130,7 +140,11 @@ public final class LazyValueCache implements AutoCloseable {
     public ByteBuf getOrFetch(ValueKey key, Supplier<byte[]> loader) {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(loader, "loader");
-        if (cache == null) {
+        // After close() the cache must not be repopulated. Behave as the
+        // disabled-cache path so a getOrFetch racing with shutdown still
+        // returns a usable, caller-owned slice without leaking a fresh
+        // entry past close().
+        if (cache == null || closed) {
             byte[] data = loader.get();
             return wrapAsDirect(data);
         }
@@ -149,7 +163,7 @@ public final class LazyValueCache implements AutoCloseable {
         // a usable slice and we do not corrupt the eviction-budget invariant.
         try {
             return cached.retainedSlice(0, cached.capacity());
-        } catch (io.netty.util.IllegalReferenceCountException raceLost) {
+        } catch (IllegalReferenceCountException raceLost) {
             byte[] data = loader.get();
             return wrapAsDirect(data);
         }
@@ -245,12 +259,23 @@ public final class LazyValueCache implements AutoCloseable {
      * <p>Implements {@link AutoCloseable} so a try-with-resources or an
      * explicit shutdown hook can ensure all pooled direct memory returns
      * to the allocator.
+     *
+     * <p><b>Post-close semantics</b>: a {@link #getOrFetch} that races with
+     * {@code close()} (or runs after it) bypasses the cache entirely and
+     * returns a one-shot caller-owned direct buffer — exactly as if the
+     * cache had been constructed with a non-positive {@code maxBytes}. This
+     * means callers do not crash on a closed cache, but they also do not
+     * leak fresh entries past shutdown.
      */
     @Override
     public void close() {
         if (cache == null) {
             return;
         }
+        // Mark closed BEFORE the drain so any concurrent getOrFetch that
+        // observes the flag bypasses the cache and does not add a new entry
+        // after invalidateAll has run.
+        closed = true;
         cache.invalidateAll();
         // Force any pending eviction work to run synchronously so the
         // removalListener releases every cache-owned refcount before the

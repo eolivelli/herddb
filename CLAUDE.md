@@ -13,21 +13,32 @@ This matches what `.github/workflows/pr-validation.yml` runs in CI (checkstyle, 
 
 For any change related to indexes, checkpoints, or concurrency, also run every
 subclass of `DirectMultipleConcurrentUpdatesSuite` (in
-`herddb-core/src/test/java/herddb/server/hammer/`) plus the BLink-level
+`herddb-core/src/test/java/herddb/server/hammer/`), the BLink-level
 concurrent search/insert hammer (`BLinkConcurrentSearchInsertTest` in
-`herddb-utils/src/test/java/herddb/index/blink/`), and make sure they all pass:
+`herddb-utils/src/test/java/herddb/index/blink/`), and — for any change
+that touches the lazy data-page read path or the value cache — every
+subclass of `LazyValueCacheConcurrentUpdatesSuite` (in
+`herddb-remote-file-service/src/test/java/herddb/remote/hammer/`); make
+sure they all pass:
 ```
 mvn -pl herddb-core -Dtest='DirectMultipleConcurrentUpdatesSuiteNoIndexesTest,DirectMultipleConcurrentUpdatesSuiteWithNonUniqueIndexesTest,DirectMultipleConcurrentUpdatesSuiteWithUniqueIndexesTest' test
 mvn -pl herddb-utils -Dtest='BLinkConcurrentSearchInsertTest' test
+mvn -pl herddb-remote-file-service -Dtest='LazyValueCacheConcurrentUpdatesSuiteNoIndexesTest,LazyValueCacheConcurrentUpdatesSuiteWithNonUniqueIndexesTest,LazyValueCacheConcurrentUpdatesSuiteWithUniqueIndexesTest' test
 ```
 The `DirectMultipleConcurrentUpdatesSuite` tests exercise concurrent DML with
-periodic checkpoints and recovery, so they are the main regression gate for
-the primary-key index, the checkpoint pipeline, and transaction isolation.
-`BLinkConcurrentSearchInsertTest` hammers the lower-level BLink with many
-concurrent searches against fewer concurrent writers on overlapping keys,
-catching regressions in the per-node and anchor lock primitives that drive
-every primary-key lookup. Run them multiple times when the first pass is
-green to reduce the chance of a flake masking a real bug.
+periodic checkpoints and recovery against the file DSM, so they are the main
+regression gate for the primary-key index, the checkpoint pipeline, and
+transaction isolation. `BLinkConcurrentSearchInsertTest` hammers the
+lower-level BLink with many concurrent searches against fewer concurrent
+writers on overlapping keys, catching regressions in the per-node and anchor
+lock primitives that drive every primary-key lookup.
+`LazyValueCacheConcurrentUpdatesSuite` mirrors the file-DSM hammer's workload
+shape (insert + concurrent UPDATE/GET + post-restart consistency check) but
+routes every read through `RemoteFileDataStorageManager` + `LazyValueCache`,
+so it is the regression gate for the lazy data-page read path, the value
+cache's refcount discipline, and post-restart recovery against remote
+storage. Run them multiple times when the first pass is green to reduce the
+chance of a flake masking a real bug.
 
 ## Test Categories
 Tests that require ZooKeeper/BookKeeper infrastructure (cluster mode) must be annotated with

@@ -28,6 +28,7 @@ import herddb.remote.LazyDataPageFormat.FixedHeader;
 import herddb.remote.LazyDataPageFormat.RecordMetadata;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
+import io.netty.buffer.ByteBuf;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -136,19 +137,33 @@ public final class LazyDataPage extends DataPage {
             return null;
         }
         try {
-            // Issue #411: the cache returns a direct ByteBuf retained slice
-            // (caller owns one refcount). Hand ownership to a Bytes.fromOffHeap
-            // wrapper whose lifecycle (release on Bytes.release(), or on lazy
-            // materialisation by an on-heap accessor) returns the refcount to
-            // the pool. Zero-length values short-circuit to Bytes.EMPTY_ARRAY
-            // because Unpooled.EMPTY_BUFFER has no refcount to manage and the
-            // downstream consumer can avoid the off-heap wrapper.
+            // Issue #411: the value cache holds direct {@link ByteBuf}s
+            // (multi-GiB savings on the JVM heap), but the {@code Record}
+            // we hand back to the rest of HerdDB carries an on-heap
+            // {@link Bytes#from_array Bytes}. Eager materialisation is the
+            // right boundary because several scan paths consume {@code Record}
+            // without ever accessing {@code value}'s bytes — pure-PK
+            // projections, {@code COUNT(*)}, {@code EXISTS}, sort-by-PK, the
+            // index-less delete/update flows that only touch
+            // {@code Record.getEstimatedSize()}. Returning a
+            // {@code Bytes.fromOffHeap(slice)} would leak one refcount per
+            // such row because no caller would release the slice or trigger
+            // its lazy materialisation, pinning the cache's pooled chunks
+            // forever. Materialising here transfers the bytes to a transient
+            // on-heap {@code byte[]} that GC reclaims with the {@code Record},
+            // and the slice's refcount returns to the pool immediately.
             if (m.valueLength == 0) {
                 return new Record(key, Bytes.EMPTY_ARRAY);
             }
-            io.netty.buffer.ByteBuf slice = dsm.readPageValue(tableSpace, uuid, pageId,
+            ByteBuf slice = dsm.readPageValue(tableSpace, uuid, pageId,
                     header, m.valueOffset, m.valueLength);
-            return new Record(key, Bytes.fromOffHeap(slice));
+            try {
+                byte[] copy = new byte[m.valueLength];
+                slice.getBytes(slice.readerIndex(), copy);
+                return new Record(key, Bytes.from_array(copy));
+            } finally {
+                slice.release();
+            }
         } catch (DataStorageManagerException e) {
             throw new LazyValueFetchException("Failed to fetch value for key "
                     + key + " from " + tableSpace + "/" + uuid + "#" + pageId, e);
