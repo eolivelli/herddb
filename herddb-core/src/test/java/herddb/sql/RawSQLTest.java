@@ -1902,10 +1902,13 @@ public class RawSQLTest {
                 try (DataScanner scan1 = manager.scan(scan, translate1.context, TransactionContext.NO_TRANSACTION)) {
                     List<DataAccessor> result = scan1.consume();
                     assertEquals(4, result.size());
-                    assertEquals(RawString.of("mykey"), result.get(3).get(0));
-                    assertEquals(RawString.of("mykey2"), result.get(2).get(0));
-                    assertEquals(RawString.of("mykey3"), result.get(1).get(0));
-                    assertEquals(RawString.of("mykey4"), result.get(0).get(0));
+                    // DESC, default NULLS LAST in HerdDB: 4, 2, 1, null →
+                    // mykey3, mykey2, mykey, mykey4. (Issue #429 fix to
+                    // SortOp.compareValues.)
+                    assertEquals(RawString.of("mykey3"), result.get(0).get(0));
+                    assertEquals(RawString.of("mykey2"), result.get(1).get(0));
+                    assertEquals(RawString.of("mykey"), result.get(2).get(0));
+                    assertEquals(RawString.of("mykey4"), result.get(3).get(0)); // NULLS LAST
                 }
             }
             assertEquals(1, executeUpdate(manager, "INSERT INTO tblspace1.tsql(k1,n1) values(?,?)", Arrays.asList("mykey5", Integer.valueOf(3))).getUpdateCount());
@@ -1964,10 +1967,12 @@ public class RawSQLTest {
                 try (DataScanner scan1 = manager.scan(scan, translate1.context, TransactionContext.NO_TRANSACTION)) {
                     List<DataAccessor> result = scan1.consume();
                     assertEquals(3, result.size());
-                    assertEquals(RawString.of("mykey4"), result.get(0).get(0));
-                    assertEquals(RawString.of("mykey3"), result.get(1).get(0));
-                    assertEquals(RawString.of("mykey5"), result.get(2).get(0));
-
+                    // DESC, default NULLS LAST in HerdDB: 4, 3, 2, 1, null →
+                    // mykey3, mykey5, mykey2, mykey, mykey4. LIMIT 3 →
+                    // mykey3, mykey5, mykey2. (Issue #429 fix.)
+                    assertEquals(RawString.of("mykey3"), result.get(0).get(0));
+                    assertEquals(RawString.of("mykey5"), result.get(1).get(0));
+                    assertEquals(RawString.of("mykey2"), result.get(2).get(0));
                 }
             }
 
@@ -2527,13 +2532,16 @@ public class RawSQLTest {
                 assertEquals(RawString.of("mykey3"), consume.get(i++).get(0));
                 assertEquals(RawString.of("mykey"), consume.get(i++).get(0));
             }
+            // DESC NULLS LAST: 214, 213, null → mykey3, mykey2, mykey.
+            // (Issue #429 fix to SortOp.compareValues; the previous
+            // expected order encoded the antisymmetry-violating bug.)
             try (DataScanner scan = scan(manager, "SELECT k1 FROM tblspace1.tsql ORDER BY n1 DESC NULLS LAST", Arrays.asList())) {
                 List<DataAccessor> consume = scan.consume();
                 assertEquals(3, consume.size());
                 int i = 0;
-                assertEquals(RawString.of("mykey"), consume.get(i++).get(0));
                 assertEquals(RawString.of("mykey3"), consume.get(i++).get(0));
                 assertEquals(RawString.of("mykey2"), consume.get(i++).get(0));
+                assertEquals(RawString.of("mykey"), consume.get(i++).get(0));
             }
             try (DataScanner scan = scan(manager, "SELECT k1 FROM tblspace1.tsql ORDER BY n1 ASC", Arrays.asList())) {
                 List<DataAccessor> consume = scan.consume();
@@ -2543,13 +2551,14 @@ public class RawSQLTest {
                 assertEquals(RawString.of("mykey3"), consume.get(i++).get(0));
                 assertEquals(RawString.of("mykey"), consume.get(i++).get(0));
             }
+            // DESC, default NULLS LAST in HerdDB: same as DESC NULLS LAST.
             try (DataScanner scan = scan(manager, "SELECT k1 FROM tblspace1.tsql ORDER BY n1 DESC", Arrays.asList())) {
                 List<DataAccessor> consume = scan.consume();
                 assertEquals(3, consume.size());
                 int i = 0;
-                assertEquals(RawString.of("mykey"), consume.get(i++).get(0));
                 assertEquals(RawString.of("mykey3"), consume.get(i++).get(0));
                 assertEquals(RawString.of("mykey2"), consume.get(i++).get(0));
+                assertEquals(RawString.of("mykey"), consume.get(i++).get(0));
             }
             try (DataScanner scan = scan(manager, "SELECT k1 FROM tblspace1.tsql ORDER BY n1 ASC NULLS FIRST", Arrays.asList())) {
                 List<DataAccessor> consume = scan.consume();
