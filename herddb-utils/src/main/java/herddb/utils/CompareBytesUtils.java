@@ -26,8 +26,18 @@ import java.nio.ByteOrder;
 import java.util.Arrays;
 
 /**
- * Java 8 compatibile version. In Java 8 you cannot use Arrays.compare(byte[],
- * byte[])
+ * Byte-array comparison and hashing helpers.
+ *
+ * <p>The compare/equals helpers delegate to the JDK's
+ * {@link Arrays#compareUnsigned} / {@link Arrays#equals} which are
+ * intrinsified by HotSpot since Java 9.
+ *
+ * <p>{@link #hashCode(byte[], int, int)} and {@link #hashCode(ByteBuf, int, int)}
+ * implement the same int-block-then-byte-tail polynomial as
+ * {@link io.netty.buffer.ByteBufUtil#hashCode(ByteBuf)} and finalise
+ * the result with a Knuth/golden-ratio multiplicative mix to defend
+ * against {@link java.util.concurrent.ConcurrentHashMap} bin
+ * treeification on tightly clustered inputs (issue #429).
  */
 public final class CompareBytesUtils {
 
@@ -35,14 +45,7 @@ public final class CompareBytesUtils {
     }
 
     public static int compare(byte[] left, byte[] right) {
-        for (int i = 0, j = 0; i < left.length && j < right.length; i++, j++) {
-            int a = (left[i] & 0xff);
-            int b = (right[j] & 0xff);
-            if (a != b) {
-                return a - b;
-            }
-        }
-        return left.length - right.length;
+        return Arrays.compareUnsigned(left, right);
     }
 
     public static boolean arraysEquals(byte[] left, byte[] right) {
@@ -53,29 +56,16 @@ public final class CompareBytesUtils {
             byte[] left, int fromIndex, int toIndex,
             byte[] right, int fromIndex2, int toIndex2
     ) {
-        for (int i = fromIndex, j = fromIndex2; i < toIndex && j < toIndex2; i++, j++) {
-            int a = (left[i] & 0xff);
-            int b = (right[j] & 0xff);
-            if (a != b) {
-                return a - b;
-            }
-        }
-        int len1 = (toIndex - fromIndex);
-        int len2 = (toIndex2 - fromIndex2);
-        return len1 - len2;
+        return Arrays.compareUnsigned(left, fromIndex, toIndex,
+                right, fromIndex2, toIndex2);
     }
 
     public static boolean arraysEquals(
             byte[] left, int fromIndex, int toIndex,
             byte[] right, int fromIndex2, int toIndex2
     ) {
-
-        int aLength = toIndex - fromIndex;
-        int bLength = toIndex2 - fromIndex2;
-        if (aLength != bLength) {
-            return false;
-        }
-        return PlatformDependent.equals(left, fromIndex, right, fromIndex2, aLength);
+        return Arrays.equals(left, fromIndex, toIndex,
+                right, fromIndex2, toIndex2);
     }
 
     /**
@@ -97,6 +87,14 @@ public final class CompareBytesUtils {
      * pre-mix accumulators.
      */
     private static final int LENGTH_MIX = 0x27D4EB2F;
+
+    /** Native byte order, captured once. */
+    private static final boolean BIG_ENDIAN_NATIVE_ORDER =
+            ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN;
+
+    /** {@code true} if {@link PlatformDependent#getInt(byte[], int)} is safe to use. */
+    private static final boolean HAS_FAST_INT_READ =
+            PlatformDependent.hasUnsafe() && PlatformDependent.isUnaligned();
 
     /**
      * Pre-computed result of {@link #hashCode(byte[], int, int)} on the
@@ -142,13 +140,24 @@ public final class CompareBytesUtils {
         return result;
     }
 
-    /** Native byte order, captured once. */
-    private static final boolean BIG_ENDIAN_NATIVE_ORDER =
-            ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN;
-
-    /** {@code true} if {@link PlatformDependent#getInt(byte[], int)} is safe to use. */
-    private static final boolean HAS_FAST_INT_READ =
-            PlatformDependent.hasUnsafe() && PlatformDependent.isUnaligned();
+    /**
+     * BE-canonical 4-byte int read. Uses {@link PlatformDependent}'s
+     * {@code Unsafe}-backed accessor where available (with an endian
+     * flip on little-endian platforms) and falls back to a manual
+     * shift/OR otherwise. Returning a deterministic BE-interpreted int
+     * is what allows the {@link ByteBuf} overload to feed the same
+     * polynomial via {@link ByteBuf#getInt} on a default (BE) buffer.
+     */
+    private static int readBigEndianInt(byte[] a, int idx) {
+        if (HAS_FAST_INT_READ) {
+            int v = PlatformDependent.getInt(a, idx);
+            return BIG_ENDIAN_NATIVE_ORDER ? v : Integer.reverseBytes(v);
+        }
+        return ((a[idx] & 0xff) << 24)
+                | ((a[idx + 1] & 0xff) << 16)
+                | ((a[idx + 2] & 0xff) << 8)
+                | (a[idx + 3] & 0xff);
+    }
 
     /**
      * Polynomial-then-mix hash for byte slices.
@@ -157,20 +166,10 @@ public final class CompareBytesUtils {
      * — read 4 bytes at a time as a big-endian {@code int}, fold each
      * into the {@code 31*h + word} polynomial, then handle the
      * remaining 0&ndash;3 bytes one at a time. This is roughly 4&times;
-     * fewer polynomial steps than the historical byte-by-byte loop, and
-     * lets the off-heap overload read {@code ByteBuf.getInt} directly
-     * (a single {@code Unsafe} access on a Direct buffer) instead of
-     * iterating byte-by-byte. Hashing 4 bytes as a single int is
-     * algebraically equivalent to hashing them one at a time with the
-     * polynomial folded:
-     * <pre>
-     *   31&sup3;*b0 + 31&sup2;*b1 + 31*b2 + b3 == ((b0&laquo;24) | (b1&laquo;16) | (b2&laquo;8) | b3)
-     * </pre>
-     * is <em>not</em> true in general — these are different polynomials
-     * — so this change <em>does</em> alter the hash values produced for
-     * a given byte sequence relative to the pre-issue-#429
-     * implementation. Equality is unaffected because both halves of any
-     * {@code Bytes.equals} comparison run through this function.
+     * fewer polynomial steps than a byte-by-byte loop, and lets the
+     * off-heap overload read {@code ByteBuf.getInt} directly (a single
+     * {@code Unsafe} access on a Direct buffer) instead of iterating
+     * byte-by-byte.
      *
      * @see #finaliseHash(int, int) for the post-loop golden-ratio mix.
      */
@@ -193,25 +192,6 @@ public final class CompareBytesUtils {
             hashCode = 31 * hashCode + a[idx++];
         }
         return finaliseHash(hashCode, length);
-    }
-
-    /**
-     * BE-canonical 4-byte int read. Uses {@link PlatformDependent}'s
-     * {@code Unsafe}-backed accessor where available (with an endian
-     * flip on little-endian platforms) and falls back to a manual
-     * shift/OR otherwise. Returning a deterministic BE-interpreted int
-     * is what allows the {@link ByteBuf} overload to feed the same
-     * polynomial via {@link ByteBuf#getInt} on a default (BE) buffer.
-     */
-    private static int readBigEndianInt(byte[] a, int idx) {
-        if (HAS_FAST_INT_READ) {
-            int v = PlatformDependent.getInt(a, idx);
-            return BIG_ENDIAN_NATIVE_ORDER ? v : Integer.reverseBytes(v);
-        }
-        return ((a[idx] & 0xff) << 24)
-                | ((a[idx + 1] & 0xff) << 16)
-                | ((a[idx + 2] & 0xff) << 8)
-                | (a[idx + 3] & 0xff);
     }
 
     /**

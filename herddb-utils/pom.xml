@@ -72,57 +72,16 @@
             </plugin>
         </plugins>
     </build>
-    <profiles>
-        <profile>
-            <id>jdk10</id>
-            <activation>
-                <jdk>[10,)</jdk>
-            </activation>
-            <build>
-                <pluginManagement>
-                    <plugins>
-                        <plugin>
-                            <groupId>org.apache.maven.plugins</groupId>
-                            <artifactId>maven-compiler-plugin</artifactId>
-                            <executions>
-                                <execution>
-                                    <id>jdk10</id>
-                                    <goals>
-                                        <goal>compile</goal>
-                                    </goals>
-                                    <configuration>
-                                        <release>10</release>
-                                        <compileSourceRoots>
-                                            <compileSourceRoot>${project.basedir}/src/main/java10</compileSourceRoot>
-                                        </compileSourceRoots>
-                                        <outputDirectory>${project.build.outputDirectory}/META-INF/versions/10</outputDirectory>
-                                        <compilerArgs>
-                                            <arg>--patch-module</arg>
-                                            <arg>example.mrjar=${project.build.outputDirectory}</arg>
-                                        </compilerArgs>
-                                    </configuration>
-                                </execution>
-                            </executions>
-                        </plugin>
-                        <plugin>
-                            <groupId>org.apache.maven.plugins</groupId>
-                            <artifactId>maven-jar-plugin</artifactId>
-                            <executions>
-                                <execution>
-                                    <id>default-jar</id>
-                                    <configuration>
-                                        <archive>
-                                            <manifestEntries>
-                                                <Multi-Release>true</Multi-Release>
-                                            </manifestEntries>
-                                        </archive>
-                                    </configuration>
-                                </execution>
-                            </executions>
-                        </plugin>
-                    </plugins>
-                </pluginManagement>
-            </build>
-        </profile>
-    </profiles>
+    <!--
+      The historical jdk10 profile that produced a multi-release JAR with
+      a JDK-10 variant of CompareBytesUtils / OpenFileUtils under
+      META-INF/versions/10/ has been removed. The project now requires
+      JDK 11+ (parent pom: maven.compiler.release=17), so the JDK-8 base
+      classes were dead code paths and the META-INF/versions/10/
+      override was the one being loaded everywhere. The base sources
+      have been replaced with what used to live under src/main/java10/
+      (Arrays.compareUnsigned / Arrays.equals intrinsics,
+      ExtendedOpenOption.DIRECT for O_DIRECT) so we ship a single,
+      modern-JDK source set.
+    -->
 </project>
