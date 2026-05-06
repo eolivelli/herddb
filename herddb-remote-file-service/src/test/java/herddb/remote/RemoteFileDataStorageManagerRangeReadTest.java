@@ -30,6 +30,7 @@ import herddb.remote.LazyDataPageFormat.FixedHeader;
 import herddb.remote.LazyDataPageFormat.RecordMetadata;
 import herddb.storage.DataPageDoesNotExistException;
 import herddb.utils.Bytes;
+import io.netty.buffer.ByteBuf;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -82,6 +83,23 @@ public class RemoteFileDataStorageManagerRangeReadTest {
         storage.close();
         client.close();
         server.stop();
+    }
+
+    /**
+     * Issue #411: {@code readPageValue} returns a direct {@link ByteBuf}
+     * retained slice. This test helper copies the readable bytes into a
+     * fresh {@code byte[]} (mirroring what
+     * {@code Bytes.fromOffHeap(slice).getBuffer()} does on first heap
+     * access) and releases the slice's refcount.
+     */
+    private static byte[] consumeAndRelease(ByteBuf slice) {
+        try {
+            byte[] out = new byte[slice.readableBytes()];
+            slice.getBytes(slice.readerIndex(), out);
+            return out;
+        } finally {
+            slice.release();
+        }
     }
 
     private static class CountingClient extends RemoteFileServiceClient {
@@ -176,7 +194,8 @@ public class RemoteFileDataStorageManagerRangeReadTest {
         RecordMetadata m = metadata.get(pickIdx);
         client.reset();
 
-        byte[] value = storage.readPageValue(TS, UUID, PAGE_ID, h, m.valueOffset, m.valueLength);
+        byte[] value = consumeAndRelease(
+                storage.readPageValue(TS, UUID, PAGE_ID, h, m.valueOffset, m.valueLength));
         assertArrayEquals(records.get(pickIdx).value.to_array(), value);
         assertEquals("value read must fetch exactly valueLength bytes",
                 (long) m.valueLength, client.readBytes.get());
@@ -198,7 +217,8 @@ public class RemoteFileDataStorageManagerRangeReadTest {
         FixedHeader h = storage.readPageHeader(TS, UUID, PAGE_ID);
         storage.readPageIndex(TS, UUID, PAGE_ID, h);
         RecordMetadata pick = storage.readPageIndex(TS, UUID, PAGE_ID, h).get(42);
-        byte[] v = storage.readPageValue(TS, UUID, PAGE_ID, h, pick.valueOffset, pick.valueLength);
+        byte[] v = consumeAndRelease(
+                storage.readPageValue(TS, UUID, PAGE_ID, h, pick.valueOffset, pick.valueLength));
         assertArrayEquals(records.get(42).value.to_array(), v);
 
         long transferred = client.readBytes.get();
@@ -229,14 +249,14 @@ public class RemoteFileDataStorageManagerRangeReadTest {
         List<RecordMetadata> metadata = storage.readPageIndex(TS, UUID, PAGE_ID, h);
         client.reset();
 
-        byte[] v0 = storage.readPageValue(TS, UUID, PAGE_ID, h,
-                metadata.get(0).valueOffset, metadata.get(0).valueLength);
+        byte[] v0 = consumeAndRelease(storage.readPageValue(TS, UUID, PAGE_ID, h,
+                metadata.get(0).valueOffset, metadata.get(0).valueLength));
         assertEquals(0, v0.length);
         // Zero-length values are handled locally; no remote call expected.
         assertEquals(0L, client.readCalls.get());
 
-        byte[] v1 = storage.readPageValue(TS, UUID, PAGE_ID, h,
-                metadata.get(1).valueOffset, metadata.get(1).valueLength);
+        byte[] v1 = consumeAndRelease(storage.readPageValue(TS, UUID, PAGE_ID, h,
+                metadata.get(1).valueOffset, metadata.get(1).valueLength));
         assertArrayEquals("non-empty".getBytes(), v1);
         assertEquals(1L, client.readCalls.get());
     }
@@ -262,9 +282,11 @@ public class RemoteFileDataStorageManagerRangeReadTest {
         RecordMetadata m = metadata.get(3);
         client.reset();
 
-        byte[] first = storage.readPageValue(TS, UUID, PAGE_ID, h, m.valueOffset, m.valueLength);
+        byte[] first = consumeAndRelease(
+                storage.readPageValue(TS, UUID, PAGE_ID, h, m.valueOffset, m.valueLength));
         long afterFirst = client.readCalls.get();
-        byte[] second = storage.readPageValue(TS, UUID, PAGE_ID, h, m.valueOffset, m.valueLength);
+        byte[] second = consumeAndRelease(
+                storage.readPageValue(TS, UUID, PAGE_ID, h, m.valueOffset, m.valueLength));
         assertEquals("second call must be served from cache",
                 afterFirst, client.readCalls.get());
         assertArrayEquals(first, second);
@@ -273,7 +295,7 @@ public class RemoteFileDataStorageManagerRangeReadTest {
         storage.writePage(TS, UUID, PAGE_ID, records);
         FixedHeader h2 = storage.readPageHeader(TS, UUID, PAGE_ID);
         long beforeThird = client.readCalls.get();
-        storage.readPageValue(TS, UUID, PAGE_ID, h2, m.valueOffset, m.valueLength);
+        storage.readPageValue(TS, UUID, PAGE_ID, h2, m.valueOffset, m.valueLength).release();
         assertTrue("third call after invalidation should hit remote",
                 client.readCalls.get() > beforeThird);
     }

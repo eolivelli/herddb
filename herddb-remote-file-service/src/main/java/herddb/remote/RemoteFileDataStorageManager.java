@@ -457,6 +457,13 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     @Override
     public void close() throws DataStorageManagerException {
+        // Issue #411: drain the value cache first so every cache-owned refcount
+        // on a direct ByteBuf is released back to the pool. Doing this before
+        // any other cleanup guarantees that a partial close (one of the steps
+        // below throws) still returns the bulk of the direct memory to the
+        // allocator. close() is idempotent, so calling it on an already-closed
+        // cache is a no-op.
+        lazyValueCache.close();
         localMetadataManager.close();
         // Close the direct-S3 client if one was wired in (issue #381).
         // S3AsyncClient + CRT HTTP-client threads are native resources; closing
@@ -812,13 +819,25 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     /**
      * Fetches a single record value from a v2 page, consulting the value
      * cache first and issuing a byte-range read against remote storage on
-     * miss. Returns a freshly-owned {@code byte[]}.
+     * miss.
+     *
+     * <p><b>Issue #411 — off-heap return</b>: returns a direct
+     * {@link ByteBuf} retained slice from the
+     * {@link LazyValueCache}'s pool. The caller owns one refcount and
+     * <b>must</b> release it (typically by handing the slice to
+     * {@link herddb.utils.Bytes#fromOffHeap(ByteBuf)} whose
+     * own lifecycle returns the refcount to the pool on
+     * {@link herddb.utils.Bytes#release()} or on lazy materialisation).
+     *
+     * <p>For zero-length values the returned buffer is the empty
+     * {@link io.netty.buffer.Unpooled#EMPTY_BUFFER}; releasing it is a
+     * no-op so callers do not need to special-case empty values.
      */
-    byte[] readPageValue(String tableSpace, String uuid, long pageId,
+    ByteBuf readPageValue(String tableSpace, String uuid, long pageId,
             LazyDataPageFormat.FixedHeader h, long valueOffset, int valueLength)
             throws DataStorageManagerException {
         if (valueLength == 0) {
-            return new byte[0];
+            return io.netty.buffer.Unpooled.EMPTY_BUFFER;
         }
         LazyValueCache.ValueKey key = new LazyValueCache.ValueKey(
                 tableSpace, uuid, pageId, valueOffset);
