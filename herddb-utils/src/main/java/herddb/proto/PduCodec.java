@@ -2093,4 +2093,775 @@ public abstract class PduCodec {
         return result;
     }
 
+    // =========================================================================
+    // File-server PDUs (issue #425).
+    //
+    // Each pair of writeRequest/writeResponse + readXxx methods follows the
+    // existing herddb-net pattern: a fixed PDU header (version + flags + type
+    // + messageId) followed by a type-specific payload. All payloads are
+    // length-prefixed (ByteBufUtils.writeArray / writeString) so a corrupted
+    // frame fails fast on the receiver rather than draining into the next
+    // PDU. Buffers are pooled directBuffers; ownership transfers to the
+    // network layer on send and to the Pdu wrapper on receive.
+    //
+    // Request/response disambiguation is via the FLAGS_ISREQUEST /
+    // FLAGS_ISRESPONSE bit, identical to the core-server PDUs.
+    // =========================================================================
+
+    /** WRITE_FILE: client → server, returns total bytes written. */
+    public abstract static class WriteFileRequest {
+
+        public static ByteBuf write(long messageId, String path, ByteBuf content) {
+            int contentLen = content.readableBytes();
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(
+                            VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                                    + VINT_LENGTH_SIZE + path.length()
+                                    + ONE_INT + contentLen);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_WRITE_FILE);
+            byteBuf.writeLong(messageId);
+            ByteBufUtils.writeString(byteBuf, path);
+            byteBuf.writeInt(contentLen);
+            byteBuf.writeBytes(content, content.readerIndex(), contentLen);
+            return byteBuf;
+        }
+
+        public static ByteBuf write(long messageId, String path, byte[] content, int offset, int length) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(
+                            VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                                    + VINT_LENGTH_SIZE + path.length()
+                                    + ONE_INT + length);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_WRITE_FILE);
+            byteBuf.writeLong(messageId);
+            ByteBufUtils.writeString(byteBuf, path);
+            byteBuf.writeInt(length);
+            byteBuf.writeBytes(content, offset, length);
+            return byteBuf;
+        }
+
+        public static String readPath(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            return ByteBufUtils.readString(buffer);
+        }
+
+        /**
+         * Returns a retained slice of the request body. The caller is
+         * responsible for releasing it once consumed. Slicing avoids a
+         * heap copy of the payload — the storage backend can read directly
+         * from the inbound network buffer.
+         */
+        public static ByteBuf readContent(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            ByteBufUtils.skipArray(buffer);
+            int len = buffer.readInt();
+            return buffer.retainedSlice(buffer.readerIndex(), len);
+        }
+    }
+
+    /** Response to a {@link WriteFileRequest}: total bytes written. */
+    public abstract static class WriteFileResponse {
+
+        public static ByteBuf write(long messageId, long writtenSize) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + ONE_LONG);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_WRITE_FILE);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeLong(writtenSize);
+            return byteBuf;
+        }
+
+        public static long readWrittenSize(Pdu pdu) {
+            return pdu.buffer.getLong(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+        }
+    }
+
+    /** WRITE_FILE_BLOCK: client → server, writes one multipart block. */
+    public abstract static class WriteFileBlockRequest {
+
+        public static ByteBuf write(long messageId, String path, long blockIndex, ByteBuf content) {
+            int contentLen = content.readableBytes();
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(
+                            VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                                    + VINT_LENGTH_SIZE + path.length()
+                                    + ONE_LONG + ONE_INT + contentLen);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_WRITE_FILE_BLOCK);
+            byteBuf.writeLong(messageId);
+            ByteBufUtils.writeString(byteBuf, path);
+            byteBuf.writeLong(blockIndex);
+            byteBuf.writeInt(contentLen);
+            byteBuf.writeBytes(content, content.readerIndex(), contentLen);
+            return byteBuf;
+        }
+
+        public static ByteBuf write(long messageId, String path, long blockIndex, byte[] content) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(
+                            VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                                    + VINT_LENGTH_SIZE + path.length()
+                                    + ONE_LONG + ONE_INT + content.length);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_WRITE_FILE_BLOCK);
+            byteBuf.writeLong(messageId);
+            ByteBufUtils.writeString(byteBuf, path);
+            byteBuf.writeLong(blockIndex);
+            byteBuf.writeInt(content.length);
+            byteBuf.writeBytes(content);
+            return byteBuf;
+        }
+
+        public static String readPath(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            return ByteBufUtils.readString(buffer);
+        }
+
+        public static long readBlockIndex(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            ByteBufUtils.skipArray(buffer);
+            return buffer.readLong();
+        }
+
+        public static ByteBuf readContent(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            ByteBufUtils.skipArray(buffer);
+            buffer.skipBytes(ONE_LONG);
+            int len = buffer.readInt();
+            return buffer.retainedSlice(buffer.readerIndex(), len);
+        }
+    }
+
+    /** Response to a {@link WriteFileBlockRequest}: bytes written for that block. */
+    public abstract static class WriteFileBlockResponse {
+
+        public static ByteBuf write(long messageId, long writtenSize) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + ONE_LONG);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_WRITE_FILE_BLOCK);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeLong(writtenSize);
+            return byteBuf;
+        }
+
+        public static long readWrittenSize(Pdu pdu) {
+            return pdu.buffer.getLong(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+        }
+    }
+
+    /** READ_FILE: client → server, returns full file content (or found=false). */
+    public abstract static class ReadFileRequest {
+
+        public static ByteBuf write(long messageId, String path) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(
+                            VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                                    + VINT_LENGTH_SIZE + path.length());
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_READ_FILE);
+            byteBuf.writeLong(messageId);
+            ByteBufUtils.writeString(byteBuf, path);
+            return byteBuf;
+        }
+
+        public static String readPath(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            return ByteBufUtils.readString(buffer);
+        }
+    }
+
+    /**
+     * Response to a {@link ReadFileRequest}.
+     * Wire layout: {@code [hdr] [byte found:0|1] [int contentLen] [contentBytes...]}.
+     * When {@code found=false}, {@code contentLen=0} and no payload follows.
+     */
+    public abstract static class ReadFileResponse {
+
+        /** Writes a "not found" response (no payload). */
+        public static ByteBuf writeNotFound(long messageId) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                            + ONE_BYTE + ONE_INT);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_READ_FILE);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeByte(0);
+            byteBuf.writeInt(0);
+            return byteBuf;
+        }
+
+        /**
+         * Writes a "found" response. {@code content} is consumed (its readable
+         * bytes are appended into the response buffer). Caller still owns
+         * {@code content} and is responsible for releasing it.
+         */
+        public static ByteBuf writeFound(long messageId, ByteBuf content) {
+            int contentLen = content.readableBytes();
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                            + ONE_BYTE + ONE_INT + contentLen);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_READ_FILE);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeByte(1);
+            byteBuf.writeInt(contentLen);
+            byteBuf.writeBytes(content, content.readerIndex(), contentLen);
+            return byteBuf;
+        }
+
+        public static ByteBuf writeFound(long messageId, byte[] content, int offset, int length) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                            + ONE_BYTE + ONE_INT + length);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_READ_FILE);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeByte(1);
+            byteBuf.writeInt(length);
+            byteBuf.writeBytes(content, offset, length);
+            return byteBuf;
+        }
+
+        public static boolean readFound(Pdu pdu) {
+            return pdu.buffer.getByte(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE) == 1;
+        }
+
+        public static int readContentLength(Pdu pdu) {
+            return pdu.buffer.getInt(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + ONE_BYTE);
+        }
+
+        /**
+         * Returns a retained slice over the response payload. Caller owns
+         * the returned slice and must {@code release()} it. Returns an
+         * empty (still-retained) slice when {@code found=false}.
+         */
+        public static ByteBuf readContent(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            int hdr = VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE;
+            int len = buffer.getInt(hdr + ONE_BYTE);
+            return buffer.retainedSlice(hdr + ONE_BYTE + ONE_INT, len);
+        }
+    }
+
+    /** READ_FILE_RANGE: client → server, returns a byte range from a (possibly multipart) file. */
+    public abstract static class ReadFileRangeRequest {
+
+        public static ByteBuf write(long messageId, String path, long offset, int length, int blockSize) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(
+                            VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                                    + VINT_LENGTH_SIZE + path.length()
+                                    + ONE_LONG + ONE_INT + ONE_INT);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_READ_FILE_RANGE);
+            byteBuf.writeLong(messageId);
+            ByteBufUtils.writeString(byteBuf, path);
+            byteBuf.writeLong(offset);
+            byteBuf.writeInt(length);
+            byteBuf.writeInt(blockSize);
+            return byteBuf;
+        }
+
+        public static String readPath(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            return ByteBufUtils.readString(buffer);
+        }
+
+        public static long readOffset(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            ByteBufUtils.skipArray(buffer);
+            return buffer.readLong();
+        }
+
+        public static int readLength(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            ByteBufUtils.skipArray(buffer);
+            buffer.skipBytes(ONE_LONG);
+            return buffer.readInt();
+        }
+
+        public static int readBlockSize(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            ByteBufUtils.skipArray(buffer);
+            buffer.skipBytes(ONE_LONG + ONE_INT);
+            return buffer.readInt();
+        }
+    }
+
+    /** Response to a {@link ReadFileRangeRequest}; identical wire shape to {@link ReadFileResponse}. */
+    public abstract static class ReadFileRangeResponse {
+
+        public static ByteBuf writeNotFound(long messageId) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                            + ONE_BYTE + ONE_INT);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_READ_FILE_RANGE);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeByte(0);
+            byteBuf.writeInt(0);
+            return byteBuf;
+        }
+
+        public static ByteBuf writeFound(long messageId, ByteBuf content) {
+            int contentLen = content.readableBytes();
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                            + ONE_BYTE + ONE_INT + contentLen);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_READ_FILE_RANGE);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeByte(1);
+            byteBuf.writeInt(contentLen);
+            byteBuf.writeBytes(content, content.readerIndex(), contentLen);
+            return byteBuf;
+        }
+
+        public static ByteBuf writeFound(long messageId, byte[] content, int offset, int length) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                            + ONE_BYTE + ONE_INT + length);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_READ_FILE_RANGE);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeByte(1);
+            byteBuf.writeInt(length);
+            byteBuf.writeBytes(content, offset, length);
+            return byteBuf;
+        }
+
+        public static boolean readFound(Pdu pdu) {
+            return pdu.buffer.getByte(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE) == 1;
+        }
+
+        public static int readContentLength(Pdu pdu) {
+            return pdu.buffer.getInt(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + ONE_BYTE);
+        }
+
+        public static ByteBuf readContent(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            int hdr = VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE;
+            int len = buffer.getInt(hdr + ONE_BYTE);
+            return buffer.retainedSlice(hdr + ONE_BYTE + ONE_INT, len);
+        }
+    }
+
+    /** DELETE_FILE: client → server, returns whether the path existed. */
+    public abstract static class DeleteFileRequest {
+
+        public static ByteBuf write(long messageId, String path) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(
+                            VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                                    + VINT_LENGTH_SIZE + path.length());
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_DELETE_FILE);
+            byteBuf.writeLong(messageId);
+            ByteBufUtils.writeString(byteBuf, path);
+            return byteBuf;
+        }
+
+        public static String readPath(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            return ByteBufUtils.readString(buffer);
+        }
+    }
+
+    /** Response to a {@link DeleteFileRequest}. */
+    public abstract static class DeleteFileResponse {
+
+        public static ByteBuf write(long messageId, boolean deleted) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + ONE_BYTE);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_DELETE_FILE);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeByte(deleted ? 1 : 0);
+            return byteBuf;
+        }
+
+        public static boolean readDeleted(Pdu pdu) {
+            return pdu.buffer.getByte(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE) == 1;
+        }
+    }
+
+    /**
+     * DELETE_FILES: client → server, batch logical-file deletion (issue #398).
+     * All paths in a single request must route to the same server (the client
+     * groups paths by consistent-hash router before dispatch). Each path is
+     * processed independently; the response carries per-path outcomes.
+     */
+    public abstract static class DeleteFilesRequest {
+
+        public static ByteBuf write(long messageId, List<String> paths) {
+            int sizeHint = VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                    + ONE_INT + 32 * paths.size();
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(sizeHint);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_DELETE_FILES);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeInt(paths.size());
+            for (String p : paths) {
+                ByteBufUtils.writeString(byteBuf, p);
+            }
+            return byteBuf;
+        }
+
+        public static List<String> readPaths(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            int count = buffer.readInt();
+            List<String> result = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                result.add(ByteBufUtils.readString(buffer));
+            }
+            return result;
+        }
+    }
+
+    /**
+     * Response to a {@link DeleteFilesRequest}. Per-path outcome carries the
+     * deletion flag and (optionally) a non-empty error message describing why
+     * the per-path delete failed. A path that did not exist is reported with
+     * {@code deleted=false} and an empty error string.
+     */
+    public abstract static class DeleteFilesResponse {
+
+        /** Per-path outcome: path, whether it was deleted, optional error message. */
+        public static final class Outcome {
+            public final String path;
+            public final boolean deleted;
+            public final String error;
+
+            public Outcome(String path, boolean deleted, String error) {
+                this.path = path;
+                this.deleted = deleted;
+                this.error = error == null ? "" : error;
+            }
+        }
+
+        public static ByteBuf write(long messageId, List<Outcome> outcomes) {
+            int sizeHint = VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                    + ONE_INT + 64 * outcomes.size();
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(sizeHint);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_DELETE_FILES);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeInt(outcomes.size());
+            for (Outcome o : outcomes) {
+                ByteBufUtils.writeString(byteBuf, o.path);
+                byteBuf.writeByte(o.deleted ? 1 : 0);
+                ByteBufUtils.writeString(byteBuf, o.error == null ? "" : o.error);
+            }
+            return byteBuf;
+        }
+
+        public static List<Outcome> readOutcomes(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            int count = buffer.readInt();
+            List<Outcome> result = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                String path = ByteBufUtils.readString(buffer);
+                boolean deleted = buffer.readByte() == 1;
+                String error = ByteBufUtils.readString(buffer);
+                result.add(new Outcome(path, deleted, error));
+            }
+            return result;
+        }
+    }
+
+    /**
+     * LIST_FILES: client → server, returns all logical paths under the prefix
+     * in a single response PDU. The previous gRPC server-streaming form is
+     * collapsed into one message because the server materializes the full list
+     * before responding anyway, and response sizes for typical HerdDB
+     * workloads (per-tablespace page directories) are small enough that
+     * single-PDU delivery has no measurable cost. If a use case ever needs
+     * per-entry streaming, add a second PDU type without breaking this one.
+     */
+    public abstract static class ListFilesRequest {
+
+        public static ByteBuf write(long messageId, String prefix) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(
+                            VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                                    + VINT_LENGTH_SIZE + prefix.length());
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_LIST_FILES);
+            byteBuf.writeLong(messageId);
+            ByteBufUtils.writeString(byteBuf, prefix);
+            return byteBuf;
+        }
+
+        public static String readPrefix(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            return ByteBufUtils.readString(buffer);
+        }
+    }
+
+    /** Response to a {@link ListFilesRequest}. */
+    public abstract static class ListFilesResponse {
+
+        public static ByteBuf write(long messageId, List<String> paths) {
+            int sizeHint = VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                    + ONE_INT + 64 * paths.size();
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(sizeHint);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_LIST_FILES);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeInt(paths.size());
+            for (String p : paths) {
+                ByteBufUtils.writeString(byteBuf, p);
+            }
+            return byteBuf;
+        }
+
+        public static List<String> readPaths(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            int count = buffer.readInt();
+            List<String> result = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                result.add(ByteBufUtils.readString(buffer));
+            }
+            return result;
+        }
+    }
+
+    /** DELETE_BY_PREFIX: client → server, bulk-delete all paths matching the prefix. */
+    public abstract static class DeleteByPrefixRequest {
+
+        public static ByteBuf write(long messageId, String prefix) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(
+                            VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE
+                                    + VINT_LENGTH_SIZE + prefix.length());
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_DELETE_BY_PREFIX);
+            byteBuf.writeLong(messageId);
+            ByteBufUtils.writeString(byteBuf, prefix);
+            return byteBuf;
+        }
+
+        public static String readPrefix(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            return ByteBufUtils.readString(buffer);
+        }
+    }
+
+    /** Response to a {@link DeleteByPrefixRequest}: number of files deleted. */
+    public abstract static class DeleteByPrefixResponse {
+
+        public static ByteBuf write(long messageId, int deletedCount) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + ONE_INT);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_DELETE_BY_PREFIX);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeInt(deletedCount);
+            return byteBuf;
+        }
+
+        public static int readDeletedCount(Pdu pdu) {
+            return pdu.buffer.getInt(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+        }
+    }
+
+    /** GET_SERVER_INFO: client → server, no payload. Admin RPC. */
+    public abstract static class GetServerInfoRequest {
+
+        public static ByteBuf write(long messageId) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_GET_SERVER_INFO);
+            byteBuf.writeLong(messageId);
+            return byteBuf;
+        }
+    }
+
+    /**
+     * Response to a {@link GetServerInfoRequest}. Mirrors the legacy
+     * {@code GetServerInfoResponse} protobuf field-for-field; absent
+     * subsystems are reported as zero.
+     */
+    public abstract static class GetServerInfoResponse {
+
+        /** Plain holder mirroring the gRPC {@code GetServerInfoResponse} message. */
+        public static final class Info {
+            public String host;
+            public int port;
+            public String storageMode;
+            public long jvmHeapUsedBytes;
+            public long jvmHeapMaxBytes;
+            public long diskCacheMaxBytes;
+            public long diskCacheHitCount;
+            public long diskCacheMissCount;
+            public long diskCacheEvictionCount;
+            public long diskCacheHitBytes;
+            public long diskCacheMissBytes;
+            public long diskCacheEstimatedEntries;
+            public long blockCacheMaxBytes;
+            public long blockCacheEstimatedBytes;
+            public long blockCacheEstimatedEntries;
+            public long blockCacheHits;
+            public long blockCacheMisses;
+            public long blockCacheEvictions;
+        }
+
+        public static ByteBuf write(long messageId, Info info) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + 256);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_GET_SERVER_INFO);
+            byteBuf.writeLong(messageId);
+            ByteBufUtils.writeString(byteBuf, info.host == null ? "" : info.host);
+            byteBuf.writeInt(info.port);
+            ByteBufUtils.writeString(byteBuf, info.storageMode == null ? "" : info.storageMode);
+            byteBuf.writeLong(info.jvmHeapUsedBytes);
+            byteBuf.writeLong(info.jvmHeapMaxBytes);
+            byteBuf.writeLong(info.diskCacheMaxBytes);
+            byteBuf.writeLong(info.diskCacheHitCount);
+            byteBuf.writeLong(info.diskCacheMissCount);
+            byteBuf.writeLong(info.diskCacheEvictionCount);
+            byteBuf.writeLong(info.diskCacheHitBytes);
+            byteBuf.writeLong(info.diskCacheMissBytes);
+            byteBuf.writeLong(info.diskCacheEstimatedEntries);
+            byteBuf.writeLong(info.blockCacheMaxBytes);
+            byteBuf.writeLong(info.blockCacheEstimatedBytes);
+            byteBuf.writeLong(info.blockCacheEstimatedEntries);
+            byteBuf.writeLong(info.blockCacheHits);
+            byteBuf.writeLong(info.blockCacheMisses);
+            byteBuf.writeLong(info.blockCacheEvictions);
+            return byteBuf;
+        }
+
+        public static Info read(Pdu pdu) {
+            ByteBuf buffer = pdu.buffer;
+            buffer.readerIndex(0);
+            buffer.skipBytes(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+            Info info = new Info();
+            info.host = ByteBufUtils.readString(buffer);
+            info.port = buffer.readInt();
+            info.storageMode = ByteBufUtils.readString(buffer);
+            info.jvmHeapUsedBytes = buffer.readLong();
+            info.jvmHeapMaxBytes = buffer.readLong();
+            info.diskCacheMaxBytes = buffer.readLong();
+            info.diskCacheHitCount = buffer.readLong();
+            info.diskCacheMissCount = buffer.readLong();
+            info.diskCacheEvictionCount = buffer.readLong();
+            info.diskCacheHitBytes = buffer.readLong();
+            info.diskCacheMissBytes = buffer.readLong();
+            info.diskCacheEstimatedEntries = buffer.readLong();
+            info.blockCacheMaxBytes = buffer.readLong();
+            info.blockCacheEstimatedBytes = buffer.readLong();
+            info.blockCacheEstimatedEntries = buffer.readLong();
+            info.blockCacheHits = buffer.readLong();
+            info.blockCacheMisses = buffer.readLong();
+            info.blockCacheEvictions = buffer.readLong();
+            return info;
+        }
+    }
+
+    /** RESIZE_DISK_CACHE: client → server, dynamically resize the disk-LRU. Admin RPC. */
+    public abstract static class ResizeDiskCacheRequest {
+
+        public static ByteBuf write(long messageId, long newMaxBytes) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + ONE_LONG);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISREQUEST);
+            byteBuf.writeByte(Pdu.TYPE_FS_RESIZE_DISK_CACHE);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeLong(newMaxBytes);
+            return byteBuf;
+        }
+
+        public static long readNewMaxBytes(Pdu pdu) {
+            return pdu.buffer.getLong(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+        }
+    }
+
+    /** Response to a {@link ResizeDiskCacheRequest}. */
+    public abstract static class ResizeDiskCacheResponse {
+
+        public static ByteBuf write(long messageId, long previousMaxBytes, long newMaxBytes) {
+            ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT
+                    .directBuffer(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + 2 * ONE_LONG);
+            byteBuf.writeByte(VERSION_3);
+            byteBuf.writeByte(Pdu.FLAGS_ISRESPONSE);
+            byteBuf.writeByte(Pdu.TYPE_FS_RESIZE_DISK_CACHE);
+            byteBuf.writeLong(messageId);
+            byteBuf.writeLong(previousMaxBytes);
+            byteBuf.writeLong(newMaxBytes);
+            return byteBuf;
+        }
+
+        public static long readPreviousMaxBytes(Pdu pdu) {
+            return pdu.buffer.getLong(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE);
+        }
+
+        public static long readNewMaxBytes(Pdu pdu) {
+            return pdu.buffer.getLong(VERSION_SIZE + FLAGS_SIZE + TYPE_SIZE + MSGID_SIZE + ONE_LONG);
+        }
+    }
+
 }

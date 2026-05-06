@@ -20,29 +20,14 @@
 
 package herddb.remote;
 
-import com.google.protobuf.UnsafeByteOperations;
-import herddb.remote.proto.DeleteByPrefixRequest;
-import herddb.remote.proto.DeleteByPrefixResponse;
-import herddb.remote.proto.DeleteFileOutcome;
-import herddb.remote.proto.DeleteFileRequest;
-import herddb.remote.proto.DeleteFileResponse;
-import herddb.remote.proto.DeleteFilesRequest;
-import herddb.remote.proto.DeleteFilesResponse;
-import herddb.remote.proto.ListFilesEntry;
-import herddb.remote.proto.ListFilesRequest;
-import herddb.remote.proto.ReadFileRangeRequest;
-import herddb.remote.proto.ReadFileRangeResponse;
-import herddb.remote.proto.ReadFileRequest;
-import herddb.remote.proto.ReadFileResponse;
-import herddb.remote.proto.RemoteFileServiceGrpc;
-import herddb.remote.proto.WriteFileBlockRequest;
-import herddb.remote.proto.WriteFileBlockResponse;
-import herddb.remote.proto.WriteFileRequest;
-import herddb.remote.proto.WriteFileResponse;
+import herddb.network.Channel;
+import herddb.proto.Pdu;
+import herddb.proto.PduCodec;
 import herddb.remote.storage.ObjectStorage;
 import herddb.remote.storage.ReadResult;
-import io.grpc.Status;
-import io.grpc.stub.StreamObserver;
+import io.netty.buffer.ByteBuf;
+import io.netty.util.ReferenceCountUtil;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -57,11 +42,25 @@ import org.apache.bookkeeper.stats.OpStatsLogger;
 import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
- * Thin gRPC adapter that delegates all storage operations to an {@link ObjectStorage} backend.
+ * Stateless dispatcher that turns inbound file-server PDUs into
+ * {@link ObjectStorage} calls and writes the response PDU back on the
+ * caller {@link Channel}. Issue #425 replaced the previous gRPC service
+ * implementation with this class so the file server speaks the same
+ * length-prefixed Netty wire protocol used by the rest of HerdDB.
+ *
+ * <p>Each handler dispatches its storage call onto the read or write
+ * executor lane (issue #100) so checkpoint write-paths cannot starve
+ * read-paths and vice versa.
+ *
+ * <p>The handlers take ownership of the inbound {@link Pdu} and release
+ * it once the request payload has been parsed (or, for async paths, once
+ * the retained payload slice has been extracted). The caller of
+ * {@link #handle(Pdu, Channel)} is therefore <em>not</em> responsible for
+ * closing the PDU.
  *
  * @author enrico.olivelli
  */
-public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServiceImplBase {
+public class RemoteFileServiceImpl {
 
     private static final Logger LOGGER = Logger.getLogger(RemoteFileServiceImpl.class.getName());
 
@@ -119,13 +118,11 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
 
     /**
      * Creates the service with dedicated read/write execution lanes (issue #100).
-     * Each RPC handler dispatches its storage call and its completion callback onto
-     * {@code readExecutor} or {@code writeExecutor} according to operation type, so
-     * slow write-path callbacks cannot starve read-path responses.
-     *
-     * <p>If either executor is {@code null}, handlers fall back to
-     * {@code whenComplete} on the storage future's default thread, preserving the
-     * legacy behavior.
+     * Each PDU handler dispatches its storage call and its completion callback
+     * onto {@code readExecutor} or {@code writeExecutor} according to
+     * operation type, so slow write-path callbacks cannot starve read-path
+     * responses. If either executor is {@code null}, handlers fall back to
+     * the storage future's default thread.
      */
     public RemoteFileServiceImpl(ObjectStorage storage, StatsLogger statsLogger,
                                  Executor readExecutor, Executor writeExecutor) {
@@ -176,221 +173,392 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
         this.readRangeLatency = scope.getOpStatsLogger("readrange_latency");
     }
 
-    @Override
-    public void writeFile(WriteFileRequest request, StreamObserver<WriteFileResponse> responseObserver) {
-        runOnLane(writeExecutor, () -> writeFileImpl(request, responseObserver));
+    /**
+     * Dispatches an inbound file-server PDU. Returns {@code true} if the type
+     * was recognized (and the PDU was consumed by this dispatcher), {@code false}
+     * otherwise. When this method returns {@code true} the caller must NOT
+     * close the PDU — the handler has already taken ownership.
+     */
+    public boolean handle(Pdu pdu, Channel channel) {
+        switch (pdu.type) {
+            case Pdu.TYPE_FS_WRITE_FILE:
+                handleWriteFile(pdu, channel);
+                return true;
+            case Pdu.TYPE_FS_WRITE_FILE_BLOCK:
+                handleWriteFileBlock(pdu, channel);
+                return true;
+            case Pdu.TYPE_FS_READ_FILE:
+                handleReadFile(pdu, channel);
+                return true;
+            case Pdu.TYPE_FS_READ_FILE_RANGE:
+                handleReadFileRange(pdu, channel);
+                return true;
+            case Pdu.TYPE_FS_DELETE_FILE:
+                handleDeleteFile(pdu, channel);
+                return true;
+            case Pdu.TYPE_FS_DELETE_FILES:
+                handleDeleteFiles(pdu, channel);
+                return true;
+            case Pdu.TYPE_FS_LIST_FILES:
+                handleListFiles(pdu, channel);
+                return true;
+            case Pdu.TYPE_FS_DELETE_BY_PREFIX:
+                handleDeleteByPrefix(pdu, channel);
+                return true;
+            default:
+                return false;
+        }
     }
 
-    private void writeFileImpl(WriteFileRequest request, StreamObserver<WriteFileResponse> responseObserver) {
+    // ----------------------------------------------------------------------
+    // WRITE_FILE
+    // ----------------------------------------------------------------------
+
+    private void handleWriteFile(Pdu pdu, Channel channel) {
+        // Parse on the calling (Netty) thread, then hop to the write lane.
+        // The retained slice keeps the inbound buffer alive past pdu.close().
+        final long messageId = pdu.messageId;
+        final String path;
+        final ByteBuf content;
+        try {
+            path = PduCodec.WriteFileRequest.readPath(pdu);
+            content = PduCodec.WriteFileRequest.readContent(pdu);
+        } catch (RuntimeException parseError) {
+            // Broad catch: PDU parse can fail on truncated / malformed frames;
+            // the netty thread must not die without replying to the client.
+            pdu.close();
+            sendError(channel, messageId, "malformed WRITE_FILE: " + parseError.getMessage());
+            return;
+        }
+        pdu.close();
+
+        try {
+            runOnLane(writeExecutor, () -> writeFileImpl(messageId, path, content, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: writeExecutor may reject the task during shutdown
+            // (RejectedExecutionException) or when the queue is bounded and
+            // saturated. Either way the lane lambda will not run, so the
+            // retained content slice would leak. Release it here, then surface
+            // the failure to the client.
+            ReferenceCountUtil.safeRelease(content);
+            sendError(channel, messageId,
+                    "writeFile dispatch failed: " + dispatchError.getMessage());
+        }
+    }
+
+    private void writeFileImpl(long messageId, String path, ByteBuf content, Channel channel) {
         long start = System.nanoTime();
         writeRequests.inc();
-        byte[] content = request.getContent().toByteArray();
-        attachCallback(storage.write(request.getPath(), content), writeExecutor,
-                (v, t) -> {
-                    long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
-                    if (t != null) {
-                        writeErrors.inc();
-                        writeLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.SEVERE, "writeFile failed for path " + request.getPath(), t);
-                        responseObserver.onError(
-                                Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
-                    } else {
-                        writtenBytes.addCount(content.length);
-                        writeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.FINE, "writeFile path={0} size={1} time={2}ms",
-                                new Object[]{request.getPath(), content.length, elapsedMs(start)});
-                        responseObserver.onNext(WriteFileResponse.newBuilder()
-                                .setWrittenSize(content.length)
-                                .build());
-                        responseObserver.onCompleted();
-                    }
-                });
+        // ObjectStorage.write takes byte[] — copy out of the retained slice.
+        // The slice is released after the async write completes.
+        final int len = content.readableBytes();
+        final byte[] bytes = new byte[len];
+        content.getBytes(content.readerIndex(), bytes);
+        attachCallback(storage.write(path, bytes), writeExecutor, (v, t) -> {
+            try {
+                long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
+                if (t != null) {
+                    writeErrors.inc();
+                    writeLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                    LOGGER.log(Level.SEVERE, "writeFile failed for path " + path, t);
+                    sendError(channel, messageId, "writeFile failed: " + t.getMessage());
+                } else {
+                    writtenBytes.addCount(len);
+                    writeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                    LOGGER.log(Level.FINE, "writeFile path={0} size={1} time={2}ms",
+                            new Object[]{path, len, elapsedMs(start)});
+                    channel.sendReplyMessage(messageId,
+                            PduCodec.WriteFileResponse.write(messageId, len));
+                }
+            } finally {
+                ReferenceCountUtil.safeRelease(content);
+            }
+        });
     }
 
-    @Override
-    public void readFile(ReadFileRequest request, StreamObserver<ReadFileResponse> responseObserver) {
-        runOnLane(readExecutor, () -> readFileImpl(request, responseObserver));
+    // ----------------------------------------------------------------------
+    // WRITE_FILE_BLOCK
+    // ----------------------------------------------------------------------
+
+    private void handleWriteFileBlock(Pdu pdu, Channel channel) {
+        final long messageId = pdu.messageId;
+        final String path;
+        final long blockIndex;
+        final ByteBuf content;
+        try {
+            path = PduCodec.WriteFileBlockRequest.readPath(pdu);
+            blockIndex = PduCodec.WriteFileBlockRequest.readBlockIndex(pdu);
+            content = PduCodec.WriteFileBlockRequest.readContent(pdu);
+        } catch (RuntimeException parseError) {
+            // Broad catch: PDU parse can fail on truncated / malformed frames.
+            pdu.close();
+            sendError(channel, messageId, "malformed WRITE_FILE_BLOCK: " + parseError.getMessage());
+            return;
+        }
+        pdu.close();
+
+        try {
+            runOnLane(writeExecutor, () -> writeFileBlockImpl(messageId, path, blockIndex, content, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: writeExecutor may reject the task at shutdown or
+            // under saturation; release the retained slice that the lambda
+            // would have owned to avoid a direct-memory leak.
+            ReferenceCountUtil.safeRelease(content);
+            sendError(channel, messageId,
+                    "writeFileBlock dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
-    private void readFileImpl(ReadFileRequest request, StreamObserver<ReadFileResponse> responseObserver) {
-        long start = System.nanoTime();
-        readRequests.inc();
-        attachCallback(storage.read(request.getPath()), readExecutor,
-                (result, t) -> {
-                    long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
-                    try {
-                        if (t != null) {
-                            readErrors.inc();
-                            readLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                            LOGGER.log(Level.SEVERE, "readFile failed for path " + request.getPath(), t);
-                            responseObserver.onError(
-                                    Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
-                        } else if (result.status() == ReadResult.Status.NOT_FOUND) {
-                            readNotFound.inc();
-                            readLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                            LOGGER.log(Level.INFO, "readFile path={0} found=false time={1}ms",
-                                    new Object[]{request.getPath(), elapsedMs(start)});
-                            responseObserver.onNext(ReadFileResponse.newBuilder().setFound(false).build());
-                            responseObserver.onCompleted();
-                        } else {
-                            io.netty.buffer.ByteBuf byteBuf = result.byteBuf();
-                            int contentLength = byteBuf.readableBytes();
-                            readBytes.addCount(contentLength);
-                            readLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                            LOGGER.log(Level.FINE, "readFile path={0} size={1} time={2}ms",
-                                    new Object[]{request.getPath(), contentLength, elapsedMs(start)});
-                            responseObserver.onNext(ReadFileResponse.newBuilder()
-                                    .setFound(true)
-                                    .setContent(UnsafeByteOperations.unsafeWrap(byteBuf.nioBuffer()))
-                                    .build());
-                            responseObserver.onCompleted();
-                        }
-                    } finally {
-                        // Release pooled ByteBuf if result was backed by one
-                        if (result != null) {
-                            result.release();
-                        }
-                    }
-                });
-    }
-
-    @Override
-    public void writeFileBlock(WriteFileBlockRequest request,
-                               StreamObserver<WriteFileBlockResponse> responseObserver) {
-        runOnLane(writeExecutor, () -> writeFileBlockImpl(request, responseObserver));
-    }
-
-    private void writeFileBlockImpl(WriteFileBlockRequest request,
-                                    StreamObserver<WriteFileBlockResponse> responseObserver) {
+    private void writeFileBlockImpl(long messageId, String path, long blockIndex,
+                                    ByteBuf content, Channel channel) {
         long start = System.nanoTime();
         writeBlockRequests.inc();
-        byte[] content = request.getContent().toByteArray();
-        attachCallback(storage.writeBlock(request.getPath(), request.getBlockIndex(), content), writeExecutor,
-                (v, t) -> {
-                    long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
-                    if (t != null) {
-                        writeBlockErrors.inc();
-                        writeBlockLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.SEVERE, "writeFileBlock failed for path " + request.getPath()
-                                + " block " + request.getBlockIndex(), t);
-                        responseObserver.onError(
-                                Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
-                    } else {
-                        writtenBlockBytes.addCount(content.length);
-                        writeBlockLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.FINE, "writeFileBlock path={0} block={1} size={2} time={3}ms",
-                                new Object[]{request.getPath(), request.getBlockIndex(),
-                                        content.length, elapsedMs(start)});
-                        responseObserver.onNext(WriteFileBlockResponse.newBuilder()
-                                .setWrittenSize(content.length)
-                                .build());
-                        responseObserver.onCompleted();
-                    }
-                });
+        final int len = content.readableBytes();
+        final byte[] bytes = new byte[len];
+        content.getBytes(content.readerIndex(), bytes);
+        attachCallback(storage.writeBlock(path, blockIndex, bytes), writeExecutor, (v, t) -> {
+            try {
+                long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
+                if (t != null) {
+                    writeBlockErrors.inc();
+                    writeBlockLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                    LOGGER.log(Level.SEVERE, "writeFileBlock failed for path " + path
+                            + " block " + blockIndex, t);
+                    sendError(channel, messageId, "writeFileBlock failed: " + t.getMessage());
+                } else {
+                    writtenBlockBytes.addCount(len);
+                    writeBlockLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                    LOGGER.log(Level.FINE, "writeFileBlock path={0} block={1} size={2} time={3}ms",
+                            new Object[]{path, blockIndex, len, elapsedMs(start)});
+                    channel.sendReplyMessage(messageId,
+                            PduCodec.WriteFileBlockResponse.write(messageId, len));
+                }
+            } finally {
+                ReferenceCountUtil.safeRelease(content);
+            }
+        });
     }
 
-    @Override
-    public void readFileRange(ReadFileRangeRequest request,
-                              StreamObserver<ReadFileRangeResponse> responseObserver) {
-        runOnLane(readExecutor, () -> readFileRangeImpl(request, responseObserver));
+    // ----------------------------------------------------------------------
+    // READ_FILE
+    // ----------------------------------------------------------------------
+
+    private void handleReadFile(Pdu pdu, Channel channel) {
+        final long messageId = pdu.messageId;
+        final String path;
+        try {
+            path = PduCodec.ReadFileRequest.readPath(pdu);
+        } catch (RuntimeException parseError) {
+            // Broad catch: PDU parse on malformed / truncated frames.
+            pdu.close();
+            sendError(channel, messageId, "malformed READ_FILE: " + parseError.getMessage());
+            return;
+        }
+        pdu.close();
+
+        try {
+            runOnLane(readExecutor, () -> readFileImpl(messageId, path, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: readExecutor may reject the task during shutdown
+            // or under saturation. Surface as ERROR so the client times out
+            // immediately instead of waiting for the configured timeout.
+            sendError(channel, messageId,
+                    "readFile dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
-    private void readFileRangeImpl(ReadFileRangeRequest request,
-                                   StreamObserver<ReadFileRangeResponse> responseObserver) {
+    private void readFileImpl(long messageId, String path, Channel channel) {
+        long start = System.nanoTime();
+        readRequests.inc();
+        attachCallback(storage.read(path), readExecutor, (result, t) -> {
+            long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
+            try {
+                if (t != null) {
+                    readErrors.inc();
+                    readLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                    LOGGER.log(Level.SEVERE, "readFile failed for path " + path, t);
+                    sendError(channel, messageId, "readFile failed: " + t.getMessage());
+                } else if (result.status() == ReadResult.Status.NOT_FOUND) {
+                    readNotFound.inc();
+                    readLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                    LOGGER.log(Level.INFO, "readFile path={0} found=false time={1}ms",
+                            new Object[]{path, elapsedMs(start)});
+                    channel.sendReplyMessage(messageId, PduCodec.ReadFileResponse.writeNotFound(messageId));
+                } else {
+                    ByteBuf byteBuf = result.byteBuf();
+                    int contentLength = byteBuf.readableBytes();
+                    readBytes.addCount(contentLength);
+                    readLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                    LOGGER.log(Level.FINE, "readFile path={0} size={1} time={2}ms",
+                            new Object[]{path, contentLength, elapsedMs(start)});
+                    // writeFound copies the bytes into a fresh response buffer;
+                    // result.release() below frees the storage-side buffer.
+                    channel.sendReplyMessage(messageId,
+                            PduCodec.ReadFileResponse.writeFound(messageId, byteBuf));
+                }
+            } finally {
+                if (result != null) {
+                    result.release();
+                }
+            }
+        });
+    }
+
+    // ----------------------------------------------------------------------
+    // READ_FILE_RANGE
+    // ----------------------------------------------------------------------
+
+    private void handleReadFileRange(Pdu pdu, Channel channel) {
+        final long messageId = pdu.messageId;
+        final String path;
+        final long offset;
+        final int length;
+        final int blockSize;
+        try {
+            path = PduCodec.ReadFileRangeRequest.readPath(pdu);
+            offset = PduCodec.ReadFileRangeRequest.readOffset(pdu);
+            length = PduCodec.ReadFileRangeRequest.readLength(pdu);
+            blockSize = PduCodec.ReadFileRangeRequest.readBlockSize(pdu);
+        } catch (RuntimeException parseError) {
+            // Broad catch: PDU parse on malformed / truncated frames.
+            pdu.close();
+            sendError(channel, messageId, "malformed READ_FILE_RANGE: " + parseError.getMessage());
+            return;
+        }
+        pdu.close();
+
+        try {
+            runOnLane(readExecutor, () -> readFileRangeImpl(messageId, path, offset, length, blockSize, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: readExecutor may reject the task during shutdown
+            // or under saturation; surface as ERROR so the client fails fast.
+            sendError(channel, messageId,
+                    "readFileRange dispatch failed: " + dispatchError.getMessage());
+        }
+    }
+
+    private void readFileRangeImpl(long messageId, String path, long offset, int length,
+                                   int blockSize, Channel channel) {
         long start = System.nanoTime();
         readRangeRequests.inc();
-        attachCallback(
-                storage.readRange(request.getPath(), request.getOffset(), request.getLength(), request.getBlockSize()),
-                readExecutor,
-                (result, t) -> {
-                    long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
-                    if (t != null) {
-                        readRangeErrors.inc();
-                        readRangeLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.SEVERE, "readFileRange failed for path " + request.getPath(), t);
-                        responseObserver.onError(
-                                Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
-                    } else {
-                        try {
-                            if (result.status() == ReadResult.Status.NOT_FOUND) {
-                                readRangeNotFound.inc();
-                                readRangeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                                responseObserver.onNext(ReadFileRangeResponse.newBuilder().setFound(false).build());
-                                responseObserver.onCompleted();
-                            } else {
-                                io.netty.buffer.ByteBuf byteBuf = result.byteBuf();
-                                int contentLength = byteBuf.readableBytes();
-                                readRangeBytes.addCount(contentLength);
-                                readRangeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                                LOGGER.log(Level.FINE, "readFileRange path={0} offset={1} size={2} time={3}ms",
-                                        new Object[]{request.getPath(), request.getOffset(),
-                                                contentLength, elapsedMs(start)});
-                                responseObserver.onNext(ReadFileRangeResponse.newBuilder()
-                                        .setFound(true)
-                                        .setContent(UnsafeByteOperations.unsafeWrap(byteBuf.nioBuffer()))
-                                        .build());
-                                responseObserver.onCompleted();
-                            }
-                        } finally {
-                            result.release();
-                        }
-                    }
-                });
+        attachCallback(storage.readRange(path, offset, length, blockSize), readExecutor, (result, t) -> {
+            long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
+            if (t != null) {
+                readRangeErrors.inc();
+                readRangeLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                LOGGER.log(Level.SEVERE, "readFileRange failed for path " + path, t);
+                sendError(channel, messageId, "readFileRange failed: " + t.getMessage());
+                return;
+            }
+            try {
+                if (result.status() == ReadResult.Status.NOT_FOUND) {
+                    readRangeNotFound.inc();
+                    readRangeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                    channel.sendReplyMessage(messageId, PduCodec.ReadFileRangeResponse.writeNotFound(messageId));
+                } else {
+                    ByteBuf byteBuf = result.byteBuf();
+                    int contentLength = byteBuf.readableBytes();
+                    readRangeBytes.addCount(contentLength);
+                    readRangeLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                    LOGGER.log(Level.FINE, "readFileRange path={0} offset={1} size={2} time={3}ms",
+                            new Object[]{path, offset, contentLength, elapsedMs(start)});
+                    channel.sendReplyMessage(messageId,
+                            PduCodec.ReadFileRangeResponse.writeFound(messageId, byteBuf));
+                }
+            } finally {
+                result.release();
+            }
+        });
     }
 
-    @Override
-    public void deleteFile(DeleteFileRequest request, StreamObserver<DeleteFileResponse> responseObserver) {
-        runOnLane(writeExecutor, () -> deleteFileImpl(request, responseObserver));
+    // ----------------------------------------------------------------------
+    // DELETE_FILE
+    // ----------------------------------------------------------------------
+
+    private void handleDeleteFile(Pdu pdu, Channel channel) {
+        final long messageId = pdu.messageId;
+        final String path;
+        try {
+            path = PduCodec.DeleteFileRequest.readPath(pdu);
+        } catch (RuntimeException parseError) {
+            // Broad catch: PDU parse on malformed / truncated frames.
+            pdu.close();
+            sendError(channel, messageId, "malformed DELETE_FILE: " + parseError.getMessage());
+            return;
+        }
+        pdu.close();
+
+        try {
+            runOnLane(writeExecutor, () -> deleteFileImpl(messageId, path, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: writeExecutor may reject the task during shutdown.
+            sendError(channel, messageId,
+                    "deleteFile dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
-    private void deleteFileImpl(DeleteFileRequest request, StreamObserver<DeleteFileResponse> responseObserver) {
+    private void deleteFileImpl(long messageId, String path, Channel channel) {
         long start = System.nanoTime();
         deleteRequests.inc();
-        attachCallback(storage.deleteLogical(request.getPath()), writeExecutor,
-                (deleted, t) -> {
-                    long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
-                    if (t != null) {
-                        deleteErrors.inc();
-                        deleteLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.SEVERE, "deleteFile failed for path " + request.getPath(), t);
-                        responseObserver.onError(
-                                Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
-                    } else {
-                        deleteLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.INFO, "deleteFile path={0} deleted={1} time={2}ms",
-                                new Object[]{request.getPath(), deleted, elapsedMs(start)});
-                        responseObserver.onNext(DeleteFileResponse.newBuilder().setDeleted(deleted).build());
-                        responseObserver.onCompleted();
-                    }
-                });
+        attachCallback(storage.deleteLogical(path), writeExecutor, (deleted, t) -> {
+            long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
+            if (t != null) {
+                deleteErrors.inc();
+                deleteLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                LOGGER.log(Level.SEVERE, "deleteFile failed for path " + path, t);
+                sendError(channel, messageId, "deleteFile failed: " + t.getMessage());
+            } else {
+                deleteLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                LOGGER.log(Level.INFO, "deleteFile path={0} deleted={1} time={2}ms",
+                        new Object[]{path, deleted, elapsedMs(start)});
+                channel.sendReplyMessage(messageId,
+                        PduCodec.DeleteFileResponse.write(messageId, Boolean.TRUE.equals(deleted)));
+            }
+        });
     }
 
-    @Override
-    public void deleteFiles(DeleteFilesRequest request, StreamObserver<DeleteFilesResponse> responseObserver) {
-        runOnLane(writeExecutor, () -> deleteFilesImpl(request, responseObserver));
+    // ----------------------------------------------------------------------
+    // DELETE_FILES (batch)
+    // ----------------------------------------------------------------------
+
+    private void handleDeleteFiles(Pdu pdu, Channel channel) {
+        final long messageId = pdu.messageId;
+        final List<String> paths;
+        try {
+            paths = PduCodec.DeleteFilesRequest.readPaths(pdu);
+        } catch (RuntimeException parseError) {
+            // Broad catch: PDU parse on malformed / truncated frames.
+            pdu.close();
+            sendError(channel, messageId, "malformed DELETE_FILES: " + parseError.getMessage());
+            return;
+        }
+        pdu.close();
+
+        try {
+            runOnLane(writeExecutor, () -> deleteFilesImpl(messageId, paths, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: writeExecutor may reject the task during shutdown.
+            sendError(channel, messageId,
+                    "deleteFiles dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
-    private void deleteFilesImpl(DeleteFilesRequest request,
-                                 StreamObserver<DeleteFilesResponse> responseObserver) {
+    private void deleteFilesImpl(long messageId, List<String> paths, Channel channel) {
         long start = System.nanoTime();
         deleteFilesRequests.inc();
-        List<String> paths = request.getPathsList();
         int total = paths.size();
         deleteFilesPathsTotal.addCount(total);
         if (total == 0) {
             deleteFilesLatency.registerSuccessfulEvent(
                     TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start), TimeUnit.MICROSECONDS);
-            responseObserver.onNext(DeleteFilesResponse.newBuilder().build());
-            responseObserver.onCompleted();
+            channel.sendReplyMessage(messageId,
+                    PduCodec.DeleteFilesResponse.write(messageId, java.util.Collections.emptyList()));
             return;
         }
-        DeleteFilesResponse.Builder responseBuilder = DeleteFilesResponse.newBuilder();
-        // Pre-size the outcomes list so the index for each path is fixed at dispatch
-        // time. The completion order of the per-path futures is unpredictable, but
-        // each callback writes back to its own slot via setOutcomes(idx, ...).
-        for (int i = 0; i < total; i++) {
-            responseBuilder.addOutcomes(DeleteFileOutcome.getDefaultInstance());
-        }
+        // Pre-size the outcomes list so each callback writes back to its own slot.
+        // Per-path completion order is unpredictable but each slot is written once.
+        final PduCodec.DeleteFilesResponse.Outcome[] outcomes =
+                new PduCodec.DeleteFilesResponse.Outcome[total];
         AtomicInteger remaining = new AtomicInteger(total);
         AtomicInteger deletedTrue = new AtomicInteger();
         AtomicInteger deletedFalse = new AtomicInteger();
@@ -399,33 +567,30 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
             final int idx = i;
             final String path = paths.get(i);
             attachCallback(storage.deleteLogical(path), writeExecutor, (deleted, t) -> {
-                DeleteFileOutcome.Builder outcome = DeleteFileOutcome.newBuilder().setPath(path);
                 if (t != null) {
                     errors.incrementAndGet();
                     String msg = t.getMessage();
-                    outcome.setError(msg == null ? t.getClass().getSimpleName() : msg);
+                    outcomes[idx] = new PduCodec.DeleteFilesResponse.Outcome(path, false,
+                            msg == null ? t.getClass().getSimpleName() : msg);
+                } else if (Boolean.TRUE.equals(deleted)) {
+                    deletedTrue.incrementAndGet();
+                    outcomes[idx] = new PduCodec.DeleteFilesResponse.Outcome(path, true, "");
                 } else {
-                    if (Boolean.TRUE.equals(deleted)) {
-                        deletedTrue.incrementAndGet();
-                        outcome.setDeleted(true);
-                    } else {
-                        deletedFalse.incrementAndGet();
-                    }
-                }
-                synchronized (responseBuilder) {
-                    responseBuilder.setOutcomes(idx, outcome.build());
+                    deletedFalse.incrementAndGet();
+                    outcomes[idx] = new PduCodec.DeleteFilesResponse.Outcome(path, false, "");
                 }
                 if (remaining.decrementAndGet() == 0) {
-                    finishDeleteFiles(start, total, deletedTrue.get(), deletedFalse.get(),
-                            errors.get(), responseBuilder, responseObserver);
+                    finishDeleteFiles(messageId, start, total,
+                            deletedTrue.get(), deletedFalse.get(), errors.get(),
+                            outcomes, channel);
                 }
             });
         }
     }
 
-    private void finishDeleteFiles(long start, int total, int deletedTrue, int deletedFalse,
-                                   int errors, DeleteFilesResponse.Builder responseBuilder,
-                                   StreamObserver<DeleteFilesResponse> responseObserver) {
+    private void finishDeleteFiles(long messageId, long start, int total,
+                                   int deletedTrue, int deletedFalse, int errors,
+                                   PduCodec.DeleteFilesResponse.Outcome[] outcomes, Channel channel) {
         long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
         long elapsedMs = elapsedMs(start);
         deleteFilesPathsDeleted.addCount(deletedTrue);
@@ -438,86 +603,112 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
         LOGGER.log(Level.INFO,
                 "deleteFiles count={0} deletedTrue={1} deletedFalse={2} errors={3} time={4}ms",
                 new Object[]{total, deletedTrue, deletedFalse, errors, elapsedMs});
-        DeleteFilesResponse response;
-        synchronized (responseBuilder) {
-            response = responseBuilder.build();
+        List<PduCodec.DeleteFilesResponse.Outcome> list = new ArrayList<>(total);
+        for (int i = 0; i < total; i++) {
+            list.add(outcomes[i]);
         }
-        responseObserver.onNext(response);
-        responseObserver.onCompleted();
+        channel.sendReplyMessage(messageId,
+                PduCodec.DeleteFilesResponse.write(messageId, list));
     }
 
-    @Override
-    public void listFiles(ListFilesRequest request, StreamObserver<ListFilesEntry> responseObserver) {
-        runOnLane(readExecutor, () -> listFilesImpl(request, responseObserver));
+    // ----------------------------------------------------------------------
+    // LIST_FILES
+    // ----------------------------------------------------------------------
+
+    private void handleListFiles(Pdu pdu, Channel channel) {
+        final long messageId = pdu.messageId;
+        final String prefix;
+        try {
+            prefix = PduCodec.ListFilesRequest.readPrefix(pdu);
+        } catch (RuntimeException parseError) {
+            // Broad catch: PDU parse on malformed / truncated frames.
+            pdu.close();
+            sendError(channel, messageId, "malformed LIST_FILES: " + parseError.getMessage());
+            return;
+        }
+        pdu.close();
+
+        try {
+            runOnLane(readExecutor, () -> listFilesImpl(messageId, prefix, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: readExecutor may reject the task during shutdown.
+            sendError(channel, messageId,
+                    "listFiles dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
-    private void listFilesImpl(ListFilesRequest request, StreamObserver<ListFilesEntry> responseObserver) {
+    private void listFilesImpl(long messageId, String prefix, Channel channel) {
         long start = System.nanoTime();
         listRequests.inc();
-        attachCallback(storage.listLogical(request.getPrefix()), readExecutor,
-                (paths, t) -> {
-                    long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
-                    if (t != null) {
-                        listErrors.inc();
-                        listLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.SEVERE, "listFiles failed for prefix " + request.getPrefix(), t);
-                        responseObserver.onError(
-                                Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
-                    } else {
-                        try {
-                            for (String path : paths) {
-                                responseObserver.onNext(ListFilesEntry.newBuilder().setPath(path).build());
-                            }
-                            listLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                            LOGGER.log(Level.INFO, "listFiles prefix={0} count={1} time={2}ms",
-                                    new Object[]{request.getPrefix(), paths.size(), elapsedMs(start)});
-                            responseObserver.onCompleted();
-                        } catch (Exception streamError) {
-                            listErrors.inc();
-                            listLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                            LOGGER.log(Level.WARNING, "listFiles streaming failed for prefix " + request.getPrefix()
-                                    + " after " + elapsedMs(start) + "ms (sent " + paths.size() + " entries)", streamError);
-                            try {
-                                responseObserver.onError(
-                                        Status.INTERNAL.withDescription(streamError.getMessage()).withCause(streamError)
-                                                .asRuntimeException());
-                            } catch (Exception ignored) {
-                                // stream may already be closed; nothing more we can do
-                            }
-                        }
-                    }
-                });
+        attachCallback(storage.listLogical(prefix), readExecutor, (paths, t) -> {
+            long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
+            if (t != null) {
+                listErrors.inc();
+                listLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                LOGGER.log(Level.SEVERE, "listFiles failed for prefix " + prefix, t);
+                sendError(channel, messageId, "listFiles failed: " + t.getMessage());
+            } else {
+                listLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                LOGGER.log(Level.INFO, "listFiles prefix={0} count={1} time={2}ms",
+                        new Object[]{prefix, paths.size(), elapsedMs(start)});
+                channel.sendReplyMessage(messageId,
+                        PduCodec.ListFilesResponse.write(messageId, paths));
+            }
+        });
     }
 
-    @Override
-    public void deleteByPrefix(DeleteByPrefixRequest request,
-                               StreamObserver<DeleteByPrefixResponse> responseObserver) {
-        runOnLane(writeExecutor, () -> deleteByPrefixImpl(request, responseObserver));
+    // ----------------------------------------------------------------------
+    // DELETE_BY_PREFIX
+    // ----------------------------------------------------------------------
+
+    private void handleDeleteByPrefix(Pdu pdu, Channel channel) {
+        final long messageId = pdu.messageId;
+        final String prefix;
+        try {
+            prefix = PduCodec.DeleteByPrefixRequest.readPrefix(pdu);
+        } catch (RuntimeException parseError) {
+            // Broad catch: PDU parse on malformed / truncated frames.
+            pdu.close();
+            sendError(channel, messageId, "malformed DELETE_BY_PREFIX: " + parseError.getMessage());
+            return;
+        }
+        pdu.close();
+
+        try {
+            runOnLane(writeExecutor, () -> deleteByPrefixImpl(messageId, prefix, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: writeExecutor may reject the task during shutdown.
+            sendError(channel, messageId,
+                    "deleteByPrefix dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
-    private void deleteByPrefixImpl(DeleteByPrefixRequest request,
-                                    StreamObserver<DeleteByPrefixResponse> responseObserver) {
+    private void deleteByPrefixImpl(long messageId, String prefix, Channel channel) {
         long start = System.nanoTime();
         deleteByPrefixRequests.inc();
-        attachCallback(storage.deleteByPrefix(request.getPrefix()), writeExecutor,
-                (count, t) -> {
-                    long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
-                    if (t != null) {
-                        deleteByPrefixErrors.inc();
-                        deleteByPrefixLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.SEVERE, "deleteByPrefix failed for prefix " + request.getPrefix(), t);
-                        responseObserver.onError(
-                                Status.INTERNAL.withDescription(t.getMessage()).asRuntimeException());
-                    } else {
-                        deleteByPrefixLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
-                        LOGGER.log(Level.INFO, "deleteByPrefix prefix={0} deletedCount={1} time={2}ms",
-                                new Object[]{request.getPrefix(), count, elapsedMs(start)});
-                        responseObserver.onNext(DeleteByPrefixResponse.newBuilder()
-                                .setDeletedCount(count)
-                                .build());
-                        responseObserver.onCompleted();
-                    }
-                });
+        attachCallback(storage.deleteByPrefix(prefix), writeExecutor, (count, t) -> {
+            long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - start);
+            if (t != null) {
+                deleteByPrefixErrors.inc();
+                deleteByPrefixLatency.registerFailedEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                LOGGER.log(Level.SEVERE, "deleteByPrefix failed for prefix " + prefix, t);
+                sendError(channel, messageId, "deleteByPrefix failed: " + t.getMessage());
+            } else {
+                deleteByPrefixLatency.registerSuccessfulEvent(elapsedMicros, TimeUnit.MICROSECONDS);
+                LOGGER.log(Level.INFO, "deleteByPrefix prefix={0} deletedCount={1} time={2}ms",
+                        new Object[]{prefix, count, elapsedMs(start)});
+                channel.sendReplyMessage(messageId,
+                        PduCodec.DeleteByPrefixResponse.write(messageId, count));
+            }
+        });
+    }
+
+    // ----------------------------------------------------------------------
+    // Helpers
+    // ----------------------------------------------------------------------
+
+    private static void sendError(Channel channel, long messageId, String message) {
+        channel.sendReplyMessage(messageId, PduCodec.ErrorResponse.write(messageId, message));
     }
 
     private static long elapsedMs(long startNanos) {
@@ -525,9 +716,8 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
     }
 
     /**
-     * Executes {@code task} on the given lane executor, or inline if the executor is
-     * {@code null} (legacy single-lane mode). Lane executors hop handler work off the
-     * Netty worker thread so checkpoint and search paths cannot block each other.
+     * Executes {@code task} on the given lane executor, or inline if the
+     * executor is {@code null} (legacy single-lane mode).
      */
     private static void runOnLane(Executor lane, Runnable task) {
         if (lane != null) {
@@ -538,9 +728,9 @@ public class RemoteFileServiceImpl extends RemoteFileServiceGrpc.RemoteFileServi
     }
 
     /**
-     * Attaches {@code callback} to {@code future} using {@code executor} when non-null
-     * ({@code whenCompleteAsync}), otherwise falls back to {@code whenComplete}. Keeps
-     * the existing legacy path byte-for-byte when lanes are disabled.
+     * Attaches {@code callback} to {@code future} using {@code executor} when
+     * non-null ({@code whenCompleteAsync}), otherwise falls back to
+     * {@code whenComplete}.
      */
     private static <T> void attachCallback(CompletableFuture<T> future,
                                            Executor executor,

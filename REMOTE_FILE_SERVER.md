@@ -57,37 +57,54 @@ New module containing everything needed to run and use the remote file service:
 
 | Class | Description |
 |-------|-------------|
-| `RemoteFileServer` | Standalone gRPC server. Stores files in a local directory. Configurable bind host and port. |
-| `RemoteFileServiceImpl` | gRPC service implementation backed by local filesystem. Writes are atomic (temp file + rename). |
-| `RemoteFileServiceClient` | Client that manages one `ManagedChannel` per server and routes requests via `ConsistentHashRouter`. `listFiles` and `deleteByPrefix` fan out to all servers. |
+| `RemoteFileServer` | Standalone Netty server (issue #425). Stores files in a local directory or S3. Configurable bind host and port. Hosts both data-plane and admin RPCs on the same socket. |
+| `RemoteFileServiceImpl` | Stateless dispatcher: turns inbound file-server PDUs into `ObjectStorage` calls. Writes are atomic (temp file + rename). |
+| `RemoteFileServerSideConnection` | Per-connection `ChannelEventListener`. Tracks OIDC SASL auth state and routes inbound PDUs to the data dispatcher or the admin dispatcher. |
+| `RemoteFileServiceClient` | Client that manages one read-plane and one write-plane Netty `Channel` per file server (issue #100), routes requests via `ConsistentHashRouter`, and performs an OIDC OAUTHBEARER SASL handshake on every freshly-opened channel when an OIDC token supplier is configured. `listFiles` and `deleteByPrefix` fan out to all servers. |
 | `ConsistentHashRouter` | Murmur3-based consistent hash ring with 150 virtual nodes per server for balanced distribution. |
 | `RemoteFileDataStorageManager` | `DataStorageManager` implementation. Delegates page I/O to `RemoteFileServiceClient`; delegates all metadata I/O to an internal `FileDataStorageManager`. |
 
-**Dependency:** Java 11, gRPC 1.68.2, protobuf 3.25.5.
+**Dependency:** Java 11, `herddb-net` (length-prefixed Netty wire framework), `herddb-utils` (PDU codec). No gRPC, no protobuf.
 
 ---
 
-## gRPC API
+## Wire protocol
 
-Defined in `src/main/proto/remote_file_service.proto`:
+Built on top of the same length-prefixed Netty framing that `herddb-net` uses
+for HerdDB core client/server communication (issue #425). Every PDU carries
+a 1-byte version, a 1-byte flags field (`FLAGS_ISREQUEST`/`FLAGS_ISRESPONSE`),
+a 1-byte type, and an 8-byte messageId for request/response correlation.
+File-server PDU types live in the **`50..69`** range so the service the
+client is talking to is identifiable from a single type-byte read on the
+wire (HerdDB core types occupy `0..25` and `100..104`).
 
-```protobuf
-service RemoteFileService {
-    rpc WriteFile        (WriteFileRequest)        returns (WriteFileResponse);
-    rpc ReadFile         (ReadFileRequest)         returns (ReadFileResponse);
-    rpc DeleteFile       (DeleteFileRequest)       returns (DeleteFileResponse);
-    rpc ListFiles        (ListFilesRequest)        returns (ListFilesResponse);
-    rpc DeleteByPrefix   (DeleteByPrefixRequest)   returns (DeleteByPrefixResponse);
-}
-```
+| Type | RPC | Notes |
+|------|-----|-------|
+| `50` | `TYPE_FS_WRITE_FILE` | request: `path`, `content`. Response: `writtenSize`. |
+| `51` | `TYPE_FS_WRITE_FILE_BLOCK` | request: `path`, `blockIndex`, `content`. Response: `writtenSize`. |
+| `52` | `TYPE_FS_READ_FILE` | request: `path`. Response: `found`, `content`. |
+| `53` | `TYPE_FS_READ_FILE_RANGE` | request: `path`, `offset`, `length`, `blockSize`. Response: `found`, `content`. |
+| `54` | `TYPE_FS_DELETE_FILE` | request: `path`. Response: `deleted`. |
+| `55` | `TYPE_FS_DELETE_FILES` | request: `paths[]`. Response: per-path `outcomes[]` (issue #398). |
+| `56` | `TYPE_FS_LIST_FILES` | request: `prefix`. Response: `paths[]` (single PDU; client dedupes when fanning out). |
+| `57` | `TYPE_FS_DELETE_BY_PREFIX` | request: `prefix`. Response: `deletedCount`. |
+| `60` | `TYPE_FS_GET_SERVER_INFO` | admin: returns identity + JVM + cache stats (issue #336). |
+| `61` | `TYPE_FS_RESIZE_DISK_CACHE` | admin: resize disk-cache LRU at runtime (issue #336). |
 
-| RPC | Request fields | Response fields | Notes |
-|-----|---------------|-----------------|-------|
-| `WriteFile` | `path`, `content` | `ok` | Atomic write via tmp+rename |
-| `ReadFile` | `path` | `content`, `found` | Returns `found=false` if missing |
-| `DeleteFile` | `path` | `deleted` | Returns `false` if file did not exist |
-| `ListFiles` | `prefix` | `paths[]` | Returns all files whose relative path starts with `prefix` |
-| `DeleteByPrefix` | `prefix` | `deleted_count` | Bulk-delete all files matching the prefix |
+The codec lives next to the core PDUs in
+`herddb-utils/src/main/java/herddb/proto/PduCodec.java`, so the file
+server and HerdDB core share the same framing, message-correlation, and
+SASL plumbing. A follow-up issue (#426) will extend `ReadFile` /
+`ReadFileRange` to use `DefaultFileRegion` for zero-copy disk reads on
+the local-storage backend.
+
+## Authentication
+
+OIDC OAUTHBEARER, mediated by SASL on the new wire protocol:
+
+- Client side: `RemoteFileServiceClient` receives a `Supplier<String>` returning a JWT bearer token. On every freshly-opened `Channel` the client performs a one-round `OAuthBearerSaslClient` handshake (`TYPE_SASL_TOKEN_MESSAGE_REQUEST` / `TYPE_SASL_TOKEN_SERVER_RESPONSE`).
+- Server side: `RemoteFileServerSideConnection` instantiates `OAuthBearerSaslServer` with a callback handler that delegates to `OidcTokenValidator`. Until the handshake completes, only SASL PDUs are accepted; data-plane PDUs are rejected with `TYPE_ERROR`.
+- Local-VM channel and OIDC-disabled mode bypass the handshake entirely.
 
 ---
 
@@ -239,5 +256,5 @@ mvn test
 - **No replication.** Each remote server stores a distinct subset of pages. If a server is lost, the pages on that server are lost. Add replication at the infrastructure level (DRBD, replicated block devices, etc.) if durability is required.
 - **No server-side resharding.** Changing the `remote.file.servers` list requires a manual data migration because the consistent hash ring changes.
 - **Metadata is local.** The node running HerdDB must have a durable local disk for metadata. Page data can be recovered from the remote servers, but the metadata (active page sets, schemas, transaction records) cannot.
-- **No TLS.** The gRPC channels are plain-text (`usePlaintext()`). For production use, configure TLS at the network layer or extend the client/server with gRPC TLS support.
-- **Single-threaded per-path writes.** No write batching or pipelining; each `writePage` call is a synchronous gRPC unary call.
+- **No TLS.** The Netty channels are plain-text. The underlying `herddb-net` framework supports `SslContext` / `SslHandler`; wiring TLS into `RemoteFileServer` is a follow-up.
+- **Single-threaded per-path writes.** No write batching or pipelining; each `writePage` call is a synchronous Netty unary call.

@@ -21,7 +21,8 @@
 package herddb.remote;
 
 import static org.junit.Assert.assertEquals;
-import io.grpc.netty.shaded.io.netty.channel.nio.NioEventLoopGroup;
+import herddb.network.netty.NettyChannelAcceptor;
+import io.netty.channel.MultithreadEventLoopGroup;
 import io.netty.util.internal.PlatformDependent;
 import java.lang.reflect.Field;
 import java.util.Properties;
@@ -35,6 +36,12 @@ import org.junit.rules.TemporaryFolder;
  * Verifies that the auto-sized block-cache budget is derived from Netty's
  * direct-memory ceiling and that the Netty worker / metadata executor pool
  * sizes can be configured independently of {@code ioThreads}.
+ *
+ * <p>Issue #425 moved the Netty worker group from being a server-owned
+ * field to living inside {@link NettyChannelAcceptor#workerGroup}. The
+ * test reaches into the acceptor reflectively because the acceptor does
+ * not expose a public worker-group accessor, and the file-server's CONFIG
+ * keys are the source of truth for the pool sizes.
  */
 public class RemoteFileServerThreadPoolConfigTest {
 
@@ -78,7 +85,7 @@ public class RemoteFileServerThreadPoolConfigTest {
                 folder.newFolder("data").toPath(), 7, props);
         server.start();
 
-        NioEventLoopGroup workerGroup = readField(server, "workerGroup", NioEventLoopGroup.class);
+        MultithreadEventLoopGroup workerGroup = readWorkerGroup(server);
         ThreadPoolExecutor metadataExecutor =
                 readField(server, "metadataExecutor", ThreadPoolExecutor.class);
 
@@ -94,7 +101,7 @@ public class RemoteFileServerThreadPoolConfigTest {
                 folder.newFolder("data").toPath(), 5, new Properties());
         server.start();
 
-        NioEventLoopGroup workerGroup = readField(server, "workerGroup", NioEventLoopGroup.class);
+        MultithreadEventLoopGroup workerGroup = readWorkerGroup(server);
         ThreadPoolExecutor metadataExecutor =
                 readField(server, "metadataExecutor", ThreadPoolExecutor.class);
 
@@ -102,6 +109,13 @@ public class RemoteFileServerThreadPoolConfigTest {
                 5, workerGroup.executorCount());
         assertEquals("metadataExecutor should default to ioThreads",
                 5, metadataExecutor.getCorePoolSize());
+    }
+
+    private static MultithreadEventLoopGroup readWorkerGroup(RemoteFileServer s) throws Exception {
+        NettyChannelAcceptor acceptor = readField(s, "acceptor", NettyChannelAcceptor.class);
+        Field f = NettyChannelAcceptor.class.getDeclaredField("workerGroup");
+        f.setAccessible(true);
+        return (MultithreadEventLoopGroup) f.get(acceptor);
     }
 
     private static <T> T readField(Object target, String name, Class<T> type) throws Exception {
