@@ -21,7 +21,6 @@
 package herddb.core;
 
 import static herddb.sql.JSQLParserPlanner.delimit;
-import static java.util.concurrent.TimeUnit.SECONDS;
 import herddb.codec.RecordSerializer;
 import herddb.core.PageSet.DataPageMetaData;
 import herddb.core.stats.TableManagerStats;
@@ -243,6 +242,39 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
      * Allow checkpoint
      */
     private final StampedLock checkpointLock = new StampedLock();
+
+    /**
+     * Count of {@link #onTransactionCommit} (and {@link #writeFromDump}) apply
+     * operations currently in progress. Phase C drains this counter to zero
+     * before proceeding, ensuring no concurrent apply is touching {@code newPages},
+     * {@code pageSet}, or {@code keyToPage} when Phase C takes its snapshot.
+     * See issue #431.
+     */
+    private final AtomicInteger activeCommitApplies = new AtomicInteger(0);
+
+    /**
+     * Set to {@code true} by Phase C before draining {@link #activeCommitApplies}.
+     * {@link #onTransactionCommit} and {@link #writeFromDump} spin on this flag when
+     * attempting to enter an apply slot; they back off immediately if they observe it
+     * as {@code true}, without ever touching page structures. This avoids the
+     * StampedLock writer-priority starvation described in issue #431: the
+     * {@code onTransactionCommit} threads spin only while Phase C is actually active
+     * (a window bounded by Phase C's write-lock hold, typically &lt; 50 ms), rather
+     * than for the full {@link #CHECKPOINT_LOCK_READ_TIMEOUT} (300 s default).
+     */
+    private volatile boolean checkpointPhaseCGate = false;
+
+    /**
+     * Test-only hook fired inside Phase C of
+     * {@link #doCheckpoint(double, double, long, long, long, boolean)} after
+     * {@link #checkpointPhaseCGate} has been set to {@code true} and
+     * {@link #activeCommitApplies} has been drained to zero, but <em>before</em>
+     * {@link #checkpointLock} write lock is acquired. Used by issue #431
+     * regression tests to deterministically hold the gate open while verifying
+     * that concurrent {@link #onTransactionCommit} calls are gated (not timed out)
+     * and complete promptly once the gate reopens. {@code null} in production.
+     */
+    private volatile Runnable duringPhaseCGateAction;
 
     /**
      * LSN of the last log entry whose apply to this table's pages has fully completed.
@@ -1164,7 +1196,19 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 return new long[]{0, 0};
             }
             snapshot = new ArrayList<>(newPages.values());
-            createNewPage(nextPageId++);
+            /*
+             * Issue #431: nextPageLock guards nextPageId against concurrent
+             * allocateLivePage calls from onTransactionCommit applies (which no longer
+             * hold checkpointLock after the issue-431 fix). Without nextPageLock here,
+             * an onTransactionCommit thread could race on the plain-long nextPageId field
+             * while allocateLivePage also increments it under nextPageLock.
+             */
+            nextPageLock.lock();
+            try {
+                createNewPage(nextPageId++);
+            } finally {
+                nextPageLock.unlock();
+            }
         } finally {
             checkpointLock.asWriteLock().unlock();
         }
@@ -2291,14 +2335,32 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
         }
 
-        boolean lockAcquired;
-        try {
-            lockAcquired = checkpointLock.asReadLock().tryLock(CHECKPOINT_LOCK_READ_TIMEOUT, SECONDS);
-        } catch (InterruptedException err) {
-            throw new DataStorageManagerException("interrupted while acquiring checkpoint lock during a commit", err);
-        }
-        if (!lockAcquired) {
-            throw new DataStorageManagerException("timed out while acquiring checkpoint lock during a commit");
+        /*
+         * Issue #431: use the commit-apply-slot mechanism instead of
+         * checkpointLock.asReadLock().tryLock().  The old approach let Phase C's
+         * write-lock request (which uses StampedLock writer-priority) block ALL new
+         * read-lock attempts from onTransactionCommit for up to CHECKPOINT_LOCK_READ_TIMEOUT
+         * (300 s), even though Phase C only holds the write lock for a few milliseconds.
+         *
+         * The new mechanism:
+         *  - acquireCommitApplySlot() spins on checkpointPhaseCGate (volatile boolean).
+         *    It blocks only while Phase C is actually active, not while Phase C is merely
+         *    queued as a writer. Phase C clears checkpointPhaseCGate as soon as it releases
+         *    its write lock, so the spin window is bounded by Phase C's write-lock hold
+         *    time (typically < 50 ms).
+         *  - activeCommitApplies (AtomicInteger) is decremented in the finally block.
+         *    Phase C drains this counter to zero before acquiring its write lock, ensuring
+         *    it sees a quiescent view of newPages, pageSet, and keyToPage.
+         *
+         * LSN ordering: lastAppliedSequenceNumber.updateAndGet() still happens before
+         * activeCommitApplies.decrementAndGet() (program order). The drain loop in Phase C
+         * observes activeCommitApplies == 0 via a volatile read, which is sequenced after
+         * the decrement (JMM happens-before). Phase C therefore sees every LSN update that
+         * was published before the corresponding decrement.  See issue #157.
+         */
+        if (!acquireCommitApplySlot()) {
+            throw new DataStorageManagerException(
+                    "timed out waiting for checkpoint Phase C gate during a commit");
         }
         try {
             Map<Bytes, Record> changedRecords = transaction.changedRecords.get(table.name);
@@ -2345,19 +2407,17 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
             /*
              * Publish the commit's LSN as "last fully applied" BEFORE releasing the
-             * checkpoint read lock. Phase C acquires the write lock only after all
-             * readers have released; at that point every apply whose LSN is below
-             * this value has its change in memory and will be flushed. Applies still
-             * waiting for the read lock have NOT bumped this counter yet, so their
-             * LSNs stay above the Phase-C snapshot and get replayed from the WAL on
-             * restart. See issue #157.
+             * apply slot. Phase C drains activeCommitApplies to zero; the JMM
+             * happens-before chain (program order within this thread + volatile read of
+             * activeCommitApplies by the drain loop) guarantees Phase C sees this update.
+             * See issue #157 and the acquireCommitApplySlot Javadoc.
              */
             LogSequenceNumber commitLsn = transaction.lastSequenceNumber;
             if (commitLsn != null) {
                 lastAppliedSequenceNumber.updateAndGet(cur -> commitLsn.after(cur) ? commitLsn : cur);
             }
         } finally {
-            checkpointLock.asReadLock().unlock();
+            activeCommitApplies.decrementAndGet();
         }
         transaction.releaseLocksOnTable(table.name, locksManager);
         if (forceFlushTableData) {
@@ -2939,15 +2999,67 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         dataStorageManager.fullTableScan(tableSpaceUUID, table.uuid, sequenceNumber, receiver);
     }
 
+    /**
+     * Acquire a "commit apply slot", gating {@link #onTransactionCommit} and
+     * {@link #writeFromDump} so they never touch page structures while Phase C's
+     * gate ({@link #checkpointPhaseCGate}) is active.
+     *
+     * <p>Callers that successfully return {@code true} <strong>must</strong>
+     * call {@code activeCommitApplies.decrementAndGet()} in a {@code finally}
+     * block. Callers that get {@code false} must NOT touch any page structure
+     * and must propagate a timeout error. See issue #431.</p>
+     *
+     * <p>Algorithm: spin while the gate is set; increment {@link
+     * #activeCommitApplies}; re-check the gate. If the gate was set between
+     * the spin check and the increment, back off (decrement) and retry, to
+     * prevent a slot from leaking into a Phase C drain window.</p>
+     *
+     * @return {@code true} if the slot was acquired (apply slot counter
+     *         incremented); {@code false} on timeout
+     * @throws DataStorageManagerException if the thread was interrupted
+     */
+    private boolean acquireCommitApplySlot() throws DataStorageManagerException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(CHECKPOINT_LOCK_READ_TIMEOUT);
+        for (;;) {
+            while (checkpointPhaseCGate) {
+                if (Thread.currentThread().isInterrupted()) {
+                    Thread.currentThread().interrupt();
+                    throw new DataStorageManagerException(
+                            "interrupted while waiting for checkpoint Phase C gate during commit");
+                }
+                if (System.nanoTime() >= deadline) {
+                    return false;
+                }
+                Thread.onSpinWait();
+            }
+            // Increment before re-checking; if Phase C activated between the spin
+            // check and here, we catch it in the second check and back off.
+            activeCommitApplies.incrementAndGet();
+            if (!checkpointPhaseCGate) {
+                return true; // slot secured
+            }
+            // Race: Phase C opened the gate after we checked but before we incremented.
+            // Back off without touching any page structure.
+            activeCommitApplies.decrementAndGet();
+            if (System.nanoTime() >= deadline) {
+                return false;
+            }
+            Thread.onSpinWait();
+        }
+    }
+
     public void writeFromDump(List<Record> record) throws DataStorageManagerException {
         LOGGER.log(Level.INFO, "{0} received {1} records", new Object[]{table.name, record.size()});
-        checkpointLock.asReadLock().lock();
+        if (!acquireCommitApplySlot()) {
+            throw new DataStorageManagerException(
+                    "timed out waiting for checkpoint Phase C gate during writeFromDump");
+        }
         try {
             for (Record r : record) {
                 applyInsert(r.key, r.value, false);
             }
         } finally {
-            checkpointLock.asReadLock().unlock();
+            activeCommitApplies.decrementAndGet();
         }
     }
 
@@ -3762,10 +3874,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
             /*
              * Use an unmodifiable live view over pageSet.activePages — no defensive
-             * copy. Safe here because Phase A holds the checkpoint write lock, so no
-             * concurrent modifications can reach PageSet while we iterate. This
-             * removes one of the two O(#pages) HashMap snapshots per checkpoint
-             * (issue #69).
+             * copy. After issue #431, onTransactionCommit no longer holds
+             * checkpointLock.asReadLock(), so it may call pageSet.setPageDirty()
+             * and pageSet.pageCreated() concurrently with this iteration.
+             * Both operations are safe: pageSet.activePages is a ConcurrentHashMap
+             * (weakly-consistent iteration; concurrent inserts may or may not be
+             * visible — missing a freshly added page here is harmless, it goes into
+             * newPages and is flushed later), and dirt is a LongAdder (concurrent
+             * increments are atomic). Phase A's write lock still excludes the
+             * non-transactional executeStatementAsync apply() path. Removes one of
+             * the two O(#pages) HashMap snapshots per checkpoint (issue #69).
              */
             final Map<Long, DataPageMetaData> activePages = pageSet.getActivePagesView();
 
@@ -3801,16 +3919,44 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
             pageAnalysis = System.currentTimeMillis();
 
-            /* New page for compaction building — must allocate under write lock */
-            buildingPage = createMutablePage(nextPageId++, 0, 0);
+            /*
+             * New page for compaction building.
+             *
+             * Issue #431: nextPageId is a plain long guarded by TWO separate mechanisms:
+             *   (a) checkpointLock.writeLock() — prevents concurrent executeStatementAsync
+             *       readers (which call allocateLivePage -> nextPageId++ under nextPageLock).
+             *   (b) nextPageLock — prevents concurrent allocateLivePage calls from Phase B
+             *       (cleanAndCompactPages) and, after the issue-431 fix, from concurrent
+             *       onTransactionCommit applies (which no longer hold checkpointLock).
+             * Phase A's checkpointLock.writeLock() still blocks executeStatementAsync, but
+             * onTransactionCommit now bypasses checkpointLock entirely, so it can call
+             * allocateLivePage while Phase A holds the write lock.  Holding nextPageLock here
+             * closes that window: allocateLivePage waits for nextPageLock and then sees the
+             * updated currentDirtyRecordsPage, taking the already-rotated-page branch.
+             */
+            nextPageLock.lock();
+            try {
+                buildingPage = createMutablePage(nextPageId++, 0, 0);
+            } finally {
+                nextPageLock.unlock();
+            }
 
             /*
              * Freeze the current set of mutable new pages (they will be flushed in Phase B).
              * Then rotate currentDirtyRecordsPage to a fresh page so DML writes that arrive
              * during Phase B go to the new page and do not interfere with the frozen ones.
+             *
+             * nextPageLock guards the nextPageId++ / createNewPage pair for the same reason
+             * as the buildingPage allocation above: concurrent onTransactionCommit applies
+             * (after the issue-431 fix) may call allocateLivePage at any time.
              */
             frozenNewPages = new ArrayList<>(newPages.values());
-            createNewPage(nextPageId++);
+            nextPageLock.lock();
+            try {
+                createNewPage(nextPageId++);
+            } finally {
+                nextPageLock.unlock();
+            }
 
         } finally {
             checkpointLock.asWriteLock().unlock();
@@ -3991,183 +4137,263 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
 
         /* ================================================================== */
-        /* === PHASE C: Brief write lock — snapshot finalize state         === */
-        /* === then RELEASE the lock and persist (BLink + tableStatus)     === */
+        /* === PHASE C: Gate + brief write lock — snapshot finalize state  === */
+        /* === then RELEASE gate+lock and persist (BLink + tableStatus)    === */
         /* === outside the lock so DML / commits proceed concurrently      === */
-        /* === with the slow remote I/O. See issue #403.                   === */
+        /* === with the slow remote I/O. See issue #403, #431.             === */
         /* ================================================================== */
 
-        boolean lockAcquiredC;
+        /*
+         * Issue #431: Two-step quiesce for Phase C.
+         *
+         * Step 1 — Close the commit-apply gate so that new onTransactionCommit /
+         * writeFromDump applies stop entering.  acquireCommitApplySlot() checks this
+         * flag and spins only while checkpointPhaseCGate is true, so callers never
+         * block for longer than Phase C's entire write-lock window (typically < 50 ms).
+         * This replaces the StampedLock writer-priority stall that previously blocked
+         * all new readers the moment Phase C queued its write-lock request.
+         */
+        checkpointPhaseCGate = true;
+        // gateCleared tracks whether the inner write-lock finally already cleared
+        // checkpointPhaseCGate.  If an exception escapes before that finally runs
+        // (e.g. drain timeout, interrupted drain, hook failure), the outer finally
+        // below must clear the gate so onTransactionCommit threads do not spin forever.
+        boolean[] gateCleared = {false};
         try {
-            lockAcquiredC = checkpointLock.asWriteLock().tryLock(CHECKPOINT_LOCK_WRITE_TIMEOUT, TimeUnit.SECONDS);
-        } catch (InterruptedException err) {
-            throw new DataStorageManagerException("interrupted while waiting for checkpoint lock (Phase C)", err);
-        }
-        if (!lockAcquiredC) {
-            throw new DataStorageManagerException("timed out while waiting for checkpoint lock (Phase C), write lock " + checkpointLock.writeLock());
-        }
-
-        // State that flows from "under-lock snapshot" into "after-lock persistence".
-        final LogSequenceNumber postFlushSequenceNumber;
-        final TableStatus tableStatus;
-        final KeyToPageCheckpointSnapshot pkIndexSnapshot;
-        final long keyToPageStart;
-
-        try {
-
-            /* *** Remaining spare data handling *** */
 
             /*
-             * Flush remaining compaction output (buildingPage). This is done under write lock because
-             * flushMutablePage uses pageSet which must not be modified concurrently with checkpointDone below.
-             */
-            if (!buildingPage.isEmpty()) {
-                flushMutablePage(buildingPage, keepFlushedPageInMemory);
-            } else {
-                /* Remove unused empty building page from memory */
-                pages.remove(buildingPage.pageId);
-            }
-
-            /*
-             * Flush any residual newPages. drainPendingNewPages() just before Phase C already
-             * flushed the bulk of what accumulated during Phase B + indexManager.checkpoint.
-             * What remains here is the small tail: the fresh current page created by the last
-             * drain, plus any pages concurrent DML allocated between unlock-of-drain and
-             * acquire-of-Phase-C-write-lock (typically one partially-filled page).
+             * Step 2 — Drain in-flight commit applies.  Any onTransactionCommit call
+             * that passed the gate check before we set checkpointPhaseCGate has already
+             * incremented activeCommitApplies; we must wait for those to finish so that
+             * their page mutations (applyInsert/Update/Delete) and lastAppliedSequenceNumber
+             * updates are fully visible before Phase C reads them.
              *
-             * We still MUST run this pass: keyToPage.prepareCheckpoint() below requires newPages
-             * empty, else it records mappings to pages missing from activePages and storage,
-             * and recovery fails with "no record in memory for K" (issue #46).
-             *
-             * Phase C holds checkpointLock.asWriteLock(), so no concurrent DML can reach
-             * applyInsert/applyUpdate/applyDelete while we flush these pages. After the flush,
-             * newPages is empty and the block at the end of Phase C allocates a fresh live page
-             * via allocateLivePage.
+             * JMM correctness: the spin loop reads activeCommitApplies via a volatile
+             * read (AtomicInteger.get()), which is sequenced after every in-flight
+             * thread's activeCommitApplies.decrementAndGet() (volatile write).  Each
+             * such decrement is sequenced after the thread's lastAppliedSequenceNumber
+             * update (program order).  Therefore, when the loop exits with count == 0,
+             * Phase C is guaranteed to observe all LSN updates and all page mutations
+             * that preceded the corresponding decrements.  See issue #157.
              */
-            if (!newPages.isEmpty()) {
-                final List<DataPage> remainingNewPages = new ArrayList<>(newPages.values());
-                for (DataPage dataPage : remainingNewPages) {
-                    /* flushNewPageForCheckpoint publishes the page to pageSet.activePages and
-                     * removes it from newPages. Do NOT add it to flushedPages: those are the
-                     * source pages that checkpointDone below removes from activePages. */
-                    flushNewPageForCheckpoint(dataPage, null);
-                    if (!dataPage.isEmpty()) {
-                        ++flushedNewPages;
-                        flushedRecords += dataPage.size();
-                    }
+            final long drainDeadline = System.nanoTime()
+                    + TimeUnit.SECONDS.toNanos(CHECKPOINT_LOCK_WRITE_TIMEOUT);
+            while (activeCommitApplies.get() > 0) {
+                if (Thread.currentThread().isInterrupted()) {
+                    Thread.currentThread().interrupt();
+                    throw new DataStorageManagerException(
+                            "interrupted while draining in-flight commit applies for Phase C gate on table "
+                                    + table.tablespace + "." + table.name);
                 }
-                /* newPages is now empty. Allocate a fresh current DML page directly via
-                 * createNewPage (under the checkpoint write lock, no concurrency on nextPageId).
-                 * Do NOT use allocateLivePage here: it would try to re-add the just-flushed
-                 * (now immutable) previous DML page to pageReplacementPolicy, which throws
-                 * "Added a page twice". */
-                createNewPage(nextPageId++);
+                if (System.nanoTime() >= drainDeadline) {
+                    throw new DataStorageManagerException(
+                            "timed out waiting for in-flight commit applies to drain for Phase C gate on table "
+                                    + table.tablespace + "." + table.name);
+                }
+                Thread.onSpinWait();
             }
 
             /*
-             * Never Never Never revert unused nextPageId! Even if we didn't use booked nextPageId it is better
-             * to throw it away — reverting could cause duplicate IDs if concurrent page creation is added later.
+             * Test-only hook: fires after the gate is set and the drain is complete,
+             * but before we acquire checkpointLock.asWriteLock().  Tests for issue #431
+             * use this to hold the gate open while verifying that concurrent
+             * onTransactionCommit calls are gated (not timed out) and complete promptly
+             * once the gate reopens.  Null in production.
              */
-
-            newPagesFlush = System.currentTimeMillis();
-
-            if (flushedDirtyPages > 0 || flushedSmallPages > 0 || flushedNewPages > 0 || flushedRecords > 0) {
-                LOGGER.log(Level.INFO, "checkpoint {0}, logpos {1}, flushed: {2} dirty pages, {3} small pages, {4} new pages, {5} records",
-                    new Object[]{table.name, sequenceNumber, flushedDirtyPages, flushedSmallPages, flushedNewPages, flushedRecords});
-            }
-
-            if (LOGGER.isLoggable(Level.FINE)) {
-                LOGGER.log(Level.FINE, "checkpoint {0}, logpos {1}, flushed pages: {2}",
-                        new Object[]{table.name, sequenceNumber, flushedPages.toString()});
+            if (duringPhaseCGateAction != null) {
+                duringPhaseCGateAction.run();
             }
 
             /*
-             * Use the LSN of the last log entry whose apply to THIS table has fully completed
-             * (tracked by {@link #lastAppliedSequenceNumber}, updated at the end of
-             * {@link #onTransactionCommit} under the checkpoint read lock). Phase C holds the
-             * write lock; the StampedLock contract guarantees that every reader has released
-             * before the write lock is granted, so every commit whose apply completed has
-             * already published its LSN to this field, and its change is sitting in a page
-             * that Phase C has flushed (currentDirtyRecordsPage or an earlier newPage).
+             * Step 3 — Acquire the write lock to block the non-transactional apply()
+             * path from executeStatementAsync (which still uses checkpointLock.readLock()
+             * for the duration of each statement callback).  This path can call applyInsert
+             * -> keyToPage.put(), which must not race with keyToPage.prepareCheckpoint().
              *
-             * We cannot use {@code log.getLastSequenceNumber()} here: it returns the last LSN
-             * ASSIGNED to the log, which includes commits whose apply callbacks are still
-             * queued on callbacksExecutor and blocked on the checkpoint read lock. Persisting
-             * such an LSN as {@code TableStatus.sequenceNumber} loses those commits on restart —
-             * their applies run after Phase C releases the lock, writing to the fresh
-             * currentDirtyRecordsPage which is not flushed until the next checkpoint, while
-             * the per-table recovery filter at line 2114 skips their WAL entries because
-             * the persisted LSN already advertised them as applied. See issue #157.
-             *
-             * Persisting this LSN (rather than the Phase-A snapshot) as TableStatus.sequenceNumber
-             * still gets us the issue #145 guarantee — entries applied to flushed pages during
-             * Phase B are correctly skipped on recovery — because those applies updated
-             * lastAppliedSequenceNumber before Phase C read it.
+             * onTransactionCommit is already quiesced by the gate above, so the write
+             * lock only needs to drain the (much smaller) executeStatementAsync reader set.
              */
-            postFlushSequenceNumber = lastAppliedSequenceNumber.get();
-            if (LOGGER.isLoggable(Level.FINE)) {
-                LOGGER.log(Level.FINE,
-                        "issue-157 phase-C LSN: table {0}.{1} phaseA={2} postFlush={3} flushedDirty={4} flushedSmall={5} flushedNew={6} newPagesLeft={7}",
-                        new Object[]{table.tablespace, table.name, sequenceNumber, postFlushSequenceNumber,
-                            flushedDirtyPages, flushedSmallPages, flushedNewPages, newPages.size()});
+            boolean lockAcquiredC;
+            try {
+                lockAcquiredC = checkpointLock.asWriteLock().tryLock(CHECKPOINT_LOCK_WRITE_TIMEOUT, TimeUnit.SECONDS);
+            } catch (InterruptedException err) {
+                throw new DataStorageManagerException("interrupted while waiting for checkpoint lock (Phase C)", err);
+            }
+            if (!lockAcquiredC) {
+                throw new DataStorageManagerException(
+                        "timed out while waiting for checkpoint lock (Phase C), write lock " + checkpointLock.writeLock());
             }
 
-            /*
-             * Snapshot the primary key index (BLink tree) state under the lock — this
-             * traverses the tree and clears per-node "dirty" flags, which requires
-             * exclusive access. The actual remote node-page writes are dispatched but
-             * NOT awaited here; the heavy I/O completes outside the lock inside
-             * persistCheckpoint below. See issue #403.
-             */
-            keyToPageStart = System.currentTimeMillis();
-            LOGGER.log(Level.INFO,
-                    "checkpoint {0}.{1} Phase C: snapshotting PK index at {2} ({3} active pages)",
-                    new Object[]{table.tablespace, table.name, postFlushSequenceNumber,
-                            pageSet.getActivePagesCount()});
-            pkIndexSnapshot = keyToPage.prepareCheckpoint(postFlushSequenceNumber, pin);
+            // State that flows from "under-lock snapshot" into "after-lock persistence".
+            final LogSequenceNumber postFlushSequenceNumber;
+            final TableStatus tableStatus;
+            final KeyToPageCheckpointSnapshot pkIndexSnapshot;
+            final long keyToPageStart;
 
-            pageSet.checkpointDone(flushedPages);
+            try {
 
-            /*
-             * Build a defensive deep snapshot of pageSet.activePages here — we are
-             * about to release the checkpoint write lock, after which concurrent DML
-             * may add or remove activePages entries AND mutate the per-page
-             * {@link PageSet.DataPageMetaData#dirt} {@link java.util.concurrent.atomic.LongAdder}
-             * via {@code setPageDirty}. A shallow copy would let a {@code dirt.sum()}
-             * read inside {@code TableStatus.serialize(...)} include dirt accumulated
-             * AFTER {@code postFlushSequenceNumber}, producing on-disk dirt counts
-             * that disagree with the persisted LSN. Cloning each metadata into a
-             * fresh {@code DataPageMetaData} with the dirt sum captured here keeps
-             * the on-disk state strictly LSN-consistent. The snapshot is consumed by
-             * dataStorageManager.tableCheckpoint below, which serializes it into the
-             * TableStatus blob written to remote storage. See issue #403.
-             */
-            Map<Long, PageSet.DataPageMetaData> activePagesSnapshot = new HashMap<>();
-            for (Entry<Long, PageSet.DataPageMetaData> e : pageSet.getActivePagesView().entrySet()) {
-                PageSet.DataPageMetaData live = e.getValue();
-                activePagesSnapshot.put(e.getKey(),
-                        new PageSet.DataPageMetaData(live.getSize(), live.getAverageRecordSize(),
-                                live.getDirtBytes()));
+                /* *** Remaining spare data handling *** */
+
+                /*
+                 * Flush remaining compaction output (buildingPage). This is done under write lock because
+                 * flushMutablePage uses pageSet which must not be modified concurrently with checkpointDone below.
+                 */
+                if (!buildingPage.isEmpty()) {
+                    flushMutablePage(buildingPage, keepFlushedPageInMemory);
+                } else {
+                    /* Remove unused empty building page from memory */
+                    pages.remove(buildingPage.pageId);
+                }
+
+                /*
+                 * Flush any residual newPages. drainPendingNewPages() just before Phase C already
+                 * flushed the bulk of what accumulated during Phase B + indexManager.checkpoint.
+                 * What remains here is the small tail: the fresh current page created by the last
+                 * drain, plus any pages concurrent DML allocated between unlock-of-drain and
+                 * gate-set / write-lock-acquire (typically one partially-filled page).
+                 *
+                 * We still MUST run this pass: keyToPage.prepareCheckpoint() below requires newPages
+                 * empty, else it records mappings to pages missing from activePages and storage,
+                 * and recovery fails with "no record in memory for K" (issue #46).
+                 *
+                 * Phase C holds checkpointLock.asWriteLock() AND checkpointPhaseCGate == true,
+                 * so no concurrent DML (onTransactionCommit or executeStatementAsync) can reach
+                 * applyInsert/applyUpdate/applyDelete while we flush these pages. After the flush,
+                 * newPages is empty and the block at the end of Phase C allocates a fresh live page.
+                 */
+                if (!newPages.isEmpty()) {
+                    final List<DataPage> remainingNewPages = new ArrayList<>(newPages.values());
+                    for (DataPage dataPage : remainingNewPages) {
+                        /* flushNewPageForCheckpoint publishes the page to pageSet.activePages and
+                         * removes it from newPages. Do NOT add it to flushedPages: those are the
+                         * source pages that checkpointDone below removes from activePages. */
+                        flushNewPageForCheckpoint(dataPage, null);
+                        if (!dataPage.isEmpty()) {
+                            ++flushedNewPages;
+                            flushedRecords += dataPage.size();
+                        }
+                    }
+                    /*
+                     * newPages is now empty. Allocate a fresh current DML page directly via
+                     * createNewPage. nextPageLock is NOT needed here: the gate and write lock
+                     * together prevent all concurrent allocateLivePage calls (gate blocks
+                     * onTransactionCommit; write lock blocks executeStatementAsync).
+                     * Do NOT use allocateLivePage: it would try to re-add the just-flushed
+                     * (now immutable) previous DML page to pageReplacementPolicy → "Added a page twice".
+                     */
+                    createNewPage(nextPageId++);
+                }
+
+                /*
+                 * Never Never Never revert unused nextPageId! Even if we didn't use booked nextPageId it is better
+                 * to throw it away — reverting could cause duplicate IDs if concurrent page creation is added later.
+                 */
+
+                newPagesFlush = System.currentTimeMillis();
+
+                if (flushedDirtyPages > 0 || flushedSmallPages > 0 || flushedNewPages > 0 || flushedRecords > 0) {
+                    LOGGER.log(Level.INFO, "checkpoint {0}, logpos {1}, flushed: {2} dirty pages, {3} small pages, {4} new pages, {5} records",
+                        new Object[]{table.name, sequenceNumber, flushedDirtyPages, flushedSmallPages, flushedNewPages, flushedRecords});
+                }
+
+                if (LOGGER.isLoggable(Level.FINE)) {
+                    LOGGER.log(Level.FINE, "checkpoint {0}, logpos {1}, flushed pages: {2}",
+                            new Object[]{table.name, sequenceNumber, flushedPages.toString()});
+                }
+
+                /*
+                 * Use the LSN of the last log entry whose apply to THIS table has fully completed.
+                 *
+                 * For onTransactionCommit applies: these are quiesced by the gate drain above
+                 * (activeCommitApplies == 0 after the spin), so every commit whose apply completed
+                 * has published its LSN to lastAppliedSequenceNumber before we read it here.
+                 *
+                 * For non-transactional apply() from executeStatementAsync: these are quiesced by
+                 * checkpointLock.asWriteLock(), which waits for all executeStatementAsync readers
+                 * (each of which holds checkpointLock.readLock() for its entire apply callback).
+                 * The StampedLock memory model guarantees all writes by released readers are visible
+                 * after write-lock acquisition.
+                 *
+                 * We cannot use log.getLastSequenceNumber(): it returns the last LSN ASSIGNED to
+                 * the log, which includes commits whose apply callbacks are still queued and have NOT
+                 * yet published their LSN to this field.  Persisting that LSN would cause recovery
+                 * to silently skip those commits (issue #157).
+                 *
+                 * Persisting lastAppliedSequenceNumber (rather than the Phase-A snapshot) still
+                 * gives us the issue #145 guarantee: entries applied to flushed pages during Phase B
+                 * correctly updated this field before Phase C reads it.
+                 */
+                postFlushSequenceNumber = lastAppliedSequenceNumber.get();
+                if (LOGGER.isLoggable(Level.FINE)) {
+                    LOGGER.log(Level.FINE,
+                            "issue-157 phase-C LSN: table {0}.{1} phaseA={2} postFlush={3} flushedDirty={4} flushedSmall={5} flushedNew={6} newPagesLeft={7}",
+                            new Object[]{table.tablespace, table.name, sequenceNumber, postFlushSequenceNumber,
+                                flushedDirtyPages, flushedSmallPages, flushedNewPages, newPages.size()});
+                }
+
+                /*
+                 * Snapshot the primary key index (BLink tree) state under the lock — this
+                 * traverses the tree and clears per-node "dirty" flags, which requires
+                 * exclusive access. The actual remote node-page writes are dispatched but
+                 * NOT awaited here; the heavy I/O completes outside the lock inside
+                 * persistCheckpoint below. See issue #403.
+                 */
+                keyToPageStart = System.currentTimeMillis();
+                LOGGER.log(Level.INFO,
+                        "checkpoint {0}.{1} Phase C: snapshotting PK index at {2} ({3} active pages)",
+                        new Object[]{table.tablespace, table.name, postFlushSequenceNumber,
+                                pageSet.getActivePagesCount()});
+                pkIndexSnapshot = keyToPage.prepareCheckpoint(postFlushSequenceNumber, pin);
+
+                pageSet.checkpointDone(flushedPages);
+
+                /*
+                 * Build a defensive deep snapshot of pageSet.activePages here — we are
+                 * about to release the checkpoint write lock, after which concurrent DML
+                 * may add or remove activePages entries AND mutate the per-page
+                 * {@link PageSet.DataPageMetaData#dirt} {@link java.util.concurrent.atomic.LongAdder}
+                 * via {@code setPageDirty}. A shallow copy would let a {@code dirt.sum()}
+                 * read inside {@code TableStatus.serialize(...)} include dirt accumulated
+                 * AFTER {@code postFlushSequenceNumber}, producing on-disk dirt counts
+                 * that disagree with the persisted LSN. Cloning each metadata into a
+                 * fresh {@code DataPageMetaData} with the dirt sum captured here keeps
+                 * the on-disk state strictly LSN-consistent. The snapshot is consumed by
+                 * dataStorageManager.tableCheckpoint below, which serializes it into the
+                 * TableStatus blob written to remote storage. See issue #403.
+                 */
+                Map<Long, PageSet.DataPageMetaData> activePagesSnapshot = new HashMap<>();
+                for (Entry<Long, PageSet.DataPageMetaData> e : pageSet.getActivePagesView().entrySet()) {
+                    PageSet.DataPageMetaData live = e.getValue();
+                    activePagesSnapshot.put(e.getKey(),
+                            new PageSet.DataPageMetaData(live.getSize(), live.getAverageRecordSize(),
+                                    live.getDirtBytes()));
+                }
+                tableStatus = new TableStatus(table.name, postFlushSequenceNumber,
+                        Bytes.longToByteArray(nextPrimaryKeyValue.get()), nextPageId,
+                        activePagesSnapshot);
+
+                /*
+                 * Can happen when at checkpoint start all pages are set as dirty or immutable (immutable or
+                 * unloaded) due to a deletion: all pages will be removed and no page will remain alive.
+                 * Note: Phase A already created a new currentDirtyRecordsPage, so this should rarely trigger.
+                 */
+                if (newPages.isEmpty()) {
+                    allocateLivePage(currentDirtyRecordsPage.get());
+                }
+
+            } finally {
+                // The checkpoint is still "running" until persistence below completes;
+                // do NOT clear checkPointRunning here. Release the write lock so that
+                // executeStatementAsync readers can proceed concurrently with the slow
+                // remote I/O performed below.
+                checkpointLock.asWriteLock().unlock();
+                // Re-open the gate so onTransactionCommit / writeFromDump applies resume.
+                // This is done here (inside the outer checkpointPhaseCGate try-finally)
+                // rather than in the outer finally, so that new applies can start as soon
+                // as the write lock is released — not only after the slow I/O completes.
+                checkpointPhaseCGate = false;
+                gateCleared[0] = true;
             }
-            tableStatus = new TableStatus(table.name, postFlushSequenceNumber,
-                    Bytes.longToByteArray(nextPrimaryKeyValue.get()), nextPageId,
-                    activePagesSnapshot);
-
-            /*
-             * Can happen when at checkpoint start all pages are set as dirty or immutable (immutable or
-             * unloaded) due to a deletion: all pages will be removed and no page will remain alive.
-             * Note: Phase A already created a new currentDirtyRecordsPage, so this should rarely trigger.
-             */
-            if (newPages.isEmpty()) {
-                allocateLivePage(currentDirtyRecordsPage.get());
-            }
-
-        } finally {
-            // The checkpoint is still "running" until persistence below completes;
-            // do NOT clear checkPointRunning here. Release the lock so commits and DML
-            // can proceed concurrently with the slow remote I/O performed below.
-            checkpointLock.asWriteLock().unlock();
-        }
 
         /* ============================================================== */
         /* === PHASE C-persist: NO checkpoint lock — slow remote I/O   === */
@@ -4204,6 +4430,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         if (LOGGER.isLoggable(Level.FINE)) {
             LOGGER.log(Level.FINE, "checkpoint {0} finished, logpos {1}, pageSet: {2}",
                     new Object[]{table.name, sequenceNumber, pageSet.toString()});
+        }
+
+        } finally {
+            // Safety net: if an exception escaped Phase C before the inner write-lock
+            // finally ran (e.g. drain timeout, interrupted wait, test hook failure),
+            // checkpointPhaseCGate may still be true.  Clear it here so that
+            // onTransactionCommit / writeFromDump threads do not spin indefinitely.
+            if (!gateCleared[0]) {
+                checkpointPhaseCGate = false;
+            }
         }
 
         } finally {
@@ -5013,6 +5249,14 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
      */
     public void setDuringPhaseBAction(Runnable duringPhaseBAction) {
         this.duringPhaseBAction = duringPhaseBAction;
+    }
+
+    /**
+     * Test-only setter for the {@link #duringPhaseCGateAction} hook.
+     * See field Javadoc and {@code Issue431CommitNotStarvedByPhaseCTest}.
+     */
+    public void setDuringPhaseCGateAction(Runnable duringPhaseCGateAction) {
+        this.duringPhaseCGateAction = duringPhaseCGateAction;
     }
 
     @Override
