@@ -356,7 +356,15 @@ public class RemoteFileServiceImpl {
         }
         pdu.close();
 
-        runOnLane(readExecutor, () -> readFileImpl(messageId, path, channel));
+        try {
+            runOnLane(readExecutor, () -> readFileImpl(messageId, path, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: readExecutor may reject the task during shutdown
+            // or under saturation. Surface as ERROR so the client times out
+            // immediately instead of waiting for the configured timeout.
+            sendError(channel, messageId,
+                    "readFile dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
     private void readFileImpl(long messageId, String path, Channel channel) {
@@ -419,7 +427,14 @@ public class RemoteFileServiceImpl {
         }
         pdu.close();
 
-        runOnLane(readExecutor, () -> readFileRangeImpl(messageId, path, offset, length, blockSize, channel));
+        try {
+            runOnLane(readExecutor, () -> readFileRangeImpl(messageId, path, offset, length, blockSize, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: readExecutor may reject the task during shutdown
+            // or under saturation; surface as ERROR so the client fails fast.
+            sendError(channel, messageId,
+                    "readFileRange dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
     private void readFileRangeImpl(long messageId, String path, long offset, int length,
@@ -473,7 +488,13 @@ public class RemoteFileServiceImpl {
         }
         pdu.close();
 
-        runOnLane(writeExecutor, () -> deleteFileImpl(messageId, path, channel));
+        try {
+            runOnLane(writeExecutor, () -> deleteFileImpl(messageId, path, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: writeExecutor may reject the task during shutdown.
+            sendError(channel, messageId,
+                    "deleteFile dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
     private void deleteFileImpl(long messageId, String path, Channel channel) {
@@ -513,7 +534,13 @@ public class RemoteFileServiceImpl {
         }
         pdu.close();
 
-        runOnLane(writeExecutor, () -> deleteFilesImpl(messageId, paths, channel));
+        try {
+            runOnLane(writeExecutor, () -> deleteFilesImpl(messageId, paths, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: writeExecutor may reject the task during shutdown.
+            sendError(channel, messageId,
+                    "deleteFiles dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
     private void deleteFilesImpl(long messageId, List<String> paths, Channel channel) {
@@ -601,7 +628,13 @@ public class RemoteFileServiceImpl {
         }
         pdu.close();
 
-        runOnLane(readExecutor, () -> listFilesImpl(messageId, prefix, channel));
+        try {
+            runOnLane(readExecutor, () -> listFilesImpl(messageId, prefix, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: readExecutor may reject the task during shutdown.
+            sendError(channel, messageId,
+                    "listFiles dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
     private void listFilesImpl(long messageId, String prefix, Channel channel) {
@@ -641,7 +674,13 @@ public class RemoteFileServiceImpl {
         }
         pdu.close();
 
-        runOnLane(writeExecutor, () -> deleteByPrefixImpl(messageId, prefix, channel));
+        try {
+            runOnLane(writeExecutor, () -> deleteByPrefixImpl(messageId, prefix, channel));
+        } catch (RuntimeException dispatchError) {
+            // Broad catch: writeExecutor may reject the task during shutdown.
+            sendError(channel, messageId,
+                    "deleteByPrefix dispatch failed: " + dispatchError.getMessage());
+        }
     }
 
     private void deleteByPrefixImpl(long messageId, String prefix, Channel channel) {

@@ -29,6 +29,7 @@ import herddb.proto.Pdu;
 import herddb.proto.PduCodec;
 import herddb.server.RemoteFileClient;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.MultithreadEventLoopGroup;
 import io.netty.channel.epoll.EpollEventLoopGroup;
@@ -689,27 +690,57 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
             CompletableFuture<ByteBuf> secondFuture = retryAsync(
                     () -> doReadFileRangeAsByteBufAsync(path, secondOffset, secondLength, blockSizeArg),
                     "readFileRange", path, 0);
-            return secondFuture
-                    .thenApply(second -> {
-                        if (second == null) {
-                            return first;
+            // Use .handle() so one branch covers BOTH the secondFuture failure
+            // and any throw from the composite-assembly lambda. Mixing
+            // thenApply().exceptionally() risks double-releasing `first` when
+            // a lambda partially built the composite (transferring `first`
+            // into it) and then threw — the .exceptionally would then release
+            // `first` a second time after composite.release() already did.
+            return secondFuture.handle((second, error) -> {
+                if (error != null) {
+                    // The second read failed before we touched the composite —
+                    // `first` is still solely owned by us, so release it.
+                    ReferenceCountUtil.safeRelease(first);
+                    if (error instanceof RuntimeException) {
+                        throw (RuntimeException) error;
+                    }
+                    throw new RuntimeException(error);
+                }
+                if (second == null) {
+                    return first;
+                }
+                // Refcount-safe composite assembly: `composite` is non-null
+                // only between creation and the point where ownership
+                // transfers to the caller. `firstTransferred`/`secondTransferred`
+                // track which components have been moved into the composite.
+                // On partial failure, releasing the composite releases the
+                // already-transferred components; not-yet-transferred ones
+                // are released independently. Setting `composite = null`
+                // before return signals that ownership has moved out.
+                CompositeByteBuf composite = null;
+                boolean firstTransferred = false;
+                boolean secondTransferred = false;
+                try {
+                    composite = PooledByteBufAllocator.DEFAULT.compositeDirectBuffer(2);
+                    composite.addComponent(true, first);
+                    firstTransferred = true;
+                    composite.addComponent(true, second);
+                    secondTransferred = true;
+                    ByteBuf result = composite;
+                    composite = null;
+                    return result;
+                } finally {
+                    if (composite != null) {
+                        ReferenceCountUtil.safeRelease(composite);
+                        if (!firstTransferred) {
+                            ReferenceCountUtil.safeRelease(first);
                         }
-                        // CompositeByteBuf gives a contiguous view over the two
-                        // pooled slices without copying their bytes. addComponent
-                        // takes ownership of the component's refcount.
-                        io.netty.buffer.CompositeByteBuf composite = PooledByteBufAllocator.DEFAULT
-                                .compositeDirectBuffer(2);
-                        composite.addComponent(true, first);
-                        composite.addComponent(true, second);
-                        return (ByteBuf) composite;
-                    })
-                    .exceptionally(t -> {
-                        ReferenceCountUtil.safeRelease(first);
-                        if (t instanceof RuntimeException) {
-                            throw (RuntimeException) t;
+                        if (!secondTransferred) {
+                            ReferenceCountUtil.safeRelease(second);
                         }
-                        throw new RuntimeException(t);
-                    });
+                    }
+                }
+            });
         });
     }
 

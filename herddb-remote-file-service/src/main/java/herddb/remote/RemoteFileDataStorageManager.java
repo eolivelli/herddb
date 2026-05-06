@@ -106,8 +106,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     /**
      * When non-null, used by {@link #downloadMultipartIndexFile} to download segment
-     * map files directly from object storage (bypassing the gRPC file-server).
-     * This eliminates the serial gRPC round-trips that make cold-start recovery very
+     * map files directly from object storage (bypassing the file-server).
+     * This eliminates the serial wire round-trips that make cold-start recovery very
      * slow when there are thousands of segments (issue #381).
      *
      * <p>Set via {@link #setDirectObjectStorage(ObjectStorage)} after construction,
@@ -120,7 +120,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * Configures a direct object-storage client for segment map-file downloads
      * during recovery. When set, {@link #supportsDirectMultipartDownload()} returns
      * {@code true} and {@link #downloadMultipartIndexFile} reads block objects directly
-     * from S3 instead of routing through the gRPC file server.
+     * from S3 instead of routing through the file server.
      *
      * <p>Ownership of {@code storage} is transferred to this manager:
      * it will be closed by {@link #close()} together with all other resources.
@@ -510,12 +510,12 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * multi-MiB windows per miss.
      *
      * <p>The 16 KiB default is sized to absorb a single jvector logical read in
-     * one gRPC call. The dominant per-node read during search is the full-
+     * one wire round-trip. The dominant per-node read during search is the full-
      * resolution vector fetched by {@code OnDiskGraphIndex.getVectorInto}
      * for re-ranking, which reads {@code dimension * 4} bytes in a single
      * {@code readFloatVector} call — 3840 bytes for GIST1M (dim=960), 6144 bytes
      * for 1536-dim embeddings. A 4 KiB buffer would split those reads across
-     * two gRPC round-trips whenever the position is unaligned; 16 KiB keeps a
+     * two wire round-trips whenever the position is unaligned; 16 KiB keeps a
      * raw vector up to ~4096 dimensions in a single fetch while still being
      * 256× smaller than the 4 MiB write block and an exact divisor of it.
      */
@@ -748,7 +748,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                 f.join();
             } catch (CompletionException ignored) {
                 // another future already carries the original error; we just need the buf pinned
-                // until every in-flight gRPC call is done, success or failure.
+                // until every in-flight wire round-trip is done, success or failure.
             }
         }
     }
@@ -1074,7 +1074,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     /**
      * Downloads a multipart segment file directly from object storage to a local file,
-     * bypassing the gRPC file-server. Blocks are fetched sequentially (sufficient
+     * bypassing the file-server. Blocks are fetched sequentially (sufficient
      * throughput for a single segment; parallelism across segments is handled by the
      * caller). Each block is freed from the Netty pool immediately after being written
      * to disk to keep peak heap / direct-memory usage bounded.

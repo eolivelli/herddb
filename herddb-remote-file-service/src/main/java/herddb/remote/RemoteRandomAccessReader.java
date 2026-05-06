@@ -46,7 +46,7 @@ import org.apache.bookkeeper.stats.StatsLogger;
  * For vector-index searches the buffer should be small — see issue #104 —
  * but still large enough to absorb a single jvector logical read (notably
  * {@code OnDiskGraphIndex.getVectorInto}, which reads {@code dimension * 4}
- * bytes for the re-rank raw vector) in one gRPC call. The default is 16 KiB.
+ * bytes for the re-rank raw vector) in one wire round-trip. The default is 16 KiB.
  * {@code writeBlockSize} is still passed to the server because it is what
  * {@code LocalObjectStorage.readRange} uses to locate the on-disk chunk file
  * ({@code blockIndex = offset / writeBlockSize}); changing it would break
@@ -303,7 +303,7 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
                     + " totalSize=" + totalSize);
         }
         // Decide hit vs miss *before* calling getBlock so the per-request
-        // counter reflects whether the bytes came from memory or from gRPC.
+        // counter reflects whether the bytes came from memory or from a wire round-trip.
         // With SegmentBlockCache.disabled() containsBlock always returns
         // false, which correctly attributes every read as a miss.
         VectorSearchRequestContext ctx = VectorSearchRequestContext.current();
@@ -340,7 +340,7 @@ public class RemoteRandomAccessReader implements RandomAccessReader {
 
     /**
      * Loader callback invoked by {@link SegmentBlockCache} on a miss. Performs
-     * the actual {@code readFileRange} gRPC call, updates the client-side
+     * the actual {@code readFileRange} wire round-trip, updates the client-side
      * counters ({@code rfs_client_read_*}), and returns a fresh pooled direct
      * {@link ByteBuf} that the cache (or, in pass-through mode, the caller)
      * takes ownership of.
