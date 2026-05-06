@@ -23,8 +23,8 @@ package herddb.remote.admin;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import herddb.proto.PduCodec;
 import herddb.remote.RemoteFileServer;
-import herddb.remote.proto.GetServerInfoResponse;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
@@ -37,13 +37,14 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 /**
- * Integration tests for the fileserver-admin CLI and gRPC admin service (issue #336).
+ * Integration tests for the fileserver-admin CLI and admin service
+ * (issue #336, ported to the native Netty wire protocol in issue #425).
  * <p>
  * Uses a {@link RemoteFileServer} in local-storage mode (no S3 needed) to verify:
  * <ul>
  *   <li>{@code server-info} returns JVM and block-cache stats</li>
  *   <li>{@code resize-cache} correctly rejects when disk cache is absent</li>
- *   <li>gRPC admin client works end-to-end</li>
+ *   <li>admin client works end-to-end</li>
  *   <li>JSON output contains expected keys</li>
  * </ul>
  *
@@ -79,35 +80,36 @@ public class FileServerAdminCliTest {
     }
 
     // ---------------------------------------------------------------
-    // gRPC client tests
+    // Admin client tests
     // ---------------------------------------------------------------
 
     @Test
-    public void testGetServerInfoViaClient() {
+    public void testGetServerInfoViaClient() throws Exception {
         try (FileServerAdminClient client = new FileServerAdminClient(serverAddress, 10)) {
-            GetServerInfoResponse resp = client.getServerInfo();
+            PduCodec.GetServerInfoResponse.Info resp = client.getServerInfo();
             assertNotNull(resp);
-            assertEquals("local", resp.getStorageMode());
-            assertTrue("jvm_heap_max_bytes must be > 0", resp.getJvmHeapMaxBytes() > 0);
-            assertTrue("jvm_heap_used_bytes must be > 0", resp.getJvmHeapUsedBytes() > 0);
+            assertEquals("local", resp.storageMode);
+            assertTrue("jvm_heap_max_bytes must be > 0", resp.jvmHeapMaxBytes > 0);
+            assertTrue("jvm_heap_used_bytes must be > 0", resp.jvmHeapUsedBytes > 0);
             // Block cache should be populated
-            assertTrue("block_cache_max_bytes must be > 0", resp.getBlockCacheMaxBytes() > 0);
+            assertTrue("block_cache_max_bytes must be > 0", resp.blockCacheMaxBytes > 0);
             // Disk cache absent in local mode — all fields zero
             assertEquals("disk_cache_max_bytes must be 0 in local mode",
-                    0L, resp.getDiskCacheMaxBytes());
+                    0L, resp.diskCacheMaxBytes);
         }
     }
 
     @Test
     public void testResizeDiskCacheFailsInLocalMode() {
-        // In local mode there is no disk cache; resize must return FAILED_PRECONDITION
+        // In local mode there is no disk cache; resize must surface as
+        // an IOException carrying the server's TYPE_ERROR message.
         try (FileServerAdminClient client = new FileServerAdminClient(serverAddress, 10)) {
             try {
                 client.resizeDiskCache(1024 * 1024 * 512L);
-                // Should not reach here
-                throw new AssertionError("Expected gRPC status exception");
-            } catch (io.grpc.StatusRuntimeException e) {
-                assertEquals(io.grpc.Status.Code.FAILED_PRECONDITION, e.getStatus().getCode());
+                throw new AssertionError("Expected IOException");
+            } catch (java.io.IOException expected) {
+                assertTrue("error message must mention disk cache",
+                        expected.getMessage().toLowerCase().contains("disk cache"));
             }
         }
     }
@@ -163,7 +165,7 @@ public class FileServerAdminCliTest {
                 "resize-cache", "--server", serverAddress, "--max-bytes", "536870912"
         });
 
-        // gRPC FAILED_PRECONDITION → CLI returns 1
+        // server returns an ERROR PDU → CLI catches the IOException and returns 1
         assertEquals("CLI should exit 1 on failed precondition", 1, rc);
         String errOutput = errBuf.toString(StandardCharsets.UTF_8);
         assertTrue("Error output should mention 'ERROR'", errOutput.contains("ERROR"));

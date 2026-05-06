@@ -22,17 +22,20 @@ package herddb.remote;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
-import herddb.remote.proto.DeleteFileOutcome;
-import herddb.remote.proto.DeleteFilesRequest;
-import herddb.remote.proto.DeleteFilesResponse;
-import herddb.remote.proto.RemoteFileServiceGrpc;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.stub.StreamObserver;
+import herddb.network.Channel;
+import herddb.network.ChannelEventListener;
+import herddb.network.netty.NettyConnector;
+import herddb.network.netty.NetworkUtils;
+import herddb.proto.Pdu;
+import herddb.proto.PduCodec;
+import io.netty.channel.MultithreadEventLoopGroup;
+import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.junit.After;
 import org.junit.Before;
@@ -41,10 +44,11 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 /**
- * Server-side tests for the {@code DeleteFiles} batch RPC (issue #398).
- * Hits {@link RemoteFileServiceImpl} directly via a gRPC channel so the per-path
- * outcome semantics (success / not-found / error) are nailed down independently
- * of the client-side fan-out logic.
+ * Server-side tests for the {@code DELETE_FILES} batch PDU (issue #398).
+ * Hits {@link RemoteFileServiceImpl} directly via a raw {@link Channel}
+ * connection so the per-path outcome semantics
+ * (success / not-found / error) are nailed down independently of the
+ * client-side fan-out logic in {@link RemoteFileServiceClient}.
  */
 public class RemoteFileServiceImplDeleteFilesTest {
 
@@ -52,28 +56,39 @@ public class RemoteFileServiceImplDeleteFilesTest {
     public TemporaryFolder folder = new TemporaryFolder();
 
     private RemoteFileServer server;
-    private ManagedChannel channel;
     private RemoteFileServiceClient writeClient;
+    private MultithreadEventLoopGroup eventLoopGroup;
+    private ExecutorService callbackExecutor;
+    private Channel channel;
 
     @Before
     public void setUp() throws Exception {
         server = new RemoteFileServer(0, folder.newFolder("rfs").toPath());
         server.start();
-        channel = ManagedChannelBuilder
-                .forAddress("localhost", server.getPort())
-                .usePlaintext()
-                .build();
         writeClient = new RemoteFileServiceClient(
                 Arrays.asList("localhost:" + server.getPort()));
+        eventLoopGroup = NetworkUtils.isEnableEpoolNative()
+                ? new EpollEventLoopGroup(1)
+                : new NioEventLoopGroup(1);
+        callbackExecutor = Executors.newCachedThreadPool();
+        channel = NettyConnector.connectUsingNetwork(
+                "localhost", server.getPort(), false, 10_000, 0,
+                new ChannelEventListener() {}, callbackExecutor, eventLoopGroup);
     }
 
     @After
     public void tearDown() throws Exception {
+        if (channel != null) {
+            channel.close();
+        }
         if (writeClient != null) {
             writeClient.close();
         }
-        if (channel != null) {
-            channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+        if (eventLoopGroup != null) {
+            eventLoopGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS).awaitUninterruptibly();
+        }
+        if (callbackExecutor != null) {
+            callbackExecutor.shutdownNow();
         }
         if (server != null) {
             server.stop();
@@ -82,8 +97,8 @@ public class RemoteFileServiceImplDeleteFilesTest {
 
     @Test
     public void emptyRequestReturnsEmptyResponse() throws Exception {
-        DeleteFilesResponse response = sendDeleteFiles(Collections.emptyList());
-        assertEquals(0, response.getOutcomesCount());
+        List<PduCodec.DeleteFilesResponse.Outcome> outcomes = sendDeleteFiles(Collections.emptyList());
+        assertEquals(0, outcomes.size());
     }
 
     @Test
@@ -102,50 +117,41 @@ public class RemoteFileServiceImplDeleteFilesTest {
                 "server/exists-3",
                 "server/missing-c"
         );
-        DeleteFilesResponse response = sendDeleteFiles(input);
-        assertEquals(input.size(), response.getOutcomesCount());
+        List<PduCodec.DeleteFilesResponse.Outcome> outcomes = sendDeleteFiles(input);
+        assertEquals(input.size(), outcomes.size());
         for (int i = 0; i < input.size(); i++) {
-            DeleteFileOutcome outcome = response.getOutcomes(i);
+            PduCodec.DeleteFilesResponse.Outcome outcome = outcomes.get(i);
             assertEquals("outcome path must match input order at index " + i,
-                    input.get(i), outcome.getPath());
-            assertTrue("no per-path error expected, got " + outcome.getError(),
-                    outcome.getError().isEmpty());
+                    input.get(i), outcome.path);
+            assertTrue("no per-path error expected, got " + outcome.error,
+                    outcome.error.isEmpty());
             if (input.get(i).startsWith("server/exists-")) {
                 assertTrue("existing path should be reported deleted=true: " + input.get(i),
-                        outcome.getDeleted());
+                        outcome.deleted);
             } else {
                 assertFalse("missing path should be reported deleted=false: " + input.get(i),
-                        outcome.getDeleted());
+                        outcome.deleted);
             }
         }
         assertTrue("server/ should be empty after batch delete",
                 writeClient.listFiles("server/").isEmpty());
     }
 
-    private DeleteFilesResponse sendDeleteFiles(List<String> paths) throws Exception {
-        RemoteFileServiceGrpc.RemoteFileServiceStub stub = RemoteFileServiceGrpc.newStub(channel)
-                .withDeadlineAfter(30, TimeUnit.SECONDS);
-        CompletableFuture<DeleteFilesResponse> future = new CompletableFuture<>();
-        stub.deleteFiles(
-                DeleteFilesRequest.newBuilder().addAllPaths(paths).build(),
-                new StreamObserver<DeleteFilesResponse>() {
-                    private DeleteFilesResponse response;
-
-                    @Override
-                    public void onNext(DeleteFilesResponse value) {
-                        this.response = value;
-                    }
-
-                    @Override
-                    public void onError(Throwable t) {
-                        future.completeExceptionally(t);
-                    }
-
-                    @Override
-                    public void onCompleted() {
-                        future.complete(response);
-                    }
-                });
-        return future.get(30, TimeUnit.SECONDS);
+    private List<PduCodec.DeleteFilesResponse.Outcome> sendDeleteFiles(List<String> paths)
+            throws Exception {
+        long requestId = channel.generateRequestId();
+        Pdu reply = channel.sendMessageWithPduReply(requestId,
+                PduCodec.DeleteFilesRequest.write(requestId, paths),
+                TimeUnit.SECONDS.toMillis(30));
+        try {
+            if (reply.type == Pdu.TYPE_ERROR) {
+                throw new IllegalStateException("server returned ERROR: "
+                        + PduCodec.ErrorResponse.readError(reply));
+            }
+            assertEquals(Pdu.TYPE_FS_DELETE_FILES, reply.type);
+            return PduCodec.DeleteFilesResponse.readOutcomes(reply);
+        } finally {
+            reply.close();
+        }
     }
 }

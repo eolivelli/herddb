@@ -20,8 +20,8 @@
 
 package herddb.remote.storage;
 
+import edu.umd.cs.findbugs.annotations.Nullable;
 import io.netty.buffer.ByteBuf;
-import javax.annotation.Nullable;
 
 /**
  * Result of a {@link ObjectStorage#read(String)} operation.

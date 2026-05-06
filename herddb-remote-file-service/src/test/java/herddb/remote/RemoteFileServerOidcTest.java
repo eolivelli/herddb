@@ -26,7 +26,6 @@ import herddb.auth.oidc.OidcBootstrap;
 import herddb.auth.oidc.OidcConfiguration;
 import herddb.auth.oidc.OidcTokenProvider;
 import herddb.auth.oidc.TestOidcServer;
-import herddb.auth.oidc.grpc.JwtAuthClientInterceptor;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collections;
@@ -36,8 +35,13 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 /**
- * Verifies that {@link RemoteFileServer} rejects unauthenticated requests and accepts
- * requests with a valid JWT bearer token when OIDC is enabled.
+ * Verifies that {@link RemoteFileServer} rejects unauthenticated requests
+ * and accepts requests carrying a valid JWT bearer token when OIDC is
+ * enabled. Issue #425 swapped the gRPC OIDC interceptor for an
+ * OAUTHBEARER SASL handshake on the new Netty transport: the server now
+ * uses {@link herddb.auth.oidc.sasl.OAuthBearerSaslServer} during
+ * connection setup, and the client supplies the bearer token via a
+ * {@code Supplier<String>} passed to {@link RemoteFileServiceClient}.
  */
 public class RemoteFileServerOidcTest {
 
@@ -62,24 +66,25 @@ public class RemoteFileServerOidcTest {
 
                 OidcConfiguration cfg = new OidcConfiguration(idp.getIssuerUrl()).discover();
                 OidcTokenProvider tp = new OidcTokenProvider(cfg, "file-client", "file-secret", null);
-                RemoteFileServiceClient client = new RemoteFileServiceClient(
+                try (RemoteFileServiceClient client = new RemoteFileServiceClient(
                         Arrays.asList("localhost:" + server.getPort()),
                         Collections.emptyMap(),
-                        new JwtAuthClientInterceptor(() -> {
+                        () -> {
                             try {
                                 return tp.getToken();
                             } catch (Exception e) {
+                                // Broad catch: the token provider declares a checked
+                                // OidcAuthException that the SASL handshake path does not
+                                // surface; any failure here propagates as the SASL
+                                // handshake failing the connect.
                                 throw new RuntimeException(e);
                             }
-                        }));
-                try {
+                        })) {
                     byte[] content = "hello OIDC".getBytes(StandardCharsets.UTF_8);
                     client.writeFile("ts/u/data/1.page", content);
                     byte[] read = client.readFile("ts/u/data/1.page");
                     assertNotNull(read);
                     assertArrayEquals(content, read);
-                } finally {
-                    client.close();
                 }
             }
         }
@@ -92,17 +97,14 @@ public class RemoteFileServerOidcTest {
                     "127.0.0.1", 0, folder.newFolder("data").toPath(),
                     2, oidcProps(idp))) {
                 server.start();
-
-                // no interceptor → no Authorization header
-                RemoteFileServiceClient client = new RemoteFileServiceClient(
-                        Arrays.asList("localhost:" + server.getPort()));
-                try {
+                // no token supplier → no SASL handshake → server rejects the
+                // first data-plane request with "authentication required".
+                try (RemoteFileServiceClient client = new RemoteFileServiceClient(
+                        Arrays.asList("localhost:" + server.getPort()))) {
                     client.writeFile("ts/u/data/1.page", new byte[]{0x01});
-                    fail("expected UNAUTHENTICATED");
+                    fail("expected authentication failure");
                 } catch (RuntimeException e) {
-                    // expected - gRPC status exception propagates
-                } finally {
-                    client.close();
+                    // expected — server replied with TYPE_ERROR
                 }
             }
         }
@@ -115,18 +117,14 @@ public class RemoteFileServerOidcTest {
                     "127.0.0.1", 0, folder.newFolder("data").toPath(),
                     2, oidcProps(idp))) {
                 server.start();
-
-                RemoteFileServiceClient client = new RemoteFileServiceClient(
+                try (RemoteFileServiceClient client = new RemoteFileServiceClient(
                         Arrays.asList("localhost:" + server.getPort()),
                         Collections.emptyMap(),
-                        new JwtAuthClientInterceptor(() -> "not.a.real.jwt"));
-                try {
+                        () -> "not.a.real.jwt")) {
                     client.writeFile("ts/u/data/1.page", new byte[]{0x01});
-                    fail("expected UNAUTHENTICATED");
+                    fail("expected authentication failure");
                 } catch (RuntimeException e) {
-                    // expected
-                } finally {
-                    client.close();
+                    // expected — SASL handshake fails, connection is closed
                 }
             }
         }

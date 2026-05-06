@@ -881,8 +881,10 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     }
 
     private static boolean isNotFound(RuntimeException e) {
-        // readFileRangeAsync wraps io.grpc status exceptions; surface common
-        // "not found" conditions as DataPageDoesNotExistException.
+        // readFileRangeAsync surfaces server-side errors via TYPE_ERROR PDUs
+        // wrapped in IOException; surface common "not found" conditions as
+        // DataPageDoesNotExistException so callers can distinguish from a
+        // protocol/network-level failure.
         Throwable t = e;
         while (t != null) {
             String msg = t.getMessage();
