@@ -156,10 +156,18 @@ public final class LazyDataPage extends DataPage {
                 return new Record(key, Bytes.EMPTY_ARRAY);
             }
             if (m.valueLength < 0) {
-                // Guard against a malformed v2 page whose index entry slipped
-                // past the parser's range checks; surface as the same
+                // Defence-in-depth (issue #416). The authoritative check now
+                // lives in {@link LazyDataPageFormat#readIndex(ByteBuf, int, long)},
+                // which rejects negative valueLength / valueOffset, long
+                // overflow on (valueOffset + valueLength), and value ranges
+                // that exceed the values section size — so under normal
+                // operation no negative valueLength can reach this point.
+                // We keep this belt-and-braces guard so that any future code
+                // path which constructs a {@link RecordMetadata} bypassing
+                // the parser still surfaces the corruption as the
                 // LazyValueFetchException callers already handle, instead of
-                // a raw NegativeArraySizeException.
+                // a raw NegativeArraySizeException leaking out of the
+                // {@code new byte[m.valueLength]} below.
                 throw new LazyValueFetchException("Negative valueLength " + m.valueLength
                         + " for key " + key + " in " + tableSpace + "/" + uuid + "#" + pageId,
                         new IllegalStateException("corrupted page index"));

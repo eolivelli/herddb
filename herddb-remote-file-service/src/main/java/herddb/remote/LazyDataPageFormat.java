@@ -270,8 +270,42 @@ public final class LazyDataPageFormat {
      * Reads {@code numRecords} {@link RecordMetadata} entries from the index
      * section (already positioned at the start of the index and containing at
      * least {@code indexSize} readable bytes).
+     *
+     * <p>Equivalent to {@link #readIndex(ByteBuf, int, long)} with
+     * {@code valueSize = Long.MAX_VALUE}: per-entry sanity checks (non-negative
+     * {@code valueOffset}/{@code valueLength}, no {@code long} overflow on
+     * {@code valueOffset + valueLength}) are performed, but the upper bound
+     * against the values-section size is skipped. Prefer the 3-arg overload
+     * when {@code valueSize} is known so corrupt entries are rejected even
+     * earlier.
      */
     public static List<RecordMetadata> readIndex(ByteBuf indexSection, int numRecords)
+            throws DataStorageManagerException {
+        return readIndex(indexSection, numRecords, Long.MAX_VALUE);
+    }
+
+    /**
+     * Reads {@code numRecords} {@link RecordMetadata} entries from the index
+     * section (already positioned at the start of the index and containing at
+     * least {@code indexSize} readable bytes), validating each entry against
+     * {@code valueSize} (the declared size of the values section, from the
+     * fixed header).
+     *
+     * <p>Each parsed entry must satisfy:
+     * <ul>
+     *   <li>{@code valueOffset >= 0}
+     *   <li>{@code valueLength >= 0}
+     *   <li>{@code valueOffset + valueLength} does not overflow {@code long}
+     *   <li>{@code valueOffset + valueLength <= valueSize}
+     * </ul>
+     *
+     * <p>A failure on any of these checks throws
+     * {@link DataStorageManagerException} so both the lazy and eager read
+     * paths surface a single, consistent corruption signal — never raw
+     * {@link NegativeArraySizeException} or {@link IndexOutOfBoundsException}
+     * from a downstream allocation or {@code getBytes} call.
+     */
+    public static List<RecordMetadata> readIndex(ByteBuf indexSection, int numRecords, long valueSize)
             throws DataStorageManagerException {
         final List<RecordMetadata> result = new ArrayList<>(numRecords);
         try {
@@ -279,6 +313,30 @@ public final class LazyDataPageFormat {
                 final byte[] keyBytes = ByteBufUtils.readArray(indexSection);
                 final long valueOffset = ByteBufUtils.readVLong(indexSection);
                 final int valueLength = ByteBufUtils.readVInt(indexSection);
+                if (valueOffset < 0L) {
+                    throw new DataStorageManagerException(
+                            "corrupted v2 page index: negative valueOffset " + valueOffset
+                                    + " at record " + i);
+                }
+                if (valueLength < 0) {
+                    throw new DataStorageManagerException(
+                            "corrupted v2 page index: negative valueLength " + valueLength
+                                    + " at record " + i);
+                }
+                // detect long overflow on the sum (valueOffset + valueLength); since both
+                // operands are non-negative, the sum can only be < valueOffset on wrap-around.
+                final long endOffset = valueOffset + (long) valueLength;
+                if (endOffset < valueOffset) {
+                    throw new DataStorageManagerException(
+                            "corrupted v2 page index: valueOffset+valueLength overflow ("
+                                    + valueOffset + " + " + valueLength + ") at record " + i);
+                }
+                if (endOffset > valueSize) {
+                    throw new DataStorageManagerException(
+                            "corrupted v2 page index: value range [" + valueOffset + ", "
+                                    + endOffset + ") exceeds valueSize " + valueSize
+                                    + " at record " + i);
+                }
                 result.add(new RecordMetadata(Bytes.from_array(keyBytes), valueOffset, valueLength));
             }
         } catch (IndexOutOfBoundsException e) {
@@ -317,9 +375,10 @@ public final class LazyDataPageFormat {
                 throw new DataStorageManagerException("v2 page footer hash mismatch");
             }
         }
-        // parse index
+        // parse index — pass valueSize so corrupted entries are rejected before
+        // we allocate value byte[]s based on attacker-controlled lengths.
         final ByteBuf indexSlice = wholeFile.slice(startIdx + FIXED_HEADER_SIZE, h.indexSize);
-        final List<RecordMetadata> metadata = readIndex(indexSlice, h.numRecords);
+        final List<RecordMetadata> metadata = readIndex(indexSlice, h.numRecords, h.valueSize);
         // extract values
         final int valueSectionStart = startIdx + FIXED_HEADER_SIZE + h.indexSize;
         final List<Record> result = new ArrayList<>(h.numRecords);

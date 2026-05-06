@@ -810,7 +810,11 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         }
         ByteBuf tmp = io.netty.buffer.Unpooled.wrappedBuffer(indexBytes);
         try {
-            return LazyDataPageFormat.readIndex(tmp, h.numRecords);
+            // Pass valueSize so corrupted index entries are rejected at parse
+            // time on the lazy-load path (issue #416), surfacing a single
+            // DataStorageManagerException instead of a downstream
+            // NegativeArraySizeException / IndexOutOfBoundsException.
+            return LazyDataPageFormat.readIndex(tmp, h.numRecords, h.valueSize);
         } finally {
             tmp.release();
         }
