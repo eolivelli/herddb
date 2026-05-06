@@ -74,11 +74,12 @@ public class Issue431CommitNotStarvedByPhaseCTest {
     private static final long GATE_HOLD_MS = 500L;
 
     /**
-     * All 50 commits must finish within this deadline. The margin vs. {@link #GATE_HOLD_MS}
-     * is intentionally large (30 s) to absorb CI I/O noise while still being orders of
-     * magnitude shorter than the old 300 s timeout.
+     * All 50 commits must finish within this deadline. Set to 10× {@link #GATE_HOLD_MS}
+     * so a partial regression (e.g. restoring a read-lock whose tryLock blocks for the
+     * write-lock duration, or whose gate is open far too long) would still trip the bound,
+     * while absorbing CI I/O noise (which adds at most a few hundred ms on any runner).
      */
-    private static final long COMMIT_DEADLINE_MS = 30_000L;
+    private static final long COMMIT_DEADLINE_MS = 5_000L;
 
     /** Number of concurrent commit threads. */
     private static final int COMMIT_THREADS = 50;
@@ -197,6 +198,12 @@ public class Issue431CommitNotStarvedByPhaseCTest {
             boolean allDone = pool.awaitTermination(COMMIT_DEADLINE_MS, TimeUnit.MILLISECONDS);
             long elapsed = System.currentTimeMillis() - t0;
 
+            // On timeout, force-stop worker threads so they don't leak into DBManager.close().
+            if (!allDone) {
+                pool.shutdownNow();
+                pool.awaitTermination(2, TimeUnit.SECONDS);
+            }
+
             ckptThread.join(GATE_HOLD_MS * 6);
             if (ckptError.get() != null) {
                 throw new AssertionError("checkpoint thread failed", ckptError.get());
@@ -204,6 +211,12 @@ public class Issue431CommitNotStarvedByPhaseCTest {
 
             assertNull("a commit thread threw an unexpected exception", commitError.get());
             assertNull("gate hook threw an unexpected exception", hookError.get());
+
+            // Lower-bound: elapsed must be at least GATE_HOLD_MS - 100 ms to prove that
+            // commits were not magically fast (i.e. the gate actually held them for a while).
+            assertTrue("commits finished too fast — gate did not actually hold them for "
+                            + GATE_HOLD_MS + " ms (elapsed=" + elapsed + " ms)",
+                    elapsed >= GATE_HOLD_MS - 100);
 
             assertTrue(
                     COMMIT_THREADS + " concurrent commits took " + elapsed + " ms, expected < "

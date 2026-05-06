@@ -3874,10 +3874,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
             /*
              * Use an unmodifiable live view over pageSet.activePages — no defensive
-             * copy. Safe here because Phase A holds the checkpoint write lock, so no
-             * concurrent modifications can reach PageSet while we iterate. This
-             * removes one of the two O(#pages) HashMap snapshots per checkpoint
-             * (issue #69).
+             * copy. After issue #431, onTransactionCommit no longer holds
+             * checkpointLock.asReadLock(), so it may call pageSet.setPageDirty()
+             * and pageSet.pageCreated() concurrently with this iteration.
+             * Both operations are safe: pageSet.activePages is a ConcurrentHashMap
+             * (weakly-consistent iteration; concurrent inserts may or may not be
+             * visible — missing a freshly added page here is harmless, it goes into
+             * newPages and is flushed later), and dirt is a LongAdder (concurrent
+             * increments are atomic). Phase A's write lock still excludes the
+             * non-transactional executeStatementAsync apply() path. Removes one of
+             * the two O(#pages) HashMap snapshots per checkpoint (issue #69).
              */
             final Map<Long, DataPageMetaData> activePages = pageSet.getActivePagesView();
 
@@ -4173,6 +4179,12 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             final long drainDeadline = System.nanoTime()
                     + TimeUnit.SECONDS.toNanos(CHECKPOINT_LOCK_WRITE_TIMEOUT);
             while (activeCommitApplies.get() > 0) {
+                if (Thread.currentThread().isInterrupted()) {
+                    Thread.currentThread().interrupt();
+                    throw new DataStorageManagerException(
+                            "interrupted while draining in-flight commit applies for Phase C gate on table "
+                                    + table.tablespace + "." + table.name);
+                }
                 if (System.nanoTime() >= drainDeadline) {
                     throw new DataStorageManagerException(
                             "timed out waiting for in-flight commit applies to drain for Phase C gate on table "
