@@ -103,13 +103,19 @@ public class S3WatermarkStoreTest {
         FakeRemoteFileIO io = new FakeRemoteFileIO();
         S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 0);
 
-        WatermarkSnapshot saved = new WatermarkSnapshot(new LogSequenceNumber(42L, 7L), 4);
+        WatermarkSnapshot saved = new WatermarkSnapshot(
+                new LogSequenceNumber(42L, 7L), 4, 1_700_000_000_500L,
+                Collections.emptyList(), Collections.emptyList());
         store.save(saved);
 
         WatermarkSnapshot loaded = store.load();
         assertEquals(saved.lsn.ledgerId, loaded.lsn.ledgerId);
         assertEquals(saved.lsn.offset, loaded.lsn.offset);
         assertEquals(saved.numInstances, loaded.numInstances);
+        // Issue #423: lastEntryTimestamp must round-trip through the
+        // S3 binary format (covered by the XXHash64 footer).
+        assertEquals("lastEntryTimestamp must round-trip",
+                saved.lastEntryTimestamp, loaded.lastEntryTimestamp);
     }
 
     @Test
@@ -124,11 +130,13 @@ public class S3WatermarkStoreTest {
         FakeRemoteFileIO io = new FakeRemoteFileIO();
         S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 0);
 
-        store.save(new WatermarkSnapshot(new LogSequenceNumber(5L, 100L), 2));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(5L, 100L), 2, 0L,
+                Collections.emptyList(), Collections.emptyList()));
         byte[] persisted = io.store.get(store.getPath());
 
         // Attempt to save an older LSN — should be a no-op.
-        store.save(new WatermarkSnapshot(new LogSequenceNumber(5L, 50L), 4));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(5L, 50L), 4, 0L,
+                Collections.emptyList(), Collections.emptyList()));
         assertArrayEquals("older save must not overwrite",
                 persisted, io.store.get(store.getPath()));
 
@@ -139,7 +147,8 @@ public class S3WatermarkStoreTest {
         assertEquals(2, loaded.numInstances);
 
         // A newer save goes through.
-        store.save(new WatermarkSnapshot(new LogSequenceNumber(5L, 200L), 4));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(5L, 200L), 4, 0L,
+                Collections.emptyList(), Collections.emptyList()));
         loaded = store.load();
         assertEquals(200L, loaded.lsn.offset);
         assertEquals(4, loaded.numInstances);
@@ -150,7 +159,8 @@ public class S3WatermarkStoreTest {
         FakeRemoteFileIO io = new FakeRemoteFileIO();
         S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 0);
 
-        WatermarkSnapshot snap = new WatermarkSnapshot(new LogSequenceNumber(1L, 1L), 1);
+        WatermarkSnapshot snap = new WatermarkSnapshot(new LogSequenceNumber(1L, 1L), 1, 0L,
+                Collections.emptyList(), Collections.emptyList());
         store.save(snap);
         store.save(snap);
         // Both saves happened — monotonicity allows equal LSN.
@@ -163,7 +173,8 @@ public class S3WatermarkStoreTest {
         FakeRemoteFileIO io = new FakeRemoteFileIO();
         S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 0);
 
-        store.save(new WatermarkSnapshot(new LogSequenceNumber(7L, 99L), 1));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(7L, 99L), 1, 0L,
+                Collections.emptyList(), Collections.emptyList()));
         byte[] data = io.store.get(store.getPath());
         // Flip a byte in the payload (not the XXHash footer) — integrity check must catch.
         data[0] ^= 0x55;
@@ -187,7 +198,8 @@ public class S3WatermarkStoreTest {
         // Seed a corrupt object.
         io.store.put(store.getPath(), new byte[]{9, 9, 9});
         // Writing over it must succeed (corrupt current value does not block saves).
-        store.save(new WatermarkSnapshot(new LogSequenceNumber(3L, 3L), 1));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(3L, 3L), 1, 0L,
+                Collections.emptyList(), Collections.emptyList()));
         assertEquals(3L, store.load().lsn.offset);
     }
 
@@ -206,7 +218,8 @@ public class S3WatermarkStoreTest {
         io.failNextWrite = true;
         S3WatermarkStore store = new S3WatermarkStore(io, "ts-uuid", 0);
         IOException ex = assertThrows(IOException.class,
-                () -> store.save(new WatermarkSnapshot(new LogSequenceNumber(1L, 1L), 1)));
+                () -> store.save(new WatermarkSnapshot(new LogSequenceNumber(1L, 1L), 1, 0L,
+                        Collections.emptyList(), Collections.emptyList())));
         assertTrue(ex.getMessage().contains("watermark"));
         // No object was written.
         assertNull(io.store.get(store.getPath()));
@@ -229,7 +242,7 @@ public class S3WatermarkStoreTest {
         Index ix = buildVectorIndex("vidx1", "tbl1");
 
         WatermarkSnapshot saved = new WatermarkSnapshot(
-                new LogSequenceNumber(5L, 300L), 2,
+                new LogSequenceNumber(5L, 300L), 2, 0L,
                 Arrays.asList(t), Arrays.asList(ix));
         store.save(saved);
 
@@ -259,7 +272,7 @@ public class S3WatermarkStoreTest {
         Index ix2 = buildVectorIndex("i2", "tb");
 
         WatermarkSnapshot saved = new WatermarkSnapshot(
-                new LogSequenceNumber(3L, 77L), 4,
+                new LogSequenceNumber(3L, 77L), 4, 0L,
                 Arrays.asList(t1, t2), Arrays.asList(ix1, ix2));
         store.save(saved);
 
@@ -285,7 +298,7 @@ public class S3WatermarkStoreTest {
         Table t = buildTable("mytable");
         Index ix = buildVectorIndex("myidx", "mytable");
         store.save(new WatermarkSnapshot(
-                new LogSequenceNumber(1L, 1L), 1,
+                new LogSequenceNumber(1L, 1L), 1, 0L,
                 Arrays.asList(t), Arrays.asList(ix)));
 
         byte[] data = io.store.get(store.getPath());
@@ -312,13 +325,13 @@ public class S3WatermarkStoreTest {
         Table t1 = buildTable("first");
         Index ix1 = buildVectorIndex("idx1", "first");
         store.save(new WatermarkSnapshot(
-                new LogSequenceNumber(1L, 100L), 1,
+                new LogSequenceNumber(1L, 100L), 1, 0L,
                 Collections.singletonList(t1), Collections.singletonList(ix1)));
 
         // Attempt to regress — must be rejected.
         Table t2 = buildTable("second");
         store.save(new WatermarkSnapshot(
-                new LogSequenceNumber(1L, 50L), 2,
+                new LogSequenceNumber(1L, 50L), 2, 0L,
                 Collections.singletonList(t2), Collections.emptyList()));
 
         WatermarkSnapshot loaded = store.load();
@@ -328,7 +341,7 @@ public class S3WatermarkStoreTest {
         // Advance LSN — must go through.
         Table t3 = buildTable("third");
         store.save(new WatermarkSnapshot(
-                new LogSequenceNumber(1L, 200L), 1,
+                new LogSequenceNumber(1L, 200L), 1, 0L,
                 Collections.singletonList(t3), Collections.emptyList()));
         loaded = store.load();
         assertEquals("advanced table name", "third", loaded.tables.get(0).name);

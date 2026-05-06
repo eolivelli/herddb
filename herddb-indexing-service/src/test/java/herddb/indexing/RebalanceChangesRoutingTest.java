@@ -744,7 +744,9 @@ public class RebalanceChangesRoutingTest {
         WatermarkStore zeroStore = new WatermarkStore() {
             @Override
             public WatermarkSnapshot load() {
-                return new WatermarkSnapshot(new LogSequenceNumber(1, 5), 0);
+                return new WatermarkSnapshot(new LogSequenceNumber(1, 5), 0, 0L,
+                        java.util.Collections.emptyList(),
+                        java.util.Collections.emptyList());
             }
 
             @Override

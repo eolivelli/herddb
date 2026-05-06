@@ -97,6 +97,14 @@ message GetIndexStatusResponse {
     // can use the ratio to estimate remaining recovery time.
     int32 loading_segments_done = 8;
     int32 loading_segments_total = 9;
+    // Wall-clock timestamp (epoch ms) of the LogEntry at the tailer LSN.
+    // Operators compute the tailer time-lag as `now - tailer_lsn_timestamp`.
+    // 0 means "unknown" (no entries processed yet). Issue #423.
+    int64 tailer_lsn_timestamp = 10;
+    // Wall-clock timestamp (epoch ms) of the LogEntry at the durable LSN.
+    // Operators compute the durable time-lag as `now - durable_lsn_timestamp`.
+    // 0 means "unknown" (no successful checkpoint yet). Issue #423.
+    int64 durable_lsn_timestamp = 11;
 }
 
 // ---- Diagnostic RPCs ----
@@ -167,6 +175,12 @@ message DescribeIndexResponse {
     // semantics as the matching field on GetIndexStatusResponse (issue #364).
     int64 durable_lsn_ledger = 26;
     int64 durable_lsn_offset = 27;
+    // Wall-clock timestamp (epoch ms) of the LogEntry at the tailer LSN.
+    // 0 = unknown. Issue #423.
+    int64 tailer_lsn_timestamp = 28;
+    // Wall-clock timestamp (epoch ms) of the LogEntry at the durable LSN.
+    // 0 = unknown. Issue #423.
+    int64 durable_lsn_timestamp = 29;
 }
 
 message ListPrimaryKeysRequest {
@@ -269,4 +283,11 @@ message GetShadowStatusResponse {
     // shadows to decide when compaction's pending-delete entries become
     // eligible for physical deletion. 0 when no vector store is loaded.
     int64 applied_index_status_generation = 10;
+    // Wall-clock timestamp (epoch ms) of the LogEntry at loaded_ledger_id /
+    // loaded_offset — the freshness of the data this shadow can serve. Picked
+    // up from the primary's advertised
+    // IndexingServiceCheckpointState.lastEntryTimestampMillis on every reload.
+    // Operators compute the shadow data-staleness as
+    // `now - loaded_entry_timestamp_ms`. 0 = unknown. Issue #423.
+    int64 loaded_entry_timestamp_ms = 11;
 }

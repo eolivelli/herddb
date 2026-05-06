@@ -103,14 +103,29 @@ public interface RemoteVectorIndexService extends AutoCloseable {
      * ({@code durableLsn*}, used by the server's commit-log retention floor
      * — never advance retention past this value, otherwise an IS restart
      * cannot replay the missing entries).
+     *
+     * <p>Issue #423: also carries the wall-clock timestamps of the LogEntry
+     * at each LSN, so dashboards can report the time-lag of the IS as
+     * {@code now - timestamp} (in milliseconds) without knowing the
+     * commit-log layout.
      */
     class IndexStatusInfo {
         private final long vectorCount;
         private final int segmentCount;
         private final long tailerLsnLedger;
         private final long tailerLsnOffset;
+        /**
+         * Wall-clock timestamp (epoch ms) of the LogEntry at the tailer LSN.
+         * 0 = unknown. Issue #423.
+         */
+        private final long tailerLsnTimestamp;
         private final long durableLsnLedger;
         private final long durableLsnOffset;
+        /**
+         * Wall-clock timestamp (epoch ms) of the LogEntry at the durable LSN.
+         * 0 = unknown. Issue #423.
+         */
+        private final long durableLsnTimestamp;
         private final String status;
         /** Number of segments loaded so far during cold-start recovery (0 when not loading). */
         private final int loadingSegmentsDone;
@@ -119,23 +134,19 @@ public interface RemoteVectorIndexService extends AutoCloseable {
 
         public IndexStatusInfo(long vectorCount, int segmentCount,
                                long tailerLsnLedger, long tailerLsnOffset,
+                               long tailerLsnTimestamp,
                                long durableLsnLedger, long durableLsnOffset,
-                               String status) {
-            this(vectorCount, segmentCount, tailerLsnLedger, tailerLsnOffset,
-                    durableLsnLedger, durableLsnOffset, status, 0, 0);
-        }
-
-        public IndexStatusInfo(long vectorCount, int segmentCount,
-                               long tailerLsnLedger, long tailerLsnOffset,
-                               long durableLsnLedger, long durableLsnOffset,
+                               long durableLsnTimestamp,
                                String status,
                                int loadingSegmentsDone, int loadingSegmentsTotal) {
             this.vectorCount = vectorCount;
             this.segmentCount = segmentCount;
             this.tailerLsnLedger = tailerLsnLedger;
             this.tailerLsnOffset = tailerLsnOffset;
+            this.tailerLsnTimestamp = tailerLsnTimestamp;
             this.durableLsnLedger = durableLsnLedger;
             this.durableLsnOffset = durableLsnOffset;
+            this.durableLsnTimestamp = durableLsnTimestamp;
             this.status = status;
             this.loadingSegmentsDone = loadingSegmentsDone;
             this.loadingSegmentsTotal = loadingSegmentsTotal;
@@ -157,12 +168,32 @@ public interface RemoteVectorIndexService extends AutoCloseable {
             return tailerLsnOffset;
         }
 
+        /**
+         * Wall-clock timestamp (epoch ms) of the LogEntry at the tailer LSN.
+         * Operators compute the tailer time-lag as
+         * {@code now - getTailerLsnTimestamp()}. {@code 0} = unknown.
+         * Issue #423.
+         */
+        public long getTailerLsnTimestamp() {
+            return tailerLsnTimestamp;
+        }
+
         public long getDurableLsnLedger() {
             return durableLsnLedger;
         }
 
         public long getDurableLsnOffset() {
             return durableLsnOffset;
+        }
+
+        /**
+         * Wall-clock timestamp (epoch ms) of the LogEntry at the durable LSN.
+         * Operators compute the durable time-lag as
+         * {@code now - getDurableLsnTimestamp()}. {@code 0} = unknown.
+         * Issue #423.
+         */
+        public long getDurableLsnTimestamp() {
+            return durableLsnTimestamp;
         }
 
         public String getStatus() {

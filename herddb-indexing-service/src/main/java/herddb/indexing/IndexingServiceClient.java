@@ -547,7 +547,9 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                 return new RemoteVectorIndexService.IndexStatusInfo(
                         resp.getVectorCount(), resp.getSegmentCount(),
                         resp.getTailerLsnLedger(), resp.getTailerLsnOffset(),
+                        resp.getTailerLsnTimestamp(),
                         resp.getDurableLsnLedger(), resp.getDurableLsnOffset(),
+                        resp.getDurableLsnTimestamp(),
                         resp.getStatus(),
                         resp.getLoadingSegmentsDone(), resp.getLoadingSegmentsTotal());
             } catch (Exception e) {

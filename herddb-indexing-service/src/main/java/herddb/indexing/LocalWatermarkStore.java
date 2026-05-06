@@ -46,6 +46,7 @@ import java.util.logging.Logger;
  *   long  ledgerId
  *   long  offset
  *   int   numInstances
+ *   long  lastEntryTimestamp   (LogEntry timestamp at lsn, ms epoch; 0=unknown)
  *   int   tableCount
  *   for each table:   int len, byte[len] serialised Table
  *   int   indexCount
@@ -91,6 +92,11 @@ public class LocalWatermarkStore implements WatermarkStore {
             long ledgerId = dis.readLong();
             long offset = dis.readLong();
             int numInstances = dis.readInt();
+            long lastEntryTimestamp = dis.readLong();
+            if (lastEntryTimestamp < 0L) {
+                throw new IOException("watermark file " + watermarkFile
+                        + " is corrupt: lastEntryTimestamp=" + lastEntryTimestamp);
+            }
 
             int tableCount = dis.readInt();
             if (tableCount < 0 || tableCount > MAX_TABLES_OR_INDEXES) {
@@ -127,6 +133,7 @@ public class LocalWatermarkStore implements WatermarkStore {
 
             WatermarkSnapshot snapshot = new WatermarkSnapshot(
                     new LogSequenceNumber(ledgerId, offset), numInstances,
+                    lastEntryTimestamp,
                     tables, vectorIndexes);
             LOGGER.info("Loaded watermark: " + snapshot);
             return snapshot;
@@ -144,6 +151,7 @@ public class LocalWatermarkStore implements WatermarkStore {
             dos.writeLong(snapshot.lsn.ledgerId);
             dos.writeLong(snapshot.lsn.offset);
             dos.writeInt(snapshot.numInstances);
+            dos.writeLong(snapshot.lastEntryTimestamp);
             // Schema snapshot: tables
             dos.writeInt(snapshot.tables.size());
             for (Table t : snapshot.tables) {

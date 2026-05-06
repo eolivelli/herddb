@@ -77,13 +77,19 @@ public class WatermarkStoreTest {
         Path dir = folder.newFolder("data").toPath();
         LocalWatermarkStore store = new LocalWatermarkStore(dir);
 
-        WatermarkSnapshot saved = new WatermarkSnapshot(new LogSequenceNumber(5, 42), 4);
+        // Issue #423: include a non-zero lastEntryTimestamp so the round-trip
+        // also covers the new field on the on-disk format.
+        WatermarkSnapshot saved = new WatermarkSnapshot(
+                new LogSequenceNumber(5, 42), 4, 1_700_000_000_500L,
+                Collections.emptyList(), Collections.emptyList());
         store.save(saved);
 
         WatermarkSnapshot loaded = store.load();
         assertEquals(saved.lsn.ledgerId, loaded.lsn.ledgerId);
         assertEquals(saved.lsn.offset, loaded.lsn.offset);
         assertEquals(saved.numInstances, loaded.numInstances);
+        assertEquals("lastEntryTimestamp must round-trip (issue #423)",
+                saved.lastEntryTimestamp, loaded.lastEntryTimestamp);
     }
 
     @Test
@@ -91,13 +97,17 @@ public class WatermarkStoreTest {
         Path dir = folder.newFolder("overwrite").toPath();
         LocalWatermarkStore store = new LocalWatermarkStore(dir);
 
-        store.save(new WatermarkSnapshot(new LogSequenceNumber(1, 10), 2));
-        store.save(new WatermarkSnapshot(new LogSequenceNumber(2, 20), 4));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(1, 10), 2, 1_000L,
+                Collections.emptyList(), Collections.emptyList()));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(2, 20), 4, 2_000L,
+                Collections.emptyList(), Collections.emptyList()));
 
         WatermarkSnapshot loaded = store.load();
         assertEquals(2, loaded.lsn.ledgerId);
         assertEquals(20, loaded.lsn.offset);
         assertEquals(4, loaded.numInstances);
+        assertEquals("lastEntryTimestamp from the latest save",
+                2_000L, loaded.lastEntryTimestamp);
     }
 
     // ---------- schema round-trip tests (issue #368) --------------------------
@@ -115,7 +125,7 @@ public class WatermarkStoreTest {
         Table t = buildTable("mytable");
         Index ix = buildVectorIndex("myidx", "mytable");
         WatermarkSnapshot saved = new WatermarkSnapshot(
-                new LogSequenceNumber(7, 100), 2,
+                new LogSequenceNumber(7, 100), 2, 0L,
                 Arrays.asList(t), Arrays.asList(ix));
 
         store.save(saved);
@@ -133,16 +143,17 @@ public class WatermarkStoreTest {
     }
 
     /**
-     * Verifies that an empty-schema snapshot (the legacy 2-arg constructor)
-     * round-trips correctly: after saving and loading, {@link WatermarkSnapshot#hasSchema()}
-     * returns {@code false} and the tables / vectorIndexes lists are empty.
+     * Verifies that an empty-schema snapshot round-trips correctly: after
+     * saving and loading, {@link WatermarkSnapshot#hasSchema()} returns
+     * {@code false} and the tables / vectorIndexes lists are empty.
      */
     @Test
     public void testSaveAndLoadWithEmptySchema() throws IOException {
         Path dir = folder.newFolder("empty-schema").toPath();
         LocalWatermarkStore store = new LocalWatermarkStore(dir);
 
-        WatermarkSnapshot saved = new WatermarkSnapshot(new LogSequenceNumber(3, 55), 1);
+        WatermarkSnapshot saved = new WatermarkSnapshot(new LogSequenceNumber(3, 55), 1, 0L,
+                Collections.emptyList(), Collections.emptyList());
         store.save(saved);
 
         WatermarkSnapshot loaded = store.load();
@@ -169,7 +180,7 @@ public class WatermarkStoreTest {
         Index ix2 = buildVectorIndex("idx2", "tab2");
 
         WatermarkSnapshot saved = new WatermarkSnapshot(
-                new LogSequenceNumber(10, 999), 4,
+                new LogSequenceNumber(10, 999), 4, 0L,
                 Arrays.asList(t1, t2), Arrays.asList(ix1, ix2));
         store.save(saved);
 
@@ -298,11 +309,12 @@ public class WatermarkStoreTest {
         Table t = buildTable("t");
         Index ix = buildVectorIndex("i", "t");
         store.save(new WatermarkSnapshot(
-                new LogSequenceNumber(1, 1), 1,
+                new LogSequenceNumber(1, 1), 1, 0L,
                 Collections.singletonList(t), Collections.singletonList(ix)));
 
         // Overwrite with empty schema
-        store.save(new WatermarkSnapshot(new LogSequenceNumber(2, 2), 1));
+        store.save(new WatermarkSnapshot(new LogSequenceNumber(2, 2), 1, 0L,
+                Collections.emptyList(), Collections.emptyList()));
         WatermarkSnapshot loaded = store.load();
         assertFalse("overwritten snapshot must have no schema", loaded.hasSchema());
         assertEquals("lsn advanced", 2, loaded.lsn.ledgerId);

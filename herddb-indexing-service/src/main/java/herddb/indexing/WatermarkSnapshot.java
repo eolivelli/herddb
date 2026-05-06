@@ -30,9 +30,10 @@ import java.util.Objects;
 /**
  * Immutable bundle of the durable indexing-service recovery state captured at
  * a successful checkpoint: the last applied {@link LogSequenceNumber}, the
- * engine's effective {@code numInstances} at that point, and a snapshot of the
- * schema ({@link Table} and vector {@link Index} definitions) tracked by the
- * engine's {@link SchemaTracker} at the time of the checkpoint.
+ * wall-clock timestamp of that {@link herddb.log.LogEntry}, the engine's
+ * effective {@code numInstances} at that point, and a snapshot of the schema
+ * ({@link Table} and vector {@link Index} definitions) tracked by the engine's
+ * {@link SchemaTracker} at the time of the checkpoint.
  *
  * <p>Persisting the schema alongside the watermark LSN ensures that a
  * restarting engine can hydrate its in-memory {@code SchemaTracker} from the
@@ -40,6 +41,12 @@ import java.util.Objects;
  * than {@code START_OF_TIME}), even when early ledgers containing the original
  * {@code CREATE_TABLE} / {@code CREATE_INDEX} entries have been trimmed from
  * BookKeeper by the server's retention policy.
+ *
+ * <p>Persisting {@link #lastEntryTimestamp} (issue #423) lets diagnostic
+ * tooling report the freshness of the durable state as
+ * {@code now - lastEntryTimestamp} (in milliseconds) — an operator-friendly
+ * complement to the LSN coordinates that does not require knowing the
+ * commit-log layout.
  *
  * @author enrico.olivelli
  */
@@ -51,9 +58,11 @@ public final class WatermarkSnapshot {
      * to fall back to its JVM-property bootstrap value. {@link #tables} and
      * {@link #vectorIndexes} are empty, telling the engine to start the tailer
      * from {@code START_OF_TIME} and rebuild its schema by replaying DDL entries.
+     * {@link #lastEntryTimestamp} is 0 ("unknown") so diagnostic consumers can
+     * treat it as "no freshness information yet".
      */
     public static final WatermarkSnapshot START_OF_TIME =
-            new WatermarkSnapshot(LogSequenceNumber.START_OF_TIME, 0,
+            new WatermarkSnapshot(LogSequenceNumber.START_OF_TIME, 0, 0L,
                     Collections.emptyList(), Collections.emptyList());
 
     public final LogSequenceNumber lsn;
@@ -67,12 +76,22 @@ public final class WatermarkSnapshot {
     public final int numInstances;
 
     /**
+     * Wall-clock timestamp (epoch ms) of the {@link herddb.log.LogEntry} at
+     * {@link #lsn} — i.e. the freshness of the durable recovery state at the
+     * moment this snapshot was published. {@code 0} means "unknown" and is
+     * used by {@link #START_OF_TIME} (no entries have been processed yet).
+     * Issue #423: surfaced in {@code GetIndexStatus} as
+     * {@code durable_lsn_timestamp} so dashboards can report
+     * {@code durable_lag_ms = now - lastEntryTimestamp}.
+     */
+    public final long lastEntryTimestamp;
+
+    /**
      * Snapshot of every {@link Table} tracked by the engine's
      * {@link SchemaTracker} at the time of the checkpoint. Empty when the
-     * snapshot was loaded from a pre-schema watermark file (old format or
-     * {@link #START_OF_TIME}). On a non-empty schema, the engine can skip
-     * replaying DDL entries from the commit log and start the tailer directly
-     * from {@link #lsn}.
+     * snapshot is {@link #START_OF_TIME}. On a non-empty schema, the engine
+     * can skip replaying DDL entries from the commit log and start the tailer
+     * directly from {@link #lsn}.
      */
     public final List<Table> tables;
 
@@ -84,29 +103,28 @@ public final class WatermarkSnapshot {
     public final List<Index> vectorIndexes;
 
     /**
-     * Legacy constructor — creates a snapshot with no schema (empty tables and
-     * vector-indexes lists). The engine will start the tailer from
-     * {@code START_OF_TIME} and rebuild its schema by replaying DDL entries.
-     */
-    public WatermarkSnapshot(LogSequenceNumber lsn, int numInstances) {
-        this(lsn, numInstances, Collections.emptyList(), Collections.emptyList());
-    }
-
-    /**
      * Full constructor — creates a snapshot with schema bundled.
      *
-     * @param lsn            last applied LSN covered by the checkpoint
-     * @param numInstances   effective routing fanout at checkpoint time
-     * @param tables         all tables tracked by {@link SchemaTracker}
-     * @param vectorIndexes  all vector indexes tracked by {@link SchemaTracker}
+     * @param lsn                last applied LSN covered by the checkpoint
+     * @param numInstances       effective routing fanout at checkpoint time
+     * @param lastEntryTimestamp wall-clock (epoch ms) of the LogEntry at {@code lsn},
+     *                           or {@code 0} when unknown
+     * @param tables             all tables tracked by {@link SchemaTracker}
+     * @param vectorIndexes      all vector indexes tracked by {@link SchemaTracker}
      */
     public WatermarkSnapshot(LogSequenceNumber lsn, int numInstances,
+                              long lastEntryTimestamp,
                               List<Table> tables, List<Index> vectorIndexes) {
         this.lsn = Objects.requireNonNull(lsn, "lsn");
         if (numInstances < 0) {
             throw new IllegalArgumentException("numInstances must be >= 0, got " + numInstances);
         }
+        if (lastEntryTimestamp < 0L) {
+            throw new IllegalArgumentException(
+                    "lastEntryTimestamp must be >= 0, got " + lastEntryTimestamp);
+        }
         this.numInstances = numInstances;
+        this.lastEntryTimestamp = lastEntryTimestamp;
         this.tables = Collections.unmodifiableList(
                 Objects.requireNonNull(tables, "tables"));
         this.vectorIndexes = Collections.unmodifiableList(
@@ -126,6 +144,7 @@ public final class WatermarkSnapshot {
     public String toString() {
         return "WatermarkSnapshot{lsn=" + lsn
                 + ", numInstances=" + numInstances
+                + ", lastEntryTimestamp=" + lastEntryTimestamp
                 + ", tables=" + tables.size()
                 + ", vectorIndexes=" + vectorIndexes.size()
                 + '}';
@@ -141,6 +160,7 @@ public final class WatermarkSnapshot {
         }
         WatermarkSnapshot that = (WatermarkSnapshot) o;
         return numInstances == that.numInstances
+                && lastEntryTimestamp == that.lastEntryTimestamp
                 && lsn.equals(that.lsn)
                 && tables.equals(that.tables)
                 && vectorIndexes.equals(that.vectorIndexes);
@@ -148,6 +168,6 @@ public final class WatermarkSnapshot {
 
     @Override
     public int hashCode() {
-        return Objects.hash(lsn, numInstances, tables, vectorIndexes);
+        return Objects.hash(lsn, numInstances, lastEntryTimestamp, tables, vectorIndexes);
     }
 }

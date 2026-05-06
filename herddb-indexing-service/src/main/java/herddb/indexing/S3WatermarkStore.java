@@ -58,6 +58,7 @@ import java.util.logging.Logger;
  * <pre>
  *   version(VLong=1) | flags(VLong=0)
  *   ledgerId(ZLong) | offset(ZLong) | numInstances(VInt)
+ *   lastEntryTimestamp(ZLong)   (LogEntry timestamp at lsn, ms epoch; 0=unknown)
  *   tableCount(VInt)
  *   for each table:   VInt len, byte[len] serialised Table
  *   indexCount(VInt)
@@ -154,6 +155,12 @@ public class S3WatermarkStore implements WatermarkStore {
             long ledgerId = din.readZLong();
             long offset = din.readZLong();
             int numInstances = din.readVInt();
+            long lastEntryTimestamp = din.readZLong();
+            if (lastEntryTimestamp < 0L) {
+                throw new CorruptWatermarkException(
+                        "watermark object at " + path
+                                + " is corrupt: lastEntryTimestamp=" + lastEntryTimestamp);
+            }
 
             int tableCount = din.readVInt();
             if (tableCount < 0 || tableCount > MAX_TABLES_OR_INDEXES) {
@@ -192,6 +199,7 @@ public class S3WatermarkStore implements WatermarkStore {
 
             WatermarkSnapshot snapshot = new WatermarkSnapshot(
                     new LogSequenceNumber(ledgerId, offset), numInstances,
+                    lastEntryTimestamp,
                     tables, vectorIndexes);
             LOGGER.log(Level.INFO, "Loaded watermark from {0}: {1}", new Object[]{path, snapshot});
             return snapshot;
@@ -226,6 +234,7 @@ public class S3WatermarkStore implements WatermarkStore {
             dout.writeZLong(snapshot.lsn.ledgerId);
             dout.writeZLong(snapshot.lsn.offset);
             dout.writeVInt(snapshot.numInstances);
+            dout.writeZLong(snapshot.lastEntryTimestamp);
             // Schema snapshot: tables
             dout.writeVInt(snapshot.tables.size());
             for (Table t : snapshot.tables) {

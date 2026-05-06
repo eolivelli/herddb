@@ -374,7 +374,7 @@ public class JoiningRestartTest {
         // pod once managed to save schema, but then it was hard-reset and
         // is now coming up as a fresh JOINING pod.
         InMemoryWatermarkStore watermark = new InMemoryWatermarkStore();
-        watermark.save(new WatermarkSnapshot(new LogSequenceNumber(99, 99), 1,
+        watermark.save(new WatermarkSnapshot(new LogSequenceNumber(99, 99), 1, 0L,
                 Collections.singletonList(buildTable()),
                 Collections.singletonList(buildVectorIndex(2))));
 
