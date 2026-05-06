@@ -75,16 +75,18 @@ public class RemoteRandomAccessReaderTest {
         byte[] data = seqBytes(BLOCK_SIZE * 2 + 20);
         client.writeMultipartFile("ts/idx/graph", new ByteArrayInputStream(data), BLOCK_SIZE);
 
-        RemoteRandomAccessReader reader = new RemoteRandomAccessReader(client, "ts/idx/graph", data.length, BLOCK_SIZE);
-        reader.seek(10);
-        assertEquals(10, reader.getPosition());
+        try (RemoteRandomAccessReader reader =
+                new RemoteRandomAccessReader(client, "ts/idx/graph", data.length, BLOCK_SIZE)) {
+            reader.seek(10);
+            assertEquals(10, reader.getPosition());
 
-        byte[] buf = new byte[5];
-        reader.readFully(buf);
-        for (int i = 0; i < 5; i++) {
-            assertEquals((byte) (10 + i), buf[i]);
+            byte[] buf = new byte[5];
+            reader.readFully(buf);
+            for (int i = 0; i < 5; i++) {
+                assertEquals((byte) (10 + i), buf[i]);
+            }
+            assertEquals(15, reader.getPosition());
         }
-        assertEquals(15, reader.getPosition());
     }
 
     @Test
@@ -92,13 +94,15 @@ public class RemoteRandomAccessReaderTest {
         byte[] data = seqBytes(BLOCK_SIZE * 2 + 10);
         client.writeMultipartFile("ts/idx/cross", new ByteArrayInputStream(data), BLOCK_SIZE);
 
-        RemoteRandomAccessReader reader = new RemoteRandomAccessReader(client, "ts/idx/cross", data.length, BLOCK_SIZE);
-        // Seek to 4 bytes before end of first block
-        reader.seek(BLOCK_SIZE - 4);
-        byte[] buf = new byte[8]; // crosses block boundary
-        reader.readFully(buf);
-        for (int i = 0; i < 8; i++) {
-            assertEquals((byte) (BLOCK_SIZE - 4 + i), buf[i]);
+        try (RemoteRandomAccessReader reader =
+                new RemoteRandomAccessReader(client, "ts/idx/cross", data.length, BLOCK_SIZE)) {
+            // Seek to 4 bytes before end of first block
+            reader.seek(BLOCK_SIZE - 4);
+            byte[] buf = new byte[8]; // crosses block boundary
+            reader.readFully(buf);
+            for (int i = 0; i < 8; i++) {
+                assertEquals((byte) (BLOCK_SIZE - 4 + i), buf[i]);
+            }
         }
     }
 
@@ -110,9 +114,11 @@ public class RemoteRandomAccessReaderTest {
         block[0] = 0x01; block[1] = 0x02; block[2] = 0x03; block[3] = 0x04;
         client.writeMultipartFile("ts/idx/int", new ByteArrayInputStream(block), BLOCK_SIZE);
 
-        RemoteRandomAccessReader reader = new RemoteRandomAccessReader(client, "ts/idx/int", BLOCK_SIZE, BLOCK_SIZE);
-        reader.seek(0);
-        assertEquals(value, reader.readInt());
+        try (RemoteRandomAccessReader reader =
+                new RemoteRandomAccessReader(client, "ts/idx/int", BLOCK_SIZE, BLOCK_SIZE)) {
+            reader.seek(0);
+            assertEquals(value, reader.readInt());
+        }
     }
 
     @Test
@@ -126,9 +132,11 @@ public class RemoteRandomAccessReaderTest {
         block[3] = (byte) bits;
         client.writeMultipartFile("ts/idx/float", new ByteArrayInputStream(block), BLOCK_SIZE);
 
-        RemoteRandomAccessReader reader = new RemoteRandomAccessReader(client, "ts/idx/float", BLOCK_SIZE, BLOCK_SIZE);
-        reader.seek(0);
-        assertEquals(expected, reader.readFloat(), 0.0f);
+        try (RemoteRandomAccessReader reader =
+                new RemoteRandomAccessReader(client, "ts/idx/float", BLOCK_SIZE, BLOCK_SIZE)) {
+            reader.seek(0);
+            assertEquals(expected, reader.readFloat(), 0.0f);
+        }
     }
 
     @Test
@@ -140,9 +148,11 @@ public class RemoteRandomAccessReaderTest {
         }
         client.writeMultipartFile("ts/idx/long", new ByteArrayInputStream(block), BLOCK_SIZE);
 
-        RemoteRandomAccessReader reader = new RemoteRandomAccessReader(client, "ts/idx/long", BLOCK_SIZE, BLOCK_SIZE);
-        reader.seek(0);
-        assertEquals(expected, reader.readLong());
+        try (RemoteRandomAccessReader reader =
+                new RemoteRandomAccessReader(client, "ts/idx/long", BLOCK_SIZE, BLOCK_SIZE)) {
+            reader.seek(0);
+            assertEquals(expected, reader.readLong());
+        }
     }
 
     @Test

@@ -192,6 +192,21 @@
                     <environmentVariables>
                         <DOCKER_API_VERSION>1.43</DOCKER_API_VERSION>
                     </environmentVariables>
+                    <!--
+                      Enable Netty paranoid resource-leak detection for every
+                      forked JVM in this module. This is the canonical
+                      regression gate for ByteBuf refcount discipline (see
+                      issue #415): any test that drops a pooled direct
+                      ByteBuf without releasing it will be flagged with a
+                      LEAK: warning and a stack trace pointing at the
+                      allocation site. We use systemPropertyVariables (rather
+                      than overriding the parent <argLine>) so the JVM flags
+                      and JaCoCo @{argLine} from the parent's ci/default
+                      profiles are preserved.
+                    -->
+                    <systemPropertyVariables>
+                        <io.netty.leakDetection.level>paranoid</io.netty.leakDetection.level>
+                    </systemPropertyVariables>
                 </configuration>
             </plugin>
             <!--

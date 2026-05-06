@@ -61,14 +61,22 @@ public class LocalObjectStorageTest {
         storage.write("ts1/uuid1/1.page", data).get();
 
         ReadResult result = storage.read("ts1/uuid1/1.page").get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertArrayEquals(data, result.content());
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(data, result.content());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
     public void testReadMissing() throws Exception {
         ReadResult result = storage.read("nonexistent/path.page").get();
-        assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        try {
+            assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -78,7 +86,12 @@ public class LocalObjectStorageTest {
 
         assertTrue(storage.delete("ts1/uuid2/1.page").get());
         assertFalse(storage.delete("ts1/uuid2/1.page").get());
-        assertEquals(ReadResult.Status.NOT_FOUND, storage.read("ts1/uuid2/1.page").get().status());
+        ReadResult missing = storage.read("ts1/uuid2/1.page").get();
+        try {
+            assertEquals(ReadResult.Status.NOT_FOUND, missing.status());
+        } finally {
+            missing.release();
+        }
     }
 
     @Test
@@ -122,23 +135,37 @@ public class LocalObjectStorageTest {
 
         // Read a range within block 0
         ReadResult r0 = storage.readRange("ts1/uuid1/graph", 10, 20, 100).get();
-        assertEquals(ReadResult.Status.FOUND, r0.status());
-        assertEquals(20, r0.content().length);
-        for (int i = 0; i < 20; i++) {
-            assertEquals((byte) (10 + i), r0.content()[i]);
+        try {
+            assertEquals(ReadResult.Status.FOUND, r0.status());
+            byte[] r0Bytes = r0.content();
+            assertEquals(20, r0Bytes.length);
+            for (int i = 0; i < 20; i++) {
+                assertEquals((byte) (10 + i), r0Bytes[i]);
+            }
+        } finally {
+            r0.release();
         }
 
         // Read first 5 bytes of block 1
         ReadResult r1 = storage.readRange("ts1/uuid1/graph", 100, 5, 100).get();
-        assertEquals(ReadResult.Status.FOUND, r1.status());
-        assertEquals(5, r1.content().length);
-        for (int i = 0; i < 5; i++) {
-            assertEquals((byte) (100 + i), r1.content()[i]);
+        try {
+            assertEquals(ReadResult.Status.FOUND, r1.status());
+            byte[] r1Bytes = r1.content();
+            assertEquals(5, r1Bytes.length);
+            for (int i = 0; i < 5; i++) {
+                assertEquals((byte) (100 + i), r1Bytes[i]);
+            }
+        } finally {
+            r1.release();
         }
 
         // Read missing block
         ReadResult missing = storage.readRange("ts1/uuid1/graph", 200, 10, 100).get();
-        assertEquals(ReadResult.Status.NOT_FOUND, missing.status());
+        try {
+            assertEquals(ReadResult.Status.NOT_FOUND, missing.status());
+        } finally {
+            missing.release();
+        }
     }
 
     @Test
@@ -152,7 +179,11 @@ public class LocalObjectStorageTest {
 
         // plain file unaffected
         ReadResult r = storage.read("ts1/uuid1/plain.page").get();
-        assertEquals(ReadResult.Status.FOUND, r.status());
+        try {
+            assertEquals(ReadResult.Status.FOUND, r.status());
+        } finally {
+            r.release();
+        }
     }
 
     @Test
@@ -181,8 +212,12 @@ public class LocalObjectStorageTest {
 
         for (CompletableFuture<ReadResult> f : futures) {
             ReadResult result = f.get();
-            assertEquals(ReadResult.Status.FOUND, result.status());
-            assertArrayEquals(data, result.content());
+            try {
+                assertEquals(ReadResult.Status.FOUND, result.status());
+                assertArrayEquals(data, result.content());
+            } finally {
+                result.release();
+            }
         }
     }
 
@@ -201,8 +236,12 @@ public class LocalObjectStorageTest {
         // Verify all writes succeeded
         for (int i = 0; i < 4; i++) {
             ReadResult result = storage.read("ts1/page" + i).get();
-            assertEquals(ReadResult.Status.FOUND, result.status());
-            assertArrayEquals(("data" + i).getBytes(), result.content());
+            try {
+                assertEquals(ReadResult.Status.FOUND, result.status());
+                assertArrayEquals(("data" + i).getBytes(), result.content());
+            } finally {
+                result.release();
+            }
         }
     }
 
@@ -215,8 +254,12 @@ public class LocalObjectStorageTest {
 
         storage.write("ts1/uuid1/large.page", largeData).get();
         ReadResult result = storage.read("ts1/uuid1/large.page").get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertArrayEquals(largeData, result.content());
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(largeData, result.content());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -229,7 +272,11 @@ public class LocalObjectStorageTest {
 
         // Request beyond file size
         ReadResult result = storage.readRange("ts1/uuid1/graph", 150, 10, 100).get();
-        assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        try {
+            assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -239,7 +286,11 @@ public class LocalObjectStorageTest {
 
         // Try to read from a block that doesn't exist
         ReadResult result = storage.readRange("ts1/uuid1/graph", 200, 10, 100).get();
-        assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        try {
+            assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -251,7 +302,11 @@ public class LocalObjectStorageTest {
 
         // Normal read should work fine
         ReadResult result = storage.read("ts1/test.page").get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -261,7 +316,11 @@ public class LocalObjectStorageTest {
         storage.write("ts1/uuid1/nested/deep/path/1.page", data).get();
 
         ReadResult result = storage.read("ts1/uuid1/nested/deep/path/1.page").get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertArrayEquals(data, result.content());
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(data, result.content());
+        } finally {
+            result.release();
+        }
     }
 }
