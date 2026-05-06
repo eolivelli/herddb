@@ -239,8 +239,10 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setSegmentCount(info.getSegmentCount())
                     .setTailerLsnLedger(info.getTailerLsnLedger())
                     .setTailerLsnOffset(info.getTailerLsnOffset())
+                    .setTailerLsnTimestamp(info.getTailerLsnTimestamp())
                     .setDurableLsnLedger(info.getDurableLsnLedger())
                     .setDurableLsnOffset(info.getDurableLsnOffset())
+                    .setDurableLsnTimestamp(info.getDurableLsnTimestamp())
                     .setStatus(info.getStatus())
                     .setLoadingSegmentsDone(info.getLoadingSegmentsDone())
                     .setLoadingSegmentsTotal(info.getLoadingSegmentsTotal())
@@ -326,8 +328,10 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setDirty(details.dirty)
                     .setTailerLsnLedger(details.tailerLsnLedger)
                     .setTailerLsnOffset(details.tailerLsnOffset)
+                    .setTailerLsnTimestamp(details.tailerLsnTimestamp)
                     .setDurableLsnLedger(details.durableLsnLedger)
                     .setDurableLsnOffset(details.durableLsnOffset)
+                    .setDurableLsnTimestamp(details.durableLsnTimestamp)
                     .setFusedPqEnabled(details.fusedPQEnabled)
                     .setM(details.m)
                     .setBeamWidth(details.beamWidth)
@@ -518,7 +522,8 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setPrimaryAdvertisedOffset(advertised != null ? advertised.offset : -1L)
                     .setLastReloadTimestampMs(engine.getShadowLastReloadTimestampMs())
                     .setReloadCount(engine.getShadowReloadCount())
-                    .setAppliedIndexStatusGeneration(engine.getMinAppliedIndexStatusGeneration());
+                    .setAppliedIndexStatusGeneration(engine.getMinAppliedIndexStatusGeneration())
+                    .setLoadedEntryTimestampMs(engine.getShadowLoadedEntryTimestamp());
             responseObserver.onNext(b.build());
             responseObserver.onCompleted();
         } catch (RuntimeException e) {

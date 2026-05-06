@@ -148,6 +148,23 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     private volatile LogSequenceNumber lastProcessedLsn;
     /**
+     * Wall-clock timestamp (epoch ms) of the {@link LogEntry} at
+     * {@link #lastProcessedLsn} — the freshness of the in-memory tailer.
+     * Updated atomically-with-best-effort next to {@link #lastProcessedLsn}
+     * inside {@link #processEntry(LogSequenceNumber, LogEntry)}. {@code 0}
+     * means "no entries processed yet". Issue #423: surfaced via
+     * {@code GetIndexStatus.tailer_lsn_timestamp}.
+     *
+     * <p><b>Caveat:</b> {@link LogEntry#timestamp} is a wall-clock value
+     * stamped by whichever cluster writer produced the entry. Different
+     * writers may have skewed clocks, so this field can <em>regress</em>
+     * between adjacent entries when the tailer crosses a writer boundary.
+     * Use it as an indicative freshness signal for dashboards
+     * ({@code now - lastProcessedEntryTimestamp ≈ "how far behind real
+     * time the IS is"}), not as a monotonic clock.
+     */
+    private volatile long lastProcessedEntryTimestamp;
+    /**
      * The LSN of the most recent checkpoint whose watermark has been
      * successfully persisted via {@link WatermarkStore#save(WatermarkSnapshot)}.
      * After a restart, the engine resumes from this LSN — so the server-side
@@ -161,6 +178,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * {@code watermarkStore.save(...)} call. Never moves backwards.
      */
     private volatile LogSequenceNumber lastDurableLsn = LogSequenceNumber.START_OF_TIME;
+    /**
+     * Wall-clock timestamp (epoch ms) of the {@link LogEntry} at
+     * {@link #lastDurableLsn} — the freshness of the durable recovery state.
+     * Initialized at {@link #start()} from
+     * {@link WatermarkSnapshot#lastEntryTimestamp}. Advanced strictly inside
+     * {@link #checkpointAndSaveWatermark()}, immediately after a successful
+     * {@code watermarkStore.save(...)} call. Issue #423: surfaced via
+     * {@code GetIndexStatus.durable_lsn_timestamp}.
+     */
+    private volatile long lastDurableEntryTimestamp;
     private long entriesSinceLastCheckpoint;
 
     /**
@@ -204,6 +231,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private volatile LogSequenceNumber primaryAdvertisedLsn;
     /** Loaded LSN of the shadow's current on-disk view. */
     private volatile LogSequenceNumber shadowLoadedLsn;
+    /**
+     * Wall-clock timestamp (epoch ms) of the LogEntry at {@link #shadowLoadedLsn}
+     * — the freshness of the data this shadow can serve. Picked up from the
+     * primary's advertised
+     * {@link herddb.metadata.IndexingServiceCheckpointState#getLastEntryTimestampMillis()}
+     * on every reload. {@code 0} means "unknown" (primary has not published
+     * a checkpoint yet). Issue #423: surfaced via
+     * {@code GetShadowStatus.loaded_entry_timestamp_ms}.
+     */
+    private volatile long shadowLoadedEntryTimestamp;
     /** Wall-clock of the most recent successful reload. */
     private volatile long shadowLastReloadTimestampMs;
     /** Count of successful reloads (including the initial one). */
@@ -805,6 +842,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // value is safe even if the JVM was killed mid-checkpoint after the
         // save. See lastDurableLsn JavaDoc (issue #364).
         lastDurableLsn = watermark;
+        // Re-hydrate the durable freshness timestamp from the snapshot so
+        // dashboards can compute "durable_lag_ms" immediately after a
+        // restart, without waiting for the next successful checkpoint.
+        // Stays 0 ("unknown") for START_OF_TIME. Issue #423.
+        lastDurableEntryTimestamp = snapshot.lastEntryTimestamp;
+        // The tailer freshness clock starts at the durable freshness — the
+        // engine will replay entries from `watermark` onward, but until the
+        // first replay tick advances `lastProcessedLsn` we report the same
+        // freshness as the durable state (rather than 0).
+        lastProcessedEntryTimestamp = snapshot.lastEntryTimestamp;
         if (snapshot.numInstances > 0) {
             int previous = currentNumInstances;
             currentNumInstances = snapshot.numInstances;
@@ -973,6 +1020,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     }
 
     /**
+     * Wall-clock timestamp (epoch ms) of the LogEntry at
+     * {@link #getLastProcessedLsn()}. {@code 0} means "unknown" (no entries
+     * processed yet on a fresh engine). Used by {@code GetIndexStatus} so
+     * dashboards can compute {@code tailer_lag_ms = now - timestamp}
+     * (issue #423).
+     */
+    public long getLastProcessedEntryTimestamp() {
+        return lastProcessedEntryTimestamp;
+    }
+
+    /**
      * Returns the LSN of the most recent checkpoint whose watermark has been
      * successfully persisted to remote storage. After a restart, the engine
      * resumes from this value. Used by {@code GetIndexStatus} so the server
@@ -981,6 +1039,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      */
     public LogSequenceNumber getLastDurableLsn() {
         return lastDurableLsn;
+    }
+
+    /**
+     * Wall-clock timestamp (epoch ms) of the LogEntry at
+     * {@link #getLastDurableLsn()}. {@code 0} means "unknown" (no successful
+     * checkpoint yet). Used by {@code GetIndexStatus} so dashboards can
+     * compute {@code durable_lag_ms = now - timestamp} (issue #423).
+     */
+    public long getLastDurableEntryTimestamp() {
+        return lastDurableEntryTimestamp;
     }
 
     /**
@@ -1030,6 +1098,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             }
 
             lastProcessedLsn = lsn;
+            // Track the LogEntry wall-clock so diagnostic tooling can report
+            // "tailer_lag_ms = now - lastProcessedEntryTimestamp" (issue #423).
+            // Note: read separately from lastProcessedLsn under no lock — a
+            // sub-microsecond race between the two volatile writes is
+            // acceptable for a diagnostic measured in seconds.
+            if (entry.timestamp > 0L) {
+                lastProcessedEntryTimestamp = entry.timestamp;
+            }
             entriesSinceLastCheckpoint++;
 
             // Periodically force a checkpoint and then persist the watermark.
@@ -1349,6 +1425,18 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     // package-private for testing
     void setLastProcessedLsnForTest(LogSequenceNumber lsn) {
         this.lastProcessedLsn = lsn;
+    }
+
+    /**
+     * Test-only sibling of {@link #setLastProcessedLsnForTest(LogSequenceNumber)}.
+     * Sets the wall-clock timestamp the engine will treat as "the LogEntry at
+     * the tailer position", used by tests that drive the engine via
+     * {@link #applyEntry(LogSequenceNumber, LogEntry)} (which bypasses
+     * {@code processEntry()}). Issue #423.
+     */
+    // package-private for testing
+    void setLastProcessedEntryTimestampForTest(long timestampMillis) {
+        this.lastProcessedEntryTimestamp = timestampMillis;
     }
 
     /**
@@ -1903,6 +1991,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             // into the in-memory store state before checkpoint captures it.
             awaitPendingWork();
             LogSequenceNumber checkpointLsn = lastProcessedLsn;
+            // Capture the LogEntry timestamp at the same instant as the LSN
+            // so the watermark we publish carries an internally-consistent
+            // (LSN, freshness) pair (issue #423). The two volatile reads are
+            // not strictly atomic, but in the worst case we observe the
+            // (LSN_n, timestamp_{n-1}) pair from two adjacent entries — fine
+            // for a freshness diagnostic measured in seconds.
+            long checkpointEntryTimestamp = lastProcessedEntryTimestamp;
             entriesSinceLastCheckpoint = 0;
 
             boolean allCheckpointsDurable = true;
@@ -2009,6 +2104,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             }
             WatermarkSnapshot snapshotToSave =
                     new WatermarkSnapshot(checkpointLsn, currentNumInstances,
+                            checkpointEntryTimestamp,
                             schemaTables, schemaVectorIndexes);
             try {
                 watermarkStore.save(snapshotToSave);
@@ -2017,6 +2113,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 // checkpointLsn on restart — this is the LSN the server's
                 // retention floor must pin against (issue #364).
                 lastDurableLsn = checkpointLsn;
+                lastDurableEntryTimestamp = checkpointEntryTimestamp;
                 LOGGER.log(Level.FINE, "Saved watermark snapshot {0}", snapshotToSave);
             } catch (IOException e) {
                 // Watermark save failed: leave lastDurableLsn unchanged.
@@ -2028,7 +2125,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             // Advertise the new durable LSN to ZK so shadow replicas can reload.
             // Primaries only; shadows never reach this code path (tailer is
             // not started for them).
-            publishCheckpointStateBestEffort(checkpointLsn);
+            publishCheckpointStateBestEffort(checkpointLsn, checkpointEntryTimestamp);
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "checkpointAndSaveWatermark failed", e);
         }
@@ -2043,7 +2140,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * watermark has already been saved, so the primary is consistent; the
      * shadow will simply observe the next successful publish.
      */
-    private void publishCheckpointStateBestEffort(LogSequenceNumber lsn) {
+    private void publishCheckpointStateBestEffort(LogSequenceNumber lsn, long entryTimestampMillis) {
         if (metadataStorageManager == null || lsn == null || config.isShadow()) {
             return;
         }
@@ -2060,7 +2157,8 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                             lsn.ledgerId,
                             lsn.offset,
                             segmentCount,
-                            System.currentTimeMillis()));
+                            System.currentTimeMillis(),
+                            entryTimestampMillis));
             LOGGER.log(Level.FINE,
                     "Published indexing-service checkpoint state: instance={0}, lsn={1}, segments={2}",
                     new Object[]{instanceId, lsn, segmentCount});
@@ -2080,7 +2178,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             return;
         }
         LogSequenceNumber lsn = lastProcessedLsn != null ? lastProcessedLsn : LogSequenceNumber.START_OF_TIME;
-        publishCheckpointStateBestEffort(lsn);
+        // At engine boot we only know the freshness from the loaded watermark
+        // (or 0 on a fresh install). Issue #423.
+        publishCheckpointStateBestEffort(lsn, lastDurableEntryTimestamp);
     }
 
     // -------------------------------------------------------------------------
@@ -2141,6 +2241,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
         if (primaryState != null) {
             this.primaryAdvertisedLsn = primaryState.toLogSequenceNumber();
+            // Pre-seed the shadow freshness clock from the primary's
+            // advertised state so the very first GetShadowStatus call
+            // after boot already carries a meaningful timestamp, even if
+            // doShadowReload() is racing with us (issue #423).
+            this.shadowLoadedEntryTimestamp = primaryState.getLastEntryTimestampMillis();
         }
         boolean initialReloadOk = doShadowReload();
         this.shadowReady = initialReloadOk;
@@ -2150,6 +2255,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             try {
                 metadataStorageManager.watchIndexingServiceCheckpointState(shadowOf, state -> {
                     this.primaryAdvertisedLsn = state.toLogSequenceNumber();
+                    // Issue #423: do NOT update shadowLoadedEntryTimestamp
+                    // here. The proto contract on
+                    // GetShadowStatus.loaded_entry_timestamp_ms says it is
+                    // the timestamp of the LogEntry at loaded_ledger_id /
+                    // loaded_offset. Advancing the timestamp BEFORE
+                    // doShadowReload() actually replays the new on-disk
+                    // state into each ReadOnlyVectorStore would expose an
+                    // inconsistent (LSN_old, ts_new) pair while the reload
+                    // executor is still running. The post-reload write
+                    // inside doShadowReload() is the only place the
+                    // freshness is published.
                     enqueueShadowReload();
                 });
             } catch (MetadataStorageManagerException e) {
@@ -2230,12 +2346,52 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     }
                 }
             } catch (Exception e) {
+                // Per-store failure isolation: a single ReadOnlyVectorStore
+                // failing its reload (corrupt segment file, transient I/O)
+                // must not abort the whole reload pass for the other stores
+                // this shadow holds. The failed store keeps serving its
+                // previously-loaded view; allOk=false makes the pass
+                // non-final so shadowLastReloadTimestampMs is not advanced.
                 LOGGER.log(Level.WARNING, "Shadow reload failed for index " + ro, e);
                 allOk = false;
             }
         }
         if (maxLsn != null) {
             this.shadowLoadedLsn = maxLsn;
+            // Capture the primary's advertised LogEntry timestamp at the
+            // moment of the reload so GetShadowStatus can report the
+            // freshness of the data this shadow can serve (issue #423).
+            //
+            // Caveats:
+            //   * shadowLoadedLsn is set BEFORE this read so the visible
+            //     pair is at worst (LSN_n, timestamp_{n+1}) — never
+            //     (LSN_n, timestamp_{n-1}). The watch-callback path
+            //     deliberately does NOT touch shadowLoadedEntryTimestamp,
+            //     leaving this method as the single writer.
+            //   * IndexStatus on disk currently always carries
+            //     sequenceNumber=START_OF_TIME (PersistentVectorStore does
+            //     not yet stamp it with the real checkpoint LSN), so we do
+            //     NOT condition the timestamp write on
+            //     maxLsn.equals(primary.toLogSequenceNumber()) — that
+            //     check would never pass and shadow freshness reporting
+            //     would be permanently broken. Instead we trust that the
+            //     primary's published state is internally consistent
+            //     (LSN + timestamp written together in
+            //     publishCheckpointStateBestEffort).
+            try {
+                IndexingServiceCheckpointState primary =
+                        metadataStorageManager != null
+                                ? metadataStorageManager.getIndexingServiceCheckpointState(
+                                        getShadowOfOrMinusOne())
+                                : null;
+                if (primary != null) {
+                    this.shadowLoadedEntryTimestamp = primary.getLastEntryTimestampMillis();
+                }
+            } catch (MetadataStorageManagerException e) {
+                LOGGER.log(Level.FINE,
+                        "Shadow could not refresh primary's lastEntryTimestamp after reload",
+                        e);
+            }
         }
         if (allOk) {
             this.shadowLastReloadTimestampMs = System.currentTimeMillis();
@@ -2283,6 +2439,18 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     public LogSequenceNumber getShadowLoadedLsn() {
         return shadowLoadedLsn;
+    }
+
+    /**
+     * Wall-clock timestamp (epoch ms) of the LogEntry at
+     * {@link #getShadowLoadedLsn()} — the freshness of the data this shadow
+     * can serve. Picked up from the primary's advertised
+     * {@link IndexingServiceCheckpointState#getLastEntryTimestampMillis()} on
+     * every reload. {@code 0} means "unknown" (primary has not published a
+     * checkpoint yet). Issue #423.
+     */
+    public long getShadowLoadedEntryTimestamp() {
+        return shadowLoadedEntryTimestamp;
     }
 
     public LogSequenceNumber getPrimaryAdvertisedLsn() {
@@ -2349,16 +2517,27 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 status = "loading";
             }
         }
-        // Snapshot both LSNs together so the response is internally consistent.
-        // Server-side retention pins on durable_lsn_*; tailer_lsn_* is exposed
-        // for diagnostics only (issue #364).
+        // Snapshot both LSNs and the matching freshness timestamps together.
+        // The pair is approximately consistent: in the worst case a reader
+        // can observe (LSN_n, timestamp_{n+1}) — i.e. the timestamp is one
+        // entry newer than the LSN — because the writes in processEntry()
+        // are not atomic across the two volatile fields. Acceptable for a
+        // diagnostic measured in seconds; locking would impose hot-path
+        // cost for no operational benefit.
+        // Server-side retention pins on durable_lsn_*; tailer_lsn_* is
+        // exposed for diagnostics only (issue #364). Timestamps are
+        // diagnostic-only (issue #423).
         LogSequenceNumber tailerSnap = lastProcessedLsn;
+        long tailerTsSnap = lastProcessedEntryTimestamp;
         LogSequenceNumber durableSnap = lastDurableLsn;
+        long durableTsSnap = lastDurableEntryTimestamp;
         return new IndexStatusInfo(vectorCount, segmentCount,
                 tailerSnap != null ? tailerSnap.ledgerId : -1,
                 tailerSnap != null ? tailerSnap.offset : -1,
+                tailerTsSnap,
                 durableSnap != null ? durableSnap.ledgerId : -1,
                 durableSnap != null ? durableSnap.offset : -1,
+                durableTsSnap,
                 status,
                 loadingSegmentsDone, loadingSegmentsTotal);
     }
@@ -2494,6 +2673,10 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             d.tailerLsnLedger = -1L;
             d.tailerLsnOffset = -1L;
         }
+        // Capture timestamps in the same order as the LSN reads above, so the
+        // (LSN, timestamp) pairs come from the same volatile-write window.
+        // Issue #423.
+        d.tailerLsnTimestamp = lastProcessedEntryTimestamp;
         LogSequenceNumber durableSnap = lastDurableLsn;
         if (durableSnap != null) {
             d.durableLsnLedger = durableSnap.ledgerId;
@@ -2502,6 +2685,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             d.durableLsnLedger = -1L;
             d.durableLsnOffset = -1L;
         }
+        d.durableLsnTimestamp = lastDurableEntryTimestamp;
         return d;
     }
 
@@ -3527,23 +3711,29 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         private final int segmentCount;
         private final long tailerLsnLedger;
         private final long tailerLsnOffset;
+        private final long tailerLsnTimestamp;
         private final long durableLsnLedger;
         private final long durableLsnOffset;
+        private final long durableLsnTimestamp;
         private final String status;
         private final int loadingSegmentsDone;
         private final int loadingSegmentsTotal;
 
         public IndexStatusInfo(long vectorCount, int segmentCount,
                                long tailerLsnLedger, long tailerLsnOffset,
+                               long tailerLsnTimestamp,
                                long durableLsnLedger, long durableLsnOffset,
+                               long durableLsnTimestamp,
                                String status,
                                int loadingSegmentsDone, int loadingSegmentsTotal) {
             this.vectorCount = vectorCount;
             this.segmentCount = segmentCount;
             this.tailerLsnLedger = tailerLsnLedger;
             this.tailerLsnOffset = tailerLsnOffset;
+            this.tailerLsnTimestamp = tailerLsnTimestamp;
             this.durableLsnLedger = durableLsnLedger;
             this.durableLsnOffset = durableLsnOffset;
+            this.durableLsnTimestamp = durableLsnTimestamp;
             this.status = status;
             this.loadingSegmentsDone = loadingSegmentsDone;
             this.loadingSegmentsTotal = loadingSegmentsTotal;
@@ -3565,12 +3755,29 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             return tailerLsnOffset;
         }
 
+        /**
+         * Wall-clock timestamp (epoch ms) of the LogEntry at the tailer LSN.
+         * {@code 0} means "unknown" (no entries processed yet). Issue #423.
+         */
+        public long getTailerLsnTimestamp() {
+            return tailerLsnTimestamp;
+        }
+
         public long getDurableLsnLedger() {
             return durableLsnLedger;
         }
 
         public long getDurableLsnOffset() {
             return durableLsnOffset;
+        }
+
+        /**
+         * Wall-clock timestamp (epoch ms) of the LogEntry at the durable
+         * watermark LSN. {@code 0} means "unknown" (no successful checkpoint
+         * yet). Issue #423.
+         */
+        public long getDurableLsnTimestamp() {
+            return durableLsnTimestamp;
         }
 
         public String getStatus() {
@@ -3673,9 +3880,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // In-memory tailer position; diagnostic only. See IndexStatusInfo.
         public long tailerLsnLedger;
         public long tailerLsnOffset;
+        // Wall-clock (epoch ms) of the LogEntry at the tailer LSN; 0=unknown.
+        // Issue #423.
+        public long tailerLsnTimestamp;
         // Durable recovery LSN; the LSN the engine resumes from on restart.
         public long durableLsnLedger;
         public long durableLsnOffset;
+        // Wall-clock (epoch ms) of the LogEntry at the durable LSN; 0=unknown.
+        // Issue #423.
+        public long durableLsnTimestamp;
         public boolean fusedPQEnabled;
         public int m;
         public int beamWidth;

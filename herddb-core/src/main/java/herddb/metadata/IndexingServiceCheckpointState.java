@@ -34,6 +34,19 @@ import java.util.Objects;
  * Written at {@code /herddb/indexingServices/state/{instanceId}} after each
  * successful checkpoint so shadow replicas can observe progress and reload
  * their on-disk snapshots.
+ *
+ * <p>Carries two timestamps with very different semantics:
+ * <ul>
+ *   <li>{@link #getTimestampMillis()} — wall-clock when the primary
+ *       <em>published</em> the checkpoint state. Useful as a heartbeat ("is
+ *       the primary still alive?").</li>
+ *   <li>{@link #getLastEntryTimestampMillis()} (issue #423) — wall-clock
+ *       timestamp of the {@link herddb.log.LogEntry} at
+ *       {@code (ledgerId, offset)}. The freshness of the data the shadow
+ *       reloaded from disk: {@code now - lastEntryTimestampMillis} is the
+ *       time-lag between real-world writes and what the shadow can serve.
+ *       {@code 0} means "unknown" (no checkpoint yet).</li>
+ * </ul>
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public final class IndexingServiceCheckpointState {
@@ -45,6 +58,7 @@ public final class IndexingServiceCheckpointState {
     private final long offset;
     private final int segmentCount;
     private final long timestampMillis;
+    private final long lastEntryTimestampMillis;
 
     @JsonCreator
     public IndexingServiceCheckpointState(
@@ -52,12 +66,14 @@ public final class IndexingServiceCheckpointState {
             @JsonProperty("ledgerId") long ledgerId,
             @JsonProperty("offset") long offset,
             @JsonProperty("segmentCount") int segmentCount,
-            @JsonProperty("timestampMillis") long timestampMillis) {
+            @JsonProperty("timestampMillis") long timestampMillis,
+            @JsonProperty("lastEntryTimestampMillis") long lastEntryTimestampMillis) {
         this.instanceId = instanceId;
         this.ledgerId = ledgerId;
         this.offset = offset;
         this.segmentCount = segmentCount;
         this.timestampMillis = timestampMillis;
+        this.lastEntryTimestampMillis = lastEntryTimestampMillis;
     }
 
     public int getInstanceId() {
@@ -78,6 +94,16 @@ public final class IndexingServiceCheckpointState {
 
     public long getTimestampMillis() {
         return timestampMillis;
+    }
+
+    /**
+     * Wall-clock timestamp (epoch ms) of the {@link herddb.log.LogEntry} at
+     * {@code (ledgerId, offset)} — i.e. the freshness of the data the shadow
+     * reloaded from disk after this checkpoint. {@code 0} means "unknown".
+     * Issue #423.
+     */
+    public long getLastEntryTimestampMillis() {
+        return lastEntryTimestampMillis;
     }
 
     @JsonIgnore
@@ -110,12 +136,14 @@ public final class IndexingServiceCheckpointState {
                 && ledgerId == that.ledgerId
                 && offset == that.offset
                 && segmentCount == that.segmentCount
-                && timestampMillis == that.timestampMillis;
+                && timestampMillis == that.timestampMillis
+                && lastEntryTimestampMillis == that.lastEntryTimestampMillis;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(instanceId, ledgerId, offset, segmentCount, timestampMillis);
+        return Objects.hash(instanceId, ledgerId, offset, segmentCount,
+                timestampMillis, lastEntryTimestampMillis);
     }
 
     @Override
@@ -126,6 +154,7 @@ public final class IndexingServiceCheckpointState {
                 + ", offset=" + offset
                 + ", segmentCount=" + segmentCount
                 + ", timestampMillis=" + timestampMillis
+                + ", lastEntryTimestampMillis=" + lastEntryTimestampMillis
                 + '}';
     }
 }

@@ -37,6 +37,7 @@ import herddb.model.Table;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.Properties;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicReference;
@@ -47,32 +48,26 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 /**
- * Issue #364: the IS must publish its <em>durable</em> recovery LSN — the
- * LSN of the most recent checkpoint whose watermark has been persisted to
- * remote storage — so that the server's commit-log retention floor never
- * drops a ledger the IS would still need to replay on a restart. The
- * volatile in-memory tailer position ({@code lastProcessedLsn}) advances
- * on every applied entry and is therefore unsafe as a retention floor.
+ * Issue #423: the indexing-service engine reports the wall-clock timestamp of
+ * the last processed {@link LogEntry} (so dashboards can compute
+ * {@code now - timestamp = tailer_lag_ms}) and the timestamp at the durable
+ * watermark LSN (for {@code durable_lag_ms}).
  *
- * <p>This test exercises the engine end-to-end:
+ * <p>These tests cover:
  * <ol>
- *   <li>{@code lastDurableLsn} is initialized from the loaded
- *       {@link WatermarkSnapshot#lsn} on engine start.</li>
- *   <li>It does NOT advance simply because entries were applied — only the
- *       tailer position advances when a successful save has not yet
- *       happened.</li>
- *   <li>It DOES advance after a successful
- *       {@link IndexingServiceEngine#forceCheckpointAndSaveWatermark()}.</li>
- *   <li>If the watermark save fails (I/O error from the
- *       {@link WatermarkStore}), {@code lastDurableLsn} stays anchored at
- *       the previous durable value while {@code lastProcessedLsn} keeps
- *       advancing.</li>
- *   <li>{@code getIndexStatus(...)} reports both LSNs distinctly so the
- *       gRPC layer can serialize them as {@code tailer_lsn_*} and
- *       {@code durable_lsn_*}.</li>
+ *   <li>{@code lastProcessedEntryTimestamp} advances on every entry that flows
+ *       through the tailer's {@code processEntry} path.</li>
+ *   <li>{@code lastDurableEntryTimestamp} only moves after a successful
+ *       {@code forceCheckpointAndSaveWatermark()}.</li>
+ *   <li>It stays anchored at the previous durable value when the watermark
+ *       save fails — same invariant as the durable LSN itself.</li>
+ *   <li>Both timestamps are exposed via {@code getIndexStatus()}.</li>
+ *   <li>The persisted watermark snapshot carries the durable timestamp, so a
+ *       restarting engine re-hydrates {@code lastDurableEntryTimestamp} from
+ *       the snapshot rather than starting at 0.</li>
  * </ol>
  */
-public class IndexingServiceEngineDurableLsnTest {
+public class IndexingServiceEngineLagTimestampsTest {
 
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
@@ -97,9 +92,8 @@ public class IndexingServiceEngineDurableLsnTest {
 
     /**
      * In-memory {@link WatermarkStore} whose {@code save()} can be flipped
-     * into a permanent failure mode: a single test can observe the engine's
-     * behaviour both when the save succeeds and when it fails, on the same
-     * engine instance.
+     * into a permanent failure mode. Mirrors the helper used in
+     * {@link IndexingServiceEngineDurableLsnTest}.
      */
     private static final class FailableWatermarkStore implements WatermarkStore {
         private final AtomicReference<WatermarkSnapshot> saved =
@@ -125,6 +119,10 @@ public class IndexingServiceEngineDurableLsnTest {
                 throw new IOException("simulated watermark save failure");
             }
             saved.set(snapshot);
+        }
+
+        synchronized WatermarkSnapshot peek() {
+            return saved.get();
         }
     }
 
@@ -153,11 +151,6 @@ public class IndexingServiceEngineDurableLsnTest {
         return v;
     }
 
-    /**
-     * Builds an engine with a real {@link PersistentVectorStore} factory
-     * and a custom {@link WatermarkStore}. Returns the engine ready to
-     * receive DDL.
-     */
     private IndexingServiceEngine buildEngine(WatermarkStore watermark) throws Exception {
         Path logDir = folder.newFolder("log").toPath();
         Path dataDir = folder.newFolder("data").toPath();
@@ -191,57 +184,45 @@ public class IndexingServiceEngineDurableLsnTest {
     }
 
     /**
-     * On a fresh engine (no persisted watermark), {@code lastDurableLsn} is
-     * {@link LogSequenceNumber#START_OF_TIME}. Applying entries advances
-     * the tailer position only — durable stays at START_OF_TIME until a
-     * checkpoint succeeds.
+     * The engine's tailer freshness clock must match the LogEntry timestamp
+     * fed into {@code processEntry}, and {@link IndexingServiceEngine.IndexStatusInfo}
+     * must surface both that and the durable freshness via the same accessor
+     * the gRPC layer reads.
      */
     @Test
-    public void freshEngineHasStartOfTimeDurableLsn() throws Exception {
+    public void tailerTimestampAdvancesViaProcessEntryAndIsExposedOnGetIndexStatus() throws Exception {
         FailableWatermarkStore watermark =
                 new FailableWatermarkStore(WatermarkSnapshot.START_OF_TIME);
         IndexingServiceEngine engine = buildEngine(watermark);
         try {
             engine.start();
-            assertEquals("fresh engine durable LSN must be START_OF_TIME",
-                    LogSequenceNumber.START_OF_TIME, engine.getLastDurableLsn());
-            assertEquals("tailer LSN must also start at START_OF_TIME",
-                    LogSequenceNumber.START_OF_TIME, engine.getLastProcessedLsn());
 
-            // Apply a few entries — tailer advances, durable does not.
+            assertEquals("fresh engine reports tailer timestamp as unknown (0)",
+                    0L, engine.getLastProcessedEntryTimestamp());
+
+            // Drive an entry through the same path as the live tailer
+            // (processEntryForTest -> processEntry).
             Table table = createTable();
-            engine.applyEntry(new LogSequenceNumber(1, 1),
-                    LogEntryFactory.createTable(table, null));
-            engine.setLastProcessedLsnForTest(new LogSequenceNumber(1, 1));
+            long entryTimestamp = 1_700_000_001_234L;
+            LogEntry create = LogEntryFactory.createTable(table, null);
+            // LogEntryFactory.createTable already stamps the timestamp from
+            // System.currentTimeMillis(); for a deterministic assertion we
+            // replace it with a hand-crafted one.
+            LogEntry stamped = new LogEntry(entryTimestamp,
+                    create.type, create.transactionId, create.tableId,
+                    create.key, create.value);
+            engine.processEntryForTest(new LogSequenceNumber(1, 1), stamped);
 
-            assertEquals("durable LSN must NOT advance just because the tailer applied entries",
-                    LogSequenceNumber.START_OF_TIME, engine.getLastDurableLsn());
-            assertEquals("tailer LSN must reflect the last applied entry",
-                    new LogSequenceNumber(1, 1), engine.getLastProcessedLsn());
-        } finally {
-            engine.close();
-        }
-    }
+            assertEquals("tailer timestamp must advance to the LogEntry timestamp",
+                    entryTimestamp, engine.getLastProcessedEntryTimestamp());
 
-    /**
-     * The engine resumes its durable LSN from the persisted snapshot — this
-     * is the recovery floor the server's retention pin must respect.
-     */
-    @Test
-    public void durableLsnRecoveredFromWatermarkSnapshot() throws Exception {
-        LogSequenceNumber persisted = new LogSequenceNumber(7, 113);
-        FailableWatermarkStore watermark =
-                new FailableWatermarkStore(new WatermarkSnapshot(persisted, 1,
-                        0L,
-                        java.util.Collections.emptyList(),
-                        java.util.Collections.emptyList()));
-        IndexingServiceEngine engine = buildEngine(watermark);
-        try {
-            engine.start();
-            assertEquals("durable LSN must equal the loaded watermark snapshot",
-                    persisted, engine.getLastDurableLsn());
-            assertEquals("tailer LSN is initialized from the same snapshot",
-                    persisted, engine.getLastProcessedLsn());
+            // And it must surface on getIndexStatus.
+            IndexingServiceEngine.IndexStatusInfo info =
+                    engine.getIndexStatus("local", "", "");
+            assertEquals("getIndexStatus.tailer_lsn_timestamp must match",
+                    entryTimestamp, info.getTailerLsnTimestamp());
+            assertEquals("getIndexStatus.durable_lsn_timestamp must still be 0 (no checkpoint)",
+                    0L, info.getDurableLsnTimestamp());
         } finally {
             engine.close();
         }
@@ -249,18 +230,18 @@ public class IndexingServiceEngineDurableLsnTest {
 
     /**
      * After a successful {@code forceCheckpointAndSaveWatermark()}, the
-     * durable LSN advances to match the captured checkpoint LSN — that
-     * value is now the safe recovery floor for the server.
+     * durable timestamp must advance to the timestamp captured at the same
+     * instant as the checkpoint LSN, and the persisted snapshot must carry
+     * it.
      */
     @Test
-    public void durableLsnAdvancesAfterSuccessfulCheckpoint() throws Exception {
+    public void durableTimestampAdvancesAfterSuccessfulCheckpoint() throws Exception {
         FailableWatermarkStore watermark =
                 new FailableWatermarkStore(WatermarkSnapshot.START_OF_TIME);
         IndexingServiceEngine engine = buildEngine(watermark);
         try {
             engine.start();
 
-            // Apply DDL and enough vectors that Phase B has work to do.
             Table table = createTable();
             engine.applyEntry(new LogSequenceNumber(1, 1),
                     LogEntryFactory.createTable(table, null));
@@ -273,7 +254,7 @@ public class IndexingServiceEngineDurableLsnTest {
             engine.applyEntry(new LogSequenceNumber(1, 2),
                     LogEntryFactory.createIndex(index, null));
 
-            Random rng = new Random(101);
+            Random rng = new Random(303);
             int numVectors = 256;
             int dim = 16;
             long baseLsn = 100;
@@ -289,30 +270,38 @@ public class IndexingServiceEngineDurableLsnTest {
             }
             engine.awaitPendingWorkForTest();
             engine.setLastProcessedLsnForTest(lastLsn);
+            // Pretend the very last LogEntry the tailer saw had this timestamp.
+            long lastEntryTs = 1_700_000_500_000L;
+            engine.setLastProcessedEntryTimestampForTest(lastEntryTs);
 
-            assertEquals("before checkpoint, durable still START_OF_TIME",
-                    LogSequenceNumber.START_OF_TIME, engine.getLastDurableLsn());
+            assertEquals("before checkpoint, durable timestamp still 0",
+                    0L, engine.getLastDurableEntryTimestamp());
 
             engine.forceCheckpointAndSaveWatermark();
 
-            assertEquals("durable LSN must advance to the checkpoint LSN",
-                    lastLsn, engine.getLastDurableLsn());
-            assertEquals("durable LSN equals tailer LSN once the checkpoint succeeds",
-                    engine.getLastProcessedLsn(), engine.getLastDurableLsn());
+            assertEquals("durable timestamp must advance to the captured value",
+                    lastEntryTs, engine.getLastDurableEntryTimestamp());
+            assertEquals("persisted watermark must carry the timestamp",
+                    lastEntryTs, watermark.peek().lastEntryTimestamp);
+            // Equally, getIndexStatus exposes both fields.
+            IndexingServiceEngine.IndexStatusInfo info =
+                    engine.getIndexStatus("local", "vectable", "vidx");
+            assertEquals("getIndexStatus.durable_lsn_timestamp",
+                    lastEntryTs, info.getDurableLsnTimestamp());
+            assertEquals("getIndexStatus.tailer_lsn_timestamp",
+                    lastEntryTs, info.getTailerLsnTimestamp());
         } finally {
             engine.close();
         }
     }
 
     /**
-     * Issue #364 core invariant: when {@code watermarkStore.save()} fails,
-     * the durable LSN must stay anchored at the previous durable value,
-     * even though the in-memory tailer position has advanced past the
-     * failed checkpoint LSN. The server's retention floor must never use
-     * the tailer position as a recovery point.
+     * Mirror of {@code durableLsnDoesNotAdvanceIfWatermarkSaveFails}: when the
+     * watermark save fails, the durable timestamp must stay anchored at the
+     * previous durable value even though the tailer timestamp has moved on.
      */
     @Test
-    public void durableLsnDoesNotAdvanceIfWatermarkSaveFails() throws Exception {
+    public void durableTimestampDoesNotAdvanceIfWatermarkSaveFails() throws Exception {
         FailableWatermarkStore watermark =
                 new FailableWatermarkStore(WatermarkSnapshot.START_OF_TIME);
         IndexingServiceEngine engine = buildEngine(watermark);
@@ -331,8 +320,8 @@ public class IndexingServiceEngineDurableLsnTest {
             engine.applyEntry(new LogSequenceNumber(1, 2),
                     LogEntryFactory.createIndex(index, null));
 
-            // First (successful) checkpoint — establishes a baseline durable LSN.
-            Random rng = new Random(202);
+            // First successful checkpoint establishes a baseline.
+            Random rng = new Random(404);
             int dim = 16;
             long baseLsn = 100;
             LogSequenceNumber firstLsn = null;
@@ -347,57 +336,53 @@ public class IndexingServiceEngineDurableLsnTest {
             }
             engine.awaitPendingWorkForTest();
             engine.setLastProcessedLsnForTest(firstLsn);
+            long firstTs = 1_700_000_100_000L;
+            engine.setLastProcessedEntryTimestampForTest(firstTs);
             engine.forceCheckpointAndSaveWatermark();
-            LogSequenceNumber baselineDurable = engine.getLastDurableLsn();
-            assertEquals("baseline durable LSN must equal first checkpoint LSN",
-                    firstLsn, baselineDurable);
+            assertEquals("baseline durable timestamp set", firstTs,
+                    engine.getLastDurableEntryTimestamp());
 
-            // Second batch of inserts — tailer advances past baseline.
+            // Now the second checkpoint will fail to save: the tailer
+            // timestamp keeps advancing, but the durable timestamp must NOT.
+            watermark.setFailOnNextSave(true);
             LogSequenceNumber secondLsn = null;
-            for (int i = 0; i < 200; i++) {
+            for (int i = 256; i < 384; i++) {
                 Record record = RecordSerializer.makeRecord(table,
-                        "pk", "k" + (1000 + i),
+                        "pk", "k" + i,
                         "vec", randomVector(rng, dim));
                 LogEntry insert =
                         LogEntryFactory.insert(table, record.key, record.value, null);
-                secondLsn = new LogSequenceNumber(2, i + 1);
+                secondLsn = new LogSequenceNumber(1, baseLsn + i);
                 engine.applySingleEntryForTest(secondLsn, insert);
             }
             engine.awaitPendingWorkForTest();
             engine.setLastProcessedLsnForTest(secondLsn);
-
-            // Second checkpoint with the watermark save failing — durable
-            // LSN must stay at the baseline, NOT advance to secondLsn.
-            watermark.setFailOnNextSave(true);
+            long secondTs = 1_700_000_200_000L;
+            engine.setLastProcessedEntryTimestampForTest(secondTs);
             engine.forceCheckpointAndSaveWatermark();
 
-            assertEquals("durable LSN must stay anchored when the save fails",
-                    baselineDurable, engine.getLastDurableLsn());
-            assertNotEquals(
-                    "tailer LSN has advanced past the durable LSN — exactly the "
-                            + "scenario where reporting tailer LSN to the server "
-                            + "would break recovery (issue #364)",
-                    engine.getLastProcessedLsn(), engine.getLastDurableLsn());
-            assertEquals("tailer reflects the last applied entry",
-                    secondLsn, engine.getLastProcessedLsn());
-
-            // Recover: the next save succeeds and the durable LSN catches up.
-            watermark.setFailOnNextSave(false);
-            engine.forceCheckpointAndSaveWatermark();
-            assertEquals("durable LSN catches up after the next successful save",
-                    secondLsn, engine.getLastDurableLsn());
+            assertEquals("durable timestamp must stay anchored at the previous durable value",
+                    firstTs, engine.getLastDurableEntryTimestamp());
+            assertNotEquals("tailer timestamp must have moved on",
+                    firstTs, engine.getLastProcessedEntryTimestamp());
+            assertEquals("tailer timestamp tracks the most recently processed entry",
+                    secondTs, engine.getLastProcessedEntryTimestamp());
         } finally {
             engine.close();
         }
     }
 
     /**
-     * Verifies {@link IndexingServiceEngine#getIndexStatus} carries the two
-     * LSNs as distinct fields — this is what the gRPC server then maps onto
-     * {@code tailer_lsn_*} and {@code durable_lsn_*} on the wire.
+     * The {@code entry.timestamp > 0} guard inside
+     * {@code processEntry()} must skip the volatile write when an entry
+     * carries an unknown ({@code 0}) or negative timestamp, so the previous
+     * "best known freshness" is preserved instead of silently regressing
+     * to 0 / unknown. Without this guard, a single test fixture or a
+     * historical entry with a missing timestamp would briefly clobber the
+     * lag dashboard.
      */
     @Test
-    public void getIndexStatusReportsBothLsnsDistinctly() throws Exception {
+    public void tailerTimestampLeavesPriorValueWhenEntryTimestampIsZero() throws Exception {
         FailableWatermarkStore watermark =
                 new FailableWatermarkStore(WatermarkSnapshot.START_OF_TIME);
         IndexingServiceEngine engine = buildEngine(watermark);
@@ -405,22 +390,60 @@ public class IndexingServiceEngineDurableLsnTest {
             engine.start();
 
             Table table = createTable();
-            engine.applyEntry(new LogSequenceNumber(1, 1),
-                    LogEntryFactory.createTable(table, null));
-            engine.setLastProcessedLsnForTest(new LogSequenceNumber(5, 42));
+            // First, a normal entry with a real timestamp.
+            long realTs = 1_700_000_010_000L;
+            LogEntry create = LogEntryFactory.createTable(table, null);
+            LogEntry stamped = new LogEntry(realTs,
+                    create.type, create.transactionId, create.tableId,
+                    create.key, create.value);
+            engine.processEntryForTest(new LogSequenceNumber(1, 1), stamped);
+            assertEquals("real timestamp recorded",
+                    realTs, engine.getLastProcessedEntryTimestamp());
 
-            IndexingServiceEngine.IndexStatusInfo info =
-                    engine.getIndexStatus("local", "", "");
-            assertEquals("tailer ledger from getIndexStatus",
-                    5, info.getTailerLsnLedger());
-            assertEquals("tailer offset from getIndexStatus",
-                    42, info.getTailerLsnOffset());
-            assertEquals("durable ledger from getIndexStatus is START_OF_TIME ledger (-1)",
-                    LogSequenceNumber.START_OF_TIME.ledgerId,
-                    info.getDurableLsnLedger());
-            assertEquals("durable offset from getIndexStatus is START_OF_TIME offset (-1)",
-                    LogSequenceNumber.START_OF_TIME.offset,
-                    info.getDurableLsnOffset());
+            // Now replay an entry with timestamp=0 (synthetic / pre-#423
+            // replay). The engine must NOT regress the freshness clock.
+            LogEntry zeroStamped = new LogEntry(0L,
+                    create.type, create.transactionId, create.tableId,
+                    create.key, create.value);
+            engine.processEntryForTest(new LogSequenceNumber(1, 2), zeroStamped);
+            assertEquals("timestamp=0 must NOT clobber prior freshness",
+                    realTs, engine.getLastProcessedEntryTimestamp());
+
+            // Same for a negative timestamp (defense-in-depth).
+            LogEntry negStamped = new LogEntry(-5L,
+                    create.type, create.transactionId, create.tableId,
+                    create.key, create.value);
+            engine.processEntryForTest(new LogSequenceNumber(1, 3), negStamped);
+            assertEquals("negative timestamp must NOT clobber prior freshness",
+                    realTs, engine.getLastProcessedEntryTimestamp());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * Issue #423 + #364: a restarting engine must re-hydrate the durable
+     * freshness from the persisted watermark snapshot — otherwise dashboards
+     * would briefly show a "0 (unknown)" durable lag every time a pod
+     * restarts, even though the engine in fact recovers from a known
+     * checkpoint.
+     */
+    @Test
+    public void durableTimestampRecoveredFromWatermarkSnapshot() throws Exception {
+        LogSequenceNumber persisted = new LogSequenceNumber(7, 113);
+        long persistedTs = 1_700_000_777_000L;
+        FailableWatermarkStore watermark = new FailableWatermarkStore(
+                new WatermarkSnapshot(persisted, 1, persistedTs,
+                        Collections.emptyList(), Collections.emptyList()));
+        IndexingServiceEngine engine = buildEngine(watermark);
+        try {
+            engine.start();
+            assertEquals("durable timestamp re-hydrated from persisted snapshot",
+                    persistedTs, engine.getLastDurableEntryTimestamp());
+            // The tailer freshness is also pre-seeded so the very first
+            // GetIndexStatus after boot already carries a meaningful value.
+            assertEquals("tailer timestamp pre-seeded from persisted snapshot",
+                    persistedTs, engine.getLastProcessedEntryTimestamp());
         } finally {
             engine.close();
         }

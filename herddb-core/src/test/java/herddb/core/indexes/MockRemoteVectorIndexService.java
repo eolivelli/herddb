@@ -121,7 +121,12 @@ public class MockRemoteVectorIndexService implements RemoteVectorIndexService {
     public IndexStatusInfo getIndexStatus(String tablespace, String table, String index) {
         String key = indexKey(table, index);
         List<VectorEntry> entries = indexes.getOrDefault(key, Collections.emptyList());
-        return new IndexStatusInfo(entries.size(), 1, 0, 0, 0, 0, "mock");
+        // tailerLsnTimestamp / durableLsnTimestamp default to 0 ("unknown")
+        // since the mock has no real commit-log behind it. Issue #423.
+        return new IndexStatusInfo(entries.size(), 1,
+                0, 0, 0L,
+                0, 0, 0L,
+                "mock", 0, 0);
     }
 
     @Override

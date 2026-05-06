@@ -325,7 +325,8 @@ public class ShadowAcrossRebalanceTest {
             // fire and the shadow's reload count must advance.
             metadata.publishIndexingServiceCheckpointState(
                     new IndexingServiceCheckpointState(99, 7L, 42L, 0,
-                            System.currentTimeMillis()));
+                            System.currentTimeMillis(),
+                            System.currentTimeMillis() - 100));
 
             long deadline = System.currentTimeMillis() + 5000;
             while (shadow.getShadowReloadCount() <= beforeReloads

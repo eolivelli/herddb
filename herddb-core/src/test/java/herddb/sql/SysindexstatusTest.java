@@ -151,6 +151,12 @@ public class SysindexstatusTest {
                 assertTrue("should contain vectorCount", props.contains("\"vectorCount\":"));
                 assertTrue("should contain segmentCount", props.contains("\"segmentCount\":"));
                 assertTrue("should contain status", props.contains("\"status\":"));
+                // Issue #423: freshness timestamps must surface in the
+                // sysindexstatus JSON for vector indexes.
+                assertTrue("should contain tailerLsnTimestamp",
+                        props.contains("\"tailerLsnTimestamp\":"));
+                assertTrue("should contain durableLsnTimestamp",
+                        props.contains("\"durableLsnTimestamp\":"));
             }
 
             // Insert more rows and verify count changes

@@ -300,19 +300,26 @@ public final class IndexingAdminCli {
                 m.put("segment_count", response.getSegmentCount());
                 m.put("tailer_lsn_ledger", response.getTailerLsnLedger());
                 m.put("tailer_lsn_offset", response.getTailerLsnOffset());
+                m.put("tailer_lsn_timestamp", response.getTailerLsnTimestamp());
+                m.put("tailer_lag_ms", computeLagMs(response.getTailerLsnTimestamp()));
                 m.put("durable_lsn_ledger", response.getDurableLsnLedger());
                 m.put("durable_lsn_offset", response.getDurableLsnOffset());
+                m.put("durable_lsn_timestamp", response.getDurableLsnTimestamp());
+                m.put("durable_lag_ms", computeLagMs(response.getDurableLsnTimestamp()));
                 m.put("status", response.getStatus());
                 out.println(JsonWriter.toJson(m));
             } else {
                 out.printf(Locale.ROOT,
-                        "vectors=%d segments=%d tailer_lsn=%d/%d durable_lsn=%d/%d status=%s%n",
+                        "vectors=%d segments=%d tailer_lsn=%d/%d tailer_lag_ms=%d "
+                                + "durable_lsn=%d/%d durable_lag_ms=%d status=%s%n",
                         response.getVectorCount(),
                         response.getSegmentCount(),
                         response.getTailerLsnLedger(),
                         response.getTailerLsnOffset(),
+                        computeLagMs(response.getTailerLsnTimestamp()),
                         response.getDurableLsnLedger(),
                         response.getDurableLsnOffset(),
+                        computeLagMs(response.getDurableLsnTimestamp()),
                         response.getStatus());
             }
         }
@@ -506,8 +513,12 @@ public final class IndexingAdminCli {
         m.put("dirty", r.getDirty());
         m.put("tailer_lsn_ledger", r.getTailerLsnLedger());
         m.put("tailer_lsn_offset", r.getTailerLsnOffset());
+        m.put("tailer_lsn_timestamp", r.getTailerLsnTimestamp());
+        m.put("tailer_lag_ms", computeLagMs(r.getTailerLsnTimestamp()));
         m.put("durable_lsn_ledger", r.getDurableLsnLedger());
         m.put("durable_lsn_offset", r.getDurableLsnOffset());
+        m.put("durable_lsn_timestamp", r.getDurableLsnTimestamp());
+        m.put("durable_lag_ms", computeLagMs(r.getDurableLsnTimestamp()));
         m.put("fused_pq_enabled", r.getFusedPqEnabled());
         m.put("m", r.getM());
         m.put("beam_width", r.getBeamWidth());
@@ -574,10 +585,12 @@ public final class IndexingAdminCli {
         out.printf(Locale.ROOT, "  dirty                 = %s%n", r.getDirty());
         out.printf(Locale.ROOT, "  fused_pq_enabled      = %s%n", r.getFusedPqEnabled());
         out.printf(Locale.ROOT, "  m / beam_width        = %d / %d%n", r.getM(), r.getBeamWidth());
-        out.printf(Locale.ROOT, "  tailer_lsn            = %d/%d%n",
-                r.getTailerLsnLedger(), r.getTailerLsnOffset());
-        out.printf(Locale.ROOT, "  durable_lsn           = %d/%d%n",
-                r.getDurableLsnLedger(), r.getDurableLsnOffset());
+        out.printf(Locale.ROOT, "  tailer_lsn            = %d/%d (lag_ms=%d)%n",
+                r.getTailerLsnLedger(), r.getTailerLsnOffset(),
+                computeLagMs(r.getTailerLsnTimestamp()));
+        out.printf(Locale.ROOT, "  durable_lsn           = %d/%d (lag_ms=%d)%n",
+                r.getDurableLsnLedger(), r.getDurableLsnOffset(),
+                computeLagMs(r.getDurableLsnTimestamp()));
         String phase = r.getCompactionPhase();
         if (phase != null && !phase.isEmpty() && !"idle".equals(phase)) {
             if ("uploading-segment".equals(phase)) {
@@ -686,6 +699,8 @@ public final class IndexingAdminCli {
                 payload.put("ready", resp.getReady());
                 payload.put("loaded_ledger_id", resp.getLoadedLedgerId());
                 payload.put("loaded_offset", resp.getLoadedOffset());
+                payload.put("loaded_entry_timestamp_ms", resp.getLoadedEntryTimestampMs());
+                payload.put("loaded_entry_lag_ms", computeLagMs(resp.getLoadedEntryTimestampMs()));
                 payload.put("primary_advertised_ledger_id", resp.getPrimaryAdvertisedLedgerId());
                 payload.put("primary_advertised_offset", resp.getPrimaryAdvertisedOffset());
                 payload.put("last_reload_timestamp_ms", resp.getLastReloadTimestampMs());
@@ -696,6 +711,8 @@ public final class IndexingAdminCli {
                 out.println("shadow_of=" + resp.getShadowOf());
                 out.println("ready=" + resp.getReady());
                 out.println("loaded_lsn=(" + resp.getLoadedLedgerId() + "," + resp.getLoadedOffset() + ")");
+                out.println("loaded_entry_timestamp_ms=" + resp.getLoadedEntryTimestampMs()
+                        + " (lag_ms=" + computeLagMs(resp.getLoadedEntryTimestampMs()) + ")");
                 out.println("primary_advertised_lsn=(" + resp.getPrimaryAdvertisedLedgerId()
                         + "," + resp.getPrimaryAdvertisedOffset() + ")");
                 out.println("reload_count=" + resp.getReloadCount());
@@ -741,5 +758,21 @@ public final class IndexingAdminCli {
             }
             return resp.getReached() ? 0 : 1;
         }
+    }
+
+    /**
+     * Returns the time-lag in milliseconds for a given LogEntry timestamp, or
+     * {@code -1} when {@code timestampMillis == 0} ("unknown" — no entries
+     * processed yet, or no checkpoint yet). Operators read this value as
+     * "how far behind real time the IS is", which is the operator-friendly
+     * complement to the LSN coordinates that does not require knowing the
+     * commit-log layout. Issue #423.
+     */
+    static long computeLagMs(long timestampMillis) {
+        if (timestampMillis <= 0L) {
+            return -1L;
+        }
+        long lag = System.currentTimeMillis() - timestampMillis;
+        return lag < 0L ? 0L : lag;
     }
 }

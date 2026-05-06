@@ -101,7 +101,10 @@ public class VectorIndexManagerSearchStreamTest {
 
         @Override
         public IndexStatusInfo getIndexStatus(String tablespace, String table, String index) {
-            return new IndexStatusInfo(population.size(), 1, 0, 0, 0, 0, "stub");
+            return new IndexStatusInfo(population.size(), 1,
+                    0, 0, 0L,
+                    0, 0, 0L,
+                    "stub", 0, 0);
         }
 
         @Override
