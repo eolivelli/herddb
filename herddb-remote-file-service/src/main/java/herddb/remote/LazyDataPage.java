@@ -155,6 +155,15 @@ public final class LazyDataPage extends DataPage {
             if (m.valueLength == 0) {
                 return new Record(key, Bytes.EMPTY_ARRAY);
             }
+            if (m.valueLength < 0) {
+                // Guard against a malformed v2 page whose index entry slipped
+                // past the parser's range checks; surface as the same
+                // LazyValueFetchException callers already handle, instead of
+                // a raw NegativeArraySizeException.
+                throw new LazyValueFetchException("Negative valueLength " + m.valueLength
+                        + " for key " + key + " in " + tableSpace + "/" + uuid + "#" + pageId,
+                        new IllegalStateException("corrupted page index"));
+            }
             ByteBuf slice = dsm.readPageValue(tableSpace, uuid, pageId,
                     header, m.valueOffset, m.valueLength);
             try {

@@ -152,6 +152,20 @@ public final class LazyValueCache implements AutoCloseable {
             byte[] data = loader.get();
             return wrapAsDirect(data);
         });
+        // TOCTOU close-race recovery: a reader that passed the `closed` check
+        // above may have been descheduled long enough for `close()` to run
+        // (writing closed=true, draining via invalidateAll() + cleanUp()) and
+        // return; this thread then resumes inside cache.get(...) and Caffeine
+        // happily inserts a fresh entry into the post-drain map. Re-check
+        // `closed` after the loader call and explicitly invalidate the entry
+        // we may have just inserted — the synchronous removalListener will
+        // release the cache-owned refcount before this method returns. The
+        // caller still gets a usable retainedSlice from the buffer Caffeine
+        // returned (its parent chunk stays alive via our retain).
+        if (closed) {
+            cache.invalidate(key);
+            cache.cleanUp();
+        }
         // Caller owns one independent refcount via retainedSlice — the cache
         // keeps its own refcount alive until the entry is evicted.
         //
@@ -161,6 +175,10 @@ public final class LazyValueCache implements AutoCloseable {
         // and retainedSlice throws IllegalReferenceCountException. Fall back
         // to a one-shot direct buffer (not cached) so the caller always gets
         // a usable slice and we do not corrupt the eviction-budget invariant.
+        // The same fallback covers the close-race path above: if the
+        // post-get invalidate already released the cache's refcount and the
+        // parent chunk is now refcnt=0, we fall through to a one-shot
+        // allocation.
         try {
             return cached.retainedSlice(0, cached.capacity());
         } catch (IllegalReferenceCountException raceLost) {

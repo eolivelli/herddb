@@ -322,17 +322,27 @@ public abstract class LazyValueCacheConcurrentUpdatesSuite {
                     + " hits:" + statsAfterPhase2.hitCount()
                     + " evictions:" + statsAfterPhase2.evictionCount());
 
-            // Issue #411 regression gate: across both phases the cache must
-            // have served at least one miss. If a future refactor bypasses
-            // the lazy read path entirely (e.g. by switching the DSM back
-            // to eager `readPage`) this assertion fails. The Phase 2
-            // post-restart scan is the deterministic source of misses.
-            long totalMisses = statsAfterPhase1.missCount() + statsAfterPhase2.missCount();
-            assertTrue("LazyValueCache must serve at least one miss across the"
-                            + " hammer workload + post-restart scan"
-                            + " (phase1=" + statsAfterPhase1.missCount()
-                            + " phase2=" + statsAfterPhase2.missCount() + ")",
-                    totalMisses > 0);
+            // Issue #411 regression gate: BOTH phases must see cache traffic.
+            // - Phase 1 misses prove the hot loop's UPDATE/GET workload
+            //   actually drove reads through the lazy DSM (i.e. the in-memory
+            //   page cache evicted under the tight 24 KiB budget and reads
+            //   re-fetched from remote storage). If a future refactor either
+            //   raises the memory budget too far or bypasses the lazy DSM
+            //   entirely, Phase 1's missCount drops to zero and this
+            //   assertion fails.
+            // - Phase 2 misses prove the post-restart cold-cache scan also
+            //   drives the lazy DSM (every page starts out un-resident).
+            assertTrue("LazyValueCache must serve at least one miss in Phase 1"
+                            + " (the concurrent hot loop). missCount="
+                            + statsAfterPhase1.missCount()
+                            + " — the in-memory page cache budget may be too"
+                            + " loose, letting the workload stay entirely in"
+                            + " on-heap pages and never exercise the lazy DSM.",
+                    statsAfterPhase1.missCount() > 0);
+            assertTrue("LazyValueCache must serve at least one miss in Phase 2"
+                            + " (the post-restart cold-cache consistency scan)."
+                            + " missCount=" + statsAfterPhase2.missCount(),
+                    statsAfterPhase2.missCount() > 0);
         }
     }
 
@@ -382,19 +392,28 @@ public abstract class LazyValueCacheConcurrentUpdatesSuite {
     }
 
     /**
-     * Build a {@link ServerConfiguration} with a tight data-page memory
-     * budget so the in-memory page cache evicts aggressively and
-     * subsequent reads have to re-fetch through the lazy DSM (which is
-     * what exercises the {@link LazyValueCache}).
+     * Build a {@link ServerConfiguration} with a very tight data-page
+     * memory budget so the in-memory page cache evicts aggressively and
+     * the read traffic in the hot loop has to re-fetch through the lazy
+     * DSM. The tight budget is what makes Phase 1 actually exercise
+     * {@link LazyValueCache}.
      *
-     * <p>Mirrors {@code DirectMultipleConcurrentUpdatesSuite}'s budget
-     * (256 KiB data, 1 MiB PK index, 10 KiB max logical page size) so the
-     * two suites stress the same eviction shape.
+     * <p>Sized vs the file-DSM suite: the file-DSM suite uses 256 KiB
+     * data + 10 KiB max page size against a 2 000-row table whose
+     * payload (~206 bytes/row) totals ~400 KiB — comfortably above the
+     * cache. Our row count is 500 with ~30-byte payload (id / n1 / n2)
+     * which would fit entirely in the file-DSM suite's 256 KiB cache, so
+     * we shrink {@code MAX_DATA_MEMORY} to 24 KiB and
+     * {@code MAX_LOGICAL_PAGE_SIZE} to 1 KiB. This forces ~16 distinct
+     * data pages, none of which can stay resident concurrently — the
+     * post-flush read traffic walks every page through the lazy DSM and
+     * the value cache sees a steady stream of misses + (with a 64 KiB
+     * cache budget) periodic evictions.
      */
     private static ServerConfiguration tightMemoryConfiguration() {
         ServerConfiguration cfg = new ServerConfiguration();
-        cfg.set(ServerConfiguration.PROPERTY_MAX_LOGICAL_PAGE_SIZE, 10 * 1024);
-        cfg.set(ServerConfiguration.PROPERTY_MAX_DATA_MEMORY, 1024 * 1024 / 4);
+        cfg.set(ServerConfiguration.PROPERTY_MAX_LOGICAL_PAGE_SIZE, 1024);
+        cfg.set(ServerConfiguration.PROPERTY_MAX_DATA_MEMORY, 24 * 1024);
         cfg.set(ServerConfiguration.PROPERTY_MAX_PK_MEMORY, 1024 * 1024);
         return cfg;
     }

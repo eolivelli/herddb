@@ -551,6 +551,90 @@ public class LazyValueCacheOffHeapTest {
     }
 
     /**
+     * Round-2 follow-up from the PR review: deterministically exercise
+     * the close-during-getOrFetch race. The previous review correctly
+     * pointed out that the {@code closed} guard alone leaves a TOCTOU
+     * window: a reader can pass the {@code if (closed)} check, get
+     * descheduled, watch {@code close()} run on another thread, then
+     * resume into {@code cache.get(...)} and have Caffeine cheerfully
+     * insert a fresh entry into the post-{@code invalidateAll()} map.
+     * The fix is the post-{@code cache.get} re-check that explicitly
+     * invalidates any entry that snuck in.
+     *
+     * <p>The harness uses a {@link CountDownLatch}-controlled loader to
+     * pin Thread A inside the loader call, then runs {@code close()} on
+     * Thread B, then releases Thread A. Asserts the cache returns to
+     * size 0 after both threads finish.
+     */
+    @Test
+    public void concurrentCloseDoesNotLeaveStaleCacheEntry() throws Exception {
+        LazyValueCache cache = new LazyValueCache(64L * 1024L);
+        try {
+            ValueKey k = new ValueKey("ts", "uuid", 1L, 0L);
+            CountDownLatch loaderEntered = new CountDownLatch(1);
+            CountDownLatch closeFinished = new CountDownLatch(1);
+
+            // Thread A: getOrFetch with a slow loader that signals it has
+            // started, then waits for close() to finish before returning the
+            // bytes. By the time the loader returns, close() has already
+            // observed an empty map; the post-get re-check must catch the
+            // late insert.
+            ExecutorService exec = Executors.newFixedThreadPool(2);
+            try {
+                Future<ByteBuf> fetchFuture = exec.submit(() -> cache.getOrFetch(k, () -> {
+                    loaderEntered.countDown();
+                    try {
+                        if (!closeFinished.await(5, TimeUnit.SECONDS)) {
+                            throw new RuntimeException("close() did not finish in time");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException(e);
+                    }
+                    return new byte[]{1, 2, 3, 4};
+                }));
+
+                // Thread B: wait for the loader to start, then close().
+                Future<?> closeFuture = exec.submit(() -> {
+                    try {
+                        if (!loaderEntered.await(5, TimeUnit.SECONDS)) {
+                            throw new RuntimeException("loader never started");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    cache.close();
+                    closeFinished.countDown();
+                });
+
+                closeFuture.get(15, TimeUnit.SECONDS);
+                ByteBuf slice = fetchFuture.get(15, TimeUnit.SECONDS);
+                try {
+                    assertTrue("reader must still observe a usable slice"
+                                    + " (refcnt > 0)", slice.refCnt() > 0);
+                    assertEquals(4, slice.readableBytes());
+                } finally {
+                    slice.release();
+                }
+            } finally {
+                exec.shutdownNow();
+            }
+
+            // The central assertion: after the close-during-fetch race the
+            // cache must hold zero entries. Without the post-cache.get
+            // `closed` re-check this would be 1 (Caffeine inserted the
+            // race-loser entry into a map that close() had already drained).
+            assertEquals("close() must drain even entries inserted by a"
+                            + " concurrent getOrFetch that observed closed=false"
+                            + " before being descheduled",
+                    0L, cache.estimatedSize());
+        } finally {
+            cache.close();
+        }
+    }
+
+    /**
      * RC #7 from the issue #411 PR review: post-{@code close()} semantics.
      * After {@code close()} returns, subsequent {@code getOrFetch} calls
      * must bypass the cache entirely (one-shot caller-owned slice) so a
