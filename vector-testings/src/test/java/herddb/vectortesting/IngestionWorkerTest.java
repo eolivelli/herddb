@@ -203,8 +203,9 @@ class IngestionWorkerTest {
                 System.nanoTime(),
                 commitsTotal,
                 commitsRecovered,
-                rowsCommitted,
-                () -> null // no rate limiting in flush/retry tests
+                rowsCommitted
+                // No rate limiting in flush/retry tests; the no-rate-limit
+                // constructor passes null group + index 0 to the canonical ctor.
         );
         worker.backoffBaseMillis = 0L; // keep tests fast
         return worker;

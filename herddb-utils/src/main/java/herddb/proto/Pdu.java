@@ -54,6 +54,25 @@ public class Pdu implements AutoCloseable {
     public static final byte TYPE_RESTORE_FINISHED = 23;
     public static final byte TYPE_TX_COMMAND = 24;
     public static final byte TYPE_TX_COMMAND_RESULT = 25;
+    // ---------------------------------------------------------------------
+    // File-server PDU types (issue #425). Allocated in the 50..69 range so
+    // the service the client is talking to is identifiable from a single
+    // type-byte read on the wire (HerdDB core-server types occupy 0..25
+    // and 100..104). Request and response PDUs share the same type byte
+    // and disambiguate via FLAGS_ISREQUEST / FLAGS_ISRESPONSE.
+    // ---------------------------------------------------------------------
+    public static final byte TYPE_FS_WRITE_FILE = 50;
+    public static final byte TYPE_FS_WRITE_FILE_BLOCK = 51;
+    public static final byte TYPE_FS_READ_FILE = 52;
+    public static final byte TYPE_FS_READ_FILE_RANGE = 53;
+    public static final byte TYPE_FS_DELETE_FILE = 54;
+    public static final byte TYPE_FS_DELETE_FILES = 55;
+    public static final byte TYPE_FS_LIST_FILES = 56;
+    public static final byte TYPE_FS_DELETE_BY_PREFIX = 57;
+    // 58, 59 reserved for future file-server data ops.
+    public static final byte TYPE_FS_GET_SERVER_INFO = 60;
+    public static final byte TYPE_FS_RESIZE_DISK_CACHE = 61;
+    // 62..69 reserved for future file-server admin ops.
     public static final byte TYPE_SASL_TOKEN_MESSAGE_REQUEST = 100;
     public static final byte TYPE_SASL_TOKEN_SERVER_RESPONSE = 101;
     public static final byte TYPE_SASL_TOKEN_MESSAGE_TOKEN = 102;

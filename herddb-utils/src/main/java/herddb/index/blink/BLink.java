@@ -229,6 +229,29 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
          */
         X getPosiviveInfinityKey();
 
+        /**
+         * Hook invoked at every BLink split / half-merge handoff that
+         * promotes a node-local key to a separator slot which may outlive
+         * the donor node (e.g. a leaf's last key becoming the right
+         * sibling's {@code rightsep}). The default implementation returns
+         * the input key unchanged.
+         *
+         * <p>Issue #411: {@code Bytes}-keyed BLink trees override this to
+         * call {@link herddb.utils.Bytes#materialiseAndDetach()} so a
+         * separator backed by the donor's per-page
+         * {@link herddb.utils.IndexKeySlab} no longer pins the slab once
+         * the donor is unloaded. Implementations must return a value that
+         * compares (and hashes) identically to the input — typically the
+         * same instance after an in-place detach.</p>
+         *
+         * @param key the key being promoted to a long-lived separator slot
+         * @return a key with identical comparison semantics, possibly the
+         *         same instance, with any soon-to-be-stale slab anchor cleared
+         */
+        default X detachSeparator(X key) {
+            return key;
+        }
+
     }
 
     public BLink(
@@ -2240,8 +2263,10 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
             // its outlink pointing to l
             right.outlink = this;
 
-            // If l is a leaf, its separator is set to the largest key in it
-            rightsep = right.rightsep;
+            // If l is a leaf, its separator is set to the largest key in it.
+            // Issue #411: detach any stale slab anchor — the right node is about
+            // to be unloaded, so its rightsep would otherwise pin its IndexKeySlab.
+            rightsep = owner.evaluator.detachSeparator(right.rightsep);
 
             /*
              * Right data page not needed anymore, unload it NOW. Removing from policy now has 2 benefits:
@@ -2333,10 +2358,21 @@ public class BLink<K extends Comparable<K>, V> implements AutoCloseable, Page.Ow
             /* We need to count the added node constant size into used memory */
             owner.usedMemory.add(NODE_CONSTANT_SIZE);
 
-            // if n and new are leaves, their separators are set equal to the largest keys in them
+            // if n and new are leaves, their separators are set equal to the largest keys in them.
+            // No detach needed for this transfer: the pre-existing rightsep is either heap-detached
+            // (split / half_merge previously ran on it, or it came from the legacy on-heap codec
+            // BLinkKeyToPageIndex.MetadataSerializer), or it anchors the IncrementalBLink codec's
+            // shared snapshot slab. In neither case does it pin a per-page IndexKeySlab, so
+            // forwarding the reference to the new right node is safe.
             right.rightsep = rightsep;
 
-            rightsep = lastKey;
+            // Issue #411: lastKey came from THIS node's per-page IndexKeySlab. Promoting it
+            // to rightsep makes it outlive every eviction/refresh of this node's keys, which
+            // would otherwise pin the slab indefinitely. detachSeparator copies the bytes onto
+            // the heap and clears the slab anchor; downstream readers see identical comparison
+            // semantics. Invariant: every rightsep ever stored on a Node has been through this
+            // detach (or is POSITIVE_INFINITY / pre-detached metadata).
+            rightsep = owner.evaluator.detachSeparator(lastKey);
 
             // the return value is the new rightmost separator in n
             // Cast to K, is K for sure because it has a right sibling

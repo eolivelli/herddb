@@ -20,8 +20,7 @@
 
 package herddb.remote.admin;
 
-import herddb.remote.proto.GetServerInfoResponse;
-import herddb.remote.proto.ResizeDiskCacheResponse;
+import herddb.proto.PduCodec;
 import java.io.PrintStream;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -126,7 +125,7 @@ public final class FileServerAdminCli {
             return 0;
         }
         try (FileServerAdminClient client = buildClient(cli)) {
-            GetServerInfoResponse resp = client.getServerInfo();
+            PduCodec.GetServerInfoResponse.Info resp = client.getServerInfo();
             if (cli.hasOption("json")) {
                 out.println(toJson(serverInfoToMap(resp)));
             } else {
@@ -149,17 +148,17 @@ public final class FileServerAdminCli {
         }
         long newMax = Long.parseLong(cli.getOptionValue("max-bytes"));
         try (FileServerAdminClient client = buildClient(cli)) {
-            ResizeDiskCacheResponse resp = client.resizeDiskCache(newMax);
+            FileServerAdminClient.ResizeResult resp = client.resizeDiskCache(newMax);
             if (cli.hasOption("json")) {
                 Map<String, Object> m = new LinkedHashMap<>();
-                m.put("previous_max_bytes", resp.getPreviousMaxBytes());
-                m.put("new_max_bytes", resp.getNewMaxBytes());
+                m.put("previous_max_bytes", resp.previousMaxBytes);
+                m.put("new_max_bytes", resp.newMaxBytes);
                 out.println(toJson(m));
             } else {
                 out.printf(Locale.ROOT,
                         "disk cache resized: previous=%d bytes (%d MiB), new=%d bytes (%d MiB)%n",
-                        resp.getPreviousMaxBytes(), resp.getPreviousMaxBytes() / (1024 * 1024),
-                        resp.getNewMaxBytes(), resp.getNewMaxBytes() / (1024 * 1024));
+                        resp.previousMaxBytes, resp.previousMaxBytes / (1024 * 1024),
+                        resp.newMaxBytes, resp.newMaxBytes / (1024 * 1024));
             }
         }
         return 0;
@@ -175,12 +174,12 @@ public final class FileServerAdminCli {
         opts.addOption(Option.builder().longOpt("json")
                 .desc("emit JSON instead of plain text").build());
         opts.addOption(Option.builder().longOpt("timeout-seconds").hasArg().argName("SECS")
-                .desc("gRPC call deadline in seconds (default 30)").build());
+                .desc("call deadline in seconds (default 30)").build());
     }
 
     private static void addServerOption(Options opts) {
         opts.addOption(Option.builder().longOpt("server").hasArg().argName("HOST:PORT")
-                .desc("file-server gRPC endpoint (required)").required().build());
+                .desc("file-server endpoint (required)").required().build());
     }
 
     private CommandLine parse(Options opts, String[] args, String commandName) throws ParseException {
@@ -202,81 +201,86 @@ public final class FileServerAdminCli {
         return new FileServerAdminClient(cli.getOptionValue("server"), timeout);
     }
 
-    private static Map<String, Object> serverInfoToMap(GetServerInfoResponse r) {
+    private static Map<String, Object> serverInfoToMap(PduCodec.GetServerInfoResponse.Info r) {
         Map<String, Object> m = new LinkedHashMap<>();
-        m.put("grpc_host", r.getGrpcHost());
-        m.put("grpc_port", r.getGrpcPort());
-        m.put("storage_mode", r.getStorageMode());
-        m.put("jvm_heap_used_bytes", r.getJvmHeapUsedBytes());
-        m.put("jvm_heap_max_bytes", r.getJvmHeapMaxBytes());
+        // The JSON keys are kept identical to the gRPC era ("grpc_host" /
+        // "grpc_port") so existing tooling (dashboards, scripts) consuming
+        // the JSON output of `fileserver-admin server-info --json` keeps
+        // working unchanged. The wire is no longer gRPC, but the field
+        // names are part of the CLI's stable contract.
+        m.put("grpc_host", r.host);
+        m.put("grpc_port", r.port);
+        m.put("storage_mode", r.storageMode);
+        m.put("jvm_heap_used_bytes", r.jvmHeapUsedBytes);
+        m.put("jvm_heap_max_bytes", r.jvmHeapMaxBytes);
         // disk cache
-        m.put("disk_cache_max_bytes", r.getDiskCacheMaxBytes());
-        m.put("disk_cache_hit_count", r.getDiskCacheHitCount());
-        m.put("disk_cache_miss_count", r.getDiskCacheMissCount());
-        m.put("disk_cache_eviction_count", r.getDiskCacheEvictionCount());
-        m.put("disk_cache_hit_bytes", r.getDiskCacheHitBytes());
-        m.put("disk_cache_miss_bytes", r.getDiskCacheMissBytes());
-        m.put("disk_cache_estimated_entries", r.getDiskCacheEstimatedEntries());
+        m.put("disk_cache_max_bytes", r.diskCacheMaxBytes);
+        m.put("disk_cache_hit_count", r.diskCacheHitCount);
+        m.put("disk_cache_miss_count", r.diskCacheMissCount);
+        m.put("disk_cache_eviction_count", r.diskCacheEvictionCount);
+        m.put("disk_cache_hit_bytes", r.diskCacheHitBytes);
+        m.put("disk_cache_miss_bytes", r.diskCacheMissBytes);
+        m.put("disk_cache_estimated_entries", r.diskCacheEstimatedEntries);
         // block cache
-        m.put("block_cache_max_bytes", r.getBlockCacheMaxBytes());
-        m.put("block_cache_estimated_bytes", r.getBlockCacheEstimatedBytes());
-        m.put("block_cache_estimated_entries", r.getBlockCacheEstimatedEntries());
-        m.put("block_cache_hits", r.getBlockCacheHits());
-        m.put("block_cache_misses", r.getBlockCacheMisses());
-        m.put("block_cache_evictions", r.getBlockCacheEvictions());
+        m.put("block_cache_max_bytes", r.blockCacheMaxBytes);
+        m.put("block_cache_estimated_bytes", r.blockCacheEstimatedBytes);
+        m.put("block_cache_estimated_entries", r.blockCacheEstimatedEntries);
+        m.put("block_cache_hits", r.blockCacheHits);
+        m.put("block_cache_misses", r.blockCacheMisses);
+        m.put("block_cache_evictions", r.blockCacheEvictions);
         return m;
     }
 
-    private void printServerInfoText(GetServerInfoResponse r) {
+    private void printServerInfoText(PduCodec.GetServerInfoResponse.Info r) {
         out.println("Server info:");
-        out.printf(Locale.ROOT, "  grpc_host          = %s%n", r.getGrpcHost());
-        out.printf(Locale.ROOT, "  grpc_port          = %d%n", r.getGrpcPort());
-        out.printf(Locale.ROOT, "  storage_mode       = %s%n", r.getStorageMode());
-        long heapMiB = r.getJvmHeapMaxBytes() / (1024 * 1024);
-        long heapUsedMiB = r.getJvmHeapUsedBytes() / (1024 * 1024);
+        out.printf(Locale.ROOT, "  host               = %s%n", r.host);
+        out.printf(Locale.ROOT, "  port               = %d%n", r.port);
+        out.printf(Locale.ROOT, "  storage_mode       = %s%n", r.storageMode);
+        long heapMiB = r.jvmHeapMaxBytes / (1024 * 1024);
+        long heapUsedMiB = r.jvmHeapUsedBytes / (1024 * 1024);
         out.printf(Locale.ROOT, "  jvm_heap           = %d / %d MiB%n", heapUsedMiB, heapMiB);
         out.println();
         out.println("Disk cache (s3 disk-cache LRU):");
-        if (r.getDiskCacheMaxBytes() == 0) {
+        if (r.diskCacheMaxBytes == 0) {
             out.println("  (not available — storage.mode is not s3)");
         } else {
-            long maxMiB = r.getDiskCacheMaxBytes() / (1024 * 1024);
-            long hitTotal = r.getDiskCacheHitCount() + r.getDiskCacheMissCount();
+            long maxMiB = r.diskCacheMaxBytes / (1024 * 1024);
+            long hitTotal = r.diskCacheHitCount + r.diskCacheMissCount;
             double hitRatio = hitTotal > 0
-                    ? (100.0 * r.getDiskCacheHitCount() / hitTotal)
+                    ? (100.0 * r.diskCacheHitCount / hitTotal)
                     : 0.0;
             out.printf(Locale.ROOT, "  max_bytes          = %d (%d MiB)%n",
-                    r.getDiskCacheMaxBytes(), maxMiB);
-            out.printf(Locale.ROOT, "  estimated_entries  = %d%n", r.getDiskCacheEstimatedEntries());
-            out.printf(Locale.ROOT, "  hit_count          = %d%n", r.getDiskCacheHitCount());
-            out.printf(Locale.ROOT, "  miss_count         = %d%n", r.getDiskCacheMissCount());
+                    r.diskCacheMaxBytes, maxMiB);
+            out.printf(Locale.ROOT, "  estimated_entries  = %d%n", r.diskCacheEstimatedEntries);
+            out.printf(Locale.ROOT, "  hit_count          = %d%n", r.diskCacheHitCount);
+            out.printf(Locale.ROOT, "  miss_count         = %d%n", r.diskCacheMissCount);
             out.printf(Locale.ROOT, "  hit_ratio          = %.1f%%%n", hitRatio);
-            out.printf(Locale.ROOT, "  eviction_count     = %d%n", r.getDiskCacheEvictionCount());
+            out.printf(Locale.ROOT, "  eviction_count     = %d%n", r.diskCacheEvictionCount);
             out.printf(Locale.ROOT, "  hit_bytes          = %d (%d MiB)%n",
-                    r.getDiskCacheHitBytes(), r.getDiskCacheHitBytes() / (1024 * 1024));
+                    r.diskCacheHitBytes, r.diskCacheHitBytes / (1024 * 1024));
             out.printf(Locale.ROOT, "  miss_bytes         = %d (%d MiB)%n",
-                    r.getDiskCacheMissBytes(), r.getDiskCacheMissBytes() / (1024 * 1024));
+                    r.diskCacheMissBytes, r.diskCacheMissBytes / (1024 * 1024));
         }
         out.println();
         out.println("Block cache (in-heap block LRU):");
-        if (r.getBlockCacheMaxBytes() == 0) {
+        if (r.blockCacheMaxBytes == 0) {
             out.println("  (not available — block.cache.enabled=false)");
         } else {
-            long bcMaxMiB = r.getBlockCacheMaxBytes() / (1024 * 1024);
-            long bcSizeMiB = r.getBlockCacheEstimatedBytes() / (1024 * 1024);
-            long bcHitTotal = r.getBlockCacheHits() + r.getBlockCacheMisses();
+            long bcMaxMiB = r.blockCacheMaxBytes / (1024 * 1024);
+            long bcSizeMiB = r.blockCacheEstimatedBytes / (1024 * 1024);
+            long bcHitTotal = r.blockCacheHits + r.blockCacheMisses;
             double bcHitRatio = bcHitTotal > 0
-                    ? (100.0 * r.getBlockCacheHits() / bcHitTotal)
+                    ? (100.0 * r.blockCacheHits / bcHitTotal)
                     : 0.0;
             out.printf(Locale.ROOT, "  max_bytes          = %d (%d MiB)%n",
-                    r.getBlockCacheMaxBytes(), bcMaxMiB);
+                    r.blockCacheMaxBytes, bcMaxMiB);
             out.printf(Locale.ROOT, "  estimated_bytes    = %d (%d MiB)%n",
-                    r.getBlockCacheEstimatedBytes(), bcSizeMiB);
-            out.printf(Locale.ROOT, "  estimated_entries  = %d%n", r.getBlockCacheEstimatedEntries());
-            out.printf(Locale.ROOT, "  hits               = %d%n", r.getBlockCacheHits());
-            out.printf(Locale.ROOT, "  misses             = %d%n", r.getBlockCacheMisses());
+                    r.blockCacheEstimatedBytes, bcSizeMiB);
+            out.printf(Locale.ROOT, "  estimated_entries  = %d%n", r.blockCacheEstimatedEntries);
+            out.printf(Locale.ROOT, "  hits               = %d%n", r.blockCacheHits);
+            out.printf(Locale.ROOT, "  misses             = %d%n", r.blockCacheMisses);
             out.printf(Locale.ROOT, "  hit_ratio          = %.1f%%%n", bcHitRatio);
-            out.printf(Locale.ROOT, "  evictions          = %d%n", r.getBlockCacheEvictions());
+            out.printf(Locale.ROOT, "  evictions          = %d%n", r.blockCacheEvictions);
         }
     }
 

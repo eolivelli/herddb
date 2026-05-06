@@ -98,14 +98,22 @@ public class S3ObjectStorageIT {
         storage.write("ts1/uuid1/1.page", data).get();
 
         ReadResult result = storage.read("ts1/uuid1/1.page").get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertArrayEquals(data, result.content());
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(data, result.content());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
     public void testReadMissing() throws Exception {
         ReadResult result = storage.read("nonexistent/key.page").get();
-        assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        try {
+            assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -117,7 +125,11 @@ public class S3ObjectStorageIT {
         assertTrue(storage.delete("del/1.page").get());
 
         ReadResult result = storage.read("del/1.page").get();
-        assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        try {
+            assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        } finally {
+            result.release();
+        }
     }
 
     @Test

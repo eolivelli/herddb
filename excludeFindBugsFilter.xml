@@ -45,6 +45,12 @@
     <Bug pattern="DM_BOXED_PRIMITIVE_FOR_PARSING"/>
     <!-- Generated protobuf classes implement Serializable via singleton pattern -->
     <Bug pattern="SING_SINGLETON_IMPLEMENTS_SERIALIZABLE"/>
+    <!-- Generated protobuf classes carry non-transient LazyStringArrayList fields
+         (e.g. DeleteFilesRequest.paths_); harmless and not under our control -->
+    <Match>
+        <Class name="~herddb\.remote\.proto\..*"/>
+        <Bug pattern="SE_BAD_FIELD"/>
+    </Match>
     <!-- Pre-existing: negating compareTo result in CachingObjectStorage sort -->
     <Bug pattern="RV_NEGATING_RESULT_OF_COMPARETO"/>
     <!-- Pre-existing: potential null from getParent() in LocalObjectStorage -->

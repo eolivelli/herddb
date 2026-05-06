@@ -22,12 +22,17 @@ package herddb.remote;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalCause;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
+import herddb.utils.HerdDBByteBufAllocators;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.util.IllegalReferenceCountException;
 import java.util.Objects;
 import java.util.function.Supplier;
 
 /**
- * Bounded in-heap cache of per-record value byte arrays, keyed by
+ * Bounded off-heap cache of per-record value bytes, keyed by
  * {@code (tableSpace, uuid, pageId, valueOffset)}. Used by
  * {@link RemoteFileDataStorageManager} when serving lazy (v2) data pages so
  * that value bytes fetched via byte-range reads against the remote file
@@ -35,31 +40,77 @@ import java.util.function.Supplier;
  * of a query — or across queries that hit the same record repeatedly —
  * without re-fetching from remote storage every time.
  *
- * <p>The cache is weight-bounded by total value bytes; the weight of a
- * single entry is its value length. Weight-based eviction is strictly
- * independent of the page-replacement policy used by {@code TableManager}:
- * a lazy {@code DataPage} may still be resident in the page map even after
- * all of its values have been evicted from this cache (a subsequent
- * {@code get(key)} on the page just re-issues a range read).
+ * <h3>Off-heap storage (issue #411)</h3>
+ * Values live in direct memory allocated from
+ * {@link HerdDBByteBufAllocators#dataPagesAllocator()} so that a large
+ * cache does not pin tens of GiB of {@code byte[]} on the JVM heap. The
+ * cache is weight-bounded by the underlying {@link ByteBuf#capacity()};
+ * eviction synchronously {@link ByteBuf#release() releases} each evicted
+ * buffer back to the pool.
+ *
+ * <h3>Refcount discipline</h3>
+ * Each cache entry owns exactly one refcount on its {@link ByteBuf}. Every
+ * {@link #getOrFetch} call returns a {@link ByteBuf#retainedSlice()
+ * retained slice} so the caller owns an independent refcount on the
+ * underlying chunk. The cache's {@code removalListener} releases the
+ * <em>cache's</em> refcount on eviction; outstanding caller slices keep
+ * the chunk reachable until they are individually released. There is no
+ * use-after-free risk because the chunk survives until the last refcount
+ * is gone.
  *
  * <p>A {@code maxBytes} value of {@code 0} or negative disables the cache:
  * every call to {@link #getOrFetch(ValueKey, Supplier)} delegates to the
- * loader. This is useful for tests and for deployments that want
+ * loader and returns a one-shot direct buffer that the caller must
+ * release. This is useful for tests and for deployments that want
  * deterministic remote-read counts.
+ *
+ * <h3>Lifecycle</h3>
+ * Call {@link #close()} on shutdown to drain the cache and release every
+ * outstanding cache-owned refcount. Outstanding caller slices remain
+ * valid until they are individually released.
  */
-public final class LazyValueCache {
+public final class LazyValueCache implements AutoCloseable {
 
     private final long maxBytes;
-    private final Cache<ValueKey, byte[]> cache;
+    private final Cache<ValueKey, ByteBuf> cache;
+    private final PooledByteBufAllocator allocator;
+    /**
+     * Set to {@code true} by {@link #close()} so subsequent {@link #getOrFetch}
+     * calls bypass the (now-empty) cache and behave as the disabled-cache
+     * path: a one-shot direct allocation, owned by the caller. Without this
+     * guard a {@code getOrFetch} racing with {@code close()} could repopulate
+     * the cache and leak the new entry to the pool until JVM exit. See
+     * BLOCK-2 of the issue #411 PR review.
+     */
+    private volatile boolean closed;
 
     public LazyValueCache(long maxBytes) {
+        this(maxBytes, HerdDBByteBufAllocators.dataPagesAllocator());
+    }
+
+    /**
+     * Test-only constructor that lets a test inject a different
+     * {@link PooledByteBufAllocator} instance (e.g. a per-test pool whose
+     * direct-memory accounting can be observed in isolation).
+     */
+    LazyValueCache(long maxBytes, PooledByteBufAllocator allocator) {
         this.maxBytes = maxBytes;
+        this.allocator = Objects.requireNonNull(allocator, "allocator");
         if (maxBytes <= 0L) {
             this.cache = null;
         } else {
             this.cache = Caffeine.newBuilder()
                     .maximumWeight(maxBytes)
-                    .weigher((ValueKey k, byte[] v) -> v == null ? 0 : v.length)
+                    .weigher((ValueKey k, ByteBuf v) -> v == null ? 0 : v.capacity())
+                    .removalListener((ValueKey k, ByteBuf v, RemovalCause cause) -> {
+                        if (v != null && v.refCnt() > 0) {
+                            // Release the cache's refcount. Outstanding caller
+                            // slices (each owning their own refcount on the
+                            // underlying chunk) keep the bytes reachable until
+                            // they are individually released — no use-after-free.
+                            v.release();
+                        }
+                    })
                     .recordStats()
                     .build();
         }
@@ -74,23 +125,112 @@ public final class LazyValueCache {
     }
 
     /**
-     * Returns the cached value for {@code key}, or invokes {@code loader}
-     * atomically (at most once per concurrent miss, as guaranteed by
-     * Caffeine's {@code Cache.get(K, Function)} contract) to populate it.
+     * Returns a {@link ByteBuf#retainedSlice() retained slice} of the cached
+     * value for {@code key}, or invokes {@code loader} atomically (at most
+     * once per concurrent miss, as guaranteed by Caffeine's
+     * {@code Cache.get(K, Function)} contract) to populate it. The returned
+     * slice is direct-memory and the caller owns one refcount — call
+     * {@link ByteBuf#release()} when done.
+     *
+     * <p>If the cache is disabled ({@link #isEnabled()} returns
+     * {@code false}) this method allocates a fresh one-shot direct buffer,
+     * fills it from the loader, and returns it. The caller still owns the
+     * one refcount and must release it.
      */
-    public byte[] getOrFetch(ValueKey key, Supplier<byte[]> loader) {
+    public ByteBuf getOrFetch(ValueKey key, Supplier<byte[]> loader) {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(loader, "loader");
-        if (cache == null) {
-            return loader.get();
+        // After close() the cache must not be repopulated. Behave as the
+        // disabled-cache path so a getOrFetch racing with shutdown still
+        // returns a usable, caller-owned slice without leaking a fresh
+        // entry past close().
+        if (cache == null || closed) {
+            byte[] data = loader.get();
+            return wrapAsDirect(data);
         }
-        return cache.get(key, k -> loader.get());
+        ByteBuf cached = cache.get(key, k -> {
+            byte[] data = loader.get();
+            return wrapAsDirect(data);
+        });
+        // TOCTOU close-race recovery: a reader that passed the `closed` check
+        // above may have been descheduled long enough for `close()` to run
+        // (writing closed=true, draining via invalidateAll() + cleanUp()) and
+        // return; this thread then resumes inside cache.get(...) and Caffeine
+        // happily inserts a fresh entry into the post-drain map. Re-check
+        // `closed` after the loader call and explicitly invalidate the entry
+        // we may have just inserted — invalidate(key) synchronously removes
+        // it from the data map, which is the invariant the
+        // concurrentCloseDoesNotLeaveStaleCacheEntry test asserts. The
+        // removalListener that releases the cache's refcount is dispatched
+        // via Caffeine's executor (ForkJoinPool.commonPool() by default) and
+        // may run after this method returns; either way the parent chunk's
+        // refcount discipline is preserved — the caller's retainedSlice
+        // (below) bumps the parent refcount before the listener can release
+        // it, so the slice stays usable. If the listener already ran by the
+        // time we attempt retainedSlice, the IllegalReferenceCountException
+        // catch falls back to a one-shot allocation.
+        if (closed) {
+            cache.invalidate(key);
+            cache.cleanUp();
+        }
+        // Caller owns one independent refcount via retainedSlice — the cache
+        // keeps its own refcount alive until the entry is evicted.
+        //
+        // Race: Caffeine's TinyLFU admission test can evict the just-loaded
+        // entry before this method returns. The removalListener releases the
+        // cache's refcount; if it ran before we retain we observe refcnt=0
+        // and retainedSlice throws IllegalReferenceCountException. Fall back
+        // to a one-shot direct buffer (not cached) so the caller always gets
+        // a usable slice and we do not corrupt the eviction-budget invariant.
+        // The same fallback covers the close-race path above: if the
+        // post-get invalidate already released the cache's refcount and the
+        // parent chunk is now refcnt=0, we fall through to a one-shot
+        // allocation.
+        try {
+            return cached.retainedSlice(0, cached.capacity());
+        } catch (IllegalReferenceCountException raceLost) {
+            byte[] data = loader.get();
+            return wrapAsDirect(data);
+        }
+    }
+
+    /**
+     * Allocates a direct {@link ByteBuf} of the appropriate capacity and
+     * copies {@code data} into it. The returned buffer's refcount is 1
+     * (owned by the caller). On any failure between allocation and copy
+     * the buffer is released so we do not leak a pooled chunk.
+     */
+    private ByteBuf wrapAsDirect(byte[] data) {
+        if (data == null) {
+            // Match the legacy contract: a loader returning null is a
+            // programming error upstream. Surface it eagerly so the cache
+            // does not store a null entry.
+            throw new NullPointerException("loader returned null");
+        }
+        ByteBuf buf = allocator.directBuffer(data.length, data.length);
+        try {
+            if (data.length > 0) {
+                buf.writeBytes(data);
+            }
+            return buf;
+        } catch (RuntimeException t) {
+            // Narrow catch (per CLAUDE.md): writeBytes can throw IOOBE on
+            // a corrupted state and the surrounding allocation paths can
+            // throw OutOfMemoryError (which is a Throwable subclass not
+            // caught here intentionally — the caller upstream is allowed
+            // to propagate it). Either way the partially-initialised
+            // direct buffer must be released to avoid leaking a pooled chunk.
+            buf.release();
+            throw t;
+        }
     }
 
     /**
      * Drops every cached value that belongs to the given page. Called when a
      * page is overwritten or deleted so that stale bytes never leak to a
-     * subsequent read.
+     * subsequent read. Each evicted buffer is released by the cache's
+     * {@code removalListener}; outstanding caller slices remain valid until
+     * their own refcounts are released.
      */
     public void invalidateForPage(String tableSpace, String uuid, long pageId) {
         if (cache == null) {
@@ -134,6 +274,38 @@ public final class LazyValueCache {
     /** Caffeine stats snapshot, or {@code null} if the cache is disabled. */
     public CacheStats stats() {
         return cache == null ? null : cache.stats();
+    }
+
+    /**
+     * Drains every cache entry, releasing each cache-owned refcount on the
+     * direct buffers. Outstanding caller slices remain valid until their
+     * own refcounts are released. Idempotent.
+     *
+     * <p>Implements {@link AutoCloseable} so a try-with-resources or an
+     * explicit shutdown hook can ensure all pooled direct memory returns
+     * to the allocator.
+     *
+     * <p><b>Post-close semantics</b>: a {@link #getOrFetch} that races with
+     * {@code close()} (or runs after it) bypasses the cache entirely and
+     * returns a one-shot caller-owned direct buffer — exactly as if the
+     * cache had been constructed with a non-positive {@code maxBytes}. This
+     * means callers do not crash on a closed cache, but they also do not
+     * leak fresh entries past shutdown.
+     */
+    @Override
+    public void close() {
+        if (cache == null) {
+            return;
+        }
+        // Mark closed BEFORE the drain so any concurrent getOrFetch that
+        // observes the flag bypasses the cache and does not add a new entry
+        // after invalidateAll has run.
+        closed = true;
+        cache.invalidateAll();
+        // Force any pending eviction work to run synchronously so the
+        // removalListener releases every cache-owned refcount before the
+        // caller observes close() has returned.
+        cache.cleanUp();
     }
 
     /**

@@ -24,6 +24,8 @@ import herddb.index.blink.BLinkMetadata.BLinkNodeMetadata;
 import herddb.utils.ByteBufCursor;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataOutputStream;
+import herddb.utils.HerdDBByteBufAllocators;
+import herddb.utils.IndexKeySlab;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -61,6 +63,17 @@ final class IncrementalBLinkPageCodec {
     private static final byte RIGHTSEP_INF = 0;
     private static final byte RIGHTSEP_BYTES = 1;
 
+    /**
+     * Defensive upper bound on the per-chunk node count read from disk.
+     * The default {@code DEFAULT_SNAPSHOT_CHUNK_SIZE} in
+     * {@link IncrementalBLinkKeyToPageIndex} is 50,000 nodes; this cap is
+     * orders of magnitude above any plausible legitimate value, so it
+     * never trips on a healthy page but blocks a corrupted {@code vint}
+     * count from triggering eight separate large-array allocations
+     * inside {@link #readNodeMetadataArray} (issue #411 review).
+     */
+    static final int MAX_NODES_PER_CHUNK = 1 << 22; // ~4.2M
+
     private IncrementalBLinkPageCodec() {
     }
 
@@ -97,10 +110,7 @@ final class IncrementalBLinkPageCodec {
         int chunkIndex = in.readVInt();
         int totalChunks = in.readVInt();
         int count = in.readVInt();
-        BLinkNodeMetadata<Bytes>[] nodes = newArray(count);
-        for (int i = 0; i < count; i++) {
-            nodes[i] = readNodeMetadata(in);
-        }
+        BLinkNodeMetadata<Bytes>[] nodes = readNodeMetadataArray(in, count);
         return new SnapshotChunkContents(epoch, chunkIndex, totalChunks, nodes);
     }
 
@@ -161,10 +171,7 @@ final class IncrementalBLinkPageCodec {
         long epoch = in.readVLong();
 
         int upsertedCount = in.readVInt();
-        BLinkNodeMetadata<Bytes>[] upserted = newArray(upsertedCount);
-        for (int i = 0; i < upsertedCount; i++) {
-            upserted[i] = readNodeMetadata(in);
-        }
+        BLinkNodeMetadata<Bytes>[] upserted = readNodeMetadataArray(in, upsertedCount);
 
         int removedCount = in.readVInt();
         long[] removedNodeIds = new long[removedCount];
@@ -215,24 +222,96 @@ final class IncrementalBLinkPageCodec {
         }
     }
 
-    private static BLinkNodeMetadata<Bytes> readNodeMetadata(ByteBufCursor in) throws IOException {
-        boolean leaf = in.readBoolean();
-        long id = in.readVLong();
-        long storeId = in.readVLong();
-        int keys = in.readVInt();
-        long bytes = in.readVLong();
-        long outlink = in.readZLong();
-        long rightlink = in.readZLong();
-        byte sepKind = in.readByte();
-        Bytes rightsep;
-        if (sepKind == RIGHTSEP_INF) {
-            rightsep = Bytes.POSITIVE_INFINITY;
-        } else if (sepKind == RIGHTSEP_BYTES) {
-            rightsep = Bytes.from_array(in.readArray());
-        } else {
-            throw new IOException("unknown rightsep marker " + sepKind);
+    /**
+     * Two-pass node-metadata array reader (issue #411). The first pass
+     * reads each node's plain fields and the rightsep raw bytes (or
+     * INF marker) into local arrays so we can size and allocate a single
+     * off-heap {@link IndexKeySlab} that holds every rightsep across
+     * the snapshot chunk / delta. The second pass packs the rightseps
+     * into the slab (gated by {@link IndexKeySlab#OFFHEAP_KEY_BYTES_THRESHOLD},
+     * so tiny snapshots keep the on-heap fast path) and builds the
+     * {@link BLinkNodeMetadata} array. Each rightsep returned via
+     * {@link IndexKeySlab#wrap(int, int)} carries a strong reference to
+     * the slab owner, anchoring the slab against premature GC for the
+     * BLink's lifetime; long-lived split-key handoffs that promote one
+     * of these rightseps later go through
+     * {@code SizeEvaluator.detachSeparator}, copying the bytes onto the
+     * heap and breaking the anchor (see issue #411).
+     */
+    private static BLinkNodeMetadata<Bytes>[] readNodeMetadataArray(ByteBufCursor in, int count)
+            throws IOException {
+        if (count < 0) {
+            throw new IOException("corrupted node-metadata array: negative count " + count);
         }
-        return new BLinkNodeMetadata<>(leaf, id, storeId, keys, bytes, outlink, rightlink, rightsep);
+        if (count > MAX_NODES_PER_CHUNK) {
+            // Refuse before we allocate eight scratch arrays of size `count`.
+            // A healthy chunk is bounded by DEFAULT_SNAPSHOT_CHUNK_SIZE
+            // (50,000 nodes); anything beyond MAX_NODES_PER_CHUNK is almost
+            // certainly a corrupted vint that would otherwise blow up the
+            // GC at allocation time.
+            throw new IOException("node-metadata array count " + count
+                    + " exceeds MAX_NODES_PER_CHUNK (" + MAX_NODES_PER_CHUNK
+                    + "); page is corrupted");
+        }
+        if (count == 0) {
+            return newArray(0);
+        }
+        boolean[] leafArr = new boolean[count];
+        long[] idArr = new long[count];
+        long[] storeIdArr = new long[count];
+        int[] keysArr = new int[count];
+        long[] bytesArr = new long[count];
+        long[] outlinkArr = new long[count];
+        long[] rightlinkArr = new long[count];
+        boolean[] rightsepInf = new boolean[count];
+        byte[][] rightsepBytes = new byte[count][];
+        long totalRightsepBytes = 0L;
+        for (int i = 0; i < count; i++) {
+            leafArr[i] = in.readBoolean();
+            idArr[i] = in.readVLong();
+            storeIdArr[i] = in.readVLong();
+            keysArr[i] = in.readVInt();
+            bytesArr[i] = in.readVLong();
+            outlinkArr[i] = in.readZLong();
+            rightlinkArr[i] = in.readZLong();
+            byte sepKind = in.readByte();
+            if (sepKind == RIGHTSEP_INF) {
+                rightsepInf[i] = true;
+            } else if (sepKind == RIGHTSEP_BYTES) {
+                byte[] rs = in.readArray();
+                if (rs == null) {
+                    // The writer never emits a null rightsep array (it always
+                    // calls writeArray on a non-null Bytes.to_array()), so a
+                    // null here means the on-disk page is corrupted. Fail
+                    // fast with an actionable message.
+                    throw new IOException("corrupted node metadata: null rightsep at index " + i);
+                }
+                rightsepBytes[i] = rs;
+                totalRightsepBytes += (long) rs.length;
+            } else {
+                throw new IOException("unknown rightsep marker " + sepKind);
+            }
+        }
+        IndexKeySlab slabOwner = (totalRightsepBytes >= IndexKeySlab.OFFHEAP_KEY_BYTES_THRESHOLD
+                && totalRightsepBytes <= (long) Integer.MAX_VALUE)
+                ? new IndexKeySlab(totalRightsepBytes,
+                        HerdDBByteBufAllocators.indexPagesAllocator())
+                : null;
+        BLinkNodeMetadata<Bytes>[] result = newArray(count);
+        for (int i = 0; i < count; i++) {
+            Bytes rightsep;
+            if (rightsepInf[i]) {
+                rightsep = Bytes.POSITIVE_INFINITY;
+            } else if (slabOwner != null) {
+                int off = slabOwner.append(rightsepBytes[i]);
+                rightsep = slabOwner.wrap(off, rightsepBytes[i].length);
+            } else {
+                rightsep = Bytes.from_array(rightsepBytes[i]);
+            }
+            result[i] = new BLinkNodeMetadata<>(leafArr[i], idArr[i], storeIdArr[i],
+                    keysArr[i], bytesArr[i], outlinkArr[i], rightlinkArr[i], rightsep);
+        }
+        return result;
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})

@@ -70,4 +70,18 @@ public final class BytesLongSizeEvaluator implements SizeEvaluator<Bytes, Long> 
     public Bytes getPosiviveInfinityKey() {
         return Bytes.POSITIVE_INFINITY;
     }
+
+    /**
+     * Issue #411: defensively detach the BLink rightsep promoted at split /
+     * half-merge time so it no longer pins the donor leaf's per-page
+     * {@link herddb.utils.IndexKeySlab}. {@link Bytes#POSITIVE_INFINITY} is a
+     * sentinel singleton with no slab anchor and goes through unchanged.
+     */
+    @Override
+    public Bytes detachSeparator(Bytes key) {
+        if (key == Bytes.POSITIVE_INFINITY) {
+            return key;
+        }
+        return key.materialiseAndDetach();
+    }
 }

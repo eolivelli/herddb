@@ -216,7 +216,7 @@ public class EnginePermanentGapClusterTest {
             Table table = buildTable();
             Index ix = buildVectorIndex();
             WatermarkSnapshot snapshot = new WatermarkSnapshot(
-                    watermarkLsn, 1,
+                    watermarkLsn, 1, 0L,
                     Collections.singletonList(table),
                     Collections.singletonList(ix));
             InMemoryWatermarkStore watermark = new InMemoryWatermarkStore(snapshot);

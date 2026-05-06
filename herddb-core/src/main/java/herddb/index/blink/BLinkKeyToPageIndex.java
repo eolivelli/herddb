@@ -26,6 +26,7 @@ import herddb.core.HerdDBInternalException;
 import herddb.core.MemoryManager;
 import herddb.core.PostCheckpointAction;
 import herddb.index.IndexOperation;
+import herddb.index.KeyToPageCheckpointSnapshot;
 import herddb.index.KeyToPageIndex;
 import herddb.index.PrimaryIndexPrefixScan;
 import herddb.index.PrimaryIndexRangeScan;
@@ -45,6 +46,8 @@ import herddb.storage.IndexStatus;
 import herddb.utils.ByteArrayCursor;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataOutputStream;
+import herddb.utils.HerdDBByteBufAllocators;
+import herddb.utils.IndexKeySlab;
 import herddb.utils.SystemProperties;
 import herddb.utils.VisibleByteArrayOutputStream;
 import java.io.IOException;
@@ -484,52 +487,121 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
 
     @Override
     public List<PostCheckpointAction> checkpoint(LogSequenceNumber sequenceNumber, boolean pin) throws DataStorageManagerException {
+        // Single-phase entry point: kept for callers that do not opt into the
+        // fuzzy two-phase protocol (tests, dump, restoreRawDumpedEntryLogs).
+        // Production callers in TableManager Phase C use prepareCheckpoint +
+        // persistCheckpoint directly so the slow remote I/O runs outside the
+        // checkpoint write lock (issue #403).
+        KeyToPageCheckpointSnapshot snapshot = prepareCheckpoint(sequenceNumber, pin);
+        return persistCheckpoint(snapshot);
+    }
 
+    @Override
+    public KeyToPageCheckpointSnapshot prepareCheckpoint(LogSequenceNumber sequenceNumber, boolean pin)
+            throws DataStorageManagerException {
+        /* Tree can be null if no data was inserted (tree creation deferred to check evaluate key size) */
+        final BLink<Bytes, Long> tree = this.tree;
+        if (tree == null) {
+            return new BLinkCheckpointSnapshot(sequenceNumber, pin, /*empty*/ true,
+                    null, null, null, 0L);
+        }
+
+        /*
+         * Install a per-checkpoint batch so node-page writes go through
+         * writeIndexPageAsync and run concurrently (issue #202). The BLink
+         * tree traversal itself remains sequential, but the remote I/O is
+         * fanned out up to CHECKPOINT_FLUSH_PARALLELISM in flight. All
+         * futures are awaited inside persistCheckpoint, before we write the
+         * IndexStatus, so the checkpoint marker never references a page
+         * whose bytes are not yet durable.
+         *
+         * Issue #403: the BLink traversal that mutates the per-node "dirty"
+         * flags must run while the caller still excludes DML (TableManager's
+         * checkpointLock write). The waitBatch + indexCheckpoint write run
+         * outside the lock inside persistCheckpoint.
+         */
+        AsyncIndexWriteBatch batch = new AsyncIndexWriteBatch(CHECKPOINT_FLUSH_PARALLELISM);
+        BLinkMetadata<Bytes> metadata;
+        currentBatch = batch;
         try {
-
-            /* Tree can be null if no data was inserted (tree creation deferred to check evaluate key size) */
-            final BLink<Bytes, Long> tree = this.tree;
-            if (tree == null) {
-                return Collections.emptyList();
-            }
-
-            /*
-             * Install a per-checkpoint batch so node-page writes go through
-             * writeIndexPageAsync and run concurrently (issue #202). The BLink
-             * tree traversal itself remains sequential, but the remote I/O is
-             * fanned out up to CHECKPOINT_FLUSH_PARALLELISM in flight. All
-             * futures are awaited below before we persist the IndexStatus, so
-             * the checkpoint marker never references a page whose bytes are
-             * not yet durable.
-             */
-            AsyncIndexWriteBatch batch = new AsyncIndexWriteBatch(CHECKPOINT_FLUSH_PARALLELISM);
-            BLinkMetadata<Bytes> metadata;
-            currentBatch = batch;
-            try {
-                metadata = getTree().checkpoint();
-            } finally {
-                currentBatch = null;
-            }
-            awaitBatch(batch);
-
-            byte[] metaPage = MetadataSerializer.INSTANCE.write(metadata);
-
-            Set<Long> activePages = new HashSet<>();
-            metadata.nodes.forEach(node -> activePages.add(node.storeId));
-
-            IndexStatus indexStatus = new IndexStatus(indexName, sequenceNumber, newPageId.get(), activePages, metaPage);
-            List<PostCheckpointAction> result = new ArrayList<>();
-            result.addAll(dataStorageManager.indexCheckpoint(tableSpace, indexName, indexStatus, pin));
-
-            LOGGER.log(Level.INFO, "checkpoint index {0} finished: logpos {1}, {2} pages",
-                    new Object[]{indexName, sequenceNumber, Integer.toString(metadata.nodes.size())});
-            LOGGER.log(Level.FINE, "checkpoint index {0} finished: logpos {1}, pages {2}",
-                    new Object[]{indexName, sequenceNumber, activePages.toString()});
-
-            return result;
-
+            metadata = getTree().checkpoint();
         } catch (IOException err) {
             throw new DataStorageManagerException(err);
+        } finally {
+            currentBatch = null;
+        }
+
+        byte[] metaPage;
+        try {
+            metaPage = MetadataSerializer.INSTANCE.write(metadata);
+        } catch (IOException err) {
+            throw new DataStorageManagerException(err);
+        }
+
+        Set<Long> activePages = new HashSet<>();
+        metadata.nodes.forEach(node -> activePages.add(node.storeId));
+
+        return new BLinkCheckpointSnapshot(sequenceNumber, pin, /*empty*/ false,
+                metaPage, activePages, batch, newPageId.get());
+    }
+
+    @Override
+    public List<PostCheckpointAction> persistCheckpoint(KeyToPageCheckpointSnapshot snapshot)
+            throws DataStorageManagerException {
+        BLinkCheckpointSnapshot s = (BLinkCheckpointSnapshot) snapshot;
+        if (s.empty) {
+            return Collections.emptyList();
+        }
+        // Wait for the BLink node-page bytes referenced by the metadata to be
+        // durable on storage. This blocks on remote I/O but does NOT hold the
+        // TableManager.checkpointLock write — concurrent DML can proceed.
+        awaitBatch(s.pendingNodeWrites);
+
+        IndexStatus indexStatus = new IndexStatus(indexName, s.sequenceNumber(),
+                s.newPageIdAtSnapshot, s.activePages, s.metaPage);
+        List<PostCheckpointAction> result = new ArrayList<>(
+                dataStorageManager.indexCheckpoint(tableSpace, indexName, indexStatus, s.pin));
+
+        LOGGER.log(Level.INFO, "checkpoint index {0} finished: logpos {1}, {2} pages",
+                new Object[]{indexName, s.sequenceNumber(), Integer.toString(s.activePages.size())});
+        if (LOGGER.isLoggable(Level.FINE)) {
+            LOGGER.log(Level.FINE, "checkpoint index {0} finished: logpos {1}, pages {2}",
+                    new Object[]{indexName, s.sequenceNumber(), s.activePages.toString()});
+        }
+        return result;
+    }
+
+    /**
+     * Snapshot taken under the caller's exclusion window in
+     * {@link #prepareCheckpoint(LogSequenceNumber, boolean)} and consumed
+     * outside the lock by
+     * {@link #persistCheckpoint(KeyToPageCheckpointSnapshot)}. See issue #403.
+     */
+    static final class BLinkCheckpointSnapshot implements KeyToPageCheckpointSnapshot {
+
+        private final LogSequenceNumber sequenceNumber;
+        final boolean pin;
+        final boolean empty;
+        final byte[] metaPage;
+        final Set<Long> activePages;
+        final AsyncIndexWriteBatch pendingNodeWrites;
+        final long newPageIdAtSnapshot;
+
+        BLinkCheckpointSnapshot(LogSequenceNumber sequenceNumber, boolean pin, boolean empty,
+                byte[] metaPage, Set<Long> activePages, AsyncIndexWriteBatch pendingNodeWrites,
+                long newPageIdAtSnapshot) {
+            this.sequenceNumber = sequenceNumber;
+            this.pin = pin;
+            this.empty = empty;
+            this.metaPage = metaPage;
+            this.activePages = activePages;
+            this.pendingNodeWrites = pendingNodeWrites;
+            this.newPageIdAtSnapshot = newPageIdAtSnapshot;
+        }
+
+        @Override
+        public LogSequenceNumber sequenceNumber() {
+            return sequenceNumber;
         }
     }
 
@@ -869,24 +941,71 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
                     throw new IOException("Wrong page type " + rtype + " expected " + type);
                 }
 
+                // Issue #399 step 4: collect all (key bytes, value) pairs
+                // first so we can size and allocate a single off-heap slab
+                // from HerdDBByteBufAllocators.indexPagesAllocator() and
+                // pack every key into it. Below the threshold we keep the
+                // legacy on-heap path to avoid the slab overhead on tiny
+                // pages.
+                List<byte[]> keyBytesList = new ArrayList<>();
+                List<Long> valueList = new ArrayList<>();
+                List<Long> infiniteValueList = new ArrayList<>();
+                long totalKeyBytes = 0L;
+
                 byte block;
                 while ((block = in.readByte()) != NODE_PAGE_END_BLOCK) {
 
                     switch (block) {
 
-                        case NODE_PAGE_KEY_VALUE_BLOCK:
-                            map.put(in.readBytes(),
-                                    in.readVLong());
+                        case NODE_PAGE_KEY_VALUE_BLOCK: {
+                            byte[] k = in.readArray();
+                            if (k == null) {
+                                // Defensive: writer never emits a null array
+                                // (it always passes a non-null byte[] to
+                                // out.writeArray), so this means the on-disk
+                                // page is corrupted. Fail fast — the previous
+                                // map.put(in.readBytes(), …) path would have
+                                // NPEd inside the TreeMap; this is more
+                                // actionable.
+                                throw new IOException("corrupted index page "
+                                        + pageId + ": null key");
+                            }
+                            long v = in.readVLong();
+                            keyBytesList.add(k);
+                            valueList.add(v);
+                            totalKeyBytes += (long) k.length;
                             break;
+                        }
 
                         case NODE_PAGE_INF_BLOCK:
-                            map.put(Bytes.POSITIVE_INFINITY, in.readVLong());
+                            infiniteValueList.add(in.readVLong());
                             break;
 
                         default:
                             throw new IOException("Wrong node block type " + block);
 
                     }
+                }
+
+                if (totalKeyBytes >= IndexKeySlab.OFFHEAP_KEY_BYTES_THRESHOLD
+                        && totalKeyBytes <= (long) Integer.MAX_VALUE) {
+                    IndexKeySlab slabOwner = new IndexKeySlab(totalKeyBytes,
+                            HerdDBByteBufAllocators.indexPagesAllocator());
+                    for (int i = 0; i < keyBytesList.size(); i++) {
+                        byte[] k = keyBytesList.get(i);
+                        int off = slabOwner.append(k);
+                        map.put(slabOwner.wrap(off, k.length), valueList.get(i));
+                    }
+                } else {
+                    // On-heap fallback: total below the threshold, or the
+                    // theoretical >2 GiB upper bound we cannot fit into one
+                    // ByteBuf — keep the original behaviour.
+                    for (int i = 0; i < keyBytesList.size(); i++) {
+                        map.put(Bytes.from_array(keyBytesList.get(i)), valueList.get(i));
+                    }
+                }
+                for (Long v : infiniteValueList) {
+                    map.put(Bytes.POSITIVE_INFINITY, v);
                 }
 
                 return map;

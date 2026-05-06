@@ -125,6 +125,29 @@ public final class ServerConfiguration {
     public static final int PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT = 8;
 
     /**
+     * Maximum number of stale page paths sent in a single {@code DeleteFiles}
+     * batch RPC during {@code RemoteFileDataStorageManager.cleanupAfterTableBoot}
+     * (issue #398). Each batch crosses the network once, so larger values cut the
+     * boot-time cleanup duration roughly proportionally on GCS-backed deployments
+     * where each individual delete costs ~100 ms. Keep small enough that one
+     * batch's RPC frame and per-path latency tail stay bounded — 100 paths per
+     * batch keeps the request well under typical gRPC frame caps and keeps
+     * progress visible in the server logs without flooding them.
+     */
+    public static final String PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE =
+            "server.remote.cleanup.batch.size";
+    public static final int PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT = 100;
+
+    /**
+     * Soft upper-bound on {@link #PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE}.
+     * Larger values trigger a startup {@code WARNING} because the resulting
+     * {@code DeleteFiles} request frame may approach the gRPC inbound message
+     * size limit (each path is a string of ~50–200 bytes, so 10,000 paths is
+     * ~0.5–2 MiB on the wire).
+     */
+    public static final int PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_MAX_RECOMMENDED = 10_000;
+
+    /**
      * Maximum number of concurrent page/index-page writes to remote storage
      * during a single checkpoint flush (e.g. parallel BLink node writes in
      * {@code BLinkKeyToPageIndex.checkpoint}). Bounds the global fan-out so a
@@ -438,6 +461,27 @@ public final class ServerConfiguration {
      */
     public static final String PROPERTY_MEMORY_LIMIT_REFERENCE = "server.memory.max.limit";
     public static final long PROPERTY_MEMORY_LIMIT_REFERENCE_DEFAULT = 0L;
+
+    /**
+     * Selects which JVM memory budget the data/index/PK percentage defaults are
+     * derived from when {@link #PROPERTY_MEMORY_LIMIT_REFERENCE} is left unset.
+     * <p>
+     * Allowed values:
+     * <ul>
+     *   <li>{@code direct} (default): use the JVM direct-memory limit as
+     *       returned by {@link herddb.utils.HerdDBByteBufAllocators#maxDirectMemoryBytes()}.
+     *       This matches the location of the on-disk page slabs (off-heap),
+     *       so the budget governs the resource it actually consumes.</li>
+     *   <li>{@code heap}: legacy behaviour — derive from the JVM max heap.
+     *       Use this only when running with on-heap page payloads or when an
+     *       embedded host has tightly coupled the JVM heap to overall RAM.</li>
+     * </ul>
+     */
+    public static final String PROPERTY_MEMORY_LIMIT_REFERENCE_SOURCE = "server.memory.max.limit.source";
+    public static final String MEMORY_LIMIT_REFERENCE_SOURCE_DIRECT = "direct";
+    public static final String MEMORY_LIMIT_REFERENCE_SOURCE_HEAP = "heap";
+    public static final String PROPERTY_MEMORY_LIMIT_REFERENCE_SOURCE_DEFAULT =
+            MEMORY_LIMIT_REFERENCE_SOURCE_DIRECT;
 
     public static final String PROPERTY_PLANSCACHE_MAXMEMORY = "server.memory.planscache.limit";
     public static final long PROPERTY_PLANSCACHE_MAXMEMORY_DEFAULT = 50 * 1024 * 1024L;

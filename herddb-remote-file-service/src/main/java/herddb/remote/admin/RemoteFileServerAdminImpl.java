@@ -20,37 +20,33 @@
 
 package herddb.remote.admin;
 
+import herddb.network.Channel;
+import herddb.proto.Pdu;
+import herddb.proto.PduCodec;
 import herddb.remote.RemoteFileServer;
-import herddb.remote.proto.GetServerInfoRequest;
-import herddb.remote.proto.GetServerInfoResponse;
-import herddb.remote.proto.RemoteFileServerAdminGrpc;
-import herddb.remote.proto.ResizeDiskCacheRequest;
-import herddb.remote.proto.ResizeDiskCacheResponse;
 import herddb.remote.storage.CachingObjectStorage;
 import herddb.remote.storage.InMemoryBlockCacheObjectStorage;
-import io.grpc.Status;
-import io.grpc.stub.StreamObserver;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * gRPC admin service for the file server (issue #336).
- * <p>
- * Registered on the same gRPC port as {@link herddb.remote.RemoteFileServiceImpl};
- * gRPC multiplexes both services by their service descriptor name so no extra port
- * is needed.
- * <p>
- * Provides two RPCs:
+ * File-server admin dispatcher (issue #336, ported to native Netty in
+ * issue #425). Hosted on the same Netty channel as
+ * {@link herddb.remote.RemoteFileServiceImpl}; PDU type-byte multiplexing
+ * routes inbound messages to the right dispatcher.
+ *
+ * <p>Two operations:
  * <ul>
- *   <li>{@code GetServerInfo} — returns a snapshot of JVM, disk-cache, and block-cache
- *       stats. Safe to call at any time; all reads are lock-free.</li>
- *   <li>{@code ResizeDiskCache} — calls {@link CachingObjectStorage#setMaxCacheBytes(long)}
- *       to resize the disk-LRU on the fly. The change is not persistent.</li>
+ *   <li>{@code GET_SERVER_INFO} — returns a snapshot of JVM, disk-cache, and
+ *       block-cache stats. Lock-free reads; safe to call any time.</li>
+ *   <li>{@code RESIZE_DISK_CACHE} — calls
+ *       {@link CachingObjectStorage#setMaxCacheBytes(long)} to resize the
+ *       disk-LRU on the fly. Not persisted across restarts.</li>
  * </ul>
  *
  * @author enrico.olivelli
  */
-public class RemoteFileServerAdminImpl extends RemoteFileServerAdminGrpc.RemoteFileServerAdminImplBase {
+public class RemoteFileServerAdminImpl {
 
     private static final Logger LOGGER = Logger.getLogger(RemoteFileServerAdminImpl.class.getName());
 
@@ -60,83 +56,103 @@ public class RemoteFileServerAdminImpl extends RemoteFileServerAdminGrpc.RemoteF
         this.server = server;
     }
 
-    @Override
-    public void getServerInfo(GetServerInfoRequest request,
-                              StreamObserver<GetServerInfoResponse> responseObserver) {
-        try {
-            GetServerInfoResponse.Builder builder = GetServerInfoResponse.newBuilder()
-                    .setGrpcHost(server.getHost())
-                    .setGrpcPort(server.getPort())
-                    .setStorageMode(server.getStorageMode());
-
-            // JVM heap stats
-            Runtime rt = Runtime.getRuntime();
-            long heapUsed = rt.totalMemory() - rt.freeMemory();
-            long heapMax = rt.maxMemory();
-            builder.setJvmHeapUsedBytes(heapUsed)
-                   .setJvmHeapMaxBytes(heapMax);
-
-            // Disk cache (populated when storage.mode=s3)
-            CachingObjectStorage dc = server.getDiskCache();
-            if (dc != null) {
-                com.github.benmanes.caffeine.cache.stats.CacheStats stats = dc.diskLruStats();
-                builder.setDiskCacheMaxBytes(dc.getMaxCacheBytes())
-                       .setDiskCacheHitCount(stats.hitCount())
-                       .setDiskCacheMissCount(stats.missCount())
-                       .setDiskCacheEvictionCount(stats.evictionCount())
-                       .setDiskCacheHitBytes(dc.getHitBytes())
-                       .setDiskCacheMissBytes(dc.getMissBytes())
-                       .setDiskCacheEstimatedEntries(dc.estimatedEntries());
-            }
-
-            // In-heap block cache (populated when block.cache.enabled=true)
-            InMemoryBlockCacheObjectStorage bc = server.getBlockCache();
-            if (bc != null) {
-                com.github.benmanes.caffeine.cache.stats.CacheStats bStats = bc.stats();
-                builder.setBlockCacheMaxBytes(bc.getMaxBytes())
-                       .setBlockCacheEstimatedBytes(bc.estimatedBytes())
-                       .setBlockCacheEstimatedEntries(bc.estimatedSize())
-                       .setBlockCacheHits(bStats.hitCount())
-                       .setBlockCacheMisses(bStats.missCount())
-                       .setBlockCacheEvictions(bStats.evictionCount());
-            }
-
-            responseObserver.onNext(builder.build());
-            responseObserver.onCompleted();
-        } catch (RuntimeException e) {
-            // Broad catch: gRPC service entry point — must not let an unchecked exception
-            // kill the worker thread without returning a status reply to the client.
-            LOGGER.log(Level.WARNING, "GetServerInfo failed", e);
-            responseObserver.onError(
-                    Status.INTERNAL.withDescription(e.getMessage()).withCause(e).asRuntimeException());
+    /**
+     * Dispatches an inbound admin PDU. Returns {@code true} if the type was
+     * recognized (and the PDU was consumed), {@code false} otherwise. When
+     * this method returns {@code true} the caller must NOT close the PDU.
+     */
+    public boolean handle(Pdu pdu, Channel channel) {
+        switch (pdu.type) {
+            case Pdu.TYPE_FS_GET_SERVER_INFO:
+                handleGetServerInfo(pdu, channel);
+                return true;
+            case Pdu.TYPE_FS_RESIZE_DISK_CACHE:
+                handleResizeDiskCache(pdu, channel);
+                return true;
+            default:
+                return false;
         }
     }
 
-    @Override
-    public void resizeDiskCache(ResizeDiskCacheRequest request,
-                                StreamObserver<ResizeDiskCacheResponse> responseObserver) {
-        CachingObjectStorage dc = server.getDiskCache();
-        if (dc == null) {
-            responseObserver.onError(Status.FAILED_PRECONDITION
-                    .withDescription("disk cache not available: storage.mode is not s3")
-                    .asRuntimeException());
-            return;
+    private void handleGetServerInfo(Pdu pdu, Channel channel) {
+        long messageId = pdu.messageId;
+        try {
+            PduCodec.GetServerInfoResponse.Info info = new PduCodec.GetServerInfoResponse.Info();
+            info.host = server.getHost();
+            info.port = server.getPort();
+            info.storageMode = server.getStorageMode();
+
+            Runtime rt = Runtime.getRuntime();
+            info.jvmHeapUsedBytes = rt.totalMemory() - rt.freeMemory();
+            info.jvmHeapMaxBytes = rt.maxMemory();
+
+            CachingObjectStorage dc = server.getDiskCache();
+            if (dc != null) {
+                com.github.benmanes.caffeine.cache.stats.CacheStats stats = dc.diskLruStats();
+                info.diskCacheMaxBytes = dc.getMaxCacheBytes();
+                info.diskCacheHitCount = stats.hitCount();
+                info.diskCacheMissCount = stats.missCount();
+                info.diskCacheEvictionCount = stats.evictionCount();
+                info.diskCacheHitBytes = dc.getHitBytes();
+                info.diskCacheMissBytes = dc.getMissBytes();
+                info.diskCacheEstimatedEntries = dc.estimatedEntries();
+            }
+
+            InMemoryBlockCacheObjectStorage bc = server.getBlockCache();
+            if (bc != null) {
+                com.github.benmanes.caffeine.cache.stats.CacheStats bStats = bc.stats();
+                info.blockCacheMaxBytes = bc.getMaxBytes();
+                info.blockCacheEstimatedBytes = bc.estimatedBytes();
+                info.blockCacheEstimatedEntries = bc.estimatedSize();
+                info.blockCacheHits = bStats.hitCount();
+                info.blockCacheMisses = bStats.missCount();
+                info.blockCacheEvictions = bStats.evictionCount();
+            }
+
+            channel.sendReplyMessage(messageId,
+                    PduCodec.GetServerInfoResponse.write(messageId, info));
+        } catch (RuntimeException e) {
+            // Broad catch: admin entry point — must not let an unchecked
+            // exception kill the netty thread without replying to the client.
+            LOGGER.log(Level.WARNING, "GetServerInfo failed", e);
+            channel.sendReplyMessage(messageId,
+                    PduCodec.ErrorResponse.write(messageId, "GetServerInfo failed: " + e.getMessage()));
+        } finally {
+            pdu.close();
         }
-        long newMax = request.getNewMaxBytes();
-        if (newMax <= 0) {
-            responseObserver.onError(Status.INVALID_ARGUMENT
-                    .withDescription("new_max_bytes must be > 0, got " + newMax)
-                    .asRuntimeException());
-            return;
+    }
+
+    private void handleResizeDiskCache(Pdu pdu, Channel channel) {
+        long messageId = pdu.messageId;
+        try {
+            CachingObjectStorage dc = server.getDiskCache();
+            if (dc == null) {
+                channel.sendReplyMessage(messageId,
+                        PduCodec.ErrorResponse.write(messageId,
+                                "disk cache not available: storage.mode is not s3"));
+                return;
+            }
+            long newMax = PduCodec.ResizeDiskCacheRequest.readNewMaxBytes(pdu);
+            if (newMax <= 0) {
+                channel.sendReplyMessage(messageId,
+                        PduCodec.ErrorResponse.write(messageId,
+                                "new_max_bytes must be > 0, got " + newMax));
+                return;
+            }
+            long prev = dc.setMaxCacheBytes(newMax);
+            LOGGER.log(Level.INFO,
+                    "ResizeDiskCache: previousMax={0} bytes, newMax={1} bytes",
+                    new Object[]{prev, newMax});
+            channel.sendReplyMessage(messageId,
+                    PduCodec.ResizeDiskCacheResponse.write(messageId, prev, newMax));
+        } catch (RuntimeException e) {
+            // Broad catch: admin entry point — must not let an unchecked
+            // exception kill the netty thread without replying to the client.
+            LOGGER.log(Level.WARNING, "ResizeDiskCache failed", e);
+            channel.sendReplyMessage(messageId,
+                    PduCodec.ErrorResponse.write(messageId, "ResizeDiskCache failed: " + e.getMessage()));
+        } finally {
+            pdu.close();
         }
-        long prev = dc.setMaxCacheBytes(newMax);
-        LOGGER.log(Level.INFO,
-                "ResizeDiskCache: previousMax={0} bytes, newMax={1} bytes",
-                new Object[]{prev, newMax});
-        responseObserver.onNext(ResizeDiskCacheResponse.newBuilder()
-                .setPreviousMaxBytes(prev)
-                .setNewMaxBytes(newMax)
-                .build());
-        responseObserver.onCompleted();
     }
 }

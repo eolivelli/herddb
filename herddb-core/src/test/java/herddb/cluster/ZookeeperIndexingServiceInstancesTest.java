@@ -138,7 +138,7 @@ public class ZookeeperIndexingServiceInstancesTest {
             assertNull(mgr.getIndexingServiceCheckpointState(0));
 
             IndexingServiceCheckpointState s1 = new IndexingServiceCheckpointState(
-                    0, 10L, 100L, 3, 1_700_000_000_000L);
+                    0, 10L, 100L, 3, 1_700_000_000_000L, 1_699_999_999_500L);
             mgr.publishIndexingServiceCheckpointState(s1);
 
             IndexingServiceCheckpointState read = mgr.getIndexingServiceCheckpointState(0);
@@ -156,7 +156,7 @@ public class ZookeeperIndexingServiceInstancesTest {
             });
 
             IndexingServiceCheckpointState s2 = new IndexingServiceCheckpointState(
-                    0, 10L, 200L, 4, 1_700_000_001_000L);
+                    0, 10L, 200L, 4, 1_700_000_001_000L, 1_700_000_000_500L);
             mgr.publishIndexingServiceCheckpointState(s2);
 
             assertTrue("watcher did not fire within 5s", latch.await(5, TimeUnit.SECONDS));
@@ -172,7 +172,7 @@ public class ZookeeperIndexingServiceInstancesTest {
             CountDownLatch latch = new CountDownLatch(1);
             mgr.watchIndexingServiceCheckpointState(7, state -> latch.countDown());
             mgr.publishIndexingServiceCheckpointState(
-                    new IndexingServiceCheckpointState(7, 1L, 2L, 0, 0L));
+                    new IndexingServiceCheckpointState(7, 1L, 2L, 0, 0L, 0L));
             assertTrue("watcher did not fire on first publish", latch.await(5, TimeUnit.SECONDS));
         }
     }

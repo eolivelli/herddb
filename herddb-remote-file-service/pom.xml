@@ -35,25 +35,16 @@
     </properties>
 
     <dependencies>
+        <!--
+          herddb-net carries the shared length-prefixed Netty wire framework
+          (NettyChannelAcceptor / NettyConnector / Channel / SASL handshake),
+          reused by the file server since issue #425 to avoid duplicating
+          framing, TLS, and authentication mechanics.
+        -->
         <dependency>
-            <groupId>io.grpc</groupId>
-            <artifactId>grpc-netty-shaded</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>io.grpc</groupId>
-            <artifactId>grpc-protobuf</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>io.grpc</groupId>
-            <artifactId>grpc-stub</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.google.protobuf</groupId>
-            <artifactId>protobuf-java</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>javax.annotation</groupId>
-            <artifactId>javax.annotation-api</artifactId>
+            <groupId>org.herddb</groupId>
+            <artifactId>herddb-net</artifactId>
+            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>org.herddb</groupId>
@@ -147,32 +138,7 @@
     </dependencies>
 
     <build>
-        <extensions>
-            <extension>
-                <groupId>kr.motd.maven</groupId>
-                <artifactId>os-maven-plugin</artifactId>
-                <version>1.7.1</version>
-            </extension>
-        </extensions>
         <plugins>
-            <plugin>
-                <groupId>org.xolstice.maven.plugins</groupId>
-                <artifactId>protobuf-maven-plugin</artifactId>
-                <version>0.6.1</version>
-                <configuration>
-                    <protocArtifact>com.google.protobuf:protoc:${libs.protobuf}:exe:${os.detected.classifier}</protocArtifact>
-                    <pluginId>grpc-java</pluginId>
-                    <pluginArtifact>io.grpc:protoc-gen-grpc-java:${libs.grpc}:exe:${os.detected.classifier}</pluginArtifact>
-                </configuration>
-                <executions>
-                    <execution>
-                        <goals>
-                            <goal>compile</goal>
-                            <goal>compile-custom</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
@@ -192,6 +158,21 @@
                     <environmentVariables>
                         <DOCKER_API_VERSION>1.43</DOCKER_API_VERSION>
                     </environmentVariables>
+                    <!--
+                      Enable Netty paranoid resource-leak detection for every
+                      forked JVM in this module. This is the canonical
+                      regression gate for ByteBuf refcount discipline (see
+                      issue #415): any test that drops a pooled direct
+                      ByteBuf without releasing it will be flagged with a
+                      LEAK: warning and a stack trace pointing at the
+                      allocation site. We use systemPropertyVariables (rather
+                      than overriding the parent <argLine>) so the JVM flags
+                      and JaCoCo @{argLine} from the parent's ci/default
+                      profiles are preserved.
+                    -->
+                    <systemPropertyVariables>
+                        <io.netty.leakDetection.level>paranoid</io.netty.leakDetection.level>
+                    </systemPropertyVariables>
                 </configuration>
             </plugin>
             <!--

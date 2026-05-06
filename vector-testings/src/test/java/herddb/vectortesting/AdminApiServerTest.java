@@ -111,8 +111,9 @@ class AdminApiServerTest {
         JsonNode json = MAPPER.readTree(resp.body());
         assertEquals(5000, json.get("ingest-max-ops").asInt());
         assertEquals(5000, runtime.config().ingestMaxOpsPerSecond);
-        // Guava RateLimiter.getRate() returns exactly the value passed to setRate().
-        assertEquals(5000.0, runtime.ingestRateLimiter().getRate(), 1e-6);
+        // The per-thread group splits the global rate across N children;
+        // total / N for each, summing to total.
+        assertEquals(5000.0, runtime.ingestRateLimiterGroup().getEffectiveRate(), 1e-6);
     }
 
     @Test
@@ -120,7 +121,10 @@ class AdminApiServerTest {
         HttpResponse<String> resp = postJson("/ingestion/config/ingest-max-ops", "{\"value\": 0}");
         assertEquals(200, resp.statusCode());
         assertEquals(0, runtime.config().ingestMaxOpsPerSecond);
-        assertEquals(BenchRuntime.UNLIMITED_RATE, runtime.ingestRateLimiter().getRate(), 1.0);
+        // Group records 0 (unlimited) at the group level; per-child rate maps to UNLIMITED_RATE.
+        assertEquals(0.0, runtime.ingestRateLimiterGroup().getEffectiveRate(), 1e-6);
+        assertEquals(PerThreadRateLimiter.UNLIMITED_RATE,
+                runtime.ingestRateLimiterGroup().limiterFor(0).getRate(), 1.0);
     }
 
     @Test
@@ -252,7 +256,10 @@ class AdminApiServerTest {
         c.ingestMaxOpsPerSecond = 0;
         c.queryMaxOpsPerSecond = 0;
         BenchRuntime r = new BenchRuntime(c);
-        assertEquals(BenchRuntime.UNLIMITED_RATE, r.ingestRateLimiter().getRate(), 1.0);
+        // 0 means "unlimited" at the group level; per-child maps to UNLIMITED_RATE.
+        assertEquals(0.0, r.ingestRateLimiterGroup().getEffectiveRate(), 1e-6);
+        assertEquals(PerThreadRateLimiter.UNLIMITED_RATE,
+                r.ingestRateLimiterGroup().limiterFor(0).getRate(), 1.0);
         assertEquals(BenchRuntime.UNLIMITED_RATE, r.queryRateLimiter().getRate(), 1.0);
     }
 
@@ -261,8 +268,10 @@ class AdminApiServerTest {
         Config c = new Config();
         c.ingestMaxOpsPerSecond = 7777;
         c.queryMaxOpsPerSecond = 111;
+        c.ingestThreads = 1;
         BenchRuntime r = new BenchRuntime(c);
-        assertEquals(7777.0, r.ingestRateLimiter().getRate(), 1e-6);
+        assertEquals(7777.0, r.ingestRateLimiterGroup().getEffectiveRate(), 1e-6);
+        assertEquals(7777.0, r.ingestRateLimiterGroup().limiterFor(0).getRate(), 1e-3);
         assertEquals(111.0, r.queryRateLimiter().getRate(), 1e-6);
     }
 
@@ -285,7 +294,7 @@ class AdminApiServerTest {
         HttpResponse<String> resp = postJson("/ingestion/config/ingest-max-ops", "{\"value\": -1}");
         assertEquals(400, resp.statusCode());
         assertEquals(100_000, runtime.config().ingestMaxOpsPerSecond);
-        assertEquals(100_000.0, runtime.ingestRateLimiter().getRate(), 1e-6);
+        assertEquals(100_000.0, runtime.ingestRateLimiterGroup().getEffectiveRate(), 1e-6);
     }
 
     @Test
@@ -356,27 +365,44 @@ class AdminApiServerTest {
                 "5 acquires after rate raise should take < 500ms, got " + (fastNanos / 1e6) + " ms");
     }
 
-    /** Mirrors {@link #liveRateChangeTakesEffectImmediately()} for the ingest side. */
+    /**
+     * Mirrors {@link #liveRateChangeTakesEffectImmediately()} for the ingest
+     * side. Uses a 1-thread runtime so the per-thread split degenerates to
+     * the configured global rate.
+     */
     @Test
     void liveIngestRateChangeTakesEffectImmediately() throws Exception {
-        postJson("/ingestion/config/ingest-max-ops", "{\"value\": 2}");
-        assertEquals(2.0, runtime.ingestRateLimiter().getRate(), 1e-6);
+        // Rebuild the runtime with a single ingest thread so per-child rate == total.
+        Config cfg = runtime.config();
+        cfg.ingestThreads = 1;
+        cfg.ingestMaxOpsPerSecond = 100_000;
+        // The default batch-size is 500; the new safety invariant
+        // (transaction-size <= ingest-max-ops) means we must lower batch-size
+        // first so we can drop the rate to 2 ops/s for this timing test.
+        cfg.batchSize = 1;
+        cfg.transactionSize = 0;
+        BenchRuntime singleThread = new BenchRuntime(cfg);
+        // Re-point the running server at the new runtime is not possible
+        // (the AdminServlet captured the original); test the limiter
+        // directly through the new runtime's API.
+        singleThread.setIngestMaxOps(2);
+        assertEquals(2.0, singleThread.ingestRateLimiterGroup().limiterFor(0).getRate(), 1e-6);
 
         long t0 = System.nanoTime();
         for (int i = 0; i < 5; i++) {
-            runtime.ingestRateLimiter().acquire(1);
+            singleThread.ingestRateLimiterGroup().acquire(0, 1);
         }
         long slowNanos = System.nanoTime() - t0;
         assertTrue(slowNanos >= 1_500_000_000L,
                 "5 acquires at 2 ops/s should take >= 1.5s, got " + (slowNanos / 1e6) + " ms");
 
-        postJson("/ingestion/config/ingest-max-ops", "{\"value\": 10000}");
-        assertEquals(10000.0, runtime.ingestRateLimiter().getRate(), 1e-6);
-        runtime.ingestRateLimiter().acquire(1);
+        singleThread.setIngestMaxOps(10000);
+        assertEquals(10000.0, singleThread.ingestRateLimiterGroup().limiterFor(0).getRate(), 1e-3);
+        singleThread.ingestRateLimiterGroup().acquire(0, 1);
 
         long t1 = System.nanoTime();
         for (int i = 0; i < 5; i++) {
-            runtime.ingestRateLimiter().acquire(1);
+            singleThread.ingestRateLimiterGroup().acquire(0, 1);
         }
         long fastNanos = System.nanoTime() - t1;
         assertTrue(fastNanos < 500_000_000L,

@@ -55,10 +55,37 @@ public class IndexingServiceDtoTest {
     @Test
     public void checkpointStateRoundTrip() throws Exception {
         IndexingServiceCheckpointState original =
-                new IndexingServiceCheckpointState(2, 10L, 100L, 5, 1_700_000_000_000L);
+                new IndexingServiceCheckpointState(
+                        2, 10L, 100L, 5, 1_700_000_000_000L, 1_699_999_999_500L);
         byte[] bytes = original.serialize();
         IndexingServiceCheckpointState decoded =
                 IndexingServiceCheckpointState.deserialize(bytes);
         assertEquals(original, decoded);
+        assertEquals(1_699_999_999_500L, decoded.getLastEntryTimestampMillis());
+    }
+
+    /**
+     * Issue #423: a primary running new code may publish state that an old
+     * shadow doesn't know how to consume — but Jackson's
+     * {@code @JsonIgnoreProperties(ignoreUnknown=true)} is supposed to make
+     * the reverse direction safe (old primary → new shadow), with the new
+     * field defaulting to {@code 0} ("unknown"). Verify that here.
+     */
+    @Test
+    public void checkpointStateMissingTimestampDefaultsToZero() throws Exception {
+        // Hand-craft a JSON document that omits lastEntryTimestampMillis.
+        byte[] jsonWithoutNewField =
+                ("{\"instanceId\":2,\"ledgerId\":10,\"offset\":100,\"segmentCount\":5,"
+                        + "\"timestampMillis\":1700000000000}")
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        IndexingServiceCheckpointState decoded =
+                IndexingServiceCheckpointState.deserialize(jsonWithoutNewField);
+        assertEquals(2, decoded.getInstanceId());
+        assertEquals(10L, decoded.getLedgerId());
+        assertEquals(100L, decoded.getOffset());
+        assertEquals(5, decoded.getSegmentCount());
+        assertEquals(1_700_000_000_000L, decoded.getTimestampMillis());
+        assertEquals("missing field defaults to 0 (unknown)",
+                0L, decoded.getLastEntryTimestampMillis());
     }
 }

@@ -22,18 +22,16 @@ package herddb.remote;
 
 import herddb.auth.oidc.OidcBootstrap;
 import herddb.auth.oidc.OidcTokenValidator;
-import herddb.auth.oidc.grpc.JwtAuthServerInterceptor;
 import herddb.metadata.MetadataStorageManager;
+import herddb.network.ServerSideConnection;
+import herddb.network.ServerSideConnectionAcceptor;
+import herddb.network.netty.NettyChannelAcceptor;
 import herddb.remote.admin.RemoteFileServerAdminImpl;
 import herddb.remote.storage.CachingObjectStorage;
 import herddb.remote.storage.InMemoryBlockCacheObjectStorage;
 import herddb.remote.storage.LocalObjectStorage;
 import herddb.remote.storage.ObjectStorage;
 import herddb.remote.storage.S3ObjectStorage;
-import io.grpc.Server;
-import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
-import io.grpc.netty.shaded.io.netty.channel.nio.NioEventLoopGroup;
-import io.grpc.netty.shaded.io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
 import java.net.URI;
@@ -71,12 +69,20 @@ import software.amazon.awssdk.services.s3.model.HeadBucketRequest;
 import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
 
 /**
- * Configurable gRPC server for RemoteFileService.
- * Supports local filesystem (default) and S3 storage backends via {@code storage.mode} property.
- * <p>
- * Also hosts the {@link RemoteFileServerAdminImpl} gRPC admin service on the same port
- * (issue #336): operators can query cache stats and resize the disk cache at runtime
- * without restarting the pod.
+ * Configurable Netty server for the file service. Issue #425 replaced the
+ * previous gRPC server with a native length-prefixed Netty wire protocol
+ * built on top of {@link NettyChannelAcceptor} from the {@code herddb-net}
+ * module — the same framework HerdDB itself uses for client/server
+ * communication. This removes per-RPC protobuf {@code byte[]} allocations
+ * and HTTP/2 framing overhead, frees up the {@code ioRatio=70} tuning, and
+ * picks up the standard SASL handshake (used for OIDC OAUTHBEARER auth)
+ * and TLS support for free.
+ *
+ * <p>Supports local-filesystem (default) and S3 storage backends via the
+ * {@code storage.mode} property. Hosts both the data-plane dispatcher
+ * ({@link RemoteFileServiceImpl}) and the admin dispatcher
+ * ({@link RemoteFileServerAdminImpl}) on the same Netty channel; PDU type
+ * multiplexing routes inbound messages to the right handler.
  *
  * @author enrico.olivelli
  */
@@ -96,8 +102,10 @@ public class RemoteFileServer implements AutoCloseable {
     public static final String CONFIG_READ_EXECUTOR_THREADS = "fileserver.read.executor.threads";
     /** Config key: thread count for the dedicated write-lane executor (issue #100). */
     public static final String CONFIG_WRITE_EXECUTOR_THREADS = "fileserver.write.executor.threads";
-    /** Config key: thread count for the Netty gRPC worker event loop. Defaults to {@code ioThreads}. */
+    /** Config key: thread count for the Netty worker event loop. Defaults to {@code ioThreads}. */
     public static final String CONFIG_NETTY_WORKER_THREADS = "fileserver.netty.worker.threads";
+    /** Config key: thread count for the Netty callback executor. Defaults to {@code ioThreads}. */
+    public static final String CONFIG_NETTY_CALLBACK_THREADS = "fileserver.netty.callback.threads";
     /**
      * Config key: thread count for the metadata executor (directory ops on local
      * storage, disk-cache index writer). Defaults to {@code ioThreads}.
@@ -109,9 +117,7 @@ public class RemoteFileServer implements AutoCloseable {
     private final Path dataDirectory;
     private final int ioThreads;
     private final Properties config;
-    private Server server;
-    private NioEventLoopGroup bossGroup;
-    private NioEventLoopGroup workerGroup;
+    private NettyChannelAcceptor acceptor;
     private ExecutorService metadataExecutor;
     private ThreadPoolExecutor readExecutor;
     private ThreadPoolExecutor writeExecutor;
@@ -127,6 +133,8 @@ public class RemoteFileServer implements AutoCloseable {
     private InMemoryBlockCacheObjectStorage blockCacheRef;
     /** Storage mode string used in admin GetServerInfo response. */
     private String storageMode;
+    /** OIDC validator built from {@link OidcBootstrap}; null when OIDC is disabled. */
+    private OidcTokenValidator oidcValidator;
 
     public RemoteFileServer(String host, int port, Path dataDirectory, int ioThreads, Properties config) {
         this.host = host;
@@ -216,38 +224,59 @@ public class RemoteFileServer implements AutoCloseable {
                 String.valueOf(DEFAULT_BLOCK_SIZE)));
         int nettyWorkerThreads = Integer.parseInt(
                 config.getProperty(CONFIG_NETTY_WORKER_THREADS, String.valueOf(ioThreads)));
-        bossGroup = new NioEventLoopGroup(1);
-        workerGroup = new NioEventLoopGroup(nettyWorkerThreads);
-        workerGroup.setIoRatio(ioRatio);
+        int nettyCallbackThreads = Integer.parseInt(
+                config.getProperty(CONFIG_NETTY_CALLBACK_THREADS, String.valueOf(ioThreads * 4)));
         LOGGER.log(Level.INFO,
                 "RemoteFileServer thread pools: ioThreads(default)={0}, "
-                        + "nettyWorker={1}, metadataExecutor={2}, readExecutor={3}, writeExecutor={4}",
-                new Object[]{ioThreads, nettyWorkerThreads, metadataExecutorThreads,
+                        + "nettyWorker={1}, nettyCallback={2}, metadataExecutor={3}, readExecutor={4}, writeExecutor={5}",
+                new Object[]{ioThreads, nettyWorkerThreads, nettyCallbackThreads, metadataExecutorThreads,
                         readExecutorThreads, writeExecutorThreads});
 
-        RemoteFileServiceImpl serviceImpl = new RemoteFileServiceImpl(
-                objectStorage, statsLogger, readExecutor, writeExecutor);
-        registerLaneExecutorGauges(statsLogger);
-        NettyServerBuilder grpcBuilder = NettyServerBuilder.forPort(port)
-                .bossEventLoopGroup(bossGroup)
-                .workerEventLoopGroup(workerGroup)
-                .channelType(NioServerSocketChannel.class)
-                .addService(serviceImpl)
-                // Admin service (issue #336): live cache stats and disk-cache resize.
-                // Runs on the same port as the data service; gRPC multiplexes by service name.
-                .addService(new RemoteFileServerAdminImpl(this))
-                .maxInboundMessageSize(blockSize + 1024 * 1024);
+        // Build OIDC validator BEFORE accepting connections so the first
+        // SASL handshake sees a fully-initialized validator.
         if (OidcBootstrap.isEnabled(config)) {
             try {
-                OidcTokenValidator validator = OidcBootstrap.buildValidator(config);
-                grpcBuilder.intercept(new JwtAuthServerInterceptor(validator::validate));
+                oidcValidator = OidcBootstrap.buildValidator(config);
                 LOGGER.log(Level.INFO, "OIDC authentication enabled for RemoteFileServer (issuer={0})",
                         config.getProperty(OidcBootstrap.PROP_ISSUER_URL));
             } catch (IOException e) {
                 throw new IOException("Failed to initialize OIDC for RemoteFileServer: " + e.getMessage(), e);
             }
         }
-        server = grpcBuilder.build().start();
+
+        final RemoteFileServiceImpl serviceImpl = new RemoteFileServiceImpl(
+                objectStorage, statsLogger, readExecutor, writeExecutor);
+        registerLaneExecutorGauges(statsLogger);
+        final RemoteFileServerAdminImpl adminImpl = new RemoteFileServerAdminImpl(this);
+
+        acceptor = new NettyChannelAcceptor(host, port, false, statsLogger);
+        acceptor.setWorkerThreads(nettyWorkerThreads);
+        acceptor.setCallbackThreads(nettyCallbackThreads);
+        // The file server has no JVM-local consumer (HerdDB-core talks to it
+        // only over the wire), so disable the LocalVMChannel registry to
+        // avoid a side-channel that would bypass authentication.
+        acceptor.setEnableJVMNetwork(false);
+        acceptor.setAcceptor(new ServerSideConnectionAcceptor() {
+            @Override
+            public ServerSideConnection createConnection(herddb.network.Channel netChannel) {
+                return new RemoteFileServerSideConnection(netChannel, serviceImpl, adminImpl, oidcValidator);
+            }
+        });
+        try {
+            acceptor.start();
+        } catch (Exception startError) {
+            // NettyChannelAcceptor.start() throws Exception; wrap into IOException
+            // so the public start() signature stays unchanged.
+            throw new IOException("Failed to start RemoteFileServer Netty acceptor on "
+                    + host + ":" + port + ": " + startError.getMessage(), startError);
+        }
+
+        // Apply the file-server's bespoke ioRatio AFTER start() so the worker
+        // group is built. NettyChannelAcceptor itself does not expose a setter
+        // for ioRatio because it does not need it; for the file server, which
+        // is almost entirely IO-bound, 70 yields measurably better throughput
+        // than the Netty default of 50.
+        applyIoRatio(ioRatio);
 
         // Start HTTP server for metrics
         boolean httpEnabled = Boolean.parseBoolean(config.getProperty("http.enable", "false"));
@@ -273,11 +302,15 @@ public class RemoteFileServer implements AutoCloseable {
         }
 
         if (metadataStorageManager != null) {
-            registeredServiceId = host + ":" + server.getPort();
+            registeredServiceId = host + ":" + getPort();
             try {
                 metadataStorageManager.registerFileServer(registeredServiceId, registeredServiceId);
                 LOGGER.log(Level.INFO, "Registered file server in metadata store: {0}", registeredServiceId);
             } catch (Exception e) {
+                // Broad catch: metadata-store registration failures must not abort
+                // server startup — operators rely on the server being reachable
+                // even when ZK is briefly unavailable, and unregistration on stop
+                // also tolerates the same failure mode.
                 LOGGER.log(Level.SEVERE, "Failed to register file server", e);
             }
         }
@@ -285,8 +318,35 @@ public class RemoteFileServer implements AutoCloseable {
         LOGGER.log(Level.INFO,
                 "RemoteFileServer started on port {0}, storage: {1}, io threads: {2}, ioRatio: {3}, "
                         + "blockSize: {4}, readLane: {5}, writeLane: {6}",
-                new Object[]{port, storageMode, ioThreads, ioRatio, this.blockSize,
+                new Object[]{getPort(), storageMode, ioThreads, ioRatio, this.blockSize,
                         readExecutorThreads, writeExecutorThreads});
+    }
+
+    /**
+     * Reflectively reach into {@link NettyChannelAcceptor} to call
+     * {@code setIoRatio} on its worker {@link io.netty.channel.epoll.EpollEventLoopGroup}
+     * (or NIO group on non-Linux). The base acceptor does not expose the
+     * worker group, but reading via reflection is a one-shot startup cost
+     * and avoids forking a copy of the acceptor solely to add this knob.
+     */
+    private void applyIoRatio(int ioRatio) {
+        try {
+            java.lang.reflect.Field workerField =
+                    NettyChannelAcceptor.class.getDeclaredField("workerGroup");
+            workerField.setAccessible(true);
+            Object workerGroup = workerField.get(acceptor);
+            if (workerGroup == null) {
+                return;
+            }
+            java.lang.reflect.Method setIoRatio = workerGroup.getClass().getMethod("setIoRatio", int.class);
+            setIoRatio.invoke(workerGroup, ioRatio);
+        } catch (ReflectiveOperationException e) {
+            // Broad catch: ioRatio tuning is best-effort. If the underlying
+            // acceptor changes shape, the file server still works correctly
+            // — it just runs with the Netty default ioRatio.
+            LOGGER.log(Level.WARNING, "Could not apply ioRatio={0} to Netty worker group: {1}",
+                    new Object[]{ioRatio, e.getMessage()});
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -295,8 +355,6 @@ public class RemoteFileServer implements AutoCloseable {
 
     /**
      * Returns the on-disk cache instance, or {@code null} when storage.mode is not s3.
-     * Used by {@link herddb.remote.admin.RemoteFileServerAdminImpl} to query stats
-     * and resize the cache at runtime.
      */
     public CachingObjectStorage getDiskCache() {
         return diskCache;
@@ -304,7 +362,6 @@ public class RemoteFileServer implements AutoCloseable {
 
     /**
      * Returns the in-heap block cache instance, or {@code null} when disabled.
-     * Used by {@link herddb.remote.admin.RemoteFileServerAdminImpl} to expose stats.
      */
     public InMemoryBlockCacheObjectStorage getBlockCache() {
         return blockCacheRef;
@@ -385,16 +442,8 @@ public class RemoteFileServer implements AutoCloseable {
         String accessKey = config.getProperty("s3.access.key");
         String secretKey = config.getProperty("s3.secret.key");
         String s3Prefix = config.getProperty("s3.prefix", "");
-        // cache.max.bytes is the local DISK cache budget for CachingObjectStorage.
-        // It is NOT an in-heap cache: byte[] values are never retained in the JVM heap;
-        // the OS page cache serves hot data under kernel-managed memory pressure.
         long cacheMaxBytes = Long.parseLong(
                 config.getProperty("cache.max.bytes", String.valueOf(DEFAULT_CACHE_MAX_BYTES)));
-        // GCS's S3-compatible endpoint (and MinIO) requires path-style addressing and
-        // rejects the AWS SDK v2 default request/response checksums (CRC32/CRC64NVME).
-        // Enabling this flag bundles both workarounds. Off by default so the client
-        // behaves like a standard AWS S3 client (virtual-hosted-style, SDK-managed
-        // checksum validation).
         boolean gcsCompatibility = Boolean.parseBoolean(
                 config.getProperty("s3.gcs.compatibility", "false"));
 
@@ -402,7 +451,6 @@ public class RemoteFileServer implements AutoCloseable {
                 .region(Region.of(region))
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create(accessKey, secretKey)))
-                // Use AWS CRT async HTTP client for better stability and non-blocking shutdown
                 .httpClientBuilder(AwsCrtAsyncHttpClient.builder());
         if (gcsCompatibility) {
             LOGGER.log(Level.INFO, "S3 client: GCS compatibility mode enabled "
@@ -422,10 +470,9 @@ public class RemoteFileServer implements AutoCloseable {
 
         S3AsyncClient s3Client = clientBuilder.build();
 
-        // Wait for bucket to become available, with configurable timeout
         long bucketWaitTimeoutMs = Long.parseLong(
                 config.getProperty("s3.bucket.wait.timeout.ms", "1800000")); // 30 minutes default
-        long bucketPollIntervalMs = 5_000; // 5 seconds between retries
+        long bucketPollIntervalMs = 5_000;
         long deadline = System.currentTimeMillis() + bucketWaitTimeoutMs;
         LOGGER.log(Level.INFO,
                 "Waiting up to {0}ms for S3 bucket ''{1}'' to become available...",
@@ -453,7 +500,6 @@ public class RemoteFileServer implements AutoCloseable {
                         throw new IOException("Interrupted while verifying S3 bucket", ie);
                     }
                 } else {
-                    // Non-bucket errors (permissions, network, etc.) fail immediately
                     s3Client.close();
                     throw new IOException("Failed to verify S3 bucket: " + bucket, cause);
                 }
@@ -472,7 +518,6 @@ public class RemoteFileServer implements AutoCloseable {
         try {
             CachingObjectStorage cache = new CachingObjectStorage(
                     s3Storage, cacheDirPath, metadataExecutor, cacheMaxBytes);
-            // Keep the reference so RemoteFileServerAdminImpl can read stats and resize.
             diskCache = cache;
             return cache;
         } catch (IOException e) {
@@ -483,9 +528,7 @@ public class RemoteFileServer implements AutoCloseable {
 
     /**
      * Default block-cache budget: 1/4 of Netty's max direct memory because the
-     * cache stores pooled direct ByteBufs (see InMemoryBlockCacheObjectStorage).
-     * Falls back to JVM max heap when {@link PlatformDependent#maxDirectMemory()}
-     * is unavailable (returns -1).
+     * cache stores pooled direct ByteBufs.
      */
     static long defaultBlockCacheMaxBytes() {
         long maxDirect = PlatformDependent.maxDirectMemory();
@@ -497,7 +540,6 @@ public class RemoteFileServer implements AutoCloseable {
         } else {
             long heap = Runtime.getRuntime().maxMemory();
             if (heap == Long.MAX_VALUE) {
-                // -Xmx unset: fall back to total memory so we don't allocate everything in sight.
                 heap = Runtime.getRuntime().totalMemory();
             }
             source = heap;
@@ -677,7 +719,44 @@ public class RemoteFileServer implements AutoCloseable {
     }
 
     public int getPort() {
-        return server != null ? server.getPort() : port;
+        if (acceptor != null) {
+            // NettyChannelAcceptor binds the configured port verbatim — there
+            // is no auto-assigned port path, so reading back the field is
+            // unnecessary. Tests that need an ephemeral port construct the
+            // server with port=0 and then locate the bound port via the
+            // bound channel; expose that via reflection on the acceptor's
+            // private "channel" field.
+            int bound = readBoundPort();
+            if (bound > 0) {
+                return bound;
+            }
+        }
+        return port;
+    }
+
+    /**
+     * Reflectively reads the local port the acceptor's bound channel is on.
+     * Returns -1 when the acceptor has not started yet or when reflection
+     * fails — callers fall back to the configured port.
+     */
+    private int readBoundPort() {
+        try {
+            java.lang.reflect.Field channelField = NettyChannelAcceptor.class.getDeclaredField("channel");
+            channelField.setAccessible(true);
+            Object ch = channelField.get(acceptor);
+            if (ch == null) {
+                return -1;
+            }
+            java.net.SocketAddress addr = ((io.netty.channel.Channel) ch).localAddress();
+            if (addr instanceof java.net.InetSocketAddress) {
+                return ((java.net.InetSocketAddress) addr).getPort();
+            }
+            return -1;
+        } catch (ReflectiveOperationException e) {
+            // Broad catch: reading the bound port is best-effort; fall back
+            // to the configured value when reflection fails.
+            return -1;
+        }
     }
 
     public int getBlockSize() {
@@ -704,6 +783,8 @@ public class RemoteFileServer implements AutoCloseable {
                 metadataStorageManager.unregisterFileServer(id);
                 LOGGER.log(Level.INFO, "Unregistered file server: {0}", id);
             } catch (Exception e) {
+                // Broad catch: metadata-store unregistration failures should not
+                // prevent the rest of the shutdown sequence from running.
                 LOGGER.log(Level.WARNING, "Failed to unregister file server", e);
             }
         }
@@ -711,21 +792,17 @@ public class RemoteFileServer implements AutoCloseable {
             try {
                 httpServer.stop();
             } catch (Exception e) {
+                // Broad catch: jetty's stop() declares Exception; we still need
+                // to continue with the rest of teardown regardless.
                 LOGGER.log(Level.WARNING, "Error stopping metrics HTTP server", e);
             }
         }
         if (statsProvider != null) {
             statsProvider.stop();
         }
-        if (server != null) {
-            server.shutdown().awaitTermination(30, TimeUnit.SECONDS);
+        if (acceptor != null) {
+            acceptor.close();
             LOGGER.log(Level.INFO, "RemoteFileServer stopped");
-        }
-        if (workerGroup != null) {
-            workerGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS).awaitUninterruptibly();
-        }
-        if (bossGroup != null) {
-            bossGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS).awaitUninterruptibly();
         }
         if (metadataExecutor != null) {
             metadataExecutor.shutdown();
@@ -743,6 +820,10 @@ public class RemoteFileServer implements AutoCloseable {
             try {
                 objectStorage.close();
             } catch (Exception e) {
+                // Broad catch: ObjectStorage.close() declares Exception (S3
+                // client close, file handle leaks, etc); failures here are
+                // logged but do not propagate so the caller's shutdown path
+                // can finish.
                 LOGGER.log(Level.WARNING, "Error closing objectStorage", e);
             }
         }

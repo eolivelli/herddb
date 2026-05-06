@@ -92,12 +92,15 @@ public class DropTableIndexCleanupRemoteFileTest {
     private static final int DIM = 16;
 
     private static Table buildTable(String name) {
+        // Issue #408: deterministic non-zero tableId — see DropTableIndexCleanupTest.
+        int h = name.hashCode() & 0x7FFFFFFF;
         return Table.builder()
                 .name(name)
                 .tablespace("default")
                 .column("pk", ColumnTypes.STRING)
                 .column("vec", ColumnTypes.FLOATARRAY)
                 .primaryKey("pk")
+                .tableId(h == 0 ? 1 : h)
                 .build();
     }
 
@@ -396,7 +399,7 @@ public class DropTableIndexCleanupRemoteFileTest {
 
                     // ---- DROP_TABLE ----
                     engine.applyEntry(new LogSequenceNumber(1, 999),
-                            LogEntryFactory.dropTable("t2", null));
+                            LogEntryFactory.dropTable(table, null));
                     engine.awaitPendingWorkForTest();
                     engine.awaitPendingDeletionsForTest();
 

@@ -44,6 +44,10 @@ import org.eclipse.jetty.servlet.ServletHolder;
  *   <li>{@code POST /ingestion/config/ingest-max-ops}</li>
  *   <li>{@code GET /ingestion/config/ingest-threads}</li>
  *   <li>{@code POST /ingestion/config/ingest-threads}</li>
+ *   <li>{@code GET /ingestion/config/batch-size}</li>
+ *   <li>{@code POST /ingestion/config/batch-size}</li>
+ *   <li>{@code GET /ingestion/config/transaction-size}</li>
+ *   <li>{@code POST /ingestion/config/transaction-size}</li>
  *   <li>{@code GET /query/config}</li>
  *   <li>{@code POST /query/config/query-max-ops}</li>
  *   <li>{@code GET /query/config/query-threads}</li>
@@ -135,6 +139,12 @@ public class AdminApiServer {
                 case "/ingestion/config/ingest-threads" ->
                         writeJson(resp, HttpServletResponse.SC_OK,
                                 Map.of("ingest-threads", runtime.config().ingestThreads));
+                case "/ingestion/config/batch-size" ->
+                        writeJson(resp, HttpServletResponse.SC_OK,
+                                Map.of("batch-size", runtime.config().batchSize));
+                case "/ingestion/config/transaction-size" ->
+                        writeJson(resp, HttpServletResponse.SC_OK,
+                                Map.of("transaction-size", runtime.config().effectiveTransactionSize()));
                 case "/query/config" -> writeJson(resp, HttpServletResponse.SC_OK, queryConfig());
                 case "/query/config/query-threads" ->
                         writeJson(resp, HttpServletResponse.SC_OK,
@@ -158,6 +168,16 @@ public class AdminApiServer {
                     case "/ingestion/config/ingest-threads" -> {
                         int value = readIntValue(req);
                         runtime.setIngestThreads(value);
+                        writeJson(resp, HttpServletResponse.SC_OK, ingestionConfig());
+                    }
+                    case "/ingestion/config/batch-size" -> {
+                        int value = readIntValue(req);
+                        runtime.setBatchSize(value);
+                        writeJson(resp, HttpServletResponse.SC_OK, ingestionConfig());
+                    }
+                    case "/ingestion/config/transaction-size" -> {
+                        int value = readIntValue(req);
+                        runtime.setTransactionSize(value);
                         writeJson(resp, HttpServletResponse.SC_OK, ingestionConfig());
                     }
                     case "/query/config/query-max-ops" -> {
@@ -195,6 +215,7 @@ public class AdminApiServer {
             m.put("ingest-max-ops", c.ingestMaxOpsPerSecond);
             m.put("ingest-threads", c.ingestThreads);
             m.put("batch-size", c.batchSize);
+            m.put("transaction-size", c.effectiveTransactionSize());
             m.put("rows", c.numRows);
             m.put("resume-from", c.resumeFrom);
             m.put("ingest-commit-retries", c.ingestCommitRetries);

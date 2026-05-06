@@ -171,52 +171,73 @@ public class SortOp implements PlannerOp, TupleComparator {
         return 0;
     }
 
+    /**
+     * Antisymmetric three-way comparator that honours both
+     * {@code ASC}/{@code DESC} and {@code NULLS FIRST}/{@code NULLS LAST}.
+     *
+     * <p>The previous implementation collapsed both
+     * {@code (null, x)} and {@code (x, null)} pairs into the same
+     * non-zero answer (always {@code -1} for {@code NULLS FIRST} or
+     * {@code +1} for {@code NULLS LAST}), which violates
+     * {@link Comparator}'s antisymmetry contract
+     * ({@code compare(a, b) == -compare(b, a)} when neither is zero).
+     * That meant the sort result depended on the order in which the
+     * sort algorithm happened to compare elements, and downstream
+     * iteration order (e.g. of the {@link java.util.concurrent.ConcurrentHashMap}
+     * that backs the table) could swing the visible result. Issue #429
+     * surfaced this by changing {@link CompareBytesUtils#hashCode} (the
+     * stronger mix changes CHM bin distribution and so the iteration
+     * order), but the bug pre-dates this change and is masked on
+     * master only by the pre-existing iteration order being lucky.
+     *
+     * <p>The contract we now implement is:
+     * <ul>
+     *   <li>{@code (null, null) == 0} regardless of NULLS FIRST/LAST.</li>
+     *   <li>For {@code NULLS FIRST}, a {@code null} compares less than
+     *       any non-null value, so {@code (null, x) < 0}
+     *       and {@code (x, null) > 0}.</li>
+     *   <li>For {@code NULLS LAST}, a {@code null} compares greater
+     *       than any non-null value, so {@code (null, x) > 0}
+     *       and {@code (x, null) < 0}.</li>
+     *   <li>{@code ASC}/{@code DESC} flips the sign only for the
+     *       non-null/non-null case &mdash; the position of {@code null}
+     *       is purely a function of NULLS FIRST/LAST, independent of
+     *       direction. (PostgreSQL and Calcite agree on this.)</li>
+     * </ul>
+     */
     private int compareValues(int i, Object value1, Object value2) throws IllegalStateException {
-        // this version of compare sorts NULL BEFORE all other values
-        boolean nullLastDirection = nullLastDirections[i];
-        if (nullLastDirection) { // NULL AST
-            // NULL LAST is preferred for us, as it is the default
-            int result = SQLRecordPredicateFunctions.compare(value1, value2);
-            if (result != 0) {
-                if (directions[i]) { // ASC
-                    return result;
-                } else if (result > 0) { // DESC - invert the result
-                    return -1;
-                } else {
-                    return 1;
-                }
-            }
+        final boolean v1Null = value1 == null;
+        final boolean v2Null = value2 == null;
+        if (v1Null && v2Null) {
             return 0;
-        } else { // NULL FIRST
-            SQLRecordPredicateFunctions.CompareResult resWithNull = SQLRecordPredicateFunctions.compareConsiderNull(value1, value2);
-            if (directions[i]) { // ASC/DEC
-                switch (resWithNull) {
-                    case EQUALS:
-                        return 0;
-                    case NULL: // ASC NULL FIRST
-                        return -1;
-                    case GREATER:
-                        return 1;
-                    case MINOR:
-                        return -1;
-                    default:
-                        throw new IllegalStateException(resWithNull + "");
-                }
-            } else {
-                switch (resWithNull) {
-                    case EQUALS:
-                        return 0;
-                    case NULL: // DESC NULL FIRST
-                        return 1;
-                    case GREATER:
-                        return -1;
-                    case MINOR:
-                        return 1;
-                    default:
-                        throw new IllegalStateException(resWithNull + "");
-                }
-            }
         }
+        final boolean nullLast = nullLastDirections[i];
+        if (v1Null) {
+            // NULLS LAST: null is greater (sort to end). NULLS FIRST:
+            // null is less (sort to start).
+            return nullLast ? 1 : -1;
+        }
+        if (v2Null) {
+            return nullLast ? -1 : 1;
+        }
+        // Neither side is null: regular comparison with ASC/DESC sign.
+        final SQLRecordPredicateFunctions.CompareResult res =
+                SQLRecordPredicateFunctions.compareConsiderNull(value1, value2);
+        final int delta;
+        switch (res) {
+            case EQUALS:
+                return 0;
+            case GREATER:
+                delta = 1;
+                break;
+            case MINOR:
+                delta = -1;
+                break;
+            default:
+                // Should be unreachable: we already handled the null cases.
+                throw new IllegalStateException(res + "");
+        }
+        return directions[i] ? delta : -delta;
     }
 
     @Override

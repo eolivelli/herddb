@@ -24,6 +24,7 @@ import herddb.storage.DataStorageManager;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
  * Factory for constructing {@code herddb-remote-file-service} components
@@ -79,6 +80,18 @@ public interface RemoteFileServiceFactory {
     }
 
     /**
+     * Stats-aware overload (issue #398). Implementations that surface internal
+     * counters (e.g. boot-time cleanup deletions) should override this and
+     * scope-register them under {@code statsLogger}. The default delegates to
+     * the config-only overload so callers without a stats logger keep working.
+     */
+    default DataStorageManager createDataStorageManager(
+            Path dataDirectory, Path tmpDirectory, int swapThreshold,
+            RemoteFileClient client, Map<String, Object> config, StatsLogger statsLogger) {
+        return createDataStorageManager(dataDirectory, tmpDirectory, swapThreshold, client, config);
+    }
+
+    /**
      * Creates a promotable (initially read-only) data storage manager for
      * shared-storage replicas.
      */
@@ -104,6 +117,26 @@ public interface RemoteFileServiceFactory {
             int swapThreshold,
             Map<String, Object> config) {
         return createPromotableDataStorageManager(client, metadata, dataDirectory, tmpDirectory, swapThreshold);
+    }
+
+    /**
+     * Stats-aware overload (issue #398). Plumbs a {@link StatsLogger} into the
+     * promotable manager so the writable delegate created by
+     * {@code promoteToWritable()} can register the boot-cleanup metrics
+     * ({@code remote_storage_cleanup_*}) — otherwise a promoted shared-storage
+     * replica would silently drop those metrics. The default delegates to the
+     * config-only overload.
+     */
+    default DataStorageManager createPromotableDataStorageManager(
+            RemoteFileClient client,
+            SharedCheckpointMetadata metadata,
+            Path dataDirectory,
+            Path tmpDirectory,
+            int swapThreshold,
+            Map<String, Object> config,
+            StatsLogger statsLogger) {
+        return createPromotableDataStorageManager(client, metadata, dataDirectory, tmpDirectory,
+                swapThreshold, config);
     }
 
     /**

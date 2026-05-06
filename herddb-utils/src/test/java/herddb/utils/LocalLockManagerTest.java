@@ -21,9 +21,12 @@
 package herddb.utils;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.fail;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -243,6 +246,136 @@ public class LocalLockManagerTest {
 
         assertEquals(0, manager.getNumKeys());
 
+    }
+
+    /**
+     * Hammer many distinct keys concurrently to exercise the slow-path
+     * put/remove and the resurrection race (refCount goes to zero on one
+     * thread while another thread is concurrently acquiring the same key).
+     * After all work is done the map must be empty.
+     */
+    @Test
+    public void testManyDistinctKeysConcurrent() {
+        final ILocalLockManager manager = makeLockManager();
+        final int numKeys = 64;
+        final int opsPerKey = 2_000;
+        final int threads = 8;
+        final ExecutorService executor = Executors.newFixedThreadPool(threads);
+        try {
+            final List<Future<?>> res = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                final int seed = t;
+                res.add(executor.submit(() -> {
+                    final Random rnd = new Random(seed);
+                    for (int i = 0; i < numKeys * opsPerKey / threads; i++) {
+                        final Bytes key = Bytes.from_int(rnd.nextInt(numKeys));
+                        final LockHandle h;
+                        if ((i & 3) == 0) {
+                            h = manager.acquireWriteLockForKey(key);
+                        } else {
+                            h = manager.acquireReadLockForKey(key);
+                        }
+                        manager.releaseLock(h);
+                    }
+                }));
+            }
+            for (Future<?> f : res) {
+                try {
+                    f.get(30, TimeUnit.SECONDS);
+                } catch (InterruptedException | ExecutionException | TimeoutException ex) {
+                    throw new RuntimeException(ex);
+                }
+            }
+            assertEquals(0, manager.getNumKeys());
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    /**
+     * Tight rapid acquire/release cycle on a single key from many threads.
+     * Stresses the refcount CAS-loop and the {@code remove(key, instance)}
+     * race against concurrent {@code compute(key, ACQUIRE_FN)} resurrections.
+     */
+    @Test
+    public void testRapidAcquireReleaseSameKey() {
+        final ILocalLockManager manager = makeLockManager();
+        final int threads = 8;
+        final int opsPerThread = 5_000;
+        final ExecutorService executor = Executors.newFixedThreadPool(threads);
+        try {
+            final List<Future<?>> res = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                final int idx = t;
+                res.add(executor.submit(() -> {
+                    for (int i = 0; i < opsPerThread; i++) {
+                        final LockHandle h;
+                        if (((idx + i) & 1) == 0) {
+                            h = manager.acquireReadLockForKey(KEY);
+                        } else {
+                            h = manager.acquireWriteLockForKey(KEY);
+                        }
+                        manager.releaseLock(h);
+                    }
+                }));
+            }
+            for (Future<?> f : res) {
+                try {
+                    f.get(30, TimeUnit.SECONDS);
+                } catch (InterruptedException | ExecutionException | TimeoutException ex) {
+                    throw new RuntimeException(ex);
+                }
+            }
+            assertEquals(0, manager.getNumKeys());
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    /**
+     * Verify that after a key has been fully released (refcount → 0,
+     * entry removed) it can be re-acquired and that the new acquire
+     * returns a working {@link LockHandle}. This exercises the slow-path
+     * recreation of a {@code LockInstance} after retirement.
+     */
+    @Test
+    public void testFastPathThenResurrection() {
+        final ILocalLockManager manager = makeLockManager();
+        for (int round = 0; round < 100; round++) {
+            final LockHandle h1 = manager.acquireWriteLockForKey(KEY);
+            assertNotNull(h1);
+            assertEquals(1, manager.getNumKeys());
+            manager.releaseLock(h1);
+            assertEquals(0, manager.getNumKeys());
+
+            final LockHandle h2 = manager.acquireReadLockForKey(KEY);
+            assertNotNull(h2);
+            assertEquals(1, manager.getNumKeys());
+            manager.releaseLock(h2);
+            assertEquals(0, manager.getNumKeys());
+        }
+    }
+
+    /**
+     * Releasing the same handle twice must be detected. {@link StampedLock}
+     * itself rejects the double {@code unlockWrite} with
+     * {@link IllegalMonitorStateException} (a {@link RuntimeException}
+     * subclass), and the {@code returnLockForKey} refcount underflow check
+     * provides a backup signal. Either is acceptable as evidence that the
+     * double release was rejected.
+     */
+    @Test
+    public void testDoubleReleaseThrows() {
+        final ILocalLockManager manager = makeLockManager();
+        final LockHandle h = manager.acquireWriteLockForKey(KEY);
+        manager.releaseLock(h);
+        try {
+            manager.releaseLock(h);
+            fail("expected an exception on double release");
+        } catch (IllegalMonitorStateException | IllegalStateException expected) {
+            // ok — both are acceptable signals that the double release
+            // was rejected.
+        }
     }
 
     private ILocalLockManager makeLockManager() {

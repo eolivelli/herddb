@@ -231,7 +231,10 @@ public class IndexingServiceEngineDurableLsnTest {
     public void durableLsnRecoveredFromWatermarkSnapshot() throws Exception {
         LogSequenceNumber persisted = new LogSequenceNumber(7, 113);
         FailableWatermarkStore watermark =
-                new FailableWatermarkStore(new WatermarkSnapshot(persisted, 1));
+                new FailableWatermarkStore(new WatermarkSnapshot(persisted, 1,
+                        0L,
+                        java.util.Collections.emptyList(),
+                        java.util.Collections.emptyList()));
         IndexingServiceEngine engine = buildEngine(watermark);
         try {
             engine.start();

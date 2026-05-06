@@ -33,9 +33,10 @@ Invocation: `java -jar vector-testings-*.jar [options]`.
 
 | Option | Default | Description |
 |---|---|---|
-| `--ingest-threads <N>` | `4` | Concurrent ingestion workers. |
-| `--batch-size <N>` | `500` | Rows per JDBC batch commit. |
-| `--ingest-max-ops <N>` | `100000` | Global ingestion rate cap in rows/s (`0` = unlimited). **Runtime-tunable** via admin API. |
+| `--ingest-threads <N>` | `4` | Concurrent ingestion workers. **Runtime-tunable** via admin API. |
+| `--batch-size <N>` | `500` | Rows per JDBC `executeBatch()` flush. When `--transaction-size` is unset, this is also the commit unit (legacy behaviour). **Runtime-tunable** via admin API. |
+| `--transaction-size <N>` | `--batch-size` | Rows per JDBC commit. When set to a value `≥ batch-size`, each commit accumulates multiple `executeBatch()` flushes on the same JDBC connection before committing once at the transaction boundary. Must be `≤ ingest-max-ops` (when finite). Need not be a multiple of `batch-size` — the final flush of a transaction may carry a remainder smaller than `batch-size`. **Runtime-tunable** via admin API. |
+| `--ingest-max-ops <N>` | `100000` | Global ingestion rate cap in rows/s (`0` = unlimited). The rate limiter is acquired per *commit* (transaction); the global rate is split evenly across all live ingest workers, so each worker has its own per-thread limiter and N concurrent workers do **not** serialise on a shared lock. **Runtime-tunable** via admin API. |
 | `--ingest-commit-retries <N>` | `3` | Retries per failed batch commit (exponential back-off 10s/20s/40s…). |
 | `--resume-from <N \| auto>` | `0` | Skip first `N` vectors and start row IDs from `N`. Pass `auto` (case-insensitive) to resolve `N` from `SELECT COUNT(*)` on the table just before ingestion. |
 | `--skip-ingest` | off | Skip the ingestion phase. |
@@ -103,6 +104,7 @@ a `POST` override the new rate is visible here.
   "ingest-max-ops": 100000,
   "ingest-threads": 4,
   "batch-size": 500,
+  "transaction-size": 500,
   "rows": 100000,
   "resume-from": 0,
   "ingest-commit-retries": 3
@@ -120,10 +122,49 @@ $ curl -X POST -d '{"value": 5000}' http://localhost:8080/ingestion/config/inges
 ```
 
 - `value >= 0` required; negative values return `400`.
-- `0` means unlimited (internally a very-high-rate limiter).
-- Internally replaces the Guava `RateLimiter` with a fresh instance so
-  workers see the new rate on their next batch without any lingering
-  pay-forward reservation from the old rate.
+- `0` means unlimited (internally maps to a sentinel rate well above any
+  achievable JVM throughput).
+- The new rate is pushed into every per-thread limiter and **all parked
+  workers are unparked** so a sleeping worker takes the new rate
+  immediately rather than after its old sleep elapses.
+- Rejected with `400` if the new rate would violate the safety invariant
+  `effective transaction-size ≤ ingest-max-ops`.
+
+### `GET /ingestion/config/batch-size`
+
+Returns the current per-flush batch size:
+
+```
+$ curl http://localhost:8080/ingestion/config/batch-size
+{"batch-size":500}
+```
+
+### `POST /ingestion/config/batch-size`
+
+Override `--batch-size` while the bench is running. Body is JSON
+`{"value": <int>}` or a bare integer. Takes effect at the next sub-flush
+boundary (the in-flight batch drains at the old size).
+
+- `value >= 1` required.
+- Rejected with `400` if `value > transaction-size` (when transaction-size
+  is set) or if `value > ingest-max-ops` (when transaction-size is unset
+  and ingest-max-ops is finite). The configuration is left untouched on
+  rejection.
+
+### `GET /ingestion/config/transaction-size`
+
+Returns the current commit unit. When `--transaction-size` is unset,
+this returns the same value as `batch-size`.
+
+### `POST /ingestion/config/transaction-size`
+
+Override `--transaction-size` while the bench is running. Body is JSON
+`{"value": <int>}` or a bare integer. Takes effect at the next transaction
+boundary.
+
+- `value >= 1` required.
+- Rejected with `400` if `value < batch-size` or
+  `value > ingest-max-ops` (when finite).
 
 ### `GET /query/config`
 
@@ -212,14 +253,44 @@ During queries:
 
 ## Notes on rate-change semantics
 
-Guava's `RateLimiter` uses pay-forward reservation: a single large
-`acquire(N)` call at a low rate can reserve many seconds into the future
-and block the *next* caller for that time, even if the rate is raised in
-the meantime. VectorBench avoids this by **replacing the limiter** on every
-`POST /…/…-max-ops`, so workers that re-read the reference see a fresh
-limiter with no lingering reservation. The worst case is a single
-already-in-flight `acquire()` finishing its wait on the old limiter; the
-next iteration uses the new one.
+VectorBench's ingestion rate limiter is split into one
+`PerThreadRateLimiter` per ingest worker (per-thread group), with each
+child rate set to `ingest-max-ops / ingest-threads`. This removes the
+inter-thread serialisation that a shared Guava limiter caused (issue
+#402, bug 1): N concurrent workers each pace themselves against their own
+per-thread budget, so total throughput sums to `ingest-max-ops` without
+any cross-thread blocking.
+
+`POST /ingestion/config/ingest-max-ops` performs three steps atomically
+inside `BenchRuntime.setIngestMaxOps`:
+
+1. Pushes the new per-child rate (`new_rate / N`) into every limiter.
+2. Resets each limiter's deadline to "now", dropping any pay-forward
+   reservation from the old rate.
+3. **Unparks every registered worker thread** so a sleeper inside
+   `acquire()` re-evaluates its sleep against the new rate immediately,
+   rather than finishing its old sleep computed at the old rate.
+
+The query side still uses Guava's `RateLimiter`; rate changes there are
+implemented by replacing the limiter reference, with the same
+pay-forward-drop semantics.
+
+## Notes on batch-size vs transaction-size
+
+`batch-size` is the per-flush unit (one `executeBatch()` call); the
+`transaction-size` is the commit unit. When `transaction-size > batch-size`,
+each commit accumulates multiple `executeBatch()` flushes on the same JDBC
+connection. This lets operators reduce per-commit Phase B pressure by
+shrinking `batch-size` while keeping `transaction-size` (and therefore
+the rate-limiter unit) constant.
+
+When `transaction-size` is **not** a multiple of `batch-size`, the last
+sub-batch in a transaction carries a remainder smaller than `batch-size`.
+For example, `--batch-size 300 --transaction-size 1000` produces flushes
+of 300, 300, 300, 100 followed by one commit per transaction.
+
+Both parameters are validated at parse time and on every admin POST: the
+configuration is left untouched on any rejection.
 
 ## Example: throttle ingestion during a production incident
 

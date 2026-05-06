@@ -69,7 +69,9 @@ import java.util.function.Function;
 import java.util.function.LongConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.apache.bookkeeper.stats.Counter;
 import org.apache.bookkeeper.stats.NullStatsLogger;
+import org.apache.bookkeeper.stats.OpStatsLogger;
 import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
@@ -104,8 +106,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     /**
      * When non-null, used by {@link #downloadMultipartIndexFile} to download segment
-     * map files directly from object storage (bypassing the gRPC file-server).
-     * This eliminates the serial gRPC round-trips that make cold-start recovery very
+     * map files directly from object storage (bypassing the file-server).
+     * This eliminates the serial wire round-trips that make cold-start recovery very
      * slow when there are thousands of segments (issue #381).
      *
      * <p>Set via {@link #setDirectObjectStorage(ObjectStorage)} after construction,
@@ -118,7 +120,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * Configures a direct object-storage client for segment map-file downloads
      * during recovery. When set, {@link #supportsDirectMultipartDownload()} returns
      * {@code true} and {@link #downloadMultipartIndexFile} reads block objects directly
-     * from S3 instead of routing through the gRPC file server.
+     * from S3 instead of routing through the file server.
      *
      * <p>Ownership of {@code storage} is transferred to this manager:
      * it will be closed by {@link #close()} together with all other resources.
@@ -196,13 +198,41 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      */
     private final boolean pageHashChecksEnabled;
 
+    /**
+     * Maximum number of paths sent in a single {@code DeleteFiles} RPC during
+     * {@link #cleanupAfterTableBoot}. Configured via
+     * {@link ServerConfiguration#PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE}.
+     */
+    private final int cleanupBatchSize;
+
+    /**
+     * Counter incremented once per {@code cleanupAfterTableBoot} batch RPC.
+     * Always non-null; defaults to a {@link NullStatsLogger}-backed no-op
+     * counter when no stats logger is wired in.
+     */
+    private final Counter cleanupBatchesCounter;
+
+    /**
+     * Counter of stale pages actually deleted by {@code cleanupAfterTableBoot}.
+     * Always non-null.
+     */
+    private final Counter cleanupDeletionsCounter;
+
+    /**
+     * Latency (microseconds) of each batch RPC issued by
+     * {@code cleanupAfterTableBoot}. Always non-null.
+     */
+    private final OpStatsLogger cleanupBatchLatency;
+
     public RemoteFileDataStorageManager(
             Path localMetadataDir, Path tmpDir, int swapThreshold,
             RemoteFileServiceClient client) {
         this(localMetadataDir, tmpDir, swapThreshold, client, new LazyValueCache(0L),
                 ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT,
                 ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT,
-                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT,
+                NullStatsLogger.INSTANCE);
     }
 
     public RemoteFileDataStorageManager(
@@ -211,7 +241,9 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         this(localMetadataDir, tmpDir, swapThreshold, client, lazyValueCache,
                 ServerConfiguration.PROPERTY_REMOTE_FILE_BLOCK_PARALLELISM_DEFAULT,
                 ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT,
-                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT,
+                NullStatsLogger.INSTANCE);
     }
 
     public RemoteFileDataStorageManager(
@@ -221,7 +253,9 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         this(localMetadataDir, tmpDir, swapThreshold, client, lazyValueCache,
                 blockUploadParallelism,
                 ServerConfiguration.PROPERTY_HASH_WRITES_ENABLED_DEFAULT,
-                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT);
+                ServerConfiguration.PROPERTY_HASH_CHECKS_ENABLED_DEFAULT,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT,
+                NullStatsLogger.INSTANCE);
     }
 
     public RemoteFileDataStorageManager(
@@ -229,6 +263,18 @@ public class RemoteFileDataStorageManager extends DataStorageManager
             RemoteFileServiceClient client, LazyValueCache lazyValueCache,
             int blockUploadParallelism,
             boolean pageHashWritesEnabled, boolean pageHashChecksEnabled) {
+        this(localMetadataDir, tmpDir, swapThreshold, client, lazyValueCache,
+                blockUploadParallelism, pageHashWritesEnabled, pageHashChecksEnabled,
+                ServerConfiguration.PROPERTY_REMOTE_FILE_CLEANUP_BATCH_SIZE_DEFAULT,
+                NullStatsLogger.INSTANCE);
+    }
+
+    public RemoteFileDataStorageManager(
+            Path localMetadataDir, Path tmpDir, int swapThreshold,
+            RemoteFileServiceClient client, LazyValueCache lazyValueCache,
+            int blockUploadParallelism,
+            boolean pageHashWritesEnabled, boolean pageHashChecksEnabled,
+            int cleanupBatchSize, StatsLogger statsLogger) {
         this.tmpDir = tmpDir;
         this.swapThreshold = swapThreshold;
         this.client = client;
@@ -236,6 +282,11 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         this.blockUploadParallelism = Math.max(1, blockUploadParallelism);
         this.pageHashWritesEnabled = pageHashWritesEnabled;
         this.pageHashChecksEnabled = pageHashChecksEnabled;
+        this.cleanupBatchSize = Math.max(1, cleanupBatchSize);
+        StatsLogger scope = (statsLogger == null ? NullStatsLogger.INSTANCE : statsLogger).scope("cleanup");
+        this.cleanupBatchesCounter = scope.getCounter("batches");
+        this.cleanupDeletionsCounter = scope.getCounter("deletions");
+        this.cleanupBatchLatency = scope.getOpStatsLogger("batch_latency");
         this.localMetadataManager = new FileDataStorageManager(
                 localMetadataDir, tmpDir, swapThreshold,
                 false, false, false, false, false,
@@ -406,6 +457,13 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     @Override
     public void close() throws DataStorageManagerException {
+        // Issue #411: drain the value cache first so every cache-owned refcount
+        // on a direct ByteBuf is released back to the pool. Doing this before
+        // any other cleanup guarantees that a partial close (one of the steps
+        // below throws) still returns the bulk of the direct memory to the
+        // allocator. close() is idempotent, so calling it on an already-closed
+        // cache is a no-op.
+        lazyValueCache.close();
         localMetadataManager.close();
         // Close the direct-S3 client if one was wired in (issue #381).
         // S3AsyncClient + CRT HTTP-client threads are native resources; closing
@@ -452,12 +510,12 @@ public class RemoteFileDataStorageManager extends DataStorageManager
      * multi-MiB windows per miss.
      *
      * <p>The 16 KiB default is sized to absorb a single jvector logical read in
-     * one gRPC call. The dominant per-node read during search is the full-
+     * one wire round-trip. The dominant per-node read during search is the full-
      * resolution vector fetched by {@code OnDiskGraphIndex.getVectorInto}
      * for re-ranking, which reads {@code dimension * 4} bytes in a single
      * {@code readFloatVector} call — 3840 bytes for GIST1M (dim=960), 6144 bytes
      * for 1536-dim embeddings. A 4 KiB buffer would split those reads across
-     * two gRPC round-trips whenever the position is unaligned; 16 KiB keeps a
+     * two wire round-trips whenever the position is unaligned; 16 KiB keeps a
      * raw vector up to ~4096 dimensions in a single fetch while still being
      * 256× smaller than the 4 MiB write block and an exact divisor of it.
      */
@@ -690,7 +748,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
                 f.join();
             } catch (CompletionException ignored) {
                 // another future already carries the original error; we just need the buf pinned
-                // until every in-flight gRPC call is done, success or failure.
+                // until every in-flight wire round-trip is done, success or failure.
             }
         }
     }
@@ -752,7 +810,11 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         }
         ByteBuf tmp = io.netty.buffer.Unpooled.wrappedBuffer(indexBytes);
         try {
-            return LazyDataPageFormat.readIndex(tmp, h.numRecords);
+            // Pass valueSize so corrupted index entries are rejected at parse
+            // time on the lazy-load path (issue #416), surfacing a single
+            // DataStorageManagerException instead of a downstream
+            // NegativeArraySizeException / IndexOutOfBoundsException.
+            return LazyDataPageFormat.readIndex(tmp, h.numRecords, h.valueSize);
         } finally {
             tmp.release();
         }
@@ -761,13 +823,25 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     /**
      * Fetches a single record value from a v2 page, consulting the value
      * cache first and issuing a byte-range read against remote storage on
-     * miss. Returns a freshly-owned {@code byte[]}.
+     * miss.
+     *
+     * <p><b>Issue #411 — off-heap return</b>: returns a direct
+     * {@link ByteBuf} retained slice from the
+     * {@link LazyValueCache}'s pool. The caller owns one refcount and
+     * <b>must</b> release it (typically by handing the slice to
+     * {@link herddb.utils.Bytes#fromOffHeap(ByteBuf)} whose
+     * own lifecycle returns the refcount to the pool on
+     * {@link herddb.utils.Bytes#release()} or on lazy materialisation).
+     *
+     * <p>For zero-length values the returned buffer is the empty
+     * {@link io.netty.buffer.Unpooled#EMPTY_BUFFER}; releasing it is a
+     * no-op so callers do not need to special-case empty values.
      */
-    byte[] readPageValue(String tableSpace, String uuid, long pageId,
+    ByteBuf readPageValue(String tableSpace, String uuid, long pageId,
             LazyDataPageFormat.FixedHeader h, long valueOffset, int valueLength)
             throws DataStorageManagerException {
         if (valueLength == 0) {
-            return new byte[0];
+            return io.netty.buffer.Unpooled.EMPTY_BUFFER;
         }
         LazyValueCache.ValueKey key = new LazyValueCache.ValueKey(
                 tableSpace, uuid, pageId, valueOffset);
@@ -807,8 +881,10 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     }
 
     private static boolean isNotFound(RuntimeException e) {
-        // readFileRangeAsync wraps io.grpc status exceptions; surface common
-        // "not found" conditions as DataPageDoesNotExistException.
+        // readFileRangeAsync surfaces server-side errors via TYPE_ERROR PDUs
+        // wrapped in IOException; surface common "not found" conditions as
+        // DataPageDoesNotExistException so callers can distinguish from a
+        // protocol/network-level failure.
         Throwable t = e;
         while (t != null) {
             String msg = t.getMessage();
@@ -998,7 +1074,7 @@ public class RemoteFileDataStorageManager extends DataStorageManager
 
     /**
      * Downloads a multipart segment file directly from object storage to a local file,
-     * bypassing the gRPC file-server. Blocks are fetched sequentially (sufficient
+     * bypassing the file-server. Blocks are fetched sequentially (sufficient
      * throughput for a single segment; parallelism across segments is handled by the
      * caller). Each block is freed from the Netty pool immediately after being written
      * to disk to keep peak heap / direct-memory usage bounded.
@@ -1351,15 +1427,90 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     @Override
     public void cleanupAfterTableBoot(String tableSpace, String uuid, Set<Long> activePagesAtBoot)
             throws DataStorageManagerException {
-        // Delete stale remote pages not in the active set
+        // Build the stale-page list from the remote listing.
+        long listStartNanos = System.nanoTime();
         List<String> remotePages = client.listFiles(remoteDataPrefix(tableSpace, uuid));
+        List<String> stalePaths = new ArrayList<>();
         for (String remotePath : remotePages) {
             long pageId = pageIdFromRemotePath(remotePath);
             if (pageId > 0 && !activePagesAtBoot.contains(pageId)) {
-                LOGGER.log(Level.FINE, "cleanupAfterTableBoot: deleting stale remote page {0}", remotePath);
-                client.deleteFile(remotePath);
+                stalePaths.add(remotePath);
             }
         }
+        long listElapsedMs = (System.nanoTime() - listStartNanos) / 1_000_000L;
+        if (stalePaths.isEmpty()) {
+            LOGGER.log(Level.INFO,
+                    "cleanupAfterTableBoot[{0}/{1}]: nothing to delete "
+                            + "(scanned {2} remote pages, active={3}, listMs={4})",
+                    new Object[]{tableSpace, uuid, remotePages.size(), activePagesAtBoot.size(),
+                            listElapsedMs});
+            return;
+        }
+        int totalToDelete = stalePaths.size();
+        int batchSize = cleanupBatchSize;
+        int totalBatches = (totalToDelete + batchSize - 1) / batchSize;
+        LOGGER.log(Level.INFO,
+                "cleanupAfterTableBoot[{0}/{1}]: deleting {2} stale remote pages "
+                        + "in {3} batches of up to {4} (active={5}, listMs={6})",
+                new Object[]{tableSpace, uuid, totalToDelete, totalBatches, batchSize,
+                        activePagesAtBoot.size(), listElapsedMs});
+        long cumulativeNanos = 0L;
+        long lastProgressLogNanos = System.nanoTime();
+        int totalDeleted = 0;
+        for (int offset = 0, batchIdx = 1; offset < totalToDelete; offset += batchSize, batchIdx++) {
+            int end = Math.min(offset + batchSize, totalToDelete);
+            List<String> batch = stalePaths.subList(offset, end);
+            long batchStartNanos = System.nanoTime();
+            int deleted;
+            try {
+                deleted = client.deleteFiles(batch);
+            } catch (RuntimeException ex) {
+                long batchElapsedMicros = (System.nanoTime() - batchStartNanos) / 1_000L;
+                cleanupBatchLatency.registerFailedEvent(batchElapsedMicros,
+                        java.util.concurrent.TimeUnit.MICROSECONDS);
+                LOGGER.log(Level.WARNING,
+                        "cleanupAfterTableBoot[" + tableSpace + "/" + uuid + "]: batch "
+                                + batchIdx + "/" + totalBatches + " of size " + batch.size()
+                                + " failed; aborting cleanup. " + totalDeleted + "/" + totalToDelete
+                                + " deleted so far (cumulativeMs="
+                                + (cumulativeNanos / 1_000_000L) + ")",
+                        ex);
+                throw ex;
+            }
+            long batchElapsedNanos = System.nanoTime() - batchStartNanos;
+            cumulativeNanos += batchElapsedNanos;
+            cleanupBatchesCounter.inc();
+            cleanupDeletionsCounter.addCount(deleted);
+            cleanupBatchLatency.registerSuccessfulEvent(batchElapsedNanos / 1_000L,
+                    java.util.concurrent.TimeUnit.MICROSECONDS);
+            totalDeleted += deleted;
+            // Rate-limit per-batch progress lines: always log the first batch, the
+            // final batch, every 100 batches, and at most once every 30 seconds.
+            // For small cleanups (e.g. a few batches) this prints every batch.
+            boolean isFirst = batchIdx == 1;
+            boolean isLast = batchIdx == totalBatches;
+            boolean every100 = (batchIdx % 100) == 0;
+            long sinceLastLogMs = (System.nanoTime() - lastProgressLogNanos) / 1_000_000L;
+            boolean every30s = sinceLastLogMs >= 30_000L;
+            if (isFirst || isLast || every100 || every30s) {
+                LOGGER.log(Level.INFO,
+                        "cleanupAfterTableBoot[{0}/{1}]: batch {2}/{3} size={4} "
+                                + "deleted={5} totalDeleted={6}/{7} "
+                                + "batchMs={8} cumulativeMs={9}",
+                        new Object[]{tableSpace, uuid, batchIdx, totalBatches, batch.size(),
+                                deleted, totalDeleted, totalToDelete,
+                                batchElapsedNanos / 1_000_000L,
+                                cumulativeNanos / 1_000_000L});
+                lastProgressLogNanos = System.nanoTime();
+            }
+        }
+        LOGGER.log(Level.INFO,
+                "cleanupAfterTableBoot[{0}/{1}]: complete. "
+                        + "deleted={2}/{3} batches={4} batchSize={5} "
+                        + "totalMs={6} avgBatchMs={7}",
+                new Object[]{tableSpace, uuid, totalDeleted, totalToDelete, totalBatches,
+                        batchSize, cumulativeNanos / 1_000_000L,
+                        totalBatches > 0 ? (cumulativeNanos / 1_000_000L) / totalBatches : 0L});
     }
 
     // -------------------------------------------------------------------------

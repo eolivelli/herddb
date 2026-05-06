@@ -180,10 +180,14 @@ public class CachingObjectStorageTest {
 
         int readsBefore = inner.readCalls.get();
         ReadResult result = cache.read("a/b.page").get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertArrayEquals(data, result.content());
-        // inner.read must NOT have been called (served from cache)
-        assertEquals(readsBefore, inner.readCalls.get());
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(data, result.content());
+            // inner.read must NOT have been called (served from cache)
+            assertEquals(readsBefore, inner.readCalls.get());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -192,7 +196,11 @@ public class CachingObjectStorageTest {
         CachingObjectStorage cache = build(inner, 10 * 1024 * 1024);
 
         ReadResult result = cache.read("nonexistent.page").get();
-        assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        try {
+            assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -205,9 +213,13 @@ public class CachingObjectStorageTest {
         inner.data.put("ts1/x.page", data);
 
         ReadResult result = caching.read("ts1/x.page").get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertArrayEquals(data, result.content());
-        assertEquals(1, inner.readCalls.get());
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(data, result.content());
+            assertEquals(1, inner.readCalls.get());
+        } finally {
+            result.release();
+        }
 
         // Local cache file should have been written
         Path cacheFile = caching.cacheFilePath("ts1/x.page");
@@ -239,7 +251,11 @@ public class CachingObjectStorageTest {
         caching.delete("del/1.page").get();
 
         ReadResult result = caching.read("del/1.page").get();
-        assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        try {
+            assertEquals(ReadResult.Status.NOT_FOUND, result.status());
+        } finally {
+            result.release();
+        }
 
         Path cacheFile = caching.cacheFilePath("del/1.page");
         assertFalse("local cache file should be gone", Files.exists(cacheFile));
@@ -258,10 +274,25 @@ public class CachingObjectStorageTest {
         assertEquals(2, deleted);
 
         // pfx entries gone from cache
-        assertEquals(ReadResult.Status.NOT_FOUND, caching.read("pfx/a.page").get().status());
-        assertEquals(ReadResult.Status.NOT_FOUND, caching.read("pfx/b.page").get().status());
+        ReadResult ra = caching.read("pfx/a.page").get();
+        try {
+            assertEquals(ReadResult.Status.NOT_FOUND, ra.status());
+        } finally {
+            ra.release();
+        }
+        ReadResult rb = caching.read("pfx/b.page").get();
+        try {
+            assertEquals(ReadResult.Status.NOT_FOUND, rb.status());
+        } finally {
+            rb.release();
+        }
         // other entry still accessible via inner
-        assertEquals(ReadResult.Status.FOUND, caching.read("other/c.page").get().status());
+        ReadResult rc = caching.read("other/c.page").get();
+        try {
+            assertEquals(ReadResult.Status.FOUND, rc.status());
+        } finally {
+            rc.release();
+        }
 
         assertFalse(Files.exists(caching.cacheFilePath("pfx/a.page")));
         assertFalse(Files.exists(caching.cacheFilePath("pfx/b.page")));
@@ -322,12 +353,17 @@ public class CachingObjectStorageTest {
 
         int readsBefore = inner.readCalls.get();
         ReadResult result = caching.readRange("big.page", 1000, 16, 4096).get();
-        // inner.read must NOT fire: slice must be served from the disk cache via FileChannel.
-        assertEquals(readsBefore, inner.readCalls.get());
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertEquals(16, result.content().length);
-        byte[] expected = Arrays.copyOfRange(block, 1000, 1016);
-        assertArrayEquals(expected, result.content());
+        try {
+            // inner.read must NOT fire: slice must be served from the disk cache via FileChannel.
+            assertEquals(readsBefore, inner.readCalls.get());
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            byte[] resultBytes = result.content();
+            assertEquals(16, resultBytes.length);
+            byte[] expected = Arrays.copyOfRange(block, 1000, 1016);
+            assertArrayEquals(expected, resultBytes);
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -363,7 +399,12 @@ public class CachingObjectStorageTest {
             futures.add(caching.read("hot.page"));
         }
         for (CompletableFuture<ReadResult> f : futures) {
-            assertEquals(ReadResult.Status.FOUND, f.get().status());
+            ReadResult res = f.get();
+            try {
+                assertEquals(ReadResult.Status.FOUND, res.status());
+            } finally {
+                res.release();
+            }
         }
         assertEquals("concurrent misses must collapse to a single inner read",
                 1, inner.readCalls.get());
@@ -385,8 +426,12 @@ public class CachingObjectStorageTest {
         // Cache LRU still reports the entry present; the next read must not throw and must
         // fall through to inner.read on NoSuchFileException.
         ReadResult result = caching.read("race/1.page").get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertArrayEquals(content, result.content());
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(content, result.content());
+        } finally {
+            result.release();
+        }
     }
 
     /** Ensures any async task (removal listener, supplyAsync) scheduled on {@code executor} completes. */
@@ -416,8 +461,12 @@ public class CachingObjectStorageTest {
 
         // Verify data is cached
         ReadResult result = caching.read("concurrent/file.page").get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertArrayEquals(data, result.content());
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(data, result.content());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -439,8 +488,12 @@ public class CachingObjectStorageTest {
 
         // Read should recover from the eviction and fall through to inner.read
         ReadResult result = caching.read("race/1.page").get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertArrayEquals(data, result.content());
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(data, result.content());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -464,8 +517,12 @@ public class CachingObjectStorageTest {
 
         // readRange should recover and fall through to inner
         ReadResult result = caching.readRange("big.page", 1000, 16, 4096).get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertEquals(16, result.content().length);
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertEquals(16, result.content().length);
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -494,8 +551,12 @@ public class CachingObjectStorageTest {
 
         // Verify reads work
         ReadResult r0 = caching.readRange("multi.page", 0, 100, 1024).get();
-        assertEquals(ReadResult.Status.FOUND, r0.status());
-        assertEquals(100, r0.content().length);
+        try {
+            assertEquals(ReadResult.Status.FOUND, r0.status());
+            assertEquals(100, r0.content().length);
+        } finally {
+            r0.release();
+        }
     }
 
     @Test
@@ -533,7 +594,11 @@ public class CachingObjectStorageTest {
         }
         for (CompletableFuture<ReadResult> f : futures) {
             ReadResult res = f.get();
-            assertEquals(ReadResult.Status.FOUND, res.status());
+            try {
+                assertEquals(ReadResult.Status.FOUND, res.status());
+            } finally {
+                res.release();
+            }
         }
         assertEquals("concurrent misses must collapse to a single inner read",
                 1, inner.readCalls.get());
@@ -566,8 +631,18 @@ public class CachingObjectStorageTest {
         assertTrue("c should remain", Files.exists(fileC));
 
         // Verify reads still work (newer entries remain accessible)
-        assertEquals(ReadResult.Status.FOUND, caching.read("blobs/b").get().status());
-        assertEquals(ReadResult.Status.FOUND, caching.read("blobs/c").get().status());
+        ReadResult rb = caching.read("blobs/b").get();
+        try {
+            assertEquals(ReadResult.Status.FOUND, rb.status());
+        } finally {
+            rb.release();
+        }
+        ReadResult rc = caching.read("blobs/c").get();
+        try {
+            assertEquals(ReadResult.Status.FOUND, rc.status());
+        } finally {
+            rc.release();
+        }
     }
 
     @Test
@@ -590,13 +665,24 @@ public class CachingObjectStorageTest {
             futures.add(caching.read("concurrent/file.page"));
         }
 
-        // Wait for all to complete
+        // Wait for all to complete; release any ReadResults returned by the
+        // concurrent reads so the pooled buffers don't leak.
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
+        for (CompletableFuture<?> f : futures) {
+            Object v = f.get();
+            if (v instanceof ReadResult) {
+                ((ReadResult) v).release();
+            }
+        }
 
         // Verify final state is correct
         ReadResult result = caching.read("concurrent/file.page").get();
-        assertEquals(ReadResult.Status.FOUND, result.status());
-        assertArrayEquals(data, result.content());
+        try {
+            assertEquals(ReadResult.Status.FOUND, result.status());
+            assertArrayEquals(data, result.content());
+        } finally {
+            result.release();
+        }
     }
 
     @Test
@@ -621,13 +707,21 @@ public class CachingObjectStorageTest {
         // Read from cached block 0 (should not call inner)
         int innerReadsBefore = inner.readCalls.get();
         ReadResult r0 = caching.readRange("big.page", 1000, 16, 4096).get();
-        assertEquals(ReadResult.Status.FOUND, r0.status());
-        assertEquals(innerReadsBefore, inner.readCalls.get()); // No new inner calls
+        try {
+            assertEquals(ReadResult.Status.FOUND, r0.status());
+            assertEquals(innerReadsBefore, inner.readCalls.get()); // No new inner calls
+        } finally {
+            r0.release();
+        }
 
         // Read from uncached block 1 (should call inner)
         ReadResult r1 = caching.readRange("big.page", 5000, 16, 4096).get();
-        assertEquals(ReadResult.Status.FOUND, r1.status());
-        assertTrue("should have called inner for uncached block", inner.readCalls.get() > innerReadsBefore);
+        try {
+            assertEquals(ReadResult.Status.FOUND, r1.status());
+            assertTrue("should have called inner for uncached block", inner.readCalls.get() > innerReadsBefore);
+        } finally {
+            r1.release();
+        }
     }
 
     @Test
@@ -666,21 +760,29 @@ public class CachingObjectStorageTest {
         long missBefore = caching.getMissBytes();
         long hitBefore = caching.getHitBytes();
         ReadResult r1 = caching.readRange("counters.page", 0, readLen, blockSize).get();
-        assertEquals(ReadResult.Status.FOUND, r1.status());
-        assertEquals("missBytes must increase by the requested length on a cache miss",
-                missBefore + readLen, caching.getMissBytes());
-        assertEquals("hitBytes must not change on a cache miss",
-                hitBefore, caching.getHitBytes());
+        try {
+            assertEquals(ReadResult.Status.FOUND, r1.status());
+            assertEquals("missBytes must increase by the requested length on a cache miss",
+                    missBefore + readLen, caching.getMissBytes());
+            assertEquals("hitBytes must not change on a cache miss",
+                    hitBefore, caching.getHitBytes());
+        } finally {
+            r1.release();
+        }
 
         // Second readRange of same block → cache HIT: hitBytes must be incremented.
         long missBefore2 = caching.getMissBytes();
         long hitBefore2 = caching.getHitBytes();
         ReadResult r2 = caching.readRange("counters.page", 0, readLen, blockSize).get();
-        assertEquals(ReadResult.Status.FOUND, r2.status());
-        assertEquals("hitBytes must increase by the requested length on a cache hit",
-                hitBefore2 + readLen, caching.getHitBytes());
-        assertEquals("missBytes must not change on a cache hit",
-                missBefore2, caching.getMissBytes());
+        try {
+            assertEquals(ReadResult.Status.FOUND, r2.status());
+            assertEquals("hitBytes must increase by the requested length on a cache hit",
+                    hitBefore2 + readLen, caching.getHitBytes());
+            assertEquals("missBytes must not change on a cache hit",
+                    missBefore2, caching.getMissBytes());
+        } finally {
+            r2.release();
+        }
     }
 
     @Test

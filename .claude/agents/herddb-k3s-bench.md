@@ -178,7 +178,21 @@ kubectl --kubeconfig .kubeconfig exec herddb-tools-0 -- \
         --tablespace <UUID> --table <table> --index vidx --json
 ```
 Fields to watch: `vector_count`, `ondisk_node_count`, `segment_count`,
-`status`, `last_lsn_ledger`, `last_lsn_offset`, `ondisk_size_bytes`.
+`status`, `tailer_lsn_ledger`, `tailer_lsn_offset`, `tailer_lsn_timestamp`,
+`durable_lsn_ledger`, `durable_lsn_offset`, `durable_lsn_timestamp`,
+`ondisk_size_bytes`.
+
+The `*_timestamp` fields (issue #423) are the wall-clock (epoch ms) of the
+LogEntry at the matching LSN. Compute `tailer_lag_ms = now - tailer_lsn_timestamp`
+(and similarly for `durable_lag_ms`) to report the IS time-lag in seconds —
+the operator-friendly complement to LSN coordinates. Treat `0` as "unknown"
+(no entries processed yet, or no checkpoint yet) and skip the lag column
+in that case.
+
+For shadow replicas (role=shadow), use `indexing-admin shadow-status` and
+read `loaded_entry_timestamp_ms`. Compute `shadow_data_staleness_ms = now -
+loaded_entry_timestamp_ms` — this is how stale the data the shadow can serve
+is, and the single best signal that a shadow has fallen behind its primary.
 
 Note: `indexing-admin list-instances` may return empty if ZooKeeper
 registration is not active; use the direct `--server` flag with pod DNS
@@ -399,6 +413,7 @@ Agent(
 - **rows / rate**: take `rows`, `total`, `ops_per_sec` from `GET /status`. Always show the count, percentage, and rate.
 - **commits**: show `commits` and `recovered_commits`. Non-zero recovered → warn.
 - **IS-N vectors**: use `VECTORS` from `indexing-admin list-indexes`, not watermark offsets. Compute lag% = `(rows - vectors) / rows * 100`. Flag WARN if lag > 10% sustained over ≥ 2 ticks.
+- **IS-N time-lag (issue #423)**: from `indexing-admin status --json`, read `tailer_lag_ms` and `durable_lag_ms`. These are the operator-friendly time-domain measure of how far behind real time the IS is. A growing `tailer_lag_ms` indicates the tailer is not keeping up with the commit log; a growing `durable_lag_ms` (with `tailer_lag_ms` flat) indicates checkpoints are stalling. Flag WARN if `tailer_lag_ms > 30000` (30 s) or `durable_lag_ms > 300000` (5 min). Skip the column when the value is `-1` ("unknown").
 - **IS-N apply_queue**: from `engine-stats`. `FULL` = IS at max throughput, lag will grow.
 - **IS-N mem**: `total_estimated_memory_bytes` from `engine-stats`, in GiB. Warn if > 18 GiB (limit is 20 GiB in values.yaml).
 - **ServerCkpt**: last `local checkpoint finish` line from server logs — LSN + age.

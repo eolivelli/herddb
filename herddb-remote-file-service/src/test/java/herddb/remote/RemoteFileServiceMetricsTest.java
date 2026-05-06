@@ -21,26 +21,15 @@
 package herddb.remote;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
-import com.google.protobuf.ByteString;
-import herddb.remote.proto.DeleteByPrefixRequest;
-import herddb.remote.proto.DeleteFileRequest;
-import herddb.remote.proto.ListFilesRequest;
-import herddb.remote.proto.ReadFileRequest;
-import herddb.remote.proto.ReadFileResponse;
-import herddb.remote.proto.RemoteFileServiceGrpc;
-import herddb.remote.proto.WriteFileRequest;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Properties;
-import java.util.concurrent.TimeUnit;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -48,7 +37,10 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 /**
- * Tests that Prometheus metrics are recorded and exposed via the HTTP endpoint.
+ * Tests that Prometheus metrics are recorded by the file-server data
+ * dispatcher and exposed via the metrics HTTP endpoint. Issue #425 ported
+ * these from raw gRPC stubs to the {@link RemoteFileServiceClient} public
+ * API; the metric names ({@code rfs_*}) are unchanged.
  */
 public class RemoteFileServiceMetricsTest {
 
@@ -56,8 +48,7 @@ public class RemoteFileServiceMetricsTest {
     public TemporaryFolder folder = new TemporaryFolder();
 
     private RemoteFileServer server;
-    private ManagedChannel channel;
-    private RemoteFileServiceGrpc.RemoteFileServiceBlockingStub stub;
+    private RemoteFileServiceClient client;
 
     @Before
     public void setUp() throws Exception {
@@ -67,36 +58,30 @@ public class RemoteFileServiceMetricsTest {
         server = new RemoteFileServer("localhost", 0,
                 folder.newFolder("data").toPath(), 2, config);
         server.start();
-
-        channel = ManagedChannelBuilder.forAddress("localhost", server.getPort())
-                .usePlaintext()
-                .build();
-        stub = RemoteFileServiceGrpc.newBlockingStub(channel);
+        client = new RemoteFileServiceClient(List.of("localhost:" + server.getPort()));
     }
 
     @After
     public void tearDown() throws Exception {
-        channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
-        server.stop();
+        if (client != null) {
+            client.close();
+        }
+        if (server != null) {
+            server.stop();
+        }
     }
 
     @Test
     public void testMetricsEndpointAvailable() throws Exception {
         int httpPort = server.getHttpPort();
         assertNotEquals(-1, httpPort);
-
         String metrics = fetchMetrics(httpPort);
-        // The endpoint should return valid Prometheus text
         assertTrue(metrics.contains("# TYPE"));
     }
 
     @Test
     public void testWriteMetricsRecorded() throws Exception {
-        byte[] data = "metrics test data".getBytes(StandardCharsets.UTF_8);
-        stub.writeFile(WriteFileRequest.newBuilder()
-                .setPath("metrics/test/1.page")
-                .setContent(ByteString.copyFrom(data))
-                .build());
+        client.writeFile("metrics/test/1.page", "metrics test data".getBytes(StandardCharsets.UTF_8));
 
         String metrics = fetchMetrics(server.getHttpPort());
         assertTrue("write_requests counter should be present",
@@ -109,24 +94,11 @@ public class RemoteFileServiceMetricsTest {
 
     @Test
     public void testReadMetricsRecorded() throws Exception {
-        // Write a file first
-        byte[] data = "read metrics".getBytes(StandardCharsets.UTF_8);
-        stub.writeFile(WriteFileRequest.newBuilder()
-                .setPath("metrics/read/1.page")
-                .setContent(ByteString.copyFrom(data))
-                .build());
-
+        client.writeFile("metrics/read/1.page", "read metrics".getBytes(StandardCharsets.UTF_8));
         // Successful read
-        ReadFileResponse resp = stub.readFile(ReadFileRequest.newBuilder()
-                .setPath("metrics/read/1.page")
-                .build());
-        assertTrue(resp.getFound());
-
+        assertTrue(client.readFile("metrics/read/1.page") != null);
         // Missing file read
-        ReadFileResponse missing = stub.readFile(ReadFileRequest.newBuilder()
-                .setPath("metrics/read/missing.page")
-                .build());
-        assertFalse(missing.getFound());
+        org.junit.Assert.assertNull(client.readFile("metrics/read/missing.page"));
 
         String metrics = fetchMetrics(server.getHttpPort());
         assertTrue("read_requests counter should be present",
@@ -139,13 +111,8 @@ public class RemoteFileServiceMetricsTest {
 
     @Test
     public void testDeleteMetricsRecorded() throws Exception {
-        stub.writeFile(WriteFileRequest.newBuilder()
-                .setPath("metrics/del/1.page")
-                .setContent(ByteString.copyFromUtf8("x"))
-                .build());
-        stub.deleteFile(DeleteFileRequest.newBuilder()
-                .setPath("metrics/del/1.page")
-                .build());
+        client.writeFile("metrics/del/1.page", "x".getBytes());
+        client.deleteFile("metrics/del/1.page");
 
         String metrics = fetchMetrics(server.getHttpPort());
         assertTrue("delete_requests counter should be present",
@@ -156,13 +123,8 @@ public class RemoteFileServiceMetricsTest {
 
     @Test
     public void testListMetricsRecorded() throws Exception {
-        stub.writeFile(WriteFileRequest.newBuilder()
-                .setPath("metrics/list/1.page")
-                .setContent(ByteString.copyFromUtf8("a"))
-                .build());
-        stub.listFiles(ListFilesRequest.newBuilder()
-                .setPrefix("metrics/list/")
-                .build()).forEachRemaining(e -> {});
+        client.writeFile("metrics/list/1.page", "a".getBytes());
+        client.listFiles("metrics/list/");
 
         String metrics = fetchMetrics(server.getHttpPort());
         assertTrue("list_requests counter should be present",
@@ -173,13 +135,8 @@ public class RemoteFileServiceMetricsTest {
 
     @Test
     public void testDeleteByPrefixMetricsRecorded() throws Exception {
-        stub.writeFile(WriteFileRequest.newBuilder()
-                .setPath("metrics/pfx/1.page")
-                .setContent(ByteString.copyFromUtf8("a"))
-                .build());
-        stub.deleteByPrefix(DeleteByPrefixRequest.newBuilder()
-                .setPrefix("metrics/pfx/")
-                .build());
+        client.writeFile("metrics/pfx/1.page", "a".getBytes());
+        client.deleteByPrefix("metrics/pfx/");
 
         String metrics = fetchMetrics(server.getHttpPort());
         assertTrue("deletebyprefix_requests counter should be present",
@@ -190,25 +147,14 @@ public class RemoteFileServiceMetricsTest {
 
     @Test
     public void testAllOperationsCountersIncrement() throws Exception {
-        // Perform multiple writes
         for (int i = 0; i < 3; i++) {
-            stub.writeFile(WriteFileRequest.newBuilder()
-                    .setPath("metrics/count/" + i + ".page")
-                    .setContent(ByteString.copyFromUtf8("data" + i))
-                    .build());
+            client.writeFile("metrics/count/" + i + ".page", ("data" + i).getBytes());
         }
-
-        // Read them
         for (int i = 0; i < 3; i++) {
-            stub.readFile(ReadFileRequest.newBuilder()
-                    .setPath("metrics/count/" + i + ".page")
-                    .build());
+            client.readFile("metrics/count/" + i + ".page");
         }
 
         String metrics = fetchMetrics(server.getHttpPort());
-
-        // Verify counters have values > 0
-        // The counter line looks like: rfs_write_requests 3.0
         assertTrue("write_requests should have value",
                 hasPositiveCounterValue(metrics, "rfs_write_requests"));
         assertTrue("read_requests should have value",

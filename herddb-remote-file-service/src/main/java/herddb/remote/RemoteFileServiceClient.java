@@ -20,51 +20,46 @@
 
 package herddb.remote;
 
-import com.google.protobuf.ByteString;
-import com.google.protobuf.UnsafeByteOperations;
-import herddb.remote.proto.DeleteByPrefixRequest;
-import herddb.remote.proto.DeleteByPrefixResponse;
-import herddb.remote.proto.DeleteFileRequest;
-import herddb.remote.proto.DeleteFileResponse;
-import herddb.remote.proto.ListFilesEntry;
-import herddb.remote.proto.ListFilesRequest;
-import herddb.remote.proto.ReadFileRangeRequest;
-import herddb.remote.proto.ReadFileRangeResponse;
-import herddb.remote.proto.ReadFileRequest;
-import herddb.remote.proto.ReadFileResponse;
-import herddb.remote.proto.RemoteFileServiceGrpc;
-import herddb.remote.proto.WriteFileBlockRequest;
-import herddb.remote.proto.WriteFileBlockResponse;
-import herddb.remote.proto.WriteFileRequest;
-import herddb.remote.proto.WriteFileResponse;
+import herddb.auth.oidc.sasl.OAuthBearerSaslClient;
+import herddb.network.Channel;
+import herddb.network.ChannelEventListener;
+import herddb.network.netty.NettyConnector;
+import herddb.network.netty.NetworkUtils;
+import herddb.proto.Pdu;
+import herddb.proto.PduCodec;
 import herddb.server.RemoteFileClient;
-import io.grpc.ClientInterceptor;
-import io.grpc.Context;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.stub.StreamObserver;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.channel.MultithreadEventLoopGroup;
+import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.FastThreadLocalThread;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -73,11 +68,23 @@ import org.apache.bookkeeper.stats.Gauge;
 import org.apache.bookkeeper.stats.StatsLogger;
 
 /**
- * Client for RemoteFileService. Manages one ManagedChannel per server and uses
- * ConsistentHashRouter for path distribution.
- * <p>
- * Provides both synchronous and asynchronous (CompletableFuture) APIs.
- * Supports dynamic server list updates via {@link #updateServers(List)}.
+ * Native-Netty client for the file service (issue #425).
+ *
+ * <p>Manages one read-plane and one write-plane {@link Channel} per file
+ * server endpoint, distributes requests across servers via
+ * {@link ConsistentHashRouter}, and exposes both blocking and async
+ * (CompletableFuture) APIs that match the previous gRPC client one-for-one
+ * so existing callers do not need to change.
+ *
+ * <p>Lane separation (issue #100) is preserved: read-plane and write-plane
+ * Channels are independent TCP connections so a slow checkpoint write
+ * cannot starve hot-path reads.
+ *
+ * <p>Authentication is OIDC OAUTHBEARER (issue #425). When the caller
+ * supplies a {@code Supplier<String>} bearer-token source, the client
+ * performs a SASL handshake on every freshly-opened {@link Channel}
+ * before issuing any data-plane RPCs. With no token supplier the client
+ * connects in plaintext and assumes the server has OIDC disabled.
  *
  * @author enrico.olivelli
  */
@@ -93,23 +100,8 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     public static final String CONFIG_CLIENT_BLOCK_SIZE = "remote.file.client.block.size";
     /**
      * Configuration key for the maximum number of bytes across all in-flight
-     * {@code readFile}/{@code readFileRange} gRPC calls whose payloads are
-     * currently being staged into a pooled direct {@link ByteBuf}. Each call
-     * reserves a byte budget equal to its requested payload length before
-     * allocation; the reservation is released on the terminal gRPC callback.
-     * The ceiling caps peak direct-memory footprint from in-flight reads,
-     * preventing IS checkpoint Phase C and query bursts that miss the
-     * {@code SegmentBlockCache} from growing Netty's {@code PoolArena}
-     * beyond {@code -XX:MaxDirectMemorySize} (see issue #246).
-     *
-     * <p>Bytes, not request count: {@code readFileRange} is also used by
-     * {@link RemoteRandomAccessReader} with 16 KiB windows, so a per-request
-     * cap would grossly under-count direct-memory pressure from small reads
-     * and over-throttle large ones. The underlying Netty {@code PoolChunk}
-     * size (typically 4 MiB) is irrelevant here: a 16 KiB read contributes
-     * 16 KiB to the reservation, the pool is free to share a chunk across
-     * sibling reads, and the reservation tracks only what the caller asked
-     * for.
+     * {@code readFile}/{@code readFileRange} calls whose payloads are
+     * currently being staged into a pooled direct {@link ByteBuf}.
      */
     public static final String CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES =
             "remote.file.client.max.inflight.read.bytes";
@@ -118,74 +110,51 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     private static final int DEFAULT_CLIENT_RETRIES = 10;
     /** Default multipart block size: 4 MB. */
     public static final int DEFAULT_BLOCK_SIZE = 4 * 1024 * 1024;
-    /**
-     * Default cap on in-flight read bytes: 256 MiB. Chosen so a 3.5 GiB
-     * {@code SegmentBlockCache} plus this cap plus routine gRPC transport
-     * comfortably fit a 6 GiB {@code -XX:MaxDirectMemorySize} budget, while
-     * still admitting tens of thousands of 16 KiB concurrent block reads
-     * ({@code 256 MiB / 16 KiB = 16,384}) or a full fan-out of 4 MiB
-     * Phase-C chunks ({@code 256 MiB / 4 MiB = 64}) without blocking.
-     */
+    /** Default cap on in-flight read bytes: 256 MiB (issue #246). */
     public static final long DEFAULT_CLIENT_MAX_INFLIGHT_READ_BYTES = 256L * 1024 * 1024;
-
     /**
-     * Emit a {@link Level#WARNING} log line if acquiring the reservation
-     * blocks for longer than this threshold. Non-configurable: the threshold
-     * is only meant to surface saturation; the gauge
-     * ({@code remote_file_client_inflight_read_bytes_available}) is the
-     * primary observability signal.
+     * Emit a WARNING log line if acquiring the in-flight reservation
+     * blocks for longer than this threshold.
      */
     private static final long PERMIT_ACQUIRE_WARN_THRESHOLD_MS = 500;
+
+    /** Connection establishment timeout (sockets only): 10 s. */
+    private static final int CONNECT_TIMEOUT_MS = 10_000;
 
     private static class ServerSnapshot {
         final ConsistentHashRouter router;
         /**
-         * Read-plane channels, one per server. Keyed by server id. Separate from
-         * {@link #writeChannels} so read and write RPCs sit on independent TCP
-         * connections and cannot share HTTP/2 stream budgets (issue #100).
+         * Read-plane channels, one per server. Keyed by server id. Separate
+         * from {@link #writeChannels} so read and write RPCs sit on
+         * independent TCP connections and cannot share resources (issue #100).
          */
-        final Map<String, ManagedChannel> readChannels;
+        final Map<String, ServerChannel> readChannels;
         /** Write-plane channels. Same keys as {@link #readChannels}. */
-        final Map<String, ManagedChannel> writeChannels;
+        final Map<String, ServerChannel> writeChannels;
 
         ServerSnapshot(ConsistentHashRouter router,
-                       Map<String, ManagedChannel> readChannels,
-                       Map<String, ManagedChannel> writeChannels) {
+                       Map<String, ServerChannel> readChannels,
+                       Map<String, ServerChannel> writeChannels) {
             this.router = router;
-            this.readChannels = Collections.unmodifiableMap(new HashMap<>(readChannels));
-            this.writeChannels = Collections.unmodifiableMap(new HashMap<>(writeChannels));
+            this.readChannels = Collections.unmodifiableMap(new LinkedHashMap<>(readChannels));
+            this.writeChannels = Collections.unmodifiableMap(new LinkedHashMap<>(writeChannels));
         }
     }
 
     private volatile ServerSnapshot snapshot;
-    /**
-     * Released once the client has seen at least one non-empty server list,
-     * either at construction or via {@link #updateServers(List)}. Lets
-     * bootstrap callers block on cold-cluster ZK discovery before issuing
-     * the first RPC. See {@link #awaitServersReady(long)}.
-     */
     private final CountDownLatch serversReadyLatch = new CountDownLatch(1);
     private final int maxRetries;
     private final long clientTimeoutSeconds;
     private final int blockSize;
     private final long maxInflightReadBytes;
-    /**
-     * Gates direct-buffer byte-volume across in-flight RPCs performed by
-     * {@link #doReadFileAsByteBufAsync} and
-     * {@link #doReadFileRangeAsByteBufAsync}. Each call reserves bytes equal
-     * to its requested payload length and releases the same count when the
-     * gRPC stream terminates (onError or onCompleted). Unfair semaphore:
-     * the workload is bursty and latency-insensitive (caller threads are
-     * indistinguishable), so unfair throughput beats FIFO starvation
-     * avoidance here.
-     *
-     * <p>The semaphore is sized as {@code min(maxInflightReadBytes,
-     * Integer.MAX_VALUE)} because {@link Semaphore} uses {@code int} permits
-     * internally; practical caps (≲ 2 GiB) fit comfortably.
-     */
     private final Semaphore inflightReadBytes;
     private final ScheduledExecutorService retryScheduler;
-    private final ClientInterceptor clientInterceptor;
+    private final Supplier<String> oidcTokenSupplier;
+
+    // Netty plumbing reused across all ServerChannels.
+    private final MultithreadEventLoopGroup eventLoopGroup;
+    private final ExecutorService callbackExecutor;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     public RemoteFileServiceClient(List<String> servers) {
         this(servers, Collections.emptyMap(), null);
@@ -195,9 +164,22 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         this(servers, configuration, null);
     }
 
+    /**
+     * @param servers           initial list of {@code host:port} server addresses; may be empty
+     *                          for cold-start ZK discovery (see {@link #updateServers(List)}).
+     * @param configuration     CONFIG_CLIENT_* tuning knobs; never {@code null}.
+     * @param oidcTokenSupplier when non-null, every freshly-opened channel
+     *                          performs an OAUTHBEARER SASL handshake using
+     *                          the token returned by the supplier; the
+     *                          supplier is invoked again on every new
+     *                          channel so it can return rotated tokens.
+     *                          When {@code null}, channels connect in
+     *                          plaintext and the server must have OIDC
+     *                          disabled.
+     */
     public RemoteFileServiceClient(List<String> servers, Map<String, Object> configuration,
-                                   ClientInterceptor clientInterceptor) {
-        this.clientInterceptor = clientInterceptor;
+                                   Supplier<String> oidcTokenSupplier) {
+        this.oidcTokenSupplier = oidcTokenSupplier;
         this.clientTimeoutSeconds = longConfig(configuration, CONFIG_CLIENT_TIMEOUT, DEFAULT_CLIENT_TIMEOUT_SECONDS);
         this.maxRetries = intConfig(configuration, CONFIG_CLIENT_RETRIES, DEFAULT_CLIENT_RETRIES);
         this.blockSize = intConfig(configuration, CONFIG_CLIENT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE);
@@ -214,7 +196,6 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                     + ") so a single full-block read is always admissible");
         }
         this.maxInflightReadBytes = configuredMaxInflightBytes;
-        // Semaphore uses int permits; clamp but keep the public view in bytes.
         int permits = maxInflightReadBytes > Integer.MAX_VALUE
                 ? Integer.MAX_VALUE
                 : (int) maxInflightReadBytes;
@@ -224,18 +205,19 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
             t.setDaemon(true);
             return t;
         });
+        this.eventLoopGroup = buildEventLoopGroup();
+        this.callbackExecutor = buildCallbackExecutor();
 
-        Map<String, ManagedChannel> readChannels = new HashMap<>();
-        Map<String, ManagedChannel> writeChannels = new HashMap<>();
+        Map<String, ServerChannel> readChannels = new LinkedHashMap<>();
+        Map<String, ServerChannel> writeChannels = new LinkedHashMap<>();
         for (String server : servers) {
-            readChannels.put(server, buildChannel(server));
-            writeChannels.put(server, buildChannel(server));
+            readChannels.put(server, new ServerChannel(server, "read"));
+            writeChannels.put(server, new ServerChannel(server, "write"));
         }
         this.snapshot = new ServerSnapshot(new ConsistentHashRouter(servers), readChannels, writeChannels);
         if (!servers.isEmpty()) {
             this.serversReadyLatch.countDown();
         }
-
         if (servers.isEmpty()) {
             LOGGER.log(Level.INFO,
                     "RemoteFileServiceClient: starting with empty server list (awaiting ZK discovery), "
@@ -248,44 +230,33 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         }
     }
 
-    /**
-     * @return the configured maximum number of bytes that may be in flight
-     *     across {@code readFile}/{@code readFileRange} calls at once.
-     */
+    private static MultithreadEventLoopGroup buildEventLoopGroup() {
+        ThreadFactory threadFactory = r -> new FastThreadLocalThread(r,
+                "remote-file-client-io-" + System.identityHashCode(r));
+        if (NetworkUtils.isEnableEpoolNative()) {
+            return new EpollEventLoopGroup(0, threadFactory);
+        }
+        return new NioEventLoopGroup(0, threadFactory);
+    }
+
+    private static ExecutorService buildCallbackExecutor() {
+        AtomicInteger ctr = new AtomicInteger();
+        ThreadFactory threadFactory = r -> {
+            Thread t = new FastThreadLocalThread(r, "remote-file-client-cb-" + ctr.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        };
+        return Executors.newCachedThreadPool(threadFactory);
+    }
+
     public long maxInflightReadBytes() {
         return maxInflightReadBytes;
     }
 
-    /**
-     * @return the number of bytes currently available for reservation.
-     *     Equal to {@link #maxInflightReadBytes()} when idle, approaches
-     *     zero under saturation. Primary observability signal for the
-     *     in-flight read budget; exposed as a Prometheus gauge by the
-     *     Indexing Service.
-     */
     public long availableInflightReadBytes() {
         return inflightReadBytes.availablePermits();
     }
 
-    /**
-     * Reserves {@code bytes} against the in-flight read budget, blocking
-     * the caller until the reservation is satisfied. Emits a
-     * {@link Level#WARNING} log line if the wait exceeds
-     * {@link #PERMIT_ACQUIRE_WARN_THRESHOLD_MS}, a cheap saturation hint
-     * for operators while the gauge carries the precise signal.
-     *
-     * <p>Uses {@code acquireUninterruptibly} so in-flight reads are not
-     * cancelled by thread interrupts from callers that opportunistically
-     * interrupt worker threads. Callers needing true cancellation should
-     * wrap the {@code CompletableFuture} they receive.
-     *
-     * <p>Callers MUST pair every successful acquire with exactly one
-     * {@link #releaseInflightReadBytes(int)} carrying the same byte count
-     * on the terminal gRPC callback path.
-     *
-     * @param bytes the payload size being staged; clamped to the
-     *     {@code Integer.MAX_VALUE} semaphore permit space. Must be > 0.
-     */
     private void acquireInflightReadBytes(int bytes) {
         if (bytes <= 0) {
             throw new IllegalArgumentException("bytes must be > 0, got " + bytes);
@@ -307,17 +278,10 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         }
     }
 
-    /** Releases a byte reservation previously taken via {@link #acquireInflightReadBytes(int)}. */
     private void releaseInflightReadBytes(int bytes) {
         inflightReadBytes.release(bytes);
     }
 
-    /**
-     * Registers {@code inflight_read_bytes_available} and
-     * {@code inflight_read_bytes_max} gauges under the given scope.
-     * Matches the gauges exported by the Indexing Service so the same
-     * Grafana panels work for both servers.
-     */
     @Override
     public void registerMetrics(StatsLogger statsLogger) {
         if (statsLogger == null) {
@@ -343,239 +307,148 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         });
     }
 
-    private static final int CHANNEL_MAX_MESSAGE_SIZE = DEFAULT_BLOCK_SIZE + 1024 * 1024; // 5 MB
-
-    private ManagedChannel buildChannel(String server) {
-        String[] parts = server.split(":");
-        String host = parts[0];
-        int port = Integer.parseInt(parts[1]);
-        ManagedChannelBuilder<?> b = ManagedChannelBuilder.forAddress(host, port)
-                .usePlaintext()
-                .disableRetry()  // eliminate UncommittedRetriableStreamsRegistry lock contention (issue #122)
-                .keepAliveTime(300, TimeUnit.SECONDS)
-                .keepAliveTimeout(20, TimeUnit.SECONDS)
-                .keepAliveWithoutCalls(false)
-                .maxInboundMessageSize(CHANNEL_MAX_MESSAGE_SIZE);
-        if (clientInterceptor != null) {
-            b.intercept(clientInterceptor);
-        }
-        return b.build();
-    }
-
-    /** Routing key for a specific block of a multipart file. */
-    private static String blockRoutingKey(String path, long blockIndex) {
-        return path + "#block" + blockIndex;
-    }
-
-    /** Read-plane stub for a specific block (issue #100). */
-    private RemoteFileServiceGrpc.RemoteFileServiceStub readStubForBlock(String path, long blockIndex) {
-        String key = blockRoutingKey(path, blockIndex);
-        ServerSnapshot s = this.snapshot;
-        String server = s.router.getServer(key);
-        return RemoteFileServiceGrpc.newStub(s.readChannels.get(server))
-                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS)
-                .withMaxOutboundMessageSize(CHANNEL_MAX_MESSAGE_SIZE);
-    }
-
-    /** Write-plane stub for a specific block (issue #100). */
-    private RemoteFileServiceGrpc.RemoteFileServiceStub writeStubForBlock(String path, long blockIndex) {
-        String key = blockRoutingKey(path, blockIndex);
-        ServerSnapshot s = this.snapshot;
-        String server = s.router.getServer(key);
-        return RemoteFileServiceGrpc.newStub(s.writeChannels.get(server))
-                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS)
-                .withMaxOutboundMessageSize(CHANNEL_MAX_MESSAGE_SIZE);
-    }
-
-    /**
-     * Runs {@code action} under {@link Context#ROOT} so any gRPC stub built and
-     * invoked inside it does not inherit a deadline from the caller's current
-     * {@link Context}. gRPC resolves the effective deadline as the minimum of
-     * the stub deadline set via {@code .withDeadlineAfter(...)} and the
-     * propagated context deadline — without detaching, an incoming 600 s search
-     * RPC on the Indexing Service would clamp every downstream readFileRange
-     * call to whatever remained on that context, causing
-     * {@code DEADLINE_EXCEEDED: context timed out} on large segment loads
-     * (issue #242). Detaching gives each client call the full
-     * {@code clientTimeoutSeconds} budget configured on the stub.
-     */
-    private static <T> T runDetached(Supplier<T> action) {
-        Context previous = Context.ROOT.attach();
-        try {
-            return action.get();
-        } finally {
-            Context.ROOT.detach(previous);
-        }
-    }
-
     @Override
     public synchronized void updateServers(List<String> newServers) {
         if (newServers.isEmpty()) {
             LOGGER.log(Level.WARNING, "updateServers called with empty list, keeping current servers");
             return;
         }
-
         ServerSnapshot current = this.snapshot;
 
         Set<String> added = new LinkedHashSet<>(newServers);
         added.removeAll(current.readChannels.keySet());
-
         Set<String> removed = new LinkedHashSet<>(current.readChannels.keySet());
         removed.removeAll(new HashSet<>(newServers));
 
-        Map<String, ManagedChannel> newReadChannels = new HashMap<>();
-        Map<String, ManagedChannel> newWriteChannels = new HashMap<>();
+        Map<String, ServerChannel> newRead = new LinkedHashMap<>();
+        Map<String, ServerChannel> newWrite = new LinkedHashMap<>();
         for (String server : newServers) {
-            ManagedChannel existingRead = current.readChannels.get(server);
-            ManagedChannel existingWrite = current.writeChannels.get(server);
-            newReadChannels.put(server, existingRead != null ? existingRead : buildChannel(server));
-            newWriteChannels.put(server, existingWrite != null ? existingWrite : buildChannel(server));
+            ServerChannel existingRead = current.readChannels.get(server);
+            ServerChannel existingWrite = current.writeChannels.get(server);
+            newRead.put(server, existingRead != null ? existingRead : new ServerChannel(server, "read"));
+            newWrite.put(server, existingWrite != null ? existingWrite : new ServerChannel(server, "write"));
         }
 
-        this.snapshot = new ServerSnapshot(new ConsistentHashRouter(newServers),
-                newReadChannels, newWriteChannels);
+        this.snapshot = new ServerSnapshot(new ConsistentHashRouter(newServers), newRead, newWrite);
         serversReadyLatch.countDown();
-
         LOGGER.log(Level.INFO, "Updated remote file servers: {0} (added: {1}, removed: {2})",
                 new Object[]{newServers, added, removed});
 
-        // Cancel in-flight RPCs to removed servers immediately via shutdownNow().
-        // Graceful shutdown (awaitTermination) is intentionally skipped: a server
-        // is removed because it crashed or deregistered from ZooKeeper, so any
-        // in-flight write to it is already lost. Using shutdownNow() ensures that
-        // callers blocking on writeFile() (e.g. during a Phase C checkpoint) fail
-        // fast rather than hanging for up to clientTimeoutSeconds (default 30 min).
         if (!removed.isEmpty()) {
-            List<ManagedChannel> toShutdown = new ArrayList<>();
-            for (String server : removed) {
-                ManagedChannel readCh = current.readChannels.get(server);
-                if (readCh != null) {
-                    toShutdown.add(readCh);
-                }
-                ManagedChannel writeCh = current.writeChannels.get(server);
-                if (writeCh != null) {
-                    toShutdown.add(writeCh);
-                }
-            }
-            Thread shutdownThread = new Thread(() -> {
-                for (ManagedChannel ch : toShutdown) {
-                    ch.shutdownNow();
+            // Detached close so we do not block updateServers() on socket teardown.
+            Thread t = new Thread(() -> {
+                for (String server : removed) {
+                    ServerChannel rc = current.readChannels.get(server);
+                    if (rc != null) {
+                        rc.closeQuiet();
+                    }
+                    ServerChannel wc = current.writeChannels.get(server);
+                    if (wc != null) {
+                        wc.closeQuiet();
+                    }
                 }
             }, "remote-file-channel-shutdown");
-            shutdownThread.setDaemon(true);
-            shutdownThread.start();
+            t.setDaemon(true);
+            t.start();
         }
     }
 
-    /**
-     * Returns {@code true} if the client currently has at least one server in
-     * its consistent-hash ring. Used by callers that need to block on cold-boot
-     * ZK discovery before issuing the first RPC.
-     */
     public boolean hasServers() {
         ServerSnapshot s = this.snapshot;
         return !s.readChannels.isEmpty();
     }
 
-    /**
-     * Blocks for up to {@code timeoutMs} milliseconds until {@link #hasServers()}
-     * returns {@code true}. Returns {@code true} as soon as a server is visible,
-     * {@code false} on timeout. Intended for use at bootstrap on a cold cluster
-     * where ZK service discovery may not yet have populated the server list by
-     * the time the first RPC is issued.
-     */
     public boolean awaitServersReady(long timeoutMs) throws InterruptedException {
         return serversReadyLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
-    /** Read-plane async stub for a path. */
-    private RemoteFileServiceGrpc.RemoteFileServiceStub readStubForPath(String path) {
+    /** Read-plane connection for a path. */
+    private ServerChannel readChannelForPath(String path) {
         ServerSnapshot s = this.snapshot;
         String server = s.router.getServer(path);
-        return RemoteFileServiceGrpc.newStub(s.readChannels.get(server))
-                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
+        return s.readChannels.get(server);
     }
 
-    /** Write-plane async stub for a path. */
-    private RemoteFileServiceGrpc.RemoteFileServiceStub writeStubForPath(String path) {
+    /** Write-plane connection for a path. */
+    private ServerChannel writeChannelForPath(String path) {
         ServerSnapshot s = this.snapshot;
         String server = s.router.getServer(path);
-        return RemoteFileServiceGrpc.newStub(s.writeChannels.get(server))
-                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
+        return s.writeChannels.get(server);
     }
 
-    /** Read-plane async stub targeting a specific server (used by listFiles fan-out). */
-    private RemoteFileServiceGrpc.RemoteFileServiceStub readStubForServer(String server) {
+    /** Read-plane connection for a multipart block. */
+    private ServerChannel readChannelForBlock(String path, long blockIndex) {
+        return readChannelForKey(blockRoutingKey(path, blockIndex));
+    }
+
+    /** Write-plane connection for a multipart block. */
+    private ServerChannel writeChannelForBlock(String path, long blockIndex) {
+        return writeChannelForKey(blockRoutingKey(path, blockIndex));
+    }
+
+    private ServerChannel readChannelForKey(String key) {
         ServerSnapshot s = this.snapshot;
-        return RemoteFileServiceGrpc.newStub(s.readChannels.get(server))
-                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
+        String server = s.router.getServer(key);
+        return s.readChannels.get(server);
     }
 
-    /** Write-plane async stub targeting a specific server (used by deleteByPrefix fan-out). */
-    private RemoteFileServiceGrpc.RemoteFileServiceStub writeStubForServer(String server) {
+    private ServerChannel writeChannelForKey(String key) {
         ServerSnapshot s = this.snapshot;
-        return RemoteFileServiceGrpc.newStub(s.writeChannels.get(server))
-                .withDeadlineAfter(clientTimeoutSeconds, TimeUnit.SECONDS);
+        String server = s.router.getServer(key);
+        return s.writeChannels.get(server);
     }
 
-    // --- Async APIs returning CompletableFuture ---
+    private static String blockRoutingKey(String path, long blockIndex) {
+        return path + "#block" + blockIndex;
+    }
+
+    public String getServerForPath(String path) {
+        return snapshot.router.getServer(path);
+    }
+
+    public String getServerForBlock(String path, long blockIndex) {
+        return snapshot.router.getServer(blockRoutingKey(path, blockIndex));
+    }
+
+    public int getBlockSize() {
+        return blockSize;
+    }
+
+    // ---------------------------------------------------------------------
+    // Async APIs returning CompletableFuture
+    // ---------------------------------------------------------------------
 
     public CompletableFuture<Long> writeFileAsync(String path, byte[] content) {
-        return writeFileAsync(path, UnsafeByteOperations.unsafeWrap(content));
+        return writeFileAsync(path, content, 0, content.length);
     }
 
-    public CompletableFuture<Long> writeFileAsync(String path, byte[] buf, int offset, int len) {
-        return writeFileAsync(path, UnsafeByteOperations.unsafeWrap(buf, offset, len));
+    public CompletableFuture<Long> writeFileAsync(String path, byte[] buf, int offset, int length) {
+        // Writes are not idempotent — no retry.
+        ServerChannel ch;
+        try {
+            ch = writeChannelForPath(path);
+        } catch (RuntimeException e) {
+            return failed(e);
+        }
+        return sendRequest(ch, requestId ->
+                        PduCodec.WriteFileRequest.write(requestId, path, buf, offset, length),
+                pdu -> PduCodec.WriteFileResponse.readWrittenSize(pdu));
     }
 
     /**
-     * Writes a file from a pooled ByteBuf. Zero-copy to gRPC ByteString.
-     * The ByteBuf is NOT released by this method; caller must release after completion.
+     * Writes a file from a pooled ByteBuf. Caller still owns {@code content}
+     * and must release after this future completes.
      */
     public CompletableFuture<Long> writeFileAsync(String path, ByteBuf content) {
-        ByteString bs = content.hasArray()
-                ? UnsafeByteOperations.unsafeWrap(content.array(),
-                        content.arrayOffset() + content.readerIndex(), content.readableBytes())
-                : UnsafeByteOperations.unsafeWrap(content.nioBuffer());
-        return writeFileAsync(path, bs);
-    }
-
-    private CompletableFuture<Long> writeFileAsync(String path, ByteString content) {
-        // Writes are not idempotent — no retry
-        return runDetached(() -> {
-            CompletableFuture<Long> future = new CompletableFuture<>();
-            RemoteFileServiceGrpc.RemoteFileServiceStub stub;
-            try {
-                stub = writeStubForPath(path);
-            } catch (Exception e) {
-                future.completeExceptionally(e);
-                return future;
-            }
-            stub.writeFile(
-                    WriteFileRequest.newBuilder()
-                            .setPath(path)
-                            .setContent(content)
-                            .build(),
-                    new StreamObserver<WriteFileResponse>() {
-                        private long writtenSize;
-
-                        @Override
-                        public void onNext(WriteFileResponse response) {
-                            writtenSize = response.getWrittenSize();
-                        }
-
-                        @Override
-                        public void onError(Throwable t) {
-                            future.completeExceptionally(t);
-                        }
-
-                        @Override
-                        public void onCompleted() {
-                            future.complete(writtenSize);
-                        }
-                    });
-            return future;
-        });
+        ServerChannel ch;
+        try {
+            ch = writeChannelForPath(path);
+        } catch (RuntimeException e) {
+            return failed(e);
+        }
+        return sendRequest(ch, requestId ->
+                        PduCodec.WriteFileRequest.write(requestId, path, content),
+                pdu -> PduCodec.WriteFileResponse.readWrittenSize(pdu));
     }
 
     public CompletableFuture<byte[]> readFileAsync(String path) {
@@ -583,111 +456,77 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     private CompletableFuture<byte[]> doReadFileAsync(String path) {
-        return runDetached(() -> {
-            CompletableFuture<byte[]> future = new CompletableFuture<>();
-            readStubForPath(path).readFile(
-                    ReadFileRequest.newBuilder().setPath(path).build(),
-                    new StreamObserver<ReadFileResponse>() {
-                        private byte[] result;
-
-                        @Override
-                        public void onNext(ReadFileResponse response) {
-                            if (response.getFound()) {
-                                result = response.getContent().toByteArray();
-                            }
+        ServerChannel ch;
+        try {
+            ch = readChannelForPath(path);
+        } catch (RuntimeException e) {
+            return failed(e);
+        }
+        return sendRequest(ch, requestId -> PduCodec.ReadFileRequest.write(requestId, path),
+                pdu -> {
+                    if (!PduCodec.ReadFileResponse.readFound(pdu)) {
+                        return null;
+                    }
+                    int len = PduCodec.ReadFileResponse.readContentLength(pdu);
+                    byte[] out = new byte[len];
+                    if (len > 0) {
+                        ByteBuf slice = PduCodec.ReadFileResponse.readContent(pdu);
+                        try {
+                            slice.readBytes(out);
+                        } finally {
+                            slice.release();
                         }
-
-                        @Override
-                        public void onError(Throwable t) {
-                            future.completeExceptionally(t);
-                        }
-
-                        @Override
-                        public void onCompleted() {
-                            future.complete(result);
-                        }
-                    });
-            return future;
-        });
+                    }
+                    return out;
+                });
     }
 
     /**
-     * Reads a file into a pooled ByteBuf. Returns null if file not found.
-     * Caller must release the ByteBuf after use.
+     * Reads a file into a pooled ByteBuf. Returns null if the file is not
+     * found. Caller must release the ByteBuf after use.
      */
     public CompletableFuture<ByteBuf> readFileAsByteBufAsync(String path) {
         return retryAsync(() -> doReadFileAsByteBufAsync(path), "readFile", path, 0);
     }
 
     private CompletableFuture<ByteBuf> doReadFileAsByteBufAsync(String path) {
-        return runDetached(() -> {
-            CompletableFuture<ByteBuf> future = new CompletableFuture<>();
-            // readFile returns the whole file in a single onNext payload,
-            // whose size is unknown until the server responds. Reserve
-            // blockSize bytes as a conservative proxy: readFile is a legacy
-            // small-object API (metadata, watermarks — not segment data),
-            // so files are typically well under blockSize. Files larger
-            // than blockSize will transiently exceed the in-flight budget
-            // by the difference; acceptable because segment data flows
-            // through readFileRange, not readFile.
-            int reservation = blockSize;
-            acquireInflightReadBytes(reservation);
-            AtomicBoolean reservationReleased = new AtomicBoolean(false);
-            Runnable releaseOnce = () -> {
-                if (reservationReleased.compareAndSet(false, true)) {
-                    releaseInflightReadBytes(reservation);
-                }
-            };
-            try {
-                readStubForPath(path).readFile(
-                        ReadFileRequest.newBuilder().setPath(path).build(),
-                        new StreamObserver<ReadFileResponse>() {
-                            private ByteBuf result;
-
-                            @Override
-                            public void onNext(ReadFileResponse response) {
-                                if (response.getFound()) {
-                                    ByteString content = response.getContent();
-                                    int size = content.size();
-                                    ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(size);
-                                    // Single copy from the protobuf LiteralByteString into the
-                                    // pooled direct buffer; matches doReadFileRangeAsByteBufAsync.
-                                    content.copyTo(buf.nioBuffer(0, size));
-                                    buf.writerIndex(size);
-                                    result = buf;
-                                }
-                            }
-
-                            @Override
-                            public void onError(Throwable t) {
-                                if (result != null) {
-                                    result.release();
-                                    result = null;
-                                }
-                                // Release permits before completing the future so that any thread
-                                // unblocked by future.completeExceptionally() observes the
-                                // restored budget immediately (issue #268).
-                                releaseOnce.run();
-                                future.completeExceptionally(t);
-                            }
-
-                            @Override
-                            public void onCompleted() {
-                                // Release permits before completing the future so that any thread
-                                // unblocked by future.complete() observes the restored budget
-                                // immediately (issue #268).
-                                releaseOnce.run();
-                                future.complete(result);
-                            }
-                        });
-            } catch (RuntimeException e) {
-                // Synchronous failure (no observer callback will fire) —
-                // release the permit here to keep the semaphore in balance.
-                releaseOnce.run();
-                throw e;
+        // readFile returns the whole file in a single response, whose size
+        // is unknown until the server replies. Reserve blockSize bytes as a
+        // conservative proxy: readFile is a legacy small-object API.
+        int reservation = blockSize;
+        acquireInflightReadBytes(reservation);
+        AtomicBoolean reservationReleased = new AtomicBoolean(false);
+        Runnable releaseOnce = () -> {
+            if (reservationReleased.compareAndSet(false, true)) {
+                releaseInflightReadBytes(reservation);
             }
-            return future;
-        });
+        };
+        ServerChannel ch;
+        try {
+            ch = readChannelForPath(path);
+        } catch (RuntimeException e) {
+            releaseOnce.run();
+            return failed(e);
+        }
+        CompletableFuture<ByteBuf> result = sendRequest(ch,
+                requestId -> PduCodec.ReadFileRequest.write(requestId, path),
+                pdu -> {
+                    if (!PduCodec.ReadFileResponse.readFound(pdu)) {
+                        return (ByteBuf) null;
+                    }
+                    int len = PduCodec.ReadFileResponse.readContentLength(pdu);
+                    ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(len);
+                    if (len > 0) {
+                        ByteBuf slice = PduCodec.ReadFileResponse.readContent(pdu);
+                        try {
+                            buf.writeBytes(slice);
+                        } finally {
+                            slice.release();
+                        }
+                    }
+                    return buf;
+                });
+        return result.whenComplete((buf, err) -> releaseOnce.run());
     }
 
     public CompletableFuture<Boolean> deleteFileAsync(String path) {
@@ -695,30 +534,14 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     private CompletableFuture<Boolean> doDeleteFileAsync(String path) {
-        return runDetached(() -> {
-            CompletableFuture<Boolean> future = new CompletableFuture<>();
-            writeStubForPath(path).deleteFile(
-                    DeleteFileRequest.newBuilder().setPath(path).build(),
-                    new StreamObserver<DeleteFileResponse>() {
-                        private boolean deleted;
-
-                        @Override
-                        public void onNext(DeleteFileResponse response) {
-                            deleted = response.getDeleted();
-                        }
-
-                        @Override
-                        public void onError(Throwable t) {
-                            future.completeExceptionally(t);
-                        }
-
-                        @Override
-                        public void onCompleted() {
-                            future.complete(deleted);
-                        }
-                    });
-            return future;
-        });
+        ServerChannel ch;
+        try {
+            ch = writeChannelForPath(path);
+        } catch (RuntimeException e) {
+            return failed(e);
+        }
+        return sendRequest(ch, requestId -> PduCodec.DeleteFileRequest.write(requestId, path),
+                pdu -> PduCodec.DeleteFileResponse.readDeleted(pdu));
     }
 
     public CompletableFuture<List<String>> listFilesAsync(String prefix) {
@@ -726,383 +549,285 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     private CompletableFuture<List<String>> doListFilesAsync(String prefix) {
-        return runDetached(() -> {
-            ServerSnapshot s = this.snapshot;
-            List<CompletableFuture<List<String>>> futures = new ArrayList<>();
-            for (String server : s.readChannels.keySet()) {
-                RemoteFileServiceGrpc.RemoteFileServiceStub stub = readStubForServer(server);
-                CompletableFuture<List<String>> serverFuture = new CompletableFuture<>();
-                List<String> paths = Collections.synchronizedList(new ArrayList<>());
-                stub.listFiles(
-                        ListFilesRequest.newBuilder().setPrefix(prefix).build(),
-                        new StreamObserver<ListFilesEntry>() {
-                            @Override
-                            public void onNext(ListFilesEntry entry) {
-                                paths.add(entry.getPath());
-                            }
-
-                            @Override
-                            public void onError(Throwable t) {
-                                serverFuture.completeExceptionally(t);
-                            }
-
-                            @Override
-                            public void onCompleted() {
-                                serverFuture.complete(paths);
-                            }
-                        });
-                futures.add(serverFuture);
-            }
-            return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                    .thenApply(v -> {
-                        // Deduplicate: multiple servers may return the same logical path
-                        // for different blocks of the same multipart file
-                        LinkedHashSet<String> seen = new LinkedHashSet<>();
-                        for (CompletableFuture<List<String>> f : futures) {
-                            seen.addAll(f.join());
-                        }
-                        return new ArrayList<>(seen);
-                    });
-        });
+        ServerSnapshot s = this.snapshot;
+        if (s.readChannels.isEmpty()) {
+            return failed(new IllegalStateException("no servers configured"));
+        }
+        List<CompletableFuture<List<String>>> perServer = new ArrayList<>(s.readChannels.size());
+        for (ServerChannel ch : s.readChannels.values()) {
+            perServer.add(sendRequest(ch, requestId -> PduCodec.ListFilesRequest.write(requestId, prefix),
+                    pdu -> PduCodec.ListFilesResponse.readPaths(pdu)));
+        }
+        return CompletableFuture.allOf(perServer.toArray(new CompletableFuture[0]))
+                .thenApply(v -> {
+                    // Multiple servers may return the same logical path for
+                    // different blocks of the same multipart file; dedupe.
+                    LinkedHashSet<String> seen = new LinkedHashSet<>();
+                    for (CompletableFuture<List<String>> f : perServer) {
+                        seen.addAll(f.join());
+                    }
+                    return new ArrayList<>(seen);
+                });
     }
 
     /**
      * Writes one block of a multipart file. Not retried (not idempotent).
-     * Routes via consistent hash of {@code path#block{blockIndex}}.
      */
     public CompletableFuture<Void> writeFileBlockAsync(String path, long blockIndex, byte[] content) {
-        return runDetached(() -> {
-            CompletableFuture<Void> future = new CompletableFuture<>();
-            writeStubForBlock(path, blockIndex).writeFileBlock(
-                    WriteFileBlockRequest.newBuilder()
-                            .setPath(path)
-                            .setBlockIndex(blockIndex)
-                            .setContent(UnsafeByteOperations.unsafeWrap(content))
-                            .build(),
-                    new StreamObserver<WriteFileBlockResponse>() {
-                        @Override
-                        public void onNext(WriteFileBlockResponse response) {
-                        }
-
-                        @Override
-                        public void onError(Throwable t) {
-                            future.completeExceptionally(t);
-                        }
-
-                        @Override
-                        public void onCompleted() {
-                            future.complete(null);
-                        }
-                    });
-            return future;
-        });
+        ServerChannel ch;
+        try {
+            ch = writeChannelForBlock(path, blockIndex);
+        } catch (RuntimeException e) {
+            return failed(e);
+        }
+        return sendRequest(ch,
+                requestId -> PduCodec.WriteFileBlockRequest.write(requestId, path, blockIndex, content),
+                pdu -> {
+                    PduCodec.WriteFileBlockResponse.readWrittenSize(pdu); // ignored
+                    return (Void) null;
+                });
     }
 
     /**
-     * Writes one block of a multipart file from a ByteBuf. Not retried (not idempotent).
-     * Routes via consistent hash of {@code path#block{blockIndex}}.
-     * The ByteBuf is NOT released by this method; caller must release after completion.
+     * Writes one block of a multipart file from a ByteBuf. Not retried.
+     * Caller still owns {@code content} and must release after completion.
      */
     public CompletableFuture<Void> writeFileBlockAsync(String path, long blockIndex, ByteBuf content) {
-        ByteString bs = content.hasArray()
-                ? UnsafeByteOperations.unsafeWrap(content.array(),
-                        content.arrayOffset() + content.readerIndex(), content.readableBytes())
-                : UnsafeByteOperations.unsafeWrap(content.nioBuffer());
-        return runDetached(() -> {
-            CompletableFuture<Void> future = new CompletableFuture<>();
-            writeStubForBlock(path, blockIndex).writeFileBlock(
-                    WriteFileBlockRequest.newBuilder()
-                            .setPath(path)
-                            .setBlockIndex(blockIndex)
-                            .setContent(bs)
-                            .build(),
-                    new StreamObserver<WriteFileBlockResponse>() {
-                        @Override
-                        public void onNext(WriteFileBlockResponse response) {
-                        }
+        ServerChannel ch;
+        try {
+            ch = writeChannelForBlock(path, blockIndex);
+        } catch (RuntimeException e) {
+            return failed(e);
+        }
+        return sendRequest(ch,
+                requestId -> PduCodec.WriteFileBlockRequest.write(requestId, path, blockIndex, content),
+                pdu -> {
+                    PduCodec.WriteFileBlockResponse.readWrittenSize(pdu);
+                    return (Void) null;
+                });
+    }
 
-                        @Override
-                        public void onError(Throwable t) {
-                            future.completeExceptionally(t);
-                        }
-
-                        @Override
-                        public void onCompleted() {
-                            future.complete(null);
-                        }
-                    });
-            return future;
+    public CompletableFuture<byte[]> readFileRangeAsync(String path, long offset, int length, int blockSizeArg) {
+        // Per the storage-side contract a single readRange call must not span two
+        // blocks. Split cross-block requests into sequential per-block reads and
+        // concatenate the results — the same shape the legacy gRPC client used.
+        long startBlock = offset / blockSizeArg;
+        long endBlock = (offset + length - 1) / blockSizeArg;
+        if (startBlock == endBlock) {
+            return retryAsync(() -> doReadFileRangeAsync(path, offset, length, blockSizeArg),
+                    "readFileRange", path, 0);
+        }
+        int firstBlockEnd = (int) ((startBlock + 1) * (long) blockSizeArg - offset);
+        int secondLength = length - firstBlockEnd;
+        long secondOffset = (startBlock + 1) * (long) blockSizeArg;
+        CompletableFuture<byte[]> firstFuture = retryAsync(
+                () -> doReadFileRangeAsync(path, offset, firstBlockEnd, blockSizeArg),
+                "readFileRange", path, 0);
+        return firstFuture.thenCompose(first -> {
+            if (first == null) {
+                return CompletableFuture.completedFuture((byte[]) null);
+            }
+            CompletableFuture<byte[]> secondFuture = retryAsync(
+                    () -> doReadFileRangeAsync(path, secondOffset, secondLength, blockSizeArg),
+                    "readFileRange", path, 0);
+            return secondFuture.thenApply(second -> {
+                if (second == null) {
+                    return first;
+                }
+                byte[] combined = new byte[first.length + second.length];
+                System.arraycopy(first, 0, combined, 0, first.length);
+                System.arraycopy(second, 0, combined, first.length, second.length);
+                return combined;
+            });
         });
     }
 
-    /**
-     * Reads a range of bytes from a (possibly multipart) file.
-     * Routes to the server responsible for the block containing {@code offset}.
-     * If the range spans two blocks, two sequential requests are made.
-     *
-     * @return the requested bytes, or null if the file is not found
-     */
-    public CompletableFuture<byte[]> readFileRangeAsync(String path, long offset, int length, int blockSize) {
-        long startBlock = offset / blockSize;
-        long endBlock = (offset + length - 1) / blockSize;
-        if (startBlock == endBlock) {
-            return doReadFileRangeAsync(path, offset, length, blockSize);
+    private CompletableFuture<byte[]> doReadFileRangeAsync(String path, long offset, int length, int blockSizeArg) {
+        ServerChannel ch;
+        try {
+            ch = readChannelForBlock(path, offset / blockSizeArg);
+        } catch (RuntimeException e) {
+            return failed(e);
         }
-        // Range spans two blocks — read sequentially and concatenate
-        int firstBlockEnd = (int) ((startBlock + 1) * (long) blockSize - offset);
-        int secondLength = length - firstBlockEnd;
-        return doReadFileRangeAsync(path, offset, firstBlockEnd, blockSize)
-                .thenCompose(first -> {
-                    if (first == null) {
-                        return CompletableFuture.completedFuture((byte[]) null);
+        return sendRequest(ch,
+                requestId -> PduCodec.ReadFileRangeRequest.write(requestId, path, offset, length, blockSizeArg),
+                pdu -> {
+                    if (!PduCodec.ReadFileRangeResponse.readFound(pdu)) {
+                        return (byte[]) null;
                     }
-                    long secondOffset = (startBlock + 1) * (long) blockSize;
-                    return doReadFileRangeAsync(path, secondOffset, secondLength, blockSize)
-                            .thenApply(second -> {
-                                if (second == null) {
-                                    return first;
-                                }
-                                byte[] combined = new byte[first.length + second.length];
-                                System.arraycopy(first, 0, combined, 0, first.length);
-                                System.arraycopy(second, 0, combined, first.length, second.length);
-                                return combined;
-                            });
+                    int len = PduCodec.ReadFileRangeResponse.readContentLength(pdu);
+                    byte[] out = new byte[len];
+                    if (len > 0) {
+                        ByteBuf slice = PduCodec.ReadFileRangeResponse.readContent(pdu);
+                        try {
+                            slice.readBytes(out);
+                        } finally {
+                            slice.release();
+                        }
+                    }
+                    return out;
                 });
     }
 
-    private CompletableFuture<byte[]> doReadFileRangeAsync(String path, long offset, int length, int blockSize) {
-        return retryAsync(() -> runDetached(() -> {
-            long blockIndex = offset / blockSize;
-            CompletableFuture<byte[]> future = new CompletableFuture<>();
-            readStubForBlock(path, blockIndex).readFileRange(
-                    ReadFileRangeRequest.newBuilder()
-                            .setPath(path)
-                            .setOffset(offset)
-                            .setLength(length)
-                            .setBlockSize(blockSize)
-                            .build(),
-                    new StreamObserver<ReadFileRangeResponse>() {
-                        private byte[] result;
-
-                        @Override
-                        public void onNext(ReadFileRangeResponse response) {
-                            // Broad catch at the gRPC callback boundary: if onNext
-                            // throws (e.g. OutOfMemoryError from toByteArray), gRPC
-                            // replaces the cause with an opaque "CANCELLED: Failed
-                            // to read message." — which makes root-cause analysis
-                            // impossible. Capture the cause directly.
-                            try {
-                                if (response.getFound()) {
-                                    result = response.getContent().toByteArray();
-                                }
-                            } catch (Throwable t) {
-                                future.completeExceptionally(t);
-                            }
-                        }
-
-                        @Override
-                        public void onError(Throwable t) {
-                            future.completeExceptionally(t);
-                        }
-
-                        @Override
-                        public void onCompleted() {
-                            if (!future.isDone()) {
-                                future.complete(result);
-                            }
-                        }
-                    });
-            return future;
-        }), "readFileRange", path, 0);
-    }
-
-    /**
-     * ByteBuf variant of {@link #readFileRangeAsync(String, long, int, int)} —
-     * the response bytes land directly in a pooled direct {@link ByteBuf} via
-     * {@code ByteString.copyTo(ByteBuffer)}, skipping the throw-away
-     * {@code byte[]} that {@code response.getContent().toByteArray()} would
-     * allocate. The protobuf parser still materialises the response payload
-     * once inside its {@code LiteralByteString} (gRPC marshaller-mandated copy);
-     * eliminating that requires bypassing protobuf entirely.
-     * <p>
-     * Cross-block ranges are returned as a {@link CompositeByteBuf} view of the
-     * two slices — no extra arraycopy. Caller MUST {@code release()} the result
-     * when done. Returns {@code null} if the file is not found.
-     */
     public CompletableFuture<ByteBuf> readFileRangeAsByteBufAsync(String path, long offset,
-                                                                  int length, int blockSize) {
-        long startBlock = offset / blockSize;
-        long endBlock = (offset + length - 1) / blockSize;
+                                                                  int length, int blockSizeArg) {
+        long startBlock = offset / blockSizeArg;
+        long endBlock = (offset + length - 1) / blockSizeArg;
         if (startBlock == endBlock) {
-            return doReadFileRangeAsByteBufAsync(path, offset, length, blockSize);
+            return retryAsync(() -> doReadFileRangeAsByteBufAsync(path, offset, length, blockSizeArg),
+                    "readFileRange", path, 0);
         }
-        int firstBlockEnd = (int) ((startBlock + 1) * (long) blockSize - offset);
+        int firstBlockEnd = (int) ((startBlock + 1) * (long) blockSizeArg - offset);
         int secondLength = length - firstBlockEnd;
-        return doReadFileRangeAsByteBufAsync(path, offset, firstBlockEnd, blockSize)
-                .thenCompose(first -> {
-                    if (first == null) {
-                        return CompletableFuture.completedFuture((ByteBuf) null);
+        long secondOffset = (startBlock + 1) * (long) blockSizeArg;
+        CompletableFuture<ByteBuf> firstFuture = retryAsync(
+                () -> doReadFileRangeAsByteBufAsync(path, offset, firstBlockEnd, blockSizeArg),
+                "readFileRange", path, 0);
+        return firstFuture.thenCompose(first -> {
+            if (first == null) {
+                return CompletableFuture.completedFuture((ByteBuf) null);
+            }
+            CompletableFuture<ByteBuf> secondFuture = retryAsync(
+                    () -> doReadFileRangeAsByteBufAsync(path, secondOffset, secondLength, blockSizeArg),
+                    "readFileRange", path, 0);
+            // Use .handle() so one branch covers BOTH the secondFuture failure
+            // and any throw from the composite-assembly lambda. Mixing
+            // thenApply().exceptionally() risks double-releasing `first` when
+            // a lambda partially built the composite (transferring `first`
+            // into it) and then threw — the .exceptionally would then release
+            // `first` a second time after composite.release() already did.
+            return secondFuture.handle((second, error) -> {
+                if (error != null) {
+                    // The second read failed before we touched the composite —
+                    // `first` is still solely owned by us, so release it.
+                    ReferenceCountUtil.safeRelease(first);
+                    if (error instanceof RuntimeException) {
+                        throw (RuntimeException) error;
                     }
-                    long secondOffset = (startBlock + 1) * (long) blockSize;
-                    return doReadFileRangeAsByteBufAsync(path, secondOffset, secondLength, blockSize)
-                            .thenApply(second -> {
-                                if (second == null) {
-                                    return first;
-                                }
-                                // CompositeByteBuf gives a contiguous view over the two
-                                // pooled slices without copying their bytes. addComponent
-                                // takes ownership of the component's refcount.
-                                CompositeByteBuf composite = PooledByteBufAllocator.DEFAULT
-                                        .compositeDirectBuffer(2);
-                                composite.addComponent(true, first);
-                                composite.addComponent(true, second);
-                                return composite;
-                            })
-                            .exceptionally(t -> {
-                                ReferenceCountUtil.safeRelease(first);
-                                if (t instanceof RuntimeException) {
-                                    throw (RuntimeException) t;
-                                }
-                                throw new RuntimeException(t);
-                            });
-                });
+                    throw new RuntimeException(error);
+                }
+                if (second == null) {
+                    return first;
+                }
+                // Refcount-safe composite assembly: `composite` is non-null
+                // only between creation and the point where ownership
+                // transfers to the caller. `firstTransferred`/`secondTransferred`
+                // track which components have been moved into the composite.
+                // On partial failure, releasing the composite releases the
+                // already-transferred components; not-yet-transferred ones
+                // are released independently. Setting `composite = null`
+                // before return signals that ownership has moved out.
+                CompositeByteBuf composite = null;
+                boolean firstTransferred = false;
+                boolean secondTransferred = false;
+                try {
+                    composite = PooledByteBufAllocator.DEFAULT.compositeDirectBuffer(2);
+                    composite.addComponent(true, first);
+                    firstTransferred = true;
+                    composite.addComponent(true, second);
+                    secondTransferred = true;
+                    ByteBuf result = composite;
+                    composite = null;
+                    return result;
+                } finally {
+                    if (composite != null) {
+                        ReferenceCountUtil.safeRelease(composite);
+                        if (!firstTransferred) {
+                            ReferenceCountUtil.safeRelease(first);
+                        }
+                        if (!secondTransferred) {
+                            ReferenceCountUtil.safeRelease(second);
+                        }
+                    }
+                }
+            });
+        });
     }
 
     private CompletableFuture<ByteBuf> doReadFileRangeAsByteBufAsync(String path, long offset,
-                                                                    int length, int blockSize) {
-        return retryAsync(() -> runDetached(() -> {
-            long blockIndex = offset / blockSize;
-            CompletableFuture<ByteBuf> future = new CompletableFuture<>();
-            // Reserve bytes equal to the requested payload length before
-            // firing the RPC — bounds the peak direct-memory high-water
-            // across concurrent reads. Reservation is released on the
-            // terminal observer callback (onError or onCompleted).
-            // Using bytes (not request count) means 16 KiB block reads
-            // from RemoteRandomAccessReader and 4 MiB Phase C chunks both
-            // contribute to the same budget in proportion to the actual
-            // direct-memory pressure they impose (issue #246).
-            int reservation = length;
-            acquireInflightReadBytes(reservation);
-            AtomicBoolean reservationReleased = new AtomicBoolean(false);
-            Runnable releaseOnce = () -> {
-                if (reservationReleased.compareAndSet(false, true)) {
-                    releaseInflightReadBytes(reservation);
-                }
-            };
-            try {
-                readStubForBlock(path, blockIndex).readFileRange(
-                        ReadFileRangeRequest.newBuilder()
-                                .setPath(path)
-                                .setOffset(offset)
-                                .setLength(length)
-                                .setBlockSize(blockSize)
-                                .build(),
-                        new StreamObserver<ReadFileRangeResponse>() {
-                            private ByteBuf result;
-
-                            @Override
-                            public void onNext(ReadFileRangeResponse response) {
-                                // Broad catch at the gRPC callback boundary: direct ByteBuf
-                                // allocation and the protobuf copy can throw OOM /
-                                // OutOfDirectMemoryError. gRPC would otherwise rewrap the
-                                // failure as an opaque "CANCELLED: Failed to read message.",
-                                // hiding the real cause from the retry log and metrics.
-                                ByteBuf local = null;
-                                try {
-                                    if (response.getFound()) {
-                                        ByteString content = response.getContent();
-                                        int size = content.size();
-                                        local = PooledByteBufAllocator.DEFAULT.directBuffer(size);
-                                        // copyTo writes into the ByteBuffer view of the pooled buf
-                                        // and the protobuf parser already holds the bytes in heap;
-                                        // this is the single copy from heap into direct memory.
-                                        content.copyTo(local.nioBuffer(0, size));
-                                        local.writerIndex(size);
-                                        result = local;
-                                        local = null;
-                                    }
-                                } catch (Throwable t) {
-                                    if (local != null) {
-                                        ReferenceCountUtil.safeRelease(local);
-                                    }
-                                    future.completeExceptionally(t);
-                                }
-                            }
-
-                            @Override
-                            public void onError(Throwable t) {
-                                if (result != null) {
-                                    ReferenceCountUtil.safeRelease(result);
-                                    result = null;
-                                }
-                                // Release permits before completing the future so that any thread
-                                // unblocked by future.completeExceptionally() observes the
-                                // restored budget immediately (issue #268).
-                                releaseOnce.run();
-                                future.completeExceptionally(t);
-                            }
-
-                            @Override
-                            public void onCompleted() {
-                                if (future.isDone()) {
-                                    // Future already failed in onNext — release the buffer we
-                                    // would have returned so it does not leak.
-                                    if (result != null) {
-                                        ReferenceCountUtil.safeRelease(result);
-                                        result = null;
-                                    }
-                                }
-                                // Release permits before completing the future so that any thread
-                                // unblocked by future.complete() observes the restored budget
-                                // immediately (issue #268).
-                                releaseOnce.run();
-                                if (!future.isDone()) {
-                                    future.complete(result);
-                                }
-                            }
-                        });
-            } catch (RuntimeException e) {
-                // Stub-side synchronous failure — no observer callback will
-                // ever fire, so release the permit here to keep the
-                // semaphore balanced across retries.
-                releaseOnce.run();
-                throw e;
+                                                                     int length, int blockSizeArg) {
+        // Reserve precisely the requested length (issue #246).
+        int reservation = length;
+        acquireInflightReadBytes(reservation);
+        AtomicBoolean reservationReleased = new AtomicBoolean(false);
+        Runnable releaseOnce = () -> {
+            if (reservationReleased.compareAndSet(false, true)) {
+                releaseInflightReadBytes(reservation);
             }
-            return future;
-        }), "readFileRange", path, 0);
+        };
+        ServerChannel ch;
+        try {
+            ch = readChannelForBlock(path, offset / blockSizeArg);
+        } catch (RuntimeException e) {
+            releaseOnce.run();
+            return failed(e);
+        }
+        CompletableFuture<ByteBuf> result = sendRequest(ch,
+                requestId -> PduCodec.ReadFileRangeRequest.write(requestId, path, offset, length, blockSizeArg),
+                pdu -> {
+                    if (!PduCodec.ReadFileRangeResponse.readFound(pdu)) {
+                        return (ByteBuf) null;
+                    }
+                    int len = PduCodec.ReadFileRangeResponse.readContentLength(pdu);
+                    ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(len);
+                    if (len > 0) {
+                        ByteBuf slice = PduCodec.ReadFileRangeResponse.readContent(pdu);
+                        try {
+                            buf.writeBytes(slice);
+                        } finally {
+                            slice.release();
+                        }
+                    }
+                    return buf;
+                });
+        return result.whenComplete((buf, err) -> releaseOnce.run());
     }
 
     /**
-     * Writes an {@link InputStream} as a multipart file, splitting into blocks of {@code blockSize}.
-     * Uses a pooled heap ByteBuf internally to avoid per-block allocations.
-     * Blocks are written sequentially. Returns the total number of bytes written.
+     * Streaming multipart write helper. Reads from {@code in} in
+     * {@code blockSizeArg}-sized blocks and dispatches each as a parallel
+     * {@link #writeFileBlockAsync(String, long, byte[])} call. Returns the
+     * total bytes written.
      */
-    public long writeMultipartFile(String path, InputStream in, int blockSize) throws IOException {
+    public long writeMultipartFile(String path, InputStream in, int blockSizeArg) throws IOException {
+        long total = 0;
         long blockIndex = 0;
-        long totalBytes = 0;
-        ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(blockSize, blockSize);
-        try {
-            byte[] backingArray = buf.array();
-            int startOffset = buf.arrayOffset();
-            int read;
-            while ((read = readFully(in, backingArray, startOffset, blockSize)) > 0) {
-                buf.setIndex(0, read); // set readerIndex=0, writerIndex=read
-                totalBytes += read;
-                getUnchecked(writeFileBlockAsync(path, blockIndex, buf)); // synchronous via getUnchecked
-                buf.clear(); // reset for next iteration; safe because writeFileBlockAsync is blocking
-                blockIndex++;
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        byte[] buf = new byte[blockSizeArg];
+        while (true) {
+            int read = readFully(in, buf, 0, blockSizeArg);
+            if (read <= 0) {
+                break;
             }
-        } finally {
-            buf.release();
+            byte[] block = new byte[read];
+            System.arraycopy(buf, 0, block, 0, read);
+            futures.add(writeFileBlockAsync(path, blockIndex, block));
+            blockIndex++;
+            total += read;
+            if (read < blockSizeArg) {
+                break;
+            }
         }
-        return totalBytes;
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while writing multipart " + path, e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException) {
+                throw (IOException) cause;
+            }
+            throw new IOException("multipart write failed for " + path, cause);
+        }
+        return total;
     }
 
-    private static int readFully(InputStream in, byte[] buf, int offset, int len) throws IOException {
+    private static int readFully(InputStream in, byte[] buf, int off, int len) throws IOException {
         int total = 0;
         while (total < len) {
-            int read = in.read(buf, offset + total, len - total);
-            if (read == -1) {
+            int read = in.read(buf, off + total, len - total);
+            if (read < 0) {
                 break;
             }
             total += read;
@@ -1115,54 +840,125 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     private CompletableFuture<Integer> doDeleteByPrefixAsync(String prefix) {
-        return runDetached(() -> {
-            ServerSnapshot s = this.snapshot;
-            List<CompletableFuture<Integer>> futures = new ArrayList<>();
-            for (String server : s.writeChannels.keySet()) {
-                RemoteFileServiceGrpc.RemoteFileServiceStub stub = writeStubForServer(server);
-                CompletableFuture<Integer> serverFuture = new CompletableFuture<>();
-                stub.deleteByPrefix(
-                        DeleteByPrefixRequest.newBuilder().setPrefix(prefix).build(),
-                        new StreamObserver<DeleteByPrefixResponse>() {
-                            private int count;
-
-                            @Override
-                            public void onNext(DeleteByPrefixResponse response) {
-                                count = response.getDeletedCount();
-                            }
-
-                            @Override
-                            public void onError(Throwable t) {
-                                serverFuture.completeExceptionally(t);
-                            }
-
-                            @Override
-                            public void onCompleted() {
-                                serverFuture.complete(count);
-                            }
-                        });
-                futures.add(serverFuture);
-            }
-            return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                    .thenApply(v -> {
-                        int total = 0;
-                        for (CompletableFuture<Integer> f : futures) {
-                            total += f.join();
-                        }
-                        return total;
-                    });
-        });
+        ServerSnapshot s = this.snapshot;
+        if (s.writeChannels.isEmpty()) {
+            return failed(new IllegalStateException("no servers configured"));
+        }
+        List<CompletableFuture<Integer>> perServer = new ArrayList<>(s.writeChannels.size());
+        for (ServerChannel ch : s.writeChannels.values()) {
+            perServer.add(sendRequest(ch,
+                    requestId -> PduCodec.DeleteByPrefixRequest.write(requestId, prefix),
+                    pdu -> PduCodec.DeleteByPrefixResponse.readDeletedCount(pdu)));
+        }
+        return CompletableFuture.allOf(perServer.toArray(new CompletableFuture[0]))
+                .thenApply(v -> {
+                    int total = 0;
+                    for (CompletableFuture<Integer> f : perServer) {
+                        total += f.join();
+                    }
+                    return total;
+                });
     }
 
-    // --- Synchronous APIs (wrappers around async) ---
+    public CompletableFuture<Integer> deleteFilesAsync(List<String> paths) {
+        if (paths == null || paths.isEmpty()) {
+            return CompletableFuture.completedFuture(0);
+        }
+        return retryAsync(() -> doDeleteFilesAsync(paths), "deleteFiles", paths.get(0), 0);
+    }
+
+    private CompletableFuture<Integer> doDeleteFilesAsync(List<String> paths) {
+        if (paths.isEmpty()) {
+            return CompletableFuture.completedFuture(0);
+        }
+        ServerSnapshot s = this.snapshot;
+        if (s.writeChannels.isEmpty()) {
+            return failed(new IllegalStateException("no servers configured"));
+        }
+        // Group by routing key so each batch goes to exactly one server.
+        Map<String, List<String>> grouped = new HashMap<>();
+        for (String p : paths) {
+            String server = s.router.getServer(p);
+            grouped.computeIfAbsent(server, k -> new ArrayList<>()).add(p);
+        }
+        List<CompletableFuture<Integer>> perServer = new ArrayList<>(grouped.size());
+        for (Map.Entry<String, List<String>> entry : grouped.entrySet()) {
+            ServerChannel ch = s.writeChannels.get(entry.getKey());
+            if (ch == null) {
+                continue;
+            }
+            final List<String> batch = entry.getValue();
+            perServer.add(sendRequest(ch,
+                    requestId -> PduCodec.DeleteFilesRequest.write(requestId, batch),
+                    pdu -> {
+                        int deleted = 0;
+                        for (PduCodec.DeleteFilesResponse.Outcome o
+                                : PduCodec.DeleteFilesResponse.readOutcomes(pdu)) {
+                            if (o.deleted) {
+                                deleted++;
+                            }
+                        }
+                        return deleted;
+                    }));
+        }
+        // Partial-success semantics: if at least one sub-batch succeeded,
+        // surface the sum of successful sub-batches even when others failed.
+        // Only when EVERY sub-batch fails do we propagate the failure (so
+        // the retry layer kicks in). Mirrors the issue #398 contract: the
+        // deleteFiles call is best-effort and the count is what was
+        // confirmed deleted, so callers drive retry by counting deletions.
+        return CompletableFuture.allOf(perServer.toArray(new CompletableFuture[0]))
+                .handle((v, error) -> {
+                    int total = 0;
+                    int succeeded = 0;
+                    Throwable lastError = null;
+                    for (CompletableFuture<Integer> f : perServer) {
+                        if (f.isCompletedExceptionally()) {
+                            lastError = extractFailure(f);
+                            continue;
+                        }
+                        try {
+                            total += f.getNow(0);
+                            succeeded++;
+                        } catch (RuntimeException e) {
+                            // Defensive: getNow on a non-completed future is impossible
+                            // here (allOf has fired), but we keep tallying.
+                            lastError = e;
+                        }
+                    }
+                    if (succeeded == 0 && lastError != null) {
+                        throw new CompletionException(lastError);
+                    }
+                    return total;
+                });
+    }
+
+    private static Throwable extractFailure(CompletableFuture<?> f) {
+        try {
+            f.getNow(null);
+            return null;
+        } catch (CompletionException ce) {
+            return ce.getCause() != null ? ce.getCause() : ce;
+        } catch (RuntimeException e) {
+            return e;
+        }
+    }
+
+    public int deleteFiles(List<String> paths) {
+        return getUnchecked(deleteFilesAsync(paths));
+    }
+
+    // ---------------------------------------------------------------------
+    // Sync wrappers
+    // ---------------------------------------------------------------------
 
     @Override
     public void writeFile(String path, byte[] content) {
         getUnchecked(writeFileAsync(path, content));
     }
 
-    public void writeFile(String path, byte[] buf, int offset, int len) {
-        getUnchecked(writeFileAsync(path, buf, offset, len));
+    public void writeFile(String path, byte[] buf, int offset, int length) {
+        getUnchecked(writeFileAsync(path, buf, offset, length));
     }
 
     @Override
@@ -1194,62 +990,266 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         getUnchecked(writeFileBlockAsync(path, blockIndex, content));
     }
 
-    /**
-     * Reads a file into a pooled ByteBuf. Returns null if file not found.
-     * Caller must release the ByteBuf after use.
-     */
     public ByteBuf readFileAsByteBuf(String path) {
         return getUnchecked(readFileAsByteBufAsync(path));
     }
 
-    public byte[] readFileRange(String path, long offset, int length, int blockSize) {
-        return getUnchecked(readFileRangeAsync(path, offset, length, blockSize));
+    public byte[] readFileRange(String path, long offset, int length, int blockSizeArg) {
+        return getUnchecked(readFileRangeAsync(path, offset, length, blockSizeArg));
     }
 
-    /**
-     * Synchronous variant of {@link #readFileRangeAsByteBufAsync}.
-     * Caller MUST {@code release()} the returned buffer when done.
-     */
-    public ByteBuf readFileRangeAsByteBuf(String path, long offset, int length, int blockSize) {
-        return getUnchecked(readFileRangeAsByteBufAsync(path, offset, length, blockSize));
-    }
-
-    public int getBlockSize() {
-        return blockSize;
-    }
-
-    /**
-     * Returns the server address that would store the given path.
-     */
-    public String getServerForPath(String path) {
-        return snapshot.router.getServer(path);
-    }
-
-    public String getServerForBlock(String path, long blockIndex) {
-        return snapshot.router.getServer(blockRoutingKey(path, blockIndex));
+    public ByteBuf readFileRangeAsByteBuf(String path, long offset, int length, int blockSizeArg) {
+        return getUnchecked(readFileRangeAsByteBufAsync(path, offset, length, blockSizeArg));
     }
 
     @Override
     public void close() {
-        retryScheduler.shutdownNow();
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
         ServerSnapshot s = this.snapshot;
-        shutdownChannels(s.readChannels, "read");
-        shutdownChannels(s.writeChannels, "write");
-    }
-
-    private static void shutdownChannels(Map<String, ManagedChannel> channels, String planeName) {
-        for (Map.Entry<String, ManagedChannel> entry : channels.entrySet()) {
-            try {
-                entry.getValue().shutdown().awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                LOGGER.log(Level.WARNING,
-                        "Interrupted while shutting down " + planeName + " channel to " + entry.getKey(), e);
-            }
+        for (ServerChannel ch : s.readChannels.values()) {
+            ch.closeQuiet();
+        }
+        for (ServerChannel ch : s.writeChannels.values()) {
+            ch.closeQuiet();
+        }
+        retryScheduler.shutdownNow();
+        eventLoopGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS);
+        callbackExecutor.shutdown();
+        try {
+            callbackExecutor.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
-    // --- Retry helper ---
+    // ---------------------------------------------------------------------
+    // Per-server channel: connects on demand, performs SASL handshake,
+    // reconnects on failure, serializes a single in-flight Channel reference.
+    // ---------------------------------------------------------------------
+
+    private final class ServerChannel {
+        private final String server;
+        private final String plane; // "read" or "write" (logging only)
+        private final Object lock = new Object();
+        private volatile Channel current;
+        private volatile boolean closed;
+
+        ServerChannel(String server, String plane) {
+            this.server = server;
+            this.plane = plane;
+        }
+
+        /**
+         * Returns the currently-open Channel, lazily connecting and
+         * authenticating if needed. Reconnects when the previous Channel
+         * has gone invalid or was closed by the peer.
+         *
+         * <p>The fast-path read of {@link #current} is volatile-only
+         * (no lock acquired) so an authenticated channel is reused without
+         * contention. The slow path serializes one connect attempt at a
+         * time; concurrent callers wait for the in-flight attempt rather
+         * than launching their own reconnect storm. The connect+SASL
+         * handshake itself runs under the per-server monitor for code
+         * simplicity — switching to a {@code CompletableFuture<Channel>}
+         * pattern that releases the monitor while the handshake is in
+         * flight is the natural next step if connect-time contention
+         * shows up in profiles.
+         */
+        Channel get() throws IOException {
+            Channel c = this.current;
+            if (c != null && c.isValid() && !c.isClosed()) {
+                return c;
+            }
+            synchronized (lock) {
+                if (closed) {
+                    throw new IOException("ServerChannel " + server + "/" + plane + " is closed");
+                }
+                c = this.current;
+                if (c != null && c.isValid() && !c.isClosed()) {
+                    return c;
+                }
+                if (c != null) {
+                    safeClose(c);
+                    this.current = null;
+                }
+                c = openAndAuthenticate();
+                this.current = c;
+                return c;
+            }
+        }
+
+        private Channel openAndAuthenticate() throws IOException {
+            String[] parts = server.split(":", 2);
+            if (parts.length != 2) {
+                throw new IOException("Bad server address (expected host:port): " + server);
+            }
+            String host = parts[0];
+            int port;
+            try {
+                port = Integer.parseInt(parts[1]);
+            } catch (NumberFormatException e) {
+                throw new IOException("Bad server port: " + server, e);
+            }
+            ChannelEventListener listener = new ChannelEventListener() {
+                // Default no-op; pdu callbacks are correlated by messageId
+                // through Channel's own request/response infrastructure, and
+                // unsolicited inbound PDUs are not expected from the server.
+            };
+            int socketTimeoutSeconds = 0; // disabled — request-level timeouts are enforced via sendRequestWithAsyncReply
+            Channel ch = NettyConnector.connectUsingNetwork(host, port, false,
+                    CONNECT_TIMEOUT_MS, socketTimeoutSeconds,
+                    listener, callbackExecutor, eventLoopGroup);
+            try {
+                if (oidcTokenSupplier != null) {
+                    performSaslHandshake(ch);
+                }
+                return ch;
+            } catch (RuntimeException | IOException badAuth) {
+                ch.close();
+                throw badAuth;
+            }
+        }
+
+        private void performSaslHandshake(Channel ch) throws IOException {
+            OAuthBearerSaslClient saslClient = new OAuthBearerSaslClient(oidcTokenSupplier);
+            byte[] firstToken;
+            try {
+                firstToken = saslClient.evaluateChallenge(new byte[0]);
+            } catch (javax.security.sasl.SaslException e) {
+                throw new IOException("SASL initial-token build failed: " + e.getMessage(), e);
+            }
+            long timeoutMs = TimeUnit.SECONDS.toMillis(clientTimeoutSeconds);
+            long requestId = ch.generateRequestId();
+            try {
+                Pdu reply = ch.sendMessageWithPduReply(requestId,
+                        PduCodec.SaslTokenMessageRequest.write(requestId,
+                                OAuthBearerSaslClient.MECHANISM, firstToken),
+                        timeoutMs);
+                try {
+                    if (reply.type == Pdu.TYPE_ERROR) {
+                        throw new IOException("SASL handshake rejected: "
+                                + PduCodec.ErrorResponse.readError(reply));
+                    }
+                    if (reply.type != Pdu.TYPE_SASL_TOKEN_SERVER_RESPONSE) {
+                        throw new IOException("Unexpected reply type during SASL handshake: " + reply.type);
+                    }
+                    if (!saslClient.isComplete()) {
+                        throw new IOException("OAUTHBEARER SASL did not complete in one round");
+                    }
+                } finally {
+                    reply.close();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted during SASL handshake", e);
+            } catch (java.util.concurrent.TimeoutException e) {
+                throw new IOException("SASL handshake timed out", e);
+            }
+        }
+
+        void closeQuiet() {
+            synchronized (lock) {
+                closed = true;
+                Channel c = current;
+                if (c != null) {
+                    safeClose(c);
+                    current = null;
+                }
+            }
+        }
+
+        private void safeClose(Channel c) {
+            try {
+                c.close();
+            } catch (RuntimeException ignored) {
+                // Broad catch: socket close on a half-broken channel can throw
+                // in netty; the caller's intent is "best-effort drain".
+            }
+        }
+
+        @Override
+        public String toString() {
+            return server + "/" + plane;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // PDU send/reply plumbing
+    // ---------------------------------------------------------------------
+
+    @FunctionalInterface
+    private interface RequestPduFactory {
+        ByteBuf build(long requestId);
+    }
+
+    @FunctionalInterface
+    private interface ResponsePduParser<T> {
+        T parse(Pdu pdu);
+    }
+
+    /**
+     * Sends a request PDU on the given {@link ServerChannel} and resolves the
+     * future when the matching response arrives. {@code TYPE_ERROR} replies
+     * are converted to a failed future carrying the server-side message.
+     */
+    private <T> CompletableFuture<T> sendRequest(ServerChannel sc,
+                                                 RequestPduFactory requestFactory,
+                                                 ResponsePduParser<T> parser) {
+        Objects.requireNonNull(sc, "ServerChannel");
+        CompletableFuture<T> future = new CompletableFuture<>();
+        Channel ch;
+        try {
+            ch = sc.get();
+        } catch (IOException openError) {
+            future.completeExceptionally(openError);
+            return future;
+        }
+        long requestId = ch.generateRequestId();
+        ByteBuf request;
+        try {
+            request = requestFactory.build(requestId);
+        } catch (RuntimeException buildError) {
+            future.completeExceptionally(buildError);
+            return future;
+        }
+        long timeoutMs = TimeUnit.SECONDS.toMillis(clientTimeoutSeconds);
+        ch.sendRequestWithAsyncReply(requestId, request, timeoutMs, (Pdu reply, Throwable err) -> {
+            if (err != null) {
+                future.completeExceptionally(err);
+                return;
+            }
+            try {
+                if (reply.type == Pdu.TYPE_ERROR) {
+                    future.completeExceptionally(new IOException(
+                            PduCodec.ErrorResponse.readError(reply)));
+                    return;
+                }
+                T value = parser.parse(reply);
+                future.complete(value);
+            } catch (RuntimeException parseError) {
+                future.completeExceptionally(parseError);
+            } finally {
+                // Pdu.close() releases the underlying pooled ByteBuf and
+                // recycles the Pdu wrapper. Pdu is NOT itself a Netty
+                // ReferenceCounted, so ReferenceCountUtil.safeRelease(reply)
+                // would silently no-op and leak the buffer.
+                reply.close();
+            }
+        });
+        return future;
+    }
+
+    private static <T> CompletableFuture<T> failed(Throwable t) {
+        CompletableFuture<T> f = new CompletableFuture<>();
+        f.completeExceptionally(t);
+        return f;
+    }
+
+    // ---------------------------------------------------------------------
+    // Retry helper
+    // ---------------------------------------------------------------------
 
     @FunctionalInterface
     private interface AsyncAction<T> {
@@ -1261,10 +1261,9 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         CompletableFuture<T> actionResult;
         try {
             actionResult = action.execute();
-        } catch (Exception e) {
-            // Handle synchronous failures (e.g. "Hash ring is empty" when no
-            // servers have been discovered yet) the same as async failures so
-            // that the retry logic below can kick in.
+        } catch (RuntimeException e) {
+            // Synchronous failures (e.g. "Hash ring is empty") flow into the
+            // same retry path as async failures.
             LOGGER.log(Level.INFO,
                     "remote file {0} synchronous failure for path {1} on attempt {2}, "
                             + "scheduling retry: {3}",
@@ -1284,12 +1283,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                 result.completeExceptionally(error);
                 return;
             }
-            // Exponential backoff: 1s, 2s, 4s, ...
             long delayMs = 1000L * (1L << (nextAttempt - 1));
-            // Log the full Throwable so the cause chain is visible: gRPC can
-            // swallow the original failure as a generic "CANCELLED: Failed to
-            // read message." when a StreamObserver throws, and dropping the
-            // cause here would hide the real root cause (e.g. OutOfDirectMemoryError).
             LogRecord record = new LogRecord(Level.INFO,
                     "remote file " + opName + " retry " + nextAttempt + "/" + maxRetries
                             + " for path " + path + " after " + delayMs + "ms (error: "
@@ -1310,7 +1304,9 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         return result;
     }
 
-    // --- Internal helpers ---
+    // ---------------------------------------------------------------------
+    // Internal helpers
+    // ---------------------------------------------------------------------
 
     private static <T> T getUnchecked(CompletableFuture<T> future) {
         try {
@@ -1320,10 +1316,10 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
             if (cause instanceof RuntimeException) {
                 throw (RuntimeException) cause;
             }
-            throw new RuntimeException(cause);
+            throw new CompletionException(cause);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException(e);
+            throw new CompletionException(e);
         }
     }
 
@@ -1348,4 +1344,5 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         }
         return Integer.parseInt(v.toString());
     }
+
 }

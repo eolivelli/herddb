@@ -20,8 +20,8 @@
 
 package herddb.remote.storage;
 
+import edu.umd.cs.findbugs.annotations.Nullable;
 import io.netty.buffer.ByteBuf;
-import javax.annotation.Nullable;
 
 /**
  * Result of a {@link ObjectStorage#read(String)} operation.
@@ -97,7 +97,7 @@ public final class ReadResult {
      * This makes a heap copy from the pooled direct ByteBuf — used by tests only.
      * Production code paths must use {@link #byteBuf()} (and call {@link #release()}
      * when done) so the bytes flow zero-copy through the cache layers and onto the
-     * gRPC wire. Adding a new production caller reintroduces the
+     * file-server wire. Adding a new production caller reintroduces the
      * {@code ReadResult.content} allocation hot-path that the cache-layer
      * refactor removed.
      *

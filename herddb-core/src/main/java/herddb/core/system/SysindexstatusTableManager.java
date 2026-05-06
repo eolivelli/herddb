@@ -94,8 +94,14 @@ public class SysindexstatusTableManager extends AbstractSystemTableManager {
                 props.put("segmentCount", status.getSegmentCount());
                 props.put("tailerLsnLedger", status.getTailerLsnLedger());
                 props.put("tailerLsnOffset", status.getTailerLsnOffset());
+                // Wall-clock (epoch ms) of the LogEntry at the tailer LSN.
+                // 0 means "unknown" (no entries processed yet). Issue #423.
+                props.put("tailerLsnTimestamp", status.getTailerLsnTimestamp());
                 props.put("durableLsnLedger", status.getDurableLsnLedger());
                 props.put("durableLsnOffset", status.getDurableLsnOffset());
+                // Wall-clock (epoch ms) of the LogEntry at the durable LSN.
+                // 0 means "unknown" (no successful checkpoint yet). Issue #423.
+                props.put("durableLsnTimestamp", status.getDurableLsnTimestamp());
                 props.put("status", status.getStatus());
             } catch (Exception e) {
                 props.put("error", e.getMessage());

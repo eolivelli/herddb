@@ -1081,13 +1081,17 @@ public class SimpleJoinTest {
 
                 assertEquals(2, tuples.size());
 
+                // ORDER BY ... DESC with default NULLS LAST in HerdDB:
+                // 4 first, NULL last. (Issue #429 fix to
+                // SortOp.compareValues — the previous expected order
+                // documented the antisymmetry-violating bug.)
                 assertTrue(
                         tuples.get(0).toMap().equals(MapUtils.map(
-                                "k1", RawString.of("b"), "maxn1", 2, "maxn2", null
-                        )));
+                                "k1", RawString.of("a"), "maxn1", 1, "maxn2", 4)));
                 assertTrue(
                         tuples.get(1).toMap().equals(MapUtils.map(
-                                "k1", RawString.of("a"), "maxn1", 1, "maxn2", 4)));
+                                "k1", RawString.of("b"), "maxn1", 2, "maxn2", null
+                        )));
 
             }
 

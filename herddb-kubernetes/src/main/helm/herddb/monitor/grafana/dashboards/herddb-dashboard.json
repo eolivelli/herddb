@@ -1420,6 +1420,166 @@
     },
     {
       "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 1900,
+          "legend": {
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": true,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "rate(remote_storage_cleanup_deletions{instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "stale pages deleted/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(remote_storage_cleanup_batches{instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "batch RPCs/s [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "Boot Cleanup Activity (server-side, 1m)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "ops",
+              "logBase": 1,
+              "min": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 1901,
+          "legend": {
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "remote_storage_cleanup_batch_latency{success=\"true\",quantile=\"0.5\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "p50 [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "remote_storage_cleanup_batch_latency{success=\"true\",quantile=\"0.95\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "p95 [{{instance}}]",
+              "refId": "B"
+            },
+            {
+              "expr": "remote_storage_cleanup_batch_latency{success=\"true\",quantile=\"0.99\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "p99 [{{instance}}]",
+              "refId": "C"
+            }
+          ],
+          "thresholds": [],
+          "title": "Boot Cleanup Batch Latency (µs)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "µs",
+              "logBase": 1,
+              "min": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "Boot Cleanup Row",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
       "height": 50,
       "panels": [
         {

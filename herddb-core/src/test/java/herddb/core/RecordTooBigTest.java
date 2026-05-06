@@ -68,7 +68,14 @@ public class RecordTooBigTest {
     public void update() throws Exception {
         String nodeId = "localhost";
         try (DBManager manager = new DBManager("localhost", new MemoryMetadataStorageManager(), new MemoryDataStorageManager(), new MemoryCommitLogManager(), null, null)) {
-            manager.setMaxLogicalPageSize(176);
+            // Issue #399 step 2: Bytes grew by ~16 bytes (compressed oops)
+            // for the off-heap-slice + slabOwner + ownsSlice fields. With
+            // two Bytes per record (key + value) each Record now reports
+            // +32 estimated bytes. The original page size of 176 was tuned
+            // to JUST fit a small record then reject the larger update;
+            // bump by the same delta to preserve the "fits then breaks"
+            // intent of the test.
+            manager.setMaxLogicalPageSize(208);
             manager.start();
             CreateTableSpaceStatement st1 = new CreateTableSpaceStatement("tblspace1", Collections.singleton(nodeId), nodeId, 1, 0, 0);
             manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), NO_TRANSACTION);

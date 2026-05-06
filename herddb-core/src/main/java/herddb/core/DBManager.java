@@ -87,6 +87,7 @@ import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.utils.DefaultJVMHalt;
 import herddb.utils.Futures;
+import herddb.utils.HerdDBByteBufAllocators;
 import io.netty.buffer.ByteBuf;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import java.io.IOException;
@@ -497,12 +498,43 @@ public class DBManager implements AutoCloseable, MetadataChangeListener {
         }
 
         final long maxHeap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getMax();
-
-        /* If max memory isn't configured or is too high default it to maximum heap */
-        if (maxMemoryReference == 0 || maxMemoryReference > maxHeap) {
-            maxMemoryReference = maxHeap;
+        final long maxDirect = HerdDBByteBufAllocators.maxDirectMemoryBytes();
+        final String referenceSource = serverConfiguration.getString(
+                ServerConfiguration.PROPERTY_MEMORY_LIMIT_REFERENCE_SOURCE,
+                ServerConfiguration.PROPERTY_MEMORY_LIMIT_REFERENCE_SOURCE_DEFAULT);
+        final long defaultReference;
+        final String resolvedSource;
+        switch (referenceSource) {
+            case ServerConfiguration.MEMORY_LIMIT_REFERENCE_SOURCE_DIRECT:
+                defaultReference = maxDirect;
+                resolvedSource = ServerConfiguration.MEMORY_LIMIT_REFERENCE_SOURCE_DIRECT;
+                break;
+            case ServerConfiguration.MEMORY_LIMIT_REFERENCE_SOURCE_HEAP:
+                defaultReference = maxHeap;
+                resolvedSource = ServerConfiguration.MEMORY_LIMIT_REFERENCE_SOURCE_HEAP;
+                break;
+            default:
+                throw new DataStorageManagerException("Invalid value '" + referenceSource
+                        + "' for " + ServerConfiguration.PROPERTY_MEMORY_LIMIT_REFERENCE_SOURCE
+                        + "; expected one of: "
+                        + ServerConfiguration.MEMORY_LIMIT_REFERENCE_SOURCE_DIRECT + ", "
+                        + ServerConfiguration.MEMORY_LIMIT_REFERENCE_SOURCE_HEAP);
         }
-        LOGGER.log(Level.INFO, ServerConfiguration.PROPERTY_MEMORY_LIMIT_REFERENCE + "= {0} bytes", Long.toString(maxMemoryReference));
+
+        /* If max memory isn't configured or is too high default it to the
+         * configured reference (direct memory by default; heap when the
+         * legacy source is selected). */
+        if (maxMemoryReference == 0 || maxMemoryReference > defaultReference) {
+            maxMemoryReference = defaultReference;
+        }
+        LOGGER.log(Level.INFO, ServerConfiguration.PROPERTY_MEMORY_LIMIT_REFERENCE
+                + "= {0} bytes (source={1}, maxHeap={2} bytes, maxDirect={3} bytes)",
+                new Object[]{
+                    Long.toString(maxMemoryReference),
+                    resolvedSource,
+                    Long.toString(maxHeap),
+                    Long.toString(maxDirect)
+                });
 
         /* If max data memory for pages isn't configured or is too high default it to a maxMemoryReference percentage */
         if (maxDataUsedMemory == 0 || maxDataUsedMemory > maxMemoryReference) {

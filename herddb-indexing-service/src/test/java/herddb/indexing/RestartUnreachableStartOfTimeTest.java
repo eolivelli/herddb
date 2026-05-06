@@ -161,7 +161,7 @@ public class RestartUnreachableStartOfTimeTest {
         // Watermark LSN that points well past the (notional) trimmed start.
         LogSequenceNumber watermarkLsn = new LogSequenceNumber(7, 1000);
         WatermarkSnapshot snapshot = new WatermarkSnapshot(
-                watermarkLsn, 1,
+                watermarkLsn, 1, 0L,
                 Collections.singletonList(table),
                 Collections.singletonList(index));
         PreloadedWatermarkStore watermark = new PreloadedWatermarkStore(snapshot);
@@ -296,7 +296,7 @@ public class RestartUnreachableStartOfTimeTest {
         // with schema present.
         LogSequenceNumber watermarkLsn = new LogSequenceNumber(5, 500);
         WatermarkSnapshot snapshot = new WatermarkSnapshot(
-                watermarkLsn, 1,
+                watermarkLsn, 1, 0L,
                 Collections.singletonList(table),
                 Collections.singletonList(index));
         PreloadedWatermarkStore watermark = new PreloadedWatermarkStore(snapshot);
