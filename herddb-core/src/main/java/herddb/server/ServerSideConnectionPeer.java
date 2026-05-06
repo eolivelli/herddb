@@ -609,6 +609,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
 
     private void handleCloseScanner(Pdu message, Channel channel, long startNanos) {
         OpStatsLogger latency = server.getRequestStats().closeScanner();
+        boolean success = false;
         try {
             long scannerId = PduCodec.CloseScanner.readScannerId(message);
             ServerSideScannerPeer removed = scanners.remove(scannerId);
@@ -618,8 +619,9 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                 }
                 removed.clientClose();
             }
+            success = true;
         } finally {
-            recordRequest(latency, startNanos, true);
+            recordRequest(latency, startNanos, success);
         }
     }
 
@@ -704,70 +706,98 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
 
                 @Override
                 public void accept(StatementExecutionResult result, Throwable error) {
-                    if (error != null) {
-                        ByteBuf errorMsg = composeErrorResponse(message.messageId, error);
-                        channel.sendReplyMessage(message.messageId, errorMsg);
-                        message.close();
-                        runningStatements.unregisterRunningStatement(statementInfo);
-                        recordRequest(latency, startNanos, false);
-                        return;
-                    }
-                    if (result instanceof DMLStatementExecutionResult) {
-                        DMLStatementExecutionResult dml = (DMLStatementExecutionResult) result;
-                        Map<String, Object> otherData = Collections.emptyMap();
-                        if (returnValues && dml.getKey() != null) {
-                            TranslatedQuery translatedQuery = queries.get(current - 1);
-                            Statement statement = translatedQuery.plan.mainStatement;
-                            TableAwareStatement tableStatement = (TableAwareStatement) statement;
-                            Table table = server.getManager().getTableSpaceManager(statement.getTableSpace()).getTableManager(tableStatement.getTable()).getTable();
-                            Object key = RecordSerializer.deserializePrimaryKey(dml.getKey(), table);
-                            otherData = new HashMap<>();
-                            otherData.put("_key", key);
-                            if (dml.getNewvalue() != null) {
-                                Map<String, Object> newvalue = RecordSerializer.toBean(new Record(dml.getKey(), dml.getNewvalue()), table);
-                                otherData.putAll(newvalue);
-                            }
+                    // The whole body is wrapped in a try/catch because a thrown
+                    // exception inside a CompletableFuture#whenComplete callback
+                    // is dropped by the JDK with no error reply to the client and
+                    // no metric record, which would silently break both the
+                    // protocol and the dashboards. The catch is intentionally
+                    // broad: anything reaching it is by definition unexpected,
+                    // so we log it, send an error reply best-effort, unregister
+                    // the running statement, and record a failed request event.
+                    try {
+                        if (error != null) {
+                            ByteBuf errorMsg = composeErrorResponse(message.messageId, error);
+                            channel.sendReplyMessage(message.messageId, errorMsg);
+                            message.close();
+                            runningStatements.unregisterRunningStatement(statementInfo);
+                            recordRequest(latency, startNanos, false);
+                            return;
                         }
-                        updateCounts.add((long) dml.getUpdateCount());
-                        otherDatas.add(otherData);
-                    } else if (result instanceof DDLStatementExecutionResult) {
-                        Map<String, Object> otherData = Collections.emptyMap();
-                        updateCounts.add(1L);
-                        otherDatas.add(otherData);
-                    } else {
-                        ByteBuf response = PduCodec.ErrorResponse.write(message.messageId, "bad result type " + result.getClass() + " (" + result + ")");
-                        channel.sendReplyMessage(message.messageId, response);
-                        message.close();
-                        runningStatements.unregisterRunningStatement(statementInfo);
-                        recordRequest(latency, startNanos, false);
-                        return;
-                    }
-
-                    long newTransactionId = result.transactionId;
-                    if (current == queries.size()) {
-                        boolean writeOk = false;
-                        try {
-                            ByteBuf response = PduCodec.ExecuteStatementsResult.write(message.messageId, updateCounts, otherDatas, newTransactionId);
+                        if (result instanceof DMLStatementExecutionResult) {
+                            DMLStatementExecutionResult dml = (DMLStatementExecutionResult) result;
+                            Map<String, Object> otherData = Collections.emptyMap();
+                            if (returnValues && dml.getKey() != null) {
+                                TranslatedQuery translatedQuery = queries.get(current - 1);
+                                Statement statement = translatedQuery.plan.mainStatement;
+                                TableAwareStatement tableStatement = (TableAwareStatement) statement;
+                                Table table = server.getManager().getTableSpaceManager(statement.getTableSpace()).getTableManager(tableStatement.getTable()).getTable();
+                                Object key = RecordSerializer.deserializePrimaryKey(dml.getKey(), table);
+                                otherData = new HashMap<>();
+                                otherData.put("_key", key);
+                                if (dml.getNewvalue() != null) {
+                                    Map<String, Object> newvalue = RecordSerializer.toBean(new Record(dml.getKey(), dml.getNewvalue()), table);
+                                    otherData.putAll(newvalue);
+                                }
+                            }
+                            updateCounts.add((long) dml.getUpdateCount());
+                            otherDatas.add(otherData);
+                        } else if (result instanceof DDLStatementExecutionResult) {
+                            Map<String, Object> otherData = Collections.emptyMap();
+                            updateCounts.add(1L);
+                            otherDatas.add(otherData);
+                        } else {
+                            ByteBuf response = PduCodec.ErrorResponse.write(message.messageId, "bad result type " + result.getClass() + " (" + result + ")");
                             channel.sendReplyMessage(message.messageId, response);
                             message.close();
                             runningStatements.unregisterRunningStatement(statementInfo);
-                            writeOk = true;
-                        } catch (Throwable t) {
-                            // Reply serialization is best-effort: log here and
-                            // record the request as failed so dashboards reflect
-                            // the actual error rate rather than masking it.
-                            LOGGER.log(Level.SEVERE, "Internal error", t);
-                        } finally {
-                            recordRequest(latency, startNanos, writeOk);
+                            recordRequest(latency, startNanos, false);
+                            return;
                         }
-                        return;
-                    }
 
-                    TranslatedQuery nextPlannedQuery = queries.get(current);
-                    TransactionContext transactionContext = new TransactionContext(newTransactionId);
-                    CompletableFuture<StatementExecutionResult> nextPromise =
-                            server.getManager().executePlanAsync(nextPlannedQuery.plan, nextPlannedQuery.context, transactionContext);
-                    nextPromise.whenComplete(new ComputeNext(current + 1));
+                        long newTransactionId = result.transactionId;
+                        if (current == queries.size()) {
+                            boolean writeOk = false;
+                            try {
+                                ByteBuf response = PduCodec.ExecuteStatementsResult.write(message.messageId, updateCounts, otherDatas, newTransactionId);
+                                channel.sendReplyMessage(message.messageId, response);
+                                message.close();
+                                runningStatements.unregisterRunningStatement(statementInfo);
+                                writeOk = true;
+                            } catch (Throwable t) {
+                                // Reply serialization is best-effort: log here and
+                                // record the request as failed so dashboards reflect
+                                // the actual error rate rather than masking it.
+                                LOGGER.log(Level.SEVERE, "Internal error", t);
+                            } finally {
+                                recordRequest(latency, startNanos, writeOk);
+                            }
+                            return;
+                        }
+
+                        TranslatedQuery nextPlannedQuery = queries.get(current);
+                        TransactionContext transactionContext = new TransactionContext(newTransactionId);
+                        CompletableFuture<StatementExecutionResult> nextPromise =
+                                server.getManager().executePlanAsync(nextPlannedQuery.plan, nextPlannedQuery.context, transactionContext);
+                        nextPromise.whenComplete(new ComputeNext(current + 1));
+                    } catch (Throwable t) {
+                        // Defensive: any thrown exception inside a whenComplete
+                        // lambda is silently dropped by the JDK; we cannot let
+                        // that swallow both the protocol reply AND the metric.
+                        LOGGER.log(Level.SEVERE, "Unexpected error in execute_statements callback", t);
+                        try {
+                            channel.sendReplyMessage(message.messageId, composeErrorResponse(message.messageId, t));
+                        } catch (Throwable ignored) {
+                            // Suppressed: best-effort error reply; the channel
+                            // may already be closed.
+                        }
+                        try {
+                            message.close();
+                        } catch (Throwable ignored) {
+                            // Suppressed: idempotent close.
+                        }
+                        runningStatements.unregisterRunningStatement(statementInfo);
+                        recordRequest(latency, startNanos, false);
+                    }
                 }
             }
 

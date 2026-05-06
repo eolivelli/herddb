@@ -969,18 +969,25 @@
               "refId": "E"
             },
             {
+              "expr": "sum(rate(requests_tx_begin_count{success=\"false\",instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_begin [{{instance}}]",
+              "refId": "F"
+            },
+            {
               "expr": "sum(rate(requests_tx_commit_count{success=\"false\",instance=~\"$instance\"}[1m])) by (instance)",
               "format": "time_series",
               "intervalFactor": 2,
               "legendFormat": "tx_commit [{{instance}}]",
-              "refId": "F"
+              "refId": "G"
             },
             {
               "expr": "sum(rate(requests_tx_rollback_count{success=\"false\",instance=~\"$instance\"}[1m])) by (instance)",
               "format": "time_series",
               "intervalFactor": 2,
               "legendFormat": "tx_rollback [{{instance}}]",
-              "refId": "G"
+              "refId": "H"
             }
           ],
           "thresholds": [],
