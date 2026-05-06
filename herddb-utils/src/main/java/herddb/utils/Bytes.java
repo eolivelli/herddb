@@ -162,9 +162,15 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      * any {@code Bytes} references its slab owner, the owner stays
      * GC-reachable and its {@code Cleanable} does not release the slab,
      * preventing a use-after-free for in-flight readers.
+     *
+     * <p>Issue #411: nulled out by {@link #materialiseAndDetach()} so a
+     * separator key promoted out of an index node (e.g. BLink {@code rightsep}
+     * after a split) no longer pins the donor's {@link IndexKeySlab}.
+     * Always nulled under {@code synchronized (this)} together with
+     * {@link #offHeap}; the {@code volatile} keyword carries the visibility
+     * guarantee for unsynchronized GC tracking.
      */
-    @SuppressFBWarnings("URF_UNREAD_FIELD")
-    private final Object slabOwner;
+    private volatile Object slabOwner;
 
     public Object deserialized;
 
@@ -587,6 +593,112 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         // off-heap reader (the slab owner's quiescence contract excludes
         // races, but losing the field would also break the slabOwner GC
         // anchor). The slab will be released by the slab owner's Cleaner.
+    }
+
+    /**
+     * <b>Restricted-use API.</b> This method is intended <em>only</em> for
+     * the BLink split / half-merge separator-handoff sites in
+     * {@code herddb-utils}'s {@code BLink} (via the
+     * {@code SizeEvaluator.detachSeparator} hook). Do not call it from
+     * request-serving code or anywhere a sibling thread might be inside
+     * a read path on this {@code Bytes}: the same quiescence contract
+     * documented on {@link #release()} applies, and a violating concurrent
+     * reader can observe an {@link IllegalStateException} or — for owned
+     * slices — a use-after-free.
+     *
+     * <p>Eagerly copies the off-heap bytes into a private on-heap
+     * {@code byte[]} and breaks every link to the underlying slab. After
+     * this call the {@code Bytes} behaves exactly like an instance built
+     * via {@link #from_array(byte[])}: {@link #isOffHeap()} returns
+     * {@code false}, {@link #isShared()} returns {@code false}, no
+     * {@link IndexKeySlab} is pinned, and equality / hashing semantics
+     * are unchanged.
+     *
+     * <h3>Use case (issue #411)</h3>
+     * BLink {@code Node.split()} promotes one of its keys to become the new
+     * {@code rightsep} on the right sibling, and {@code Node.half_merge()}
+     * inherits the right sibling's {@code rightsep}. Both promotions hand a
+     * key that came from the donor's per-page {@link IndexKeySlab} into a
+     * slot that may outlive the donor (after the donor is unloaded the
+     * separator stays alive on the BLink anchor / parent index). Without a
+     * defensive copy, that single separator pins the donor's multi-KiB slab
+     * indefinitely. Calling {@code materialiseAndDetach()} at the handoff
+     * site copies the bytes onto the heap and clears the slab anchor, so
+     * the donor's slab can be reclaimed once the rest of its keys are
+     * evicted.
+     *
+     * <h3>Semantics by current state</h3>
+     * <ul>
+     *   <li><b>Already on-heap</b> (this includes a previously-detached
+     *       instance and a shared-slab instance whose lazy materialisation
+     *       has already run): no-op, returns {@code this}.</li>
+     *   <li><b>Owned-slice off-heap</b> ({@link #fromOffHeap(ByteBuf)}):
+     *       copies the slice into a fresh {@code byte[]}, releases the
+     *       slice (matching the existing {@link #materialiseFromOffHeap()}
+     *       contract), nulls {@link #offHeap}.</li>
+     *   <li><b>Shared-slab off-heap</b> ({@link #fromSharedSlab(ByteBuf, int, int, Object)}):
+     *       copies the slice into a fresh {@code byte[]}, then nulls both
+     *       {@link #offHeap} and {@link #slabOwner}. The slab's refcount is
+     *       <em>not</em> decremented (the slab owner still holds the single
+     *       refcount); however, dropping the slab-owner anchor frees the
+     *       JDK {@link java.lang.ref.Cleaner} attached to the slab to run
+     *       once every other slice on the same slab also becomes
+     *       GC-unreachable.</li>
+     * </ul>
+     *
+     * <h3>Quiescence contract</h3>
+     * Same as {@link #release()} and {@link #materialiseFromOffHeap()}:
+     * the caller must guarantee no other thread is inside a read path on
+     * this {@code Bytes} at the moment of detach. The BLink call sites
+     * satisfy this naturally — the rightsep handoff in {@code split()} /
+     * {@code half_merge()} runs under the donor / receiver write lock and
+     * before any reader could observe the new separator slot.
+     *
+     * <h3>Idempotency</h3>
+     * Calling {@code materialiseAndDetach()} a second (or n-th) time on
+     * the same instance is a no-op: the first call sets {@link #buffer},
+     * and every subsequent call observes that and returns immediately.
+     *
+     * @return {@code this}, for fluent chaining
+     * @throws IllegalStateException if {@link #release()} ran before
+     *         materialisation and the bytes are no longer reachable.
+     */
+    public synchronized Bytes materialiseAndDetach() {
+        if (buffer != null) {
+            // Already on-heap, or a previous detach / lazy materialisation
+            // already copied the bytes. For a shared-slab instance whose
+            // lazy materialisation ran (offHeap still non-null, slabOwner
+            // still non-null), this also clears the residual anchor so
+            // detach is fully effective even on those instances.
+            if (offHeap != null) {
+                offHeap = null;
+            }
+            if (slabOwner != null) {
+                slabOwner = null;
+            }
+            return this;
+        }
+        ByteBuf local = offHeap;
+        if (local == null) {
+            throw new IllegalStateException("Bytes already released");
+        }
+        byte[] copy = new byte[length];
+        if (length > 0) {
+            local.getBytes(local.readerIndex(), copy, 0, length);
+        }
+        buffer = copy;
+        offset = 0;
+        offHeap = null;
+        if (ownsSlice) {
+            // Owned slice: this Bytes held the single refcount; release it
+            // exactly like materialiseFromOffHeap does.
+            local.release();
+        }
+        // Shared-slab: do NOT release; the slab owner owns the refcount.
+        // Drop the slab anchor so GC can reclaim the slab owner once every
+        // other slice on the slab also becomes unreachable.
+        slabOwner = null;
+        return this;
     }
 
     /**
