@@ -714,11 +714,18 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                     // broad: anything reaching it is by definition unexpected,
                     // so we log it, send an error reply best-effort, unregister
                     // the running statement, and record a failed request event.
+                    //
+                    // Pdu.close() is NOT idempotent (it calls Recycler.recycle,
+                    // which must not be invoked twice on the same handle), so we
+                    // track whether the message has already been closed and skip
+                    // a second close in the catch block.
+                    boolean[] messageClosed = {false};
                     try {
                         if (error != null) {
                             ByteBuf errorMsg = composeErrorResponse(message.messageId, error);
                             channel.sendReplyMessage(message.messageId, errorMsg);
                             message.close();
+                            messageClosed[0] = true;
                             runningStatements.unregisterRunningStatement(statementInfo);
                             recordRequest(latency, startNanos, false);
                             return;
@@ -749,6 +756,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                             ByteBuf response = PduCodec.ErrorResponse.write(message.messageId, "bad result type " + result.getClass() + " (" + result + ")");
                             channel.sendReplyMessage(message.messageId, response);
                             message.close();
+                            messageClosed[0] = true;
                             runningStatements.unregisterRunningStatement(statementInfo);
                             recordRequest(latency, startNanos, false);
                             return;
@@ -761,6 +769,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                                 ByteBuf response = PduCodec.ExecuteStatementsResult.write(message.messageId, updateCounts, otherDatas, newTransactionId);
                                 channel.sendReplyMessage(message.messageId, response);
                                 message.close();
+                                messageClosed[0] = true;
                                 runningStatements.unregisterRunningStatement(statementInfo);
                                 writeOk = true;
                             } catch (Throwable t) {
@@ -783,17 +792,38 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                         // Defensive: any thrown exception inside a whenComplete
                         // lambda is silently dropped by the JDK; we cannot let
                         // that swallow both the protocol reply AND the metric.
+                        // In practice this catches: RuntimeException from the
+                        // table-manager / RecordSerializer chain (e.g. table
+                        // dropped concurrently), unserializable column types
+                        // bubbling up from PduCodec, and Errors such as OOM.
                         LOGGER.log(Level.SEVERE, "Unexpected error in execute_statements callback", t);
+                        ByteBuf errBuf = null;
                         try {
-                            channel.sendReplyMessage(message.messageId, composeErrorResponse(message.messageId, t));
+                            errBuf = composeErrorResponse(message.messageId, t);
+                            channel.sendReplyMessage(message.messageId, errBuf);
+                            errBuf = null;
                         } catch (Throwable ignored) {
                             // Suppressed: best-effort error reply; the channel
-                            // may already be closed.
+                            // may already be closed. We still need to release
+                            // the buffer if we allocated one but never handed
+                            // it to the channel.
+                            if (errBuf != null) {
+                                try {
+                                    errBuf.release();
+                                } catch (Throwable ignoredRelease) {
+                                    // Suppressed: nothing useful we can do here.
+                                }
+                            }
                         }
-                        try {
-                            message.close();
-                        } catch (Throwable ignored) {
-                            // Suppressed: idempotent close.
+                        if (!messageClosed[0]) {
+                            try {
+                                message.close();
+                            } catch (Throwable ignored) {
+                                // Suppressed: best-effort; Pdu.close() must not
+                                // be retried on failure (Recycler.recycle is
+                                // not idempotent). Logging the original error
+                                // above is sufficient.
+                            }
                         }
                         runningStatements.unregisterRunningStatement(statementInfo);
                         recordRequest(latency, startNanos, false);

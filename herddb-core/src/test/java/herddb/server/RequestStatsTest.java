@@ -35,14 +35,13 @@ import herddb.model.TransactionContext;
 import herddb.model.commands.CreateTableSpaceStatement;
 import herddb.model.commands.GetStatement;
 import herddb.utils.Bytes;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import org.apache.bookkeeper.test.TestStatsProvider;
 import org.apache.bookkeeper.test.TestStatsProvider.TestOpStatsLogger;
 import org.junit.Rule;
@@ -140,12 +139,39 @@ public class RequestStatsTest {
             assertSuccessRecorded(statsProvider, "requests.tx_begin");
             assertSuccessRecorded(statsProvider, "requests.tx_commit");
             assertSuccessRecorded(statsProvider, "requests.tx_rollback");
+
+            // Tighten the assertions on the deterministic-count metrics so a
+            // regression that records spurious extras (e.g. a stray
+            // registerSuccessfulEvent in the wrong branch) is caught.
+            TestOpStatsLogger txBegin = statsProvider.getOpStatsLogger("requests.tx_begin");
+            assertEquals("tx_begin success count", 2L, txBegin.getSuccessCount());
+            assertEquals("tx_begin failure count", 0L, txBegin.getFailureCount());
+            TestOpStatsLogger txCommit = statsProvider.getOpStatsLogger("requests.tx_commit");
+            assertEquals("tx_commit success count", 1L, txCommit.getSuccessCount());
+            assertEquals("tx_commit failure count", 0L, txCommit.getFailureCount());
+            TestOpStatsLogger txRollback = statsProvider.getOpStatsLogger("requests.tx_rollback");
+            assertEquals("tx_rollback success count", 1L, txRollback.getSuccessCount());
+            assertEquals("tx_rollback failure count", 0L, txRollback.getFailureCount());
+
+            // request_tablespace_dump is the only non-trivial admin request
+            // type covered by RequestStats. Driving it requires a TableSpace
+            // dump receiver scaffolding that adds non-trivial complexity
+            // without exercising new code paths in ServerSideConnectionPeer
+            // (handleRequestTablespaceDump just calls dumpTableSpace). The
+            // metric registration / wiring is verified structurally: the
+            // logger must exist (the OpStatsLogger is created eagerly in
+            // RequestStats's constructor).
+            assertTrue("requests.request_tablespace_dump logger missing — "
+                    + "RequestStats wiring regressed",
+                    statsProvider.getOpStatsLogger("requests.request_tablespace_dump") != null);
         }
     }
 
     /**
-     * Executes a scan with a fetch size larger than the result so the client
-     * library issues an explicit CLOSESCANNER, hitting the close_scanner path.
+     * Executes a scan with a small fetch size and partial consumption so the
+     * client library issues an explicit CLOSESCANNER, hitting the close_scanner
+     * handler. Because CLOSESCANNER is sent fire-and-forget (one-way, no ack),
+     * we must poll the metric instead of asserting it immediately.
      */
     @Test
     public void testCloseScannerRecorded() throws Exception {
@@ -175,9 +201,12 @@ public class RequestStatsTest {
                         rs.next();
                     }
                 }
-            }
 
-            assertSuccessRecorded(statsProvider, "requests.close_scanner");
+                // CLOSESCANNER is one-way; poll the metric until the server
+                // has handled it, instead of relying on a synchronous reply.
+                awaitSuccess(statsProvider, "requests.close_scanner",
+                        Duration.ofSeconds(10));
+            }
         }
     }
 
@@ -247,6 +276,27 @@ public class RequestStatsTest {
             assertFailureRecorded(statsProvider, "requests.open_scanner");
             assertFailureRecorded(statsProvider, "requests.tx_commit");
             assertFailureRecorded(statsProvider, "requests.tx_rollback");
+
+            // Tighten: metrics whose only intended driver in this test is a
+            // failure path must NOT have any successful events. (CREATE TABLE
+            // at the start does succeed, so requests.execute_statement does
+            // legitimately have one success — we don't pin it here.)
+            TestOpStatsLogger executeBatch =
+                    statsProvider.getOpStatsLogger("requests.execute_statements");
+            assertEquals("execute_statements should have no successes in this test",
+                    0L, executeBatch.getSuccessCount());
+            TestOpStatsLogger openScanner =
+                    statsProvider.getOpStatsLogger("requests.open_scanner");
+            assertEquals("open_scanner should have no successes in this test",
+                    0L, openScanner.getSuccessCount());
+            TestOpStatsLogger txCommit =
+                    statsProvider.getOpStatsLogger("requests.tx_commit");
+            assertEquals("tx_commit should have no successes in this test",
+                    0L, txCommit.getSuccessCount());
+            TestOpStatsLogger txRollback =
+                    statsProvider.getOpStatsLogger("requests.tx_rollback");
+            assertEquals("tx_rollback should have no successes in this test",
+                    0L, txRollback.getSuccessCount());
         }
     }
 
@@ -277,6 +327,13 @@ public class RequestStatsTest {
                  HDBConnection connection = client.openConnection()) {
                 client.setClientSideMetadataProvider(new StaticClientSideMetadataProvider(server));
 
+                // Warm the SASL handshake on a successful call first so the
+                // doomed call below races only against the actual PREPARE
+                // round-trip, not server bootstrap.
+                connection.executeUpdate(TableSpace.DEFAULT,
+                        "CREATE TABLE warmup (id string primary key)",
+                        0, false, true, Collections.emptyList());
+
                 ExecutorService runner = Executors.newSingleThreadExecutor();
                 Future<?> doomed = runner.submit(() -> {
                     try {
@@ -287,11 +344,15 @@ public class RequestStatsTest {
                     }
                 });
                 try {
-                    doomed.get(2, TimeUnit.SECONDS);
-                } catch (TimeoutException expected) {
-                    // Client is in its retry loop — that's fine, the very
-                    // first PREPARE attempt has already failed and the metric
-                    // has been recorded.
+                    // Poll the failure metric instead of relying on a hard
+                    // 2-second cap; a slow CI runner may need more time for
+                    // the first PREPARE round-trip. We cap the overall wait
+                    // at 30 s and cancel the doomed call once the metric has
+                    // moved (the client would otherwise retry forever because
+                    // LeaderChangedException.getMaxRetry() returns
+                    // Integer.MAX_VALUE).
+                    awaitFailure(statsProvider, "requests.prepare_statement",
+                            Duration.ofSeconds(30));
                 } finally {
                     doomed.cancel(true);
                     runner.shutdownNow();
@@ -370,8 +431,6 @@ public class RequestStatsTest {
     private static void assertSuccessRecorded(TestStatsProvider provider, String fullPath) {
         TestOpStatsLogger logger = provider.getOpStatsLogger(fullPath);
         assertTrue(fullPath + " OpStatsLogger missing", logger != null);
-        long total = logger.getSuccessCount() + logger.getFailureCount();
-        assertTrue("expected at least one event for " + fullPath + ", got " + total, total >= 1);
         assertTrue(
                 "expected at least one successful event for " + fullPath
                         + ", success=" + logger.getSuccessCount()
@@ -387,6 +446,51 @@ public class RequestStatsTest {
                         + ", success=" + logger.getSuccessCount()
                         + " failure=" + logger.getFailureCount(),
                 logger.getFailureCount() >= 1);
+    }
+
+    private static void assertNoEvents(TestStatsProvider provider, String fullPath) {
+        TestOpStatsLogger logger = provider.getOpStatsLogger(fullPath);
+        if (logger == null) {
+            return;
+        }
+        assertEquals("expected no successful events for " + fullPath,
+                0L, logger.getSuccessCount());
+        assertEquals("expected no failed events for " + fullPath,
+                0L, logger.getFailureCount());
+    }
+
+    private static void awaitSuccess(TestStatsProvider provider, String fullPath,
+                                     Duration timeout) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (System.nanoTime() < deadline) {
+            TestOpStatsLogger logger = provider.getOpStatsLogger(fullPath);
+            if (logger != null && logger.getSuccessCount() >= 1) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+        TestOpStatsLogger logger = provider.getOpStatsLogger(fullPath);
+        long success = logger == null ? -1 : logger.getSuccessCount();
+        long failure = logger == null ? -1 : logger.getFailureCount();
+        org.junit.Assert.fail("timed out waiting for a successful event on " + fullPath
+                + " after " + timeout + ", success=" + success + " failure=" + failure);
+    }
+
+    private static void awaitFailure(TestStatsProvider provider, String fullPath,
+                                     Duration timeout) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (System.nanoTime() < deadline) {
+            TestOpStatsLogger logger = provider.getOpStatsLogger(fullPath);
+            if (logger != null && logger.getFailureCount() >= 1) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+        TestOpStatsLogger logger = provider.getOpStatsLogger(fullPath);
+        long success = logger == null ? -1 : logger.getSuccessCount();
+        long failure = logger == null ? -1 : logger.getFailureCount();
+        org.junit.Assert.fail("timed out waiting for a failed event on " + fullPath
+                + " after " + timeout + ", success=" + success + " failure=" + failure);
     }
 
     /**
