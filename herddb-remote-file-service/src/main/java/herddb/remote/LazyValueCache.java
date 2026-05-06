@@ -158,10 +158,17 @@ public final class LazyValueCache implements AutoCloseable {
         // return; this thread then resumes inside cache.get(...) and Caffeine
         // happily inserts a fresh entry into the post-drain map. Re-check
         // `closed` after the loader call and explicitly invalidate the entry
-        // we may have just inserted — the synchronous removalListener will
-        // release the cache-owned refcount before this method returns. The
-        // caller still gets a usable retainedSlice from the buffer Caffeine
-        // returned (its parent chunk stays alive via our retain).
+        // we may have just inserted — invalidate(key) synchronously removes
+        // it from the data map, which is the invariant the
+        // concurrentCloseDoesNotLeaveStaleCacheEntry test asserts. The
+        // removalListener that releases the cache's refcount is dispatched
+        // via Caffeine's executor (ForkJoinPool.commonPool() by default) and
+        // may run after this method returns; either way the parent chunk's
+        // refcount discipline is preserved — the caller's retainedSlice
+        // (below) bumps the parent refcount before the listener can release
+        // it, so the slice stays usable. If the listener already ran by the
+        // time we attempt retainedSlice, the IllegalReferenceCountException
+        // catch falls back to a one-shot allocation.
         if (closed) {
             cache.invalidate(key);
             cache.cleanUp();
