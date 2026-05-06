@@ -36,6 +36,7 @@ import herddb.model.DataScanner;
 import herddb.model.GetResult;
 import herddb.model.Index;
 import herddb.model.StatementEvaluationContext;
+import herddb.model.StatementExecutionException;
 import herddb.model.Table;
 import herddb.model.TableSpace;
 import herddb.model.TransactionContext;
@@ -62,6 +63,25 @@ import org.junit.experimental.categories.Category;
 
 @Category(ClusterTest.class)
 public class BootFollowerTest extends MultiServerBase {
+
+    /**
+     * Returns true when the throwable chain matches a known transient signal
+     * that the follower's TableSpaceManager is being torn down and re-created.
+     * See {@code testFollowAfterLedgerRollback} for context (issue #420).
+     */
+    private static boolean isTransientFollowerRebootError(Throwable t) {
+        Throwable cur = t;
+        while (cur != null) {
+            String msg = cur.getMessage();
+            if (msg != null
+                    && (msg.contains("No such tableSpace")
+                            || msg.contains("already closed"))) {
+                return true;
+            }
+            cur = cur.getCause();
+        }
+        return false;
+    }
 
     @Test
     public void testLeaderOnlineLogAvailable() throws Exception {
@@ -538,21 +558,45 @@ public class BootFollowerTest extends MultiServerBase {
                 server_1.getManager().executeStatement(new CommitTransactionStatement(TableSpace.DEFAULT, executeUpdateTransaction.transactionId), StatementEvaluationContext.
                         DEFAULT_EVALUATION_CONTEXT(), TransactionContext.NO_TRANSACTION);
 
-                // wait for data to arrive on server_2
-                for (int i = 0; i < 100; i++) {
-                    GetResult found = server_2.getManager().get(new GetStatement(TableSpace.DEFAULT, "t1", Bytes.from_int(5), null, false), StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
-                            TransactionContext.NO_TRANSACTION);
-                    if (found.found()) {
-                        break;
+                // Wait for all five inserted rows to be visible on the follower.
+                // While the leader rolls ledgers, server_2's FollowerThread can hit
+                // a transient error and call setFailed(); the next activator tick
+                // then runs stopTableSpace (DBManager.java:1611-1630), which closes
+                // the TableSpaceManager (and its BLink index) before removing it
+                // from DBManager.tablesSpaces. During that window concurrent get()
+                // calls land in two known transient states:
+                //   - NotLeaderException("No such tableSpace ...") at
+                //     DBManager.java:899-902, after the entry is removed from
+                //     tablesSpaces;
+                //   - DataStorageManagerException("Index ... already closed") at
+                //     BLinkKeyToPageIndex.java:306/671, while the entry is still
+                //     in tablesSpaces but its inner index has been closed.
+                // errorIfNotLeader is disabled on both servers
+                // (PROPERTY_ENFORCE_LEADERSHIP=false), so no genuine "wrong
+                // leader" path can reach here. Tolerate the two transient
+                // signals, keep polling, and let the activator re-boot the
+                // follower. Any other failure is rethrown so real regressions
+                // are not masked. Issue #420.
+                TestUtils.waitForCondition(() -> {
+                    try {
+                        for (int i = 1; i <= 5; i++) {
+                            GetResult found = server_2.getManager().get(
+                                    new GetStatement(TableSpace.DEFAULT, "t1",
+                                            Bytes.from_int(i), null, false),
+                                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                                    TransactionContext.NO_TRANSACTION);
+                            if (!found.found()) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    } catch (StatementExecutionException transientErr) {
+                        if (isTransientFollowerRebootError(transientErr)) {
+                            return false;
+                        }
+                        throw transientErr;
                     }
-                    Thread.sleep(100);
-                }
-                for (int i = 1; i <= 5; i++) {
-                    System.out.println("checking key c=" + i);
-                    assertTrue(server_2.getManager().get(new GetStatement(TableSpace.DEFAULT, "t1", Bytes.from_int(i), null, false),
-                            StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
-                            TransactionContext.NO_TRANSACTION).found());
-                }
+                }, TestUtils.NOOP, 30, "all rows c=1..5 visible on follower server_2");
                 BookkeeperCommitLog logServer2 = (BookkeeperCommitLog) tableSpaceManager.getLog();
                 LogSequenceNumber lastSequenceNumberServer1 = logServer1.getLastSequenceNumber();
                 LogSequenceNumber lastSequenceNumberServer2 = logServer2.getLastSequenceNumber();
