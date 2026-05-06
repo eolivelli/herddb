@@ -517,8 +517,9 @@ public class LazyValueCacheOffHeapTest {
             cache.cleanUp();
 
             AtomicInteger loaderCalls = new AtomicInteger();
+            ByteBuf returned = null;
             try {
-                cache.getOrFetch(k, () -> {
+                returned = cache.getOrFetch(k, () -> {
                     int call = loaderCalls.incrementAndGet();
                     if (call == 1) {
                         // First call: succeed. Caffeine stores the buffer;
@@ -538,6 +539,13 @@ public class LazyValueCacheOffHeapTest {
                 // Recovery loader was invoked and threw — the public API
                 // must surface it as-is.
                 assertEquals("transient remote failure", expected.getMessage());
+            } finally {
+                // When the recovery path was NOT triggered, getOrFetch returned
+                // a retained slice that the caller owns and must release —
+                // otherwise paranoid leak detection flags it.
+                if (returned != null) {
+                    returned.release();
+                }
             }
             // Whether or not the race fired, the cache must not retain a
             // dangling entry referencing a failed load.
