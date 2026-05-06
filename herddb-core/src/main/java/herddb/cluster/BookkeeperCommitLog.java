@@ -32,6 +32,7 @@ import herddb.utils.ExtendedDataInputStream;
 import herddb.utils.SystemProperties;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufInputStream;
+import io.netty.util.ReferenceCountUtil;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -163,19 +164,21 @@ public class BookkeeperCommitLog extends CommitLog {
 
         /**
          * Last entry id assigned to a write submitted to BookKeeper. Mutated
-         * <em>only</em> from the {@link #executor} thread (so a plain
-         * pre-increment is safe there). Declared {@code volatile} so the
+         * <em>only</em> from the {@link #executor} thread; held in an
+         * {@link AtomicLong} (rather than a {@code volatile long}) so the
          * close-path log statement on the rotation thread observes the
-         * latest value via a happens-before that is also established by the
-         * {@link #pendingAdds} atomic decrements which {@link #waitForAllPendingWrites()}
-         * reads to {@code 0} before logging.
+         * latest value via a clean atomic load — and so SpotBugs is satisfied
+         * that the executor-side {@code incrementAndGet} / {@code decrementAndGet}
+         * do not look like a non-atomic volatile increment. There is never
+         * any contention on this atomic: only the single executor thread
+         * mutates it.
          *
          * <p>Replaces the previous {@code WriteHandle.getLastAddPushed()}
          * call, which the {@link WriteAdvHandle} interface does not expose
          * (issue #434). Semantically identical: both equal the entry id of
          * the last entry handed off to BookKeeper.
          */
-        private volatile long lastAssignedEntryId = -1L;
+        private final AtomicLong lastAssignedEntryId = new AtomicLong(-1L);
 
         /**
          * Local cache of the ledger's closed state. Set to {@code true} in
@@ -382,12 +385,27 @@ public class BookkeeperCommitLog extends CommitLog {
             // Mirrors Apache Pulsar's ManagedLedgerImpl.asyncAddEntry pattern.
             try {
                 executor.execute(() -> {
+                    // Short-circuit: if a previous write on this ledger already
+                    // failed, do NOT consume an entryId or call into BK. Under
+                    // {@link WriteAdvHandle}'s "ack-only-when-prefix-acked"
+                    // contract, gapping an entryId would stall every later
+                    // entry's ack until BK's addEntryQuorumTimeout fires (60 s
+                    // by default). Failing the future cleanly here also lets
+                    // {@link #waitForAllPendingWrites()} drain promptly so
+                    // ledger rotation can open a fresh ledger right away
+                    // (issue #434, PR #437 review follow-up).
+                    if (errorOccurredDuringWrite) {
+                        ReferenceCountUtil.safeRelease(serialize);
+                        pendingAdds.decrementAndGet();
+                        result.completeExceptionally(new LogNotAvailableException(
+                                "writer entered failed state before this entry was dispatched"));
+                        return;
+                    }
                     // entryId assignment is single-threaded (only this executor
-                    // thread mutates lastAssignedEntryId), so a plain
-                    // pre-increment is sufficient. The volatile write
-                    // publishes the new value to readers on other threads
-                    // (used by the close-time log statement).
-                    final long entryId = ++lastAssignedEntryId;
+                    // thread mutates lastAssignedEntryId). The atomic
+                    // load/store also publishes the new value to readers on
+                    // other threads (used by the close-time log statement).
+                    final long entryId = lastAssignedEntryId.incrementAndGet();
                     try {
                         out.writeAsync(entryId, serialize)
                                 .whenComplete((ackedId, error) -> {
@@ -416,11 +434,16 @@ public class BookkeeperCommitLog extends CommitLog {
                         // waitForAllPendingWrites() can drain, and the
                         // caller's future fails cleanly. This path is not
                         // expected to fire under normal BK operation.
-                        try {
-                            serialize.release();
-                        } catch (RuntimeException ignored) {
-                            // best-effort release; nothing more to do
-                        }
+                        // Roll back lastAssignedEntryId so subsequent tasks
+                        // already in the executor queue do NOT skip past the
+                        // failed entry id and create a gap that BK would
+                        // otherwise try to fill — matters because
+                        // WriteAdvHandle ack semantics gate every later
+                        // entry's commit on the missing prefix. Single-thread
+                        // executor → atomic decrement is race-free
+                        // (PR #437 review follow-up).
+                        lastAssignedEntryId.decrementAndGet();
+                        ReferenceCountUtil.safeRelease(serialize);
                         writeError.set(synchronousFailure);
                         pendingAdds.decrementAndGet();
                         errorOccurredDuringWrite = true;
@@ -435,7 +458,7 @@ public class BookkeeperCommitLog extends CommitLog {
                 // waitForAllPendingWrites() can drain. localLength is
                 // intentionally NOT reverted: see the field javadoc — rolling
                 // a ledger slightly early on a rejected write is safe.
-                serialize.release();
+                ReferenceCountUtil.safeRelease(serialize);
                 pendingAdds.decrementAndGet();
                 errorOccurredDuringWrite = true;
                 writeError.set(rex);
@@ -475,12 +498,11 @@ public class BookkeeperCommitLog extends CommitLog {
             try {
                 // lastAssignedEntryId replaces the old WriteHandle.getLastAddPushed()
                 // log field (not exposed by WriteAdvHandle, see field javadoc).
-                // pendingAdds.get()==0 has just been observed by the caller's
-                // waitForAllPendingWrites() (when waitForPendingAdds=true),
-                // establishing happens-before with the executor-thread writes
-                // to lastAssignedEntryId via the AtomicLong (issue #434).
+                // localLength.get() is used in place of the synchronized
+                // out.getLength() so close still avoids the BK monitor on the
+                // shutdown path (consistent with isWritable() — issue #385).
                 LOGGER.log(Level.INFO, "{0} closing ledger {1}, with LastAddConfirmed={2}, LastAddPushed={3} length={4}, errorOccurred:{5}",
-                        new Object[]{tableSpaceDescription(), out.getId(), out.getLastAddConfirmed(), lastAssignedEntryId, out.getLength(), errorOccurredDuringWrite});
+                        new Object[]{tableSpaceDescription(), out.getId(), out.getLastAddConfirmed(), lastAssignedEntryId.get(), localLength.get(), errorOccurredDuringWrite});
                 out.closeAsync().get(60, TimeUnit.SECONDS);
             } catch (InterruptedException | ExecutionException | TimeoutException err) {
                 throw new LogNotAvailableException(err);

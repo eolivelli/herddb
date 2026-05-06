@@ -23,6 +23,7 @@ import static herddb.core.TestUtils.newServerConfigurationWithAutoPort;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import herddb.cluster.BookkeeperCommitLog;
 import herddb.cluster.BookkeeperCommitLogManager;
 import herddb.cluster.ZookeeperMetadataStorageManager;
@@ -256,11 +257,19 @@ public class BookKeeperCommitLogAsyncWriterTest {
                                 for (int i = 0; i < writesPerThread; i++) {
                                     int txId = txCounter.incrementAndGet();
                                     LogEntry entry = LogEntryFactory.beginTransaction(txId);
-                                    LogSequenceNumber lsn = writer.log(entry, true).getLogSequenceNumber();
+                                    // Bounded get so a hung future surfaces as
+                                    // a timeout against this specific entry,
+                                    // not a generic latch timeout (PR #437
+                                    // review follow-up #5).
+                                    LogSequenceNumber lsn = writer.log(entry, true)
+                                            .logSequenceNumber.get(60, TimeUnit.SECONDS);
                                     results.get(threadIndex).add(lsn);
                                 }
                             } catch (InterruptedException ie) {
                                 Thread.currentThread().interrupt();
+                            } catch (java.util.concurrent.ExecutionException
+                                    | java.util.concurrent.TimeoutException ex) {
+                                throw new RuntimeException(ex);
                             } finally {
                                 done.countDown();
                             }
@@ -338,18 +347,23 @@ public class BookKeeperCommitLogAsyncWriterTest {
                 // close() runs through try-with-resources here; must not hang.
             }
 
-            // The contract this test enforces: every submitted future must
-            // resolve (no dangling futures), and any non-success must be a
-            // clean LogNotAvailableException.  CommitLog.close() takes the
-            // {@code waitForPendingAdds=false} path, so writes that were
-            // still in flight at close-time are correctly rejected — we do
-            // not assert any minimum success rate, only that nothing hangs.
+            // The contract this test enforces:
+            //   1. Every submitted future must resolve — no dangling futures.
+            //   2. Any non-success must be a clean LogNotAvailableException.
+            //   3. Every successfully-completed future's LSN must be readable
+            //      by recovery — i.e. successful = durably committed
+            //      (issue #434, PR #437 review follow-up #4).
+            // CommitLog.close() takes the {@code waitForPendingAdds=false}
+            // path, so writes that were still in flight at close-time are
+            // correctly rejected.
+            final java.util.Set<LogSequenceNumber> successfulLsns = new java.util.HashSet<>();
             int successes = 0;
             int rejections = 0;
             for (CompletableFuture<LogSequenceNumber> f : futures) {
                 try {
                     LogSequenceNumber lsn = f.get(60, TimeUnit.SECONDS);
                     assertTrue(lsn.after(LogSequenceNumber.START_OF_TIME));
+                    successfulLsns.add(lsn);
                     successes++;
                 } catch (ExecutionException ee) {
                     assertTrue("unexpected failure cause " + ee.getCause(),
@@ -358,6 +372,170 @@ public class BookKeeperCommitLogAsyncWriterTest {
                 }
             }
             assertEquals(totalWrites, successes + rejections);
+
+            // Durability assertion: every successful future must be
+            // recoverable from the persisted ledger(s).
+            try (BookkeeperCommitLog reader = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
+                final java.util.Set<LogSequenceNumber> recoveredLsns = new java.util.HashSet<>();
+                reader.recovery(LogSequenceNumber.START_OF_TIME, (lsn, entry) -> {
+                    recoveredLsns.add(lsn);
+                }, false);
+                for (LogSequenceNumber lsn : successfulLsns) {
+                    assertTrue("successful future LSN " + lsn
+                            + " was reported as committed but is not recoverable",
+                            recoveredLsns.contains(lsn));
+                }
+            }
+        }
+    }
+
+    /**
+     * Once {@code errorOccurredDuringWrite} is set on a writer (here via the
+     * test-only {@code forceWriteError} hook), every subsequent
+     * {@code writeEntry} call must short-circuit on the executor thread,
+     * release its buffer, and fail with {@link LogNotAvailableException}
+     * <em>without</em> consuming an entry id or calling into BookKeeper —
+     * preventing the {@code WriteAdvHandle} prefix-gap that would otherwise
+     * stall every later commit until BK's add-entry quorum timeout fires
+     * (issue #434, PR #437 review follow-up #2).
+     */
+    @Test
+    public void testFailedWriterShortCircuitsSubsequentWrites() throws Exception {
+        final String tableSpaceUUID = UUID.randomUUID().toString();
+        final String name = TableSpace.DEFAULT;
+        final String nodeid = "nodeid";
+
+        ServerConfiguration serverConfiguration = newServerConfigurationWithAutoPort();
+        try (ZookeeperMetadataStorageManager man = new ZookeeperMetadataStorageManager(testEnv.getAddress(),
+                testEnv.getTimeout(), testEnv.getPath());
+                BookkeeperCommitLogManager logManager = new BookkeeperCommitLogManager(man, serverConfiguration, NullStatsLogger.INSTANCE)) {
+            logManager.setMaxLedgerSizeBytes(256L * 1024 * 1024);
+            man.start();
+            logManager.start();
+
+            // goodLsns is captured before the writer closes so we can verify
+            // recoverability against the sealed ledger after close().
+            final List<LogSequenceNumber> goodLsns = new ArrayList<>();
+            try (BookkeeperCommitLog writer = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
+                writer.setWriteLedgerHeader(false);
+                writer.startWriting(1);
+                // Write a few entries successfully first.
+                for (int i = 0; i < 3; i++) {
+                    LogSequenceNumber lsn = writer.log(
+                            LogEntryFactory.beginTransaction(i), true)
+                            .logSequenceNumber.get(30, TimeUnit.SECONDS);
+                    goodLsns.add(lsn);
+                }
+
+                // Force the writer into the failed state via the test hook.
+                // forceWriteError sets errorOccurredDuringWrite=true on the
+                // CommitFileWriter without going through the BK callback,
+                // matching the production scenario of a synchronous writeAsync
+                // failure on the executor thread.
+                writer.getWriter().forceWriteError(
+                        new java.lang.RuntimeException("forced for test"));
+
+                // Subsequent log() calls go through getValidWriter, which sees
+                // the writer is no longer writable and rotates to a new
+                // ledger.  But ANY write submitted on the failed writer
+                // (e.g. one already in flight when the error fires) must
+                // short-circuit cleanly.  Drive this directly by calling
+                // writeEntry on the failed CommitFileWriter — bypassing
+                // getValidWriter's rotation path.
+                final BookkeeperCommitLog.CommitFileWriter failedWriter = writer.getWriter();
+                final List<CompletableFuture<LogSequenceNumber>> rejected = new ArrayList<>();
+                for (int i = 0; i < 5; i++) {
+                    rejected.add(failedWriter.writeEntry(
+                            LogEntryFactory.beginTransaction(100 + i)));
+                }
+                for (CompletableFuture<LogSequenceNumber> f : rejected) {
+                    try {
+                        f.get(15, TimeUnit.SECONDS);
+                        fail("expected LogNotAvailableException for write on failed writer");
+                    } catch (ExecutionException ee) {
+                        assertTrue("unexpected cause " + ee.getCause(),
+                                ee.getCause() instanceof LogNotAvailableException);
+                    }
+                }
+
+                // The pending-adds counter must drain to zero — proving every
+                // short-circuited write released its claim on the writer's
+                // accounting (so a future close/rotation does not deadlock
+                // waiting for phantom in-flight writes).
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (failedWriter.getPendingAdds() > 0
+                        && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(50);
+                }
+                assertEquals(0L, failedWriter.getPendingAdds());
+            }
+            // Writer try-with-resources closes the ledger here, sealing
+            // metadata at LAC. Now run recovery against the sealed ledger
+            // and verify that every successful pre-failure LSN is readable —
+            // this is the durability invariant the reviewer asked for: a
+            // future that completed successfully MUST correspond to a
+            // recoverable entry (PR #437 review follow-up #2 + #4).
+            try (BookkeeperCommitLog reader = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
+                final java.util.Set<LogSequenceNumber> recovered = new java.util.HashSet<>();
+                reader.recovery(LogSequenceNumber.START_OF_TIME, (lsn, entry) -> {
+                    recovered.add(lsn);
+                }, false);
+                for (LogSequenceNumber lsn : goodLsns) {
+                    assertTrue("successful pre-failure LSN " + lsn
+                            + " must be recoverable, recovered=" + recovered,
+                            recovered.contains(lsn));
+                }
+            }
+        }
+    }
+
+    /**
+     * If the BookKeeper main worker pool has been shut down before a write is
+     * dispatched, the executor's {@code execute} call throws
+     * {@link java.util.concurrent.RejectedExecutionException}; the writer
+     * must release the serialised buffer (BK never took ownership), revert
+     * {@code pendingAdds}, and fail the future cleanly without leaking
+     * (issue #434, PR #437 review follow-up #3).
+     */
+    @Test
+    public void testRejectedExecutionFailsCleanlyAndDoesNotLeakBuffer() throws Exception {
+        final String tableSpaceUUID = UUID.randomUUID().toString();
+        final String name = TableSpace.DEFAULT;
+        final String nodeid = "nodeid";
+
+        ServerConfiguration serverConfiguration = newServerConfigurationWithAutoPort();
+        try (ZookeeperMetadataStorageManager man = new ZookeeperMetadataStorageManager(testEnv.getAddress(),
+                testEnv.getTimeout(), testEnv.getPath());
+                BookkeeperCommitLogManager logManager = new BookkeeperCommitLogManager(man, serverConfiguration, NullStatsLogger.INSTANCE)) {
+            logManager.setMaxLedgerSizeBytes(256L * 1024 * 1024);
+            man.start();
+            logManager.start();
+
+            try (BookkeeperCommitLog writer = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
+                writer.setWriteLedgerHeader(false);
+                writer.startWriting(1);
+                // Drive one successful write so the writer is fully primed.
+                writer.log(LogEntryFactory.beginTransaction(1), true)
+                        .logSequenceNumber.get(30, TimeUnit.SECONDS);
+
+                // Forcefully shut down the BK main worker pool so the next
+                // executor.execute(...) inside writeEntry rejects.
+                logManager.getBookKeeper().getMainWorkerPool().shutdown();
+
+                CompletableFuture<LogSequenceNumber> rejected =
+                        writer.getWriter().writeEntry(
+                                LogEntryFactory.beginTransaction(2));
+                try {
+                    rejected.get(15, TimeUnit.SECONDS);
+                    fail("expected LogNotAvailableException after BK pool shutdown");
+                } catch (ExecutionException ee) {
+                    assertTrue("unexpected cause " + ee.getCause(),
+                            ee.getCause() instanceof LogNotAvailableException);
+                }
+                // pendingAdds must drain to 0 — proving the rejected write
+                // released its claim on the writer's accounting.
+                assertEquals(0L, writer.getWriter().getPendingAdds());
+            }
         }
     }
 
@@ -464,11 +642,19 @@ public class BookKeeperCommitLogAsyncWriterTest {
                                 start.await();
                                 for (int i = 0; i < writesPerThread; i++) {
                                     LogEntry entry = LogEntryFactory.beginTransaction(threadIndex * 1000L + i);
-                                    LogSequenceNumber lsn = writer.log(entry, true).getLogSequenceNumber();
+                                    // Bounded get so a hung future surfaces as
+                                    // a timeout against this specific entry,
+                                    // not a generic latch timeout (PR #437
+                                    // review follow-up #5).
+                                    LogSequenceNumber lsn = writer.log(entry, true)
+                                            .logSequenceNumber.get(60, TimeUnit.SECONDS);
                                     results.get(threadIndex).add(lsn);
                                 }
                             } catch (InterruptedException ie) {
                                 Thread.currentThread().interrupt();
+                            } catch (java.util.concurrent.ExecutionException
+                                    | java.util.concurrent.TimeoutException ex) {
+                                throw new RuntimeException(ex);
                             } finally {
                                 done.countDown();
                             }
