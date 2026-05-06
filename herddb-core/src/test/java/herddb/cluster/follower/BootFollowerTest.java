@@ -36,7 +36,6 @@ import herddb.model.DataScanner;
 import herddb.model.GetResult;
 import herddb.model.Index;
 import herddb.model.StatementEvaluationContext;
-import herddb.model.StatementExecutionException;
 import herddb.model.Table;
 import herddb.model.TableSpace;
 import herddb.model.TransactionContext;
@@ -58,27 +57,60 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
 @Category(ClusterTest.class)
 public class BootFollowerTest extends MultiServerBase {
 
+    private static final Logger BFT_LOGGER =
+            Logger.getLogger(BootFollowerTest.class.getName());
+
+    /**
+     * Cap the cause-chain walk in {@link #isTransientFollowerRebootError}
+     * to defend against pathological cyclic chains
+     * ({@link Throwable#initCause} does not forbid cycles).
+     */
+    private static final int MAX_CAUSE_CHAIN = 16;
+
     /**
      * Returns true when the throwable chain matches a known transient signal
      * that the follower's TableSpaceManager is being torn down and re-created.
+     * The two known signals are:
+     * <ul>
+     *   <li>{@code "No such tableSpace ..."} from
+     *       {@code DBManager.executeStatementAsync} when the follower has
+     *       already been removed from {@code tablesSpaces}; and</li>
+     *   <li>{@code "Index <name> already closed"} from
+     *       {@code BLinkKeyToPageIndex} / {@code IncrementalBLinkKeyToPageIndex}
+     *       when the follower's index has been closed but the manager is
+     *       still in the map.</li>
+     * </ul>
+     * The {@code "Index "} half of the second match is required so that
+     * unrelated subsystems whose error messages happen to contain the
+     * English idiom "already closed" cannot silently extend this tolerance.
      * See {@code testFollowAfterLedgerRollback} for context (issue #420).
      */
     private static boolean isTransientFollowerRebootError(Throwable t) {
         Throwable cur = t;
-        while (cur != null) {
+        for (int i = 0; cur != null && i < MAX_CAUSE_CHAIN; i++) {
             String msg = cur.getMessage();
-            if (msg != null
-                    && (msg.contains("No such tableSpace")
-                            || msg.contains("already closed"))) {
-                return true;
+            if (msg != null) {
+                if (msg.contains("No such tableSpace")) {
+                    return true;
+                }
+                if (msg.contains("Index ") && msg.contains(" already closed")) {
+                    return true;
+                }
             }
-            cur = cur.getCause();
+            Throwable next = cur.getCause();
+            if (next == cur) { // self-cycle
+                break;
+            }
+            cur = next;
         }
         return false;
     }
@@ -575,28 +607,62 @@ public class BootFollowerTest extends MultiServerBase {
                 // (PROPERTY_ENFORCE_LEADERSHIP=false), so no genuine "wrong
                 // leader" path can reach here. Tolerate the two transient
                 // signals, keep polling, and let the activator re-boot the
-                // follower. Any other failure is rethrown so real regressions
-                // are not masked. Issue #420.
-                TestUtils.waitForCondition(() -> {
-                    try {
-                        for (int i = 1; i <= 5; i++) {
-                            GetResult found = server_2.getManager().get(
-                                    new GetStatement(TableSpace.DEFAULT, "t1",
-                                            Bytes.from_int(i), null, false),
-                                    StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
-                                    TransactionContext.NO_TRANSACTION);
-                            if (!found.found()) {
+                // follower. Any non-matching RuntimeException is rethrown.
+                // Issue #420.
+                //
+                // Note: TestUtils.waitForCondition's outer catch wraps any
+                // rethrown exception into a fresh AssertionError without
+                // initCause, so the original stack trace would otherwise be
+                // lost. Capture the most recent transient cause here so that,
+                // if the follower never recovers, the timeout failure points
+                // at *what* the follower was throwing rather than just the
+                // timeout itself.
+                AtomicReference<Throwable> lastTransient = new AtomicReference<>();
+                try {
+                    TestUtils.waitForCondition(() -> {
+                        try {
+                            for (int i = 1; i <= 5; i++) {
+                                GetResult found = server_2.getManager().get(
+                                        new GetStatement(TableSpace.DEFAULT, "t1",
+                                                Bytes.from_int(i), null, false),
+                                        StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                                        TransactionContext.NO_TRANSACTION);
+                                if (!found.found()) {
+                                    return false;
+                                }
+                            }
+                            return true;
+                            // RuntimeException (rather than the narrower
+                            // StatementExecutionException) so that any future
+                            // change to DBManager.executeStatement's
+                            // exception-rewrapping behaviour cannot silently
+                            // re-introduce the flake.
+                        } catch (RuntimeException transientErr) {
+                            if (isTransientFollowerRebootError(transientErr)) {
+                                lastTransient.set(transientErr);
+                                BFT_LOGGER.log(Level.FINE,
+                                        "tolerating transient follower-reboot error",
+                                        transientErr);
                                 return false;
                             }
+                            throw transientErr;
                         }
-                        return true;
-                    } catch (StatementExecutionException transientErr) {
-                        if (isTransientFollowerRebootError(transientErr)) {
-                            return false;
+                    }, TestUtils.NOOP, 30, "all rows c=1..5 visible on follower server_2");
+                } catch (AssertionError timeout) {
+                    Throwable last = lastTransient.get();
+                    if (last != null) {
+                        AssertionError enriched = new AssertionError(
+                                timeout.getMessage()
+                                        + " — last transient follower-reboot error: "
+                                        + last,
+                                last);
+                        if (timeout.getCause() != null) {
+                            enriched.addSuppressed(timeout.getCause());
                         }
-                        throw transientErr;
+                        throw enriched;
                     }
-                }, TestUtils.NOOP, 30, "all rows c=1..5 visible on follower server_2");
+                    throw timeout;
+                }
                 BookkeeperCommitLog logServer2 = (BookkeeperCommitLog) tableSpaceManager.getLog();
                 LogSequenceNumber lastSequenceNumberServer1 = logServer1.getLastSequenceNumber();
                 LogSequenceNumber lastSequenceNumberServer2 = logServer2.getLastSequenceNumber();
