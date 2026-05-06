@@ -24,18 +24,20 @@ import org.junit.Test;
 
 public class DirectMultipleConcurrentUpdatesSuiteNoIndexesTest extends DirectMultipleConcurrentUpdatesSuite {
 
-    @Test(timeout = 120_000)
+    // No-checkpoint variants: 180 s JUnit ceiling, 90 s inner per-future limit
+    // (inner is strictly smaller so TimeoutException fires before JUnit interrupt).
+    @Test(timeout = 180_000)
     public void test() throws Exception {
         performTest(false, 0, false, false);
     }
 
-    @Test(timeout = 120_000)
+    @Test(timeout = 180_000)
     public void testWithTransactions() throws Exception {
         performTest(true, 0, false, false);
     }
 
-    // Checkpoint variants may block on slow CI I/O; 240 s is well above any
-    // healthy runtime while still cutting the 300 s+ CI hangs down (issue #417).
+    // Checkpoint variants: 240 s JUnit ceiling, 90 s inner per-future limit
+    // (issue #417 — cuts 300 s+ CI hangs; dumpOnFailure rule captures thread dump).
     @Test(timeout = 240_000)
     public void testWithCheckpoints() throws Exception {
         performTest(false, 2000, false, false);

@@ -36,7 +36,9 @@ import herddb.server.Server;
 import herddb.server.ServerConfiguration;
 import herddb.server.StaticClientSideMetadataProvider;
 import herddb.utils.RawString;
+import java.lang.management.LockInfo;
 import java.lang.management.ManagementFactory;
+import java.lang.management.MonitorInfo;
 import java.lang.management.ThreadInfo;
 import java.lang.management.ThreadMXBean;
 import java.nio.file.Path;
@@ -57,6 +59,8 @@ import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.junit.rules.TestWatcher;
+import org.junit.runner.Description;
 
 /**
  * Concurrent updates
@@ -74,49 +78,69 @@ public class MultipleConcurrentUpdatesTest {
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
 
-    @Test(timeout = 120_000)
+    /**
+     * Dumps all JVM threads on any test failure (including JUnit's own
+     * TestTimedOutException) so the CI surefire report contains the lock-holder
+     * context needed to triage the checkpoint/DML hang (issue #417). This rule
+     * fires regardless of whether the hang was detected by the JUnit method
+     * timeout or by the inner per-future timeout in performTest.
+     */
+    @Rule
+    public TestWatcher dumpOnFailure = new TestWatcher() {
+        @Override
+        protected void failed(Throwable e, Description description) {
+            dumpAllThreads(description.getMethodName() + " failed: " + e.getClass().getSimpleName());
+        }
+    };
+
+    // No-checkpoint variants: 180 s JUnit ceiling, 90 s inner per-future limit.
+    // The inner limit is strictly smaller than the outer so a stuck future fires
+    // TimeoutException before JUnit interrupts the test thread (issue #417).
+    @Test(timeout = 180_000)
     public void test() throws Exception {
-        performTest(false, 0, false);
+        performTest(false, 0, false, 90);
     }
 
-    @Test(timeout = 120_000)
+    @Test(timeout = 180_000)
     public void testWithTransactions() throws Exception {
-        performTest(true, 0, false);
+        performTest(true, 0, false, 90);
     }
 
-    // Checkpoint variants may block on slow CI I/O; 240 s is well above any
-    // healthy runtime while still cutting the 900 s CI hangs to ~240 s.
+    // Checkpoint variants: 240 s JUnit ceiling, 200 s inner per-future limit.
+    // The 200 s inner limit is below the 240 s outer so a stuck checkpoint-phase
+    // future fires TimeoutException first, triggering the thread dump (issue #417).
     @Test(timeout = 240_000)
     public void testWithCheckpoints() throws Exception {
-        performTest(false, 2000, false);
+        performTest(false, 2000, false, 200);
     }
 
     @Test(timeout = 240_000)
     public void testWithTransactionsWithCheckpoints() throws Exception {
-        performTest(true, 2000, false);
+        performTest(true, 2000, false, 200);
     }
 
-    @Test(timeout = 120_000)
+    @Test(timeout = 180_000)
     public void testWithIndexes() throws Exception {
-        performTest(false, 0, true);
+        performTest(false, 0, true, 90);
     }
 
-    @Test(timeout = 120_000)
+    @Test(timeout = 180_000)
     public void testWithTransactionsAndIndexes() throws Exception {
-        performTest(true, 0, true);
+        performTest(true, 0, true, 90);
     }
 
     @Test(timeout = 240_000)
     public void testWithCheckpointsAndIndexes() throws Exception {
-        performTest(false, 2000, true);
+        performTest(false, 2000, true, 200);
     }
 
     @Test(timeout = 240_000)
     public void testWithTransactionsWithCheckpointsAndIndexes() throws Exception {
-        performTest(true, 2000, true);
+        performTest(true, 2000, true, 200);
     }
 
-    private void performTest(boolean useTransactions, long checkPointPeriod, boolean withIndexes) throws Exception {
+    private void performTest(boolean useTransactions, long checkPointPeriod, boolean withIndexes,
+            int futureTimeoutSeconds) throws Exception {
         Path baseDir = folder.newFolder().toPath();
         ServerConfiguration serverConfiguration = newServerConfigurationWithAutoPort(baseDir);
 
@@ -233,15 +257,17 @@ public class MultipleConcurrentUpdatesTest {
                         ));
                     }
                     for (Future f : futures) {
-                        // 600 s matches the client timeout set above; prevents an infinite
-                        // hang in case a future becomes truly stuck (e.g. thread pool
-                        // exhaustion or undetected deadlock). Mirrors DirectMultipleConcurrentUpdatesSuite.
-                        // On TimeoutException we emit a full thread dump before rethrowing so
-                        // that the CI surefire report captures the lock-holder context (issue #417).
+                        // futureTimeoutSeconds is always strictly less than the enclosing
+                        // @Test(timeout=…) value, so a stuck future fires TimeoutException
+                        // *before* JUnit interrupts the test thread. The TimeoutException
+                        // catch below emits the thread dump; the dumpOnFailure TestWatcher
+                        // rule is a second safety net that fires even if the hang happens
+                        // outside this loop (e.g. waitForTableSpaceBoot). See issue #417.
                         try {
-                            f.get(600, TimeUnit.SECONDS);
+                            f.get(futureTimeoutSeconds, TimeUnit.SECONDS);
                         } catch (TimeoutException e) {
-                            dumpAllThreads("MultipleConcurrentUpdatesTest: future timed out after 600 s");
+                            dumpAllThreads("MultipleConcurrentUpdatesTest: future timed out after "
+                                    + futureTimeoutSeconds + " s");
                             throw e;
                         }
                     }
@@ -301,10 +327,16 @@ public class MultipleConcurrentUpdatesTest {
     }
 
     /**
-     * Dumps all JVM threads (with locked monitors and synchronizers) to stderr,
-     * prefixed with a context label. Also runs deadlock detection. Called when a
-     * per-future timeout fires so the surefire report captures the lock-holder
-     * context for issue #417 triage.
+     * Dumps all JVM threads to stderr with full stack traces (not truncated),
+     * locked monitors, and locked synchronizers, plus JVM deadlock detection.
+     * Called both from the per-future TimeoutException catch and from the
+     * dumpOnFailure TestWatcher rule so every hang produces a useful trace
+     * in the CI surefire report (issue #417).
+     *
+     * <p>We walk {@code ti.getStackTrace()} directly rather than calling
+     * {@code ThreadInfo.toString()} because the latter truncates to
+     * {@code MAX_FRAMES = 8} by JDK spec, which hides the lock-acquisition
+     * frames that identify the checkpoint/DML contention site.
      */
     private static void dumpAllThreads(String context) {
         System.err.println("=== Thread dump [" + context + "] ===");
@@ -314,7 +346,27 @@ public class MultipleConcurrentUpdatesTest {
             System.err.println("DEADLOCKED THREAD IDs: " + Arrays.toString(deadlocked));
         }
         for (ThreadInfo ti : tmx.dumpAllThreads(true, true)) {
-            System.err.print(ti);
+            System.err.println("\"" + ti.getThreadName() + "\""
+                    + (ti.isDaemon() ? " daemon" : "")
+                    + " prio=" + ti.getPriority()
+                    + " Id=" + ti.getThreadId()
+                    + " " + ti.getThreadState());
+            if (ti.getLockName() != null) {
+                System.err.println("\t- waiting on " + ti.getLockName()
+                        + (ti.getLockOwnerName() != null
+                           ? " owned by \"" + ti.getLockOwnerName() + "\" Id=" + ti.getLockOwnerId()
+                           : ""));
+            }
+            for (StackTraceElement ste : ti.getStackTrace()) {
+                System.err.println("\tat " + ste);
+            }
+            for (MonitorInfo mi : ti.getLockedMonitors()) {
+                System.err.println("\t- locked <" + mi + "> at " + mi.getLockedStackFrame());
+            }
+            for (LockInfo li : ti.getLockedSynchronizers()) {
+                System.err.println("\t- locked <" + li + ">");
+            }
+            System.err.println();
         }
         System.err.println("=== End thread dump [" + context + "] ===");
     }
