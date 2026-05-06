@@ -36,6 +36,11 @@ import herddb.model.TransactionContext;
 import herddb.server.Server;
 import herddb.server.ServerConfiguration;
 import herddb.utils.DataAccessor;
+import java.lang.management.LockInfo;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MonitorInfo;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -49,9 +54,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.Rule;
 import org.junit.rules.TemporaryFolder;
+import org.junit.rules.TestWatcher;
+import org.junit.runner.Description;
 
 /**
  * Concurrent updates
@@ -67,6 +75,20 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
 
+    /**
+     * Dumps all JVM threads on any test failure (including JUnit's own
+     * TestTimedOutException) so the CI surefire report contains the lock-holder
+     * context needed to triage the checkpoint/DML hang (issue #417). Inherited
+     * by all subclasses; fires regardless of whether the hang was detected by
+     * the JUnit method timeout or by the inner per-future timeout.
+     */
+    @Rule
+    public TestWatcher dumpOnFailure = new TestWatcher() {
+        @Override
+        protected void failed(Throwable e, Description description) {
+            dumpAllThreads(description.getMethodName() + " failed: " + e.getClass().getSimpleName());
+        }
+    };
 
     protected void performTest(boolean useTransactions, long checkPointPeriod, boolean withIndexes, boolean uniqueIndexes) throws Exception {
         Path baseDir = folder.newFolder().toPath();
@@ -177,7 +199,17 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
                     ));
                 }
                 for (Future f : futures) {
-                    f.get(120, TimeUnit.SECONDS);
+                    // 90 s is strictly less than both outer @Test timeout values
+                    // (180 s for no-checkpoint variants, 240 s for checkpoint variants)
+                    // so a stuck future fires TimeoutException *before* JUnit interrupts
+                    // the test thread. The dumpOnFailure TestWatcher rule is a second
+                    // safety net for hangs that occur outside this loop (issue #417).
+                    try {
+                        f.get(90, TimeUnit.SECONDS);
+                    } catch (TimeoutException e) {
+                        dumpAllThreads("DirectMultipleConcurrentUpdatesSuite: future timed out after 90 s");
+                        throw e;
+                    }
                 }
 
                 System.out.println("stats::updates:" + updates);
@@ -268,5 +300,50 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
             }
         }
         System.out.println("=== end issue-157 diagnostics [" + stage + "] ===");
+    }
+
+    /**
+     * Dumps all JVM threads to stderr with full stack traces (not truncated),
+     * locked monitors, and locked synchronizers, plus JVM deadlock detection.
+     * Called both from the per-future TimeoutException catch and from the
+     * dumpOnFailure TestWatcher rule so every hang produces a useful trace
+     * in the CI surefire report (issue #417).
+     *
+     * <p>We walk {@code ti.getStackTrace()} directly rather than calling
+     * {@code ThreadInfo.toString()} because the latter truncates to
+     * {@code MAX_FRAMES = 8} by JDK spec, which hides the lock-acquisition
+     * frames that identify the checkpoint/DML contention site.
+     */
+    static void dumpAllThreads(String context) {
+        System.err.println("=== Thread dump [" + context + "] ===");
+        ThreadMXBean tmx = ManagementFactory.getThreadMXBean();
+        long[] deadlocked = tmx.findDeadlockedThreads();
+        if (deadlocked != null) {
+            System.err.println("DEADLOCKED THREAD IDs: " + Arrays.toString(deadlocked));
+        }
+        for (ThreadInfo ti : tmx.dumpAllThreads(true, true)) {
+            System.err.println("\"" + ti.getThreadName() + "\""
+                    + (ti.isDaemon() ? " daemon" : "")
+                    + " prio=" + ti.getPriority()
+                    + " Id=" + ti.getThreadId()
+                    + " " + ti.getThreadState());
+            if (ti.getLockName() != null) {
+                System.err.println("\t- waiting on " + ti.getLockName()
+                        + (ti.getLockOwnerName() != null
+                           ? " owned by \"" + ti.getLockOwnerName() + "\" Id=" + ti.getLockOwnerId()
+                           : ""));
+            }
+            for (StackTraceElement ste : ti.getStackTrace()) {
+                System.err.println("\tat " + ste);
+            }
+            for (MonitorInfo mi : ti.getLockedMonitors()) {
+                System.err.println("\t- locked <" + mi + "> at " + mi.getLockedStackFrame());
+            }
+            for (LockInfo li : ti.getLockedSynchronizers()) {
+                System.err.println("\t- locked <" + li + ">");
+            }
+            System.err.println();
+        }
+        System.err.println("=== End thread dump [" + context + "] ===");
     }
 }

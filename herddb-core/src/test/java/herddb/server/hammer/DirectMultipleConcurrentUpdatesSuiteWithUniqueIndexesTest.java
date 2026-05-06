@@ -25,22 +25,26 @@ import org.junit.Test;
 
 public class DirectMultipleConcurrentUpdatesSuiteWithUniqueIndexesTest extends DirectMultipleConcurrentUpdatesSuite {
 
-    @Test
+    // No-checkpoint variants: 180 s JUnit ceiling, 90 s inner per-future limit
+    // (inner is strictly smaller so TimeoutException fires before JUnit interrupt).
+    @Test(timeout = 180_000)
     public void testWithUniqueIndexes() throws Exception {
         performTest(false, 0, true, true);
     }
 
-    @Test
+    @Test(timeout = 180_000)
     public void testWithTransactionsAndUniqueIndexes() throws Exception {
         performTest(true, 0, true, true);
     }
 
-    @Test
+    // Checkpoint variants: 240 s JUnit ceiling, 90 s inner per-future limit
+    // (issue #417 — cuts 300 s+ CI hangs; dumpOnFailure rule captures thread dump).
+    @Test(timeout = 240_000)
     public void testWithCheckpointsAndUniqueIndexes() throws Exception {
         performTest(false, 2000, true, true);
     }
 
-    @Test
+    @Test(timeout = 240_000)
     public void testWithTransactionsWithCheckpointsAndUniqueIndexes() throws Exception {
         performTest(true, 2000, true, true);
     }
