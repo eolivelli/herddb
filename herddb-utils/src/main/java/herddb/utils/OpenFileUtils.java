@@ -20,16 +20,19 @@
 
 package herddb.utils;
 
+import com.sun.nio.file.ExtendedOpenOption;
 import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.util.logging.Logger;
 
 /**
- * Java 8 compatibile version. In Java 8 you cannot use O_DIRECT
+ * O_DIRECT-capable file helpers. Requires JDK 10+ (which the project
+ * already mandates via {@code maven.compiler.release=17}).
  *
  * @author enrico.olivelli
  */
@@ -38,25 +41,26 @@ public class OpenFileUtils {
     private static final Logger LOG = Logger.getLogger(OpenFileUtils.class.getName());
 
     static {
-        LOG.info("This JVM is not able to use O_DIRECT (only from Java 10+)");
+        LOG.fine("This JVM is able to use O_DIRECT");
     }
 
     public static FileChannel openFileChannelWithO_DIRECT(Path path, OpenOption... options) throws IOException {
-        return FileChannel.open(path, options);
+        OpenOption[] options2 = new OpenOption[options.length + 1];
+        System.arraycopy(options, 0, options2, 0, options.length);
+        options2[options2.length - 1] = ExtendedOpenOption.DIRECT;
+        return FileChannel.open(path, options2);
     }
 
     public static long getBlockSize(Path p) throws IOException {
-        // this is dummy
-        return 4096;
+        return Files.getFileStore(p).getBlockSize();
     }
 
     public static boolean isO_DIRECT_Supported() {
-        return false;
+        return true;
     }
 
     public static ByteBuffer alignedSlice(ByteBuffer buffer, int alignment) {
-        // on JDK8 you cannot require an aligned slice, but you cannot use O_DIRECT as well
-        return buffer;
+        return buffer.alignedSlice(alignment);
     }
 
     public static void releaseAlignedBuffer(ByteBuffer buffer) {
