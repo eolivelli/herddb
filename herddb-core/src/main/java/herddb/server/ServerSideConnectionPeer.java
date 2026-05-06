@@ -88,10 +88,12 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.apache.bookkeeper.stats.OpStatsLogger;
 import org.apache.calcite.tools.ValidationException;
 
 /**
@@ -141,6 +143,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
     @Override
     public void requestReceived(Pdu message, Channel channel) {
         // message is handled by current thread
+        long startNanos = System.nanoTime();
         boolean releaseMessageSync = true;
         try {
             LOGGER.log(Level.FINEST, "messageReceived {0}", message);
@@ -149,28 +152,31 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                 case Pdu.TYPE_EXECUTE_STATEMENT: {
                     if (!authenticated) {
                         sendAuthRequiredError(channel, message);
+                        recordRequest(server.getRequestStats().executeStatement(), startNanos, false);
                         break;
                     }
                     releaseMessageSync = false;
-                    handleExecuteStatement(message, channel);
+                    handleExecuteStatement(message, channel, startNanos);
                 }
                 break;
                 case Pdu.TYPE_PREPARE_STATEMENT: {
                     if (!authenticated) {
                         sendAuthRequiredError(channel, message);
+                        recordRequest(server.getRequestStats().prepareStatement(), startNanos, false);
                         break;
                     }
                     releaseMessageSync = false;
-                    handlePrepareStatement(message, channel);
+                    handlePrepareStatement(message, channel, startNanos);
                 }
                 break;
                 case Pdu.TYPE_EXECUTE_STATEMENTS: {
                     if (!authenticated) {
                         sendAuthRequiredError(channel, message);
+                        recordRequest(server.getRequestStats().executeStatements(), startNanos, false);
                         break;
                     }
                     releaseMessageSync = false;
-                    handleExecuteStatements(message, channel);
+                    handleExecuteStatements(message, channel, startNanos);
                 }
                 break;
                 case Pdu.TYPE_SASL_TOKEN_MESSAGE_REQUEST: {
@@ -183,44 +189,51 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                 break;
                 case Pdu.TYPE_TX_COMMAND: {
                     if (!authenticated) {
+                        // Tx command type is not yet decoded, attribute to the
+                        // tx_commit metric arbitrarily so the failure surfaces.
                         sendAuthRequiredError(channel, message);
+                        recordRequest(server.getRequestStats().txCommit(), startNanos, false);
                         break;
                     }
                     releaseMessageSync = false;
-                    handleTxCommand(message, channel);
+                    handleTxCommand(message, channel, startNanos);
                 }
                 break;
                 case Pdu.TYPE_OPENSCANNER: {
                     if (!authenticated) {
                         sendAuthRequiredError(channel, message);
+                        recordRequest(server.getRequestStats().openScanner(), startNanos, false);
                         break;
                     }
-                    handleOpenScanner(message, channel);
+                    handleOpenScanner(message, channel, startNanos);
 
                 }
                 break;
                 case Pdu.TYPE_FETCHSCANNERDATA: {
                     if (!authenticated) {
                         sendAuthRequiredError(channel, message);
+                        recordRequest(server.getRequestStats().fetchScannerData(), startNanos, false);
                         break;
                     }
-                    handleFetchScannerData(message, channel);
+                    handleFetchScannerData(message, channel, startNanos);
                 }
                 break;
                 case Pdu.TYPE_CLOSESCANNER: {
                     if (!authenticated) {
                         sendAuthRequiredError(channel, message);
+                        recordRequest(server.getRequestStats().closeScanner(), startNanos, false);
                         break;
                     }
-                    handleCloseScanner(message, channel);
+                    handleCloseScanner(message, channel, startNanos);
                 }
                 break;
                 case Pdu.TYPE_REQUEST_TABLESPACE_DUMP: {
                     if (!authenticated) {
                         sendAuthRequiredError(channel, message);
+                        recordRequest(server.getRequestStats().requestTablespaceDump(), startNanos, false);
                         break;
                     }
-                    handleRequestTablespaceDump(message, channel);
+                    handleRequestTablespaceDump(message, channel, startNanos);
                 }
                 break;
                 case Pdu.TYPE_REQUEST_TABLE_RESTORE: {
@@ -307,6 +320,21 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
 
     private static ByteBuf composeErrorResponse(long messageId, Throwable err) {
         return PduCodec.ErrorResponse.write(messageId, err, err instanceof NotLeaderException, false);
+    }
+
+    /**
+     * Records the latency of a request that started at {@code startNanos} on the
+     * given per-request-type {@link OpStatsLogger}. The BookKeeper Prometheus
+     * provider converts the registered nanosecond value to milliseconds before
+     * exporting; dashboards must use the {@code ms} format accordingly.
+     */
+    private static void recordRequest(OpStatsLogger latency, long startNanos, boolean success) {
+        long elapsed = System.nanoTime() - startNanos;
+        if (success) {
+            latency.registerSuccessfulEvent(elapsed, TimeUnit.NANOSECONDS);
+        } else {
+            latency.registerFailedEvent(elapsed, TimeUnit.NANOSECONDS);
+        }
     }
 
     private void handleTableRestoreFinished(Pdu message, Channel channel) {
@@ -422,7 +450,8 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
         }
     }
 
-    private void handleOpenScanner(Pdu message, Channel channel) {
+    private void handleOpenScanner(Pdu message, Channel channel, long startNanos) {
+        OpStatsLogger latency = server.getRequestStats().openScanner();
 
         long txId = PduCodec.OpenScanner.readTx(message);
 
@@ -434,6 +463,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
         if (query == null) {
             ByteBuf error = PduCodec.ErrorResponse.writeMissingPreparedStatementError(message.messageId, "bad statement id: " + statementId);
             channel.sendReplyMessage(message.messageId, error);
+            recordRequest(latency, startNanos, false);
             return;
         }
 
@@ -460,6 +490,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
         RunningStatementsStats runningStatements = server.getManager().getRunningStatements();
         RunningStatementInfo statementInfo = new RunningStatementInfo(query,
                 System.currentTimeMillis(), tableSpace, "", 1);
+        boolean success = false;
         try {
             TranslatedQuery translatedQuery = server
                     .getManager()
@@ -505,6 +536,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                     // no need to hold the scanner anymore
                     scanner.close();
                 }
+                success = true;
             } else {
                 ByteBuf error = PduCodec.ErrorResponse.write(message.messageId, "unsupported query type for scan " + query + ": PLAN is " + translatedQuery.plan);
                 channel.sendReplyMessage(message.messageId, error);
@@ -521,60 +553,73 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
             channel.sendReplyMessage(message.messageId, error);
         } finally {
             runningStatements.unregisterRunningStatement(statementInfo);
+            recordRequest(latency, startNanos, success);
         }
     }
 
-    private void handleFetchScannerData(Pdu message, Channel channel) {
-        long scannerId = PduCodec.FetchScannerData.readScannerId(message);
-        int fetchSize = PduCodec.FetchScannerData.readFetchSize(message);
-        if (fetchSize <= 0) {
-            fetchSize = 10;
-        }
-        ServerSideScannerPeer scanner = scanners.get(scannerId);
-        if (scanner != null) {
-            try {
-                DataScanner dataScanner = scanner.getScanner();
-                List<DataAccessor> records = dataScanner.consume(fetchSize);
-                String[] columns = dataScanner.getFieldNames();
-                TuplesList tuplesList = new TuplesList(columns, records);
-
-                boolean last = false;
-                if (dataScanner.isFinished()) {
-                    LOGGER.log(Level.FINEST, "unregistering scanner {0}, resultset is finished", scannerId);
-                    scanners.remove(scannerId);
-                    last = true;
-                }
-//                        LOGGER.log(Level.SEVERE, "sending " + converted.size() + " records to scanner " + scannerId);
+    private void handleFetchScannerData(Pdu message, Channel channel, long startNanos) {
+        OpStatsLogger latency = server.getRequestStats().fetchScannerData();
+        boolean success = false;
+        try {
+            long scannerId = PduCodec.FetchScannerData.readScannerId(message);
+            int fetchSize = PduCodec.FetchScannerData.readFetchSize(message);
+            if (fetchSize <= 0) {
+                fetchSize = 10;
+            }
+            ServerSideScannerPeer scanner = scanners.get(scannerId);
+            if (scanner != null) {
                 try {
-                    ByteBuf result = PduCodec.ResultSetChunk.write(message.messageId, tuplesList, last, dataScanner.getTransactionId());
-                    channel.sendReplyMessage(message.messageId, result);
-                } catch (HerdDBInternalException err) {
-                    // do not leak an unserializable scanner
-                    scanners.remove(scannerId);
-                    scanner.close();
-                    throw err;
+                    DataScanner dataScanner = scanner.getScanner();
+                    List<DataAccessor> records = dataScanner.consume(fetchSize);
+                    String[] columns = dataScanner.getFieldNames();
+                    TuplesList tuplesList = new TuplesList(columns, records);
+
+                    boolean last = false;
+                    if (dataScanner.isFinished()) {
+                        LOGGER.log(Level.FINEST, "unregistering scanner {0}, resultset is finished", scannerId);
+                        scanners.remove(scannerId);
+                        last = true;
+                    }
+//                        LOGGER.log(Level.SEVERE, "sending " + converted.size() + " records to scanner " + scannerId);
+                    try {
+                        ByteBuf result = PduCodec.ResultSetChunk.write(message.messageId, tuplesList, last, dataScanner.getTransactionId());
+                        channel.sendReplyMessage(message.messageId, result);
+                    } catch (HerdDBInternalException err) {
+                        // do not leak an unserializable scanner
+                        scanners.remove(scannerId);
+                        scanner.close();
+                        throw err;
+                    }
+                    if (last) {
+                        dataScanner.close();
+                    }
+                    success = true;
+                } catch (DataScannerException | StatementExecutionException err) {
+                    ByteBuf error = composeErrorResponse(message.messageId, err);
+                    channel.sendReplyMessage(message.messageId, error);
                 }
-                if (last) {
-                    dataScanner.close();
-                }
-            } catch (DataScannerException | StatementExecutionException err) {
-                ByteBuf error = composeErrorResponse(message.messageId, err);
+            } else {
+                ByteBuf error = PduCodec.ErrorResponse.write(message.messageId, "no such scanner " + scannerId);
                 channel.sendReplyMessage(message.messageId, error);
             }
-        } else {
-            ByteBuf error = PduCodec.ErrorResponse.write(message.messageId, "no such scanner " + scannerId);
-            channel.sendReplyMessage(message.messageId, error);
+        } finally {
+            recordRequest(latency, startNanos, success);
         }
     }
 
-    private void handleCloseScanner(Pdu message, Channel channel) {
-        long scannerId = PduCodec.CloseScanner.readScannerId(message);
-        ServerSideScannerPeer removed = scanners.remove(scannerId);
-        if (removed != null) {
-            if (LOGGER.isLoggable(Level.FINER)) {
-                LOGGER.log(Level.FINER, "remove scanner {0} as requested by client", scannerId);
+    private void handleCloseScanner(Pdu message, Channel channel, long startNanos) {
+        OpStatsLogger latency = server.getRequestStats().closeScanner();
+        try {
+            long scannerId = PduCodec.CloseScanner.readScannerId(message);
+            ServerSideScannerPeer removed = scanners.remove(scannerId);
+            if (removed != null) {
+                if (LOGGER.isLoggable(Level.FINER)) {
+                    LOGGER.log(Level.FINER, "remove scanner {0} as requested by client", scannerId);
+                }
+                removed.clientClose();
             }
-            removed.clientClose();
+        } finally {
+            recordRequest(latency, startNanos, true);
         }
     }
 
@@ -584,18 +629,26 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
         channel.sendReplyMessage(message.messageId, error);
     }
 
-    private void handleRequestTablespaceDump(Pdu message, Channel channel) {
-        String dumpId = PduCodec.RequestTablespaceDump.readDumpId(message);
-        int fetchSize = PduCodec.RequestTablespaceDump.readFetchSize(message);
-        if (fetchSize <= 0) {
-            fetchSize = 10;
+    private void handleRequestTablespaceDump(Pdu message, Channel channel, long startNanos) {
+        OpStatsLogger latency = server.getRequestStats().requestTablespaceDump();
+        boolean success = false;
+        try {
+            String dumpId = PduCodec.RequestTablespaceDump.readDumpId(message);
+            int fetchSize = PduCodec.RequestTablespaceDump.readFetchSize(message);
+            if (fetchSize <= 0) {
+                fetchSize = 10;
+            }
+            String tableSpace = PduCodec.RequestTablespaceDump.readTablespace(message);
+            boolean includeTransactionLog = PduCodec.RequestTablespaceDump.readInludeTransactionLog(message);
+            server.getManager().dumpTableSpace(tableSpace, dumpId, message, channel, fetchSize, includeTransactionLog);
+            success = true;
+        } finally {
+            recordRequest(latency, startNanos, success);
         }
-        String tableSpace = PduCodec.RequestTablespaceDump.readTablespace(message);
-        boolean includeTransactionLog = PduCodec.RequestTablespaceDump.readInludeTransactionLog(message);
-        server.getManager().dumpTableSpace(tableSpace, dumpId, message, channel, fetchSize, includeTransactionLog);
     }
 
-    private void handleExecuteStatements(Pdu message, Channel channel) {
+    private void handleExecuteStatements(Pdu message, Channel channel, long startNanos) {
+        OpStatsLogger latency = server.getRequestStats().executeStatements();
         long transactionId = PduCodec.ExecuteStatements.readTx(message);
         String tableSpace = PduCodec.ExecuteStatements.readTablespace(message);
         long statementId = PduCodec.ExecuteStatements.readStatementId(message);
@@ -606,6 +659,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
             ByteBuf error = PduCodec.ErrorResponse.writeMissingPreparedStatementError(message.messageId, "bad statement id: " + statementId);
             channel.sendReplyMessage(message.messageId, error);
             message.close();
+            recordRequest(latency, startNanos, false);
             return;
         }
         boolean returnValues = PduCodec.ExecuteStatements.readReturnValues(message);
@@ -655,6 +709,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                         channel.sendReplyMessage(message.messageId, errorMsg);
                         message.close();
                         runningStatements.unregisterRunningStatement(statementInfo);
+                        recordRequest(latency, startNanos, false);
                         return;
                     }
                     if (result instanceof DMLStatementExecutionResult) {
@@ -684,18 +739,26 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                         channel.sendReplyMessage(message.messageId, response);
                         message.close();
                         runningStatements.unregisterRunningStatement(statementInfo);
+                        recordRequest(latency, startNanos, false);
                         return;
                     }
 
                     long newTransactionId = result.transactionId;
                     if (current == queries.size()) {
+                        boolean writeOk = false;
                         try {
                             ByteBuf response = PduCodec.ExecuteStatementsResult.write(message.messageId, updateCounts, otherDatas, newTransactionId);
                             channel.sendReplyMessage(message.messageId, response);
                             message.close();
                             runningStatements.unregisterRunningStatement(statementInfo);
+                            writeOk = true;
                         } catch (Throwable t) {
+                            // Reply serialization is best-effort: log here and
+                            // record the request as failed so dashboards reflect
+                            // the actual error rate rather than masking it.
                             LOGGER.log(Level.SEVERE, "Internal error", t);
+                        } finally {
+                            recordRequest(latency, startNanos, writeOk);
                         }
                         return;
                     }
@@ -718,6 +781,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
             channel.sendReplyMessage(message.messageId, response);
             message.close();
             runningStatements.unregisterRunningStatement(statementInfo);
+            recordRequest(latency, startNanos, false);
         }
     }
 
@@ -836,7 +900,8 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
         }
     }
 
-    private void handleExecuteStatement(Pdu message, Channel channel) {
+    private void handleExecuteStatement(Pdu message, Channel channel, long startNanos) {
+        OpStatsLogger latency = server.getRequestStats().executeStatement();
         long txId = PduCodec.ExecuteStatement.readTx(message);
         String tablespace = PduCodec.ExecuteStatement.readTablespace(message);
         long statementId = PduCodec.ExecuteStatement.readStatementId(message);
@@ -847,6 +912,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
             ByteBuf error = PduCodec.ErrorResponse.writeMissingPreparedStatementError(message.messageId, "bad statement id: " + statementId);
             channel.sendReplyMessage(message.messageId, error);
             message.close();
+            recordRequest(latency, startNanos, false);
             return;
         }
         boolean returnValues = PduCodec.ExecuteStatement.readReturnValues(message);
@@ -870,6 +936,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
             ByteBuf error = composeErrorResponse(message.messageId, ex);
             channel.sendReplyMessage(message.messageId, error);
             message.close();
+            recordRequest(latency, startNanos, false);
             return;
         }
 
@@ -882,6 +949,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                 .executePlanAsync(translatedQuery.plan, translatedQuery.context, transactionContext);
 //                    LOGGER.log(Level.SEVERE, "query " + query + ", " + parameters + ", result:" + result);
         res.whenComplete((result, err) -> {
+            boolean success = false;
             try {
                 runningStatements.unregisterRunningStatement(statementInfo);
                 if (err != null) {
@@ -923,6 +991,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                     channel.sendReplyMessage(message.messageId,
                             PduCodec.ExecuteStatementResult.write(
                                     message.messageId, dml.getUpdateCount(), dml.transactionId, newRecord));
+                    success = true;
                 } else if (result instanceof GetResult) {
                     GetResult get = (GetResult) result;
                     if (!get.found()) {
@@ -935,31 +1004,41 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                                 PduCodec.ExecuteStatementResult.write(
                                         message.messageId, 1, get.transactionId, record));
                     }
+                    success = true;
                 } else if (result instanceof TransactionResult) {
                     TransactionResult txresult = (TransactionResult) result;
                     channel.sendReplyMessage(message.messageId,
                             PduCodec.ExecuteStatementResult.write(
                                     message.messageId, 1, txresult.getTransactionId(), null));
+                    success = true;
                 } else if (result instanceof DDLStatementExecutionResult) {
                     DDLStatementExecutionResult ddl = (DDLStatementExecutionResult) result;
                     channel.sendReplyMessage(message.messageId,
                             PduCodec.ExecuteStatementResult.write(
                                     message.messageId, 1, ddl.transactionId, null));
+                    success = true;
                 } else if (result instanceof DataConsistencyStatementResult) {
                     channel.sendReplyMessage(message.messageId,
                             PduCodec.ExecuteStatementResult.write(
                                     message.messageId, 0, 0, null));
+                    success = true;
                 } else {
                     ByteBuf error = PduCodec.ErrorResponse.write(message.messageId, "unknown result type:" + result);
                     channel.sendReplyMessage(message.messageId, error);
                 }
             } finally {
-                message.close();
+                try {
+                    message.close();
+                } finally {
+                    recordRequest(latency, startNanos, success);
+                }
             }
         });
     }
 
-    private void handlePrepareStatement(Pdu message, Channel channel) {
+    private void handlePrepareStatement(Pdu message, Channel channel, long startNanos) {
+        OpStatsLogger latency = server.getRequestStats().prepareStatement();
+        boolean success = false;
         try {
             String query = PduCodec.PrepareStatement.readQuery(message);
             String tablespace = PduCodec.PrepareStatement.readTablespace(message);
@@ -977,8 +1056,13 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
             channel.sendReplyMessage(message.messageId,
                     PduCodec.PrepareStatementResult.write(
                             message.messageId, newId));
+            success = true;
         } finally {
-            message.close();
+            try {
+                message.close();
+            } finally {
+                recordRequest(latency, startNanos, success);
+            }
         }
     }
 
@@ -1012,37 +1096,47 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
         }
     }
 
-    private void handleTxCommand(Pdu message, Channel channel) {
+    private void handleTxCommand(Pdu message, Channel channel, long startNanos) {
         long txId = PduCodec.TxCommand.readTx(message);
         int type = PduCodec.TxCommand.readCommand(message);
         String tableSpace = PduCodec.TxCommand.readTablespace(message);
         TransactionContext transactionContext = new TransactionContext(txId);
         Statement statement;
+        OpStatsLogger latency;
         switch (type) {
             case TX_COMMAND_COMMIT_TRANSACTION:
                 statement = new CommitTransactionStatement(tableSpace, txId);
+                latency = server.getRequestStats().txCommit();
                 break;
             case TX_COMMAND_ROLLBACK_TRANSACTION:
                 statement = new RollbackTransactionStatement(tableSpace, txId);
+                latency = server.getRequestStats().txRollback();
                 break;
             case TX_COMMAND_BEGIN_TRANSACTION:
                 statement = new BeginTransactionStatement(tableSpace);
+                latency = server.getRequestStats().txBegin();
                 break;
             default:
                 statement = null;
+                // Unknown command: charge to commit metric so the failure is
+                // still visible somewhere instead of being silently dropped.
+                latency = server.getRequestStats().txCommit();
 
         }
         if (statement == null) {
             ByteBuf error = PduCodec.ErrorResponse.write(message.messageId, "unknown txcommand type:" + type);
             channel.sendReplyMessage(message.messageId, error);
             message.close();
+            recordRequest(latency, startNanos, false);
         } else {
 //            LOGGER.log(Level.SEVERE, "statement " + statement);
             CompletableFuture<StatementExecutionResult> res = server
                     .getManager()
                     .executeStatementAsync(statement, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(), transactionContext);
 //                    LOGGER.log(Level.SEVERE, "query " + query + ", " + parameters + ", result:" + result);
+            final OpStatsLogger latencyForCallback = latency;
             res.whenComplete((result, err) -> {
+                boolean success = false;
                 try {
                     if (err != null) {
                         if (err instanceof NotLeaderException) {
@@ -1061,6 +1155,7 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                             TransactionResult txresult = (TransactionResult) result;
                             ByteBuf response = PduCodec.TxCommandResult.write(message.messageId, txresult.transactionId);
                             channel.sendReplyMessage(message.messageId, response);
+                            success = true;
                         } else {
                             ByteBuf error = PduCodec.ErrorResponse.write(message.messageId, "unknown result type:" + result);
                             channel.sendReplyMessage(message.messageId, error);
@@ -1068,7 +1163,11 @@ public class ServerSideConnectionPeer implements ServerSideConnection, ChannelEv
                         }
                     }
                 } finally {
-                    message.close();
+                    try {
+                        message.close();
+                    } finally {
+                        recordRequest(latencyForCallback, startNanos, success);
+                    }
                 }
             });
         }
