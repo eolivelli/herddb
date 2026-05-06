@@ -22,6 +22,7 @@ package herddb.utils;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -796,64 +797,134 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
      * between an off-heap and an on-heap {@code Bytes} with identical bytes
      * round-trips correctly.
      *
-     * <p>Bulk-copies the slice into a stack-local byte[] so the inner hash
-     * loop matches the well-optimised on-heap path (issue #399 step-4 review).
+     * <p>Issue #429 removed the per-call temporary {@code byte[length]}
+     * allocation (which dominated the alloc profile on the off-heap key
+     * insert path) by delegating to
+     * {@link CompareBytesUtils#hashCode(ByteBuf, int, int)}. That helper
+     * fast-paths heap-backed {@link ByteBuf} instances through the
+     * tight byte[] loop and reads off-heap slices directly via
+     * {@link ByteBuf#getByte} with no copy.
      */
     private static int hashCodeFromByteBuf(ByteBuf buf, int start, int len) {
-        if (len == 0) {
-            return CompareBytesUtils.hashCode(new byte[0], 0, 0);
-        }
-        byte[] copy = new byte[len];
-        buf.getBytes(start, copy, 0, len);
-        return CompareBytesUtils.hashCode(copy, 0, len);
+        return CompareBytesUtils.hashCode(buf, start, len);
     }
 
     /**
      * Byte-for-byte comparison that handles all four (on/off)-heap × (on/off)-heap
      * combinations. Lengths must already match.
      *
-     * <p>Off-heap branches snapshot {@code offHeap} and the slice's
-     * {@code readerIndex()} once at method entry and walk both sides byte
-     * by byte using direct {@code slice.getByte(baseIdx + i)} calls. An
-     * earlier round used a one-shot bulk {@link ByteBuf#getBytes(int, byte[], int, int)}
-     * copy into a stack-local byte[] before dispatching to
-     * {@link CompareBytesUtils#arraysEquals}, but for the small index keys
-     * typical of BLink lookups (8-24 bytes) the per-call byte[] allocation
-     * dominated and the snapshot-and-loop variant ended up faster
-     * (issue #399 step-4 review).
+     * <p>The implementation funnels every case it can through the tight
+     * {@link CompareBytesUtils#arraysEquals byte[]} comparison
+     * (which itself dispatches to
+     * {@link PlatformDependent#equals(byte[], int, byte[], int, int)} and
+     * compares 8-byte words at a time). Specifically:
+     * <ul>
+     *   <li>Both sides on-heap: directly use the byte[] path.</li>
+     *   <li>An off-heap side whose backing {@link ByteBuf} exposes a
+     *       backing array via {@link ByteBuf#hasArray()} is promoted to
+     *       its array for the comparison.</li>
+     *   <li>Both sides off-heap with no backing array: dispatch to
+     *       {@link ByteBufUtil#equals(ByteBuf, int, ByteBuf, int, int)}
+     *       which does an 8-byte word-at-a-time comparison via
+     *       {@link ByteBuf#getLong}, again without copying.</li>
+     *   <li>Mixed (one byte[], one truly direct {@link ByteBuf}):
+     *       compare 8 bytes at a time using
+     *       {@link Bytes#toRawLong(byte[], int)} on the heap side and a
+     *       big-endian-canonicalised {@link ByteBuf#getLong} on the
+     *       direct side, with a byte tail.</li>
+     * </ul>
+     * No path allocates a {@code byte[]} (the previous implementation
+     * fell back to a per-byte loop in the mixed case to avoid a bulk
+     * copy; we now get the same no-allocation behaviour with 8x fewer
+     * virtual calls on the hot path).
      *
      * @throws IllegalStateException if either side has been {@link #release()}d
      *         without a preceding lazy materialisation.
      */
     private static boolean bytesEqual(Bytes a, Bytes b) {
-        // Hot path: both on-heap (or already materialised). Snapshot the
-        // fields once into locals so the JIT eliminates the volatile reads.
+        final int len = a.length;
+
+        // Snapshot all four references once so the JIT can eliminate
+        // the volatile reads and reason about the local copies.
         byte[] aBuf = a.buffer;
         byte[] bBuf = b.buffer;
+
+        // Hot path: both on-heap (or already materialised).
         if (aBuf != null && bBuf != null) {
-            return CompareBytesUtils.arraysEquals(aBuf, a.offset, a.offset + a.length,
-                    bBuf, b.offset, b.offset + b.length);
+            return CompareBytesUtils.arraysEquals(aBuf, a.offset, a.offset + len,
+                    bBuf, b.offset, b.offset + len);
         }
-        // Off-heap-aware path with the same snapshot-and-loop optimization
-        // as compareTo (avoids per-byte volatile + virtual-call cost; cheaper
-        // than a bulk byte[] copy for the small keys typical of index hot
-        // paths). Fail fast on a released side.
+
         ByteBuf aSlice = a.offHeap;
         ByteBuf bSlice = b.offHeap;
-        if (aBuf == null && aSlice == null) {
+        if ((aBuf == null && aSlice == null) || (bBuf == null && bSlice == null)) {
             throw new IllegalStateException("Bytes already released");
         }
-        if (bBuf == null && bSlice == null) {
-            throw new IllegalStateException("Bytes already released");
-        }
-        int aBaseIdx = aSlice == null ? 0 : aSlice.readerIndex();
-        int bBaseIdx = bSlice == null ? 0 : bSlice.readerIndex();
+
+        // Promote heap-backed ByteBufs to their underlying array so the
+        // hot byte[]-vs-byte[] path can be reused.
         int aOff = a.offset;
         int bOff = b.offset;
-        for (int i = 0; i < a.length; i++) {
-            byte ai = aBuf != null ? aBuf[aOff + i] : aSlice.getByte(aBaseIdx + i);
-            byte bi = bBuf != null ? bBuf[bOff + i] : bSlice.getByte(bBaseIdx + i);
-            if (ai != bi) {
+        if (aBuf == null && aSlice.hasArray()) {
+            aBuf = aSlice.array();
+            aOff = aSlice.arrayOffset() + aSlice.readerIndex();
+        }
+        if (bBuf == null && bSlice.hasArray()) {
+            bBuf = bSlice.array();
+            bOff = bSlice.arrayOffset() + bSlice.readerIndex();
+        }
+        if (aBuf != null && bBuf != null) {
+            return CompareBytesUtils.arraysEquals(aBuf, aOff, aOff + len,
+                    bBuf, bOff, bOff + len);
+        }
+
+        // Both sides truly direct (no backing array on either): Netty's
+        // ByteBufUtil.equals reads 8-byte longs from each side via
+        // ByteBuf.getLong (which on a Direct buffer maps to a single
+        // Unsafe access) and compares them, with a byte tail. This is
+        // the fastest portable comparison we can do here.
+        if (aBuf == null && bBuf == null) {
+            return ByteBufUtil.equals(aSlice, aSlice.readerIndex(),
+                    bSlice, bSlice.readerIndex(), len);
+        }
+
+        // Mixed (one byte[], one truly direct ByteBuf): chunked
+        // long-at-a-time compare with byte tail. Both sides
+        // canonicalised to big-endian so the long equality test is a
+        // valid byte-equality test regardless of the ByteBuf's
+        // configured order.
+        final byte[] heap = aBuf != null ? aBuf : bBuf;
+        final int heapOff = aBuf != null ? aOff : bOff;
+        final ByteBuf direct = aBuf == null ? aSlice : bSlice;
+        final int directOff = direct.readerIndex();
+        return equalsHeapVsDirect(heap, heapOff, direct, directOff, len);
+    }
+
+    private static boolean equalsHeapVsDirect(byte[] heap, int hOff, ByteBuf direct, int dOff, int length) {
+        final int longCount = length >>> 3;
+        final int tail = length & 7;
+        final boolean directIsBigEndian = direct.order() == ByteOrder.BIG_ENDIAN;
+        for (int i = 0; i < longCount; i++) {
+            final int hp = hOff + (i << 3);
+            final int dp = dOff + (i << 3);
+            // toRawLong returns the eight bytes interpreted as a
+            // big-endian 64-bit value. ByteBuf.getLong does the same on
+            // a default (BE) buffer; on a configured-LE buffer we flip
+            // the result so the equality predicate is purely about the
+            // underlying bytes.
+            final long h = toRawLong(heap, hp);
+            long d = direct.getLong(dp);
+            if (!directIsBigEndian) {
+                d = Long.reverseBytes(d);
+            }
+            if (h != d) {
+                return false;
+            }
+        }
+        final int hTail = hOff + (longCount << 3);
+        final int dTail = dOff + (longCount << 3);
+        for (int i = 0; i < tail; i++) {
+            if (heap[hTail + i] != direct.getByte(dTail + i)) {
                 return false;
             }
         }
