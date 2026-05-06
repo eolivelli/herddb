@@ -90,13 +90,13 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
         byte[] data = seqBytes(BLOCK_SIZE * 3);
         client.writeMultipartFile("ts/idx/one", new ByteArrayInputStream(data), BLOCK_SIZE);
 
-        RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
+        try (RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
                 client, "ts/idx/one", data.length, BLOCK_SIZE, BLOCK_SIZE,
-                statsLogger, SegmentBlockCache.disabled());
-        // Sequential read over 3 blocks — should trigger exactly 3 RPCs.
-        byte[] buf = new byte[BLOCK_SIZE * 3];
-        reader.readFully(buf);
-        reader.close();
+                statsLogger, SegmentBlockCache.disabled())) {
+            // Sequential read over 3 blocks — should trigger exactly 3 RPCs.
+            byte[] buf = new byte[BLOCK_SIZE * 3];
+            reader.readFully(buf);
+        }
 
         long requests = counter("rfs.client", "read_requests");
         long bytes = counter("rfs.client", "read_bytes");
@@ -110,15 +110,13 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
         byte[] data = seqBytes(BLOCK_SIZE * 2);
         client.writeMultipartFile("ts/idx/ctx", new ByteArrayInputStream(data), BLOCK_SIZE);
 
-        RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
+        VectorSearchRequestContext ctx;
+        try (RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
                 client, "ts/idx/ctx", data.length, BLOCK_SIZE, BLOCK_SIZE,
-                statsLogger, SegmentBlockCache.disabled());
-        VectorSearchRequestContext ctx = VectorSearchRequestContext.begin();
-        try {
+                statsLogger, SegmentBlockCache.disabled())) {
+            ctx = VectorSearchRequestContext.begin();
             byte[] buf = new byte[BLOCK_SIZE * 2];
             reader.readFully(buf);
-        } finally {
-            reader.close();
         }
         assertEquals(2L, ctx.getReadFileRangeCalls());
         assertEquals((long) BLOCK_SIZE * 2, ctx.getReadFileRangeBytes());
@@ -134,12 +132,12 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
         byte[] data = seqBytes(BLOCK_SIZE);
         client.writeMultipartFile("ts/idx/no-ctx", new ByteArrayInputStream(data), BLOCK_SIZE);
 
-        RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
+        try (RemoteRandomAccessReader reader = new RemoteRandomAccessReader(
                 client, "ts/idx/no-ctx", data.length, BLOCK_SIZE, BLOCK_SIZE,
-                statsLogger, SegmentBlockCache.disabled());
-        byte[] buf = new byte[BLOCK_SIZE];
-        reader.readFully(buf);
-        reader.close();
+                statsLogger, SegmentBlockCache.disabled())) {
+            byte[] buf = new byte[BLOCK_SIZE];
+            reader.readFully(buf);
+        }
         // No exception means ensureBlockLoaded safely handles a null context.
     }
 
@@ -155,19 +153,19 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
                 statsLogger, cache);
 
         // Warm the cache on reader #1 — 3 misses → 3 RPCs.
-        RemoteRandomAccessReader r1 = (RemoteRandomAccessReader) supplier.get();
         byte[] buf = new byte[BLOCK_SIZE * 3];
-        r1.readFully(buf);
-        r1.close();
+        try (RemoteRandomAccessReader r1 = (RemoteRandomAccessReader) supplier.get()) {
+            r1.readFully(buf);
+        }
         long requestsAfterFirstReader = counter("rfs.client", "read_requests");
         assertEquals(3L, requestsAfterFirstReader);
 
         // Reader #2: same segment, same byte ranges. All reads should be hits.
-        RemoteRandomAccessReader r2 = (RemoteRandomAccessReader) supplier.get();
         VectorSearchRequestContext ctx = VectorSearchRequestContext.begin();
         byte[] buf2 = new byte[BLOCK_SIZE * 3];
-        r2.readFully(buf2);
-        r2.close();
+        try (RemoteRandomAccessReader r2 = (RemoteRandomAccessReader) supplier.get()) {
+            r2.readFully(buf2);
+        }
         long requestsAfterSecondReader = counter("rfs.client", "read_requests");
         assertEquals("no additional RPCs — all served from cache",
                 requestsAfterFirstReader, requestsAfterSecondReader);
@@ -192,20 +190,20 @@ public class RemoteRandomAccessReaderCacheAndMetricsTest {
                 client, "ts/idx/inv", data.length, BLOCK_SIZE, BLOCK_SIZE,
                 statsLogger, cache);
 
-        RemoteRandomAccessReader r1 = (RemoteRandomAccessReader) supplier.get();
         byte[] buf = new byte[BLOCK_SIZE * 2];
-        r1.readFully(buf);
-        r1.close();
+        try (RemoteRandomAccessReader r1 = (RemoteRandomAccessReader) supplier.get()) {
+            r1.readFully(buf);
+        }
         long requestsAfterWarm = counter("rfs.client", "read_requests");
         assertEquals(2L, requestsAfterWarm);
 
         cache.invalidatePath("ts/idx/inv");
 
         // After invalidation, next read must refetch from remote.
-        RemoteRandomAccessReader r2 = (RemoteRandomAccessReader) supplier.get();
         byte[] buf2 = new byte[BLOCK_SIZE * 2];
-        r2.readFully(buf2);
-        r2.close();
+        try (RemoteRandomAccessReader r2 = (RemoteRandomAccessReader) supplier.get()) {
+            r2.readFully(buf2);
+        }
         long requestsAfterInvalidate = counter("rfs.client", "read_requests");
         assertEquals("invalidation forced 2 more RPCs",
                 requestsAfterWarm + 2, requestsAfterInvalidate);
