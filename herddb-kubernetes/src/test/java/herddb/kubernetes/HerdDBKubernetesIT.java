@@ -71,7 +71,9 @@ public class HerdDBKubernetesIT {
     //
     // -XX:NativeMemoryTracking=summary enables `jcmd <pid> VM.native_memory summary` so that
     // KubernetesDiagnostics can report the actual direct/native memory breakdown when a test fails
-    // (issue #438). Adds ~2% steady-state overhead; acceptable for diagnostic CI runs.
+    // (issue #438). Per Oracle, NMT summary mode adds ~5-10% per-malloc overhead — accepted here
+    // because the K3s ITs need the breakdown to diagnose memory-pressure stalls. Remove this flag
+    // once issue #438 is resolved if the overhead becomes a problem in tighter-memory scenarios.
     private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m"
             + " -Dio.netty.maxDirectMemory=268435456"
@@ -325,12 +327,16 @@ public class HerdDBKubernetesIT {
                 LOG.info("Tablespace not ready yet: " + e.getMessage());
             }
             // Periodic mid-wait diagnostics (issue #438): if waitForTablespace is taking
-            // longer than 3 minutes, dump server pod state every 3 minutes so we can see
-            // *why* the tablespace is not ready (stuck on BookKeeper, GC pause, ZK churn, ...).
-            if (System.currentTimeMillis() - lastDiagnostic > TimeUnit.MINUTES.toMillis(3)) {
-                LOG.info("waitForTablespace exceeded 3 minutes; dumping interim diagnostics...");
+            // longer than 5 minutes, dump LIGHTWEIGHT pod state every 5 minutes so we can
+            // see *why* the tablespace is not ready (stuck on BookKeeper, ZK churn, missing
+            // image, ...). Lightweight = pods, events, kubectl describe, recent logs only —
+            // skip the heavier inside-pod jstack/jcmd probes which can themselves hang on a
+            // stuck JVM and burn the per-test 25-min budget. The heavy probes are reserved
+            // for the final timeout dump below and the @Rule TestWatcher.failed dump.
+            if (System.currentTimeMillis() - lastDiagnostic > TimeUnit.MINUTES.toMillis(5)) {
+                LOG.info("waitForTablespace exceeded 5 minutes; dumping interim (lightweight) diagnostics...");
                 try {
-                    KubernetesDiagnostics.dumpAll(k3sContainer, kubernetesClient,
+                    KubernetesDiagnostics.dumpLightweight(k3sContainer, kubernetesClient,
                             "waitForTablespace-progress");
                 } catch (RuntimeException diag) {
                     LOG.log(Level.WARNING, "interim diagnostics dump failed", diag);
@@ -339,7 +345,7 @@ public class HerdDBKubernetesIT {
             }
             Thread.sleep(5000);
         }
-        // Final diagnostic before throwing.
+        // Final diagnostic before throwing — full heavy dump (jstack, jcmd, smaps).
         try {
             KubernetesDiagnostics.dumpAll(k3sContainer, kubernetesClient, "waitForTablespace-timeout");
         } catch (RuntimeException diag) {

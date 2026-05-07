@@ -37,31 +37,29 @@ import org.testcontainers.k3s.K3sContainer;
  * no way to tell whether the JVM is stuck in GC, deadlocked, OOM-ing on direct
  * memory, OOMKilled by the kubelet, or something else.
  *
- * <p>This helper is invoked from a JUnit {@code @Rule TestWatcher} in each
- * {@code *IT} class and dumps:
+ * <p>Two entry points:
  * <ul>
- *   <li>{@code kubectl get pods -A -o wide}, {@code kubectl get events -A}</li>
- *   <li>For each pod in the default namespace:
- *       <ul>
- *         <li>{@code kubectl describe pod} (status, conditions, restartCount, OOMKilled reasons)</li>
- *         <li>Last 1000 lines of pod logs (current container)</li>
- *         <li>Previous-container logs if the container has restarted (where OOMKill messages live)</li>
- *         <li>{@code jstack -l &lt;pid&gt;} (full thread dump with locks)</li>
- *         <li>{@code jcmd &lt;pid&gt; VM.native_memory summary} (requires
- *             {@code -XX:NativeMemoryTracking=summary} on the JVM)</li>
- *         <li>{@code jcmd &lt;pid&gt; GC.heap_info}, {@code VM.flags}</li>
- *         <li>{@code /proc/&lt;pid&gt;/status} VM and Threads counters</li>
- *         <li>{@code /proc/&lt;pid&gt;/smaps_rollup} (RSS / Pss / Anonymous breakdown)</li>
- *       </ul>
- *   </li>
- *   <li>{@code dmesg | tail -200} from the K3s host (looking for
- *       {@code Memory cgroup out of memory} OOMKill events)</li>
+ *   <li>{@link #dumpAll(K3sContainer, KubernetesClient, String)} — full dump
+ *       including inside-pod {@code jstack}/{@code jcmd} probes. Use from a
+ *       JUnit {@code @Rule TestWatcher.failed()} hook and from final
+ *       wait-for-ready timeouts.</li>
+ *   <li>{@link #dumpLightweight(K3sContainer, KubernetesClient, String)} —
+ *       cluster overview + per-pod {@code kubectl describe} + pod logs only.
+ *       Skips the inside-pod JVM probes. Use for periodic mid-wait progress
+ *       dumps where running jstack on a not-yet-stuck JVM only burns time.</li>
  * </ul>
  *
+ * <p>Inside-pod probes ({@code jstack -l}, {@code jcmd VM.native_memory
+ * summary}, {@code jcmd GC.heap_info}, {@code jcmd VM.flags}) are wrapped in
+ * {@code timeout N} so a hung JVM (the exact failure mode being
+ * investigated) cannot itself hang the diagnostic — without this, jstack's
+ * Attach API blocks before producing output and the trailing
+ * {@code | head -n N} cannot terminate it.
+ *
  * <p>Every individual command is wrapped in try/catch so a partial diagnostic
- * is still better than nothing. The output is written via {@link Logger} so
- * Surefire captures it in {@code target/surefire-reports/*-output.txt} which
- * the CI workflow uploads as an artifact on failure.
+ * is still better than nothing. Output goes through {@link Logger} so Surefire
+ * captures it in {@code target/surefire-reports/*-output.txt} which the CI
+ * workflow uploads as an artifact on failure.
  */
 public final class KubernetesDiagnostics {
 
@@ -71,54 +69,121 @@ public final class KubernetesDiagnostics {
     private static final int POD_LOG_TAIL_LINES = 1000;
     /** Maximum log lines to fetch per pod (previous container after restart). */
     private static final int PREV_POD_LOG_TAIL_LINES = 500;
-    /** Per-kubectl-exec timeout: jstack on a stuck JVM may itself be slow. */
-    private static final int EXEC_TIMEOUT_LINES = 1500;
+    /** Cap jstack output (head) — accounting for stack-heavy JVMs. */
+    private static final int JSTACK_MAX_LINES = 1500;
+    /** Per-command shell {@code timeout} so a hung JVM cannot hang the diagnostic. */
+    private static final int JSTACK_TIMEOUT_SECONDS = 30;
+    private static final int JCMD_TIMEOUT_SECONDS = 15;
+    /** Cap dmesg output. */
+    private static final int DMESG_TAIL_LINES = 200;
 
     private KubernetesDiagnostics() {
     }
 
     /**
-     * Dump comprehensive diagnostics for the K3s cluster. Safe to call from a
+     * Dump comprehensive diagnostics for the K3s cluster, including inside-pod
+     * {@code jstack}/{@code jcmd} probes. Safe to call from a
      * {@code @Rule TestWatcher.failed()} hook — every sub-step is best-effort.
      *
+     * <p>Aborts early if the calling thread's interrupt flag is set (the JUnit
+     * {@code Timeout} rule fires by interrupting the test thread; once that
+     * happens, further {@code testcontainers.execInContainer} calls would
+     * either no-op or throw, so it's wasteful to keep iterating).
+     *
      * @param k3s    the testcontainers K3s container (used for kubectl exec / dmesg)
-     * @param client the fabric8 client (used for {@code .pods().getLog()})
+     * @param client the fabric8 client (may be {@code null} if {@code @BeforeClass} failed)
      * @param tag    a short identifier (typically the failing test method name)
      */
     public static void dumpAll(K3sContainer k3s, KubernetesClient client, String tag) {
         section("KUBERNETES DIAGNOSTICS START [" + tag + "]");
-        // Cluster overview ----------------------------------------------------
-        runKubectl(k3s, "get", "pods", "-A", "-o", "wide");
-        runKubectl(k3s, "get", "events", "-A", "--sort-by=.metadata.creationTimestamp");
-        runKubectl(k3s, "top", "pods", "-A");
-        runKubectl(k3s, "top", "nodes");
+        if (dumpClusterOverview(k3s)) {
+            return;
+        }
+        if (dumpPerPodSection(k3s, client, /*heavy=*/ true)) {
+            return;
+        }
+        section("DMESG (K3s host, last " + DMESG_TAIL_LINES + " lines)");
+        runK3sShell(k3s, "dmesg 2>/dev/null | tail -" + DMESG_TAIL_LINES + " || echo 'dmesg unavailable'");
+        section("KUBERNETES DIAGNOSTICS END [" + tag + "]");
+    }
 
-        // Per-pod -------------------------------------------------------------
+    /**
+     * Lightweight diagnostic dump: cluster overview + per-pod
+     * {@code kubectl describe} and recent logs only. Skips the inside-pod
+     * {@code jstack}/{@code jcmd} probes which can themselves hang on a
+     * stuck JVM. Use this for periodic mid-wait progress dumps.
+     */
+    public static void dumpLightweight(K3sContainer k3s, KubernetesClient client, String tag) {
+        section("KUBERNETES LIGHTWEIGHT DIAGNOSTICS START [" + tag + "]");
+        if (dumpClusterOverview(k3s)) {
+            return;
+        }
+        if (dumpPerPodSection(k3s, client, /*heavy=*/ false)) {
+            return;
+        }
+        section("KUBERNETES LIGHTWEIGHT DIAGNOSTICS END [" + tag + "]");
+    }
+
+    // -------------------------------------------------------------------------
+    // High-level sections
+    // -------------------------------------------------------------------------
+
+    /**
+     * Cluster overview: {@code kubectl get pods -A} + {@code get events -A}.
+     * Returns true if the calling thread was interrupted mid-dump (caller
+     * should abort).
+     */
+    private static boolean dumpClusterOverview(K3sContainer k3s) {
+        runKubectl(k3s, "get", "pods", "-A", "-o", "wide");
+        if (Thread.currentThread().isInterrupted()) {
+            LOG.warning("Diagnostic thread interrupted; aborting dump.");
+            return true;
+        }
+        runKubectl(k3s, "get", "events", "-A", "--sort-by=.metadata.creationTimestamp");
+        return Thread.currentThread().isInterrupted();
+    }
+
+    /**
+     * Per-pod section: {@code kubectl describe} + logs (always), plus
+     * {@code jstack}/{@code jcmd} + {@code /proc/<pid>/...} when
+     * {@code heavy=true}. Returns true if interrupted.
+     *
+     * <p>Tolerates a {@code null} client (set when {@code @BeforeClass}
+     * failed before {@code kubernetesClient} was assigned): in that case
+     * the per-pod section is skipped but kubectl-level diagnostics still
+     * ran via {@link #dumpClusterOverview}.
+     */
+    private static boolean dumpPerPodSection(K3sContainer k3s, KubernetesClient client, boolean heavy) {
+        if (client == null) {
+            LOG.info("Per-pod section skipped: KubernetesClient is null (likely @BeforeClass failure).");
+            return false;
+        }
         List<Pod> pods;
         try {
             pods = client.pods().inNamespace("default").list().getItems();
         } catch (RuntimeException e) {
             LOG.log(Level.WARNING, "Listing pods in default namespace failed", e);
-            pods = List.of();
+            return false;
         }
         for (Pod pod : pods) {
+            if (Thread.currentThread().isInterrupted()) {
+                LOG.warning("Diagnostic thread interrupted mid per-pod loop; aborting dump.");
+                return true;
+            }
             String podName = pod.getMetadata().getName();
             section("POD " + podName);
             runKubectl(k3s, "describe", "pod", podName);
             dumpPodLogs(client, pod);
-            dumpJvmState(k3s, podName);
-            dumpProcessState(k3s, podName);
+            if (heavy) {
+                dumpJvmState(k3s, podName);
+                dumpProcessState(k3s, podName);
+            }
         }
-
-        // K3s host ------------------------------------------------------------
-        section("DMESG (K3s host)");
-        runK3sShell(k3s, "dmesg 2>/dev/null | tail -200 || echo 'dmesg unavailable'");
-
-        section("KUBERNETES DIAGNOSTICS END [" + tag + "]");
+        return false;
     }
 
     // -------------------------------------------------------------------------
-    // Pod logs
+    // Pod logs (always available, lightweight)
     // -------------------------------------------------------------------------
 
     private static void dumpPodLogs(KubernetesClient client, Pod pod) {
@@ -163,46 +228,55 @@ public final class KubernetesDiagnostics {
     }
 
     // -------------------------------------------------------------------------
-    // JVM state inside the pod
+    // JVM state inside the pod (heavy)
     // -------------------------------------------------------------------------
 
     /**
-     * jstack and jcmd inside the pod's JVM. The HerdDB docker image is built
-     * from {@code eclipse-temurin:25-jdk} (see herddb-docker/.../Dockerfile)
-     * so {@code jstack} and {@code jcmd} are on PATH.
+     * jstack and jcmd inside the pod's JVM, each wrapped in {@code timeout N}
+     * so a hung JVM cannot block the diagnostic forever. The HerdDB docker
+     * image is built from {@code eclipse-temurin:25-jdk} so {@code jstack},
+     * {@code jcmd}, and the {@code timeout} coreutil are all on PATH.
      *
      * <p>{@code jcmd VM.native_memory summary} requires the JVM to be started
      * with {@code -XX:NativeMemoryTracking=summary}; a missing flag is
      * gracefully handled (jcmd prints {@code Native memory tracking is not enabled}).
      */
     private static void dumpJvmState(K3sContainer k3s, String podName) {
-        // Find the java PID. Prefer pgrep on a HerdDB main class; fall back to any java.
+        // Find the java PID. Prefer the HerdDB server main class; fall back to any java.
+        // Tightened pattern (was 'herddb\\.|herddb-' which also matched the bash launcher
+        // /opt/herddb/bin/service while it was still resident — see issue #438 review).
         String shellCmd =
                 "set +e; "
-                + "pid=$(pgrep -f 'herddb\\.|herddb-' 2>/dev/null | head -n1); "
+                + "pid=$(pgrep -f 'java .*herddb\\.' 2>/dev/null | head -n1); "
                 + "if [ -z \"$pid\" ]; then pid=$(pgrep -x java 2>/dev/null | head -n1); fi; "
                 + "if [ -z \"$pid\" ]; then echo 'NO_JAVA_PID'; ps -ef; exit 0; fi; "
                 + "echo '----- pid -----'; echo \"$pid\"; "
-                + "echo '----- jcmd VM.flags -----'; "
-                + "jcmd \"$pid\" VM.flags 2>&1 || echo 'jcmd VM.flags failed'; "
-                + "echo '----- jcmd GC.heap_info -----'; "
-                + "jcmd \"$pid\" GC.heap_info 2>&1 || echo 'jcmd GC.heap_info failed'; "
-                + "echo '----- jcmd VM.native_memory summary -----'; "
-                + "jcmd \"$pid\" VM.native_memory summary 2>&1 || echo 'jcmd VM.native_memory failed'; "
-                + "echo '----- jstack -l (head " + EXEC_TIMEOUT_LINES + " lines) -----'; "
-                + "jstack -l \"$pid\" 2>&1 | head -n " + EXEC_TIMEOUT_LINES + " || echo 'jstack failed'";
+                + "echo '----- jcmd VM.flags (timeout " + JCMD_TIMEOUT_SECONDS + "s) -----'; "
+                + "timeout " + JCMD_TIMEOUT_SECONDS + " jcmd \"$pid\" VM.flags 2>&1 "
+                + "  || echo 'jcmd VM.flags failed or timed out'; "
+                + "echo '----- jcmd GC.heap_info (timeout " + JCMD_TIMEOUT_SECONDS + "s) -----'; "
+                + "timeout " + JCMD_TIMEOUT_SECONDS + " jcmd \"$pid\" GC.heap_info 2>&1 "
+                + "  || echo 'jcmd GC.heap_info failed or timed out'; "
+                + "echo '----- jcmd VM.native_memory summary (timeout " + JCMD_TIMEOUT_SECONDS + "s) -----'; "
+                + "timeout " + JCMD_TIMEOUT_SECONDS + " jcmd \"$pid\" VM.native_memory summary 2>&1 "
+                + "  || echo 'jcmd VM.native_memory failed or timed out'; "
+                + "echo '----- jstack -l (timeout " + JSTACK_TIMEOUT_SECONDS + "s, head "
+                + JSTACK_MAX_LINES + " lines) -----'; "
+                + "timeout " + JSTACK_TIMEOUT_SECONDS + " jstack -l \"$pid\" 2>&1 "
+                + "  | head -n " + JSTACK_MAX_LINES + " "
+                + "  || echo 'jstack failed or timed out'";
         section("JVM STATE " + podName);
         runKubectlExec(k3s, podName, shellCmd);
     }
 
     // -------------------------------------------------------------------------
-    // Process / cgroup state inside the pod
+    // Process / cgroup state inside the pod (heavy)
     // -------------------------------------------------------------------------
 
     private static void dumpProcessState(K3sContainer k3s, String podName) {
         String shellCmd =
                 "set +e; "
-                + "pid=$(pgrep -f 'herddb\\.|herddb-' 2>/dev/null | head -n1); "
+                + "pid=$(pgrep -f 'java .*herddb\\.' 2>/dev/null | head -n1); "
                 + "if [ -z \"$pid\" ]; then pid=$(pgrep -x java 2>/dev/null | head -n1); fi; "
                 + "if [ -z \"$pid\" ]; then echo 'NO_JAVA_PID'; exit 0; fi; "
                 + "echo '----- /proc/'\"$pid\"'/status (VM/RSS/Threads/State) -----'; "
