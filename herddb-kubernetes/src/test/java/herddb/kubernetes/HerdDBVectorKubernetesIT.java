@@ -39,12 +39,17 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestWatcher;
+import org.junit.rules.Timeout;
+import org.junit.runner.Description;
 import org.testcontainers.k3s.K3sContainer;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
@@ -73,9 +78,12 @@ public class HerdDBVectorKubernetesIT {
     // Recent off-heap relocations (issues #399, #409, #411) make even simple SQL traffic allocate enough direct
     // memory that the previous 64 MiB cap caused server stalls on CI (issue #438).
     // Byte value: 134217728 = 128 * 1024 * 1024 (= MaxDirectMemorySize=128m).
+    // -XX:NativeMemoryTracking=summary enables jcmd VM.native_memory summary inside the pod
+    // so KubernetesDiagnostics can show actual direct/native memory breakdown on test failure (issue #438).
     private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
             + " -Dio.netty.maxDirectMemory=134217728"
+            + " -XX:NativeMemoryTracking=summary"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -84,6 +92,24 @@ public class HerdDBVectorKubernetesIT {
 
     private static KubernetesClient kubernetesClient;
     private static String helmChartPath;
+
+    /** Per-test wall-clock timeout (issue #438). See HerdDBKubernetesIT.perTestTimeout. */
+    @Rule
+    public Timeout perTestTimeout = new Timeout(25, TimeUnit.MINUTES);
+
+    /** Dump cluster diagnostics on test failure (issue #438). */
+    @Rule
+    public TestWatcher diagnosticsRule = new TestWatcher() {
+        @Override
+        protected void failed(Throwable e, Description description) {
+            LOG.severe("Test " + description.getMethodName() + " FAILED: " + e);
+            try {
+                KubernetesDiagnostics.dumpAll(k3s, kubernetesClient, description.getMethodName());
+            } catch (RuntimeException diag) {
+                LOG.log(Level.WARNING, "diagnostics dump failed", diag);
+            }
+        }
+    };
 
     @BeforeClass
     public static void setup() throws Exception {
@@ -175,6 +201,7 @@ public class HerdDBVectorKubernetesIT {
         String serverJavaOpts = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
                 + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m"
                 + " -Dio.netty.maxDirectMemory=268435456"
+                + " -XX:NativeMemoryTracking=summary"
                 + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
         values.put("server.javaOpts", serverJavaOpts);
         values.put("server.resources.requests.memory", "768Mi");

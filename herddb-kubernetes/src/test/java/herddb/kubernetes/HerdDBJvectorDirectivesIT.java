@@ -38,12 +38,17 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestWatcher;
+import org.junit.rules.Timeout;
+import org.junit.runner.Description;
 import org.testcontainers.k3s.K3sContainer;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
@@ -71,6 +76,24 @@ public class HerdDBJvectorDirectivesIT {
 
     private static KubernetesClient kubernetesClient;
     private static String helmChartPath;
+
+    /** Per-test wall-clock timeout (issue #438). See HerdDBKubernetesIT.perTestTimeout. */
+    @Rule
+    public Timeout perTestTimeout = new Timeout(25, TimeUnit.MINUTES);
+
+    /** Dump cluster diagnostics on test failure (issue #438). */
+    @Rule
+    public TestWatcher diagnosticsRule = new TestWatcher() {
+        @Override
+        protected void failed(Throwable e, Description description) {
+            LOG.severe("Test " + description.getMethodName() + " FAILED: " + e);
+            try {
+                KubernetesDiagnostics.dumpAll(k3s, kubernetesClient, description.getMethodName());
+            } catch (RuntimeException diag) {
+                LOG.log(Level.WARNING, "diagnostics dump failed", diag);
+            }
+        }
+    };
 
     @BeforeClass
     public static void setup() throws Exception {
@@ -143,6 +166,7 @@ public class HerdDBJvectorDirectivesIT {
                 "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
                         + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
                         + " -Dio.netty.maxDirectMemory=134217728"
+                        + " -XX:NativeMemoryTracking=summary"
                         + " -Djava.awt.headless=true --add-modules jdk.incubator.vector");
         values.put("tools.enabled", "false");
         values.put("zookeeper.enabled", "false");
@@ -156,6 +180,7 @@ public class HerdDBJvectorDirectivesIT {
                 "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
                         + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
                         + " -Dio.netty.maxDirectMemory=134217728"
+                        + " -XX:NativeMemoryTracking=summary"
                         + " -Djava.awt.headless=true --add-modules jdk.incubator.vector");
         values.put("indexingService.resources.requests.memory", "384Mi");
         values.put("indexingService.resources.requests.cpu", "0.5");

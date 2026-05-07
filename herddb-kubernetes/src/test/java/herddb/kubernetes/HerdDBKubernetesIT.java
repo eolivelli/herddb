@@ -36,12 +36,17 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestWatcher;
+import org.junit.rules.Timeout;
+import org.junit.runner.Description;
 import org.testcontainers.k3s.K3sContainer;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
@@ -63,9 +68,14 @@ public class HerdDBKubernetesIT {
     // Recent off-heap relocations (issues #399, #409, #411) make even simple SQL traffic allocate enough direct
     // memory that the previous 128 MiB cap caused server stalls on CI (issue #438).
     // Byte values: 268435456 = 256 * 1024 * 1024 (= MaxDirectMemorySize=256m).
+    //
+    // -XX:NativeMemoryTracking=summary enables `jcmd <pid> VM.native_memory summary` so that
+    // KubernetesDiagnostics can report the actual direct/native memory breakdown when a test fails
+    // (issue #438). Adds ~2% steady-state overhead; acceptable for diagnostic CI runs.
     private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m"
             + " -Dio.netty.maxDirectMemory=268435456"
+            + " -XX:NativeMemoryTracking=summary"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -73,6 +83,34 @@ public class HerdDBKubernetesIT {
             .withExposedPorts(6443);
 
     private static KubernetesClient kubernetesClient;
+
+    /**
+     * Per-test wall-clock timeout (issue #438). The JDBC client already has a 600s
+     * application-level timeout; this rule bounds the test method itself in case
+     * something below the JDBC layer (e.g. {@code kubectl exec} streaming) hangs
+     * indefinitely. 25 minutes leaves headroom for boot + slow first-DDL + diagnostics.
+     */
+    @Rule
+    public Timeout perTestTimeout = new Timeout(25, TimeUnit.MINUTES);
+
+    /**
+     * Dump comprehensive diagnostics from the K3s cluster on test failure
+     * (issue #438). Without this, the only signal we get from CI is
+     * "Request timedout (600s)" with no clue whether the server JVM was
+     * stuck in GC, OOMKilled, deadlocked, or otherwise hung.
+     */
+    @Rule
+    public TestWatcher diagnosticsRule = new TestWatcher() {
+        @Override
+        protected void failed(Throwable e, Description description) {
+            LOG.severe("Test " + description.getMethodName() + " FAILED: " + e);
+            try {
+                KubernetesDiagnostics.dumpAll(k3s, kubernetesClient, description.getMethodName());
+            } catch (RuntimeException diag) {
+                LOG.log(Level.WARNING, "diagnostics dump failed", diag);
+            }
+        }
+    };
 
     @BeforeClass
     public static void setup() throws Exception {
@@ -277,6 +315,7 @@ public class HerdDBKubernetesIT {
      */
     static void waitForTablespace(K3sContainer k3sContainer, String toolsPod) throws Exception {
         long deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(10);
+        long lastDiagnostic = System.currentTimeMillis();
         while (System.currentTimeMillis() < deadline) {
             try {
                 execSqlViaKubectl(k3sContainer, toolsPod, "SELECT * FROM systables LIMIT 1");
@@ -285,7 +324,26 @@ public class HerdDBKubernetesIT {
             } catch (Exception e) {
                 LOG.info("Tablespace not ready yet: " + e.getMessage());
             }
+            // Periodic mid-wait diagnostics (issue #438): if waitForTablespace is taking
+            // longer than 3 minutes, dump server pod state every 3 minutes so we can see
+            // *why* the tablespace is not ready (stuck on BookKeeper, GC pause, ZK churn, ...).
+            if (System.currentTimeMillis() - lastDiagnostic > TimeUnit.MINUTES.toMillis(3)) {
+                LOG.info("waitForTablespace exceeded 3 minutes; dumping interim diagnostics...");
+                try {
+                    KubernetesDiagnostics.dumpAll(k3sContainer, kubernetesClient,
+                            "waitForTablespace-progress");
+                } catch (RuntimeException diag) {
+                    LOG.log(Level.WARNING, "interim diagnostics dump failed", diag);
+                }
+                lastDiagnostic = System.currentTimeMillis();
+            }
             Thread.sleep(5000);
+        }
+        // Final diagnostic before throwing.
+        try {
+            KubernetesDiagnostics.dumpAll(k3sContainer, kubernetesClient, "waitForTablespace-timeout");
+        } catch (RuntimeException diag) {
+            LOG.log(Level.WARNING, "final diagnostics dump failed", diag);
         }
         throw new RuntimeException("Timed out waiting for tablespace to be ready");
     }
@@ -340,6 +398,17 @@ public class HerdDBKubernetesIT {
         }
 
         if (exitCode != 0) {
+            // Diagnostic dump on SQL failure (issue #438): every K3s IT failure
+            // we have seen on CI has this exact code path, so capture cluster
+            // state HERE — before the test method returns and the @Rule
+            // TestWatcher kicks in (the watcher fires too, but captures from a
+            // slightly later vantage point; both are kept for safety).
+            try {
+                KubernetesDiagnostics.dumpAll(k3sContainer, kubernetesClient,
+                        "execSqlViaKubectl-failure");
+            } catch (RuntimeException diag) {
+                LOG.log(Level.WARNING, "diagnostics dump failed", diag);
+            }
             throw new RuntimeException("SQL failed (exit=" + exitCode + "): " + output);
         }
         return output;
@@ -362,10 +431,12 @@ public class HerdDBKubernetesIT {
 
     // Same rationale as SERVER_JAVA_OPTS: set -Dio.netty.maxDirectMemory explicitly to match
     // MaxDirectMemorySize so Netty uses the Unsafe no-cleaner path (issue #253, issue #438).
+    // -XX:NativeMemoryTracking=summary enables jcmd VM.native_memory summary for diagnostics.
     // Byte values: 134217728 = 128 * 1024 * 1024 (= MaxDirectMemorySize=128m).
     private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
             + " -Dio.netty.maxDirectMemory=134217728"
+            + " -XX:NativeMemoryTracking=summary"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     private static String helmTemplate(String chartPath) throws Exception {

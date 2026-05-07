@@ -39,13 +39,18 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.FixMethodOrder;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestWatcher;
+import org.junit.rules.Timeout;
+import org.junit.runner.Description;
 import org.junit.runners.MethodSorters;
 import org.testcontainers.k3s.K3sContainer;
 import org.testcontainers.utility.DockerImageName;
@@ -70,13 +75,17 @@ public class HerdDBClusterKubernetesIT {
     // memory that the previous 128 MiB cap caused server stalls on CI (issue #438).
     // Byte values: 268435456 = 256 * 1024 * 1024 (= MaxDirectMemorySize=256m);
     //              134217728 = 128 * 1024 * 1024 (= MaxDirectMemorySize=128m).
+    // -XX:NativeMemoryTracking=summary enables jcmd VM.native_memory summary inside the pod
+    // so KubernetesDiagnostics can show actual direct/native memory breakdown on test failure (issue #438).
     private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m"
             + " -Dio.netty.maxDirectMemory=268435456"
+            + " -XX:NativeMemoryTracking=summary"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
     private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
             + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
             + " -Dio.netty.maxDirectMemory=134217728"
+            + " -XX:NativeMemoryTracking=summary"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -86,6 +95,24 @@ public class HerdDBClusterKubernetesIT {
     private static KubernetesClient kubernetesClient;
     private static String helmChartPath;
     private static List<HasMetadata> lastAppliedResources;
+
+    /** Per-test wall-clock timeout (issue #438). See HerdDBKubernetesIT.perTestTimeout. */
+    @Rule
+    public Timeout perTestTimeout = new Timeout(25, TimeUnit.MINUTES);
+
+    /** Dump cluster diagnostics on test failure (issue #438). */
+    @Rule
+    public TestWatcher diagnosticsRule = new TestWatcher() {
+        @Override
+        protected void failed(Throwable e, Description description) {
+            LOG.severe("Test " + description.getMethodName() + " FAILED: " + e);
+            try {
+                KubernetesDiagnostics.dumpAll(k3s, kubernetesClient, description.getMethodName());
+            } catch (RuntimeException diag) {
+                LOG.log(Level.WARNING, "diagnostics dump failed", diag);
+            }
+        }
+    };
 
     @BeforeClass
     public static void setup() throws Exception {
