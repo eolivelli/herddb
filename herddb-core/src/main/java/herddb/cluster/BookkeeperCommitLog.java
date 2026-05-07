@@ -63,8 +63,8 @@ import org.apache.bookkeeper.client.api.LastConfirmedAndEntry;
 import org.apache.bookkeeper.client.api.LedgerEntries;
 import org.apache.bookkeeper.client.api.LedgerMetadata;
 import org.apache.bookkeeper.client.api.ReadHandle;
-import org.apache.bookkeeper.client.api.WriteAdvHandle;
 import org.apache.bookkeeper.client.api.WriteFlag;
+import org.apache.bookkeeper.client.api.WriteHandle;
 import org.apache.bookkeeper.common.concurrent.FutureUtils;
 import org.apache.bookkeeper.versioning.Versioned;
 
@@ -139,7 +139,7 @@ public class BookkeeperCommitLog extends CommitLog {
     // Visible for Testing
     public class CommitFileWriter {
 
-        private final WriteAdvHandle out;
+        private final WriteHandle out;
         private final long ledgerId;
         private volatile boolean errorOccurredDuringWrite;
         private final AtomicLong pendingAdds = new AtomicLong();
@@ -148,7 +148,7 @@ public class BookkeeperCommitLog extends CommitLog {
         /**
          * Single-threaded executor borrowed from BookKeeper's main worker pool
          * via {@code BookKeeper.getMainWorkerPool().chooseThread(ledgerId)}.
-         * Every {@code writeAsync} call for this ledger is funnelled through
+         * Every {@code appendAsync} call for this ledger is funnelled through
          * this one thread so that BookKeeper's internal {@code synchronized
          * (this)} block in {@code LedgerHandle.doAsyncAddEntry} is never
          * contended (issue #434). Pulsar's {@code ManagedLedgerImpl} uses the
@@ -167,7 +167,7 @@ public class BookkeeperCommitLog extends CommitLog {
          * thread. So our submitted lambdas and the corresponding BK acks
          * <em>interleave</em> on a single thread, which keeps
          * {@code lh.lastAddConfirmed} fresh between consecutive
-         * {@code writeAsync} calls. That freshness is essential for the
+         * {@code appendAsync} calls. That freshness is essential for the
          * piggybacked LAC the writer sends with each new entry — a
          * dedicated executor (not on BK's pool) batches our lambdas ahead
          * of any acks, all entries piggyback the same stale LAC, and
@@ -179,40 +179,22 @@ public class BookkeeperCommitLog extends CommitLog {
         private final ExecutorService executor;
 
         /**
-         * Last entry id assigned to a write submitted to BookKeeper. Mutated
-         * <em>only</em> from the {@link #executor} thread; held in an
-         * {@link AtomicLong} (rather than a {@code volatile long}) so the
-         * close-path log statement on the rotation thread observes the
-         * latest value via a clean atomic load — and so SpotBugs is satisfied
-         * that the executor-side {@code incrementAndGet} / {@code decrementAndGet}
-         * do not look like a non-atomic volatile increment. There is never
-         * any contention on this atomic: only the single executor thread
-         * mutates it.
-         *
-         * <p>Replaces the previous {@code WriteHandle.getLastAddPushed()}
-         * call, which the {@link WriteAdvHandle} interface does not expose
-         * (issue #434). Semantically identical: both equal the entry id of
-         * the last entry handed off to BookKeeper.
-         */
-        private final AtomicLong lastAssignedEntryId = new AtomicLong(-1L);
-
-        /**
          * Local cache of the ledger's closed state. Set to {@code true} in
          * {@link #close()} (always called under the outer write lock) so that
          * {@link #isWritable()} can check closure without acquiring the
          * intrinsic {@code synchronized} lock on the BookKeeper
-         * {@link WriteAdvHandle} instance, eliminating monitor contention under
+         * {@link WriteHandle} instance, eliminating monitor contention under
          * concurrent ingest (issue #385).
          */
         private volatile boolean outClosed = false;
 
         /**
          * Running count of serialised bytes <em>requested</em> to BookKeeper,
-         * used in place of {@link WriteAdvHandle#getLength()} (which is
-         * {@code synchronized} on the {@link WriteAdvHandle} instance) in the hot
+         * used in place of {@link WriteHandle#getLength()} (which is
+         * {@code synchronized} on the {@link WriteHandle} instance) in the hot
          * {@link #isWritable()} check, eliminating monitor contention under
          * concurrent ingest (issue #385).
-         * Incremented <em>before</em> each {@code writeAsync} dispatch so that
+         * Incremented <em>before</em> each {@code appendAsync} dispatch so that
          * size-based ledger rotation fires promptly even when writes are submitted
          * faster than BK acknowledges them (e.g. in tight async-write loops).
          * On write failure the counter is NOT decremented: the ledger rolls
@@ -250,7 +232,7 @@ public class BookkeeperCommitLog extends CommitLog {
             }
         }
 
-        private WriteAdvHandle makeNewWriteHandle(int actualEnsembleSize, int actualWriteQuorumSize, int actualAckQuorumSize,
+        private WriteHandle makeNewWriteHandle(int actualEnsembleSize, int actualWriteQuorumSize, int actualAckQuorumSize,
                                                Map<String, byte[]> metadata) throws BKException, LogNotAvailableException {
             BKNotEnoughBookiesException lastError = null;
             long maxTime = System.currentTimeMillis() + parent.getBookkeeperClusterReadyWaitTime();
@@ -265,18 +247,33 @@ public class BookkeeperCommitLog extends CommitLog {
                 // within the bookkeeperClusterReadyWaitTime window.
                 long remaining = maxTime - System.currentTimeMillis();
                 long attemptMs = Math.max(1_000L, Math.min(30_000L, remaining));
-                // Use makeAdv() to obtain a WriteAdvHandle: caller-assigned entryId
-                // lets the writer thread pre-compute the LSN without going through
-                // BK's internal {@code ++lastAddPushed} increment, and
-                // DigestType.DUMMY skips the per-entry CRC32C compute on the client
-                // side (BookKeeper journal/ledger storage retains its own per-entry
-                // checksums and TCP provides wire integrity). Read paths use
-                // {@code setEnableDigestTypeAutodetection(true)} (set in
-                // BookkeeperCommitLogManager) so existing CRC32C ledgers continue
-                // to read with CRC32C; only newly created ledgers carry DUMMY
-                // (issue #434). WriteFlag.NONE keeps the default
-                // synchronous-fsync behaviour — DEFERRED_SYNC would weaken durability.
-                CompletableFuture<WriteAdvHandle> createFuture = bookKeeper
+                // Open a regular WriteHandle (LedgerHandle): BookKeeper auto-assigns
+                // sequential entry ids inside {@code synchronized (this)} on every
+                // {@code appendAsync} call. Because the single-thread executor (see
+                // {@link #executor}) is the only producer for this ledger, that
+                // monitor is uncontended even though it still exists.
+                //
+                // We deliberately do NOT use {@code makeAdv()} / {@code WriteAdvHandle}
+                // here: it switches BK's pending-ops queue from a lock-free
+                // {@code ConcurrentLinkedQueue} to a {@code PriorityBlockingQueue},
+                // which adds two O(n) operations per write — a {@code contains(op)}
+                // duplicate-id guard on the hot {@code asyncAddEntry} path and a
+                // {@code toArray()} scan inside the background
+                // {@code monitorPendingAddOps} timer — that grow with the in-flight
+                // entry count. The single-thread pipeline never reuses or skips ids,
+                // so caller-assigned ids would buy zero correctness guarantee while
+                // adding measurable overhead under high-fanout ingest (issue #444).
+                //
+                // {@code DigestType.DUMMY} skips the per-entry CRC32C compute on the
+                // client side (BookKeeper journal/ledger storage retains its own
+                // per-entry checksums and TCP provides wire integrity). Read paths
+                // use {@code setEnableDigestTypeAutodetection(true)} (set in
+                // {@link BookkeeperCommitLogManager}) so existing CRC32C ledgers
+                // continue to read with CRC32C; only newly created ledgers carry
+                // DUMMY (issue #434). {@code WriteFlag.NONE} keeps the default
+                // synchronous-fsync behaviour — {@code DEFERRED_SYNC} would weaken
+                // durability.
+                CompletableFuture<WriteHandle> createFuture = bookKeeper
                         .newCreateLedgerOp()
                         .withEnsembleSize(actualEnsembleSize)
                         .withWriteQuorumSize(actualWriteQuorumSize)
@@ -285,7 +282,6 @@ public class BookkeeperCommitLog extends CommitLog {
                         .withPassword(SHARED_SECRET.getBytes(StandardCharsets.UTF_8))
                         .withWriteFlags(WriteFlag.NONE)
                         .withCustomMetadata(metadata)
-                        .makeAdv()
                         .execute();
                 try {
                     return createFuture.get(attemptMs, TimeUnit.MILLISECONDS);
@@ -352,7 +348,7 @@ public class BookkeeperCommitLog extends CommitLog {
          * the scenario where a transport-level {@link RuntimeException} (e.g.
          * "Bookie is not running any more" from the JVM-local transport) sets
          * {@code errorOccurredDuringWrite=true} and {@code writeError} to a
-         * <em>non-BKException</em> while leaving the BK {@link WriteAdvHandle}
+         * <em>non-BKException</em> while leaving the BK {@link WriteHandle}
          * in the OPEN state.
          *
          * <p>This method intentionally bypasses {@link #handleBookKeeperFailure} so
@@ -389,7 +385,7 @@ public class BookkeeperCommitLog extends CommitLog {
             localLength.addAndGet(entryBytes);
             pendingAdds.incrementAndGet();
             final CompletableFuture<LogSequenceNumber> result = new CompletableFuture<>();
-            // Hot path of issue #434: instead of calling out.writeAsync from
+            // Hot path of issue #434: instead of calling out.appendAsync from
             // the producer thread (where BookKeeper's
             // synchronized(this) block in LedgerHandle.doAsyncAddEntry was
             // contended by every concurrent ingest thread, accounting for
@@ -402,14 +398,10 @@ public class BookkeeperCommitLog extends CommitLog {
             try {
                 executor.execute(() -> {
                     // Short-circuit: if a previous write on this ledger already
-                    // failed, do NOT consume an entryId or call into BK. Under
-                    // {@link WriteAdvHandle}'s "ack-only-when-prefix-acked"
-                    // contract, gapping an entryId would stall every later
-                    // entry's ack until BK's addEntryQuorumTimeout fires (60 s
-                    // by default). Failing the future cleanly here also lets
-                    // {@link #waitForAllPendingWrites()} drain promptly so
-                    // ledger rotation can open a fresh ledger right away
-                    // (issue #434, PR #437 review follow-up).
+                    // failed, do NOT call into BK. Failing the future cleanly
+                    // here lets {@link #waitForAllPendingWrites()} drain
+                    // promptly so ledger rotation can open a fresh ledger
+                    // right away (issue #434, PR #437 review follow-up).
                     if (errorOccurredDuringWrite) {
                         ReferenceCountUtil.safeRelease(serialize);
                         pendingAdds.decrementAndGet();
@@ -417,20 +409,24 @@ public class BookkeeperCommitLog extends CommitLog {
                                 "writer entered failed state before this entry was dispatched"));
                         return;
                     }
-                    // entryId assignment is single-threaded (only this executor
-                    // thread mutates lastAssignedEntryId). The atomic
-                    // load/store also publishes the new value to readers on
-                    // other threads (used by the close-time log statement).
-                    final long entryId = lastAssignedEntryId.incrementAndGet();
                     try {
-                        out.writeAsync(entryId, serialize)
+                        // {@link WriteHandle#appendAsync} returns a future of the
+                        // BK-assigned entry id. BK assigns ids sequentially under
+                        // {@code synchronized (this)} in {@code asyncAddEntry}, so
+                        // with our single-thread executor calling appendAsync one
+                        // entry at a time, ids are dense and monotonic per ledger
+                        // (issue #444 — replaced explicit ids assigned via
+                        // {@code WriteAdvHandle.writeAsync} which forced BK's
+                        // pending-ops queue to a {@link java.util.concurrent.PriorityBlockingQueue}
+                        // with two O(n) lock-protected operations per write).
+                        out.appendAsync(serialize)
                                 .whenComplete((ackedId, error) -> {
                                     if (error == null) {
                                         pendingAdds.decrementAndGet();
                                         if (edit.type != LogEntryType.NOOP) { // do not take into account NOOPs
                                             lastApplicationWriteTs = System.currentTimeMillis();
                                         }
-                                        result.complete(new LogSequenceNumber(ledgerId, entryId));
+                                        result.complete(new LogSequenceNumber(ledgerId, ackedId));
                                     } else {
                                         writeError.set(error);
                                         pendingAdds.decrementAndGet();
@@ -440,7 +436,7 @@ public class BookkeeperCommitLog extends CommitLog {
                                     }
                                 });
                     } catch (RuntimeException synchronousFailure) {
-                        // Defensive: if writeAsync throws synchronously
+                        // Defensive: if appendAsync throws synchronously
                         // (e.g. an internal BK assertion), the buffer is
                         // leaked and the future never completes — leaving
                         // callers hung forever. Catching RuntimeException
@@ -450,15 +446,13 @@ public class BookkeeperCommitLog extends CommitLog {
                         // waitForAllPendingWrites() can drain, and the
                         // caller's future fails cleanly. This path is not
                         // expected to fire under normal BK operation.
-                        // Roll back lastAssignedEntryId so subsequent tasks
-                        // already in the executor queue do NOT skip past the
-                        // failed entry id and create a gap that BK would
-                        // otherwise try to fill — matters because
-                        // WriteAdvHandle ack semantics gate every later
-                        // entry's commit on the missing prefix. Single-thread
-                        // executor → atomic decrement is race-free
-                        // (PR #437 review follow-up).
-                        lastAssignedEntryId.decrementAndGet();
+                        // No entry-id rollback is required: with
+                        // {@code appendAsync}, BK assigns the id only after
+                        // entering its own {@code synchronized} block inside
+                        // {@code doAsyncAddEntry}, so a synchronous throw at
+                        // any earlier point leaves {@code lastAddPushed}
+                        // untouched and no gap can appear in the entry-id
+                        // sequence (issue #444).
                         ReferenceCountUtil.safeRelease(serialize);
                         writeError.set(synchronousFailure);
                         pendingAdds.decrementAndGet();
@@ -506,26 +500,29 @@ public class BookkeeperCommitLog extends CommitLog {
             // that still holds a stale reference to this writer (captured
             // before the write lock was acquired for rotation) sees
             // isWritable()==false immediately, without entering the
-            // synchronized WriteAdvHandle.isClosed() (issue #385).
+            // synchronized WriteHandle.isClosed() (issue #385).
             // close() is always invoked under the outer write lock, so
             // there are no concurrent readers in getValidWriter() at this
             // exact moment; the flag is for post-rotation observers.
             outClosed = true;
             try {
-                // lastAssignedEntryId replaces the old WriteHandle.getLastAddPushed()
-                // log field (not exposed by WriteAdvHandle, see field javadoc).
-                // localLength.get() is used in place of the synchronized
-                // out.getLength() so close still avoids the BK monitor on the
-                // shutdown path (consistent with isWritable() — issue #385).
+                // out.getLastAddPushed() is exposed by {@link WriteHandle}
+                // (issue #444 reverted the caller-assigned-id pipeline). It is
+                // {@code synchronized} on the LedgerHandle, but close() runs on
+                // the rotation thread under the outer write lock so monitor
+                // contention is not a concern here. localLength.get() is used
+                // in place of the synchronized out.getLength() so close still
+                // avoids the BK monitor on the shutdown path (consistent with
+                // isWritable() — issue #385).
                 LOGGER.log(Level.INFO, "{0} closing ledger {1}, with LastAddConfirmed={2}, LastAddPushed={3} length={4}, errorOccurred:{5}",
-                        new Object[]{tableSpaceDescription(), out.getId(), out.getLastAddConfirmed(), lastAssignedEntryId.get(), localLength.get(), errorOccurredDuringWrite});
+                        new Object[]{tableSpaceDescription(), out.getId(), out.getLastAddConfirmed(), out.getLastAddPushed(), localLength.get(), errorOccurredDuringWrite});
                 out.closeAsync().get(60, TimeUnit.SECONDS);
             } catch (InterruptedException | ExecutionException | TimeoutException err) {
                 throw new LogNotAvailableException(err);
             }
         }
 
-        public WriteAdvHandle getOut() {
+        public WriteHandle getOut() {
             return out;
         }
 
@@ -559,7 +556,7 @@ public class BookkeeperCommitLog extends CommitLog {
 
         private boolean isWritable() {
             // Use locally cached fields instead of the synchronized
-            // WriteAdvHandle.isClosed() / WriteAdvHandle.getLength() to avoid
+            // WriteHandle.isClosed() / WriteHandle.getLength() to avoid
             // intrinsic-lock contention under concurrent ingest (issue #385).
             return !errorOccurredDuringWrite
                     && !outClosed

@@ -63,16 +63,21 @@ import org.junit.rules.TemporaryFolder;
 
 /**
  * Tests for the single-threaded BookKeeper writer pipeline introduced in
- * issue #434. The pipeline funnels every {@code writeAsync} call for a
+ * issue #434. The pipeline funnels every {@code appendAsync} call for a
  * given ledger through a single thread borrowed from BookKeeper's main
  * worker pool ({@code chooseThread(ledgerId)}), eliminating monitor
  * contention on {@code LedgerHandle.doAsyncAddEntry}'s
  * {@code synchronized (this)} block.
  *
- * <p>The pipeline also (a) creates ledgers with
- * {@link DigestType#DUMMY} so per-entry CRC32C is skipped on the client
- * side, and (b) uses {@code WriteAdvHandle} so the writer thread
- * pre-assigns sequential entry ids (0..N-1).
+ * <p>The pipeline also creates ledgers with {@link DigestType#DUMMY} so
+ * per-entry CRC32C is skipped on the client side. Entry ids are auto-assigned
+ * by BookKeeper inside its {@code synchronized} block; because the executor
+ * is single-threaded, those ids are dense and monotonically increasing
+ * within a ledger (0..N-1). Issue #444 reverted an earlier
+ * {@code WriteAdvHandle} variant of the pipeline because explicit
+ * caller-assigned ids forced BK's pending-ops queue to a
+ * {@link java.util.concurrent.PriorityBlockingQueue} with two O(n)
+ * lock-protected operations per write.
  */
 @Category(ClusterTest.class)
 public class BookKeeperCommitLogAsyncWriterTest {
@@ -101,8 +106,10 @@ public class BookKeeperCommitLogAsyncWriterTest {
      * entry is recoverable, total entry count matches, LSNs within each
      * ledger are strictly monotonically increasing, and entry ids are
      * dense (no gaps). Proves the MPSC pipeline preserves WAL ordering
-     * and that {@code WriteAdvHandle}'s caller-assigned entry ids do not
-     * skip or duplicate under high concurrency.
+     * and that BookKeeper's auto-assigned entry ids (delivered via
+     * {@code WriteHandle.appendAsync}) do not skip or duplicate under
+     * high concurrency, even though every producer thread shares a single
+     * ledger.
      */
     @Test
     public void testConcurrentWrites() throws Exception {
@@ -394,10 +401,12 @@ public class BookKeeperCommitLogAsyncWriterTest {
      * test-only {@code forceWriteError} hook), every subsequent
      * {@code writeEntry} call must short-circuit on the executor thread,
      * release its buffer, and fail with {@link LogNotAvailableException}
-     * <em>without</em> consuming an entry id or calling into BookKeeper —
-     * preventing the {@code WriteAdvHandle} prefix-gap that would otherwise
-     * stall every later commit until BK's add-entry quorum timeout fires
-     * (issue #434, PR #437 review follow-up #2).
+     * <em>without</em> calling into BookKeeper — so that
+     * {@link BookkeeperCommitLog.CommitFileWriter#waitForAllPendingWrites}
+     * drains promptly and ledger rotation can open a fresh ledger right
+     * away (issue #434, PR #437 review follow-up #2; the original
+     * caller-assigned-id prefix-gap concern was lifted by issue #444 but
+     * the short-circuit is still required for fast failure semantics).
      */
     @Test
     public void testFailedWriterShortCircuitsSubsequentWrites() throws Exception {
@@ -594,12 +603,16 @@ public class BookKeeperCommitLogAsyncWriterTest {
 
     /**
      * After a round of concurrent writes, asserts that the ledger contains
-     * exactly entry ids {@code 0..N-1} with no gaps. Proves the
-     * caller-assigned {@code entryId} from {@code WriteAdvHandle} is dense
-     * and monotonic per ledger.
+     * exactly entry ids {@code 0..N-1} with no gaps. Proves that BookKeeper's
+     * auto-assigned entry ids (returned by {@code WriteHandle.appendAsync})
+     * are dense and monotonic per ledger when every {@code appendAsync} call
+     * is routed through the single-thread executor — the invariant the
+     * issue #444 revert relies on (no caller-side id tracking is needed
+     * because BK assigns ids sequentially under its own
+     * {@code synchronized (this)} in {@code asyncAddEntry}).
      */
     @Test
-    public void testWriteAdvHandleEntryIdsAreSequential() throws Exception {
+    public void testEntryIdsAreSequential() throws Exception {
         final String tableSpaceUUID = UUID.randomUUID().toString();
         final String name = TableSpace.DEFAULT;
         final String nodeid = "nodeid";
