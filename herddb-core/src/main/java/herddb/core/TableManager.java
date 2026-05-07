@@ -1311,9 +1311,11 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
      * @return number of eviction-driven {@code unload(pageId)} calls dispatched
      *         to the checkpoint-flush executor by {@link #onTransactionCommit}
      *         since this {@code TableManager} was instantiated. Issue #448.
-     *         Visible for tests.
+     *         Public so cross-package hammer tests in
+     *         {@code herddb.server.hammer} can assert that the new
+     *         commit-time batched-unload path was actually exercised.
      */
-    long getParallelUnloadsCount() {
+    public long getParallelUnloadsCount() {
         return parallelUnloadsCount.get();
     }
 
