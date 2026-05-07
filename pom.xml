@@ -119,6 +119,12 @@
         <libs.caffeine>3.1.8</libs.caffeine>
         <libs.awssdk>2.42.34</libs.awssdk>
         <libs.testcontainers>1.21.4</libs.testcontainers>
+        <!--
+            HdrHistogram is used by vector-testings/MetricsCollector for
+            allocation-free latency recording. See issue #443. Tiny dep
+            (~120 KB, no transitives, Apache 2.0).
+        -->
+        <libs.hdrhistogram>2.2.2</libs.hdrhistogram>
     </properties>
 
     <dependencies>
@@ -151,6 +157,11 @@
 
     <dependencyManagement>
         <dependencies>
+            <dependency>
+                <groupId>org.hdrhistogram</groupId>
+                <artifactId>HdrHistogram</artifactId>
+                <version>${libs.hdrhistogram}</version>
+            </dependency>
             <dependency>
                 <groupId>io.netty</groupId>
                 <artifactId>netty-transport</artifactId>

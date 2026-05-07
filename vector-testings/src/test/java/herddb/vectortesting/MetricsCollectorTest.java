@@ -25,6 +25,19 @@ import org.junit.jupiter.api.Test;
 
 class MetricsCollectorTest {
 
+    /**
+     * HdrHistogram with 3 significant digits has ~0.1 % quantization error
+     * on each recorded value. We assert percentile / max values within this
+     * band rather than exact-equal — see issue #443.
+     */
+    private static final double HDR_TOLERANCE = 0.002; // 0.2 %, 2x the bucket precision
+
+    private static void assertWithinTolerance(long expected, long actual) {
+        long band = Math.max(1L, (long) (expected * HDR_TOLERANCE));
+        assertTrue(Math.abs(actual - expected) <= band,
+                "expected " + expected + " ±" + band + ", got " + actual);
+    }
+
     @Test
     void computeStatsEmpty() {
         MetricsCollector mc = new MetricsCollector();
@@ -38,9 +51,10 @@ class MetricsCollectorTest {
         mc.record(5_000_000L);
         MetricsCollector.Stats stats = mc.computeStats();
         assertEquals(1, stats.count());
-        assertEquals(5_000_000L, stats.p50Nanos());
-        assertEquals(5_000_000L, stats.p99Nanos());
-        assertEquals(5_000_000L, stats.maxNanos());
+        // HdrHistogram quantizes to 3 significant digits — ~0.1% band.
+        assertWithinTolerance(5_000_000L, stats.p50Nanos());
+        assertWithinTolerance(5_000_000L, stats.p99Nanos());
+        assertWithinTolerance(5_000_000L, stats.maxNanos());
     }
 
     @Test
@@ -51,21 +65,56 @@ class MetricsCollectorTest {
         }
         MetricsCollector.Stats stats = mc.computeStats();
         assertEquals(100, stats.count());
-        // p50 should be around 50ms, p99 around 99ms
-        assertTrue(stats.p50Nanos() >= 50_000_000L);
-        assertTrue(stats.p99Nanos() >= 99_000_000L);
-        assertEquals(100_000_000L, stats.maxNanos());
+        // p50 should be around 50ms, p99 around 99ms, allowing for HdrHistogram's
+        // bucket boundary effects (a sample may land in the next-higher bucket).
+        assertTrue(stats.p50Nanos() >= 49_000_000L && stats.p50Nanos() <= 51_000_000L,
+                "p50=" + stats.p50Nanos());
+        assertTrue(stats.p99Nanos() >= 98_000_000L && stats.p99Nanos() <= 100_500_000L,
+                "p99=" + stats.p99Nanos());
+        assertWithinTolerance(100_000_000L, stats.maxNanos());
+    }
+
+    @Test
+    void recordClampsBelowLowestAndAboveHighest() {
+        // HdrHistogram is configured for 1 ns – 1 hour at 3 sig digits;
+        // record() must clamp values outside that range rather than
+        // throw. Also asserts getLastNanos() returns the same clamped
+        // value the histogram saw (issue #443 review feedback).
+        MetricsCollector mcLow = new MetricsCollector();
+        mcLow.record(0L);
+        MetricsCollector.Stats lowStats = mcLow.computeStats();
+        assertEquals(1L, lowStats.count());
+        assertEquals(1L, lowStats.maxNanos(),
+                "record(0) should clamp to LOWEST_NANOS=1 ns");
+        assertEquals(1L, mcLow.getLastNanos(),
+                "getLastNanos() must reflect the clamped value, not the raw input");
+
+        MetricsCollector mcNeg = new MetricsCollector();
+        mcNeg.record(-42L);
+        assertEquals(1L, mcNeg.computeStats().maxNanos());
+        assertEquals(1L, mcNeg.getLastNanos());
+
+        long oneHourNanos = java.util.concurrent.TimeUnit.HOURS.toNanos(1);
+        MetricsCollector mcHigh = new MetricsCollector();
+        mcHigh.record(Long.MAX_VALUE);
+        MetricsCollector.Stats highStats = mcHigh.computeStats();
+        assertEquals(1L, highStats.count());
+        // HdrHistogram quantizes to bucket boundaries — assert the value
+        // is within tolerance of HIGHEST_NANOS rather than exact-equal.
+        assertWithinTolerance(oneHourNanos, highStats.maxNanos());
+        assertEquals(oneHourNanos, mcHigh.getLastNanos(),
+                "getLastNanos() must reflect the HIGHEST_NANOS clamp");
     }
 
     @Test
     void percentileIndexDoesNotOverflowWithLargeSize() {
-        // This is the scenario that caused the original bug:
-        // size * percentile would overflow int when size > ~21M
-        // We test via computeStats by recording enough entries to trigger the overflow.
-        // Since we can't easily record 22M entries in a unit test, we verify the
-        // fix indirectly by checking the arithmetic doesn't produce negative indices.
+        // Original (pre-issue-443) regression guard: with the old reservoir-based
+        // implementation, percentileIndex could overflow when size > ~21M because
+        // of int×int multiplication. HdrHistogram does its percentile lookup over
+        // bucket counts (longs internally) so the overflow class is gone, but we
+        // keep the test to assert the public API still returns sane percentile
+        // values for small samples.
         MetricsCollector mc = new MetricsCollector();
-        // Record 10 entries and verify all percentile indices are non-negative
         for (int i = 0; i < 10; i++) {
             mc.record((i + 1) * 1_000_000L);
         }
@@ -73,16 +122,6 @@ class MetricsCollectorTest {
         assertTrue(stats.p50Nanos() > 0);
         assertTrue(stats.p95Nanos() > 0);
         assertTrue(stats.p99Nanos() > 0);
-
-        // Direct arithmetic check: simulate the old vs new calculation for large size
-        int largeSize = 22_000_000;
-        // Old code: (int)(size * percentile / 100.0) - would overflow
-        int oldResult = (int) (largeSize * 99 / 100.0);
-        // New code: (int)((long) size * percentile / 100.0) - correct
-        int newResult = (int) ((long) largeSize * 99 / 100.0);
-
-        assertTrue(oldResult < 0, "Old calculation should overflow to negative");
-        assertTrue(newResult > 0, "New calculation should be positive");
-        assertEquals(21_780_000, newResult);
+        assertTrue(stats.maxNanos() > 0);
     }
 }
