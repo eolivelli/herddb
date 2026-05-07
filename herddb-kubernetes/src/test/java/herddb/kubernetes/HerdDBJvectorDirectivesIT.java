@@ -38,12 +38,17 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestWatcher;
+import org.junit.rules.Timeout;
+import org.junit.runner.Description;
 import org.testcontainers.k3s.K3sContainer;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
@@ -71,6 +76,24 @@ public class HerdDBJvectorDirectivesIT {
 
     private static KubernetesClient kubernetesClient;
     private static String helmChartPath;
+
+    /** Per-test wall-clock timeout (issue #438). See HerdDBKubernetesIT.perTestTimeout. */
+    @Rule
+    public Timeout perTestTimeout = new Timeout(25, TimeUnit.MINUTES);
+
+    /** Dump cluster diagnostics on test failure (issue #438). */
+    @Rule
+    public TestWatcher diagnosticsRule = new TestWatcher() {
+        @Override
+        protected void failed(Throwable e, Description description) {
+            LOG.severe("Test " + description.getMethodName() + " FAILED: " + e);
+            try {
+                KubernetesDiagnostics.dumpAll(k3s, kubernetesClient, description.getMethodName());
+            } catch (RuntimeException diag) {
+                LOG.log(Level.WARNING, "diagnostics dump failed", diag);
+            }
+        }
+    };
 
     @BeforeClass
     public static void setup() throws Exception {
@@ -124,16 +147,26 @@ public class HerdDBJvectorDirectivesIT {
         values.put("server.mode", "standalone");
         values.put("server.storageMode", "local");
         values.put("server.replicaCount", "1");
-        values.put("server.resources.requests.memory", "256Mi");
+        // Container memory raised from 256Mi to 384Mi to fit 128m heap + 128m direct + ~128m JVM/native
+        // overhead under the new off-heap memory profile (issue #438).
+        values.put("server.resources.requests.memory", "384Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "256Mi");
+        values.put("server.resources.limits.memory", "384Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
-        // Tiny heap is fine — we don't run real workloads against it.
+        // Tiny heap is fine — we don't run real workloads against it. -Dio.netty.maxDirectMemory=134217728
+        // (= MaxDirectMemorySize=128m in bytes): without this property, Netty falls back to
+        // ByteBuffer.allocateDirect (bounded by phantom-reference GC delays via Bits.reserveMemory) instead
+        // of the Unsafe.allocateMemory no-cleaner pooled path. The default JAVA_OPTS in setenv.sh sets
+        // -Dio.netty.maxDirectMemory=0 but that baseline is replaced when the Helm chart's full-replace
+        // server.javaOpts is supplied (issue #438, #253). Direct memory raised from 64m to 128m to absorb
+        // recent off-heap relocations (issues #399, #409, #411).
         values.put("server.javaOpts",
                 "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
-                        + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+                        + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+                        + " -Dio.netty.maxDirectMemory=134217728"
+                        + " -XX:NativeMemoryTracking=summary"
                         + " -Djava.awt.headless=true --add-modules jdk.incubator.vector");
         values.put("tools.enabled", "false");
         values.put("zookeeper.enabled", "false");
@@ -142,13 +175,16 @@ public class HerdDBJvectorDirectivesIT {
         values.put("indexingService.enabled", "true");
         values.put("indexingService.replicaCount", "1");
         values.put("indexingService.storageMode", "memory");
+        // Same -Dio.netty.maxDirectMemory rationale as server.javaOpts above (issue #438, #253).
         values.put("indexingService.javaOpts",
                 "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
-                        + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+                        + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+                        + " -Dio.netty.maxDirectMemory=134217728"
+                        + " -XX:NativeMemoryTracking=summary"
                         + " -Djava.awt.headless=true --add-modules jdk.incubator.vector");
-        values.put("indexingService.resources.requests.memory", "256Mi");
+        values.put("indexingService.resources.requests.memory", "384Mi");
         values.put("indexingService.resources.requests.cpu", "0.5");
-        values.put("indexingService.resources.limits.memory", "256Mi");
+        values.put("indexingService.resources.limits.memory", "384Mi");
         values.put("indexingService.resources.limits.cpu", "0.5");
         values.put("indexingService.storage.data.size", "1Gi");
         values.put("indexingService.storage.log.size", "1Gi");

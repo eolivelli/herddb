@@ -39,13 +39,18 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.FixMethodOrder;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestWatcher;
+import org.junit.rules.Timeout;
+import org.junit.runner.Description;
 import org.junit.runners.MethodSorters;
 import org.testcontainers.k3s.K3sContainer;
 import org.testcontainers.utility.DockerImageName;
@@ -60,11 +65,27 @@ public class HerdDBClusterKubernetesIT {
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
 
+    // Setting -Dio.netty.maxDirectMemory=<bytes> matching -XX:MaxDirectMemorySize is required so that
+    // Netty uses Unsafe.allocateMemory (no-cleaner pooled path) with an internal byte cap, bypassing
+    // JVM Bits.reserveMemory accounting. Without this property, Netty falls back to ByteBuffer.allocateDirect
+    // and direct allocations are bounded by phantom-reference GC delays — see issue #253 and the comment in
+    // herddb-services/src/main/resources/bin/setenv.sh which sets -Dio.netty.maxDirectMemory=0 in the default
+    // JAVA_OPTS baseline (lost when the Helm chart's full-replace server.javaOpts is supplied as in these tests).
+    // Recent off-heap relocations (issues #399, #409, #411) make even simple SQL traffic allocate enough direct
+    // memory that the previous 128 MiB cap caused server stalls on CI (issue #438).
+    // Byte values: 268435456 = 256 * 1024 * 1024 (= MaxDirectMemorySize=256m);
+    //              134217728 = 128 * 1024 * 1024 (= MaxDirectMemorySize=128m).
+    // -XX:NativeMemoryTracking=summary enables jcmd VM.native_memory summary inside the pod
+    // so KubernetesDiagnostics can show actual direct/native memory breakdown on test failure (issue #438).
     private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m"
+            + " -Dio.netty.maxDirectMemory=268435456"
+            + " -XX:NativeMemoryTracking=summary"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
     private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Dio.netty.maxDirectMemory=134217728"
+            + " -XX:NativeMemoryTracking=summary"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -74,6 +95,24 @@ public class HerdDBClusterKubernetesIT {
     private static KubernetesClient kubernetesClient;
     private static String helmChartPath;
     private static List<HasMetadata> lastAppliedResources;
+
+    /** Per-test wall-clock timeout (issue #438). See HerdDBKubernetesIT.perTestTimeout. */
+    @Rule
+    public Timeout perTestTimeout = new Timeout(25, TimeUnit.MINUTES);
+
+    /** Dump cluster diagnostics on test failure (issue #438). */
+    @Rule
+    public TestWatcher diagnosticsRule = new TestWatcher() {
+        @Override
+        protected void failed(Throwable e, Description description) {
+            LOG.severe("Test " + description.getMethodName() + " FAILED: " + e);
+            try {
+                KubernetesDiagnostics.dumpAll(k3s, kubernetesClient, description.getMethodName());
+            } catch (RuntimeException diag) {
+                LOG.log(Level.WARNING, "diagnostics dump failed", diag);
+            }
+        }
+    };
 
     @BeforeClass
     public static void setup() throws Exception {
@@ -128,18 +167,30 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.enabled", "false");
         values.put("image.pullPolicy", "Never");
         values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
-        values.put("zookeeper.resources.requests.memory", "256Mi");
+        values.put("zookeeper.resources.requests.memory", "384Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
-        values.put("zookeeper.resources.limits.memory", "256Mi");
+        values.put("zookeeper.resources.limits.memory", "384Mi");
         values.put("zookeeper.resources.limits.cpu", "0.5");
         values.put("zookeeper.storage.size", "1Gi");
         values.put("server.javaOpts", SERVER_JAVA_OPTS);
-        values.put("server.resources.requests.memory", "512Mi");
+        values.put("server.resources.requests.memory", "768Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "512Mi");
+        values.put("server.resources.limits.memory", "768Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
+        // File server: 1 replica with infra-sized resources to fit on a 4-vCPU
+        // K3s runner. Chart defaults are replicaCount=2 × cpu=4 = 8 CPUs which
+        // is unschedulable on GH Actions; see issue #438. Empty fileServer.javaOpts
+        // (chart default) means setenv.sh's -Xmx4g default would apply inside the
+        // pod and instantly OOM at the 384Mi memory limit, so override javaOpts too.
+        values.put("fileServer.replicaCount", "1");
+        values.put("fileServer.javaOpts", INFRA_JAVA_OPTS);
+        values.put("fileServer.resources.requests.memory", "384Mi");
+        values.put("fileServer.resources.requests.cpu", "0.5");
+        values.put("fileServer.resources.limits.memory", "384Mi");
+        values.put("fileServer.resources.limits.cpu", "0.5");
+        values.put("fileServer.storage.size", "1Gi");
 
         applyHelmChart(values);
 
@@ -174,25 +225,37 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.replicaCount", "1");
         values.put("image.pullPolicy", "Never");
         values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
-        values.put("zookeeper.resources.requests.memory", "256Mi");
+        values.put("zookeeper.resources.requests.memory", "384Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
-        values.put("zookeeper.resources.limits.memory", "256Mi");
+        values.put("zookeeper.resources.limits.memory", "384Mi");
         values.put("zookeeper.resources.limits.cpu", "0.5");
         values.put("zookeeper.storage.size", "1Gi");
         values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
-        values.put("bookkeeper.resources.requests.memory", "256Mi");
+        values.put("bookkeeper.resources.requests.memory", "384Mi");
         values.put("bookkeeper.resources.requests.cpu", "0.5");
-        values.put("bookkeeper.resources.limits.memory", "256Mi");
+        values.put("bookkeeper.resources.limits.memory", "384Mi");
         values.put("bookkeeper.resources.limits.cpu", "0.5");
         values.put("bookkeeper.storage.journal.size", "1Gi");
         values.put("bookkeeper.storage.ledger.size", "1Gi");
         values.put("server.javaOpts", SERVER_JAVA_OPTS);
-        values.put("server.resources.requests.memory", "512Mi");
+        values.put("server.resources.requests.memory", "768Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "512Mi");
+        values.put("server.resources.limits.memory", "768Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
+        // File server: 1 replica with infra-sized resources to fit on a 4-vCPU
+        // K3s runner. Chart defaults are replicaCount=2 × cpu=4 = 8 CPUs which
+        // is unschedulable on GH Actions; see issue #438. Empty fileServer.javaOpts
+        // (chart default) means setenv.sh's -Xmx4g default would apply inside the
+        // pod and instantly OOM at the 384Mi memory limit, so override javaOpts too.
+        values.put("fileServer.replicaCount", "1");
+        values.put("fileServer.javaOpts", INFRA_JAVA_OPTS);
+        values.put("fileServer.resources.requests.memory", "384Mi");
+        values.put("fileServer.resources.requests.cpu", "0.5");
+        values.put("fileServer.resources.limits.memory", "384Mi");
+        values.put("fileServer.resources.limits.cpu", "0.5");
+        values.put("fileServer.storage.size", "1Gi");
 
         applyHelmChart(values);
 
@@ -238,25 +301,37 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.replicaCount", "1");
         values.put("image.pullPolicy", "Never");
         values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
-        values.put("zookeeper.resources.requests.memory", "256Mi");
+        values.put("zookeeper.resources.requests.memory", "384Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
-        values.put("zookeeper.resources.limits.memory", "256Mi");
+        values.put("zookeeper.resources.limits.memory", "384Mi");
         values.put("zookeeper.resources.limits.cpu", "0.5");
         values.put("zookeeper.storage.size", "1Gi");
         values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
-        values.put("bookkeeper.resources.requests.memory", "256Mi");
+        values.put("bookkeeper.resources.requests.memory", "384Mi");
         values.put("bookkeeper.resources.requests.cpu", "0.5");
-        values.put("bookkeeper.resources.limits.memory", "256Mi");
+        values.put("bookkeeper.resources.limits.memory", "384Mi");
         values.put("bookkeeper.resources.limits.cpu", "0.5");
         values.put("bookkeeper.storage.journal.size", "1Gi");
         values.put("bookkeeper.storage.ledger.size", "1Gi");
         values.put("server.javaOpts", SERVER_JAVA_OPTS);
-        values.put("server.resources.requests.memory", "512Mi");
+        values.put("server.resources.requests.memory", "768Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "512Mi");
+        values.put("server.resources.limits.memory", "768Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
+        // File server: 1 replica with infra-sized resources to fit on a 4-vCPU
+        // K3s runner. Chart defaults are replicaCount=2 × cpu=4 = 8 CPUs which
+        // is unschedulable on GH Actions; see issue #438. Empty fileServer.javaOpts
+        // (chart default) means setenv.sh's -Xmx4g default would apply inside the
+        // pod and instantly OOM at the 384Mi memory limit, so override javaOpts too.
+        values.put("fileServer.replicaCount", "1");
+        values.put("fileServer.javaOpts", INFRA_JAVA_OPTS);
+        values.put("fileServer.resources.requests.memory", "384Mi");
+        values.put("fileServer.resources.requests.cpu", "0.5");
+        values.put("fileServer.resources.limits.memory", "384Mi");
+        values.put("fileServer.resources.limits.cpu", "0.5");
+        values.put("fileServer.storage.size", "1Gi");
 
         applyHelmChart(values);
 
@@ -326,25 +401,37 @@ public class HerdDBClusterKubernetesIT {
         values.put("bookkeeper.replicaCount", "1");
         values.put("image.pullPolicy", "Never");
         values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
-        values.put("zookeeper.resources.requests.memory", "256Mi");
+        values.put("zookeeper.resources.requests.memory", "384Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
-        values.put("zookeeper.resources.limits.memory", "256Mi");
+        values.put("zookeeper.resources.limits.memory", "384Mi");
         values.put("zookeeper.resources.limits.cpu", "0.5");
         values.put("zookeeper.storage.size", "1Gi");
         values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
-        values.put("bookkeeper.resources.requests.memory", "256Mi");
+        values.put("bookkeeper.resources.requests.memory", "384Mi");
         values.put("bookkeeper.resources.requests.cpu", "0.5");
-        values.put("bookkeeper.resources.limits.memory", "256Mi");
+        values.put("bookkeeper.resources.limits.memory", "384Mi");
         values.put("bookkeeper.resources.limits.cpu", "0.5");
         values.put("bookkeeper.storage.journal.size", "1Gi");
         values.put("bookkeeper.storage.ledger.size", "1Gi");
         values.put("server.javaOpts", SERVER_JAVA_OPTS);
-        values.put("server.resources.requests.memory", "512Mi");
+        values.put("server.resources.requests.memory", "768Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "512Mi");
+        values.put("server.resources.limits.memory", "768Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
+        // File server: 1 replica with infra-sized resources to fit on a 4-vCPU
+        // K3s runner. Chart defaults are replicaCount=2 × cpu=4 = 8 CPUs which
+        // is unschedulable on GH Actions; see issue #438. Empty fileServer.javaOpts
+        // (chart default) means setenv.sh's -Xmx4g default would apply inside the
+        // pod and instantly OOM at the 384Mi memory limit, so override javaOpts too.
+        values.put("fileServer.replicaCount", "1");
+        values.put("fileServer.javaOpts", INFRA_JAVA_OPTS);
+        values.put("fileServer.resources.requests.memory", "384Mi");
+        values.put("fileServer.resources.requests.cpu", "0.5");
+        values.put("fileServer.resources.limits.memory", "384Mi");
+        values.put("fileServer.resources.limits.cpu", "0.5");
+        values.put("fileServer.storage.size", "1Gi");
 
         applyHelmChart(values);
 
