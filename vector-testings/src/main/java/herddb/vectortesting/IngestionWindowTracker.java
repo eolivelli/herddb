@@ -122,8 +122,13 @@ public class IngestionWindowTracker {
      * @param rows         number of rows committed in this transaction
      */
     public void recordCommit(long latencyNanos, long rows) {
-        long now = clock.getAsLong();
         synchronized (lock) {
+            // Capture the clock inside the lock so the deque stays monotonically
+            // ordered by timestamp — preventing the race where two threads capture
+            // their timestamps before either enters the lock and then insert in
+            // reverse order (which would break the trim loop's head-removal
+            // assumption for the rare case of a stale entry at the tail).
+            long now = clock.getAsLong();
             window.addLast(new Entry(now, rows, latencyNanos));
             // Trim entries that are outside the 5-minute retention window.
             // This runs on every write so the deque is bounded even if /status

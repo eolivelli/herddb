@@ -166,7 +166,7 @@ class IngestionWindowTrackerTest {
     }
 
     @Test
-    void onlyCurentWindowRowsCountedNotAll() {
+    void onlyCurrentWindowRowsCountedNotAll() {
         // Regression guard: commit inside 5-min but outside 1-min must appear
         // in ops_per_sec_5m but NOT in ops_per_sec_1m.
         AtomicLong clock = new AtomicLong(0L);

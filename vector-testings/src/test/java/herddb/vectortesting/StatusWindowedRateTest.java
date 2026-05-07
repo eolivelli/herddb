@@ -94,7 +94,9 @@ class StatusWindowedRateTest {
 
     @AfterEach
     void stop() {
-        server.stop();
+        if (server != null) {
+            server.stop();
+        }
     }
 
     @Test
