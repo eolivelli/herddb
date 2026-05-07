@@ -58,8 +58,7 @@ BRANCH=issue-<N>-<SLUG>
 WORKTREE=/home/eolivelli/dev/herddb-issue-<N>
 MAVEN_REPO=/home/eolivelli/dev/repo-issue-<N>
 PRIMARY_REPO=/home/eolivelli/dev/herddb
-JVECTOR_DIR=/home/eolivelli/dev/jvector-issue-<N>
-JVECTOR_REPO=https://github.com/eolivelli/jvector
+HOST_M2=$HOME/.m2/repository
 ```
 
 Example: issue #267 titled "Flaky test: herddb.server.hammer.MultipleConcurrentUpdatesTest"
@@ -95,25 +94,40 @@ Run in sequence:
    ```
    Must print `$BRANCH`. Stop if it doesn't.
 
-5. **Build jvector into the isolated Maven repo.** HerdDB depends on a
-   custom fork of jvector (`https://github.com/eolivelli/jvector`) whose
-   artifacts are not always available on Maven Central, so it must be
-   built and installed locally **before** any HerdDB Maven build, otherwise
-   dependency resolution will fail.
+5. **Seed the isolated Maven repo with jvector + BookKeeper artifacts from
+   the host's `~/.m2/repository`.** HerdDB depends on two artifacts that
+   are not on Maven Central — the `eolivelli/jvector` fork (`io.github.jbellis`)
+   and the `eolivelli/bookkeeper` fork (`org.apache.bookkeeper`,
+   4.17.4-SNAPSHOT, see issue #435). They must be present in `$MAVEN_REPO`
+   **before** any HerdDB Maven build, otherwise dependency resolution
+   will fail.
 
-   Stop and report on any failure — do not proceed to Phase B if jvector
-   does not install cleanly.
+   These are slow to build (BookKeeper alone takes ~4 minutes and requires
+   JDK 17), so do **not** re-clone and re-build them on every issue.
+   Instead, the developer is expected to bootstrap them once into
+   `$HOST_M2` per the "Local Build Dependencies" section of the project
+   `CLAUDE.md`. The agent then just copies the relevant subtrees:
 
    ```
-   git clone --depth 1 $JVECTOR_REPO $JVECTOR_DIR
-   mvn -f $JVECTOR_DIR/pom.xml \
-       -Dmaven.repo.local=$MAVEN_REPO \
-       -DskipTests \
-       clean install
+   # Precondition check — fail fast with a clear message.
+   if [ ! -d "$HOST_M2/io/github/jbellis" ] \
+       || [ ! -d "$HOST_M2/org/apache/bookkeeper/bookkeeper-server/4.17.4-SNAPSHOT" ]; then
+     echo "Missing jvector or BookKeeper 4.17.4-SNAPSHOT in $HOST_M2."
+     echo "Bootstrap them per CLAUDE.md '## Local Build Dependencies' before running this agent."
+     exit 1
+   fi
+
+   mkdir -p "$MAVEN_REPO/io/github" "$MAVEN_REPO/org/apache"
+   cp -r "$HOST_M2/io/github/jbellis"     "$MAVEN_REPO/io/github/"
+   cp -r "$HOST_M2/org/apache/bookkeeper" "$MAVEN_REPO/org/apache/"
    ```
 
-   If a different branch/tag is required by an issue, check out that ref
-   inside `$JVECTOR_DIR` before running `mvn install`.
+   Stop and report on any failure — do not proceed to Phase B if either
+   subtree is missing or the copy fails.
+
+   If an issue requires a non-default jvector or BookKeeper branch, check
+   out and `mvn install` that branch into `$HOST_M2` first (per
+   `CLAUDE.md`), then re-run the copy step.
 
 ---
 
@@ -402,11 +416,10 @@ Run in sequence:
 git -C $PRIMARY_REPO worktree remove $WORKTREE --force
 git -C $PRIMARY_REPO branch -D $BRANCH
 rm -rf $MAVEN_REPO
-rm -rf $JVECTOR_DIR
 ```
 
 Report:
-> "Cleaned up worktree `$WORKTREE`, branch `$BRANCH`, Maven repo `$MAVEN_REPO`, and jvector clone `$JVECTOR_DIR` for issue #<N>."
+> "Cleaned up worktree `$WORKTREE`, branch `$BRANCH`, and Maven repo `$MAVEN_REPO` for issue #<N>."
 
 Do NOT clean up automatically after merge — always wait for explicit user
 confirmation or request.
@@ -444,6 +457,11 @@ confirmation or request.
   report it and stop rather than creating a second one.
 - **Always target `eolivelli/herddb`** for every `gh issue` / `gh pr`
   command (`--repo eolivelli/herddb`). Never operate on a different repo.
-- **Build jvector first.** The `eolivelli/jvector` fork must be cloned and
-  `mvn install`'d into `$MAVEN_REPO` during Phase A; HerdDB builds will
+- **Seed `$MAVEN_REPO` from `$HOST_M2` first.** Both jvector and the
+  eolivelli BookKeeper fork (4.17.4-SNAPSHOT, see issue #435) must be
+  copied from `$HOST_M2/io/github/jbellis` and
+  `$HOST_M2/org/apache/bookkeeper` into `$MAVEN_REPO` during Phase A.
+  Never re-clone or re-build them inside the agent — that's slow
+  (BookKeeper takes ~4 minutes, requires JDK 17) and unnecessary; the
+  developer bootstraps them once per `CLAUDE.md`. HerdDB builds will
   fail to resolve dependencies otherwise.

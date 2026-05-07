@@ -1,5 +1,56 @@
 # HerdDB - Development Guidelines
 
+## Local Build Dependencies (jvector + BookKeeper)
+HerdDB depends on two artifacts that are **not** on Maven Central:
+
+1. **jvector** — the `eolivelli/jvector` fork (`main` branch). Built on the
+   default JDK (currently 25).
+2. **BookKeeper 4.17.4-SNAPSHOT** — the `eolivelli/bookkeeper` fork on branch
+   `fix-concurrentlonghashmap-record-4.17`, carrying a temporary fix for the
+   `PendingAddOp` leak / `ConcurrentLongHashMap` record issue tracked in
+   issue #435. The `circe-checksum` module bundles a Lombok 1.18.30
+   annotation processor that **does not** run on JDK 25 (`TypeTag :: UNKNOWN`),
+   so this build must use **JDK 17**. CI follows the same pattern (see
+   `.github/workflows/ci.yml`).
+
+Bootstrap them once into your `~/.m2/repository` — they live there permanently
+and can be reused for every PR / agent run:
+
+```
+# jvector — default JDK is fine
+git clone https://github.com/eolivelli/jvector ~/dev/jvector
+mvn -f ~/dev/jvector/pom.xml -DskipTests -Drat.skip=true clean install
+
+# BookKeeper — must build on JDK 17
+git clone --branch fix-concurrentlonghashmap-record-4.17 \
+    https://github.com/eolivelli/bookkeeper ~/dev/bookkeeper
+JAVA_HOME=$(sdk home java 17.0.19-tem) PATH=$JAVA_HOME/bin:$PATH \
+  mvn -f ~/dev/bookkeeper/pom.xml -DskipTests \
+      -Drat.skip=true -Dspotbugs.skip=true \
+      -Dcheckstyle.skip=true -Dlicense.skip=true \
+      clean install
+```
+
+After bootstrap, the artifacts you care about are under:
+- `~/.m2/repository/io/github/jbellis/`  (jvector)
+- `~/.m2/repository/org/apache/bookkeeper/` (incl. `bookkeeper-server`,
+  `bookkeeper-common`, `bookkeeper-stats-api`, `circe-checksum`, all
+  4.17.4-SNAPSHOT)
+
+For agent workflows that use an isolated Maven repo
+(`-Dmaven.repo.local=$MAVEN_REPO`), do **not** re-clone and re-build these
+dependencies on every run. Instead, copy the relevant subtrees from
+`~/.m2/repository` into `$MAVEN_REPO` once at the start of the run:
+
+```
+mkdir -p "$MAVEN_REPO/io/github" "$MAVEN_REPO/org/apache"
+cp -r ~/.m2/repository/io/github/jbellis     "$MAVEN_REPO/io/github/"
+cp -r ~/.m2/repository/org/apache/bookkeeper "$MAVEN_REPO/org/apache/"
+```
+
+Re-run the bootstrap commands above whenever the upstream `eolivelli/jvector`
+or `eolivelli/bookkeeper` branch heads move.
+
 ## Git Workflow
 Never push commits directly to the `master` branch. Always create a feature branch and
 open a pull request so that CI runs and changes can be reviewed before merging.

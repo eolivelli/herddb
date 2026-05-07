@@ -757,6 +757,513 @@
     },
     {
       "collapse": false,
+      "height": 50,
+      "panels": [
+        {
+          "content": "<h3 style=\"text-align:center;color:#33b5e5;\">Request Execution</h3>",
+          "id": 300,
+          "mode": "html",
+          "span": 12,
+          "title": "",
+          "transparent": true,
+          "type": "text"
+        }
+      ],
+      "showTitle": false,
+      "title": "Request Execution Header",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 301,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "sum(rate(requests_execute_statement_count{instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "execute_statement [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "sum(rate(requests_execute_statements_count{instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "execute_statements [{{instance}}]",
+              "refId": "B"
+            },
+            {
+              "expr": "sum(rate(requests_open_scanner_count{instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "open_scanner [{{instance}}]",
+              "refId": "C"
+            },
+            {
+              "expr": "sum(rate(requests_fetch_scanner_data_count{instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "fetch_scanner_data [{{instance}}]",
+              "refId": "D"
+            },
+            {
+              "expr": "sum(rate(requests_close_scanner_count{instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "close_scanner [{{instance}}]",
+              "refId": "E"
+            },
+            {
+              "expr": "sum(rate(requests_prepare_statement_count{instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "prepare_statement [{{instance}}]",
+              "refId": "F"
+            },
+            {
+              "expr": "sum(rate(requests_tx_begin_count{instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_begin [{{instance}}]",
+              "refId": "G"
+            },
+            {
+              "expr": "sum(rate(requests_tx_commit_count{instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_commit [{{instance}}]",
+              "refId": "H"
+            },
+            {
+              "expr": "sum(rate(requests_tx_rollback_count{instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_rollback [{{instance}}]",
+              "refId": "I"
+            }
+          ],
+          "thresholds": [],
+          "title": "Request Rate by Type (1m rate, ops/sec)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "ops",
+              "logBase": 1,
+              "min": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 302,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "sum(rate(requests_execute_statement_count{success=\"false\",instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "execute_statement [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "sum(rate(requests_execute_statements_count{success=\"false\",instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "execute_statements [{{instance}}]",
+              "refId": "B"
+            },
+            {
+              "expr": "sum(rate(requests_open_scanner_count{success=\"false\",instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "open_scanner [{{instance}}]",
+              "refId": "C"
+            },
+            {
+              "expr": "sum(rate(requests_fetch_scanner_data_count{success=\"false\",instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "fetch_scanner_data [{{instance}}]",
+              "refId": "D"
+            },
+            {
+              "expr": "sum(rate(requests_prepare_statement_count{success=\"false\",instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "prepare_statement [{{instance}}]",
+              "refId": "E"
+            },
+            {
+              "expr": "sum(rate(requests_tx_begin_count{success=\"false\",instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_begin [{{instance}}]",
+              "refId": "F"
+            },
+            {
+              "expr": "sum(rate(requests_tx_commit_count{success=\"false\",instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_commit [{{instance}}]",
+              "refId": "G"
+            },
+            {
+              "expr": "sum(rate(requests_tx_rollback_count{success=\"false\",instance=~\"$instance\"}[1m])) by (instance)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_rollback [{{instance}}]",
+              "refId": "H"
+            }
+          ],
+          "thresholds": [],
+          "title": "Failed Request Rate by Type (1m rate, ops/sec)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "ops",
+              "logBase": 1,
+              "min": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        }
+      ],
+      "showTitle": false,
+      "title": "Request Rate Row",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 303,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "requests_execute_statement{success=\"true\",quantile=\"0.95\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "execute_statement [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "requests_execute_statements{success=\"true\",quantile=\"0.95\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "execute_statements [{{instance}}]",
+              "refId": "B"
+            },
+            {
+              "expr": "requests_open_scanner{success=\"true\",quantile=\"0.95\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "open_scanner [{{instance}}]",
+              "refId": "C"
+            },
+            {
+              "expr": "requests_fetch_scanner_data{success=\"true\",quantile=\"0.95\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "fetch_scanner_data [{{instance}}]",
+              "refId": "D"
+            },
+            {
+              "expr": "requests_prepare_statement{success=\"true\",quantile=\"0.95\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "prepare_statement [{{instance}}]",
+              "refId": "E"
+            },
+            {
+              "expr": "requests_tx_begin{success=\"true\",quantile=\"0.95\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_begin [{{instance}}]",
+              "refId": "F"
+            },
+            {
+              "expr": "requests_tx_commit{success=\"true\",quantile=\"0.95\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_commit [{{instance}}]",
+              "refId": "G"
+            },
+            {
+              "expr": "requests_tx_rollback{success=\"true\",quantile=\"0.95\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_rollback [{{instance}}]",
+              "refId": "H"
+            }
+          ],
+          "thresholds": [],
+          "title": "Request Latency p95 by Type (ms)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "ms",
+              "logBase": 1,
+              "min": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "fill": 1,
+          "id": 304,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "rightSide": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "percentage": false,
+          "pointradius": 5,
+          "points": false,
+          "renderer": "flot",
+          "seriesOverrides": [],
+          "spaceLength": 10,
+          "span": 6,
+          "stack": false,
+          "steppedLine": false,
+          "targets": [
+            {
+              "expr": "requests_execute_statement{success=\"true\",quantile=\"0.99\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "execute_statement [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "requests_execute_statements{success=\"true\",quantile=\"0.99\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "execute_statements [{{instance}}]",
+              "refId": "B"
+            },
+            {
+              "expr": "requests_open_scanner{success=\"true\",quantile=\"0.99\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "open_scanner [{{instance}}]",
+              "refId": "C"
+            },
+            {
+              "expr": "requests_fetch_scanner_data{success=\"true\",quantile=\"0.99\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "fetch_scanner_data [{{instance}}]",
+              "refId": "D"
+            },
+            {
+              "expr": "requests_prepare_statement{success=\"true\",quantile=\"0.99\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "prepare_statement [{{instance}}]",
+              "refId": "E"
+            },
+            {
+              "expr": "requests_tx_begin{success=\"true\",quantile=\"0.99\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_begin [{{instance}}]",
+              "refId": "F"
+            },
+            {
+              "expr": "requests_tx_commit{success=\"true\",quantile=\"0.99\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_commit [{{instance}}]",
+              "refId": "G"
+            },
+            {
+              "expr": "requests_tx_rollback{success=\"true\",quantile=\"0.99\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "tx_rollback [{{instance}}]",
+              "refId": "H"
+            }
+          ],
+          "thresholds": [],
+          "title": "Request Latency p99 by Type (ms)",
+          "tooltip": {
+            "shared": true,
+            "sort": 0,
+            "value_type": "individual"
+          },
+          "type": "graph",
+          "xaxis": {
+            "mode": "time",
+            "show": true
+          },
+          "yaxes": [
+            {
+              "format": "ms",
+              "logBase": 1,
+              "min": 0,
+              "show": true
+            },
+            {
+              "format": "short",
+              "logBase": 1,
+              "show": false
+            }
+          ]
+        }
+      ],
+      "showTitle": false,
+      "title": "Request Latency Row",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
       "height": 250,
       "panels": [
         {

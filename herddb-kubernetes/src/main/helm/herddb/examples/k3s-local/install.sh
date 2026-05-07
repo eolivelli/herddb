@@ -50,8 +50,17 @@ export KUBECONFIG="$KUBECONFIG_FILE"
 
 # ── 1. Build Docker images ──────────────────────────────────────────
 if $BUILD; then
+    # On shared machines an isolated Maven local repo prevents the build from
+    # polluting the user's default ~/.m2/repository. Honour MAVEN_REPO_LOCAL
+    # if set (and the directory exists or can be created); fall back to the
+    # Maven default otherwise.
+    MVN_LOCAL_ARGS=()
+    if [[ -n "${MAVEN_REPO_LOCAL:-}" ]]; then
+        MVN_LOCAL_ARGS=(-Dmaven.repo.local="$MAVEN_REPO_LOCAL")
+        echo "==> Using isolated Maven local repository: $MAVEN_REPO_LOCAL"
+    fi
     echo "==> Building Docker images with Maven..."
-    (cd "$REPO_ROOT" && mvn clean install -DskipTests -Pdocker)
+    (cd "$REPO_ROOT" && mvn "${MVN_LOCAL_ARGS[@]}" clean install -DskipTests -Pdocker)
 fi
 
 # Ensure the image exists locally — it will be side-loaded into k3s.

@@ -36,12 +36,17 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestWatcher;
+import org.junit.rules.Timeout;
+import org.junit.runner.Description;
 import org.testcontainers.k3s.K3sContainer;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
@@ -54,8 +59,25 @@ public class HerdDBKubernetesIT {
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
 
+    // Setting -Dio.netty.maxDirectMemory=<bytes> matching -XX:MaxDirectMemorySize is required so that
+    // Netty uses Unsafe.allocateMemory (no-cleaner pooled path) with an internal byte cap, bypassing
+    // JVM Bits.reserveMemory accounting. Without this property, Netty falls back to ByteBuffer.allocateDirect
+    // and direct allocations are bounded by phantom-reference GC delays — see issue #253 and the comment in
+    // herddb-services/src/main/resources/bin/setenv.sh which sets -Dio.netty.maxDirectMemory=0 in the default
+    // JAVA_OPTS baseline (lost when the Helm chart's full-replace server.javaOpts is supplied as in these tests).
+    // Recent off-heap relocations (issues #399, #409, #411) make even simple SQL traffic allocate enough direct
+    // memory that the previous 128 MiB cap caused server stalls on CI (issue #438).
+    // Byte values: 268435456 = 256 * 1024 * 1024 (= MaxDirectMemorySize=256m).
+    //
+    // -XX:NativeMemoryTracking=summary enables `jcmd <pid> VM.native_memory summary` so that
+    // KubernetesDiagnostics can report the actual direct/native memory breakdown when a test fails
+    // (issue #438). Per Oracle, NMT summary mode adds ~5-10% per-malloc overhead — accepted here
+    // because the K3s ITs need the breakdown to diagnose memory-pressure stalls. Remove this flag
+    // once issue #438 is resolved if the overhead becomes a problem in tighter-memory scenarios.
     private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m"
+            + " -Dio.netty.maxDirectMemory=268435456"
+            + " -XX:NativeMemoryTracking=summary"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -63,6 +85,34 @@ public class HerdDBKubernetesIT {
             .withExposedPorts(6443);
 
     private static KubernetesClient kubernetesClient;
+
+    /**
+     * Per-test wall-clock timeout (issue #438). The JDBC client already has a 600s
+     * application-level timeout; this rule bounds the test method itself in case
+     * something below the JDBC layer (e.g. {@code kubectl exec} streaming) hangs
+     * indefinitely. 25 minutes leaves headroom for boot + slow first-DDL + diagnostics.
+     */
+    @Rule
+    public Timeout perTestTimeout = new Timeout(25, TimeUnit.MINUTES);
+
+    /**
+     * Dump comprehensive diagnostics from the K3s cluster on test failure
+     * (issue #438). Without this, the only signal we get from CI is
+     * "Request timedout (600s)" with no clue whether the server JVM was
+     * stuck in GC, OOMKilled, deadlocked, or otherwise hung.
+     */
+    @Rule
+    public TestWatcher diagnosticsRule = new TestWatcher() {
+        @Override
+        protected void failed(Throwable e, Description description) {
+            LOG.severe("Test " + description.getMethodName() + " FAILED: " + e);
+            try {
+                KubernetesDiagnostics.dumpAll(k3s, kubernetesClient, description.getMethodName());
+            } catch (RuntimeException diag) {
+                LOG.log(Level.WARNING, "diagnostics dump failed", diag);
+            }
+        }
+    };
 
     @BeforeClass
     public static void setup() throws Exception {
@@ -267,6 +317,7 @@ public class HerdDBKubernetesIT {
      */
     static void waitForTablespace(K3sContainer k3sContainer, String toolsPod) throws Exception {
         long deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(10);
+        long lastDiagnostic = System.currentTimeMillis();
         while (System.currentTimeMillis() < deadline) {
             try {
                 execSqlViaKubectl(k3sContainer, toolsPod, "SELECT * FROM systables LIMIT 1");
@@ -275,7 +326,30 @@ public class HerdDBKubernetesIT {
             } catch (Exception e) {
                 LOG.info("Tablespace not ready yet: " + e.getMessage());
             }
+            // Periodic mid-wait diagnostics (issue #438): if waitForTablespace is taking
+            // longer than 5 minutes, dump LIGHTWEIGHT pod state every 5 minutes so we can
+            // see *why* the tablespace is not ready (stuck on BookKeeper, ZK churn, missing
+            // image, ...). Lightweight = pods, events, kubectl describe, recent logs only —
+            // skip the heavier inside-pod jstack/jcmd probes which can themselves hang on a
+            // stuck JVM and burn the per-test 25-min budget. The heavy probes are reserved
+            // for the final timeout dump below and the @Rule TestWatcher.failed dump.
+            if (System.currentTimeMillis() - lastDiagnostic > TimeUnit.MINUTES.toMillis(5)) {
+                LOG.info("waitForTablespace exceeded 5 minutes; dumping interim (lightweight) diagnostics...");
+                try {
+                    KubernetesDiagnostics.dumpLightweight(k3sContainer, kubernetesClient,
+                            "waitForTablespace-progress");
+                } catch (RuntimeException diag) {
+                    LOG.log(Level.WARNING, "interim diagnostics dump failed", diag);
+                }
+                lastDiagnostic = System.currentTimeMillis();
+            }
             Thread.sleep(5000);
+        }
+        // Final diagnostic before throwing — full heavy dump (jstack, jcmd, smaps).
+        try {
+            KubernetesDiagnostics.dumpAll(k3sContainer, kubernetesClient, "waitForTablespace-timeout");
+        } catch (RuntimeException diag) {
+            LOG.log(Level.WARNING, "final diagnostics dump failed", diag);
         }
         throw new RuntimeException("Timed out waiting for tablespace to be ready");
     }
@@ -330,6 +404,17 @@ public class HerdDBKubernetesIT {
         }
 
         if (exitCode != 0) {
+            // Diagnostic dump on SQL failure (issue #438): every K3s IT failure
+            // we have seen on CI has this exact code path, so capture cluster
+            // state HERE — before the test method returns and the @Rule
+            // TestWatcher kicks in (the watcher fires too, but captures from a
+            // slightly later vantage point; both are kept for safety).
+            try {
+                KubernetesDiagnostics.dumpAll(k3sContainer, kubernetesClient,
+                        "execSqlViaKubectl-failure");
+            } catch (RuntimeException diag) {
+                LOG.log(Level.WARNING, "diagnostics dump failed", diag);
+            }
             throw new RuntimeException("SQL failed (exit=" + exitCode + "): " + output);
         }
         return output;
@@ -350,39 +435,67 @@ public class HerdDBKubernetesIT {
                 + "Looked in: " + String.join(", ", candidates));
     }
 
+    // Same rationale as SERVER_JAVA_OPTS: set -Dio.netty.maxDirectMemory explicitly to match
+    // MaxDirectMemorySize so Netty uses the Unsafe no-cleaner path (issue #253, issue #438).
+    // -XX:NativeMemoryTracking=summary enables jcmd VM.native_memory summary for diagnostics.
+    // Byte values: 134217728 = 128 * 1024 * 1024 (= MaxDirectMemorySize=128m).
     private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Dio.netty.maxDirectMemory=134217728"
+            + " -XX:NativeMemoryTracking=summary"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     private static String helmTemplate(String chartPath) throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
                 "helm", "template", "test-release", chartPath,
                 "--set", "server.mode=cluster",
+                // Keep chart-default server.storageMode=remote so the test exercises the
+                // production cluster+remote-storage path. To fit on the single-node K3s
+                // testcontainer (4 vCPUs on GH Actions) we right-size the file-server
+                // (the chart default is replicaCount=2 × cpu=4 = 8 CPUs requested,
+                // which is unschedulable and leaves file-server-0 Pending with
+                // "Insufficient cpu" — see issue #438).
                 "--set", "server.replicaCount=1",
                 "--set", "tools.enabled=true",
                 "--set", "zookeeper.enabled=true",
                 "--set", "bookkeeper.enabled=true",
                 "--set", "bookkeeper.replicaCount=1",
                 "--set", "zookeeper.javaOpts=" + INFRA_JAVA_OPTS,
-                "--set", "zookeeper.resources.requests.memory=256Mi",
+                // Container memory raised from 256Mi to 384Mi to fit 128m heap + 128m direct + ~128m
+                // JVM/native overhead (issue #438). Same applies to all infra pods below.
+                "--set", "zookeeper.resources.requests.memory=384Mi",
                 "--set", "zookeeper.resources.requests.cpu=0.5",
-                "--set", "zookeeper.resources.limits.memory=256Mi",
+                "--set", "zookeeper.resources.limits.memory=384Mi",
                 "--set", "zookeeper.resources.limits.cpu=0.5",
                 "--set", "zookeeper.storage.size=1Gi",
                 "--set", "bookkeeper.javaOpts=" + INFRA_JAVA_OPTS,
-                "--set", "bookkeeper.resources.requests.memory=256Mi",
+                "--set", "bookkeeper.resources.requests.memory=384Mi",
                 "--set", "bookkeeper.resources.requests.cpu=0.5",
-                "--set", "bookkeeper.resources.limits.memory=256Mi",
+                "--set", "bookkeeper.resources.limits.memory=384Mi",
                 "--set", "bookkeeper.resources.limits.cpu=0.5",
                 "--set", "bookkeeper.storage.journal.size=1Gi",
                 "--set", "bookkeeper.storage.ledger.size=1Gi",
                 "--set", "server.javaOpts=" + SERVER_JAVA_OPTS,
-                "--set", "server.resources.requests.memory=512Mi",
+                // Server container memory raised from 512Mi to 768Mi to fit 256m heap + 256m direct +
+                // ~256m JVM/native overhead under the new off-heap memory profile (issue #438).
+                "--set", "server.resources.requests.memory=768Mi",
                 "--set", "server.resources.requests.cpu=0.5",
-                "--set", "server.resources.limits.memory=512Mi",
+                "--set", "server.resources.limits.memory=768Mi",
                 "--set", "server.resources.limits.cpu=0.5",
                 "--set", "server.storage.data.size=1Gi",
                 "--set", "server.storage.commitlog.size=1Gi",
+                // File server: 1 replica with infra-sized resources to fit on a 4-vCPU
+                // K3s runner. Chart defaults are replicaCount=2 × cpu=4 = 8 CPUs which
+                // is unschedulable on GH Actions; see issue #438. Empty fileServer.javaOpts
+                // (chart default) means setenv.sh's -Xmx4g default applies inside the pod
+                // and instantly OOMs at the 384Mi memory limit, so override javaOpts too.
+                "--set", "fileServer.replicaCount=1",
+                "--set", "fileServer.javaOpts=" + INFRA_JAVA_OPTS,
+                "--set", "fileServer.resources.requests.memory=384Mi",
+                "--set", "fileServer.resources.requests.cpu=0.5",
+                "--set", "fileServer.resources.limits.memory=384Mi",
+                "--set", "fileServer.resources.limits.cpu=0.5",
+                "--set", "fileServer.storage.size=1Gi",
                 "--set", "image.pullPolicy=Never"
         );
         pb.redirectErrorStream(true);

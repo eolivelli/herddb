@@ -38,6 +38,7 @@ import java.net.URL;
 import java.net.URLConnection;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -649,7 +650,20 @@ public class DatasetLoader {
 
         if (skipVectors > 0) {
             System.out.println("  Skipping " + skipVectors + " vectors to resume from position " + skipVectors + "...");
-            skipVecsInStream(dis, format, skipVectors);
+            try {
+                skipVecsInStream(dis, format, skipVectors);
+            } catch (IOException e) {
+                // The new "loud EOF" semantics in skipExactly makes this
+                // throw path reachable on corrupt / truncated files; close
+                // the file handle before propagating so a partially-built
+                // VectorStream doesn't leak the FD across retries.
+                try {
+                    dis.close();
+                } catch (IOException closeEx) {
+                    e.addSuppressed(closeEx);
+                }
+                throw e;
+            }
             System.out.println("  Skip complete.");
         }
 
@@ -665,6 +679,30 @@ public class DatasetLoader {
                     private long count = 0;
                     private float[] next = null;
                     private boolean eof = false;
+                    /**
+                     * Reusable byte-buffer for the raw payload; allocated
+                     * lazily on the first read once dim is known. Issue
+                     * #443: hoisting the byte[] out of the per-vector
+                     * read loop eliminates ~4 KB of garbage per vector at
+                     * dim=1024 (~400 GB on a 100 M ingest).
+                     */
+                    private byte[] scratchBytes;
+                    /**
+                     * Reusable little-endian FloatBuffer view over
+                     * {@link #scratchBytes}; only populated for FVECS.
+                     * Saves both the {@code ByteBuffer.wrap(...)} and
+                     * {@code asFloatBuffer()} wrapper allocations per
+                     * vector.
+                     */
+                    private FloatBuffer scratchFloatView;
+                    /**
+                     * Cached dim from the previous vector; SIFT files
+                     * have a constant dim, so reusing the scratch is safe
+                     * unless we encounter a file that violates the
+                     * invariant — in which case we transparently
+                     * reallocate.
+                     */
+                    private int cachedDim = -1;
 
                     private float[] readNext() {
                         if (count >= maxVectors || eof) {
@@ -678,27 +716,42 @@ public class DatasetLoader {
                                 eof = true;
                                 return null;
                             }
+                            ensureScratch(dim);
+                            dis.readFully(scratchBytes);
+                            // float[] is the one allocation we cannot
+                            // avoid — the iterator contract hands the
+                            // array to the caller, who keeps it.
+                            float[] vec = new float[dim];
                             if (format == VecFormat.BVECS) {
-                                byte[] bytes = new byte[dim];
-                                dis.readFully(bytes);
-                                float[] vec = new float[dim];
                                 for (int i = 0; i < dim; i++) {
-                                    vec[i] = (bytes[i] & 0xFF);
+                                    vec[i] = (scratchBytes[i] & 0xFF);
                                 }
-                                return vec;
                             } else {
-                                byte[] bytes = new byte[dim * 4];
-                                dis.readFully(bytes);
-                                ByteBuffer bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
-                                float[] vec = new float[dim];
-                                for (int i = 0; i < dim; i++) {
-                                    vec[i] = bb.getFloat();
-                                }
-                                return vec;
+                                // Issue #443: bulk decode via reused
+                                // FloatBuffer view. The JIT can vectorize
+                                // the underlying byte→float conversion
+                                // and the wrappers are not re-allocated.
+                                scratchFloatView.rewind();
+                                scratchFloatView.get(vec);
                             }
+                            return vec;
                         } catch (IOException e) {
                             eof = true;
                             throw new RuntimeException("Error reading vector stream", e);
+                        }
+                    }
+
+                    private void ensureScratch(int dim) {
+                        if (scratchBytes != null && cachedDim == dim) {
+                            return;
+                        }
+                        cachedDim = dim;
+                        int payloadBytes = (format == VecFormat.BVECS) ? dim : dim * 4;
+                        scratchBytes = new byte[payloadBytes];
+                        if (format != VecFormat.BVECS) {
+                            scratchFloatView = ByteBuffer.wrap(scratchBytes)
+                                    .order(ByteOrder.LITTLE_ENDIAN)
+                                    .asFloatBuffer();
                         }
                     }
 
@@ -728,22 +781,85 @@ public class DatasetLoader {
         };
     }
 
-    /** Skip {@code count} vectors in-place from a DataInputStream of FVECS or BVECS format. */
+    /**
+     * Skip {@code count} vectors in-place from a DataInputStream of FVECS
+     * or BVECS format.
+     *
+     * <p><b>Correctness requirement:</b> the SIFT format guarantees a
+     * constant {@code dim} across every record in a single file. The
+     * bulk-skip implementation below relies on this — it reads dim from
+     * the first record only, computes the per-record byte size, and then
+     * skips the remaining {@code count - 1} records as a single
+     * {@link DataInputStream#skip(long)}. A file that violates the
+     * constant-dim invariant would silently land at the wrong byte
+     * offset, so do <em>not</em> introduce a partial-fallback path here
+     * that re-reads dim per record without also detecting and surfacing
+     * the inconsistency loudly.
+     *
+     * <p>Issue #443: the previous per-vector {@code readInt + skip} loop
+     * was wasted work — for a 100 M-row resume that was 100 M small
+     * reads followed by 100 M skip calls. Folding into one bulk skip
+     * lets the underlying {@code BufferedInputStream} (or
+     * {@code GZIPInputStream}) short-circuit via {@code
+     * FileInputStream.skip()} where supported.
+     */
     private static void skipVecsInStream(DataInputStream dis, VecFormat format, long count) throws IOException {
-        for (long i = 0; i < count; i++) {
-            int dim = readLittleEndianInt(dis);
-            long bytesToSkip = (format == VecFormat.BVECS) ? dim : (long) dim * 4;
-            long remaining = bytesToSkip;
-            while (remaining > 0) {
-                long skipped = dis.skip(remaining);
-                if (skipped <= 0) {
-                    throw new IOException("Unexpected end of stream while skipping vector " + i);
-                }
-                remaining -= skipped;
+        if (count <= 0) {
+            return;
+        }
+        // Read dim from the first record. SIFT format guarantees this
+        // value is identical for every subsequent record in the same file.
+        int dim = readLittleEndianInt(dis);
+        long payloadBytes = (format == VecFormat.BVECS) ? dim : (long) dim * 4;
+        long recordBytes = 4L + payloadBytes;
+
+        // Skip the rest of the first record's payload.
+        skipExactly(dis, payloadBytes, "first vector payload");
+
+        // Bulk-skip the remaining (count - 1) records.
+        long remainingRecords = count - 1L;
+        if (remainingRecords > 0) {
+            long bytesToSkip = remainingRecords * recordBytes;
+            skipExactly(dis, bytesToSkip, "bulk-skip of " + remainingRecords + " vectors");
+        }
+        System.out.println("  Skipped " + count + " vectors (dim=" + dim + ").");
+    }
+
+    /**
+     * Skip exactly {@code totalBytes} bytes from {@code dis}, throwing
+     * if EOF is reached early.
+     *
+     * <p>Implemented via chunked {@link DataInputStream#readFully(byte[],
+     * int, int)} into a 64 KB scratch buffer rather than
+     * {@link InputStream#skip(long)}. Reason: {@code FileInputStream.skip}
+     * delegates to {@code lseek}, which on most platforms succeeds even
+     * when seeking past EOF (the next {@code read()} returns -1, but the
+     * {@code skip()} itself does not throw). A bulk-skip that silently
+     * lands past EOF would let a corrupted / short file slip through the
+     * resume path undetected. {@code readFully} reads bytes through user
+     * space and surfaces EOF as a loud {@link java.io.EOFException},
+     * which we re-wrap into an actionable {@link IOException} below.
+     *
+     * <p>The throughput cost vs raw {@code skip()} is meaningful (a few
+     * hundred MB/s of memcpy), but resume is a one-time startup cost so
+     * we trade it for reliable error reporting.
+     */
+    private static void skipExactly(DataInputStream dis, long totalBytes, String what) throws IOException {
+        if (totalBytes <= 0) {
+            return;
+        }
+        int bufSize = (int) Math.min(64L * 1024L, totalBytes);
+        byte[] discard = new byte[bufSize];
+        long remaining = totalBytes;
+        while (remaining > 0) {
+            int chunk = (int) Math.min((long) bufSize, remaining);
+            try {
+                dis.readFully(discard, 0, chunk);
+            } catch (java.io.EOFException e) {
+                throw new IOException("Unexpected end of stream while skipping " + what
+                        + " (asked for " + totalBytes + " bytes, " + remaining + " left)", e);
             }
-            if ((i + 1) % 1_000_000 == 0) {
-                System.out.println("  Skipped " + (i + 1) + " vectors...");
-            }
+            remaining -= chunk;
         }
     }
 
@@ -882,6 +998,12 @@ public class DatasetLoader {
     private List<float[]> loadFvecs(InputStream in, int maxVectors) throws IOException {
         List<float[]> vectors = new ArrayList<>();
         try (DataInputStream dis = new DataInputStream(in)) {
+            // Issue #443: reuse the byte[] and FloatBuffer view across
+            // every vector in this file. SIFT files have constant dim,
+            // so a single allocation suffices.
+            byte[] scratchBytes = null;
+            FloatBuffer scratchView = null;
+            int cachedDim = -1;
             while (vectors.size() < maxVectors) {
                 int dim;
                 try {
@@ -889,13 +1011,17 @@ public class DatasetLoader {
                 } catch (java.io.EOFException e) {
                     break;
                 }
-                byte[] bytes = new byte[dim * 4];
-                dis.readFully(bytes);
-                ByteBuffer bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
-                float[] vec = new float[dim];
-                for (int i = 0; i < dim; i++) {
-                    vec[i] = bb.getFloat();
+                if (scratchBytes == null || cachedDim != dim) {
+                    cachedDim = dim;
+                    scratchBytes = new byte[dim * 4];
+                    scratchView = ByteBuffer.wrap(scratchBytes)
+                            .order(ByteOrder.LITTLE_ENDIAN)
+                            .asFloatBuffer();
                 }
+                dis.readFully(scratchBytes);
+                float[] vec = new float[dim];
+                scratchView.rewind();
+                scratchView.get(vec);
                 vectors.add(vec);
                 if (vectors.size() % 1_000_000 == 0) {
                     System.out.println("  Loaded " + vectors.size() + " vectors...");
@@ -908,6 +1034,9 @@ public class DatasetLoader {
     private List<float[]> loadBvecs(InputStream in, int maxVectors) throws IOException {
         List<float[]> vectors = new ArrayList<>();
         try (DataInputStream dis = new DataInputStream(in)) {
+            // Issue #443: reuse the byte[] across every vector.
+            byte[] scratchBytes = null;
+            int cachedDim = -1;
             while (vectors.size() < maxVectors) {
                 int dim;
                 try {
@@ -915,11 +1044,14 @@ public class DatasetLoader {
                 } catch (java.io.EOFException e) {
                     break;
                 }
-                byte[] bytes = new byte[dim];
-                dis.readFully(bytes);
+                if (scratchBytes == null || cachedDim != dim) {
+                    cachedDim = dim;
+                    scratchBytes = new byte[dim];
+                }
+                dis.readFully(scratchBytes);
                 float[] vec = new float[dim];
                 for (int i = 0; i < dim; i++) {
-                    vec[i] = (bytes[i] & 0xFF);
+                    vec[i] = (scratchBytes[i] & 0xFF);
                 }
                 vectors.add(vec);
                 if (vectors.size() % 1_000_000 == 0) {

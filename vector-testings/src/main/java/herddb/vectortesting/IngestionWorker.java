@@ -133,7 +133,8 @@ public class IngestionWorker implements Runnable {
         this.runtime = runtime;
     }
 
-    private static String formatEta(double seconds) {
+    /** Package-private so {@link VectorBench}'s progress thread can format ETA consistently. */
+    static String formatEta(double seconds) {
         if (seconds <= 0) {
             return "N/A";
         }
@@ -526,26 +527,12 @@ public class IngestionWorker implements Runnable {
                 preAcquireForNextTransaction();
             }
 
-            if (rowsIngested % 10_000 == 0 && rowsIngested > 0) {
-                MetricsCollector.Stats s = metrics.computeStats();
-                double elapsedSecs = (System.nanoTime() - ingestStartNanos) / 1e9;
-                double rowsPerSec = rowsIngested / elapsedSecs;
-                long remaining = config.numRows - rowsIngested;
-                double etaSecs = rowsPerSec > 0 ? remaining / rowsPerSec : 0;
-                String etaStr = formatEta(etaSecs);
-                statusLine.set(String.format(
-                        "Ingested %d/%d rows | %.0f ops/s | commits: %d (recovered: %d) | "
-                                + "batch mean: %.2f ms | batch p50: %.2f ms | batch p99: %.2f ms | ETA: %s",
-                        rowsIngested,
-                        config.numRows,
-                        rowsPerSec,
-                        commitsTotal.get(),
-                        commitsRecovered.get(),
-                        s.meanNanos() / 1_000_000.0,
-                        s.p50Nanos() / 1_000_000.0,
-                        s.p99Nanos() / 1_000_000.0,
-                        etaStr));
-            }
+            // Status-line publication moved to VectorBench's progress thread
+            // (issue #443): every worker calling computeStats() and
+            // overwriting the shared statusLine on its own cadence dominated
+            // the CPU profile and produced racy partial views. The progress
+            // thread publishes a single coherent line every 500 ms using the
+            // global counters and an HdrHistogram-backed snapshot.
         }
         // Final drain at end-of-input: flush any remaining sub-batch and
         // commit whatever remains in the transaction. The commit unit may be

@@ -23,7 +23,7 @@
 #     --set fileServer.s3.bucket=<your-bucket-name>
 #
 # Memory layout (heap + direct + ~1 GiB JVM overhead = container limit):
-#   server          :  22 g heap + 17 g direct + 1 g = 40 GiB
+#   server          :  20 g heap + 20 g Netty direct + 4 g JVM direct + 1 g ≈ 45 GiB RSS (50 GiB limit)
 #   fileServer      :   6 g heap +  8 g direct + 1 g = 15 g  (< 16 GiB, 16 CPU)
 #   indexingService :  28 g heap + 10 g direct + 1 g = 39 g  (< 40 GiB)
 #   bookkeeper      :   2 g heap +  1 g direct + 1 g =  4 g  (< 8 GiB)
@@ -53,17 +53,36 @@ server:
   # (cross-zone egress in GKE is billed; same-zone traffic is free).
   nodeSelector:
     topology.kubernetes.io/zone: "europe-west4-a"
-  # 22 g heap + 17 g direct + ~1 g JVM overhead = 40 GiB container.
-  # Heap raised from 14 g to 22 g (+8 GB) to give the server more room for
-  # the page index, dirty-page map, and transaction working set at high row counts.
-  # --add-modules jdk.incubator.vector: required for Panama Vector API (jvector 4.x).
-  # -Dio.netty.maxDirectMemory=18253611008 (= MaxDirectMemorySize=17g in bytes):
-  # Netty uses Unsafe.allocateMemory bypassing JVM Bits.reserveMemory, preventing
-  # phantom-reference GC delays from exhausting the direct-memory counter (issue #253).
-  javaOpts: "-Xms22g -Xmx22g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=18253611008 -XX:MaxDirectMemorySize=17g"
+  # 20 g heap + 20 g Netty direct + 4 g JVM direct + ~1 g overhead = ~45 g actual RSS
+  # (50 GiB container limit gives ~5 GiB headroom for GC working set and OS).
+  # Heap raised from 12 g to 20 g (issue #407): BookKeeper client allocates on-heap
+  # DefaultChannelPromise per addEntry call; 12 g was insufficient under Phase B flush
+  # load (~50K records/s) — heap exhausted in ~90s during the second checkpoint.
+  #
+  # Memory model after off-heap migration:
+  #   -Dio.netty.maxDirectMemory=21474836480 (20 GiB, ≈ 20 × 1024³ bytes):
+  #     GLOBAL cap shared by ALL Netty PooledByteBufAllocator instances:
+  #       • PooledByteBufAllocator.DEFAULT   — network/gRPC/BK-client frames
+  #       • HerdDBByteBufAllocators.dataPagesAllocator()  — DataPage value slabs
+  #       • HerdDBByteBufAllocators.indexPagesAllocator() — BLink/BRIN key slabs
+  #     PlatformDependent.incrementMemoryCounter() tracks the aggregate; all three
+  #     pools check against the same DIRECT_MEMORY_LIMIT.
+  #     HerdDBByteBufAllocators.maxDirectMemoryBytes() reads this value as the
+  #     server's memory-budget reference (PROPERTY_MEMORY_LIMIT_REFERENCE_SOURCE=direct):
+  #       data pages : 50% × 20 g = 10 g  (off-heap)
+  #       PK index   : 20% × 20 g =  4 g  (off-heap)
+  #       network    :              ~6 g  (remainder, shared with gRPC + BK client)
+  #   -XX:MaxDirectMemorySize=4g:
+  #     JVM's native cap for ByteBuffer.allocateDirect() (non-Netty code paths).
+  #     Netty bypasses this via Unsafe.allocateMemory, so it does NOT limit the 20 g
+  #     Netty pool above. Acts as a safety rail for non-Netty JVM direct buffers.
+  javaOpts: "-Xms20g -Xmx20g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=21474836480 -XX:MaxDirectMemorySize=4g -DBUILD=20260505-fuzzy-checkpoint-v1"
   storage:
     data:
-      size: 10Gi
+      # 100 GiB: enlarged from 10 GiB to hold a full JVM heap dump (server
+      # heap = 32 GiB; heapdump-on-OOME + manual jmap both write to this PVC
+      # via diagnostics.sh which guards against insufficient free space).
+      size: 100Gi
     commitlog:
       size: 5Gi
   extraConfig:
@@ -78,17 +97,17 @@ server:
     server.bookkeeper.ledgers.max.size: "10737418240"          # 10 GiB
     # Retention raised to 35 min to satisfy the server constraint:
     # checkpoint.period < retention.period / 2
-    # → retention.period must be > 2 × 900,000 ms = 1,800,000 ms.
+    # → retention.period must be > 2 × 300,000 ms = 600,000 ms.
     # 2,100,000 ms (35 min) gives a comfortable margin. Closed ledgers may
     # accumulate for up to 35 min before dropOldLedgers prunes them; with
     # 500 GiB ledger PVCs this is well within capacity for a 100M-row bench.
     server.bookkeeper.ledgers.retention.period: "2100000"      # 35 min (ms)
-    # Raised from 1 min to 15 min (900,000 ms). Fewer but larger checkpoints
-    # reduce the fraction of wall-clock time spent in full-flush stalls
-    # (see issue #202: checkpoint page-flush blocks ingest commits). The 1-min
-    # period was chosen originally to work around a 5-min retention limit; now
-    # that retention is 35 min the original default of 15 min is safe again.
-    server.checkpoint.period: "900000"                         # 15 min (ms)
+    # Reduced from 15 min (900,000 ms) to 5 min (300,000 ms). More frequent
+    # checkpoints keep dirty-page count lower, reducing Phase B flush time per
+    # checkpoint and bounding commit-log lag to a smaller window. The constraint
+    # checkpoint.period < retention.period / 2 is satisfied:
+    # 300,000 < 2,100,000 / 2 = 1,050,000 ✓
+    server.checkpoint.period: "300000"                         # 5 min (ms)
     # --- BookKeeper client resilience tuning (issues #152, #164) ---
     # The code default (issue #152) is addEntryTimeoutSec=30 /
     # addEntryQuorumTimeoutSec=60. Overridden here because checkpoint-induced
@@ -124,11 +143,11 @@ server:
     bookkeeper.zkTimeout: "40000"
   resources:
     requests:
-      memory: "40Gi"
-      cpu: "16"
+      memory: "50Gi"
+      cpu: "24"
     limits:
-      memory: "40Gi"
-      cpu: "16"
+      memory: "50Gi"
+      cpu: "24"
 
 fileServer:
   replicaCount: 2
@@ -257,6 +276,14 @@ bookkeeper:
     # Raise bookie ZK session timeout from the 10s default (AbstractConfiguration.getZkTimeout())
     # to 40s so it survives checkpoint-induced I/O bursts without expiring (issue #210).
     zkTimeout: "40000"
+    # Raise the bookie's in-progress read-request gate (issue #449).
+    # Default is 10,000. With 2 IS replicas each catching up on ~1,000 BK entries at
+    # tailbatchsize=10,000, both IS tailers connecting simultaneously fired
+    # "Too many read requests in progress, disabling autoread" immediately, which
+    # caused BK-0 to freeze for ~10 minutes while SortedLedgerStorage flushes were
+    # running concurrently, blocking all addEntry writes. Setting to 1,000,000
+    # (100× default) prevents the IS catch-up burst from triggering the gate.
+    maxReadRequestsInProgress: "1000000"
   # Journal: pd-SSD (premium-rwo) — random write I/O, latency-sensitive.
   #   During a 1B bigann ingest run the bookie journal showed p99.9 write
   #   latency of 45–60 ms on pd-balanced (standard-rwo). This tail feeds a
@@ -343,13 +370,10 @@ indexingService:
   javaOpts: "-Xms28g -Xmx28g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=10737418240 -XX:MaxDirectMemorySize=10g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=10000 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/opt/herddb/indexdata/heapdump.hprof"
   storage:
     data:
-      # NOTE: PVC size kept at 20Gi to avoid StatefulSet volumeClaimTemplate
-      # immutability error on helm upgrade. GKE supports online PVC expansion
-      # but the StatefulSet template itself cannot change without deleting the
-      # STS first. A full heap dump (28g heap, worst-case ~28 GiB) will not fit
-      # here; to expand, manually patch PVCs and delete/recreate the STS via
-      # reset-cluster.sh on the next fresh run.
-      size: 20Gi
+      # 100 GiB: accommodates a full heap dump (28g heap, worst-case ~28 GiB HPROF)
+      # plus IS working data. STS was deleted via teardown+reset, so the
+      # volumeClaimTemplate can be freely set on this fresh install.
+      size: 100Gi
     log:
       size: 5Gi
   extraConfig:
@@ -479,13 +503,13 @@ tools:
   resources:
     requests:
       memory: "7Gi"
-      cpu: "0.5"
+      cpu: "4"
     limits:
       memory: "7Gi"
-      cpu: "1"
+      cpu: "4"
 
 prometheus:
-  enabled: false
+  enabled: true
 
 grafana:
-  enabled: false
+  enabled: true

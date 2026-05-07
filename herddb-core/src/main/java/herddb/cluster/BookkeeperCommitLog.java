@@ -32,6 +32,7 @@ import herddb.utils.ExtendedDataInputStream;
 import herddb.utils.SystemProperties;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufInputStream;
+import io.netty.util.ReferenceCountUtil;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -43,6 +44,8 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -60,6 +63,7 @@ import org.apache.bookkeeper.client.api.LastConfirmedAndEntry;
 import org.apache.bookkeeper.client.api.LedgerEntries;
 import org.apache.bookkeeper.client.api.LedgerMetadata;
 import org.apache.bookkeeper.client.api.ReadHandle;
+import org.apache.bookkeeper.client.api.WriteFlag;
 import org.apache.bookkeeper.client.api.WriteHandle;
 import org.apache.bookkeeper.common.concurrent.FutureUtils;
 import org.apache.bookkeeper.versioning.Versioned;
@@ -142,6 +146,39 @@ public class BookkeeperCommitLog extends CommitLog {
         private final AtomicReference<Throwable> writeError = new AtomicReference<>();
 
         /**
+         * Single-threaded executor borrowed from BookKeeper's main worker pool
+         * via {@code BookKeeper.getMainWorkerPool().chooseThread(ledgerId)}.
+         * Every {@code appendAsync} call for this ledger is funnelled through
+         * this one thread so that BookKeeper's internal {@code synchronized
+         * (this)} block in {@code LedgerHandle.doAsyncAddEntry} is never
+         * contended (issue #434). Pulsar's {@code ManagedLedgerImpl} uses the
+         * exact same pattern with the comment <i>"Jump to specific thread to
+         * avoid contention from writers writing from different threads"</i>.
+         * The underlying {@code SingleThreadExecutor} uses a JCTools
+         * {@code GrowableMpScArrayConsumerBlockingQueue}, so the producer-side
+         * enqueue is lock-free MPSC and the consumer drains in batches.
+         * No new threads are created — we share an existing BK thread, picked
+         * deterministically by hashing {@code ledgerId}.
+         *
+         * <p>Critically, sharing the thread with BK's response handling is
+         * a <em>correctness</em> requirement, not just a resource-saving
+         * choice: BK dispatches each entry's ack callback via
+         * {@code executeOrdered(ledgerId, ...)}, which lands on this same
+         * thread. So our submitted lambdas and the corresponding BK acks
+         * <em>interleave</em> on a single thread, which keeps
+         * {@code lh.lastAddConfirmed} fresh between consecutive
+         * {@code appendAsync} calls. That freshness is essential for the
+         * piggybacked LAC the writer sends with each new entry — a
+         * dedicated executor (not on BK's pool) batches our lambdas ahead
+         * of any acks, all entries piggyback the same stale LAC, and
+         * followers reading via {@code readLastAddConfirmed} cannot make
+         * progress until a later entry happens to land
+         * (regression observed in {@code SimpleReplicationTest} when this
+         * was tried).
+         */
+        private final ExecutorService executor;
+
+        /**
          * Local cache of the ledger's closed state. Set to {@code true} in
          * {@link #close()} (always called under the outer write lock) so that
          * {@link #isWritable()} can check closure without acquiring the
@@ -157,7 +194,7 @@ public class BookkeeperCommitLog extends CommitLog {
          * {@code synchronized} on the {@link WriteHandle} instance) in the hot
          * {@link #isWritable()} check, eliminating monitor contention under
          * concurrent ingest (issue #385).
-         * Incremented <em>before</em> each {@code appendAsync} call so that
+         * Incremented <em>before</em> each {@code appendAsync} dispatch so that
          * size-based ledger rotation fires promptly even when writes are submitted
          * faster than BK acknowledges them (e.g. in tight async-write loops).
          * On write failure the counter is NOT decremented: the ledger rolls
@@ -180,6 +217,12 @@ public class BookkeeperCommitLog extends CommitLog {
 
                 this.out = makeNewWriteHandle(actualEnsembleSize, actualWriteQuorumSize, actualAckQuorumSize, metadata);
                 this.ledgerId = this.out.getId();
+                // Hash on the ledger id so all writes for this ledger always
+                // land on the same BK worker thread (single-threaded BK
+                // access). Different ledgers may share a thread, but
+                // single-thread-per-ledger is what eliminates monitor
+                // contention. Mirrors Pulsar's ManagedLedgerImpl pattern.
+                this.executor = bookKeeper.getMainWorkerPool().chooseThread(this.ledgerId);
                 LOGGER.log(Level.INFO, "{0} created ledger {1} (" + actualEnsembleSize + "/" + actualWriteQuorumSize + "/" + actualAckQuorumSize + ") bookies: {2}",
                         new Object[]{tableSpaceDescription(), ledgerId, this.out.getLedgerMetadata().getAllEnsembles()});
                 lastLedgerId = ledgerId;
@@ -204,13 +247,40 @@ public class BookkeeperCommitLog extends CommitLog {
                 // within the bookkeeperClusterReadyWaitTime window.
                 long remaining = maxTime - System.currentTimeMillis();
                 long attemptMs = Math.max(1_000L, Math.min(30_000L, remaining));
+                // Open a regular WriteHandle (LedgerHandle): BookKeeper auto-assigns
+                // sequential entry ids inside {@code synchronized (this)} on every
+                // {@code appendAsync} call. Because the single-thread executor (see
+                // {@link #executor}) is the only producer for this ledger, that
+                // monitor is uncontended even though it still exists.
+                //
+                // We deliberately do NOT use {@code makeAdv()} / {@code WriteAdvHandle}
+                // here: it switches BK's pending-ops queue from a lock-free
+                // {@code ConcurrentLinkedQueue} to a {@code PriorityBlockingQueue},
+                // which adds two O(n) operations per write — a {@code contains(op)}
+                // duplicate-id guard on the hot {@code asyncAddEntry} path and a
+                // {@code toArray()} scan inside the background
+                // {@code monitorPendingAddOps} timer — that grow with the in-flight
+                // entry count. The single-thread pipeline never reuses or skips ids,
+                // so caller-assigned ids would buy zero correctness guarantee while
+                // adding measurable overhead under high-fanout ingest (issue #444).
+                //
+                // {@code DigestType.DUMMY} skips the per-entry CRC32C compute on the
+                // client side (BookKeeper journal/ledger storage retains its own
+                // per-entry checksums and TCP provides wire integrity). Read paths
+                // use {@code setEnableDigestTypeAutodetection(true)} (set in
+                // {@link BookkeeperCommitLogManager}) so existing CRC32C ledgers
+                // continue to read with CRC32C; only newly created ledgers carry
+                // DUMMY (issue #434). {@code WriteFlag.NONE} keeps the default
+                // synchronous-fsync behaviour — {@code DEFERRED_SYNC} would weaken
+                // durability.
                 CompletableFuture<WriteHandle> createFuture = bookKeeper
                         .newCreateLedgerOp()
                         .withEnsembleSize(actualEnsembleSize)
                         .withWriteQuorumSize(actualWriteQuorumSize)
                         .withAckQuorumSize(actualAckQuorumSize)
-                        .withDigestType(DigestType.CRC32C)
+                        .withDigestType(DigestType.DUMMY)
                         .withPassword(SHARED_SECRET.getBytes(StandardCharsets.UTF_8))
+                        .withWriteFlags(WriteFlag.NONE)
                         .withCustomMetadata(metadata)
                         .execute();
                 try {
@@ -305,8 +375,8 @@ public class BookkeeperCommitLog extends CommitLog {
 
         public CompletableFuture<LogSequenceNumber> writeEntry(LogEntry edit) {
             // BK will release the buffer after handling the entry
-            ByteBuf serialize = edit.serializeAsByteBuf();
-            // Capture size before appendAsync: BK releases the buffer after
+            final ByteBuf serialize = edit.serializeAsByteBuf();
+            // Capture size before dispatch: BK releases the buffer after
             // processing it, so readableBytes() would return 0 in the callback.
             // localLength is incremented here (pre-acknowledgement) so that
             // size-based rotation fires promptly even when writes are submitted
@@ -314,23 +384,97 @@ public class BookkeeperCommitLog extends CommitLog {
             final int entryBytes = serialize.readableBytes();
             localLength.addAndGet(entryBytes);
             pendingAdds.incrementAndGet();
-            final CompletableFuture<LogSequenceNumber> res = this.out.appendAsync(serialize)
-                    .handle((offset, error) -> {
-                        if (error == null) {
-                            pendingAdds.decrementAndGet();
-                            if (edit.type != LogEntryType.NOOP) { // do not take into account NOOPs
-                                lastApplicationWriteTs = System.currentTimeMillis();
-                            }
-                            return new LogSequenceNumber(ledgerId, offset);
-                        } else {
-                            writeError.set(error);
-                            pendingAdds.decrementAndGet();
-                            errorOccurredDuringWrite = true;
-                            handleBookKeeperFailure(error, edit);
-                            throw new LogNotAvailableException(error);
-                        }
-                    });
-            return res;
+            final CompletableFuture<LogSequenceNumber> result = new CompletableFuture<>();
+            // Hot path of issue #434: instead of calling out.appendAsync from
+            // the producer thread (where BookKeeper's
+            // synchronized(this) block in LedgerHandle.doAsyncAddEntry was
+            // contended by every concurrent ingest thread, accounting for
+            // ~99.6% of monitor-wait time in the lock profile), we hand off
+            // to the per-ledger BK worker thread. Because every write for
+            // this ledger always runs on the same single thread (deterministic
+            // chooseThread(ledgerId) hash), BK's monitor is uncontended and
+            // resolves to a thin/biased lock that is essentially free.
+            // Mirrors Apache Pulsar's ManagedLedgerImpl.asyncAddEntry pattern.
+            try {
+                executor.execute(() -> {
+                    // Short-circuit: if a previous write on this ledger already
+                    // failed, do NOT call into BK. Failing the future cleanly
+                    // here lets {@link #waitForAllPendingWrites()} drain
+                    // promptly so ledger rotation can open a fresh ledger
+                    // right away (issue #434, PR #437 review follow-up).
+                    if (errorOccurredDuringWrite) {
+                        ReferenceCountUtil.safeRelease(serialize);
+                        pendingAdds.decrementAndGet();
+                        result.completeExceptionally(new LogNotAvailableException(
+                                "writer entered failed state before this entry was dispatched"));
+                        return;
+                    }
+                    try {
+                        // {@link WriteHandle#appendAsync} returns a future of the
+                        // BK-assigned entry id. BK assigns ids sequentially under
+                        // {@code synchronized (this)} in {@code asyncAddEntry}, so
+                        // with our single-thread executor calling appendAsync one
+                        // entry at a time, ids are dense and monotonic per ledger
+                        // (issue #444 — replaced explicit ids assigned via
+                        // {@code WriteAdvHandle.writeAsync} which forced BK's
+                        // pending-ops queue to a {@link java.util.concurrent.PriorityBlockingQueue}
+                        // with two O(n) lock-protected operations per write).
+                        out.appendAsync(serialize)
+                                .whenComplete((ackedId, error) -> {
+                                    if (error == null) {
+                                        pendingAdds.decrementAndGet();
+                                        if (edit.type != LogEntryType.NOOP) { // do not take into account NOOPs
+                                            lastApplicationWriteTs = System.currentTimeMillis();
+                                        }
+                                        result.complete(new LogSequenceNumber(ledgerId, ackedId));
+                                    } else {
+                                        writeError.set(error);
+                                        pendingAdds.decrementAndGet();
+                                        errorOccurredDuringWrite = true;
+                                        handleBookKeeperFailure(error, edit);
+                                        result.completeExceptionally(new LogNotAvailableException(error));
+                                    }
+                                });
+                    } catch (RuntimeException synchronousFailure) {
+                        // Defensive: if appendAsync throws synchronously
+                        // (e.g. an internal BK assertion), the buffer is
+                        // leaked and the future never completes — leaving
+                        // callers hung forever. Catching RuntimeException
+                        // here (the narrowest type the BK API can leak
+                        // before scheduling the op) ensures the buffer is
+                        // released, pendingAdds is reverted so
+                        // waitForAllPendingWrites() can drain, and the
+                        // caller's future fails cleanly. This path is not
+                        // expected to fire under normal BK operation.
+                        // No entry-id rollback is required: with
+                        // {@code appendAsync}, BK assigns the id only after
+                        // entering its own {@code synchronized} block inside
+                        // {@code doAsyncAddEntry}, so a synchronous throw at
+                        // any earlier point leaves {@code lastAddPushed}
+                        // untouched and no gap can appear in the entry-id
+                        // sequence (issue #444).
+                        ReferenceCountUtil.safeRelease(serialize);
+                        writeError.set(synchronousFailure);
+                        pendingAdds.decrementAndGet();
+                        errorOccurredDuringWrite = true;
+                        handleBookKeeperFailure(synchronousFailure, edit);
+                        result.completeExceptionally(new LogNotAvailableException(synchronousFailure));
+                    }
+                });
+            } catch (RejectedExecutionException rex) {
+                // Executor is shutting down (BookKeeper main worker pool has
+                // been stopped). Release the buffer ourselves — BK never got
+                // a chance to do it — and revert pendingAdds so
+                // waitForAllPendingWrites() can drain. localLength is
+                // intentionally NOT reverted: see the field javadoc — rolling
+                // a ledger slightly early on a rejected write is safe.
+                ReferenceCountUtil.safeRelease(serialize);
+                pendingAdds.decrementAndGet();
+                errorOccurredDuringWrite = true;
+                writeError.set(rex);
+                result.completeExceptionally(new LogNotAvailableException(rex));
+            }
+            return result;
         }
 
         public void waitForAllPendingWrites() throws LogNotAvailableException {
@@ -362,8 +506,16 @@ public class BookkeeperCommitLog extends CommitLog {
             // exact moment; the flag is for post-rotation observers.
             outClosed = true;
             try {
+                // out.getLastAddPushed() is exposed by {@link WriteHandle}
+                // (issue #444 reverted the caller-assigned-id pipeline). It is
+                // {@code synchronized} on the LedgerHandle, but close() runs on
+                // the rotation thread under the outer write lock so monitor
+                // contention is not a concern here. localLength.get() is used
+                // in place of the synchronized out.getLength() so close still
+                // avoids the BK monitor on the shutdown path (consistent with
+                // isWritable() — issue #385).
                 LOGGER.log(Level.INFO, "{0} closing ledger {1}, with LastAddConfirmed={2}, LastAddPushed={3} length={4}, errorOccurred:{5}",
-                        new Object[]{tableSpaceDescription(), out.getId(), out.getLastAddConfirmed(), out.getLastAddPushed(), out.getLength(), errorOccurredDuringWrite});
+                        new Object[]{tableSpaceDescription(), out.getId(), out.getLastAddConfirmed(), out.getLastAddPushed(), localLength.get(), errorOccurredDuringWrite});
                 out.closeAsync().get(60, TimeUnit.SECONDS);
             } catch (InterruptedException | ExecutionException | TimeoutException err) {
                 throw new LogNotAvailableException(err);

@@ -16,10 +16,13 @@
 # ~1.2 GB of raw float data and the CachingObjectStorage reads it into
 # the JVM heap during compaction.
 #
-# Server heap raised to 12 g: sift10m background activator checkpoint
-# serializes all 5,257+ dirty pages (~1 MiB each via VisibleByteArrayOutputStream)
-# during a full 10M-row flush; 8 g was insufficient (issue #111).
-# 12 g heap + 1 GiB JVM overhead → 13 GiB container memory.
+# Server memory layout: 8 g heap + 8 g Netty direct + 2 g JVM direct + 1 g
+# overhead → 19 GiB container. After the off-heap migration of data pages
+# (issue #399) and BLink/BRIN keys (issue #405), the heap holds only the
+# transient working set (transactions, plan caches, BK-client on-heap state)
+# while DataPage values and PK index keys live in dedicated Netty pooled
+# direct allocators. See the long comment above `server.javaOpts` for the
+# memory-budget breakdown.
 #
 # Tools heap raised to 2 g: loading the sift1m base set (1M × 128 × 4 B
 # = 512 MB) into the vector-bench JVM plus JVM overhead exceeds 512 Mi;
@@ -44,17 +47,41 @@ server:
   mode: cluster
   storageMode: remote
   replicaCount: 1
-  # Heap: 16 g. Previously 20 g (raised for bigann 100M), reduced by 4 g to free
-  # host RAM for other components while still covering sift10m (5,257 dirty pages)
-  # and bigann 10M workloads. Revisit if bigann 100M checkpoint OOMs recur.
-  # Direct memory raised to 2 g: the server's gRPC commit-log client (BookKeeper)
-  # uses Netty direct buffers for addEntry / readEntries payloads; 1 g was
-  # tight under sustained bigann ingest.
-  # 16 g heap + 2 g direct + 1 GiB JVM overhead = 19 GiB → container = 19 GiB.
-  # -Dio.netty.maxDirectMemory=2147483648 (= MaxDirectMemorySize=2g in bytes):
-  # Netty uses Unsafe.allocateMemory bypassing JVM Bits.reserveMemory, preventing
-  # phantom-reference GC delays from exhausting the direct-memory counter (issue #253).
-  javaOpts: "-Xms16g -Xmx16g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=2147483648 -XX:MaxDirectMemorySize=2g"
+  # 8 g heap + 8 g Netty direct + 2 g JVM direct + ~1 g overhead = 19 GiB container.
+  #
+  # Memory layout after off-heap migration of data pages and BLink/BRIN keys
+  # (issues #399, #405, #406): the dominant memory consumers (DataPage values
+  # and PK index keys) now live in Netty pooled direct buffers instead of the
+  # JVM heap, so the heap shrinks while the Netty direct cap grows.
+  #
+  # Heap reduced from 16 g to 8 g: dirty data pages (e.g. sift10m's ~5 GiB) are
+  # no longer serialized through on-heap VisibleByteArrayOutputStream and the
+  # PK index keys live in indexPagesAllocator. The remaining 8 g heap covers
+  # transactions, plan caches, GC working set, and on-heap BookKeeper client
+  # allocations (DefaultChannelPromise per addEntry — see issue #407 for the
+  # GKE-scale evidence; k3s-local's lower ingest rate keeps this well below 8 g).
+  #
+  #   -Dio.netty.maxDirectMemory=8589934592 (8 GiB, ≈ 8 × 1024³ bytes):
+  #     GLOBAL cap shared by ALL Netty PooledByteBufAllocator instances:
+  #       • PooledByteBufAllocator.DEFAULT   — network/gRPC/BK-client frames
+  #       • HerdDBByteBufAllocators.dataPagesAllocator()  — DataPage value slabs
+  #       • HerdDBByteBufAllocators.indexPagesAllocator() — BLink/BRIN key slabs
+  #     PlatformDependent.incrementMemoryCounter() tracks the aggregate; all
+  #     three pools check against the same DIRECT_MEMORY_LIMIT.
+  #     HerdDBByteBufAllocators.maxDirectMemoryBytes() reads this value as the
+  #     server's memory-budget reference (PROPERTY_MEMORY_LIMIT_REFERENCE_SOURCE=direct):
+  #       data pages : 50% × 8 g = 4 g    (off-heap)
+  #       PK index   : 20% × 8 g = 1.6 g  (off-heap)
+  #       network    :          ~2.4 g    (remainder, shared with gRPC + BK client)
+  #     Netty uses Unsafe.allocateMemory bypassing JVM Bits.reserveMemory,
+  #     preventing phantom-reference GC delays from exhausting the direct-memory
+  #     counter (issue #253).
+  #   -XX:MaxDirectMemorySize=2g:
+  #     JVM's native cap for ByteBuffer.allocateDirect() (non-Netty code paths).
+  #     Netty bypasses this via Unsafe.allocateMemory, so it does NOT limit the
+  #     8 g Netty pool above. Acts as a safety rail for non-Netty JVM direct
+  #     buffers (e.g. NIO transient allocations).
+  javaOpts: "-Xms8g -Xmx8g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=8589934592 -XX:MaxDirectMemorySize=2g"
   storage:
     data:
       size: 5Gi
@@ -309,6 +336,10 @@ indexingService:
   #   Search gRPC headroom: 3.5 GiB (6g - 2.5g cache) for concurrent reads ✓
   #   Heap (7g) + direct (6g) + JVM overhead (1g) = 14g JVM + native ≤ 20g ✓
   extraConfig:
+    # BookKeeper V2 wire protocol — mirrors the server setting above.
+    # The IS reads BK ledgers as a commit-log tailer; enabling V2 here
+    # removes protobuf overhead from every readEntries call.
+    bookkeeper.useV2WireProtocol: "true"
     indexing.vector.segmentPageCacheMaxBytes: "2684354560"    # 2.5 GiB
     # Caps bytes across in-flight readFile/readFileRange gRPC calls that
     # allocate a pooled direct ByteBuf to bound peak Netty PoolArena growth

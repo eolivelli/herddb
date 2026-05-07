@@ -260,10 +260,16 @@ forbidden.
 
 ## Default workload
 
+> **Full VectorBench CLI reference** (all flags, dataset presets, admin API,
+> rate-limiter safety rules, known bugs) is in
+> `herddb-kubernetes/src/main/helm/herddb/examples/gke/VECTORBENCH_CLI.md`.
+> Read it with the `Read` tool before constructing any non-trivial workload.
+
 ```
 ./scripts/run-bench.sh --dataset sift10k -n 10000 -k 100 \
     --ingest-max-ops 40000 --ingest-threads 8 --batch-size 10000 \
-    --checkpoint --wait-for-indexes
+    --checkpoint --checkpoint-timeout-seconds 1800 \
+    --wait-for-indexes --wait-for-indexes-timeout 1800
 ```
 
 Rules that apply to every workload, including user-specified ones:

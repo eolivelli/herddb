@@ -52,6 +52,26 @@ jobs:
           path: jvector
       - name: 'Build jvector'
         run: mvn -B install -DskipTests -Drat.skip=true --file jvector/pom.xml && rm -rf jvector
+      # BookKeeper temporary SNAPSHOT — see issue #435.
+      # See ci.yml for why the build runs on JDK 17.
+      - name: 'Checkout bookkeeper (eolivelli fork)'
+        uses: actions/checkout@v4
+        with:
+          repository: eolivelli/bookkeeper
+          ref: fix-concurrentlonghashmap-record-4.17
+          path: bookkeeper
+      - name: 'Set up JDK 17 (for BookKeeper build only)'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: 'Build bookkeeper'
+        run: mvn -B install -DskipTests -Drat.skip=true -Dspotbugs.skip=true -Dcheckstyle.skip=true -Dlicense.skip=true --file bookkeeper/pom.xml && rm -rf bookkeeper
+      - name: 'Set up JDK 25 (restore for HerdDB build)'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'oracle'
       - name: 'Build with Maven'
         run: mvn -B install -DskipTests --file pom.xml -Pci
       - name: 'Build docker images'
@@ -66,5 +86,22 @@ jobs:
         run: helm unittest herddb-kubernetes/src/main/helm/herddb
       - name: 'Run Kubernetes tests'
         run: mvn -B verify -pl herddb-kubernetes --file pom.xml -Pkubernetes
+      # Upload surefire/failsafe reports + any hs_err / heap dumps on failure
+      # so we can inspect the on-disk diagnostics produced by the K3s ITs
+      # (issue #438). The TestWatcher rule streams `kubectl exec jstack`,
+      # `jcmd VM.native_memory summary`, `dmesg`, and pod logs into the test
+      # output, which surefire writes into target/surefire-reports/*-output.txt.
+      - name: 'Upload Kubernetes test reports'
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes-test-reports
+          path: |
+            herddb-kubernetes/target/surefire-reports/**
+            herddb-kubernetes/target/failsafe-reports/**
+            **/hs_err_pid*.log
+            **/heapdump*.hprof
+          retention-days: 7
+          if-no-files-found: ignore
       - name: 'Remove Snapshots Before Caching'
         run: find ~/.m2 -name '*SNAPSHOT' | xargs rm -Rf

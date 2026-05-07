@@ -57,7 +57,15 @@ public class VectorBench {
                 .append(" similarity=").append(config.effectiveSimilarity())
                 .append(" fusedPQ=true");
         if (config.indexNumShards > 1) {
-            sb.append(" numShards ").append(config.indexNumShards);
+            // Use key=value syntax to match every other property in the WITH
+            // clause. Space-separated "numShards 4" was silently dropped by
+            // JSQLParserPlanner.extractIndexWithClause (parts without '=' were
+            // skipped without warning), so the Index ended up with no
+            // numShards property and IndexingServiceEngine.isAcceptedLocally
+            // short-circuited to "accept everything" — every IS replica
+            // re-indexed every vector instead of the expected
+            // total / numInstances split. See issue #451.
+            sb.append(" numShards=").append(config.indexNumShards);
         }
         return sb.toString();
     }
@@ -325,7 +333,12 @@ public class VectorBench {
             MetricsCollector ingestMetrics = new MetricsCollector();
             AtomicReference<String> ingestStatus = new AtomicReference<>("");
 
-            BlockingQueue<float[]> ingestQueue = new ArrayBlockingQueue<>(1000);
+            // Issue #443: previously a fixed 1000-slot queue, which meant a
+            // single worker pause stalled the entire pool. Sizing per-thread
+            // with a 2 048 lower bound lets short pauses absorb without
+            // back-pressuring the producer thread.
+            int ingestQueueCapacity = Math.max(2048, config.ingestThreads * 64);
+            BlockingQueue<float[]> ingestQueue = new ArrayBlockingQueue<>(ingestQueueCapacity);
             AtomicBoolean producerDone = new AtomicBoolean(false);
             AtomicLong rowId = new AtomicLong(config.resumeFrom);
             AtomicLong commitsTotal = new AtomicLong(0);
@@ -400,7 +413,15 @@ public class VectorBench {
                 return m;
             });
 
-            // Progress display thread runs during the entire ingestion
+            // Progress display thread runs during the entire ingestion.
+            // Issue #443: this thread is now the *single* publisher of
+            // ingestStatus — workers used to overwrite it from their hot
+            // loop on every 10 000 rows, which was both racy (each worker
+            // saw only its own rowsIngested counter) and CPU-expensive
+            // (every overwrite triggered a computeStats() call from N
+            // parallel workers). Producing one coherent line every 500 ms
+            // here uses a single computeStats() call against the cached
+            // HdrHistogram snapshot.
             AtomicBoolean ingestDone = new AtomicBoolean(false);
             final long totalRowsTarget = config.numRows;
             Thread progressThread = new Thread(() -> {
@@ -423,6 +444,27 @@ public class VectorBench {
                     fields.put("recovered_commits", commitsRecovered.get());
                     fields.put("heap_used_mb", usedMb);
                     fields.put("heap_max_mb", maxMb);
+
+                    // Refresh ingestStatus with the same fields the workers
+                    // used to publish — so the spinner output shape is
+                    // unchanged for log scrapers / dashboards. The previous
+                    // value of ingestStatus may still hold a transient
+                    // commit-retry error message set by IngestionWorker; we
+                    // overwrite it with the steady-state line here.
+                    MetricsCollector.Stats s = ingestMetrics.computeStats();
+                    String etaStr = IngestionWorker.formatEta(etaSecs);
+                    ingestStatus.set(String.format(
+                            "Ingested %d/%d rows | %.0f ops/s | commits: %d (recovered: %d) | "
+                                    + "batch mean: %.2f ms | batch p50: %.2f ms | batch p99: %.2f ms | ETA: %s",
+                            rowsIngested,
+                            totalRowsTarget,
+                            opsPerSec,
+                            commitsTotal.get(),
+                            commitsRecovered.get(),
+                            s.meanNanos() / 1_000_000.0,
+                            s.p50Nanos() / 1_000_000.0,
+                            s.p99Nanos() / 1_000_000.0,
+                            etaStr));
 
                     String spinnerLine = String.format("heap: %d/%d MB | %s", usedMb, maxMb, ingestStatus.get());
 
@@ -546,7 +588,12 @@ public class VectorBench {
             ingestionWallSecs = ingestSecs;
             ingestionRows = rowId.get() - config.resumeFrom;
             ingestionThroughput = ingestionRows / ingestSecs;
-            ingestionLatency = ingestMetrics.computeStats();
+            // Bypass the 200 ms TTL cache: this snapshot ends up in the
+            // canonical "=== INGESTION RESULTS ===" block and the JSON
+            // commit_latency, so it must include every recorded value —
+            // even the ones written between the progress thread's last
+            // tick and the workers finishing.
+            ingestionLatency = ingestMetrics.computeStatsUncached();
 
             if (!out.suppressesText()) {
                 System.out.printf("=== INGESTION RESULTS ===%n");
@@ -707,6 +754,18 @@ public class VectorBench {
             fields.put("latency_p95_ms", round2(intermediateStats.p95Nanos() / 1e6));
             fields.put("latency_p99_ms", round2(intermediateStats.p99Nanos() / 1e6));
             fields.put("latency_max_ms", round2(intermediateStats.maxNanos() / 1e6));
+            // Issue #443: query progress loop is now the single publisher
+            // of queryStatus — QueryWorker no longer overwrites it from
+            // its hot loop. We reuse the same line shape the workers used
+            // so log scrapers see no format change.
+            queryStatus.set(String.format(
+                    "Executed %d queries | mean: %.2f ms | p50: %.2f ms | p95: %.2f ms | p99: %.2f ms | max: %.2f ms",
+                    queriesDone,
+                    intermediateStats.meanNanos() / 1_000_000.0,
+                    intermediateStats.p50Nanos() / 1_000_000.0,
+                    intermediateStats.p95Nanos() / 1_000_000.0,
+                    intermediateStats.p99Nanos() / 1_000_000.0,
+                    intermediateStats.maxNanos() / 1_000_000.0));
             out.progress("query", elapsed, queryStatus.get(), fields);
         }
         double querySecs = (System.nanoTime() - queryStart) / 1e9;
@@ -715,7 +774,9 @@ public class VectorBench {
         queryWallSecs = querySecs;
         queriesRun = queryMetrics.getCount();
         queryThroughput = queriesRun / querySecs;
-        queryLatency = queryMetrics.computeStats();
+        // Bypass the 200 ms TTL cache for the canonical "=== QUERY RESULTS ==="
+        // block — see the matching ingestionLatency comment above.
+        queryLatency = queryMetrics.computeStatsUncached();
 
         if (!out.suppressesText()) {
             System.out.printf("=== QUERY RESULTS ===%n");
