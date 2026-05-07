@@ -239,6 +239,15 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             new java.util.concurrent.atomic.AtomicLong();
 
     /**
+     * Counts how many eviction-driven {@code unload(pageId)} calls were dispatched
+     * to the checkpoint-flush executor by {@link #onTransactionCommit} via the
+     * commit-time {@code CheckpointFlushBatch}. Issue #448. Lets tests assert that
+     * the new parallel-unload path was actually exercised.
+     */
+    private final java.util.concurrent.atomic.AtomicLong parallelUnloadsCount =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /**
      * Allow checkpoint
      */
     private final StampedLock checkpointLock = new StampedLock();
@@ -849,6 +858,35 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     }
 
     private Long allocateLivePage(Long lastKnownPageId) {
+        return allocateLivePage(lastKnownPageId, null);
+    }
+
+    /**
+     * Allocate a fresh mutable page when the previous "current" page filled up.
+     *
+     * <p>Issue #448: when {@code unloadBatch} is non-{@code null}, the
+     * eviction victim returned by {@link #pageReplacementPolicy} is dispatched
+     * to the batch (which runs on the DBManager checkpoint-flush executor)
+     * instead of being unloaded synchronously on the caller thread. This lets
+     * {@link #onTransactionCommit} overlap many remote-storage page writes
+     * during a bulk-insert commit; the caller awaits the batch before
+     * releasing the commit-apply slot.
+     *
+     * <p>When {@code unloadBatch} is {@code null}, behaviour is unchanged from
+     * the legacy path: the caller waits for the unload synchronously. Used by
+     * {@link #apply(CommitLogResult, LogEntry, boolean)} (single-record log
+     * replay), the autocommit DML path, and the Phase-B
+     * {@code cleanAndCompactPage} caller.
+     *
+     * @param lastKnownPageId the page id the caller observed as
+     *                        {@code currentDirtyRecordsPage} before discovering it
+     *                        was full
+     * @param unloadBatch     optional batch that absorbs the unload of the
+     *                        replacement policy's eviction victim; may be
+     *                        {@code null} for synchronous behaviour
+     * @return the page id of the new (or already-rotated) current dirty page
+     */
+    private Long allocateLivePage(Long lastKnownPageId, CheckpointFlushBatch unloadBatch) {
         /* This method expect that a new page actually exists! */
         nextPageLock.lock();
 
@@ -900,7 +938,23 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
 
         /* Dereferenced page unload. Out of locking */
         if (unload != null) {
-            unload.owner.unload(unload.pageId);
+            if (unloadBatch != null) {
+                /*
+                 * Issue #448: dispatch the eviction-driven unload to the
+                 * checkpoint-flush executor. The submit() call blocks on a
+                 * semaphore once the parallelism cap is reached, so the
+                 * number of in-flight (still-resident) victim pages is
+                 * bounded by checkpointFlushParallelism. The caller of
+                 * onTransactionCommit awaits the batch before releasing the
+                 * commit-apply slot, so victim pages cannot survive past
+                 * the commit boundary.
+                 */
+                final Page.Metadata captured = unload;
+                unloadBatch.submit(() -> captured.owner.unload(captured.pageId));
+                parallelUnloadsCount.incrementAndGet();
+            } else {
+                unload.owner.unload(unload.pageId);
+            }
         }
 
         /* Both created now or already created */
@@ -1007,9 +1061,17 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     }
 
     /**
-     * Bounded-parallel collector of {@code dataStorageManager.writePage} calls
-     * submitted to the DBManager checkpoint-flush executor during Phase B
-     * (issue #202). Lives for a single Phase-B invocation on one table.
+     * Bounded-parallel collector of page-flush actions submitted to the
+     * DBManager checkpoint-flush executor.
+     *
+     * <p>Originally introduced for the Phase-B {@code dataStorageManager.writePage}
+     * fan-out (issue #202) and reused by:
+     * <ul>
+     *   <li>Phase-C {@code drainPendingNewPages} (issue #431),</li>
+     *   <li>{@link #onTransactionCommit} for parallelizing eviction-driven
+     *       {@link #unload(long)} calls triggered by {@link #allocateLivePage}
+     *       (issue #448).</li>
+     * </ul>
      *
      * <p>The {@link #submit(Runnable)} call blocks (on a semaphore) when the
      * configured parallelism limit is reached, so the caller cannot run ahead
@@ -1243,6 +1305,16 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
      */
     long getDrainedNewPagesOutsideLock() {
         return drainedNewPagesOutsideLock.get();
+    }
+
+    /**
+     * @return number of eviction-driven {@code unload(pageId)} calls dispatched
+     *         to the checkpoint-flush executor by {@link #onTransactionCommit}
+     *         since this {@code TableManager} was instantiated. Issue #448.
+     *         Visible for tests.
+     */
+    long getParallelUnloadsCount() {
+        return parallelUnloadsCount.get();
     }
 
     /**
@@ -2362,26 +2434,42 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             throw new DataStorageManagerException(
                     "timed out waiting for checkpoint Phase C gate during a commit");
         }
+        /*
+         * Issue #448: dispatch eviction-driven page unloads (triggered when
+         * applyInsert / applyUpdate fill a page and allocateLivePage rotates
+         * to a fresh one) to the checkpoint-flush executor. The semaphore
+         * inside CheckpointFlushBatch caps the number of in-flight unloads at
+         * checkpointFlushParallelism, so the extra resident memory budget is
+         * bounded. We awaitAll() before publishing the commit LSN, so victim
+         * pages cannot survive past this commit's boundary — Phase C and the
+         * next commits see a quiescent state.
+         *
+         * keyToPage.put(...) and lastAppliedSequenceNumber.updateAndGet(...)
+         * remain on this thread, in program order: only the I/O of pages that
+         * are no longer being written to is parallelized.
+         */
+        final CheckpointFlushBatch unloadBatch = new CheckpointFlushBatch(
+                tableSpaceManager.getCheckpointFlushExecutor(), checkpointFlushParallelism);
         try {
             Map<Bytes, Record> changedRecords = transaction.changedRecords.get(table.name);
             // transaction is still holding locks on each record, so we can change records
             Map<Bytes, Record> newRecords = transaction.newRecords.get(table.name);
             if (newRecords != null) {
                 for (Record record : newRecords.values()) {
-                    applyInsert(record.key, record.value, true);
+                    applyInsert(record.key, record.value, true, unloadBatch);
                 }
             }
             if (changedRecords != null) {
                 for (Record r : changedRecords.values()) {
                     try {
-                        applyUpdate(r.key, r.value);
+                        applyUpdate(r.key, r.value, unloadBatch);
                     } catch (PageNotFoundException e) {
                         if (recovery) {
                             LOGGER.log(Level.FINE,
                                     "{0}.{1} recovery: re-applying update for key {2} as delete+insert (transaction commit)",
                                     new Object[]{table.tablespace, table.name, r.key});
                             keyToPage.remove(r.key);
-                            applyInsert(r.key, r.value, false);
+                            applyInsert(r.key, r.value, false, unloadBatch);
                         } else {
                             throw e;
                         }
@@ -2406,6 +2494,14 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 }
             }
             /*
+             * Issue #448: wait for all parallel unloads to finish before
+             * publishing the commit LSN and releasing the apply slot. This
+             * preserves the issue #157 invariant — Phase C, when it observes
+             * activeCommitApplies == 0, must see both the LSN update and a
+             * quiescent page state for every commit that already passed.
+             */
+            unloadBatch.awaitAll();
+            /*
              * Publish the commit's LSN as "last fully applied" BEFORE releasing the
              * apply slot. Phase C drains activeCommitApplies to zero; the JMM
              * happens-before chain (program order within this thread + volatile read of
@@ -2416,6 +2512,30 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             if (commitLsn != null) {
                 lastAppliedSequenceNumber.updateAndGet(cur -> commitLsn.after(cur) ? commitLsn : cur);
             }
+        } catch (RuntimeException | Error primary) {
+            /*
+             * Issue #448: on any failure inside the apply loop (or in
+             * unloadBatch.awaitAll() above), drain the batch best-effort
+             * before releasing the apply slot. Otherwise executor threads
+             * might still touch pages — and update the (now stale)
+             * pageReplacementPolicy — after the caller has observed our
+             * exception. The drain will fast-path to a no-op when awaitAll()
+             * already succeeded above, since CompletableFuture.allOf on
+             * already-completed futures returns instantly.
+             *
+             * Note: DataStorageManagerException extends HerdDBInternalException
+             * extends RuntimeException, so it is covered by the
+             * RuntimeException alternative — Java forbids listing a subclass
+             * separately in a multi-catch. Catching (RuntimeException | Error)
+             * deliberately excludes checked exceptions that the apply path
+             * does not declare.
+             */
+            try {
+                unloadBatch.awaitAll();
+            } catch (DataStorageManagerException secondary) {
+                primary.addSuppressed(secondary);
+            }
+            throw primary;
         } finally {
             activeCommitApplies.decrementAndGet();
         }
@@ -2746,6 +2866,20 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     }
 
     private void applyUpdate(Bytes key, Bytes value) throws DataStorageManagerException {
+        applyUpdate(key, value, null);
+    }
+
+    /**
+     * Apply an UPDATE effect to the in-memory state.
+     *
+     * <p>Issue #448: when {@code unloadBatch} is non-{@code null}, eviction-driven
+     * unloads triggered by {@link #allocateLivePage} (when an in-place update
+     * does not fit and the record is re-inserted onto a fresh page) are
+     * dispatched to the batch instead of running synchronously on the caller
+     * thread. See {@link #applyInsert(Bytes, Bytes, boolean, CheckpointFlushBatch)}.
+     */
+    private void applyUpdate(Bytes key, Bytes value,
+            CheckpointFlushBatch unloadBatch) throws DataStorageManagerException {
         // do not want to retain shared buffers as keys
         key = key.nonShared();
 
@@ -2925,7 +3059,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 }
 
                 /* Try allocate a new page if no already done */
-                insertionPageId = allocateLivePage(insertionPageId);
+                insertionPageId = allocateLivePage(insertionPageId, unloadBatch);
             }
 
             /* Update the value on keyToPage */
@@ -3087,6 +3221,20 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
     }
 
     private void applyInsert(Bytes key, Bytes value, boolean onTransaction) throws DataStorageManagerException {
+        applyInsert(key, value, onTransaction, null);
+    }
+
+    /**
+     * Apply an INSERT effect to the in-memory state.
+     *
+     * <p>Issue #448: when {@code unloadBatch} is non-{@code null}, eviction-driven
+     * unloads triggered by {@link #allocateLivePage} are dispatched to the
+     * batch (and therefore to the checkpoint-flush executor) instead of running
+     * synchronously on the caller thread. {@link #onTransactionCommit} uses this
+     * to overlap remote-storage page writes during a bulk-insert commit.
+     */
+    private void applyInsert(Bytes key, Bytes value, boolean onTransaction,
+            CheckpointFlushBatch unloadBatch) throws DataStorageManagerException {
         // don't want to keep strong references to shared buffers in the keyToPages
         key = key.nonShared();
 
@@ -3136,7 +3284,7 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             }
 
             /* Try allocate a new page if no already done */
-            insertionPageId = allocateLivePage(insertionPageId);
+            insertionPageId = allocateLivePage(insertionPageId, unloadBatch);
         }
 
         /* Insert  the value on keyToPage */
