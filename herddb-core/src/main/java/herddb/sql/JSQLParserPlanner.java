@@ -857,9 +857,17 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
                 continue;
             }
             int eq = part.indexOf('=');
-            if (eq > 0) {
-                props.put(part.substring(0, eq).trim(), part.substring(eq + 1).trim());
+            // Reject tokens without '=': previously dropped silently, which let
+            // space-separated DDL like "WITH ... numShards 4" land an empty
+            // properties map and silently disable cross-instance sharding in
+            // the indexing service (issue #451). Mirror the strict-loud
+            // behaviour of the JSQLParser-native WITH parser at line ~795.
+            if (eq <= 0 || eq == part.length() - 1) {
+                throw new StatementExecutionException(
+                        "invalid index property syntax: expected key=value but got '"
+                                + part + "' in WITH clause '" + withText + "'");
             }
+            props.put(part.substring(0, eq).trim(), part.substring(eq + 1).trim());
         }
 
         if (!props.isEmpty()) {

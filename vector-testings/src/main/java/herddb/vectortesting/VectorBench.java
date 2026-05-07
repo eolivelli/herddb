@@ -57,7 +57,15 @@ public class VectorBench {
                 .append(" similarity=").append(config.effectiveSimilarity())
                 .append(" fusedPQ=true");
         if (config.indexNumShards > 1) {
-            sb.append(" numShards ").append(config.indexNumShards);
+            // Use key=value syntax to match every other property in the WITH
+            // clause. Space-separated "numShards 4" was silently dropped by
+            // JSQLParserPlanner.extractIndexWithClause (parts without '=' were
+            // skipped without warning), so the Index ended up with no
+            // numShards property and IndexingServiceEngine.isAcceptedLocally
+            // short-circuited to "accept everything" — every IS replica
+            // re-indexed every vector instead of the expected
+            // total / numInstances split. See issue #451.
+            sb.append(" numShards=").append(config.indexNumShards);
         }
         return sb.toString();
     }

@@ -154,7 +154,7 @@ class VectorBenchTest {
         assertEquals(
                 "CREATE VECTOR INDEX vidx ON vector_bench(vec)"
                         + " WITH m=16 beamWidth=100 similarity=" + cfg.effectiveSimilarity()
-                        + " fusedPQ=true numShards 4",
+                        + " fusedPQ=true numShards=4",
                 sql);
     }
 
@@ -192,8 +192,8 @@ class VectorBenchTest {
         String sql = VectorBench.buildCreateVectorIndexSql(cfg);
 
         org.junit.jupiter.api.Assertions.assertTrue(
-                sql.endsWith("numShards 8"),
-                "expected trailing `numShards 8`, got: " + sql);
+                sql.endsWith("numShards=8"),
+                "expected trailing `numShards=8`, got: " + sql);
     }
 
     @Test
@@ -211,7 +211,7 @@ class VectorBenchTest {
         assertEquals(
                 "CREATE VECTOR INDEX vidx ON my_vectors(vec)"
                         + " WITH m=32 beamWidth=200 similarity=cosine"
-                        + " fusedPQ=true numShards 2",
+                        + " fusedPQ=true numShards=2",
                 sql);
     }
 
