@@ -580,7 +580,12 @@ public class VectorBench {
             ingestionWallSecs = ingestSecs;
             ingestionRows = rowId.get() - config.resumeFrom;
             ingestionThroughput = ingestionRows / ingestSecs;
-            ingestionLatency = ingestMetrics.computeStats();
+            // Bypass the 200 ms TTL cache: this snapshot ends up in the
+            // canonical "=== INGESTION RESULTS ===" block and the JSON
+            // commit_latency, so it must include every recorded value —
+            // even the ones written between the progress thread's last
+            // tick and the workers finishing.
+            ingestionLatency = ingestMetrics.computeStatsUncached();
 
             if (!out.suppressesText()) {
                 System.out.printf("=== INGESTION RESULTS ===%n");
@@ -761,7 +766,9 @@ public class VectorBench {
         queryWallSecs = querySecs;
         queriesRun = queryMetrics.getCount();
         queryThroughput = queriesRun / querySecs;
-        queryLatency = queryMetrics.computeStats();
+        // Bypass the 200 ms TTL cache for the canonical "=== QUERY RESULTS ==="
+        // block — see the matching ingestionLatency comment above.
+        queryLatency = queryMetrics.computeStatsUncached();
 
         if (!out.suppressesText()) {
             System.out.printf("=== QUERY RESULTS ===%n");

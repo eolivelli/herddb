@@ -110,7 +110,11 @@ public class MetricsCollector {
         }
         recorder.recordValue(clamped);
         count.increment();
-        lastNanos.set(nanos);
+        // Store the clamped value so getLastNanos() and the histogram
+        // agree on what was recorded — otherwise record(0) would put
+        // 1 ns in the histogram but expose 0 via getLastNanos(), which
+        // is confusing and arguably wrong.
+        lastNanos.set(clamped);
         // Deliberately do NOT invalidate the cache: under the workloads
         // this collector serves (continuous record() from many worker
         // threads), invalidating per-record would prevent the cache from
@@ -133,18 +137,34 @@ public class MetricsCollector {
         if (prev != INVALID && System.nanoTime() - prev.timestampNanos < CACHE_TTL_NANOS) {
             return prev.stats;
         }
-        return computeStatsLocked();
+        return computeStatsLocked(/* bypassCache */ false);
     }
 
-    private Stats computeStatsLocked() {
+    /**
+     * Snapshot the current state without consulting (or honouring) the
+     * TTL cache. Use this for canonical end-of-run summary lines where
+     * stats up to {@link #CACHE_TTL_NANOS} stale would silently omit the
+     * last batch of recorded latencies. The freshly-computed snapshot is
+     * still installed in the cache so a subsequent live-UI {@link
+     * #computeStats()} call does not have to redo the work.
+     */
+    public Stats computeStatsUncached() {
+        return computeStatsLocked(/* bypassCache */ true);
+    }
+
+    private Stats computeStatsLocked(boolean bypassCache) {
         synchronized (snapshotLock) {
             // Re-check the cache under the lock: another caller may have
             // refreshed it while we were waiting. This avoids redundant
             // buffer swaps when many readers contend for the lock at once.
-            Snapshot prev = cached.get();
-            long now = System.nanoTime();
-            if (prev != INVALID && now - prev.timestampNanos < CACHE_TTL_NANOS) {
-                return prev.stats;
+            // Bypassed when the caller explicitly requested a fresh snapshot
+            // (final run summary) — see computeStatsUncached().
+            if (!bypassCache) {
+                Snapshot prev = cached.get();
+                long checkNow = System.nanoTime();
+                if (prev != INVALID && checkNow - prev.timestampNanos < CACHE_TTL_NANOS) {
+                    return prev.stats;
+                }
             }
             // Atomically swap the active recorder buffer and merge the
             // just-completed interval into the running cumulative histogram.
@@ -165,6 +185,11 @@ public class MetricsCollector {
                         cumulative.getMaxValue()
                 );
             }
+            // Capture the timestamp AFTER the buffer-swap+merge so the
+            // cached entry's age reflects the data it actually contains
+            // (not the moment we entered the lock — a few μs earlier in
+            // contended cases).
+            long now = System.nanoTime();
             // Cache write inside the lock: write order = lock acquisition
             // order = monotonically increasing cumulative state, so the
             // cached snapshot's count and max never go backwards.

@@ -23,6 +23,8 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import herddb.vectortesting.DatasetLoader.DatasetPreset;
 import java.io.File;
 import java.io.IOException;
@@ -80,6 +82,88 @@ class DatasetLoaderFvecsBulkDecodeTest {
         // the stream resumes at the *correct* vector by verifying the
         // first emitted vector matches the (skipVectors)th written one.
         roundtrip(tmp, /* dim */ 8, /* total */ 100, /* skip */ 73, /* maxRead */ 27);
+    }
+
+    @Test
+    void skipExceedingFileLengthThrowsClearException(@TempDir Path tmp) throws Exception {
+        // Issue #443 review: the bulk-skip path reads dim from the first
+        // record and then asks the underlying stream for one big skip(N)
+        // covering the rest. A short / corrupt file must surface a loud
+        // IOException rather than silently land at the wrong offset.
+        int dim = 8;
+        int totalWritten = 10;
+        Path subDir = setupCustomDataset(tmp, dim, /* descriptorTotal */ 200);
+        generateAndWriteFvecs(
+                subDir.resolve("bulk_base.fvecs").toFile(), dim, totalWritten);
+        generateAndWriteFvecs(subDir.resolve("bulk_query.fvecs").toFile(), dim, 2);
+
+        DatasetLoader loader = new DatasetLoader(tmp.toString(), DatasetPreset.CUSTOM, null);
+        loader.ensureDataset();
+        loader.loadDescriptor();
+
+        IOException ex = assertThrows(IOException.class,
+                () -> loader.streamBaseVectors(/* skip */ 50, /* maxRead */ 1));
+        // The bulk-skip path produces a "Unexpected end of stream while
+        // skipping ..." message — assert that rather than a generic EOF.
+        String msg = ex.getMessage();
+        assertTrue(msg != null && msg.contains("Unexpected end of stream"),
+                "expected bulk-skip EOF message, got: " + msg);
+    }
+
+    @Test
+    void scratchReallocatesOnDimChange(@TempDir Path tmp) throws Exception {
+        // Issue #443 review: the streaming reader caches one byte[] +
+        // FloatBuffer view sized to the first vector's dim. A file that
+        // violates the constant-dim invariant must still decode every
+        // record correctly — the cachedDim != dim branch in
+        // ensureScratch reallocates the scratch on the fly.
+        Path subDir = tmp.resolve(DatasetPreset.CUSTOM.subDir);
+        Files.createDirectories(subDir);
+        // Write a hand-crafted FVECS file with two records of different
+        // dim. We keep the descriptor's "dimensions" set to the first
+        // record's dim (since the loader uses it for sanity logging
+        // only — the streaming reader reads dim from each record header).
+        File baseFile = subDir.resolve("bulk_base.fvecs").toFile();
+        try (SiftWriter w = new SiftWriter(baseFile)) {
+            float[] firstDim4 = new float[]{1.0f, 2.0f, 3.0f, 4.0f};
+            float[] secondDim8 = new float[]{
+                    10.5f, 11.5f, 12.5f, 13.5f, 14.5f, 15.5f, 16.5f, 17.5f};
+            w.writeFvec(firstDim4);
+            w.writeFvec(secondDim8);
+        }
+        // Query file required by descriptor (consistent dim is fine).
+        generateAndWriteFvecs(subDir.resolve("bulk_query.fvecs").toFile(), 4, 2);
+        // Descriptor declares dim=4; the second record's dim=8 is read
+        // from the per-record header by the streamer.
+        Files.writeString(subDir.resolve("bulk_descriptor.json"),
+                "{\n"
+                + "  \"name\": \"bulk\",\n"
+                + "  \"format\": \"fvecs\",\n"
+                + "  \"dimensions\": 4,\n"
+                + "  \"similarity\": \"euclidean\",\n"
+                + "  \"totalVectors\": 2,\n"
+                + "  \"numQueries\": 2,\n"
+                + "  \"groundTruthK\": 1,\n"
+                + "  \"baseFile\": \"bulk_base.fvecs\",\n"
+                + "  \"queryFile\": \"bulk_query.fvecs\",\n"
+                + "  \"groundTruthFile\": \"bulk_groundtruth.ivecs\"\n"
+                + "}\n");
+
+        DatasetLoader loader = new DatasetLoader(tmp.toString(), DatasetPreset.CUSTOM, null);
+        loader.ensureDataset();
+        loader.loadDescriptor();
+
+        try (DatasetLoader.VectorStream stream = loader.streamBaseVectors(0L, 2)) {
+            Iterator<float[]> it = stream.iterator();
+            float[] first = it.next();
+            float[] second = it.next();
+            assertEquals(4, first.length, "first record should be dim=4");
+            assertEquals(8, second.length, "second record should be dim=8 (scratch reallocated)");
+            assertArrayEquals(new float[]{1.0f, 2.0f, 3.0f, 4.0f}, first);
+            assertArrayEquals(
+                    new float[]{10.5f, 11.5f, 12.5f, 13.5f, 14.5f, 15.5f, 16.5f, 17.5f},
+                    second);
+        }
     }
 
     @Test

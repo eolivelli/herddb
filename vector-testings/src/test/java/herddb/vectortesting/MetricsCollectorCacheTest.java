@@ -99,4 +99,44 @@ class MetricsCollectorCacheTest {
         assertEquals(0, first.count());
         assertSame(first, second);
     }
+
+    @Test
+    void uncachedAlwaysRecomputesAndIncludesEveryRecord() {
+        // The canonical run-summary path uses computeStatsUncached() to
+        // bypass the 200 ms TTL — otherwise the very last batch of
+        // record() calls (made between the progress thread's last tick
+        // and the workers finishing) would be silently omitted from the
+        // printed final stats.
+        MetricsCollector mc = new MetricsCollector();
+        for (int i = 1; i <= 50; i++) {
+            mc.record(i * 1_000_000L);
+        }
+        // Populate the cache via the live-UI path.
+        MetricsCollector.Stats cached = mc.computeStats();
+        assertEquals(50, cached.count());
+
+        // Record additional values; computeStats() within TTL will return
+        // the stale cached snapshot, but computeStatsUncached() must see
+        // every value recorded so far.
+        for (int i = 51; i <= 100; i++) {
+            mc.record(i * 1_000_000L);
+        }
+        MetricsCollector.Stats stale = mc.computeStats();
+        assertEquals(50, stale.count(), "TTL cache should still report the pre-record snapshot");
+
+        MetricsCollector.Stats fresh = mc.computeStatsUncached();
+        assertEquals(100, fresh.count(),
+                "uncached snapshot must reflect every record() up to this moment");
+        assertNotEquals(stale, fresh,
+                "uncached path must produce a distinct snapshot from the stale cached one");
+        assertTrue(fresh.maxNanos() >= 99_000_000L,
+                "max should reflect the highest recorded value, got " + fresh.maxNanos());
+
+        // After computeStatsUncached(), the cache holds the fresh snapshot,
+        // so a subsequent computeStats() within TTL hits the new value
+        // (no redundant buffer-swap).
+        MetricsCollector.Stats afterUncached = mc.computeStats();
+        assertSame(fresh, afterUncached,
+                "uncached path should also refresh the cache for subsequent live-UI reads");
+    }
 }

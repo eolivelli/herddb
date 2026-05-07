@@ -772,14 +772,22 @@ public class DatasetLoader {
      * Skip {@code count} vectors in-place from a DataInputStream of FVECS
      * or BVECS format.
      *
-     * <p>Issue #443: SIFT files have a constant dim across every record,
-     * so the per-vector {@code readInt(dim) + skip(payload)} dance the
-     * original code performed was wasted work — for a 100 M-row resume
-     * that's 100 M small reads followed by 100 M skip calls. The new
-     * implementation reads dim from the first record only and then
-     * bulk-skips the remaining {@code count - 1} records as a single
-     * skip operation, leaving the underlying {@code BufferedInputStream}
-     * (or {@code GZIPInputStream}) free to short-circuit via {@code
+     * <p><b>Correctness requirement:</b> the SIFT format guarantees a
+     * constant {@code dim} across every record in a single file. The
+     * bulk-skip implementation below relies on this — it reads dim from
+     * the first record only, computes the per-record byte size, and then
+     * skips the remaining {@code count - 1} records as a single
+     * {@link DataInputStream#skip(long)}. A file that violates the
+     * constant-dim invariant would silently land at the wrong byte
+     * offset, so do <em>not</em> introduce a partial-fallback path here
+     * that re-reads dim per record without also detecting and surfacing
+     * the inconsistency loudly.
+     *
+     * <p>Issue #443: the previous per-vector {@code readInt + skip} loop
+     * was wasted work — for a 100 M-row resume that was 100 M small
+     * reads followed by 100 M skip calls. Folding into one bulk skip
+     * lets the underlying {@code BufferedInputStream} (or
+     * {@code GZIPInputStream}) short-circuit via {@code
      * FileInputStream.skip()} where supported.
      */
     private static void skipVecsInStream(DataInputStream dis, VecFormat format, long count) throws IOException {
@@ -805,19 +813,40 @@ public class DatasetLoader {
     }
 
     /**
-     * Skip exactly {@code totalBytes} bytes from {@code dis}, looping
-     * until the stream returns 0 (EOF) or we've advanced enough. Throws
-     * if EOF arrives early.
+     * Skip exactly {@code totalBytes} bytes from {@code dis}, throwing
+     * if EOF is reached early.
+     *
+     * <p>Implemented via chunked {@link DataInputStream#readFully(byte[],
+     * int, int)} into a 64 KB scratch buffer rather than
+     * {@link InputStream#skip(long)}. Reason: {@code FileInputStream.skip}
+     * delegates to {@code lseek}, which on most platforms succeeds even
+     * when seeking past EOF (the next {@code read()} returns -1, but the
+     * {@code skip()} itself does not throw). A bulk-skip that silently
+     * lands past EOF would let a corrupted / short file slip through the
+     * resume path undetected. {@code readFully} reads bytes through user
+     * space and surfaces EOF as a loud {@link java.io.EOFException},
+     * which we re-wrap into an actionable {@link IOException} below.
+     *
+     * <p>The throughput cost vs raw {@code skip()} is meaningful (a few
+     * hundred MB/s of memcpy), but resume is a one-time startup cost so
+     * we trade it for reliable error reporting.
      */
     private static void skipExactly(DataInputStream dis, long totalBytes, String what) throws IOException {
+        if (totalBytes <= 0) {
+            return;
+        }
+        int bufSize = (int) Math.min(64L * 1024L, totalBytes);
+        byte[] discard = new byte[bufSize];
         long remaining = totalBytes;
         while (remaining > 0) {
-            long skipped = dis.skip(remaining);
-            if (skipped <= 0) {
+            int chunk = (int) Math.min((long) bufSize, remaining);
+            try {
+                dis.readFully(discard, 0, chunk);
+            } catch (java.io.EOFException e) {
                 throw new IOException("Unexpected end of stream while skipping " + what
-                        + " (asked for " + totalBytes + " bytes, " + remaining + " left)");
+                        + " (asked for " + totalBytes + " bytes, " + remaining + " left)", e);
             }
-            remaining -= skipped;
+            remaining -= chunk;
         }
     }
 

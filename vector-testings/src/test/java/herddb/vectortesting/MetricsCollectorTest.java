@@ -75,6 +75,38 @@ class MetricsCollectorTest {
     }
 
     @Test
+    void recordClampsBelowLowestAndAboveHighest() {
+        // HdrHistogram is configured for 1 ns – 1 hour at 3 sig digits;
+        // record() must clamp values outside that range rather than
+        // throw. Also asserts getLastNanos() returns the same clamped
+        // value the histogram saw (issue #443 review feedback).
+        MetricsCollector mcLow = new MetricsCollector();
+        mcLow.record(0L);
+        MetricsCollector.Stats lowStats = mcLow.computeStats();
+        assertEquals(1L, lowStats.count());
+        assertEquals(1L, lowStats.maxNanos(),
+                "record(0) should clamp to LOWEST_NANOS=1 ns");
+        assertEquals(1L, mcLow.getLastNanos(),
+                "getLastNanos() must reflect the clamped value, not the raw input");
+
+        MetricsCollector mcNeg = new MetricsCollector();
+        mcNeg.record(-42L);
+        assertEquals(1L, mcNeg.computeStats().maxNanos());
+        assertEquals(1L, mcNeg.getLastNanos());
+
+        long oneHourNanos = java.util.concurrent.TimeUnit.HOURS.toNanos(1);
+        MetricsCollector mcHigh = new MetricsCollector();
+        mcHigh.record(Long.MAX_VALUE);
+        MetricsCollector.Stats highStats = mcHigh.computeStats();
+        assertEquals(1L, highStats.count());
+        // HdrHistogram quantizes to bucket boundaries — assert the value
+        // is within tolerance of HIGHEST_NANOS rather than exact-equal.
+        assertWithinTolerance(oneHourNanos, highStats.maxNanos());
+        assertEquals(oneHourNanos, mcHigh.getLastNanos(),
+                "getLastNanos() must reflect the HIGHEST_NANOS clamp");
+    }
+
+    @Test
     void percentileIndexDoesNotOverflowWithLargeSize() {
         // Original (pre-issue-443) regression guard: with the old reservoir-based
         // implementation, percentileIndex could overflow when size > ~21M because
