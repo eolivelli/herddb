@@ -32,11 +32,6 @@ jobs:
   build:
     name: Build and validate
     runs-on: ubuntu-latest
-    # TEMPORARY (issue #438): skip the full CI matrix on the K3s-debug branch to
-    # save runner minutes while we iterate on Kubernetes-test diagnostics. Other
-    # jobs declare `needs: build`, so skipping `build` cascades to all of them.
-    # Revert this `if:` when the issue is closed.
-    if: github.head_ref != 'issue-438-investigate-kubernetes-tests-failures-on'
     steps:
       - uses: actions/checkout@v2
       - name: 'Set up JDK 25'
