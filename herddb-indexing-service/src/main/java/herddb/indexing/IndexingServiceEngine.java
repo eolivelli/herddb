@@ -2635,6 +2635,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         d.liveVectorsMemoryBytes = store.estimatedMemoryUsageBytes();
         d.storeClass = store.getClass().getSimpleName();
         d.persistent = store instanceof PersistentVectorStore;
+        // Surface the per-index `numShards` configuration alongside the live
+        // counters so operators can correlate sharding decisions with what the
+        // index was actually created with (issue #451). The schema tracker is
+        // the source of truth for the Index.properties map; if the index has
+        // been dropped between the vectorStores lookup and here we just leave
+        // d.numShards at its default (1).
+        Index indexDef = schemaTracker.getIndex(index);
+        if (indexDef != null) {
+            d.numShards = getNumShardsForIndex(indexDef);
+        }
         if (store instanceof PersistentVectorStore) {
             PersistentVectorStore pvs = (PersistentVectorStore) store;
             d.dimension = pvs.getDimension();
@@ -3905,5 +3915,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // Global monotonic node-id counter (issue #256). Widened to long end-to-end;
         // surfaced so clients and dashboards can observe the burn rate.
         public long nextNodeId;
+        // Per-index `numShards` from the CREATE VECTOR INDEX WITH clause.
+        // Controls within-instance HNSW graph-bucket granularity; defaults to
+        // 1 when the property is absent. Issue #451.
+        public int numShards = 1;
     }
 }

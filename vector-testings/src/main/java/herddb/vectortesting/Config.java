@@ -120,7 +120,7 @@ public class Config {
         opts.addOption(null, "beam-width", true, "Vector index beamWidth (default: 100)");
         opts.addOption(null, "index-num-shards", true,
                 "Vector index numShards (default: 4). Set to 1 to disable sharding; "
-                        + "otherwise emitted as `numShards N` in the CREATE VECTOR INDEX DDL.");
+                        + "otherwise emitted as `numShards=N` in the CREATE VECTOR INDEX DDL.");
         opts.addOption(null, "skip-ingest", false, "Skip ingestion phase");
         opts.addOption(null, "skip-index", false, "Skip index creation");
         opts.addOption(null, "skip-verify", false, "Skip row count verification after ingestion");

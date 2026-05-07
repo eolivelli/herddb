@@ -20,6 +20,9 @@
 
 package herddb.core.system;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import herddb.codec.RecordSerializer;
 import herddb.core.AbstractIndexManager;
 import herddb.core.TableSpaceManager;
@@ -46,6 +49,7 @@ public class SysindexesTableManager extends AbstractSystemTableManager {
             .column("index_name", ColumnTypes.STRING)
             .column("index_uuid", ColumnTypes.STRING)
             .column("index_type", ColumnTypes.STRING)
+            .column("properties", ColumnTypes.STRING)
             .column("unique", ColumnTypes.INTEGER)
             .primaryKey("table_name", false)
             .primaryKey("index_name", false)
@@ -74,9 +78,48 @@ public class SysindexesTableManager extends AbstractSystemTableManager {
                         "index_name", r.name,
                         "index_uuid", r.uuid,
                         "index_type", r.type,
+                        "properties", encodePropertiesAsJson(r.properties),
                         "unique", r.unique ? 1 : 0
                 ))
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * Single shared {@link ObjectMapper} configured to emit map entries in
+     * key-sorted order. Jackson's {@code ObjectMapper} is documented as
+     * thread-safe for the read/write methods after configuration, and we
+     * never mutate it after construction.
+     */
+    private static final ObjectMapper JSON_MAPPER = new ObjectMapper()
+            .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+
+    /**
+     * Serializes the {@code properties} map of an {@link herddb.model.Index} as
+     * a deterministic JSON object (keys sorted lexicographically). Used by the
+     * {@code properties} column of {@code sysindexes} so operators can read the
+     * full set of WITH-clause values from any JDBC client without going through
+     * the indexing-service admin tool. See issue #451.
+     *
+     * <p>Always returns a syntactically valid JSON object: {@code "{}"} for an
+     * empty / null map, and a {@code {"key":"value", ...}} object otherwise.
+     * Escaping and ordering are delegated to Jackson's {@link ObjectMapper}
+     * with {@link SerializationFeature#ORDER_MAP_ENTRIES_BY_KEYS} enabled, so
+     * the same input always produces the same JSON regardless of the
+     * iteration order of the underlying map.
+     */
+    static String encodePropertiesAsJson(Map<String, String> properties) {
+        if (properties == null || properties.isEmpty()) {
+            return "{}";
+        }
+        try {
+            return JSON_MAPPER.writeValueAsString(properties);
+        } catch (JsonProcessingException e) {
+            // The input is a Map<String, String> with no nulls expected, so
+            // Jackson should never fail on it — but if it does, surface the
+            // failure rather than silently returning malformed JSON.
+            throw new IllegalStateException(
+                    "failed to encode index properties as JSON: " + properties, e);
+        }
     }
 
 }

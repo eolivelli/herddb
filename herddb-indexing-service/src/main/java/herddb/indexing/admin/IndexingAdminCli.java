@@ -530,6 +530,7 @@ public final class IndexingAdminCli {
         m.put("compaction_nodes_total", r.getCompactionNodesTotal());
         m.put("upload_bytes_done", r.getUploadBytesDone());
         m.put("upload_bytes_total", r.getUploadBytesTotal());
+        m.put("num_shards", r.getNumShards());
         return m;
     }
 
@@ -585,6 +586,7 @@ public final class IndexingAdminCli {
         out.printf(Locale.ROOT, "  dirty                 = %s%n", r.getDirty());
         out.printf(Locale.ROOT, "  fused_pq_enabled      = %s%n", r.getFusedPqEnabled());
         out.printf(Locale.ROOT, "  m / beam_width        = %d / %d%n", r.getM(), r.getBeamWidth());
+        out.printf(Locale.ROOT, "  num_shards            = %d%n", r.getNumShards());
         out.printf(Locale.ROOT, "  tailer_lsn            = %d/%d (lag_ms=%d)%n",
                 r.getTailerLsnLedger(), r.getTailerLsnOffset(),
                 computeLagMs(r.getTailerLsnTimestamp()));
