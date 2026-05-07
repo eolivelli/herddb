@@ -490,12 +490,13 @@ public class BookKeeperCommitLogAsyncWriterTest {
     }
 
     /**
-     * If the BookKeeper main worker pool has been shut down before a write is
-     * dispatched, the executor's {@code execute} call throws
-     * {@link java.util.concurrent.RejectedExecutionException}; the writer
-     * must release the serialised buffer (BK never took ownership), revert
-     * {@code pendingAdds}, and fail the future cleanly without leaking
-     * (issue #434, PR #437 review follow-up #3).
+     * After {@link BookkeeperCommitLog.CommitFileWriter#close()} has shut
+     * down the writer's dedicated executor, any subsequent
+     * {@code writeEntry} call hits the
+     * {@link java.util.concurrent.RejectedExecutionException} catch path:
+     * the writer must release the serialised buffer (BK never took
+     * ownership), revert {@code pendingAdds}, and fail the future cleanly
+     * without leaking (issue #434, PR #437 review follow-up #3).
      */
     @Test
     public void testRejectedExecutionFailsCleanlyAndDoesNotLeakBuffer() throws Exception {
@@ -511,31 +512,32 @@ public class BookKeeperCommitLogAsyncWriterTest {
             man.start();
             logManager.start();
 
-            try (BookkeeperCommitLog writer = logManager.createCommitLog(tableSpaceUUID, name, nodeid);) {
-                writer.setWriteLedgerHeader(false);
-                writer.startWriting(1);
-                // Drive one successful write so the writer is fully primed.
-                writer.log(LogEntryFactory.beginTransaction(1), true)
-                        .logSequenceNumber.get(30, TimeUnit.SECONDS);
+            BookkeeperCommitLog writer = logManager.createCommitLog(tableSpaceUUID, name, nodeid);
+            writer.setWriteLedgerHeader(false);
+            writer.startWriting(1);
+            writer.log(LogEntryFactory.beginTransaction(1), true)
+                    .logSequenceNumber.get(30, TimeUnit.SECONDS);
 
-                // Forcefully shut down the BK main worker pool so the next
-                // executor.execute(...) inside writeEntry rejects.
-                logManager.getBookKeeper().getMainWorkerPool().shutdown();
+            // Capture the CommitFileWriter then close the BookkeeperCommitLog,
+            // which calls CommitFileWriter#close and shuts down the dedicated
+            // executor.
+            BookkeeperCommitLog.CommitFileWriter committed = writer.getWriter();
+            writer.close();
 
-                CompletableFuture<LogSequenceNumber> rejected =
-                        writer.getWriter().writeEntry(
-                                LogEntryFactory.beginTransaction(2));
-                try {
-                    rejected.get(15, TimeUnit.SECONDS);
-                    fail("expected LogNotAvailableException after BK pool shutdown");
-                } catch (ExecutionException ee) {
-                    assertTrue("unexpected cause " + ee.getCause(),
-                            ee.getCause() instanceof LogNotAvailableException);
-                }
-                // pendingAdds must drain to 0 — proving the rejected write
-                // released its claim on the writer's accounting.
-                assertEquals(0L, writer.getWriter().getPendingAdds());
+            // Submitting on the closed writer must hit the
+            // RejectedExecutionException catch path inside writeEntry,
+            // release the buffer, decrement pendingAdds, and fail the
+            // returned future cleanly.
+            CompletableFuture<LogSequenceNumber> rejected = committed.writeEntry(
+                    LogEntryFactory.beginTransaction(2));
+            try {
+                rejected.get(15, TimeUnit.SECONDS);
+                fail("expected LogNotAvailableException after writer close");
+            } catch (ExecutionException ee) {
+                assertTrue("unexpected cause " + ee.getCause(),
+                        ee.getCause() instanceof LogNotAvailableException);
             }
+            assertEquals(0L, committed.getPendingAdds());
         }
     }
 
