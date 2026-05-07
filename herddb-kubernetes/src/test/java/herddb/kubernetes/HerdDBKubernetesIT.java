@@ -54,8 +54,18 @@ public class HerdDBKubernetesIT {
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
 
+    // Setting -Dio.netty.maxDirectMemory=<bytes> matching -XX:MaxDirectMemorySize is required so that
+    // Netty uses Unsafe.allocateMemory (no-cleaner pooled path) with an internal byte cap, bypassing
+    // JVM Bits.reserveMemory accounting. Without this property, Netty falls back to ByteBuffer.allocateDirect
+    // and direct allocations are bounded by phantom-reference GC delays — see issue #253 and the comment in
+    // herddb-services/src/main/resources/bin/setenv.sh which sets -Dio.netty.maxDirectMemory=0 in the default
+    // JAVA_OPTS baseline (lost when the Helm chart's full-replace server.javaOpts is supplied as in these tests).
+    // Recent off-heap relocations (issues #399, #409, #411) make even simple SQL traffic allocate enough direct
+    // memory that the previous 128 MiB cap caused server stalls on CI (issue #438).
+    // Byte values: 268435456 = 256 * 1024 * 1024 (= MaxDirectMemorySize=256m).
     private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m"
+            + " -Dio.netty.maxDirectMemory=268435456"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -350,8 +360,12 @@ public class HerdDBKubernetesIT {
                 + "Looked in: " + String.join(", ", candidates));
     }
 
+    // Same rationale as SERVER_JAVA_OPTS: set -Dio.netty.maxDirectMemory explicitly to match
+    // MaxDirectMemorySize so Netty uses the Unsafe no-cleaner path (issue #253, issue #438).
+    // Byte values: 134217728 = 128 * 1024 * 1024 (= MaxDirectMemorySize=128m).
     private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Dio.netty.maxDirectMemory=134217728"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     private static String helmTemplate(String chartPath) throws Exception {
@@ -364,22 +378,26 @@ public class HerdDBKubernetesIT {
                 "--set", "bookkeeper.enabled=true",
                 "--set", "bookkeeper.replicaCount=1",
                 "--set", "zookeeper.javaOpts=" + INFRA_JAVA_OPTS,
-                "--set", "zookeeper.resources.requests.memory=256Mi",
+                // Container memory raised from 256Mi to 384Mi to fit 128m heap + 128m direct + ~128m
+                // JVM/native overhead (issue #438). Same applies to all infra pods below.
+                "--set", "zookeeper.resources.requests.memory=384Mi",
                 "--set", "zookeeper.resources.requests.cpu=0.5",
-                "--set", "zookeeper.resources.limits.memory=256Mi",
+                "--set", "zookeeper.resources.limits.memory=384Mi",
                 "--set", "zookeeper.resources.limits.cpu=0.5",
                 "--set", "zookeeper.storage.size=1Gi",
                 "--set", "bookkeeper.javaOpts=" + INFRA_JAVA_OPTS,
-                "--set", "bookkeeper.resources.requests.memory=256Mi",
+                "--set", "bookkeeper.resources.requests.memory=384Mi",
                 "--set", "bookkeeper.resources.requests.cpu=0.5",
-                "--set", "bookkeeper.resources.limits.memory=256Mi",
+                "--set", "bookkeeper.resources.limits.memory=384Mi",
                 "--set", "bookkeeper.resources.limits.cpu=0.5",
                 "--set", "bookkeeper.storage.journal.size=1Gi",
                 "--set", "bookkeeper.storage.ledger.size=1Gi",
                 "--set", "server.javaOpts=" + SERVER_JAVA_OPTS,
-                "--set", "server.resources.requests.memory=512Mi",
+                // Server container memory raised from 512Mi to 768Mi to fit 256m heap + 256m direct +
+                // ~256m JVM/native overhead under the new off-heap memory profile (issue #438).
+                "--set", "server.resources.requests.memory=768Mi",
                 "--set", "server.resources.requests.cpu=0.5",
-                "--set", "server.resources.limits.memory=512Mi",
+                "--set", "server.resources.limits.memory=768Mi",
                 "--set", "server.resources.limits.cpu=0.5",
                 "--set", "server.storage.data.size=1Gi",
                 "--set", "server.storage.commitlog.size=1Gi",

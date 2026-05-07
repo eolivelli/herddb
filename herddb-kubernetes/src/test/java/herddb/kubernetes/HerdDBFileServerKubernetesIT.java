@@ -63,11 +63,23 @@ public class HerdDBFileServerKubernetesIT {
     private static final String IMAGE_NAME = "herddb/herddb-server";
     private static final String IMAGE_TAG = "0.30.0-SNAPSHOT";
     private static final String FULL_IMAGE = IMAGE_NAME + ":" + IMAGE_TAG;
+    // Setting -Dio.netty.maxDirectMemory=<bytes> matching -XX:MaxDirectMemorySize is required so that
+    // Netty uses Unsafe.allocateMemory (no-cleaner pooled path) with an internal byte cap, bypassing
+    // JVM Bits.reserveMemory accounting. Without this property, Netty falls back to ByteBuffer.allocateDirect
+    // and direct allocations are bounded by phantom-reference GC delays — see issue #253 and the comment in
+    // herddb-services/src/main/resources/bin/setenv.sh which sets -Dio.netty.maxDirectMemory=0 in the default
+    // JAVA_OPTS baseline (lost when the Helm chart's full-replace .javaOpts is supplied as in these tests).
+    // Recent off-heap relocations (issues #399, #409, #411) make even simple SQL traffic allocate enough direct
+    // memory that the previous 128 MiB cap caused server stalls on CI (issue #438).
+    // Byte values: 268435456 = 256 * 1024 * 1024 (= MaxDirectMemorySize=256m);
+    //              134217728 = 128 * 1024 * 1024 (= MaxDirectMemorySize=128m).
     private static final String SERVER_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx256m -Xms256m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=256m"
+            + " -Dio.netty.maxDirectMemory=268435456"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
     private static final String INFRA_JAVA_OPTS = "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
-            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+            + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+            + " -Dio.netty.maxDirectMemory=134217728"
             + " -Djava.awt.headless=true --add-modules jdk.incubator.vector";
 
     @ClassRule
@@ -136,18 +148,18 @@ public class HerdDBFileServerKubernetesIT {
         // ZooKeeper
         values.put("zookeeper.enabled", "true");
         values.put("zookeeper.javaOpts", INFRA_JAVA_OPTS);
-        values.put("zookeeper.resources.requests.memory", "256Mi");
+        values.put("zookeeper.resources.requests.memory", "384Mi");
         values.put("zookeeper.resources.requests.cpu", "0.5");
-        values.put("zookeeper.resources.limits.memory", "256Mi");
+        values.put("zookeeper.resources.limits.memory", "384Mi");
         values.put("zookeeper.resources.limits.cpu", "0.5");
         values.put("zookeeper.storage.size", "1Gi");
         // BookKeeper
         values.put("bookkeeper.enabled", "true");
         values.put("bookkeeper.replicaCount", "1");
         values.put("bookkeeper.javaOpts", INFRA_JAVA_OPTS);
-        values.put("bookkeeper.resources.requests.memory", "256Mi");
+        values.put("bookkeeper.resources.requests.memory", "384Mi");
         values.put("bookkeeper.resources.requests.cpu", "0.5");
-        values.put("bookkeeper.resources.limits.memory", "256Mi");
+        values.put("bookkeeper.resources.limits.memory", "384Mi");
         values.put("bookkeeper.resources.limits.cpu", "0.5");
         values.put("bookkeeper.storage.journal.size", "1Gi");
         values.put("bookkeeper.storage.ledger.size", "1Gi");
@@ -155,9 +167,9 @@ public class HerdDBFileServerKubernetesIT {
         values.put("fileServer.replicaCount", "2");
         values.put("fileServer.storageMode", "s3");
         values.put("fileServer.javaOpts", INFRA_JAVA_OPTS);
-        values.put("fileServer.resources.requests.memory", "256Mi");
+        values.put("fileServer.resources.requests.memory", "384Mi");
         values.put("fileServer.resources.requests.cpu", "0.5");
-        values.put("fileServer.resources.limits.memory", "256Mi");
+        values.put("fileServer.resources.limits.memory", "384Mi");
         values.put("fileServer.resources.limits.cpu", "0.5");
         values.put("fileServer.storage.size", "1Gi");
         // MinIO
@@ -169,9 +181,9 @@ public class HerdDBFileServerKubernetesIT {
         values.put("minio.storage.size", "1Gi");
         // Server resources
         values.put("server.javaOpts", SERVER_JAVA_OPTS);
-        values.put("server.resources.requests.memory", "512Mi");
+        values.put("server.resources.requests.memory", "768Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "512Mi");
+        values.put("server.resources.limits.memory", "768Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");

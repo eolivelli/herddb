@@ -124,16 +124,25 @@ public class HerdDBJvectorDirectivesIT {
         values.put("server.mode", "standalone");
         values.put("server.storageMode", "local");
         values.put("server.replicaCount", "1");
-        values.put("server.resources.requests.memory", "256Mi");
+        // Container memory raised from 256Mi to 384Mi to fit 128m heap + 128m direct + ~128m JVM/native
+        // overhead under the new off-heap memory profile (issue #438).
+        values.put("server.resources.requests.memory", "384Mi");
         values.put("server.resources.requests.cpu", "0.5");
-        values.put("server.resources.limits.memory", "256Mi");
+        values.put("server.resources.limits.memory", "384Mi");
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
-        // Tiny heap is fine — we don't run real workloads against it.
+        // Tiny heap is fine — we don't run real workloads against it. -Dio.netty.maxDirectMemory=134217728
+        // (= MaxDirectMemorySize=128m in bytes): without this property, Netty falls back to
+        // ByteBuffer.allocateDirect (bounded by phantom-reference GC delays via Bits.reserveMemory) instead
+        // of the Unsafe.allocateMemory no-cleaner pooled path. The default JAVA_OPTS in setenv.sh sets
+        // -Dio.netty.maxDirectMemory=0 but that baseline is replaced when the Helm chart's full-replace
+        // server.javaOpts is supplied (issue #438, #253). Direct memory raised from 64m to 128m to absorb
+        // recent off-heap relocations (issues #399, #409, #411).
         values.put("server.javaOpts",
                 "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
-                        + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+                        + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+                        + " -Dio.netty.maxDirectMemory=134217728"
                         + " -Djava.awt.headless=true --add-modules jdk.incubator.vector");
         values.put("tools.enabled", "false");
         values.put("zookeeper.enabled", "false");
@@ -142,13 +151,15 @@ public class HerdDBJvectorDirectivesIT {
         values.put("indexingService.enabled", "true");
         values.put("indexingService.replicaCount", "1");
         values.put("indexingService.storageMode", "memory");
+        // Same -Dio.netty.maxDirectMemory rationale as server.javaOpts above (issue #438, #253).
         values.put("indexingService.javaOpts",
                 "-XX:+UseG1GC -Duser.language=en -Xmx128m -Xms128m"
-                        + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=64m"
+                        + " -Djava.net.preferIPv4Stack=true -XX:MaxDirectMemorySize=128m"
+                        + " -Dio.netty.maxDirectMemory=134217728"
                         + " -Djava.awt.headless=true --add-modules jdk.incubator.vector");
-        values.put("indexingService.resources.requests.memory", "256Mi");
+        values.put("indexingService.resources.requests.memory", "384Mi");
         values.put("indexingService.resources.requests.cpu", "0.5");
-        values.put("indexingService.resources.limits.memory", "256Mi");
+        values.put("indexingService.resources.limits.memory", "384Mi");
         values.put("indexingService.resources.limits.cpu", "0.5");
         values.put("indexingService.storage.data.size", "1Gi");
         values.put("indexingService.storage.log.size", "1Gi");
