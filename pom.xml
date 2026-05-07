@@ -100,7 +100,14 @@
         <libs.slf4j>2.0.4</libs.slf4j>
         <libs.commonscollections>3.2.2</libs.commonscollections>
         <libs.lz4>1.3.0</libs.lz4>
-        <libs.bookkeeper>4.17.2</libs.bookkeeper>
+        <!--
+            BookKeeper temporary SNAPSHOT pin — see issue #435.
+            Built from https://github.com/eolivelli/bookkeeper, branch
+            fix-concurrentlonghashmap-record-4.17.
+            Reverts to a Central-released 4.17.x once the upstream
+            ConcurrentLongHashMap record + PendingAddOp leak fixes ship.
+        -->
+        <libs.bookkeeper>4.17.4-SNAPSHOT</libs.bookkeeper>
         <libs.jersey>2.26</libs.jersey>
         <libs.jcipi-annotations>1.0</libs.jcipi-annotations>
         <libs.spotbugsannotations>4.9.8</libs.spotbugsannotations>
