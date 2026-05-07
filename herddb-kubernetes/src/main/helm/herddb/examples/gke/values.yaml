@@ -276,6 +276,14 @@ bookkeeper:
     # Raise bookie ZK session timeout from the 10s default (AbstractConfiguration.getZkTimeout())
     # to 40s so it survives checkpoint-induced I/O bursts without expiring (issue #210).
     zkTimeout: "40000"
+    # Raise the bookie's in-progress read-request gate (issue #449).
+    # Default is 10,000. With 2 IS replicas each catching up on ~1,000 BK entries at
+    # tailbatchsize=10,000, both IS tailers connecting simultaneously fired
+    # "Too many read requests in progress, disabling autoread" immediately, which
+    # caused BK-0 to freeze for ~10 minutes while SortedLedgerStorage flushes were
+    # running concurrently, blocking all addEntry writes. Setting to 1,000,000
+    # (100× default) prevents the IS catch-up burst from triggering the gate.
+    maxReadRequestsInProgress: "1000000"
   # Journal: pd-SSD (premium-rwo) — random write I/O, latency-sensitive.
   #   During a 1B bigann ingest run the bookie journal showed p99.9 write
   #   latency of 45–60 ms on pd-balanced (standard-rwo). This tail feeds a
@@ -306,7 +314,7 @@ bookkeeper:
 indexingService:
   enabled: true
   storageMode: remote
-  replicaCount: 0
+  replicaCount: 2
   # Raised from the chart default (failureThreshold=3, periodSeconds=15 → 45s tolerance)
   # to survive IS memory-flush cycles where the HTTP /metrics endpoint becomes temporarily
   # unresponsive under extreme GC pressure (98% heap). The double-flush scenario observed
@@ -362,13 +370,10 @@ indexingService:
   javaOpts: "-Xms28g -Xmx28g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -Dio.netty.maxDirectMemory=10737418240 -XX:MaxDirectMemorySize=10g -Dio.netty.allocator.numDirectArenas=8 -Dherddb.commitlog.tailbatchsize=10000 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/opt/herddb/indexdata/heapdump.hprof"
   storage:
     data:
-      # NOTE: PVC size kept at 20Gi to avoid StatefulSet volumeClaimTemplate
-      # immutability error on helm upgrade. GKE supports online PVC expansion
-      # but the StatefulSet template itself cannot change without deleting the
-      # STS first. A full heap dump (28g heap, worst-case ~28 GiB) will not fit
-      # here; to expand, manually patch PVCs and delete/recreate the STS via
-      # reset-cluster.sh on the next fresh run.
-      size: 20Gi
+      # 100 GiB: accommodates a full heap dump (28g heap, worst-case ~28 GiB HPROF)
+      # plus IS working data. STS was deleted via teardown+reset, so the
+      # volumeClaimTemplate can be freely set on this fresh install.
+      size: 100Gi
     log:
       size: 5Gi
   extraConfig:
