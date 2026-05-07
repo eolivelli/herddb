@@ -449,6 +449,15 @@ public class HerdDBKubernetesIT {
         ProcessBuilder pb = new ProcessBuilder(
                 "helm", "template", "test-release", chartPath,
                 "--set", "server.mode=cluster",
+                // server.storageMode=local: do not render the file-server StatefulSet
+                // (it is gated by `{{- if eq .Values.server.storageMode "remote" }}` in
+                // file-server-statefulset.yaml). Without this, the chart's default
+                // fileServer.resources.requests.cpu=4 × fileServer.replicaCount=2 = 8 CPUs
+                // exhausts the single-node K3s testcontainer (4 vCPUs on GH Actions),
+                // leaving file-server-0 Pending with "Insufficient cpu" — and the HerdDB
+                // server then blocks all SQL on unreachable remote storage, surfacing as
+                // the JDBC client's 600 s TimeoutException (issue #438).
+                "--set", "server.storageMode=local",
                 "--set", "server.replicaCount=1",
                 "--set", "tools.enabled=true",
                 "--set", "zookeeper.enabled=true",
