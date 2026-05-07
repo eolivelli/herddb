@@ -64,6 +64,30 @@ jobs:
           path: jvector
       - name: 'Build jvector'
         run: mvn -B install -DskipTests -Drat.skip=true --file jvector/pom.xml && rm -rf jvector
+      # BookKeeper temporary SNAPSHOT — see issue #435.
+      # The fork carries fixes that have not shipped in any released 4.17.x
+      # (PendingAddOp leak + ConcurrentLongHashMap record/JDK-25 issue).
+      # circe-checksum bundles a Lombok 1.18.30 annotation processor which
+      # cannot run on JDK 25 (TypeTag :: UNKNOWN), so we build BookKeeper on
+      # JDK 17 and then switch back to JDK 25 for the HerdDB build.
+      - name: 'Checkout bookkeeper (eolivelli fork)'
+        uses: actions/checkout@v4
+        with:
+          repository: eolivelli/bookkeeper
+          ref: fix-concurrentlonghashmap-record-4.17
+          path: bookkeeper
+      - name: 'Set up JDK 17 (for BookKeeper build only)'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: 'Build bookkeeper'
+        run: mvn -B install -DskipTests -Drat.skip=true -Dspotbugs.skip=true -Dcheckstyle.skip=true -Dlicense.skip=true --file bookkeeper/pom.xml && rm -rf bookkeeper
+      - name: 'Set up JDK 25 (restore for HerdDB build)'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'oracle'
       - name: 'Build with Maven (with checkstyle, rat, spotbugs)'
         run: mvn -B checkstyle:check apache-rat:check install -DskipTests spotbugs:check -Dmaven.test.redirectTestOutputToFile=true -Dherddb.file.requirefsync=false --file pom.xml -Pci
       - name: 'Upload build artifacts'
@@ -73,8 +97,13 @@ jobs:
           path: |
             ~/.m2/repository/org/herddb
             ~/.m2/repository/io/github/jbellis
+            ~/.m2/repository/org/apache/bookkeeper
           retention-days: 1
       - name: 'Remove Snapshots Before Caching'
+        # Strip every *SNAPSHOT* dir from the cache so the next CI run rebuilds
+        # both jvector and the eolivelli BookKeeper fork from source. Test jobs
+        # still get the SNAPSHOT artifacts via the upload/download-artifact
+        # round-trip above.
         run: find ~/.m2 -name '*SNAPSHOT' | xargs rm -Rf
 
   test-core:
