@@ -449,15 +449,12 @@ public class HerdDBKubernetesIT {
         ProcessBuilder pb = new ProcessBuilder(
                 "helm", "template", "test-release", chartPath,
                 "--set", "server.mode=cluster",
-                // server.storageMode=local: do not render the file-server StatefulSet
-                // (it is gated by `{{- if eq .Values.server.storageMode "remote" }}` in
-                // file-server-statefulset.yaml). Without this, the chart's default
-                // fileServer.resources.requests.cpu=4 × fileServer.replicaCount=2 = 8 CPUs
-                // exhausts the single-node K3s testcontainer (4 vCPUs on GH Actions),
-                // leaving file-server-0 Pending with "Insufficient cpu" — and the HerdDB
-                // server then blocks all SQL on unreachable remote storage, surfacing as
-                // the JDBC client's 600 s TimeoutException (issue #438).
-                "--set", "server.storageMode=local",
+                // Keep chart-default server.storageMode=remote so the test exercises the
+                // production cluster+remote-storage path. To fit on the single-node K3s
+                // testcontainer (4 vCPUs on GH Actions) we right-size the file-server
+                // (the chart default is replicaCount=2 × cpu=4 = 8 CPUs requested,
+                // which is unschedulable and leaves file-server-0 Pending with
+                // "Insufficient cpu" — see issue #438).
                 "--set", "server.replicaCount=1",
                 "--set", "tools.enabled=true",
                 "--set", "zookeeper.enabled=true",
@@ -487,6 +484,18 @@ public class HerdDBKubernetesIT {
                 "--set", "server.resources.limits.cpu=0.5",
                 "--set", "server.storage.data.size=1Gi",
                 "--set", "server.storage.commitlog.size=1Gi",
+                // File server: 1 replica with infra-sized resources to fit on a 4-vCPU
+                // K3s runner. Chart defaults are replicaCount=2 × cpu=4 = 8 CPUs which
+                // is unschedulable on GH Actions; see issue #438. Empty fileServer.javaOpts
+                // (chart default) means setenv.sh's -Xmx4g default applies inside the pod
+                // and instantly OOMs at the 384Mi memory limit, so override javaOpts too.
+                "--set", "fileServer.replicaCount=1",
+                "--set", "fileServer.javaOpts=" + INFRA_JAVA_OPTS,
+                "--set", "fileServer.resources.requests.memory=384Mi",
+                "--set", "fileServer.resources.requests.cpu=0.5",
+                "--set", "fileServer.resources.limits.memory=384Mi",
+                "--set", "fileServer.resources.limits.cpu=0.5",
+                "--set", "fileServer.storage.size=1Gi",
                 "--set", "image.pullPolicy=Never"
         );
         pb.redirectErrorStream(true);

@@ -161,9 +161,6 @@ public class HerdDBClusterKubernetesIT {
 
         Map<String, String> values = new LinkedHashMap<>();
         values.put("server.mode", "standalone");
-        // server.storageMode=local: skip the file-server StatefulSet (issue #438).
-        // See HerdDBKubernetesIT.helmTemplate for full rationale.
-        values.put("server.storageMode", "local");
         values.put("server.replicaCount", "1");
         values.put("tools.enabled", "false");
         values.put("zookeeper.enabled", "true");
@@ -182,6 +179,18 @@ public class HerdDBClusterKubernetesIT {
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
+        // File server: 1 replica with infra-sized resources to fit on a 4-vCPU
+        // K3s runner. Chart defaults are replicaCount=2 × cpu=4 = 8 CPUs which
+        // is unschedulable on GH Actions; see issue #438. Empty fileServer.javaOpts
+        // (chart default) means setenv.sh's -Xmx4g default would apply inside the
+        // pod and instantly OOM at the 384Mi memory limit, so override javaOpts too.
+        values.put("fileServer.replicaCount", "1");
+        values.put("fileServer.javaOpts", INFRA_JAVA_OPTS);
+        values.put("fileServer.resources.requests.memory", "384Mi");
+        values.put("fileServer.resources.requests.cpu", "0.5");
+        values.put("fileServer.resources.limits.memory", "384Mi");
+        values.put("fileServer.resources.limits.cpu", "0.5");
+        values.put("fileServer.storage.size", "1Gi");
 
         applyHelmChart(values);
 
@@ -209,9 +218,6 @@ public class HerdDBClusterKubernetesIT {
 
         Map<String, String> values = new LinkedHashMap<>();
         values.put("server.mode", "standalone");
-        // server.storageMode=local: skip the file-server StatefulSet (issue #438).
-        // See HerdDBKubernetesIT.helmTemplate for full rationale.
-        values.put("server.storageMode", "local");
         values.put("server.replicaCount", "1");
         values.put("tools.enabled", "false");
         values.put("zookeeper.enabled", "true");
@@ -238,6 +244,18 @@ public class HerdDBClusterKubernetesIT {
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
+        // File server: 1 replica with infra-sized resources to fit on a 4-vCPU
+        // K3s runner. Chart defaults are replicaCount=2 × cpu=4 = 8 CPUs which
+        // is unschedulable on GH Actions; see issue #438. Empty fileServer.javaOpts
+        // (chart default) means setenv.sh's -Xmx4g default would apply inside the
+        // pod and instantly OOM at the 384Mi memory limit, so override javaOpts too.
+        values.put("fileServer.replicaCount", "1");
+        values.put("fileServer.javaOpts", INFRA_JAVA_OPTS);
+        values.put("fileServer.resources.requests.memory", "384Mi");
+        values.put("fileServer.resources.requests.cpu", "0.5");
+        values.put("fileServer.resources.limits.memory", "384Mi");
+        values.put("fileServer.resources.limits.cpu", "0.5");
+        values.put("fileServer.storage.size", "1Gi");
 
         applyHelmChart(values);
 
@@ -276,14 +294,6 @@ public class HerdDBClusterKubernetesIT {
 
         Map<String, String> values = new LinkedHashMap<>();
         values.put("server.mode", "cluster");
-        // server.storageMode=local: skip the file-server StatefulSet (issue #438).
-        // The chart default fileServer.resources.requests.cpu=4 × replicaCount=2 = 8 CPUs
-        // exhausts the single-node K3s testcontainer (4 vCPUs on GH Actions), leaving the
-        // file-server Pending and the HerdDB server unable to flush remote-storage pages —
-        // surfaces as the JDBC client's 600 s TimeoutException on CREATE TABLE. cluster
-        // mode (= ZK+BK replication) is orthogonal to storageMode (= where pages live);
-        // these tests don't assert anything about remote storage.
-        values.put("server.storageMode", "local");
         values.put("server.replicaCount", "1");
         values.put("tools.enabled", "true");
         values.put("zookeeper.enabled", "true");
@@ -310,6 +320,18 @@ public class HerdDBClusterKubernetesIT {
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
+        // File server: 1 replica with infra-sized resources to fit on a 4-vCPU
+        // K3s runner. Chart defaults are replicaCount=2 × cpu=4 = 8 CPUs which
+        // is unschedulable on GH Actions; see issue #438. Empty fileServer.javaOpts
+        // (chart default) means setenv.sh's -Xmx4g default would apply inside the
+        // pod and instantly OOM at the 384Mi memory limit, so override javaOpts too.
+        values.put("fileServer.replicaCount", "1");
+        values.put("fileServer.javaOpts", INFRA_JAVA_OPTS);
+        values.put("fileServer.resources.requests.memory", "384Mi");
+        values.put("fileServer.resources.requests.cpu", "0.5");
+        values.put("fileServer.resources.limits.memory", "384Mi");
+        values.put("fileServer.resources.limits.cpu", "0.5");
+        values.put("fileServer.storage.size", "1Gi");
 
         applyHelmChart(values);
 
@@ -372,14 +394,6 @@ public class HerdDBClusterKubernetesIT {
 
         Map<String, String> values = new LinkedHashMap<>();
         values.put("server.mode", "cluster");
-        // server.storageMode=local: skip the file-server StatefulSet (issue #438).
-        // The chart default fileServer.resources.requests.cpu=4 × replicaCount=2 = 8 CPUs
-        // exhausts the single-node K3s testcontainer (4 vCPUs on GH Actions), leaving the
-        // file-server Pending and the HerdDB server unable to flush remote-storage pages —
-        // surfaces as the JDBC client's 600 s TimeoutException on CREATE TABLE. cluster
-        // mode (= ZK+BK replication) is orthogonal to storageMode (= where pages live);
-        // these tests don't assert anything about remote storage.
-        values.put("server.storageMode", "local");
         values.put("server.replicaCount", "1");
         values.put("tools.enabled", "true");
         values.put("zookeeper.enabled", "true");
@@ -406,6 +420,18 @@ public class HerdDBClusterKubernetesIT {
         values.put("server.resources.limits.cpu", "0.5");
         values.put("server.storage.data.size", "1Gi");
         values.put("server.storage.commitlog.size", "1Gi");
+        // File server: 1 replica with infra-sized resources to fit on a 4-vCPU
+        // K3s runner. Chart defaults are replicaCount=2 × cpu=4 = 8 CPUs which
+        // is unschedulable on GH Actions; see issue #438. Empty fileServer.javaOpts
+        // (chart default) means setenv.sh's -Xmx4g default would apply inside the
+        // pod and instantly OOM at the 384Mi memory limit, so override javaOpts too.
+        values.put("fileServer.replicaCount", "1");
+        values.put("fileServer.javaOpts", INFRA_JAVA_OPTS);
+        values.put("fileServer.resources.requests.memory", "384Mi");
+        values.put("fileServer.resources.requests.cpu", "0.5");
+        values.put("fileServer.resources.limits.memory", "384Mi");
+        values.put("fileServer.resources.limits.cpu", "0.5");
+        values.put("fileServer.storage.size", "1Gi");
 
         applyHelmChart(values);
 
