@@ -650,7 +650,20 @@ public class DatasetLoader {
 
         if (skipVectors > 0) {
             System.out.println("  Skipping " + skipVectors + " vectors to resume from position " + skipVectors + "...");
-            skipVecsInStream(dis, format, skipVectors);
+            try {
+                skipVecsInStream(dis, format, skipVectors);
+            } catch (IOException e) {
+                // The new "loud EOF" semantics in skipExactly makes this
+                // throw path reachable on corrupt / truncated files; close
+                // the file handle before propagating so a partially-built
+                // VectorStream doesn't leak the FD across retries.
+                try {
+                    dis.close();
+                } catch (IOException closeEx) {
+                    e.addSuppressed(closeEx);
+                }
+                throw e;
+            }
             System.out.println("  Skip complete.");
         }
 
