@@ -45,9 +45,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -148,33 +146,35 @@ public class BookkeeperCommitLog extends CommitLog {
         private final AtomicReference<Throwable> writeError = new AtomicReference<>();
 
         /**
-         * Dedicated single-thread executor that owns every {@code writeAsync}
-         * call for this ledger. Producer threads submit a small dispatch
-         * lambda via {@link ExecutorService#execute} and return; the executor
-         * thread serially calls into BookKeeper. Because only one thread ever
-         * enters {@code LedgerHandle.doAsyncAddEntry}'s {@code synchronized
-         * (this)} block for this ledger, the BK monitor is uncontended and
-         * resolves to a thin/biased lock that is essentially free
-         * (issue #434).
+         * Single-threaded executor borrowed from BookKeeper's main worker pool
+         * via {@code BookKeeper.getMainWorkerPool().chooseThread(ledgerId)}.
+         * Every {@code writeAsync} call for this ledger is funnelled through
+         * this one thread so that BookKeeper's internal {@code synchronized
+         * (this)} block in {@code LedgerHandle.doAsyncAddEntry} is never
+         * contended (issue #434). Pulsar's {@code ManagedLedgerImpl} uses the
+         * exact same pattern with the comment <i>"Jump to specific thread to
+         * avoid contention from writers writing from different threads"</i>.
+         * The underlying {@code SingleThreadExecutor} uses a JCTools
+         * {@code GrowableMpScArrayConsumerBlockingQueue}, so the producer-side
+         * enqueue is lock-free MPSC and the consumer drains in batches.
+         * No new threads are created — we share an existing BK thread, picked
+         * deterministically by hashing {@code ledgerId}.
          *
-         * <p>Pulsar's {@code ManagedLedgerImpl} uses the same single-thread
-         * pattern but borrows from {@code BookKeeper.getMainWorkerPool().chooseThread(name)}.
-         * We deliberately do NOT borrow from the main worker pool: in
-         * CPU-constrained deployments (e.g. K8s pods with 0.5 CPU and
-         * {@code Runtime.availableProcessors() == 1}) that pool has very few
-         * threads and is also responsible for BK's own response handling,
-         * metadata operations, and recovery; head-of-queue blocking between
-         * our writes and BK's internal scheduling can stall ingestion. A
-         * dedicated thread per writer is one small thread but eliminates
-         * that risk and restores the latency-isolation property that the
-         * original Pulsar pattern relies on a fully-provisioned worker pool
-         * to provide.
-         *
-         * <p>Lifecycle: started in the {@link CommitFileWriter} constructor,
-         * shut down in {@link #close()} after {@code waitForAllPendingWrites}
-         * has drained {@code pendingAdds}. The executor is a daemon thread,
-         * so even if shutdown is missed (JVM-level abort) it does not block
-         * exit.
+         * <p>Critically, sharing the thread with BK's response handling is
+         * a <em>correctness</em> requirement, not just a resource-saving
+         * choice: BK dispatches each entry's ack callback via
+         * {@code executeOrdered(ledgerId, ...)}, which lands on this same
+         * thread. So our submitted lambdas and the corresponding BK acks
+         * <em>interleave</em> on a single thread, which keeps
+         * {@code lh.lastAddConfirmed} fresh between consecutive
+         * {@code writeAsync} calls. That freshness is essential for the
+         * piggybacked LAC the writer sends with each new entry — a
+         * dedicated executor (not on BK's pool) batches our lambdas ahead
+         * of any acks, all entries piggyback the same stale LAC, and
+         * followers reading via {@code readLastAddConfirmed} cannot make
+         * progress until a later entry happens to land
+         * (regression observed in {@code SimpleReplicationTest} when this
+         * was tried).
          */
         private final ExecutorService executor;
 
@@ -235,18 +235,12 @@ public class BookkeeperCommitLog extends CommitLog {
 
                 this.out = makeNewWriteHandle(actualEnsembleSize, actualWriteQuorumSize, actualAckQuorumSize, metadata);
                 this.ledgerId = this.out.getId();
-                // Dedicated single-thread executor (see field javadoc for the
-                // rationale of NOT borrowing from BK's main worker pool).
-                final long ledgerIdForName = this.ledgerId;
-                final String tablespaceName = tableSpaceName;
-                this.executor = Executors.newSingleThreadExecutor(new ThreadFactory() {
-                    @Override
-                    public Thread newThread(Runnable r) {
-                        Thread t = new Thread(r, "herddb-bk-writer-" + tablespaceName + "-" + ledgerIdForName);
-                        t.setDaemon(true);
-                        return t;
-                    }
-                });
+                // Hash on the ledger id so all writes for this ledger always
+                // land on the same BK worker thread (single-threaded BK
+                // access). Different ledgers may share a thread, but
+                // single-thread-per-ledger is what eliminates monitor
+                // contention. Mirrors Pulsar's ManagedLedgerImpl pattern.
+                this.executor = bookKeeper.getMainWorkerPool().chooseThread(this.ledgerId);
                 LOGGER.log(Level.INFO, "{0} created ledger {1} (" + actualEnsembleSize + "/" + actualWriteQuorumSize + "/" + actualAckQuorumSize + ") bookies: {2}",
                         new Object[]{tableSpaceDescription(), ledgerId, this.out.getLedgerMetadata().getAllEnsembles()});
                 lastLedgerId = ledgerId;
@@ -528,20 +522,6 @@ public class BookkeeperCommitLog extends CommitLog {
                 out.closeAsync().get(60, TimeUnit.SECONDS);
             } catch (InterruptedException | ExecutionException | TimeoutException err) {
                 throw new LogNotAvailableException(err);
-            } finally {
-                // Always shut down the dedicated executor — even on close()
-                // failure — so the writer thread does not outlive the BK
-                // ledger handle. shutdown() (NOT shutdownNow()) lets any
-                // already-queued lambdas run to completion: they will call
-                // {@code out.writeAsync(...)} on the now-closed handle, BK
-                // will fail their callbacks with LedgerClosedException, our
-                // {@link #writeEntry} {@code whenComplete} callback then
-                // releases each buffer and fails each producer future
-                // cleanly. This avoids leaving callers stuck on an
-                // uncompleted future. The thread is daemon, so even if the
-                // queue still has work after this method returns the JVM
-                // can still exit.
-                executor.shutdown();
             }
         }
 
