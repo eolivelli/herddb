@@ -84,6 +84,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
     private final ServerConfiguration configuration;
     private final StatsProvider statsProvider;
     private final StatsLogger statsLogger;
+    private final RequestStats requestStats;
     private final Path baseDirectory;
     private final Path dataDirectory;
     private final Path tmpDirectory;
@@ -148,6 +149,15 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         return manager;
     }
 
+    /**
+     * Returns the per-request-type statistics exposed by this server. Each
+     * handler in {@link ServerSideConnectionPeer} records request latency and
+     * counts on the corresponding {@link org.apache.bookkeeper.stats.OpStatsLogger}.
+     */
+    public RequestStats getRequestStats() {
+        return requestStats;
+    }
+
     public NettyChannelAcceptor getNetworkServer() {
         return networkServer;
     }
@@ -159,6 +169,7 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
     public Server(ServerConfiguration configuration, StatsProvider statsProvider) {
         this.statsProvider = statsProvider;
         this.statsLogger = statsProvider == null ? new NullStatsLogger() : statsProvider.getStatsLogger("");
+        this.requestStats = new RequestStats(this.statsLogger);
         this.configuration = configuration;
         // Expose Netty direct-memory counters so the unified JVM dashboard
         // can correlate pool-arena growth against -XX:MaxDirectMemorySize
