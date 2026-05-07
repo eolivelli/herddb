@@ -181,6 +181,12 @@ message DescribeIndexResponse {
     // Wall-clock timestamp (epoch ms) of the LogEntry at the durable LSN.
     // 0 = unknown. Issue #423.
     int64 durable_lsn_timestamp = 29;
+    // Per-index `numShards` value from the CREATE VECTOR INDEX WITH clause
+    // (Index.properties[numShards]). Controls within-instance HNSW
+    // graph-bucket granularity. Defaults to 1 when not set on the index.
+    // Issue #451 — exposed so operators can verify what sharding configuration
+    // an index is actually running with from the admin CLI.
+    int32 num_shards = 30;
 }
 
 message ListPrimaryKeysRequest {
