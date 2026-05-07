@@ -185,7 +185,7 @@ public class BookKeeperCommitLogAsyncWriterTest {
                 }
 
                 // Group by ledger, sort by offset, verify each ledger's
-                // offsets are 0..k-1 with no gaps (caller-assigned ids).
+                // offsets are 0..k-1 with no gaps (BK-assigned sequential ids).
                 Map<Long, List<Long>> perLedger = new java.util.TreeMap<>();
                 for (LogSequenceNumber lsn : assigned) {
                     perLedger.computeIfAbsent(lsn.ledgerId, k -> new ArrayList<>()).add(lsn.offset);
@@ -439,7 +439,7 @@ public class BookKeeperCommitLogAsyncWriterTest {
                 // Force the writer into the failed state via the test hook.
                 // forceWriteError sets errorOccurredDuringWrite=true on the
                 // CommitFileWriter without going through the BK callback,
-                // matching the production scenario of a synchronous writeAsync
+                // matching the production scenario of a synchronous appendAsync
                 // failure on the executor thread.
                 writer.getWriter().forceWriteError(
                         new java.lang.RuntimeException("forced for test"));
