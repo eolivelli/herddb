@@ -100,17 +100,12 @@ public class QueryWorker implements Runnable {
                     metrics.record(elapsed);
                     allResults.set(i, ids);
 
-                    long total = metrics.getCount();
-                    if (total % 100 == 0) {
-                        MetricsCollector.Stats s = metrics.computeStats();
-                        statusLine.set(String.format("Executed %d queries | mean: %.2f ms | p50: %.2f ms | p95: %.2f ms | p99: %.2f ms | max: %.2f ms",
-                                total,
-                                s.meanNanos() / 1_000_000.0,
-                                s.p50Nanos() / 1_000_000.0,
-                                s.p95Nanos() / 1_000_000.0,
-                                s.p99Nanos() / 1_000_000.0,
-                                s.maxNanos() / 1_000_000.0));
-                    }
+                    // Status-line publication moved to VectorBench's query
+                    // progress loop (issue #443): every worker calling
+                    // computeStats() every 100 queries and overwriting the
+                    // shared statusLine added redundant CPU on the hot
+                    // path. The query progress loop already emits the same
+                    // fields every 500 ms.
                 }
             } finally {
                 if (ps != null) {
