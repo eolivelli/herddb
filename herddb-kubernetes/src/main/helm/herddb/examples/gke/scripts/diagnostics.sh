@@ -6,6 +6,15 @@
 #
 # Usage (heap dump):
 #   ./scripts/diagnostics.sh [--pod <pod>] [--analyze] [--mat-home <path>]
+#   WARNING: full heap dumps require ~Xmx bytes of free disk inside the pod.
+#   The default write path is the data PVC (/opt/herddb/data) which must be
+#   large enough to hold the dump.  For large JVMs (Xmx ≥ 10g) prefer
+#   --histo (class histogram) which is a few KB and never evicts the pod.
+#
+# Usage (class histogram — safe for any heap size):
+#   ./scripts/diagnostics.sh [--pod <pod>] --histo
+#   Runs 'jmap -histo:live' inside the pod and saves the output locally.
+#   Prints  HISTO=<local-path>  on the last line on success.
 #
 # Usage (async-profiler profiles):
 #   ./scripts/diagnostics.sh --pod <pod> --profile \
@@ -81,6 +90,7 @@ CSTACK_MODE="vm"
 THREAD_COUNT=false
 THREAD_FILTER=""
 JSTACK=false
+HISTO=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -95,6 +105,7 @@ while [[ $# -gt 0 ]]; do
         --thread-count)      THREAD_COUNT=true;       shift   ;;
         --thread-filter)     THREAD_FILTER="$2";      shift 2 ;;
         --jstack)            JSTACK=true;             shift   ;;
+        --histo)             HISTO=true;              shift   ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -227,7 +238,41 @@ if $PROFILE; then
     exit 0
 fi
 
+if $HISTO; then
+    section "Class histogram (jmap -histo:live) from pod $POD"
+
+    echo "  Locating JVM PID..."
+    JVM_PID=$(kubectl -n default exec "$POD" -- sh -c \
+        'jcmd 2>/dev/null | grep -v "^[0-9]* Jcmd$" | awk "NR==1{print \$1}"')
+
+    if [[ -z "$JVM_PID" ]]; then
+        echo "ERROR: could not determine JVM PID in $POD (is jcmd available?)" >&2
+        exit 1
+    fi
+    echo "  JVM PID: $JVM_PID"
+
+    TS="$(timestamp)"
+    LOCAL_HISTO="$REPORTS_DIR/histo-${POD}-${TS}.txt"
+    mkdir -p "$REPORTS_DIR"
+
+    echo "  Running jmap -histo:live (triggers full GC to exclude unreachable objects)..."
+    kubectl -n default exec "$POD" -- jcmd "$JVM_PID" GC.heap_info 2>/dev/null || true
+    kubectl -n default exec "$POD" -- sh -c \
+        "jmap -histo:live $JVM_PID 2>/dev/null" > "$LOCAL_HISTO"
+
+    echo "  Top 40 classes by retained bytes:"
+    echo "  --------------------------------------------------------"
+    head -45 "$LOCAL_HISTO" | tail -42
+    echo "  ..."
+    echo "  Full histogram saved to: $LOCAL_HISTO"
+    echo ""
+    echo "HISTO=$LOCAL_HISTO"
+    exit 0
+fi
+
 section "Heap dump from pod $POD"
+echo "  NOTE: Full heap dumps write ~Xmx bytes to the data PVC."
+echo "        For large JVMs prefer --histo (safe, no disk pressure)."
 
 echo "  Locating JVM PID..."
 JVM_PID=$(kubectl -n default exec "$POD" -- sh -c \
@@ -239,7 +284,21 @@ if [[ -z "$JVM_PID" ]]; then
 fi
 echo "  JVM PID: $JVM_PID"
 
-REMOTE_DUMP="/tmp/heapdump-$(date +%Y%m%d-%H%M%S).hprof"
+# Write to the data PVC mount (persistent, survives pod restart) rather than
+# /tmp (ephemeral storage, 1 GiB limit — will evict large JVM pods).
+# Fail fast if the data mount doesn't have enough free space.
+HEAP_MAX_BYTES=$(kubectl -n default exec "$POD" -- sh -c \
+    'jcmd $(jcmd 2>/dev/null | grep -v Jcmd | awk "NR==1{print \$1}") VM.flags 2>/dev/null | grep -oP "MaxHeapSize=\K[0-9]+"' 2>/dev/null || echo 0)
+DATA_FREE_BYTES=$(kubectl -n default exec "$POD" -- sh -c \
+    "df --output=avail -B1 /opt/herddb/data 2>/dev/null | tail -1" 2>/dev/null || echo 0)
+echo "  Heap max: $(( HEAP_MAX_BYTES / 1073741824 )) GiB  |  Data PVC free: $(( DATA_FREE_BYTES / 1073741824 )) GiB"
+if (( DATA_FREE_BYTES < HEAP_MAX_BYTES )); then
+    echo "ERROR: data PVC has only $(( DATA_FREE_BYTES / 1073741824 )) GiB free but heap is $(( HEAP_MAX_BYTES / 1073741824 )) GiB." >&2
+    echo "       Use --histo for a lightweight class histogram instead." >&2
+    exit 1
+fi
+
+REMOTE_DUMP="/opt/herddb/data/heapdump-$(date +%Y%m%d-%H%M%S).hprof"
 echo "  Writing heap dump to $POD:$REMOTE_DUMP ..."
 kubectl -n default exec "$POD" -- jcmd "$JVM_PID" GC.heap_dump "$REMOTE_DUMP"
 
