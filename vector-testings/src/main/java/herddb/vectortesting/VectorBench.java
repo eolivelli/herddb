@@ -346,6 +346,7 @@ public class VectorBench {
             AtomicLong rowsCommitted = new AtomicLong(0);
 
             long ingestStart = System.nanoTime();
+            IngestionWindowTracker windowTracker = new IngestionWindowTracker();
 
             // Shared across all ingestion workers so --ingest-max-ops is a true
             // global cap. Live-override via POST /ingestion/config/ingest-max-ops
@@ -378,7 +379,7 @@ public class VectorBench {
                         config, ingestQueue, producerDone, rowId,
                         ingestMetrics, ingestStatus, ingestStart,
                         commitsTotal, commitsRecovered, rowsCommitted,
-                        runtime.ingestRateLimiterGroup(), idx, runtime);
+                        runtime.ingestRateLimiterGroup(), idx, runtime, windowTracker);
             };
 
             runtime.setIngestContext(ingestQueue, ingestPool, ingestWorkerFactory);
@@ -410,6 +411,14 @@ public class VectorBench {
                 latency.put("p99_ms", round2(s.p99Nanos() / 1e6));
                 latency.put("max_ms", round2(s.maxNanos() / 1e6));
                 m.put("commit_latency", latency);
+                // Windowed rate and latency (issue #453): 1-minute and 5-minute
+                // sliding windows over per-commit data recorded by each worker.
+                m.put("ops_per_sec_1m", windowTracker.computeWindowedRate(
+                        IngestionWindowTracker.ONE_MIN_NANOS, ingestStart));
+                m.put("ops_per_sec_5m", windowTracker.computeWindowedRate(
+                        IngestionWindowTracker.FIVE_MIN_NANOS, ingestStart));
+                m.put("commit_latency_5m", windowTracker.computeWindowedLatencyMap(
+                        IngestionWindowTracker.FIVE_MIN_NANOS));
                 return m;
             });
 
