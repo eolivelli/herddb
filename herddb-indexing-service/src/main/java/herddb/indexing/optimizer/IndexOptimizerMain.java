@@ -20,6 +20,7 @@
 package herddb.indexing.optimizer;
 
 import herddb.indexing.segment.SegmentRegistryClient;
+import io.netty.util.concurrent.FastThreadLocalThread;
 import java.io.FileInputStream;
 import java.util.Properties;
 import java.util.ServiceLoader;
@@ -173,7 +174,7 @@ public final class IndexOptimizerMain {
                 safeModeFileDeletion);
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "index-optimizer-engine");
+            FastThreadLocalThread t = new FastThreadLocalThread(r, "index-optimizer-engine");
             t.setDaemon(true);
             return t;
         });

@@ -49,6 +49,7 @@ import herddb.storage.DataStorageManager;
 import herddb.storage.IndexStatus;
 import herddb.utils.Bytes;
 import herddb.utils.XXHash64Utils;
+import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -799,7 +800,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             applyWorkers[i] = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
                     new LinkedBlockingQueue<>(queueCapacity),
                     r -> {
-                        Thread t = new Thread(r, "indexing-apply-worker-" + idx);
+                        FastThreadLocalThread t = new FastThreadLocalThread(r, "indexing-apply-worker-" + idx);
                         t.setDaemon(true);
                         return t;
                     },
@@ -813,7 +814,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // triggerCheckpointAsync() can submit tasks as soon as the tailer
         // starts processing entries.
         checkpointExecutor = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "indexing-checkpoint");
+            FastThreadLocalThread t = new FastThreadLocalThread(r, "indexing-checkpoint");
             t.setDaemon(true);
             return t;
         });
@@ -1020,7 +1021,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         } else {
             tailer = new FileCommitLogTailer(logDirectory, tableSpaceUUID, tailerStart, this::processEntry);
         }
-        tailerThread = new Thread(tailer, "indexing-service-tailer");
+        tailerThread = new FastThreadLocalThread(tailer, "indexing-service-tailer");
         tailerThread.setDaemon(true);
         tailerThread.start();
 
@@ -2441,7 +2442,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         this.startTimeMillis = System.currentTimeMillis();
 
         shadowReloadExecutor = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "indexing-shadow-reload");
+            FastThreadLocalThread t = new FastThreadLocalThread(r, "indexing-shadow-reload");
             t.setDaemon(true);
             return t;
         });

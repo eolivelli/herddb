@@ -32,6 +32,7 @@ import herddb.remote.storage.InMemoryBlockCacheObjectStorage;
 import herddb.remote.storage.LocalObjectStorage;
 import herddb.remote.storage.ObjectStorage;
 import herddb.remote.storage.S3ObjectStorage;
+import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
 import java.net.URI;
@@ -159,7 +160,7 @@ public class RemoteFileServer implements AutoCloseable {
     public void start() throws IOException {
         AtomicInteger threadId = new AtomicInteger();
         ThreadFactory threadFactory = r -> {
-            Thread t = new Thread(r, "remote-file-meta-" + threadId.getAndIncrement());
+            FastThreadLocalThread t = new FastThreadLocalThread(r, "remote-file-meta-" + threadId.getAndIncrement());
             t.setDaemon(true);
             return t;
         };
@@ -382,7 +383,7 @@ public class RemoteFileServer implements AutoCloseable {
     private ThreadPoolExecutor buildLaneExecutor(String namePrefix, int threads) {
         AtomicInteger counter = new AtomicInteger();
         ThreadFactory factory = r -> {
-            Thread t = new Thread(r, namePrefix + counter.getAndIncrement());
+            FastThreadLocalThread t = new FastThreadLocalThread(r, namePrefix + counter.getAndIncrement());
             t.setDaemon(true);
             return t;
         };

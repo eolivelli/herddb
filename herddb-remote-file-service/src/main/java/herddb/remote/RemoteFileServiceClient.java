@@ -237,7 +237,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                 : (int) maxInflightWriteBytes;
         this.inflightWriteBytes = new Semaphore(writePermits);
         this.retryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "remote-file-retry");
+            FastThreadLocalThread t = new FastThreadLocalThread(r, "remote-file-retry");
             t.setDaemon(true);
             return t;
         });
@@ -452,7 +452,7 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
         if (!removed.isEmpty()) {
             // Detached close so we do not block updateServers() on socket teardown.
-            Thread t = new Thread(() -> {
+            FastThreadLocalThread t = new FastThreadLocalThread(() -> {
                 for (String server : removed) {
                     ServerChannel rc = current.readChannels.get(server);
                     if (rc != null) {
