@@ -165,6 +165,16 @@ public class Index implements ColumnsList {
      * <p>The original instance is not mutated; the returned instance keeps the
      * same {@link #properties} immutability contract.
      *
+     * <p><b>Contract:</b> the helper does NOT re-run {@link Builder#build()}'s
+     * validation rules (e.g. the {@code numShards} integer-parse check, the
+     * vector-column type check, the {@code unique}-on-vector rejection). It
+     * is the caller's responsibility to pass an {@code Index} that has
+     * already been validated via {@link #builder()}. Both {@code key} and
+     * {@code value} must be non-null because the persisted format
+     * (writeUTF) does not allow nulls — passing {@code null} for either
+     * raises {@link IllegalArgumentException} so a latent
+     * {@link NullPointerException} cannot reach {@link #serialize()}.
+     *
      * <p>Issue #471: used by the server-side {@code CREATE VECTOR INDEX}
      * handler to mark a freshly-created index with {@code rebuild=true} when
      * the underlying table is non-empty, so the IndexingService can drive a
@@ -173,6 +183,12 @@ public class Index implements ColumnsList {
     public Index withProperty(String key, String value) {
         if (key == null) {
             throw new IllegalArgumentException("property key must not be null");
+        }
+        if (value == null) {
+            // Reject null up-front — Index#serialize uses DataOutputStream.writeUTF,
+            // which NPEs on null values; surfacing the error here is far less
+            // confusing than discovering it on the first checkpoint roundtrip.
+            throw new IllegalArgumentException("property value must not be null");
         }
         Map<String, String> newProperties = new HashMap<>(properties);
         newProperties.put(key, value);

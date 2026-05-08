@@ -24,7 +24,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import org.junit.Test;
@@ -168,18 +167,17 @@ public class IndexWithPropertyTest {
     }
 
     @Test
-    public void withProperty_nullValueIsAccepted() {
+    public void withProperty_nullValueThrows() {
         // The persisted Index format uses writeUTF for keys AND values, which
-        // does not allow nulls — but the in-memory Index map can carry a null
-        // value.  Surface that asymmetry deliberately so callers know they
-        // must coerce nulls to a sentinel ("") before serialising.  We do not
-        // attempt to forbid it at the helper level: callers (the
-        // CREATE INDEX path) only ever pass literal "true" / "false".
+        // does not allow nulls — pinning the rejection at the helper level
+        // prevents a latent NullPointerException from sneaking into a later
+        // serialize() call (e.g. on the next checkpoint roundtrip).
         Index original = baseIndex();
-        Index copy = original.withProperty("rebuild", null);
-        assertNull(copy.properties.get("rebuild"));
-        assertTrue(copy.properties.containsKey("rebuild"));
+        int originalPropCount = original.properties.size();
+        assertThrows(IllegalArgumentException.class,
+                () -> original.withProperty("rebuild", null));
         // The original is unchanged.
-        assertSame(baseIndex().properties.size(), original.properties.size());
+        assertEquals(originalPropCount, original.properties.size());
+        assertFalse(original.properties.containsKey("rebuild"));
     }
 }
