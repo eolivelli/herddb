@@ -24,6 +24,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import herddb.core.DBManager;
 import herddb.core.indexes.MockRemoteVectorIndexService;
 import herddb.file.FileCommitLogManager;
@@ -35,12 +37,15 @@ import herddb.model.StatementEvaluationContext;
 import herddb.model.TransactionContext;
 import herddb.model.commands.CreateTableSpaceStatement;
 import herddb.server.ServerConfiguration;
+import herddb.utils.SystemInstrumentation;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
+import org.junit.After;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.junit.rules.Timeout;
 
 /**
  * Server-side coverage for the issue #471 {@code rebuild=true} marking on the
@@ -59,6 +64,22 @@ public class CreateVectorIndexRebuildPropertyTest {
 
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
+
+    /**
+     * Class-wide timeout: a regression that leaks the tablespace write
+     * lock would otherwise hang the suite indefinitely (the rejection
+     * counter-tests would block on commit forever). 60 s is generous
+     * enough for the checkpoint-trigger paths on a constrained CI runner.
+     */
+    @Rule
+    public Timeout globalTimeout = Timeout.seconds(60);
+
+    @After
+    public void clearInstrumentation() {
+        // Each test method may install a SystemInstrumentation listener;
+        // make sure it does not leak across tests in the same JVM.
+        SystemInstrumentation.clear();
+    }
 
     private DBManager buildManager(Path dataPath, Path logsPath, Path metadataPath, Path tmpDir)
             throws Exception {
@@ -146,10 +167,191 @@ public class CreateVectorIndexRebuildPropertyTest {
             assertEquals(Index.TYPE_VECTOR, idx.type);
             assertEquals("non-empty table MUST receive rebuild=true",
                     "true", idx.properties.get(VectorIndexManager.PROP_REBUILD));
+            // The pinned LSN must travel alongside the rebuild marker so
+            // the IS knows which checkpoint to scan.
+            String rebuildLsn = idx.properties.get(VectorIndexManager.PROP_REBUILD_LSN);
+            assertNotNull("non-empty table MUST receive _rebuildLsn", rebuildLsn);
+            assertTrue("_rebuildLsn must be ledgerId:offset, got: " + rebuildLsn,
+                    rebuildLsn.matches("\\d+:\\d+"));
             // The user-supplied properties must be preserved alongside the
             // auto-injected rebuild marker.
             assertEquals("16", idx.properties.get(VectorIndexManager.PROP_M));
             assertEquals("4", idx.properties.get(VectorIndexManager.PROP_NUM_SHARDS));
+        }
+    }
+
+    @Test
+    public void truncatedTable_vectorIndex_doesNotSetRebuildProperty() throws Exception {
+        // After TRUNCATE TABLE the row count is 0, so the rebuild branch
+        // must skip even though the table previously held data. The
+        // IndexingService's CREATE_TABLE / TRUNCATE_TABLE handling already
+        // resets the vector store; CREATE INDEX after a TRUNCATE has
+        // nothing to back-fill.
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmpDir = folder.newFolder("tmp").toPath();
+
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmpDir)) {
+            manager.start();
+            bootstrapTablespaceAndTable(manager);
+            insertSomeRows(manager, 5);
+            execute(manager, "TRUNCATE TABLE tblspace1.t1", Collections.emptyList());
+
+            execute(manager,
+                    "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            Index idx = getCreatedIndex(manager, "t1", "vidx");
+            assertNotNull("vector index must exist after CREATE on truncated table", idx);
+            assertNull("truncated table must NOT receive rebuild=true",
+                    idx.properties.get(VectorIndexManager.PROP_REBUILD));
+            assertFalse("truncated table must NOT receive _rebuildLsn",
+                    idx.properties.containsKey(VectorIndexManager.PROP_REBUILD_LSN));
+        }
+    }
+
+    @Test
+    public void alterTableThenCreateVectorIndex_persistsPostAlterColumns() throws Exception {
+        // INSERT, then ALTER TABLE ADD COLUMN, then INSERT more rows, then
+        // CREATE VECTOR INDEX. The persisted Index columns must reflect
+        // the post-ALTER table — otherwise the IS would scan against a
+        // schema that does not match the live table.
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmpDir = folder.newFolder("tmp").toPath();
+
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmpDir)) {
+            manager.start();
+            bootstrapTablespaceAndTable(manager);
+            insertSomeRows(manager, 3);
+            execute(manager, "ALTER TABLE tblspace1.t1 ADD COLUMN extra INT",
+                    Collections.emptyList());
+            execute(manager,
+                    "INSERT INTO tblspace1.t1 (id, vec, n, extra) VALUES (?, ?, ?, ?)",
+                    Arrays.asList(99, new float[]{9.0f, 9.0f, 9.0f}, 99, 999));
+
+            execute(manager,
+                    "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            Index idx = getCreatedIndex(manager, "t1", "vidx");
+            assertEquals("rebuild=true must be set on post-ALTER non-empty table",
+                    "true", idx.properties.get(VectorIndexManager.PROP_REBUILD));
+            // The Index references just the vector column by design; the
+            // post-ALTER schema lives on the Table side. We pin the
+            // post-ALTER table column count via the tablespace manager,
+            // not via the Index — assert the table itself sees the new
+            // column so the IS-side scan in step 3 can read it.
+            assertEquals("post-ALTER table must have 4 columns",
+                    4, manager.getTableSpaceManager("tblspace1")
+                            .getTableManager("t1").getTable().getColumns().length);
+        }
+    }
+
+    @Test
+    public void backToBackVectorIndexes_eachReceiveOwnRebuildMarker() throws Exception {
+        // Two CREATE VECTOR INDEX statements back-to-back on the same
+        // non-empty table must each take their own checkpoint and each
+        // mark their own Index — there is no caching that would make the
+        // second create skip the rebuild path.
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmpDir = folder.newFolder("tmp").toPath();
+
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmpDir)) {
+            manager.start();
+            // Two separate vector columns so we can create two indexes.
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton("localhost"),
+                    "localhost", 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+            execute(manager,
+                    "CREATE TABLE tblspace1.t1 (id int primary key, "
+                            + "vec1 floata not null, vec2 floata not null)",
+                    Collections.emptyList());
+            for (int i = 0; i < 5; i++) {
+                execute(manager,
+                        "INSERT INTO tblspace1.t1 (id, vec1, vec2) VALUES (?, ?, ?)",
+                        Arrays.asList(i,
+                                new float[]{i * 0.1f, 0f, 0f},
+                                new float[]{0f, i * 0.2f, 0f}));
+            }
+
+            execute(manager,
+                    "CREATE VECTOR INDEX v1 ON tblspace1.t1(vec1)",
+                    Collections.emptyList());
+            execute(manager,
+                    "CREATE VECTOR INDEX v2 ON tblspace1.t1(vec2)",
+                    Collections.emptyList());
+
+            Index idx1 = getCreatedIndex(manager, "t1", "v1");
+            Index idx2 = getCreatedIndex(manager, "t1", "v2");
+            assertEquals("first vector index must receive rebuild=true",
+                    "true", idx1.properties.get(VectorIndexManager.PROP_REBUILD));
+            assertEquals("second vector index must receive rebuild=true",
+                    "true", idx2.properties.get(VectorIndexManager.PROP_REBUILD));
+            assertNotNull("first vector index must receive _rebuildLsn",
+                    idx1.properties.get(VectorIndexManager.PROP_REBUILD_LSN));
+            assertNotNull("second vector index must receive _rebuildLsn",
+                    idx2.properties.get(VectorIndexManager.PROP_REBUILD_LSN));
+        }
+    }
+
+    @Test
+    public void checkpointFailureLeavesNoStalePartialState() throws Exception {
+        // Inject a RuntimeException at the post-checkpoint instrumentation
+        // hook (the closest pre-log.log() boundary we can reliably hook
+        // from a test). The CREATE INDEX must fail with
+        // StatementExecutionException, the indexes map must be empty, and
+        // the tablespace write lock must be released so subsequent DDL
+        // succeeds.
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmpDir = folder.newFolder("tmp").toPath();
+
+        SystemInstrumentation.addListener(new SystemInstrumentation.SingleInstrumentationPointListener(
+                "createVectorIndex.checkpointTaken") {
+            @Override
+            public void acceptSingle(Object... args) {
+                throw new RuntimeException("injected checkpoint hook failure");
+            }
+        });
+
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmpDir)) {
+            manager.start();
+            bootstrapTablespaceAndTable(manager);
+            insertSomeRows(manager, 3);
+
+            try {
+                execute(manager,
+                        "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                        Collections.emptyList());
+                fail("CREATE INDEX must fail when the checkpoint hook throws");
+            } catch (RuntimeException expected) {
+                // StatementExecutionException is a RuntimeException subclass,
+                // and SystemInstrumentation may also wrap the injected
+                // throwable as a plain RuntimeException — either form is
+                // acceptable. The important contract is that the index is
+                // NOT in the indexes map and the lock was released.
+            }
+
+            // The indexes map must NOT contain a partially-created index.
+            assertTrue("indexes map must be empty after checkpoint failure",
+                    manager.getTableSpaceManager("tblspace1")
+                            .getIndexesOnTable("t1") == null
+                            || manager.getTableSpaceManager("tblspace1")
+                                    .getIndexesOnTable("t1").isEmpty());
+            // The tablespace write lock must be released — verified by
+            // running another DDL statement that needs it.
+            execute(manager,
+                    "CREATE TABLE tblspace1.t2 (id int primary key)",
+                    Collections.emptyList());
         }
     }
 

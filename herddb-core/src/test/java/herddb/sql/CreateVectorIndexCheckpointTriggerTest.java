@@ -21,7 +21,6 @@ package herddb.sql;
 
 import static herddb.core.TestUtils.execute;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import herddb.core.DBManager;
 import herddb.core.indexes.MockRemoteVectorIndexService;
@@ -41,6 +40,7 @@ import org.junit.After;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.junit.rules.Timeout;
 
 /**
  * Verifies that {@link herddb.core.TableSpaceManager#createIndex} takes a
@@ -65,6 +65,14 @@ public class CreateVectorIndexCheckpointTriggerTest {
 
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
+
+    /**
+     * Class-wide timeout (60 s) — see {@link CreateVectorIndexRebuildPropertyTest}
+     * for the rationale: a tablespace-lock leak would otherwise hang the
+     * suite indefinitely on a regression.
+     */
+    @Rule
+    public Timeout globalTimeout = Timeout.seconds(60);
 
     @After
     public void clearInstrumentation() {
@@ -115,6 +123,11 @@ public class CreateVectorIndexCheckpointTriggerTest {
                 hookHits.incrementAndGet();
                 lastArgs.setLength(0);
                 lastArgs.append(args[0]).append('.').append(args[1]).append('.').append(args[2]);
+                // args[3] is the pinned LogSequenceNumber — verify the
+                // hook is wired with the LSN payload that step 3 needs.
+                if (args.length >= 4) {
+                    lastArgs.append("@").append(args[3]);
+                }
             }
         });
 
@@ -132,8 +145,9 @@ public class CreateVectorIndexCheckpointTriggerTest {
 
             assertEquals("checkpoint hook must fire exactly once",
                     1, hookHits.get());
-            assertEquals("hook must carry tablespace.table.index identity",
-                    "tblspace1.t1.vidx", lastArgs.toString());
+            assertTrue("hook must carry tablespace.table.index@<lsn> identity, got: "
+                            + lastArgs.toString(),
+                    lastArgs.toString().startsWith("tblspace1.t1.vidx@"));
         }
     }
 
@@ -239,16 +253,29 @@ public class CreateVectorIndexCheckpointTriggerTest {
                     "INSERT INTO tblspace1.t1 (id, vec) VALUES (?, ?)",
                     Arrays.asList(1, new float[]{1.0f, 2.0f, 3.0f}));
 
+            // 99 = "listener body threw" — distinguishable from the two
+            // expected outcomes (1 = correct, 2 = regression).
+            final java.util.concurrent.atomic.AtomicReference<Throwable> listenerError =
+                    new java.util.concurrent.atomic.AtomicReference<>();
             SystemInstrumentation.addListener(
                     new SystemInstrumentation.SingleInstrumentationPointListener(
                             "createVectorIndex.checkpointTaken") {
                 @Override
                 public void acceptSingle(Object... args) {
-                    boolean indexAlreadyPresent = manager.getTableSpaceManager("tblspace1")
-                            .getIndexesOnTable("t1") != null
-                            && manager.getTableSpaceManager("tblspace1")
-                                    .getIndexesOnTable("t1").containsKey("vidx");
-                    orderingObservation.set(indexAlreadyPresent ? 2 : 1);
+                    try {
+                        java.util.Map<String, herddb.core.AbstractIndexManager> idxs =
+                                manager.getTableSpaceManager("tblspace1")
+                                        .getIndexesOnTable("t1");
+                        boolean indexAlreadyPresent = idxs != null && idxs.containsKey("vidx");
+                        orderingObservation.set(indexAlreadyPresent ? 2 : 1);
+                    } catch (Throwable t) {
+                        // Wrap and surface — bubbling up out of the
+                        // instrumentation point would otherwise abort
+                        // CREATE INDEX with an opaque error and the
+                        // assertion below would lie about the cause.
+                        orderingObservation.set(99);
+                        listenerError.set(t);
+                    }
                 }
             });
 
@@ -256,17 +283,74 @@ public class CreateVectorIndexCheckpointTriggerTest {
                     "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
                     Collections.emptyList());
 
+            if (orderingObservation.get() == 99) {
+                throw new AssertionError(
+                        "listener body threw — diagnostic before the ordering assertion",
+                        listenerError.get());
+            }
             assertEquals(
                     "checkpoint hook must fire BEFORE the CREATE_INDEX entry is applied "
                             + "(observed=" + orderingObservation.get() + ")",
                     1, orderingObservation.get());
-            // Sanity: the CREATE INDEX did succeed and the index is now present.
-            assertTrue("index must be visible after CREATE INDEX returns",
+            // Sanity: after CREATE INDEX returns, the index IS visible.
+            assertTrue("index vidx must be visible after CREATE INDEX returns",
                     manager.getTableSpaceManager("tblspace1")
                             .getIndexesOnTable("t1").containsKey("vidx"));
-            assertFalse("table must still exist",
-                    manager.getTableSpaceManager("tblspace1")
-                            .getIndexesOnTable("t1").isEmpty());
+        }
+    }
+
+    @Test
+    public void twoBackToBackVectorIndexes_eachFiresOwnCheckpointHook() throws Exception {
+        // Two CREATE VECTOR INDEX statements back-to-back on the same
+        // non-empty table must each take their own checkpoint and fire
+        // the hook independently — there is no caching that would
+        // suppress the second hook firing.
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmpDir = folder.newFolder("tmp").toPath();
+
+        AtomicInteger hookHits = new AtomicInteger(0);
+
+        SystemInstrumentation.addListener(new SystemInstrumentation.SingleInstrumentationPointListener(
+                "createVectorIndex.checkpointTaken") {
+            @Override
+            public void acceptSingle(Object... args) {
+                hookHits.incrementAndGet();
+            }
+        });
+
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmpDir)) {
+            manager.start();
+            // Two vector columns so we can register two distinct vector
+            // indexes on the same table.
+            CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
+                    "tblspace1", Collections.singleton("localhost"),
+                    "localhost", 1, 0, 0);
+            manager.executeStatement(st1, StatementEvaluationContext.DEFAULT_EVALUATION_CONTEXT(),
+                    TransactionContext.NO_TRANSACTION);
+            manager.waitForTablespace("tblspace1", 10000);
+            execute(manager,
+                    "CREATE TABLE tblspace1.t1 (id int primary key, "
+                            + "vec1 floata not null, vec2 floata not null)",
+                    Collections.emptyList());
+            for (int i = 0; i < 4; i++) {
+                execute(manager,
+                        "INSERT INTO tblspace1.t1 (id, vec1, vec2) VALUES (?, ?, ?)",
+                        Arrays.asList(i,
+                                new float[]{i * 0.1f, 0f, 0f},
+                                new float[]{0f, i * 0.2f, 0f}));
+            }
+
+            execute(manager,
+                    "CREATE VECTOR INDEX v1 ON tblspace1.t1(vec1)",
+                    Collections.emptyList());
+            execute(manager,
+                    "CREATE VECTOR INDEX v2 ON tblspace1.t1(vec2)",
+                    Collections.emptyList());
+
+            assertEquals("hook must fire twice — once per CREATE VECTOR INDEX",
+                    2, hookHits.get());
         }
     }
 }

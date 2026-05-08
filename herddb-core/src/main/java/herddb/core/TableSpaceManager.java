@@ -2507,48 +2507,87 @@ public class TableSpaceManager {
             // pre-existing data. We mark the index with rebuild=true so the
             // IS detects the back-fill on the live tailer path, and we take
             // a synchronous single-table checkpoint UNDER the existing
-            // tablespace write lock so the IS's full-table-scan reads a
-            // consistent view at LSN == CREATE_INDEX_LSN - 1 (no DML can
-            // sneak in between because the write lock is held). For
-            // non-vector indexes the existing in-process rebuild path on
-            // bootIndex/scanForIndexRebuild covers the back-fill, so this
-            // branch is a no-op.
+            // tablespace write lock.
+            //
+            // Ordering contract: at the moment we write the CREATE_INDEX
+            // log entry, no DML can intervene between the pinned
+            // checkpoint LSN and the CREATE_INDEX LSN, because we hold the
+            // tablespace write lock. NOOP heartbeats from
+            // BookkeeperCommitLog.forceLastAddConfirmed CAN intervene in
+            // cluster mode (they run on a separate idle-timer thread that
+            // does not respect generalLock) — but they carry no row
+            // payload, so the IS's scan-then-tail flow still observes the
+            // table state at LSN == checkpointSequenceNumber correctly.
+            //
+            // pin=true is required (see issue #471 step 2 review): a
+            // periodic activator-driven checkpoint can reclaim our page
+            // files within minutes, but a 20 B-row rebuild scan can run
+            // for hours. The pin ensures the IS reads a coherent view for
+            // the entire scan duration. The pin is unpinned by step 3 of
+            // issue #471 (the IS-side rebuilder) — until then, abandoning
+            // the rebuild leaves a single pinned checkpoint per index that
+            // survives until the table is dropped.
+            //
+            // For non-vector indexes the existing in-process rebuild path
+            // on bootIndex/scanForIndexRebuild covers the back-fill, so
+            // this branch is a no-op.
             Index originalIndex = statement.getIndexDefinition();
             Index indexToCreate = originalIndex;
             if (Index.TYPE_VECTOR.equals(originalIndex.type)) {
                 AbstractTableManager tableManager = tables.get(originalIndex.table);
-                if (tableManager != null && tableManager.getStats().getTablesize() > 0) {
-                    if (transaction != null) {
-                        // The rebuild requires a checkpoint of table data
-                        // that does not belong to the transaction's
-                        // commit/rollback boundary. A transactional CREATE
-                        // VECTOR INDEX on a non-empty table cannot be
-                        // honoured cleanly — refuse early with a clear
-                        // error rather than silently producing an empty or
-                        // partially-indexed vector store.
-                        throw new StatementExecutionException(
-                                "CREATE VECTOR INDEX on a non-empty table is not allowed inside a transaction"
-                                        + " (table " + originalIndex.tablespace + "." + originalIndex.table
-                                        + " currently has " + tableManager.getStats().getTablesize() + " rows)");
+                if (tableManager != null) {
+                    long tableSize = tableManager.getStats().getTablesize();
+                    if (tableSize > 0) {
+                        if (transaction != null) {
+                            // The rebuild requires a checkpoint of table data
+                            // that does not belong to the transaction's
+                            // commit/rollback boundary. A transactional CREATE
+                            // VECTOR INDEX on a non-empty table cannot be
+                            // honoured cleanly — refuse early with a clear
+                            // error rather than silently producing an empty or
+                            // partially-indexed vector store.
+                            throw new StatementExecutionException(
+                                    "CREATE VECTOR INDEX on a non-empty table is not allowed inside a transaction"
+                                            + " (table " + originalIndex.tablespace + "." + originalIndex.table
+                                            + " currently has " + tableSize + " rows);"
+                                            + " run the CREATE VECTOR INDEX outside any transaction"
+                                            + " (the rebuild requires a checkpoint that cannot be tied to a"
+                                            + " transaction's commit/rollback boundary)");
+                        }
+                        LOGGER.log(Level.INFO,
+                                "CREATE VECTOR INDEX {0}.{1}.{2} on non-empty table ({3} rows): "
+                                        + "taking single-table checkpoint (pin=true) and marking index for rebuild",
+                                new Object[]{originalIndex.tablespace, originalIndex.table,
+                                        originalIndex.name, tableSize});
+                        long checkpointStartNanos = System.nanoTime();
+                        AbstractTableManager.TableCheckpoint pinnedCheckpoint =
+                                tableManager.checkpoint(true);
+                        long checkpointElapsedMillis =
+                                (System.nanoTime() - checkpointStartNanos) / 1_000_000L;
+                        if (pinnedCheckpoint == null
+                                || pinnedCheckpoint.sequenceNumber == null) {
+                            // Defensive: a null result would silently leave the
+                            // IS without a pin LSN to scan at; surface the
+                            // failure loudly rather than producing a CREATE
+                            // INDEX with an unusable rebuild marker.
+                            throw new StatementExecutionException(
+                                    "tableManager.checkpoint(true) returned null for "
+                                            + originalIndex.tablespace + "." + originalIndex.table);
+                        }
+                        LogSequenceNumber pinnedLsn = pinnedCheckpoint.sequenceNumber;
+                        LOGGER.log(Level.INFO,
+                                "CREATE VECTOR INDEX {0}.{1}.{2}: pinned table checkpoint at {3} in {4} ms",
+                                new Object[]{originalIndex.tablespace, originalIndex.table,
+                                        originalIndex.name, pinnedLsn, checkpointElapsedMillis});
+                        SystemInstrumentation.instrumentationPoint(
+                                "createVectorIndex.checkpointTaken",
+                                originalIndex.tablespace, originalIndex.table,
+                                originalIndex.name, pinnedLsn);
+                        indexToCreate = originalIndex
+                                .withProperty(VectorIndexManager.PROP_REBUILD, "true")
+                                .withProperty(VectorIndexManager.PROP_REBUILD_LSN,
+                                        pinnedLsn.ledgerId + ":" + pinnedLsn.offset);
                     }
-                    LOGGER.log(Level.INFO,
-                            "CREATE VECTOR INDEX {0}.{1}.{2} on non-empty table ({3} rows): "
-                                    + "taking single-table checkpoint and marking index for rebuild",
-                            new Object[]{originalIndex.tablespace, originalIndex.table,
-                                    originalIndex.name, tableManager.getStats().getTablesize()});
-                    long checkpointStartNanos = System.nanoTime();
-                    tableManager.checkpoint(false);
-                    long checkpointElapsedMillis =
-                            (System.nanoTime() - checkpointStartNanos) / 1_000_000L;
-                    LOGGER.log(Level.INFO,
-                            "CREATE VECTOR INDEX {0}.{1}.{2}: single-table checkpoint completed in {3} ms",
-                            new Object[]{originalIndex.tablespace, originalIndex.table,
-                                    originalIndex.name, checkpointElapsedMillis});
-                    SystemInstrumentation.instrumentationPoint(
-                            "createVectorIndex.checkpointTaken",
-                            originalIndex.tablespace, originalIndex.table, originalIndex.name);
-                    indexToCreate = originalIndex.withProperty(
-                            VectorIndexManager.PROP_REBUILD, "true");
                 }
             }
             LogEntry entry = LogEntryFactory.createIndex(indexToCreate, transaction);

@@ -80,13 +80,44 @@ public class VectorIndexManager extends AbstractIndexManager {
      * runs against a non-empty table; consumed by
      * {@code IndexingServiceEngine.applyEntry} on the live tailer path to
      * trigger a {@code DataStorageManager.fullTableScan}-driven rebuild
-     * against the latest table checkpoint. The value is the literal string
-     * {@code "true"}; any other value (including absent) means "no rebuild
-     * needed". The flag is one-shot: it travels in the {@code CREATE_INDEX}
-     * log entry only and is never re-applied on snapshot replay (the
-     * watermark advances past the entry once the rebuild completes).
+     * against the table checkpoint pinned at CREATE INDEX time. The value
+     * is the literal string {@code "true"}; any other value (including
+     * absent) means "no rebuild needed". The flag is one-shot: it travels
+     * in the {@code CREATE_INDEX} log entry only and is never re-applied
+     * on snapshot replay (the watermark advances past the entry once the
+     * rebuild completes).
      */
     public static final String PROP_REBUILD = "rebuild";
+    /**
+     * Issue #471: leading-underscore "internal" Index property carrying the
+     * pinned table-checkpoint LSN that the IndexingService must scan when
+     * it observes a {@code CREATE_INDEX} entry with
+     * {@link #PROP_REBUILD}{@code =true}. The value is encoded as
+     * {@code "<ledgerId>:<offset>"} (two non-negative longs in decimal,
+     * separated by a single colon).
+     *
+     * <p>Why it lives in the Index properties: the CREATE_INDEX log entry
+     * is the only signal the IS receives — the IS does not have its own
+     * RPC channel back to the herddb server's tablespace manager, so the
+     * LSN must travel with the entry. The leading underscore marks the
+     * key as engine-internal so user-supplied {@code WITH} clauses cannot
+     * collide with it.
+     *
+     * <p><b>Pin ownership contract</b>: the herddb server pins the
+     * checkpoint at this LSN with {@link
+     * herddb.core.AbstractTableManager#checkpoint(boolean)
+     * tableManager.checkpoint(true)} so a periodic activator-driven
+     * checkpoint cannot reclaim the pages while the IS is scanning. Step 3
+     * of issue #471 adds a server-side unpin path triggered when the
+     * IndexingService publishes its post-rebuild watermark past the
+     * {@code CREATE_INDEX} LSN — until that lands, the pin lingers on the
+     * server's tableManager. Operators MUST be aware that
+     * abandoning a CREATE VECTOR INDEX (e.g. by destroying the IS without
+     * letting it complete the rebuild) leaves a single pinned checkpoint
+     * that survives until the table is dropped or until the unpin RPC is
+     * invoked manually.
+     */
+    public static final String PROP_REBUILD_LSN = "_rebuildLsn";
 
     /**
      * Resolved lazily at every call so that the owning DBManager can

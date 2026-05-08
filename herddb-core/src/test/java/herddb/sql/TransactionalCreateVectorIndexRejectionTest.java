@@ -45,6 +45,7 @@ import java.util.Collections;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.junit.rules.Timeout;
 
 /**
  * Verifies the issue #471 contract that a {@code CREATE VECTOR INDEX} on a
@@ -75,6 +76,14 @@ public class TransactionalCreateVectorIndexRejectionTest {
 
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
+
+    /**
+     * Class-wide timeout (60 s) — see {@link CreateVectorIndexRebuildPropertyTest}
+     * for the rationale: a tablespace-lock leak from the rejection path
+     * would otherwise hang on {@code commitTransaction} indefinitely.
+     */
+    @Rule
+    public Timeout globalTimeout = Timeout.seconds(60);
 
     private DBManager buildManager(Path dataPath, Path logsPath, Path metadataPath, Path tmpDir)
             throws Exception {
