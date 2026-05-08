@@ -73,6 +73,20 @@ public class VectorIndexManager extends AbstractIndexManager {
     public static final String PROP_MAX_SEGMENT_SIZE = "maxSegmentSize";
     public static final String PROP_MAX_LIVE_GRAPH_SIZE = "maxLiveGraphSize";
     public static final String PROP_NUM_SHARDS = "numShards";
+    /**
+     * Issue #471: marker that the IndexingService must back-fill the
+     * pre-existing table data into this newly-created vector index. Set by
+     * {@code TableSpaceManager.createIndex} when {@code CREATE VECTOR INDEX}
+     * runs against a non-empty table; consumed by
+     * {@code IndexingServiceEngine.applyEntry} on the live tailer path to
+     * trigger a {@code DataStorageManager.fullTableScan}-driven rebuild
+     * against the latest table checkpoint. The value is the literal string
+     * {@code "true"}; any other value (including absent) means "no rebuild
+     * needed". The flag is one-shot: it travels in the {@code CREATE_INDEX}
+     * log entry only and is never re-applied on snapshot replay (the
+     * watermark advances past the entry once the rebuild completes).
+     */
+    public static final String PROP_REBUILD = "rebuild";
 
     /**
      * Resolved lazily at every call so that the owning DBManager can

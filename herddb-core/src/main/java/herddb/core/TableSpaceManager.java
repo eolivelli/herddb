@@ -113,6 +113,7 @@ import herddb.storage.FullTableScanConsumer;
 import herddb.utils.Bytes;
 import herddb.utils.Futures;
 import herddb.utils.KeyValue;
+import herddb.utils.SystemInstrumentation;
 import herddb.utils.SystemProperties;
 import java.io.EOFException;
 import java.io.IOException;
@@ -2501,7 +2502,56 @@ public class TableSpaceManager {
                         + ", there is already an index " + exists.getIndex().name + " on table " + exists.getIndex().table);
                 throw new IndexAlreadyExistsException(statement.getIndexDefinition().name);
             }
-            LogEntry entry = LogEntryFactory.createIndex(statement.getIndexDefinition(), transaction);
+            // Issue #471: when the new index is a VECTOR index and the table
+            // already has rows, the IndexingService must back-fill the
+            // pre-existing data. We mark the index with rebuild=true so the
+            // IS detects the back-fill on the live tailer path, and we take
+            // a synchronous single-table checkpoint UNDER the existing
+            // tablespace write lock so the IS's full-table-scan reads a
+            // consistent view at LSN == CREATE_INDEX_LSN - 1 (no DML can
+            // sneak in between because the write lock is held). For
+            // non-vector indexes the existing in-process rebuild path on
+            // bootIndex/scanForIndexRebuild covers the back-fill, so this
+            // branch is a no-op.
+            Index originalIndex = statement.getIndexDefinition();
+            Index indexToCreate = originalIndex;
+            if (Index.TYPE_VECTOR.equals(originalIndex.type)) {
+                AbstractTableManager tableManager = tables.get(originalIndex.table);
+                if (tableManager != null && tableManager.getStats().getTablesize() > 0) {
+                    if (transaction != null) {
+                        // The rebuild requires a checkpoint of table data
+                        // that does not belong to the transaction's
+                        // commit/rollback boundary. A transactional CREATE
+                        // VECTOR INDEX on a non-empty table cannot be
+                        // honoured cleanly — refuse early with a clear
+                        // error rather than silently producing an empty or
+                        // partially-indexed vector store.
+                        throw new StatementExecutionException(
+                                "CREATE VECTOR INDEX on a non-empty table is not allowed inside a transaction"
+                                        + " (table " + originalIndex.tablespace + "." + originalIndex.table
+                                        + " currently has " + tableManager.getStats().getTablesize() + " rows)");
+                    }
+                    LOGGER.log(Level.INFO,
+                            "CREATE VECTOR INDEX {0}.{1}.{2} on non-empty table ({3} rows): "
+                                    + "taking single-table checkpoint and marking index for rebuild",
+                            new Object[]{originalIndex.tablespace, originalIndex.table,
+                                    originalIndex.name, tableManager.getStats().getTablesize()});
+                    long checkpointStartNanos = System.nanoTime();
+                    tableManager.checkpoint(false);
+                    long checkpointElapsedMillis =
+                            (System.nanoTime() - checkpointStartNanos) / 1_000_000L;
+                    LOGGER.log(Level.INFO,
+                            "CREATE VECTOR INDEX {0}.{1}.{2}: single-table checkpoint completed in {3} ms",
+                            new Object[]{originalIndex.tablespace, originalIndex.table,
+                                    originalIndex.name, checkpointElapsedMillis});
+                    SystemInstrumentation.instrumentationPoint(
+                            "createVectorIndex.checkpointTaken",
+                            originalIndex.tablespace, originalIndex.table, originalIndex.name);
+                    indexToCreate = originalIndex.withProperty(
+                            VectorIndexManager.PROP_REBUILD, "true");
+                }
+            }
+            LogEntry entry = LogEntryFactory.createIndex(indexToCreate, transaction);
             CommitLogResult pos;
             try {
                 pos = log.log(entry, entry.transactionId <= 0);
