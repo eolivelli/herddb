@@ -127,11 +127,21 @@ public class VectorIndexManager extends AbstractIndexManager {
      * <p>{@code TableSpaceManager.createIndex} releases the pin if
      * anything between {@code checkpoint(true)} and a successful
      * {@code apply()} fails (so an aborted CREATE VECTOR INDEX leaves
-     * no pin). {@code TableManager.doCheckpoint} also rolls back any
-     * partial pin it took if {@code checkpoint(true)} itself throws
-     * partway through (so a checkpoint-internal failure leaves no pin
-     * either). The two recovery paths together guarantee that an
-     * unsuccessful CREATE VECTOR INDEX never leaves a pin behind.
+     * no pin). {@code TableManager.doCheckpoint} also rolls back the
+     * pins it took at each of its sequential pin sites (per pre-existing
+     * secondary index, the PK BLink keyToPage, the table itself) if a
+     * later step throws. Together these two recovery paths cover every
+     * failure point BETWEEN pin sites.
+     *
+     * <p>An internal failure inside a single
+     * {@code dataStorageManager.tableCheckpoint} or
+     * {@code dataStorageManager.indexCheckpoint} call AFTER its
+     * post-write pin step (e.g. a page-files listing IOException
+     * inside {@code FileDataStorageManager}, or remote listing failures
+     * in {@code RemoteFileDataStorageManager}) can still leave a pin
+     * in the in-memory map in the rare case where I/O fails after the
+     * file write succeeded. That sub-window is pre-existing and not
+     * specific to this feature; tracked as a follow-up.
      */
     public static final String PROP_REBUILD_LSN = "_rebuildLsn";
 

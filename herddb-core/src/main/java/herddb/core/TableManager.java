@@ -4640,10 +4640,6 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 new Object[]{table.tablespace, table.name, tablecheckpoint - tableStatusStart});
 
         result = new TableCheckpoint(table.name, postFlushSequenceNumber, actions);
-        // Issue #471: from here on, the checkpoint is "complete" and
-        // the pins are owned by the caller. The outer finally must NOT
-        // run rollbacks even if a downstream LOGGER call throws.
-        checkpointSucceeded = true;
 
         end = System.currentTimeMillis();
         if (flushedRecords > 0) {
@@ -4657,6 +4653,13 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             LOGGER.log(Level.FINE, "checkpoint {0} finished, logpos {1}, pageSet: {2}",
                     new Object[]{table.name, sequenceNumber, pageSet.toString()});
         }
+
+        // Issue #471: place the success flag AFTER the trailing LOGGER
+        // calls so that an unlikely LOGGER throw still triggers the
+        // partial-pin rollback. This is the last statement of the
+        // outer try body — the next thing the JVM runs is the outer
+        // finally, which inspects checkpointSucceeded.
+        checkpointSucceeded = true;
 
         } finally {
             // Safety net: if an exception escaped Phase C before the inner write-lock
