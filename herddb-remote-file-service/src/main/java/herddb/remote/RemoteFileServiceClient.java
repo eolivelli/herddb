@@ -105,6 +105,20 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
      */
     public static final String CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES =
             "remote.file.client.max.inflight.read.bytes";
+    /**
+     * Configuration key for the maximum number of bytes across all in-flight
+     * {@code writeFile}/{@code writeFileBlock}/{@code writeMultipartFile}
+     * calls whose payloads are currently being staged into the write-plane
+     * Netty channel. Symmetric to
+     * {@link #CONFIG_CLIENT_MAX_INFLIGHT_READ_BYTES} but for the write side
+     * (issue #468). Acquired before each block-async call is launched and
+     * released when the corresponding future completes; bounds peak
+     * write-plane network pressure so a multipart compaction write cannot
+     * fan out hundreds of in-flight blocks at once and starve concurrent
+     * reads on the shared event-loop pool / file server.
+     */
+    public static final String CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES =
+            "remote.file.client.max.inflight.write.bytes";
 
     private static final long DEFAULT_CLIENT_TIMEOUT_SECONDS = 1800; // 30 minutes
     private static final int DEFAULT_CLIENT_RETRIES = 10;
@@ -112,6 +126,8 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     public static final int DEFAULT_BLOCK_SIZE = 4 * 1024 * 1024;
     /** Default cap on in-flight read bytes: 256 MiB (issue #246). */
     public static final long DEFAULT_CLIENT_MAX_INFLIGHT_READ_BYTES = 256L * 1024 * 1024;
+    /** Default cap on in-flight write bytes: 256 MiB (issue #468). */
+    public static final long DEFAULT_CLIENT_MAX_INFLIGHT_WRITE_BYTES = 256L * 1024 * 1024;
     /**
      * Emit a WARNING log line if acquiring the in-flight reservation
      * blocks for longer than this threshold.
@@ -148,6 +164,8 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     private final int blockSize;
     private final long maxInflightReadBytes;
     private final Semaphore inflightReadBytes;
+    private final long maxInflightWriteBytes;
+    private final Semaphore inflightWriteBytes;
     private final ScheduledExecutorService retryScheduler;
     private final Supplier<String> oidcTokenSupplier;
 
@@ -200,6 +218,24 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                 ? Integer.MAX_VALUE
                 : (int) maxInflightReadBytes;
         this.inflightReadBytes = new Semaphore(permits);
+        long configuredMaxInflightWriteBytes = longConfig(configuration,
+                CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
+                DEFAULT_CLIENT_MAX_INFLIGHT_WRITE_BYTES);
+        if (configuredMaxInflightWriteBytes <= 0) {
+            throw new IllegalArgumentException(CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES
+                    + " must be > 0, got " + configuredMaxInflightWriteBytes);
+        }
+        if (configuredMaxInflightWriteBytes < this.blockSize) {
+            throw new IllegalArgumentException(CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES
+                    + " (" + configuredMaxInflightWriteBytes + ") must be >= "
+                    + CONFIG_CLIENT_BLOCK_SIZE + " (" + this.blockSize
+                    + ") so a single full-block write is always admissible");
+        }
+        this.maxInflightWriteBytes = configuredMaxInflightWriteBytes;
+        int writePermits = maxInflightWriteBytes > Integer.MAX_VALUE
+                ? Integer.MAX_VALUE
+                : (int) maxInflightWriteBytes;
+        this.inflightWriteBytes = new Semaphore(writePermits);
         this.retryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "remote-file-retry");
             t.setDaemon(true);
@@ -221,12 +257,16 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         if (servers.isEmpty()) {
             LOGGER.log(Level.INFO,
                     "RemoteFileServiceClient: starting with empty server list (awaiting ZK discovery), "
-                            + "timeout={0}s, retries={1}, maxInflightReadBytes={2}",
-                    new Object[]{clientTimeoutSeconds, maxRetries, maxInflightReadBytes});
+                            + "timeout={0}s, retries={1}, maxInflightReadBytes={2}, "
+                            + "maxInflightWriteBytes={3}",
+                    new Object[]{clientTimeoutSeconds, maxRetries, maxInflightReadBytes,
+                            maxInflightWriteBytes});
         } else {
             LOGGER.log(Level.INFO,
-                    "RemoteFileServiceClient: servers={0}, timeout={1}s, retries={2}, maxInflightReadBytes={3}",
-                    new Object[]{servers, clientTimeoutSeconds, maxRetries, maxInflightReadBytes});
+                    "RemoteFileServiceClient: servers={0}, timeout={1}s, retries={2}, "
+                            + "maxInflightReadBytes={3}, maxInflightWriteBytes={4}",
+                    new Object[]{servers, clientTimeoutSeconds, maxRetries, maxInflightReadBytes,
+                            maxInflightWriteBytes});
         }
     }
 
@@ -257,6 +297,14 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         return inflightReadBytes.availablePermits();
     }
 
+    public long maxInflightWriteBytes() {
+        return maxInflightWriteBytes;
+    }
+
+    public long availableInflightWriteBytes() {
+        return inflightWriteBytes.availablePermits();
+    }
+
     private void acquireInflightReadBytes(int bytes) {
         if (bytes <= 0) {
             throw new IllegalArgumentException("bytes must be > 0, got " + bytes);
@@ -282,6 +330,56 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         inflightReadBytes.release(bytes);
     }
 
+    private void acquireInflightWriteBytes(int bytes) {
+        if (bytes <= 0) {
+            throw new IllegalArgumentException("bytes must be > 0, got " + bytes);
+        }
+        if (inflightWriteBytes.tryAcquire(bytes)) {
+            return;
+        }
+        long startNanos = System.nanoTime();
+        inflightWriteBytes.acquireUninterruptibly(bytes);
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+        if (elapsedMs >= PERMIT_ACQUIRE_WARN_THRESHOLD_MS) {
+            LOGGER.log(Level.WARNING,
+                    "remote file client inflight-write reservation blocked for {0}ms "
+                            + "(requested={1} bytes, available={2}/{3}); consider raising "
+                            + CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES
+                            + " or reducing concurrent compaction/page-write load",
+                    new Object[]{elapsedMs, bytes, inflightWriteBytes.availablePermits(),
+                            maxInflightWriteBytes});
+        }
+    }
+
+    private void releaseInflightWriteBytes(int bytes) {
+        inflightWriteBytes.release(bytes);
+    }
+
+    /**
+     * Acquires {@code bytes} from the in-flight write-bytes budget and
+     * returns an idempotent {@link Runnable} that releases the same number
+     * of permits exactly once. Callers wire the runnable into the
+     * {@code whenComplete} hook of the future returned by
+     * {@code sendRequest}, and into every synchronous failure branch (e.g.
+     * {@code writeChannelForBlock} throwing) so the reservation is always
+     * returned. Empty payloads ({@code bytes == 0}) skip both the acquire
+     * and the release — {@link #writeAsMultipart} legitimately uses
+     * {@code Unpooled.EMPTY_BUFFER} to materialise an empty file marker
+     * and would otherwise be rejected by {@link #acquireInflightWriteBytes}.
+     */
+    private Runnable reserveInflightWriteBytes(int bytes) {
+        if (bytes <= 0) {
+            return () -> { };
+        }
+        acquireInflightWriteBytes(bytes);
+        AtomicBoolean released = new AtomicBoolean(false);
+        return () -> {
+            if (released.compareAndSet(false, true)) {
+                releaseInflightWriteBytes(bytes);
+            }
+        };
+    }
+
     @Override
     public void registerMetrics(StatsLogger statsLogger) {
         if (statsLogger == null) {
@@ -303,6 +401,24 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
             @Override public Long getSample() {
                 return maxInflightReadBytes();
+            }
+        });
+        statsLogger.registerGauge("inflight_write_bytes_available", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return availableInflightWriteBytes();
+            }
+        });
+        statsLogger.registerGauge("inflight_write_bytes_max", new Gauge<Long>() {
+            @Override public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override public Long getSample() {
+                return maxInflightWriteBytes();
             }
         });
     }
@@ -424,15 +540,18 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
     public CompletableFuture<Long> writeFileAsync(String path, byte[] buf, int offset, int length) {
         // Writes are not idempotent — no retry.
+        Runnable releaseOnce = reserveInflightWriteBytes(length);
         ServerChannel ch;
         try {
             ch = writeChannelForPath(path);
         } catch (RuntimeException e) {
+            releaseOnce.run();
             return failed(e);
         }
-        return sendRequest(ch, requestId ->
+        CompletableFuture<Long> result = sendRequest(ch, requestId ->
                         PduCodec.WriteFileRequest.write(requestId, path, buf, offset, length),
                 pdu -> PduCodec.WriteFileResponse.readWrittenSize(pdu));
+        return result.whenComplete((written, err) -> releaseOnce.run());
     }
 
     /**
@@ -440,15 +559,18 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
      * and must release after this future completes.
      */
     public CompletableFuture<Long> writeFileAsync(String path, ByteBuf content) {
+        Runnable releaseOnce = reserveInflightWriteBytes(content.readableBytes());
         ServerChannel ch;
         try {
             ch = writeChannelForPath(path);
         } catch (RuntimeException e) {
+            releaseOnce.run();
             return failed(e);
         }
-        return sendRequest(ch, requestId ->
+        CompletableFuture<Long> result = sendRequest(ch, requestId ->
                         PduCodec.WriteFileRequest.write(requestId, path, content),
                 pdu -> PduCodec.WriteFileResponse.readWrittenSize(pdu));
+        return result.whenComplete((written, err) -> releaseOnce.run());
     }
 
     public CompletableFuture<byte[]> readFileAsync(String path) {
@@ -572,39 +694,54 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
 
     /**
      * Writes one block of a multipart file. Not retried (not idempotent).
+     *
+     * <p>Acquires the in-flight write-bytes reservation (issue #468) before
+     * launching the RPC and releases it when the returned future completes,
+     * regardless of outcome. The acquisition is synchronous: callers fanning
+     * many blocks out at once will block here when the cap is hit, providing
+     * natural backpressure that protects concurrent reads on the shared
+     * event-loop pool.
      */
     public CompletableFuture<Void> writeFileBlockAsync(String path, long blockIndex, byte[] content) {
+        Runnable releaseOnce = reserveInflightWriteBytes(content.length);
         ServerChannel ch;
         try {
             ch = writeChannelForBlock(path, blockIndex);
         } catch (RuntimeException e) {
+            releaseOnce.run();
             return failed(e);
         }
-        return sendRequest(ch,
+        CompletableFuture<Void> result = sendRequest(ch,
                 requestId -> PduCodec.WriteFileBlockRequest.write(requestId, path, blockIndex, content),
                 pdu -> {
                     PduCodec.WriteFileBlockResponse.readWrittenSize(pdu); // ignored
                     return (Void) null;
                 });
+        return result.whenComplete((v, err) -> releaseOnce.run());
     }
 
     /**
      * Writes one block of a multipart file from a ByteBuf. Not retried.
      * Caller still owns {@code content} and must release after completion.
+     * Acquires/releases the in-flight write-bytes reservation (issue #468)
+     * symmetrically to the {@code byte[]} overload.
      */
     public CompletableFuture<Void> writeFileBlockAsync(String path, long blockIndex, ByteBuf content) {
+        Runnable releaseOnce = reserveInflightWriteBytes(content.readableBytes());
         ServerChannel ch;
         try {
             ch = writeChannelForBlock(path, blockIndex);
         } catch (RuntimeException e) {
+            releaseOnce.run();
             return failed(e);
         }
-        return sendRequest(ch,
+        CompletableFuture<Void> result = sendRequest(ch,
                 requestId -> PduCodec.WriteFileBlockRequest.write(requestId, path, blockIndex, content),
                 pdu -> {
                     PduCodec.WriteFileBlockResponse.readWrittenSize(pdu);
                     return (Void) null;
                 });
+        return result.whenComplete((v, err) -> releaseOnce.run());
     }
 
     public CompletableFuture<byte[]> readFileRangeAsync(String path, long offset, int length, int blockSizeArg) {

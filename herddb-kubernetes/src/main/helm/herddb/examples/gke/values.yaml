@@ -423,6 +423,15 @@ indexingService:
     # MaxDirectMemorySize budgets, raise only if Netty PoolArena headroom
     # is proven sufficient (see issue #246).
     remote.file.client.max.inflight.read.bytes: "268435456"
+    # Symmetric write-side cap (issue #468). Bounds bytes across in-flight
+    # writeFile/writeFileBlock/writeMultipartFile calls so a Phase B
+    # compaction write burst (graphs of 322–658 MB + maps of 159–326 MB at
+    # gist1m scale) cannot fan out hundreds of in-flight blocks at once and
+    # starve concurrent ANN reads on the shared event-loop pool / file
+    # server. Default 256 MiB matches the read cap; lower this (e.g.
+    # "67108864" = 64 MiB) on smaller pods or profiles where compaction
+    # visibly hurts query p99 latency. Set explicitly here for visibility.
+    remote.file.client.max.inflight.write.bytes: "268435456"
     # Disable segment-count back-pressure (PR #358 / issue #354).
     # Default threshold is 500 segments: when exceeded, addVectorInternal()
     # parks the apply thread in waitForSegmentCountRelief() until compaction

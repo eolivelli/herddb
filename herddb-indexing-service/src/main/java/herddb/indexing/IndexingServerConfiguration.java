@@ -404,6 +404,27 @@ public final class IndexingServerConfiguration {
             256L * 1024 * 1024;
 
     /**
+     * Maximum number of bytes across in-flight {@code writeFile}/{@code writeFileBlock}/
+     * {@code writeMultipartFile} calls whose payloads are currently being staged
+     * into the write-plane Netty channel. Symmetric to
+     * {@link #PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES} but for the
+     * write side (issue #468). Acquired before each block-async call is launched
+     * and released when the corresponding future completes; the
+     * {@code writeMultipartFile} driver thread naturally backpressures by
+     * blocking on {@code acquire()} when the cap is hit instead of fanning out
+     * hundreds of in-flight blocks at once. Bounds peak write-plane network
+     * pressure so a Phase-B compaction write cannot starve concurrent ANN
+     * search reads sharing the same Netty event-loop pool / file server.
+     * Default 256 MiB matches the read cap; lower this on memory-constrained
+     * IS pods or profiles where compaction-vs-search contention is observed
+     * (e.g. 64 MiB for the k3s-local profile in issue #468).
+     */
+    public static final String PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_WRITE_BYTES =
+            "remote.file.client.max.inflight.write.bytes";
+    public static final long PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_WRITE_BYTES_DEFAULT =
+            256L * 1024 * 1024;
+
+    /**
      * Maximum time (in milliseconds) to block at bootstrap waiting for at
      * least one remote file server to be discovered (via ZK) before giving up
      * and failing startup. Guards against a cold-cluster race where the
