@@ -36,7 +36,12 @@ public class Issue448BulkCommitHammerWithNonUniqueIndexesTest extends Issue448Bu
         performHammer(0, true, false);
     }
 
-    @Test(timeout = 240_000)
+    /**
+     * Timeout raised to 300 s (from 240 s) to give extra headroom on CI
+     * runners where the checkpoint thread adds significant commit stalls
+     * (issue #456).
+     */
+    @Test(timeout = 300_000)
     public void hammerWithCheckpoint() throws Exception {
         performHammer(2_000, true, false);
     }
