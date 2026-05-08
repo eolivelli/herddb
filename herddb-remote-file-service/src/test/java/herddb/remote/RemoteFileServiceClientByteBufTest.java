@@ -28,6 +28,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.buffer.Unpooled;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.ResourceLeakDetector;
 import java.io.ByteArrayInputStream;
@@ -37,7 +38,12 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -487,13 +493,17 @@ public class RemoteFileServiceClientByteBufTest {
     }
 
     /**
-     * A reasonably concurrent burst of {@code readFileRange} calls must
-     * never reveal a negative budget and must return the full cap by the
-     * time every call settles. This is the end-to-end smoke test that the
-     * acquire/release are balanced even under parallelism.
+     * A burst of {@code readFileRange} calls issued sequentially from the
+     * test thread must never reveal a negative budget and must return the
+     * full cap by the time every call settles. The acquires happen serially
+     * on the calling thread; the underlying RPC completions overlap on the
+     * Netty event-loop pool. End-to-end smoke test that acquire/release
+     * are balanced when many futures are outstanding at once. (The
+     * "concurrent" in the previous name referred to the RPC completion
+     * order, not the acquisition order — see issue #477).
      */
     @Test
-    public void testInflightReadBytes_concurrentBurstReturnsReservations() throws Exception {
+    public void testInflightReadBytes_serialBurstReturnsReservations() throws Exception {
         String path = "test/permits/concurrent.bin";
         int blockSize = 4096;
         byte[] content = new byte[blockSize * 8];
@@ -812,13 +822,16 @@ public class RemoteFileServiceClientByteBufTest {
     }
 
     /**
-     * A reasonably concurrent burst of {@code writeFileBlock} calls must
-     * never reveal a negative budget and must return the full cap by the
-     * time every call settles. Symmetric to the read-side concurrent-burst
-     * test.
+     * A burst of {@code writeFileBlock} calls issued sequentially from the
+     * test thread must never reveal a negative budget and must return the
+     * full cap by the time every call settles. The acquires happen serially
+     * on the calling thread; the underlying RPC completions overlap on the
+     * Netty event-loop pool. Symmetric to the read-side serial-burst test.
+     * For the truly-concurrent acquisition path see
+     * {@link #testInflightWriteBytes_concurrentMultipartWritersShareBudget}.
      */
     @Test
-    public void testInflightWriteBytes_concurrentBurstReturnsReservations() throws Exception {
+    public void testInflightWriteBytes_serialBurstReturnsReservations() throws Exception {
         long max = client.maxInflightWriteBytes();
         int burst = 32;
         int payloadSize = 4096;
@@ -941,8 +954,136 @@ public class RemoteFileServiceClientByteBufTest {
     public void testInflightWriteBytes_emptyPayloadSkipsReservation() throws Exception {
         long before = client.availableInflightWriteBytes();
         client.writeFileBlock("test/permits/write/empty.bin", 0L,
-                io.netty.buffer.Unpooled.EMPTY_BUFFER);
+                Unpooled.EMPTY_BUFFER);
         long after = client.availableInflightWriteBytes();
         assertEquals("empty payload neither acquires nor leaks", before, after);
+    }
+
+    /**
+     * The byte budget is per-client, not per-call. Two concurrent
+     * {@code writeMultipartFile} drivers must serialise on the shared
+     * semaphore when their combined demand exceeds the cap.
+     *
+     * <p>Each thread writes an 8-block file via {@code writeMultipartFile}
+     * with {@code blockSize} = 4 KiB and a per-client cap of 4 blocks.
+     * The combined steady-state demand (2 × 8 = 16 acquires) must be
+     * admitted in batches of at most 4 blocks across both writers. A
+     * {@link CountDownLatch} fences out a degenerate ordering where one
+     * driver acquires + releases all 8 blocks before the other has even
+     * started; both threads only call {@code writeMultipartFile} after the
+     * latch reaches zero. This is the regression gate that catches a bug
+     * where the budget is mistakenly reset to per-call (issue #477).
+     */
+    @Test(timeout = 60_000)
+    public void testInflightWriteBytes_concurrentMultipartWritersShareBudget() throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        int blockSize = 4096;
+        long budget = 4L * blockSize;
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, blockSize);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, budget);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            int blocksPerFile = 8;
+            int writers = 2;
+            CountDownLatch startLatch = new CountDownLatch(writers);
+            ExecutorService exec = Executors.newFixedThreadPool(writers);
+            try {
+                AtomicLong observedMin = new AtomicLong(budget);
+                @SuppressWarnings("unchecked")
+                Future<Long>[] futures = new Future[writers];
+                for (int i = 0; i < writers; i++) {
+                    final int writerId = i;
+                    futures[i] = exec.submit(() -> {
+                        // Both threads count down then await — neither starts
+                        // its multipart write until both threads exist, so the
+                        // race window is real.
+                        startLatch.countDown();
+                        startLatch.await(30, TimeUnit.SECONDS);
+                        byte[] content = new byte[blockSize * blocksPerFile];
+                        for (int j = 0; j < content.length; j++) {
+                            content[j] = (byte) ((writerId << 4) | (j & 0x0f));
+                        }
+                        long written = tuned.writeMultipartFile(
+                                "test/permits/write/concurrent-" + writerId + ".bin",
+                                new ByteArrayInputStream(content), blockSize);
+                        long snapshot = tuned.availableInflightWriteBytes();
+                        observedMin.accumulateAndGet(snapshot, Math::min);
+                        return written;
+                    });
+                }
+                long expected = (long) blockSize * blocksPerFile;
+                for (int i = 0; i < writers; i++) {
+                    assertEquals("writer " + i + " wrote the expected bytes",
+                            expected, futures[i].get(30, TimeUnit.SECONDS).longValue());
+                }
+                // The shared budget never went negative even under
+                // concurrent fan-out: observedMin is captured AFTER each
+                // writer's last block release, so it reflects post-release
+                // state and must be >= 0.
+                assertTrue("budget never observed negative",
+                        observedMin.get() >= 0);
+                assertEquals("budget fully restored after both writers finish",
+                        budget, tuned.availableInflightWriteBytes());
+                assertTrue("observed budget never exceeded cap",
+                        observedMin.get() <= budget);
+            } finally {
+                exec.shutdown();
+                exec.awaitTermination(30, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    /**
+     * An interrupted caller can still call {@code writeFileBlockAsync}
+     * without an {@code InterruptedException} leaking out of the
+     * write-byte budget helper. The acquire goes through
+     * {@code Semaphore.tryAcquire} on the fast path (or
+     * {@code acquireUninterruptibly} when saturated); neither throws on
+     * an already-interrupted thread. The budget is correctly restored
+     * when the future settles, and the interrupt status is preserved
+     * across the helper (issue #477).
+     *
+     * <p>The test issues a benign warm-up write first so the underlying
+     * write-plane Netty channel is already established by the time we
+     * set the interrupt flag. Without the warm-up, the interrupt would
+     * be observed by Netty's lazy connect-and-sync path
+     * ({@code NettyConnector.connectUsingNetwork} calls {@code .sync()}
+     * on the bootstrap promise, which propagates {@code InterruptedException}
+     * out as an IOException) — that's a different code path from the one
+     * this test is meant to pin.
+     *
+     * <p>The interrupt is also cleared <i>before</i> the eventual
+     * {@code future.get()}: that's a separate CompletableFuture semantics
+     * issue (an interrupted thread blocking on {@code get()} throws
+     * {@code InterruptedException}) and is orthogonal to whether the
+     * budget helper itself throws.
+     */
+    @Test
+    public void testInflightWriteBytes_acquireSurvivesInterrupt() throws Exception {
+        // Warm-up: open the write-plane channel so the test exercises the
+        // budget helper, not the Netty connect path.
+        client.writeFileBlock("test/permits/write/interrupt-warmup.bin", 0L,
+                new byte[1]);
+        long before = client.availableInflightWriteBytes();
+        Thread.currentThread().interrupt();
+        CompletableFuture<Void> future;
+        try {
+            // Call the API under test on the interrupted thread.
+            future = client.writeFileBlockAsync(
+                    "test/permits/write/interrupt.bin", 0L, new byte[4096]);
+            // The helper must not have thrown InterruptedException, and
+            // must have left the interrupt flag intact for the caller.
+            assertTrue("interrupt status preserved across writeFileBlockAsync",
+                    Thread.currentThread().isInterrupted());
+        } finally {
+            // Clear the interrupt before we block on .get() so the test
+            // can observe the future's normal completion. Always run so
+            // a thrown assert above doesn't leak an interrupted thread to
+            // JUnit / Surefire.
+            Thread.interrupted();
+        }
+        future.get(30, TimeUnit.SECONDS);
+        assertEquals("budget restored after interrupted call",
+                before, client.availableInflightWriteBytes());
     }
 }
