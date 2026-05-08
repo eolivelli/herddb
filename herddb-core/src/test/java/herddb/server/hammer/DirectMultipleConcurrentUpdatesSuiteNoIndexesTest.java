@@ -24,8 +24,9 @@ import org.junit.Test;
 
 public class DirectMultipleConcurrentUpdatesSuiteNoIndexesTest extends DirectMultipleConcurrentUpdatesSuite {
 
-    // No-checkpoint variants: 180 s JUnit ceiling, 90 s inner per-future limit
-    // (inner is strictly smaller so TimeoutException fires before JUnit interrupt).
+    // No-checkpoint variants: 180 s JUnit ceiling, 120 s inner per-future limit
+    // (raised from 90 s per issue #456; inner is strictly smaller so TimeoutException
+    // fires before JUnit interrupt).
     @Test(timeout = 180_000)
     public void test() throws Exception {
         performTest(false, 0, false, false);
