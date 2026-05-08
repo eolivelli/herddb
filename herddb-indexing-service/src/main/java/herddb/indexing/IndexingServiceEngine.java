@@ -68,6 +68,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Predicate;
 import java.util.logging.Level;
@@ -345,6 +346,40 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      */
     private long warmupBytesPerSegment;
 
+    /**
+     * Whether the post-Phase-C warmup runs on a dedicated executor
+     * ({@code true}) or inline on {@link #checkpointExecutor} ({@code false}).
+     * Resolved at {@link #start()} from
+     * {@link IndexingServerConfiguration#PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC}
+     * with the JVM system property
+     * {@link IndexingServerConfiguration#SYSPROP_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC}
+     * as fallback (issue #472).
+     */
+    private boolean warmupAsync;
+
+    /**
+     * Single-thread executor that runs the post-Phase-C BFS warmup off the
+     * {@link #checkpointExecutor} thread (issue #472). The warmup reads the
+     * entry-point neighbourhood of every segment via the same
+     * {@link herddb.remote.SegmentBlockCache} that search queries use; running
+     * it inline on the checkpoint thread blocks both the next checkpoint and
+     * the watermark snapshot publication for the duration of the BFS (~3 s
+     * for 21 × 33 MiB segments in the gist1m bench profile of issue #472).
+     *
+     * <p>Owned by the engine — created in {@link #start()} when warmup is
+     * enabled in async mode and shut down in {@link #close()}. {@code null}
+     * when warmup is disabled or running in synchronous mode.
+     */
+    private ExecutorService warmupExecutor;
+
+    /**
+     * Tracks the most recently submitted warmup task. Used to coalesce
+     * concurrent submits (skip a new submit if the previous warmup is still
+     * running) and to let {@link #forceCheckpointAndSaveWatermark()} await
+     * completion so test post-conditions still hold (issue #472).
+     */
+    private final AtomicReference<Future<?>> lastWarmupFuture = new AtomicReference<>();
+
     private ExecutorService[] applyWorkers;
     private int applyParallelism;
     private volatile Throwable asyncError;
@@ -513,6 +548,27 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             }
         }
         checkpointAndSaveWatermark();
+        // The synchronous checkpoint may have queued an async warmup
+        // (issue #472). Wait for it to complete so that the caller's
+        // post-condition — "after this returns, the cache has been warmed
+        // and bytes have been read through the storage manager" — still
+        // holds for tests written before async warmup existed. Production
+        // code does not call forceCheckpointAndSaveWatermark; it goes
+        // through triggerCheckpointAsync instead, which is unaffected.
+        Future<?> warmup = lastWarmupFuture.get();
+        if (warmup != null) {
+            try {
+                warmup.get(60, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOGGER.log(Level.WARNING, "Interrupted awaiting warmup in forceCheckpointAndSaveWatermark");
+            } catch (ExecutionException e) {
+                LOGGER.log(Level.FINE, "Async warmup ended with failure", e.getCause());
+            } catch (java.util.concurrent.TimeoutException e) {
+                LOGGER.log(Level.WARNING,
+                        "Async warmup did not complete within 60 s in forceCheckpointAndSaveWatermark");
+            }
+        }
     }
 
     public void setVectorStoreFactory(VectorStoreFactory factory) {
@@ -705,19 +761,6 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         .registerMetrics(this.statsLogger.scope("remote_file_client"));
             }
 
-            // Resolve the post-Phase-C cache warmup byte budget (issue #322).
-            // Priority: properties-file key > JVM system property > hard-coded default.
-            long syspropWarmupBytes = Long.getLong(
-                    IndexingServerConfiguration.SYSPROP_VECTOR_SEGMENT_CACHE_WARMUP_BYTES,
-                    IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES_DEFAULT);
-            this.warmupBytesPerSegment = config.getLong(
-                    IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES,
-                    syspropWarmupBytes);
-            LOGGER.log(Level.INFO,
-                    "vector index segmentCacheWarmupBytes: {0} ({1})",
-                    new Object[]{warmupBytesPerSegment,
-                            warmupBytesPerSegment > 0 ? "enabled" : "disabled"});
-
             final long vectorMemLimit = maxVectorMemoryBytes;
             final VectorMemoryBudget budget = this;
             final long finalSegmentPageCacheMaxBytes = segmentPageCacheMaxBytes;
@@ -771,6 +814,37 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             LOGGER.info("Using InMemoryVectorStore factory (storage type: " + storageType + ")");
         }
 
+        // Resolve the post-Phase-C cache warmup byte budget (issue #322) and
+        // the async/sync warmup mode (issue #472). Resolved here — outside
+        // the storage-type branch — so that engine instances driving an
+        // in-memory or local-file store (test paths, plus operators using
+        // the in-memory mode for diagnostics) honour the same configuration
+        // as the production remote-file path. The warmup is a no-op against
+        // an in-memory backing reader by design (the BFS reads complete
+        // without populating any remote cache); the test value of resolving
+        // it here is that the engine wires up the warmup executor and the
+        // warmup Future, which is what these tests verify.
+        // Priority: properties-file key > JVM system property > hard-coded default.
+        long syspropWarmupBytes = Long.getLong(
+                IndexingServerConfiguration.SYSPROP_VECTOR_SEGMENT_CACHE_WARMUP_BYTES,
+                IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES_DEFAULT);
+        this.warmupBytesPerSegment = config.getLong(
+                IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES,
+                syspropWarmupBytes);
+        String syspropWarmupAsync = System.getProperty(
+                IndexingServerConfiguration.SYSPROP_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC);
+        boolean defaultWarmupAsync = syspropWarmupAsync != null
+                ? Boolean.parseBoolean(syspropWarmupAsync)
+                : IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC_DEFAULT;
+        this.warmupAsync = config.getBoolean(
+                IndexingServerConfiguration.PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC,
+                defaultWarmupAsync);
+        LOGGER.log(Level.INFO,
+                "vector index segmentCacheWarmupBytes: {0} ({1}, mode={2})",
+                new Object[]{warmupBytesPerSegment,
+                        warmupBytesPerSegment > 0 ? "enabled" : "disabled",
+                        warmupAsync ? "async" : "sync"});
+
         // Initialize components (watermark store is loaded later, after the
         // tablespace UUID is resolved, because a remote-backed watermark store
         // addresses its S3 object by tablespace UUID).
@@ -818,6 +892,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             t.setDaemon(true);
             return t;
         });
+
+        // Single-thread executor that runs the post-Phase-C BFS warmup off the
+        // checkpointExecutor thread (issue #472). Created only when warmup is
+        // enabled AND in async mode, so a sync-mode engine pays no executor
+        // cost. The warmup thread is daemon so it never blocks JVM exit; on
+        // close() it is shut down with a bounded awaitTermination, then
+        // shutdownNow.
+        if (warmupBytesPerSegment > 0 && warmupAsync) {
+            warmupExecutor = Executors.newSingleThreadExecutor(r -> {
+                FastThreadLocalThread t = new FastThreadLocalThread(r, "indexing-warmup");
+                t.setDaemon(true);
+                return t;
+            });
+        }
 
         // Validate instance identity. The bootstrap numInstances is a lower
         // bound on the engine's identity range; the running value may grow
@@ -1636,6 +1724,43 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     }
 
     /**
+     * Returns the most recently submitted async warmup {@link Future}, or
+     * {@code null} if no warmup has been submitted yet OR warmup was last run
+     * inline in sync mode (used by tests to verify async dispatch and
+     * coalescing — see {@code BlockCacheWarmupAsyncTest}).
+     */
+    // package-private for testing
+    Future<?> getLastWarmupFutureForTest() {
+        return lastWarmupFuture.get();
+    }
+
+    /**
+     * Awaits the most recently submitted async warmup {@link Future}, if any.
+     * No-op when warmup is disabled, ran inline in sync mode, or has already
+     * completed.
+     *
+     * @param timeoutMs maximum time to wait, in milliseconds
+     * @throws java.util.concurrent.TimeoutException if the warmup does not
+     *         complete within {@code timeoutMs}
+     */
+    // package-private for testing
+    void awaitPendingWarmupForTest(long timeoutMs)
+            throws InterruptedException, java.util.concurrent.TimeoutException {
+        Future<?> f = lastWarmupFuture.get();
+        if (f == null) {
+            return;
+        }
+        try {
+            f.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (ExecutionException e) {
+            // The warmup task itself caught any RuntimeException per-store;
+            // a propagating failure is unexpected. Log and rethrow as
+            // unchecked so the test fails clearly.
+            throw new RuntimeException("warmup task failed", e.getCause());
+        }
+    }
+
+    /**
      * Sets the "last processed LSN" that
      * {@link #checkpointAndSaveWatermark()} will capture and persist. Used
      * by tests that drive the engine via
@@ -2275,14 +2400,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             // so the first query batch finds hot cache blocks rather than
             // issuing cold gRPC streaming reads against the file server.
             // Warmup is best-effort — failures are logged and never abort the
-            // watermark save.  A warmupBytesPerSegment of 0 disables this.
-            if (warmupBytesPerSegment > 0) {
-                for (AbstractVectorStore store : vectorStores.values()) {
-                    if (store instanceof PersistentVectorStore) {
-                        ((PersistentVectorStore) store).warmUpBlockCache(warmupBytesPerSegment);
-                    }
-                }
-            }
+            // watermark save. A warmupBytesPerSegment of 0 disables this.
+            //
+            // In async mode (default since issue #472) the warmup runs on
+            // {@link #warmupExecutor} and the watermark snapshot is published
+            // immediately below. In sync mode the warmup runs inline here,
+            // preserving the original issue #322 behaviour.
+            submitWarmupAsyncOrInline();
             // Only now — all stores have durably persisted state covering
             // checkpointLsn — is it safe to publish the watermark snapshot.
             // We capture the engine's current numInstances together with the
@@ -2363,6 +2487,132 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             publishCheckpointStateBestEffort(checkpointLsn, checkpointEntryTimestamp);
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "checkpointAndSaveWatermark failed", e);
+        }
+    }
+
+    /**
+     * Runs the post-Phase-C BFS warmup (issue #322) either on a dedicated
+     * executor (async, default since issue #472) or inline on the calling
+     * thread (sync, opt-in via
+     * {@link IndexingServerConfiguration#PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC}).
+     *
+     * <p>In async mode this method snapshots the current persistent vector
+     * stores, submits a single task to {@link #warmupExecutor}, stores the
+     * resulting Future in {@link #lastWarmupFuture}, and returns immediately.
+     * Concurrent submits are coalesced: if a previous warmup is still running
+     * the new submit is dropped (logged at FINE) and the next checkpoint
+     * trigger will queue a fresh warmup with the latest segment list. This
+     * prevents unbounded executor queueing under pathological scheduling
+     * while guaranteeing the system converges to "warm against the latest
+     * segment set".
+     *
+     * <p>In sync mode the warmup runs inline on the caller (typically the
+     * {@code indexing-checkpoint} thread), preserving the original issue #322
+     * behaviour where the watermark snapshot is held back until the cache is
+     * primed.
+     *
+     * <p>Per-store {@link RuntimeException}s are caught and logged at WARNING
+     * so a single misbehaving store cannot abort the warmup of the others.
+     * (The store-level method already swallows IOException itself.)
+     */
+    private void submitWarmupAsyncOrInline() {
+        if (warmupBytesPerSegment <= 0) {
+            return;
+        }
+        if (warmupAsync && warmupExecutor != null && !warmupExecutor.isShutdown()) {
+            // Snapshot the persistent stores at submit time so the executor
+            // task does not race with concurrent map mutations (createIndex /
+            // dropIndex). The snapshot is a defensive copy of references —
+            // if a store is closed concurrently, the per-store catch below
+            // logs and continues.
+            final List<PersistentVectorStore> snapshot = new ArrayList<>();
+            for (AbstractVectorStore store : vectorStores.values()) {
+                if (store instanceof PersistentVectorStore) {
+                    snapshot.add((PersistentVectorStore) store);
+                }
+            }
+            if (snapshot.isEmpty()) {
+                return;
+            }
+            // Coalesce: if a previous warmup is still in progress, drop this
+            // submit. The next checkpoint will trigger a fresh warmup against
+            // the then-current segment list.
+            Future<?> prev = lastWarmupFuture.get();
+            if (prev != null && !prev.isDone()) {
+                LOGGER.log(Level.FINE,
+                        "Skipping warmup submit: previous warmup still in progress");
+                return;
+            }
+            final long bytesPerSegment = this.warmupBytesPerSegment;
+            try {
+                Future<?> f = warmupExecutor.submit(() -> runWarmupTask(snapshot, bytesPerSegment));
+                lastWarmupFuture.set(f);
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                // Executor was shut down concurrently with this submit —
+                // accept the race and skip the warmup.
+                LOGGER.log(Level.FINE,
+                        "Warmup executor rejected task (likely concurrent shutdown)");
+            }
+        } else {
+            // Sync mode (or async disabled at runtime): run inline.
+            for (AbstractVectorStore store : vectorStores.values()) {
+                if (store instanceof PersistentVectorStore) {
+                    ((PersistentVectorStore) store).warmUpBlockCache(warmupBytesPerSegment);
+                }
+            }
+        }
+    }
+
+    /**
+     * Test-only hook executed at the very start of the async warmup task,
+     * before any segment is touched. {@code null} (the default) means no-op.
+     * Tests use this to pause the warmup deterministically (e.g. {@code
+     * latch.await()}) so they can observe the in-flight state without
+     * interfering with the unrelated Phase A / B / C reads of the checkpoint.
+     */
+    private volatile Runnable warmupPauseHookForTest = null;
+
+    /**
+     * Installs (or clears) the test-only warmup pause hook. Package-private:
+     * production code never calls this. The hook fires on the
+     * {@code indexing-warmup} thread before the per-store BFS loop starts.
+     */
+    // package-private for testing
+    void setWarmupPauseHookForTest(Runnable hook) {
+        this.warmupPauseHookForTest = hook;
+    }
+
+    /**
+     * Body of the async warmup task: iterates the snapshot of persistent
+     * stores and calls {@link PersistentVectorStore#warmUpBlockCache} on each.
+     * Per-store {@link RuntimeException}s are caught so a single store's
+     * failure cannot prevent the others from warming.
+     */
+    private void runWarmupTask(List<PersistentVectorStore> snapshot, long bytesPerSegment) {
+        Runnable hook = warmupPauseHookForTest;
+        if (hook != null) {
+            try {
+                hook.run();
+            } catch (RuntimeException e) {
+                // Test hook misbehaved — log and continue. Production never
+                // installs a hook so this catch is purely defensive against
+                // a misuse in tests.
+                LOGGER.log(Level.WARNING, "warmupPauseHookForTest threw; continuing", e);
+            }
+        }
+        for (PersistentVectorStore store : snapshot) {
+            try {
+                store.warmUpBlockCache(bytesPerSegment);
+            } catch (RuntimeException e) {
+                // Catch RuntimeException narrowly: warmUpBlockCache itself
+                // already handles IOException internally; the only way
+                // RuntimeException propagates here is from a store closed
+                // concurrently or another unexpected programming error.
+                // Log and continue with the next store so a single bad store
+                // does not break warmup for the others.
+                LOGGER.log(Level.WARNING,
+                        "Async warmUpBlockCache failed for one store; continuing with others", e);
+            }
         }
     }
 
@@ -4024,6 +4274,29 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             // AbstractVectorStore instances) are eligible for GC.
             pendingDropTasks.clear();
             LOGGER.info("Checkpoint executor shut down");
+        }
+
+        // Shut down the warmup executor AFTER the checkpoint executor
+        // (issue #472) so the final synchronous checkpoint above could still
+        // queue a warmup. The warmup is best-effort and never holds invariants
+        // — we wait briefly for an in-flight warmup to finish, then force
+        // shutdownNow. The thread is daemon so it never blocks JVM exit even
+        // if shutdownNow is interrupted.
+        if (warmupExecutor != null) {
+            warmupExecutor.shutdown();
+            try {
+                if (!warmupExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    LOGGER.log(Level.FINE,
+                            "In-flight warmup did not complete within 5s of shutdown; forcing shutdownNow");
+                    warmupExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                warmupExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+            warmupExecutor = null;
+            lastWarmupFuture.set(null);
+            LOGGER.info("Warmup executor shut down");
         }
 
         // Drain and shut down apply workers
