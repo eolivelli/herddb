@@ -37,6 +37,11 @@ public class QueryWorker implements Runnable {
     private final int startIdx;
     private final int endIdx;
     private final MetricsCollector metrics;
+    /**
+     * Per-query result storage used for recall computation. {@code null} when the
+     * caller does not need recall (e.g. during-ingestion sampling rounds), in which
+     * case results are discarded after timing is recorded.
+     */
     private final List<List<Integer>> allResults;
     private final AtomicReference<String> statusLine;
     /**
@@ -45,10 +50,37 @@ public class QueryWorker implements Runnable {
      * restarting the worker.
      */
     private final Supplier<RateLimiter> queryRateLimiter;
+    /**
+     * When {@code true}, a result set smaller than {@code topK} is logged but
+     * does not abort the JVM. Use for during-ingestion sampling rounds where the
+     * graph is only partially built and short results are expected. When
+     * {@code false} (the default for post-ingest query phases), a short result
+     * set is a hard error and the benchmark exits with non-zero status.
+     */
+    private final boolean tolerateShortResults;
 
+    /**
+     * Creates a worker for the normal post-ingest query phase.
+     * Short result sets are treated as fatal errors ({@code System.exit(1)}).
+     */
     public QueryWorker(Config config, List<float[]> queryVectors, int startIdx, int endIdx,
                        MetricsCollector metrics, List<List<Integer>> allResults,
                        AtomicReference<String> statusLine, Supplier<RateLimiter> queryRateLimiter) {
+        this(config, queryVectors, startIdx, endIdx, metrics, allResults,
+                statusLine, queryRateLimiter, false);
+    }
+
+    /**
+     * Creates a worker with explicit control over short-result tolerance.
+     * Pass {@code tolerateShortResults=true} for during-ingestion sampling so
+     * partial result sets (graph not yet fully built) are accepted rather than
+     * aborting the JVM.  Pass {@code allResults=null} when recall computation is
+     * not needed (the caller discards results after metrics are recorded).
+     */
+    public QueryWorker(Config config, List<float[]> queryVectors, int startIdx, int endIdx,
+                       MetricsCollector metrics, List<List<Integer>> allResults,
+                       AtomicReference<String> statusLine, Supplier<RateLimiter> queryRateLimiter,
+                       boolean tolerateShortResults) {
         this.config = config;
         this.queryVectors = queryVectors;
         this.startIdx = startIdx;
@@ -57,6 +89,7 @@ public class QueryWorker implements Runnable {
         this.allResults = allResults;
         this.statusLine = statusLine;
         this.queryRateLimiter = queryRateLimiter;
+        this.tolerateShortResults = tolerateShortResults;
     }
 
     @Override
@@ -92,13 +125,24 @@ public class QueryWorker implements Runnable {
                         }
                     }
                     if (ids.size() != k) {
-                        System.err.println("FATAL: query " + i + " returned " + ids.size()
-                                + " results, expected " + k);
-                        System.exit(1);
+                        if (tolerateShortResults) {
+                            // During ingestion the HNSW graph is only partially built;
+                            // short result sets are expected and should not abort the run.
+                            System.err.println("[ingest_query] query " + i + " returned " + ids.size()
+                                    + " results (expected " + k + ") — partial graph, continuing");
+                        } else {
+                            System.err.println("FATAL: query " + i + " returned " + ids.size()
+                                    + " results, expected " + k);
+                            System.exit(1);
+                        }
                     }
                     long elapsed = System.nanoTime() - start;
                     metrics.record(elapsed);
-                    allResults.set(i, ids);
+                    // allResults is null when the caller does not need recall storage
+                    // (e.g. during-ingestion sampling). Skip the set in that case.
+                    if (allResults != null) {
+                        allResults.set(i, ids);
+                    }
 
                     // Status-line publication moved to VectorBench's query
                     // progress loop (issue #443): every worker calling

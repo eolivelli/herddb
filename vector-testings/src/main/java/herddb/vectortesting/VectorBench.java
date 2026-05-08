@@ -533,9 +533,11 @@ public class VectorBench {
             }
 
             // Optional during-ingestion query thread: every runQueriesDuringIngestionPeriodSeconds,
-            // run the full query workload using a dedicated autocommit connection (independent of
-            // all ingest workers). Recall is intentionally not computed here because the ground-truth
-            // file covers the complete dataset, not the partially ingested state.
+            // run the full query workload via a dedicated QueryWorker on a fresh autocommit
+            // connection (independent of all ingest workers). Each round uses a single-threaded
+            // executor so the round completes before the next sleep begins.
+            // Recall is intentionally not computed here because the ground-truth file covers the
+            // complete dataset, not the partially ingested state.
             Thread duringIngestionQueryThread = null;
             if (config.runQueriesDuringIngestion) {
                 final long queryPeriodMs = (long) config.runQueriesDuringIngestionPeriodSeconds * 1000L;
@@ -553,50 +555,33 @@ public class VectorBench {
                             }
                             nextRun = now + queryPeriodMs;
                             roundNumber++;
-                            // Each round opens a fresh connection so the query thread never
-                            // holds a connection across sleep intervals.
-                            // JDBC connections default to autocommit=true, which is what we
-                            // want: no explicit transaction wrapping for these sampling queries.
+
+                            // Delegate to QueryWorker with:
+                            //   tolerateShortResults=true  — graph partially built, short results OK
+                            //   allResults=null            — no recall storage needed
+                            //   rate limiter=() -> null    — no throttling for sampling rounds
                             MetricsCollector roundMetrics = new MetricsCollector();
-                            int queriesThisRound = 0;
-                            int zeroResultQueries = 0;
-                            try (Connection qConn = DriverManager.getConnection(
-                                    config.effectiveJdbcUrl(), config.username, config.password)) {
-                                int k = config.topK;
-                                String sql = "SELECT id FROM " + config.tableName
-                                        + " ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT " + k;
-                                try (java.sql.PreparedStatement qPs = qConn.prepareStatement(sql)) {
-                                    for (float[] qVec : capturedQueryVectors) {
-                                        if (ingestDone.get()) {
-                                            break;
-                                        }
-                                        long qStart = System.nanoTime();
-                                        qPs.setObject(1, qVec);
-                                        int resultCount = 0;
-                                        try (java.sql.ResultSet rs = qPs.executeQuery()) {
-                                            while (rs.next()) {
-                                                resultCount++;
-                                            }
-                                        }
-                                        roundMetrics.record(System.nanoTime() - qStart);
-                                        queriesThisRound++;
-                                        if (resultCount == 0) {
-                                            zeroResultQueries++;
-                                        }
-                                    }
-                                }
-                            } catch (java.sql.SQLException e) {
-                                out.info("[ingest_query] round " + roundNumber
-                                        + " failed: " + e.getMessage());
-                                continue;
-                            }
+                            AtomicReference<String> roundStatus = new AtomicReference<>("");
+                            QueryWorker roundWorker = new QueryWorker(
+                                    config, capturedQueryVectors,
+                                    0, capturedQueryVectors.size(),
+                                    roundMetrics,
+                                    null,       // allResults=null: discard per-query id lists
+                                    roundStatus,
+                                    () -> null, // no rate limiter for sampling rounds
+                                    true);      // tolerateShortResults
+                            Thread roundThread = new Thread(roundWorker,
+                                    "vector-bench-ingest-query-round-" + roundNumber);
+                            roundThread.start();
+                            roundThread.join();
+
                             MetricsCollector.Stats s = roundMetrics.computeStatsUncached();
+                            long queriesThisRound = roundMetrics.getCount();
                             double elapsed = (System.nanoTime() - capturedIngestStart) / 1e9;
                             double qps = elapsed > 0 ? queriesThisRound / elapsed : 0.0;
                             LinkedHashMap<String, Object> fields = new LinkedHashMap<>();
                             fields.put("round", roundNumber);
                             fields.put("queries_run", queriesThisRound);
-                            fields.put("zero_result_queries", zeroResultQueries);
                             fields.put("qps", round2(qps));
                             fields.put("latency_mean_ms", round2(s.meanNanos() / 1e6));
                             fields.put("latency_p50_ms", round2(s.p50Nanos() / 1e6));
