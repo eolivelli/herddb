@@ -122,10 +122,16 @@ public class VectorIndexManager extends AbstractIndexManager {
      * Index and re-checkpoint-and-pin the table from the leader before
      * allowing the IS to scan. Step 3 also owns the unpin path:
      * the server unpins once the IS publishes its post-rebuild watermark
-     * past the {@code CREATE_INDEX} LSN. {@code TableSpaceManager.createIndex}
-     * itself releases the pin if anything between {@code checkpoint(true)}
-     * and a successful {@code apply()} fails — abandoning a CREATE
-     * VECTOR INDEX during the call leaves no in-memory pin.
+     * past the {@code CREATE_INDEX} LSN.
+     *
+     * <p>{@code TableSpaceManager.createIndex} releases the pin if
+     * anything between {@code checkpoint(true)} and a successful
+     * {@code apply()} fails (so an aborted CREATE VECTOR INDEX leaves
+     * no pin). {@code TableManager.doCheckpoint} also rolls back any
+     * partial pin it took if {@code checkpoint(true)} itself throws
+     * partway through (so a checkpoint-internal failure leaves no pin
+     * either). The two recovery paths together guarantee that an
+     * unsuccessful CREATE VECTOR INDEX never leaves a pin behind.
      */
     public static final String PROP_REBUILD_LSN = "_rebuildLsn";
 

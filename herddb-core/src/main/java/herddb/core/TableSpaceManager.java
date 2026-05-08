@@ -2573,20 +2573,13 @@ public class TableSpaceManager {
                                 new Object[]{originalIndex.tablespace, originalIndex.table,
                                         originalIndex.name, tableSize});
                         long checkpointStartNanos = System.nanoTime();
-                        // NOTE on partial-pin failure class: tableManager.checkpoint(true) takes
-                        // multiple pins inside doCheckpoint (PK BLink keyToPage, every
-                        // pre-existing secondary index, and the table itself). If
-                        // doCheckpoint throws AFTER taking some of those pins but
-                        // BEFORE returning the TableCheckpoint, the call site here
-                        // never observes the LSN to unpin. Background activator-driven
-                        // checkpoints tolerate this leak by retrying; foreground SQL
-                        // callers (this one) cannot. Until the doCheckpoint outer
-                        // try/finally is hardened to roll back partial pins, a CREATE
-                        // VECTOR INDEX that fails INSIDE checkpoint(true) leaves an
-                        // in-memory pin that survives until leader process restart.
-                        // We log SEVERELY in the catch path below so an operator
-                        // chasing a "page files won't be reclaimed" incident has a
-                        // breadcrumb. See PR #476 review for the deeper fix proposal.
+                        // tableManager.checkpoint(true) takes multiple pins inside
+                        // doCheckpoint (PK BLink keyToPage, every pre-existing
+                        // secondary index, and the table itself). doCheckpoint's
+                        // outer finally (issue #471) rolls back any partial pin
+                        // it took before a downstream step threw, so a failure
+                        // here cannot leak a pin into the leader's in-memory
+                        // pin maps.
                         AbstractTableManager.TableCheckpoint pinnedCheckpoint =
                                 tableManager.checkpoint(true);
                         long checkpointElapsedMillis =
@@ -2637,18 +2630,19 @@ public class TableSpaceManager {
             indexCreateSucceeded = true;
             return new DDLStatementExecutionResult(entry.transactionId);
         } catch (DataStorageManagerException err) {
-            // If this exception came from tableManager.checkpoint(true), a
-            // partial pin may already be in-memory on doCheckpoint's
-            // sequenceNumber and there is no path here to release it
-            // (we never observed the TableCheckpoint). The pin will
-            // survive until leader process restart. Log loudly so an
-            // operator can correlate it with disk-pressure incidents.
+            // Issue #471: if this exception came from tableManager.checkpoint(true),
+            // doCheckpoint's pin-rollback finally block already released
+            // any partial pin it took before the failure (pinRollbacks
+            // walked in reverse order on the failure path). No leak.
+            // We still log loudly so an operator chasing a "CREATE
+            // VECTOR INDEX failed" alert can correlate it with the
+            // checkpoint subsystem.
             if (rebuildPinLsn == null
                     && Index.TYPE_VECTOR.equals(statement.getIndexDefinition().type)) {
                 LOGGER.log(Level.SEVERE,
                         "CREATE VECTOR INDEX {0}.{1}.{2} failed inside checkpoint(true);"
-                                + " a partial pin may have leaked on the leader's in-memory pin"
-                                + " maps and will only be reclaimed by a leader restart",
+                                + " any partial pin taken by doCheckpoint has been rolled back."
+                                + " The CREATE INDEX is aborted; no index was created.",
                         new Object[]{
                                 statement.getIndexDefinition().tablespace,
                                 statement.getIndexDefinition().table,
