@@ -92,6 +92,21 @@ public class Config {
      * visible in the run log. {@code 0} disables the status thread entirely.
      */
     int statusIntervalSeconds = 60;
+    /**
+     * When {@code true}, a dedicated background thread runs the configured query
+     * workload periodically throughout the ingestion phase, using a separate JDBC
+     * connection opened in autocommit mode (independent of all ingest worker
+     * connections). Recall is intentionally <em>not</em> computed during these
+     * mid-ingestion rounds because the ground-truth file covers the full dataset,
+     * not the partially ingested one.
+     */
+    boolean runQueriesDuringIngestion = false;
+    /**
+     * Period in seconds between consecutive query rounds when
+     * {@link #runQueriesDuringIngestion} is {@code true}. Must be {@code >= 1}.
+     * Default: {@code 30}.
+     */
+    int runQueriesDuringIngestionPeriodSeconds = 30;
 
     private static Options buildOptions() {
         Options opts = new Options();
@@ -149,6 +164,13 @@ public class Config {
                 "Output format: text (default) or json (NDJSON, one object per line). json implies --no-progress.");
         opts.addOption(null, "status-interval-seconds", true,
                 "Seconds between server-status dumps during ingestion; 0 disables (default: 60)");
+        opts.addOption(null, "run-queries-during-ingestion", false,
+                "Run the configured query workload periodically while ingestion is in progress. "
+                        + "Queries use a separate autocommit connection. Recall is not computed "
+                        + "mid-ingestion (ground truth covers the full dataset, not a partial one).");
+        opts.addOption(null, "run-queries-during-ingestion-period", true,
+                "Seconds between consecutive query rounds when --run-queries-during-ingestion is "
+                        + "active (default: 30, minimum: 1)");
         opts.addOption(null, "config", true, "Path to properties file");
         opts.addOption("h", "help", false, "Show help");
         return opts;
@@ -282,6 +304,13 @@ public class Config {
         }
         if (cmd.hasOption("status-interval-seconds")) {
             cfg.statusIntervalSeconds = Integer.parseInt(cmd.getOptionValue("status-interval-seconds"));
+        }
+        if (cmd.hasOption("run-queries-during-ingestion")) {
+            cfg.runQueriesDuringIngestion = true;
+        }
+        if (cmd.hasOption("run-queries-during-ingestion-period")) {
+            cfg.runQueriesDuringIngestionPeriodSeconds = Integer.parseInt(
+                    cmd.getOptionValue("run-queries-during-ingestion-period"));
         }
 
         // Validate batch/transaction/ingest-max-ops invariants. We surface these as
@@ -427,6 +456,13 @@ public class Config {
         if (props.containsKey("status-interval-seconds")) {
             statusIntervalSeconds = Integer.parseInt(props.getProperty("status-interval-seconds"));
         }
+        if (props.containsKey("run-queries-during-ingestion")) {
+            runQueriesDuringIngestion = Boolean.parseBoolean(props.getProperty("run-queries-during-ingestion"));
+        }
+        if (props.containsKey("run-queries-during-ingestion-period")) {
+            runQueriesDuringIngestionPeriodSeconds = Integer.parseInt(
+                    props.getProperty("run-queries-during-ingestion-period"));
+        }
     }
 
     private static void parseResumeFrom(Config cfg, String raw) {
@@ -566,6 +602,8 @@ public class Config {
                 + ", noProgress=" + noProgress
                 + ", outputFormat=" + outputFormat
                 + ", statusIntervalSeconds=" + statusIntervalSeconds
+                + ", runQueriesDuringIngestion=" + runQueriesDuringIngestion
+                + ", runQueriesDuringIngestionPeriodSeconds=" + runQueriesDuringIngestionPeriodSeconds
                 + '}';
     }
 }

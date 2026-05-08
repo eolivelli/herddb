@@ -494,6 +494,81 @@ class VectorBenchTest {
         assertTrue(elapsed >= 0.0, "elapsed time must be non-negative");
     }
 
+    // -----------------------------------------------------------------------
+    // --run-queries-during-ingestion / --run-queries-during-ingestion-period
+    // -----------------------------------------------------------------------
+
+    @Test
+    void configRunQueriesDuringIngestionDefaultIsFalse() throws Exception {
+        Config cfg = Config.parse(new String[]{});
+        assertEquals(false, cfg.runQueriesDuringIngestion);
+    }
+
+    @Test
+    void configRunQueriesDuringIngestionPeriodDefaultIs30() throws Exception {
+        Config cfg = Config.parse(new String[]{});
+        assertEquals(30, cfg.runQueriesDuringIngestionPeriodSeconds);
+    }
+
+    @Test
+    void configRunQueriesDuringIngestionFlagEnablesFeature() throws Exception {
+        Config cfg = Config.parse(new String[]{"--run-queries-during-ingestion"});
+        assertEquals(true, cfg.runQueriesDuringIngestion);
+    }
+
+    @Test
+    void configRunQueriesDuringIngestionPeriodParsedFromCli() throws Exception {
+        Config cfg = Config.parse(new String[]{
+                "--run-queries-during-ingestion",
+                "--run-queries-during-ingestion-period", "120"
+        });
+        assertEquals(true, cfg.runQueriesDuringIngestion);
+        assertEquals(120, cfg.runQueriesDuringIngestionPeriodSeconds);
+    }
+
+    @Test
+    void configRunQueriesDuringIngestionPeriodCanBeSetWithoutEnablingFlag() throws Exception {
+        // Period can be pre-configured even if the feature is off; the flag
+        // controls whether the thread is actually started.
+        Config cfg = Config.parse(new String[]{"--run-queries-during-ingestion-period", "60"});
+        assertEquals(false, cfg.runQueriesDuringIngestion);
+        assertEquals(60, cfg.runQueriesDuringIngestionPeriodSeconds);
+    }
+
+    @Test
+    void configRunQueriesDuringIngestionParsedFromPropertiesFile(@TempDir java.io.File tmpDir)
+            throws Exception {
+        java.io.File props = new java.io.File(tmpDir, "bench.properties");
+        try (java.io.PrintWriter pw = new java.io.PrintWriter(props)) {
+            pw.println("run-queries-during-ingestion=true");
+            pw.println("run-queries-during-ingestion-period=45");
+        }
+        Config cfg = Config.parse(new String[]{"--config", props.getAbsolutePath()});
+        assertEquals(true, cfg.runQueriesDuringIngestion);
+        assertEquals(45, cfg.runQueriesDuringIngestionPeriodSeconds);
+    }
+
+    @Test
+    void configToStringIncludesRunQueriesDuringIngestion() throws Exception {
+        Config cfg = Config.parse(new String[]{"--run-queries-during-ingestion",
+                "--run-queries-during-ingestion-period", "90"});
+        String s = cfg.toString();
+        assertTrue(s.contains("runQueriesDuringIngestion=true"),
+                "toString() must include runQueriesDuringIngestion=true; got: " + s);
+        assertTrue(s.contains("runQueriesDuringIngestionPeriodSeconds=90"),
+                "toString() must include runQueriesDuringIngestionPeriodSeconds=90; got: " + s);
+    }
+
+    @Test
+    void configToStringShowsDefaultsWhenFeatureIsDisabled() throws Exception {
+        Config cfg = Config.parse(new String[]{});
+        String s = cfg.toString();
+        assertTrue(s.contains("runQueriesDuringIngestion=false"),
+                "toString() must include runQueriesDuringIngestion=false by default; got: " + s);
+        assertTrue(s.contains("runQueriesDuringIngestionPeriodSeconds=30"),
+                "toString() must include runQueriesDuringIngestionPeriodSeconds=30 by default; got: " + s);
+    }
+
     private static void writeLittleEndianInt(DataOutputStream dos, int value) throws Exception {
         byte[] buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array();
         dos.write(buf);

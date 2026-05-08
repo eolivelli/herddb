@@ -532,6 +532,91 @@ public class VectorBench {
                 statusThread.start();
             }
 
+            // Optional during-ingestion query thread: every runQueriesDuringIngestionPeriodSeconds,
+            // run the full query workload using a dedicated autocommit connection (independent of
+            // all ingest workers). Recall is intentionally not computed here because the ground-truth
+            // file covers the complete dataset, not the partially ingested state.
+            Thread duringIngestionQueryThread = null;
+            if (config.runQueriesDuringIngestion) {
+                final long queryPeriodMs = (long) config.runQueriesDuringIngestionPeriodSeconds * 1000L;
+                final List<float[]> capturedQueryVectors = queryVectors;
+                final long capturedIngestStart = ingestStart;
+                duringIngestionQueryThread = new Thread(() -> {
+                    long nextRun = System.currentTimeMillis() + queryPeriodMs;
+                    int roundNumber = 0;
+                    while (!ingestDone.get()) {
+                        try {
+                            long now = System.currentTimeMillis();
+                            if (now < nextRun) {
+                                Thread.sleep(Math.min(500L, nextRun - now));
+                                continue;
+                            }
+                            nextRun = now + queryPeriodMs;
+                            roundNumber++;
+                            // Each round opens a fresh connection so the query thread never
+                            // holds a connection across sleep intervals.
+                            // JDBC connections default to autocommit=true, which is what we
+                            // want: no explicit transaction wrapping for these sampling queries.
+                            MetricsCollector roundMetrics = new MetricsCollector();
+                            int queriesThisRound = 0;
+                            int zeroResultQueries = 0;
+                            try (Connection qConn = DriverManager.getConnection(
+                                    config.effectiveJdbcUrl(), config.username, config.password)) {
+                                int k = config.topK;
+                                String sql = "SELECT id FROM " + config.tableName
+                                        + " ORDER BY ann_of(vec, CAST(? AS FLOAT ARRAY)) DESC LIMIT " + k;
+                                try (java.sql.PreparedStatement qPs = qConn.prepareStatement(sql)) {
+                                    for (float[] qVec : capturedQueryVectors) {
+                                        if (ingestDone.get()) {
+                                            break;
+                                        }
+                                        long qStart = System.nanoTime();
+                                        qPs.setObject(1, qVec);
+                                        int resultCount = 0;
+                                        try (java.sql.ResultSet rs = qPs.executeQuery()) {
+                                            while (rs.next()) {
+                                                resultCount++;
+                                            }
+                                        }
+                                        roundMetrics.record(System.nanoTime() - qStart);
+                                        queriesThisRound++;
+                                        if (resultCount == 0) {
+                                            zeroResultQueries++;
+                                        }
+                                    }
+                                }
+                            } catch (java.sql.SQLException e) {
+                                out.info("[ingest_query] round " + roundNumber
+                                        + " failed: " + e.getMessage());
+                                continue;
+                            }
+                            MetricsCollector.Stats s = roundMetrics.computeStatsUncached();
+                            double elapsed = (System.nanoTime() - capturedIngestStart) / 1e9;
+                            double qps = elapsed > 0 ? queriesThisRound / elapsed : 0.0;
+                            LinkedHashMap<String, Object> fields = new LinkedHashMap<>();
+                            fields.put("round", roundNumber);
+                            fields.put("queries_run", queriesThisRound);
+                            fields.put("zero_result_queries", zeroResultQueries);
+                            fields.put("qps", round2(qps));
+                            fields.put("latency_mean_ms", round2(s.meanNanos() / 1e6));
+                            fields.put("latency_p50_ms", round2(s.p50Nanos() / 1e6));
+                            fields.put("latency_p99_ms", round2(s.p99Nanos() / 1e6));
+                            fields.put("latency_max_ms", round2(s.maxNanos() / 1e6));
+                            // Recall is intentionally omitted: the ground-truth file is for the
+                            // full dataset; computing recall against a partial ingest would be
+                            // misleading (and would require knowing the partial ground truth).
+                            fields.put("recall", "N/A (ingestion in progress)");
+                            out.status("ingest_query", elapsed, fields);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                }, "vector-bench-ingest-query");
+                duringIngestionQueryThread.setDaemon(true);
+                duringIngestionQueryThread.start();
+            }
+
             long vectorsEmitted = 0;
             try (DatasetLoader.VectorStream stream = loader.streamBaseVectors(config.resumeFrom, toIngest)) {
                 for (float[] vec : stream) {
@@ -590,6 +675,9 @@ public class VectorBench {
             progressThread.join();
             if (statusThread != null) {
                 statusThread.join();
+            }
+            if (duringIngestionQueryThread != null) {
+                duringIngestionQueryThread.join();
             }
             double ingestSecs = (System.nanoTime() - ingestStart) / 1e9;
             out.phaseDone("ingest", ingestSecs);
