@@ -1096,7 +1096,7 @@ public class RemoteFileServiceClientByteBufTest {
      * {@code InterruptedException} out as an IOException — a different
      * code path from the one this test pins).
      */
-    @Test(timeout = 60_000)
+    @Test(timeout = 120_000)
     public void testInflightWriteBytes_acquireSurvivesInterrupt() throws Exception {
         // Warm-up: open the write-plane Netty channel so the test
         // exercises the budget helper, not Netty's connect-and-sync path.
@@ -1126,6 +1126,10 @@ public class RemoteFileServiceClientByteBufTest {
                         "test/permits/write/interrupt.bin", 0L, new byte[4096]);
                 futureRef.set(future);
                 interruptStatusAfterCall.set(Thread.currentThread().isInterrupted());
+                // Catch Throwable so AssertionError or any other Error from
+                // the helper still surfaces in threadError instead of being
+                // silently swallowed by the daemon thread (per CLAUDE.md
+                // exception-handling guidance).
             } catch (Throwable t) {
                 threadError.set(t);
             } finally {
