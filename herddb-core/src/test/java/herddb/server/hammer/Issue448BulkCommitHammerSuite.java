@@ -128,9 +128,11 @@ public abstract class Issue448BulkCommitHammerSuite {
      * shrink, or modify that set.
      *
      * <p>Reduced from 60 to 30 to speed up both the pre-populate phase and
-     * the post-run key-level verification (issue #456).  30 rows per thread
-     * at ~470 bytes each fills ~56 KB across 4 threads, which still exceeds
-     * the 32 KB page-cache budget and guarantees eviction pressure.
+     * the post-run key-level verification (issue #456).  At ~250–300 bytes
+     * per row, 30 rows × 4 threads ≈ 30–36 KB of initial data — at the
+     * boundary of the 32 KB page-cache budget — which is sufficient to
+     * trigger eviction pressure; the {@code assertTrue(delta &gt; 0)} assertion
+     * on {@code parallelUnloadsCount} confirms this empirically on every run.
      */
     protected static final int INITIAL_ROWS_PER_THREAD = 30;
 
