@@ -25,12 +25,13 @@ import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.index.vector.PersistentVectorStore;
+import herddb.log.LogSequenceNumber;
 import herddb.mem.MemoryDataStorageManager;
+import herddb.storage.IndexStatus;
 import herddb.utils.Bytes;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import java.nio.file.Path;
 import java.util.Random;
-import java.util.concurrent.atomic.AtomicLong;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -42,22 +43,42 @@ import org.junit.rules.TemporaryFolder;
  * <p>Before the fix, {@code PersistentVectorStore.estimatedMemoryUsageBytes()}
  * iterated over every {@code VectorSegment} on every call.  At ~14 k+ segments
  * during tailing catch-up it dominated IS CPU on async-profiler flamegraphs.
- * The fix replaces the iteration with an {@link AtomicLong} counter maintained
+ * The fix replaces the iteration with an {@code AtomicLong} counter maintained
  * incrementally at every mutation of the {@code segments} list.
  *
- * <p>These tests cross-check the counter against an independent
- * "ground-truth" value (the {@code estimatedMemoryUsageBytes()} call itself,
- * which now reads the same counter, plus the additional invariants below)
- * and exercise every lifecycle event: empty store, after first checkpoint,
- * after second checkpoint, on close, and after restart from persisted state.
+ * <p>Each test method exercises one lifecycle path and then calls
+ * {@link #assertCounterMatchesIteration} to compare the counter
+ * ({@code getOnDiskSegmentsEstimatedMemoryBytes()}) against an independent
+ * iterated ground truth
+ * ({@code sumOnDiskSegmentMemoryBytesByIterationForTesting()}).  A missed
+ * register/unregister at any future mutation site would cause the two values
+ * to diverge and the assertion to fail — which is the test contract this
+ * class enforces.
  *
- * <p>The intent is that any future mutation site on {@code segments} that
- * forgets to call register/unregister will fail at least one assertion here.
+ * <p>The cross-check is invoked only at "clean" lifecycle points where no
+ * BLink page-cache activity can have shifted a registered segment's
+ * {@code estimatedInMemoryBytes()} since registration: immediately after
+ * {@code start()}, after each {@code checkpoint()}, after
+ * {@code runCompactionCycle()}, after {@code reloadFromStatus()}, and after
+ * the all-deleted checkpoint that clears the segment list.
  */
 public class PersistentVectorStoreEstimatedMemoryCounterTest {
 
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
+
+    /**
+     * Cross-checks that the incremental counter equals the live iterated sum.
+     * Use only at "clean" lifecycle points (see class Javadoc).
+     */
+    private void assertCounterMatchesIteration(PersistentVectorStore store, String label) {
+        long counter = store.getOnDiskSegmentsEstimatedMemoryBytes();
+        long iterated = store.sumOnDiskSegmentMemoryBytesByIterationForTesting();
+        assertEquals("[" + label + "] on-disk-segment counter must equal the iterated"
+                + " sum of seg.estimatedInMemoryBytes() — a missed register/unregister"
+                + " at any segments-list mutation site would cause these to diverge",
+                iterated, counter);
+    }
 
     private PersistentVectorStore createStore(Path tmpDir, MemoryDataStorageManager dsm,
                                               MemoryManager mm, String indexUUID) {
@@ -81,7 +102,8 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
     }
 
     /**
-     * Empty store (no segments yet): the on-disk counter must be exactly 0.
+     * Empty store (no segments yet): the on-disk counter must be exactly 0
+     * and the iterated sum must agree.
      */
     @Test
     public void testCounterStartsAtZero() throws Exception {
@@ -95,15 +117,17 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
                     0L, store.getOnDiskSegmentsEstimatedMemoryBytes());
             assertEquals("empty store must have zero segments",
                     0, store.getSegmentCount());
+            assertCounterMatchesIteration(store, "empty");
         }
     }
 
     /**
      * After a single checkpoint the counter must become non-zero (segments
      * exist now and each one's pkData/pkOffsets/pkLengths arrays plus its
-     * BLink.getUsedMemory() contribute) and {@code estimatedMemoryUsageBytes()}
-     * must be at least the on-disk-segment portion (plus whatever live-shard
-     * overhead the empty post-checkpoint shards still report).
+     * BLink contribute), the live iterated sum must agree exactly, and
+     * {@code estimatedMemoryUsageBytes()} must be at least the on-disk
+     * portion (plus whatever live-shard overhead the empty post-checkpoint
+     * shards still report).
      */
     @Test
     public void testCounterIsPopulatedAfterCheckpoint() throws Exception {
@@ -118,7 +142,7 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
 
         try (PersistentVectorStore store = createStore(tmpDir, dsm, mm, "uuid-ckpt")) {
             store.start();
-            assertEquals(0L, store.getOnDiskSegmentsEstimatedMemoryBytes());
+            assertCounterMatchesIteration(store, "after start");
 
             for (int i = 0; i < numVectors; i++) {
                 store.addVector(Bytes.from_int(i), randomVector(rng, dim));
@@ -127,6 +151,7 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
             // still zero because no segments have been registered yet.
             assertEquals("on-disk counter must remain zero before any checkpoint",
                     0L, store.getOnDiskSegmentsEstimatedMemoryBytes());
+            assertCounterMatchesIteration(store, "before first checkpoint");
 
             store.checkpoint();
 
@@ -138,6 +163,7 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
                     + " (pkData+pkOffsets+pkLengths for " + numVectors
                     + " vectors), got " + onDisk,
                     onDisk >= pkArrayLowerBound);
+            assertCounterMatchesIteration(store, "after first checkpoint");
 
             long total = store.estimatedMemoryUsageBytes();
             assertTrue("estimatedMemoryUsageBytes() must include the on-disk counter,"
@@ -147,13 +173,12 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
     }
 
     /**
-     * Each successive checkpoint that produces fresh segments must monotonically
-     * grow the counter (ignoring compaction, which is disabled in this test).
-     * This catches a regression where the Phase C swap forgets to register the
-     * newly-preloaded segments.
+     * Successive checkpoints must keep the counter in lockstep with the
+     * iterated sum.  Catches a regression where the Phase C swap forgets to
+     * register the newly-preloaded segments.
      */
     @Test
-    public void testCounterGrowsAcrossCheckpoints() throws Exception {
+    public void testCounterMatchesIterationAcrossCheckpoints() throws Exception {
         Path tmpDir = tmpFolder.newFolder("counter-grow").toPath();
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         MemoryManager mm = new MemoryManager(128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
@@ -172,39 +197,36 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
             long afterFirst = store.getOnDiskSegmentsEstimatedMemoryBytes();
             assertTrue("after first checkpoint counter must be > 0, got " + afterFirst,
                     afterFirst > 0);
-            int segsAfterFirst = store.getSegmentCount();
+            assertCounterMatchesIteration(store, "after first checkpoint");
 
             for (int i = batch; i < batch * 2; i++) {
                 store.addVector(Bytes.from_int(i), randomVector(rng, dim));
             }
             store.checkpoint();
             long afterSecond = store.getOnDiskSegmentsEstimatedMemoryBytes();
-            int segsAfterSecond = store.getSegmentCount();
-            // We may either accumulate a fresh segment or extend an existing
-            // one; either way the counter must not decrease and the segment
-            // count must not decrease.
-            assertTrue("after second checkpoint counter must be >= afterFirst,"
-                    + " afterFirst=" + afterFirst + " afterSecond=" + afterSecond,
-                    afterSecond >= afterFirst);
-            assertTrue("after second checkpoint segCount must be >= segsAfterFirst,"
-                    + " first=" + segsAfterFirst + " second=" + segsAfterSecond,
-                    segsAfterSecond >= segsAfterFirst);
+            assertTrue("after second checkpoint counter must be > 0, got " + afterSecond,
+                    afterSecond > 0);
+            assertCounterMatchesIteration(store, "after second checkpoint");
+
+            // Third batch + checkpoint to exercise the Phase C swap once more.
+            for (int i = batch * 2; i < batch * 3; i++) {
+                store.addVector(Bytes.from_int(i), randomVector(rng, dim));
+            }
+            store.checkpoint();
+            assertCounterMatchesIteration(store, "after third checkpoint");
         }
     }
 
     /**
-     * Drop / shutdown path: after the store is closed, every segment must have
-     * been unregistered from the counter.  Since the counter lives on the
-     * store and the store is gone, we instead verify the equivalent invariant
-     * on a fresh store opened on a fresh directory, then on a store reopened
-     * on the same persisted directory.
+     * Drop / restart path: after the store is closed and reopened against the
+     * same persisted directory, {@code loadFromStatus} must register every
+     * segment it reconstructs.  The reopened store's counter must equal the
+     * iterated sum and be at least {@code pkArrayLowerBound}.
      */
     @Test
     public void testCounterReflectsPersistedSegmentsAfterRestart() throws Exception {
         Path tmpDir = tmpFolder.newFolder("counter-restart").toPath();
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
-        // Two separate MemoryManager instances so the second store does not
-        // share the first's BLink page cache; this models a true restart.
         MemoryManager mm1 = new MemoryManager(128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
 
         int numVectors = 400;
@@ -213,25 +235,18 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
         Random rng = new Random(7);
         String indexUUID = "uuid-restart";
 
-        AtomicLong onDiskBeforeClose = new AtomicLong(0);
-
         try (PersistentVectorStore store = createStore(tmpDir, dsm, mm1, indexUUID)) {
             store.start();
             for (int i = 0; i < numVectors; i++) {
                 store.addVector(Bytes.from_int(i), randomVector(rng, dim));
             }
             store.checkpoint();
-            onDiskBeforeClose.set(store.getOnDiskSegmentsEstimatedMemoryBytes());
-            assertTrue("counter must be > 0 after the producing checkpoint, got "
-                    + onDiskBeforeClose.get(), onDiskBeforeClose.get() > 0);
-            assertTrue("counter must be >= pkArrayLowerBound, got "
-                    + onDiskBeforeClose.get(), onDiskBeforeClose.get() >= pkArrayLowerBound);
+            assertCounterMatchesIteration(store, "before close");
+            assertTrue(store.getOnDiskSegmentsEstimatedMemoryBytes() >= pkArrayLowerBound);
         }
 
         // Reopen the same persisted directory: loadFromStatus must register
-        // every segment it reconstructs.  A reasonable lower bound after
-        // restart is pkArrayLowerBound (BLink page cache may carry a slightly
-        // different snapshot, but the static pk arrays are identical).
+        // every segment it reconstructs.
         MemoryManager mm2 = new MemoryManager(128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
         try (PersistentVectorStore store2 = createStore(tmpDir, dsm, mm2, indexUUID)) {
             store2.start();
@@ -242,11 +257,7 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
                     onDiskAfterRestart >= pkArrayLowerBound);
             assertNotEquals("after restart counter must not be zero",
                     0L, onDiskAfterRestart);
-
-            assertTrue("estimatedMemoryUsageBytes() must include the restart counter,"
-                    + " got total=" + store2.estimatedMemoryUsageBytes()
-                    + ", onDisk=" + onDiskAfterRestart,
-                    store2.estimatedMemoryUsageBytes() >= onDiskAfterRestart);
+            assertCounterMatchesIteration(store2, "after restart");
         }
     }
 
@@ -285,6 +296,8 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
                     counterA > 0);
             assertEquals("storeB counter must be 0 (no vectors / no checkpoint), got "
                     + counterB, 0L, counterB);
+            assertCounterMatchesIteration(storeA, "storeA after checkpoint");
+            assertCounterMatchesIteration(storeB, "storeB unchanged");
         }
     }
 
@@ -315,6 +328,7 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
             long afterCheckpoint = store.getOnDiskSegmentsEstimatedMemoryBytes();
             assertTrue("counter must be > 0 after producing checkpoint, got "
                     + afterCheckpoint, afterCheckpoint > 0);
+            assertCounterMatchesIteration(store, "after producing checkpoint");
 
             // Delete every PK so the next checkpoint hits the
             // totalActiveVectors==0 + !segments.isEmpty() branch.
@@ -328,6 +342,141 @@ public class PersistentVectorStoreEstimatedMemoryCounterTest {
                     store.getOnDiskSegmentsEstimatedMemoryBytes());
             assertEquals("segments list must be empty in the all-deleted branch",
                     0, store.getSegmentCount());
+            assertCounterMatchesIteration(store, "after delete-all checkpoint");
+        }
+    }
+
+    /**
+     * Compaction merge path ({@code atomicSwapCompactionResult}): after
+     * {@code runCompactionCycle()} the counter must equal the iterated sum.
+     * Specifically catches a regression where the merge swap forgets to
+     * unregister the input segments or to register the merged output.
+     */
+    @Test
+    public void testCounterAfterCompactionMerge() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("counter-compact").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        MemoryManager mm = new MemoryManager(128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+
+        int dim = 16;
+        int batch = 300;
+        Random rng = new Random(2026);
+
+        try (PersistentVectorStore store = createStore(tmpDir, dsm, mm, "uuid-compact")) {
+            // Aggressive compaction policy so the test cycle actually merges
+            // all of the small per-checkpoint segments into one output.
+            // Args: intervalMs (unused — we drive the cycle ourselves),
+            // minBytes=1, maxBytes=Long.MAX_VALUE, minCount=2,
+            // maxCount=Integer.MAX_VALUE, retentionMs=0.
+            store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 2,
+                    Integer.MAX_VALUE, 0);
+            store.start();
+
+            int totalVectors = 0;
+            for (int c = 0; c < 5; c++) {
+                for (int i = 0; i < batch; i++) {
+                    store.addVector(Bytes.from_int(c * 100_000 + i),
+                            randomVector(rng, dim));
+                    totalVectors++;
+                }
+                store.checkpoint();
+            }
+            int beforeMerge = store.getSegmentCount();
+            assertTrue("must have several segments before merge to make the test"
+                    + " meaningful, got " + beforeMerge, beforeMerge >= 2);
+            long counterBefore = store.getOnDiskSegmentsEstimatedMemoryBytes();
+            assertTrue("counter must be > 0 with " + beforeMerge + " segments,"
+                    + " got " + counterBefore, counterBefore > 0);
+            assertCounterMatchesIteration(store, "before compaction merge");
+
+            store.runCompactionCycle();
+
+            int afterMerge = store.getSegmentCount();
+            assertTrue("compaction must have reduced segment count: before="
+                    + beforeMerge + " after=" + afterMerge,
+                    afterMerge < beforeMerge);
+            // Most importantly: counter must equal iterated sum after the merge.
+            assertCounterMatchesIteration(store, "after compaction merge");
+
+            // Drop a few vectors then checkpoint so the next cycle exercises
+            // the "extend an existing segment" flavour of Phase C.
+            for (int i = 0; i < 50; i++) {
+                store.addVector(Bytes.from_int(999_000 + i), randomVector(rng, dim));
+            }
+            store.checkpoint();
+            assertCounterMatchesIteration(store, "after post-merge checkpoint");
+            // totalVectors used only for failure context above.
+            assertTrue("sanity: at least " + (totalVectors + 50)
+                    + " vectors total were added", totalVectors + 50 >= 1550);
+        }
+    }
+
+    /**
+     * Read-only shadow {@code reloadFromStatus} path: switching the shadow
+     * from one persisted {@code IndexStatus} to another must unregister the
+     * old segments and register the new ones, so the counter stays in
+     * lockstep with the iterated sum after each reload.
+     */
+    @Test
+    public void testCounterAfterReloadFromStatus() throws Exception {
+        Path tmpDir = tmpFolder.newFolder("counter-reload").toPath();
+        MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+        MemoryManager mmLeader = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+        MemoryManager mmShadow = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+        String indexUUID = "uuid-reload";
+
+        int dim = 16;
+        int batch = 300;
+        Random rng = new Random(11);
+
+        try (PersistentVectorStore leader = createStore(tmpDir, dsm, mmLeader, indexUUID);
+             PersistentVectorStore shadow = createStore(tmpDir, dsm, mmShadow, indexUUID)) {
+            // Leader is the writer; tighten compaction so it can produce
+            // a merged-segment IndexStatus to feed the shadow.
+            leader.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 2,
+                    Integer.MAX_VALUE, 0);
+            leader.start();
+            shadow.setReadOnly(true);
+            shadow.start();
+            assertCounterMatchesIteration(shadow, "shadow after start");
+
+            // Leader builds a few segments.
+            for (int c = 0; c < 3; c++) {
+                for (int i = 0; i < batch; i++) {
+                    leader.addVector(Bytes.from_int(c * 100_000 + i),
+                            randomVector(rng, dim));
+                }
+                leader.checkpoint();
+            }
+            int leaderSegmentsPre = leader.getSegmentCount();
+            assertTrue("leader must have multiple segments to drive the test, got "
+                    + leaderSegmentsPre, leaderSegmentsPre >= 2);
+
+            // Shadow reloads to the pre-compaction state.
+            IndexStatus preStatus = dsm.getIndexStatus("tstblspace", indexUUID,
+                    LogSequenceNumber.START_OF_TIME);
+            shadow.reloadFromStatus(preStatus);
+            assertEquals("shadow segment count must match leader pre-compaction",
+                    leaderSegmentsPre, shadow.getSegmentCount());
+            assertTrue("shadow counter must be > 0 after reload",
+                    shadow.getOnDiskSegmentsEstimatedMemoryBytes() > 0);
+            assertCounterMatchesIteration(shadow, "shadow after first reload");
+
+            // Leader compacts to fewer segments.
+            leader.runCompactionCycle();
+            int leaderSegmentsPost = leader.getSegmentCount();
+            assertTrue("compaction must have reduced segment count, before="
+                    + leaderSegmentsPre + " after=" + leaderSegmentsPost,
+                    leaderSegmentsPost < leaderSegmentsPre);
+
+            // Shadow reloads to the post-compaction state.  This exercises the
+            // "unregister all old + register all new" branch of reloadFromStatus.
+            IndexStatus postStatus = dsm.getIndexStatus("tstblspace", indexUUID,
+                    LogSequenceNumber.START_OF_TIME);
+            shadow.reloadFromStatus(postStatus);
+            assertEquals("shadow segment count must match leader post-compaction",
+                    leaderSegmentsPost, shadow.getSegmentCount());
+            assertCounterMatchesIteration(shadow, "shadow after second reload");
         }
     }
 }
