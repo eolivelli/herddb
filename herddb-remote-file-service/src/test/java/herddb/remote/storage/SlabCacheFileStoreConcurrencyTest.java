@@ -30,6 +30,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
@@ -131,23 +132,37 @@ public class SlabCacheFileStoreConcurrencyTest {
                             String key = "k" + rnd.nextInt(KEY_POOL);
                             int choice = rnd.nextInt(10);
                             if (choice < 4) {
-                                // ADMIT.
+                                // ADMIT. tryStore returns null on tier-full (NOT an
+                                // exception) so any exceptional completion or timeout
+                                // here is a real bug — fail the test loudly. The same
+                                // applies to InterruptedException (a stuck slab admit
+                                // is a real bug, not benign).
                                 int variant = variantByKey.get(key).incrementAndGet();
                                 byte[] payload = payloadFor(key, variant);
                                 try {
                                     slab.tryStore(key, bufOf(payload)).get(5, TimeUnit.SECONDS);
                                     totalWrites.incrementAndGet();
-                                } catch (Exception e) {
-                                    // Tier-full / I/O error / interrupted: skip; counts
-                                    // are sanity-checked below.
+                                } catch (java.util.concurrent.TimeoutException te) {
+                                    throw new AssertionError("tryStore stuck for 5s on key " + key, te);
+                                } catch (ExecutionException ee) {
+                                    throw new AssertionError("tryStore failed exceptionally on key " + key, ee);
+                                } catch (InterruptedException ie) {
+                                    Thread.currentThread().interrupt();
+                                    return;
                                 }
                             } else if (choice < 8) {
-                                // READ.
+                                // READ. Same rationale: read returns null on miss
+                                // (NOT an exception). Anything else is a bug.
                                 ByteBuf buf;
                                 try {
                                     buf = slab.read(key).get(5, TimeUnit.SECONDS);
-                                } catch (Exception e) {
-                                    continue;
+                                } catch (java.util.concurrent.TimeoutException te) {
+                                    throw new AssertionError("read stuck for 5s on key " + key, te);
+                                } catch (ExecutionException ee) {
+                                    throw new AssertionError("read failed exceptionally on key " + key, ee);
+                                } catch (InterruptedException ie) {
+                                    Thread.currentThread().interrupt();
+                                    return;
                                 }
                                 if (buf == null) {
                                     continue;

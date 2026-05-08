@@ -32,6 +32,7 @@ import herddb.remote.storage.InMemoryBlockCacheObjectStorage;
 import herddb.remote.storage.LocalObjectStorage;
 import herddb.remote.storage.ObjectStorage;
 import herddb.remote.storage.S3ObjectStorage;
+import herddb.remote.storage.SlabCacheFileStore;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
@@ -811,7 +812,7 @@ public class RemoteFileServer implements AutoCloseable {
      * way.
      */
     private static void registerSlabGauges(StatsLogger scope, String tierName,
-                                           herddb.remote.storage.SlabCacheFileStore slab) {
+                                           SlabCacheFileStore slab) {
         registerLongGauge(scope, tierName + "_cell_bytes",
                 () -> slab == null ? 0L : (long) slab.cellSize());
         registerLongGauge(scope, tierName + "_total_cells",

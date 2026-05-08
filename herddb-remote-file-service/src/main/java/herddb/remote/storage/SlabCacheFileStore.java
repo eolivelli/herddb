@@ -33,6 +33,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -123,6 +124,14 @@ public class SlabCacheFileStore implements AutoCloseable {
      * (the cache is volatile). The file is pre-allocated to {@code totalCells * cellSize}
      * bytes so the OS can pick contiguous extents.
      *
+     * Note: the file is sized to {@code totalCells * cellSize} via a one-byte tail
+     * write. On ext4/xfs/apfs and other extent-based filesystems this creates a
+     * sparse file (the holes materialise as the slab is written into); we do not
+     * attempt to force contiguous on-disk extents. The kept-open
+     * {@link AsynchronousFileChannel} is what avoids the per-admit
+     * {@code open}/{@code close}/{@code create}/{@code delete} syscall cost — not
+     * any layout guarantee of the underlying filesystem.
+     *
      * @param slabFile path of the slab file (parent dir must exist)
      * @param cellSize cell size in bytes; must be {@code > 0}
      * @param totalCells number of cells; must be {@code >= 0} (zero is legal — the
@@ -146,8 +155,10 @@ public class SlabCacheFileStore implements AutoCloseable {
                 StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE);
         if (totalCells > 0) {
             try {
-                // Note: AsynchronousFileChannel does not have a truncate-up operation,
-                // so we extend the file by writing one byte at the last position.
+                // Size the file to totalCells * cellSize via a one-byte tail write.
+                // AsynchronousFileChannel does not have a truncate-up operation; on
+                // common extent-based filesystems this creates a sparse file (holes
+                // are realised as the slab is written into).
                 ByteBuffer one = ByteBuffer.allocate(1);
                 CompletableFuture<Integer> latch = new CompletableFuture<>();
                 channel.write(one, (long) totalCells * cellSize - 1, null,
@@ -163,16 +174,25 @@ public class SlabCacheFileStore implements AutoCloseable {
                             }
                         });
                 latch.get();
-            } catch (Exception e) {
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
                 try {
                     channel.close();
                 } catch (IOException ignored) {
                     // Best-effort; we're already throwing.
                 }
-                if (e instanceof IOException) {
-                    throw (IOException) e;
+                throw new IOException("Interrupted while pre-allocating slab file " + slabFile, ie);
+            } catch (ExecutionException ee) {
+                try {
+                    channel.close();
+                } catch (IOException ignored) {
+                    // Best-effort; we're already throwing.
                 }
-                throw new IOException("Failed to pre-allocate slab file " + slabFile, e);
+                Throwable cause = ee.getCause();
+                if (cause instanceof IOException) {
+                    throw (IOException) cause;
+                }
+                throw new IOException("Failed to pre-allocate slab file " + slabFile, ee);
             }
         }
         for (int i = 0; i < totalCells; i++) {

@@ -365,9 +365,10 @@ public class CachingObjectStorage implements ObjectStorage {
                 fallbackFileCount.decrementAndGet();
                 fallbackBytes.addAndGet(-payloadLength);
             } else {
-                // File already gone (e.g. cache cleared); still drop the counters so
-                // the gauges don't drift. Use a CAS-loop pattern via getAndUpdate to
-                // avoid going negative on duplicate eviction notifications.
+                // File already gone (e.g. clearCacheDir on construction racing with
+                // a stale eviction notification, or a manual filesystem-level delete).
+                // Clamp the counters at zero to keep the gauges non-negative under
+                // any unexpected double-eviction.
                 fallbackFileCount.updateAndGet(v -> v > 0 ? v - 1 : 0);
                 fallbackBytes.updateAndGet(v -> v - payloadLength >= 0 ? v - payloadLength : 0);
             }
@@ -379,6 +380,9 @@ public class CachingObjectStorage implements ObjectStorage {
     /**
      * Asynchronously writes {@code bytes} to a fallback cache file using
      * {@link AsynchronousFileChannel}. Writes to a temp file then atomically renames.
+     * On any failure we delete BOTH the partially-written temp file and the target
+     * (the rename may have run before {@code completed} threw); leaving either
+     * behind would be a per-cache-lifetime leak.
      */
     private CompletableFuture<Void> writeFallbackFileAsync(String path, byte[] bytes) {
         CompletableFuture<Void> result = new CompletableFuture<>();
@@ -397,6 +401,7 @@ public class CachingObjectStorage implements ObjectStorage {
                         Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
                         result.complete(null);
                     } catch (IOException e) {
+                        bestEffortDelete(tmp);
                         bestEffortDelete(target);
                         result.completeExceptionally(e);
                     }
@@ -409,11 +414,13 @@ public class CachingObjectStorage implements ObjectStorage {
                     } catch (IOException ignored) {
                         // Channel close failure during error handling: safe to ignore.
                     }
+                    bestEffortDelete(tmp);
                     bestEffortDelete(target);
                     result.completeExceptionally(exc);
                 }
             });
         } catch (IOException t) {
+            bestEffortDelete(tmp);
             bestEffortDelete(target);
             result.completeExceptionally(t);
         }
@@ -559,14 +566,25 @@ public class CachingObjectStorage implements ObjectStorage {
         }
         if (smallSlab != null && len <= smallSlab.cellSize()) {
             ByteBuf retainedForSmall = buf.retainedDuplicate();
-            return smallSlab.tryStore(path, retainedForSmall).thenCompose(slot -> {
-                if (slot != null) {
-                    putEntry(path, new CacheEntry(TIER_SMALL_SLAB, len));
-                    buf.release();
-                    return CompletableFuture.completedFuture(null);
-                }
-                return tryLargeOrFallbackBuf(path, buf);
-            });
+            // whenComplete fires on BOTH success and exceptional completion so the
+            // outer buf retain (held alongside the retainedDuplicate handed to the
+            // slab) is released exactly once even when tryStore completes
+            // exceptionally — thenCompose only runs on successful completion and
+            // would otherwise leak the pooled direct buffer.
+            return smallSlab.tryStore(path, retainedForSmall)
+                    .whenComplete((slot, err) -> {
+                        if (err != null) {
+                            buf.release();
+                        }
+                    })
+                    .thenCompose(slot -> {
+                        if (slot != null) {
+                            putEntry(path, new CacheEntry(TIER_SMALL_SLAB, len));
+                            buf.release();
+                            return CompletableFuture.completedFuture(null);
+                        }
+                        return tryLargeOrFallbackBuf(path, buf);
+                    });
         }
         return tryLargeOrFallbackBuf(path, buf);
     }
@@ -575,14 +593,23 @@ public class CachingObjectStorage implements ObjectStorage {
         int len = buf.readableBytes();
         if (largeSlab != null && len <= largeSlab.cellSize()) {
             ByteBuf retainedForLarge = buf.retainedDuplicate();
-            return largeSlab.tryStore(path, retainedForLarge).thenCompose(slot -> {
-                if (slot != null) {
-                    putEntry(path, new CacheEntry(TIER_LARGE_SLAB, len));
-                    buf.release();
-                    return CompletableFuture.completedFuture(null);
-                }
-                return copyAndFallback(path, buf);
-            });
+            // Same exceptional-completion guard as admitChooseTier(ByteBuf): release
+            // the outer buf retain whether tryStore resolves with a slot, returns
+            // null (tier-full), or completes exceptionally.
+            return largeSlab.tryStore(path, retainedForLarge)
+                    .whenComplete((slot, err) -> {
+                        if (err != null) {
+                            buf.release();
+                        }
+                    })
+                    .thenCompose(slot -> {
+                        if (slot != null) {
+                            putEntry(path, new CacheEntry(TIER_LARGE_SLAB, len));
+                            buf.release();
+                            return CompletableFuture.completedFuture(null);
+                        }
+                        return copyAndFallback(path, buf);
+                    });
         }
         return copyAndFallback(path, buf);
     }

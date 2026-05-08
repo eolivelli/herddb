@@ -267,12 +267,15 @@ is a **two-tier slab** rather than one file per cached object:
   size fall through to the original one-file-per-object path so
   arbitrarily large objects remain cacheable.
 
-Both slab files are pre-allocated at boot and kept open as
-`AsynchronousFileChannel`s for the JVM lifetime, so admit/evict no longer
-pay `open`/`close`/`create`/`delete` syscalls per cached object. The
-in-memory index (`Map<key, Slot>`) is volatile: the slab files are
-deleted on construction and on close, and the index starts empty on every
-boot — matching the volatile-cache contract.
+Both slab files are sized at boot to `totalCells * cellSize` (sparse file
+on extent-based filesystems) and kept open as `AsynchronousFileChannel`s
+for the JVM lifetime, so admit/evict no longer pay
+`open`/`close`/`create`/`delete` syscalls per cached object — the
+syscall savings come from the kept-open channel, not from any layout
+guarantee on the underlying filesystem. The in-memory index
+(`Map<key, Slot>`) is volatile: the slab files are deleted on
+construction and on close, and the index starts empty on every boot —
+matching the volatile-cache contract.
 
 Knobs (see `fileserver.properties`):
 

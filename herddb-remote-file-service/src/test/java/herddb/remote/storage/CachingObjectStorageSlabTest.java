@@ -26,10 +26,15 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.remote.storage.CachingObjectStorageTest.FakeObjectStorage;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -285,6 +290,58 @@ public class CachingObjectStorageSlabTest {
         assertFalse(caching.isInCache("ts1/huge"));
         assertTrue(caching.isInCache("ts2/small"));
         assertEquals(0L, caching.getFallbackFileCount());
+    }
+
+    @Test
+    public void testInnerBufferReleasedWhenSlabAdmitFailsOnLoadAndCache() throws Exception {
+        // Regression test for the refcount-leak path called out by pr-reviewer:
+        // when CachingObjectStorage.loadAndCache hands a pooled direct ByteBuf to
+        // admitChooseTier(ByteBuf) and the slab admit completes EXCEPTIONALLY (e.g.
+        // closed channel, disk-full, I/O error), the outer buf retain held alongside
+        // the retainedDuplicate handed to the slab must still be released exactly
+        // once. Without the whenComplete-on-error guard, that retain leaked because
+        // thenCompose only fires on successful completion.
+        AtomicReference<ByteBuf> capturedBuf = new AtomicReference<>();
+        FakeObjectStorage inner = new FakeObjectStorage() {
+            @Override
+            public CompletableFuture<ReadResult> read(String path) {
+                readCalls.incrementAndGet();
+                byte[] bytes = data.get(path);
+                if (bytes == null) {
+                    return CompletableFuture.completedFuture(ReadResult.notFound());
+                }
+                ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(bytes.length);
+                buf.writeBytes(bytes);
+                capturedBuf.set(buf);
+                return CompletableFuture.completedFuture(ReadResult.found(buf));
+            }
+        };
+        byte[] payload = "payload bytes for slab admit failure".getBytes();
+        inner.data.put("k1", payload);
+
+        try (CachingObjectStorage caching = build(inner, 1024 * 1024, defaultTestSlabConfig())) {
+            // Close both slabs so any tryStore call resolves exceptionally.
+            caching.getSmallSlab().close();
+            caching.getLargeSlab().close();
+
+            // Trigger the slab admit failure via loadAndCache. The future returned
+            // by caching.read should fail (admitToDisk's whenComplete propagates
+            // the exception to the read future).
+            ExecutionException thrown = null;
+            try {
+                ReadResult result = caching.read("k1").get();
+                if (result != null) {
+                    result.release();
+                }
+            } catch (ExecutionException expected) {
+                thrown = expected;
+            }
+            assertNotNull("read must propagate the slab admit failure", thrown);
+            assertNotNull("inner.read must have been called", capturedBuf.get());
+            assertEquals(
+                    "inner pooled ByteBuf must be fully released after slab admit failure",
+                    0, capturedBuf.get().refCnt());
+        }
     }
 
     @Test
