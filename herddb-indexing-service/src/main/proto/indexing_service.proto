@@ -206,37 +206,32 @@ message PrimaryKeysChunk {
 message GetEngineStatsRequest {
 }
 
+// Tagged union for engine-stats values. Issue #463: the engine-stats RPC
+// surface used to be a frozen schema of ~20 typed fields, so every new
+// counter required a proto migration. The response is now a flat
+// repeated list of (key, MetricValue) entries — adding a metric is just
+// `addInt64(builder, "new_metric", value)` server-side.
+message MetricValue {
+    oneof kind {
+        int64 int64_value = 1;
+        double double_value = 2;
+        bool bool_value = 3;
+        string string_value = 4;
+    }
+}
+
+message MetricEntry {
+    string key = 1;
+    MetricValue value = 2;
+}
+
 message GetEngineStatsResponse {
-    int64 uptime_millis = 1;
-    int64 tailer_watermark_ledger = 2;
-    int64 tailer_watermark_offset = 3;
-    int64 tailer_entries_processed = 4;
-    bool tailer_running = 5;
-    int32 apply_queue_size = 6;
-    int32 apply_queue_capacity = 7;
-    int64 total_estimated_memory_bytes = 8;
-    int32 loaded_index_count = 9;
-    int32 apply_parallelism = 10;
-    // JVM heap (issue #80): read from ManagementFactory.getMemoryMXBean()
-    int64 jvm_heap_used_bytes = 11;
-    int64 jvm_heap_max_bytes = 12;
-    int32 jvm_heap_used_pct = 13;
-    // Issue #459: per-operation-type tailer counters. All monotonically
-    // increasing since JVM start; rates are derived by the consumer.
-    // entries_accepted = INSERT + UPDATE + DELETE entries (intent to
-    // mutate the HNSW graph). entries_skipped = DDL + NOOP + REBALANCE +
-    // BEGIN/COMMIT/ROLLBACKTRANSACTION (no graph mutation).
-    int64 tailer_entries_accepted = 14;
-    int64 tailer_entries_skipped = 15;
-    int64 tailer_inserts = 16;
-    int64 tailer_updates = 17;
-    int64 tailer_deletes = 18;
-    int64 tailer_ddl = 19;
-    // Number of read batches the underlying tailer has completed: one
-    // poll/follow cycle that processed at least one entry counts as one
-    // batch. Together with tailer_entries_processed this lets operators
-    // spot pathological "many tiny batches" patterns.
-    int64 tailer_batches = 20;
+    // Ordered list of (key, MetricValue) pairs. The server emits them in a
+    // deterministic, human-readable order so the indexing-admin CLI text
+    // output stays stable across releases. Consumers MUST NOT assume any
+    // particular subset of keys is always present — tests that need a
+    // specific metric key should look it up by name, not by position.
+    repeated MetricEntry metrics = 1;
 }
 
 message GetInstanceInfoRequest {

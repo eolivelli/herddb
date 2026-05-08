@@ -222,9 +222,19 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      *       COMMITTRANSACTION ultimately replays are themselves DML and were
      *       already classified as accepted on their original arrival.</li>
      * </ul>
+     *
+     * <p>Issue #463: {@link #tailerEntriesShardFiltered} is bumped from
+     * {@link #applyInsert(LogEntry)}, NOT from {@code classifyForMetrics} —
+     * the shard-filter decision is per-key + per-index and only knowable
+     * after schema lookup. It counts INSERT entries this replica did NOT
+     * apply because every vector index for the table rejected the key
+     * via {@link #isAcceptedLocally(Bytes, Index)}. UPDATE entries are
+     * not tracked here because their broadcast remove still mutates state
+     * on every replica, regardless of shard ownership.
      */
     private final LongAdder tailerEntriesAccepted = new LongAdder();
     private final LongAdder tailerEntriesSkipped = new LongAdder();
+    private final LongAdder tailerEntriesShardFiltered = new LongAdder();
     private final LongAdder tailerInserts = new LongAdder();
     private final LongAdder tailerUpdates = new LongAdder();
     private final LongAdder tailerDeletes = new LongAdder();
@@ -1103,6 +1113,27 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         return tailerEntriesSkipped.sum();
     }
 
+    /**
+     * Issue #463: INSERT entries this replica did not apply because every
+     * vector index defined on the entry's table rejected the key via the
+     * shard filter. Operators verify the filter is doing its job by
+     * watching this counter rise — for a balanced {@code numShards} ≥
+     * {@code numInstances} configuration it should track roughly
+     * {@code (numInstances - 1) / numInstances} of {@link #getTailerInserts()}.
+     *
+     * <p>The counter excludes:
+     * <ul>
+     *   <li>INSERTs whose table has no vector index (different reason —
+     *       not a shard-filter rejection);</li>
+     *   <li>UPDATE / DELETE entries (UPDATE always does a broadcast remove
+     *       on every replica, DELETE is broadcast unconditionally — neither
+     *       is "filtered out" the same way an INSERT can be).</li>
+     * </ul>
+     */
+    public long getTailerEntriesShardFiltered() {
+        return tailerEntriesShardFiltered.sum();
+    }
+
     /** Issue #459: INSERT entries the tailer has classified. */
     public long getTailerInserts() {
         return tailerInserts.sum();
@@ -1891,6 +1922,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
         Record record = new Record(entry.key, entry.value);
         DataAccessorForFullRecord accessor = new DataAccessorForFullRecord(table, record);
+        // Issue #463: track whether AT LEAST one vector index for this table
+        // accepted the key locally. If every applicable index rejects it via
+        // the shard filter, the entry contributes nothing to local state and
+        // we bump tailerEntriesShardFiltered so operators can confirm the
+        // filter is firing in production. Note this is strictly a "rejected
+        // by every index" counter — INSERTs on tables with no vector index
+        // hit the early return above and are NOT counted here (different
+        // reason: no vector indexing applies).
+        boolean anyIndexAcceptedKey = false;
         for (Index idx : vectorIndexes) {
             // Per-index ownership: indexes on the same table may have different
             // numInstances (e.g. a pre-rebalance index with N=2 next to a
@@ -1898,6 +1938,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             if (!isAcceptedLocally(entry.key, idx)) {
                 continue;
             }
+            anyIndexAcceptedKey = true;
             AbstractVectorStore store = vectorStores.get(storeKey(tableName, idx.name));
             if (store == null) {
                 continue;
@@ -1906,6 +1947,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             if (vector != null) {
                 store.addVector(entry.key, vector);
             }
+        }
+        if (!anyIndexAcceptedKey) {
+            tailerEntriesShardFiltered.increment();
         }
     }
 
@@ -3155,6 +3199,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             @Override
             public Long getSample() {
                 return tailerEntriesSkipped.sum();
+            }
+        });
+        // Issue #463: INSERT entries this replica did not apply because the
+        // shard filter rejected the key on every vector index defined on the
+        // entry's table. Operators verify cross-replica sharding is actually
+        // happening by watching this rise to ~(N-1)/N of `tailer_inserts`.
+        tailerStats.registerGauge("entries_shard_filtered", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return tailerEntriesShardFiltered.sum();
             }
         });
         tailerStats.registerGauge("inserts", new Gauge<Long>() {

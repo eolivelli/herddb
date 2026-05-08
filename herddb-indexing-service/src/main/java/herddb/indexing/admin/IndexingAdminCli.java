@@ -28,6 +28,8 @@ import herddb.indexing.proto.GetInstanceInfoResponse;
 import herddb.indexing.proto.GetShadowStatusResponse;
 import herddb.indexing.proto.IndexDescriptor;
 import herddb.indexing.proto.ListIndexesResponse;
+import herddb.indexing.proto.MetricEntry;
+import herddb.indexing.proto.MetricValue;
 import herddb.indexing.proto.PrimaryKeysChunk;
 import herddb.indexing.proto.WaitForCheckpointResponse;
 import herddb.metadata.IndexingServiceInstanceDescriptor;
@@ -391,33 +393,23 @@ public final class IndexingAdminCli {
         }
         try (IndexingAdminClient client = buildClient(cli)) {
             GetEngineStatsResponse response = client.getEngineStats();
+            Map<String, Object> map = engineStatsToMap(response);
             if (cli.hasOption("json")) {
-                out.println(JsonWriter.toJson(engineStatsToMap(response)));
+                out.println(JsonWriter.toJson(map));
             } else {
+                // Issue #463: the wire response is now a generic
+                // (key, MetricValue) list, so the CLI renders the text output
+                // by walking the list in the order the server emitted it.
+                // Keys are left-padded to 31 characters: enough room for the
+                // longest current key (`tailer_entries_shard_filtered`, 29
+                // chars) plus a 2-char separator before `=`, with comfortable
+                // space for future metrics. The separator is ` = ` (space-
+                // equals-space) so a key that exactly fills the field width
+                // still has visible whitespace between key and value.
                 out.println("Engine stats:");
-                out.printf(Locale.ROOT, "  uptime_ms                   = %d%n", response.getUptimeMillis());
-                out.printf(Locale.ROOT, "  tailer_running              = %s%n", response.getTailerRunning());
-                out.printf(Locale.ROOT, "  tailer_watermark            = %d/%d%n",
-                        response.getTailerWatermarkLedger(), response.getTailerWatermarkOffset());
-                out.printf(Locale.ROOT, "  tailer_entries_processed    = %d%n", response.getTailerEntriesProcessed());
-                // Issue #459: per-operation-type breakdown of the tailer's
-                // commit-log workload. accepted = INSERT/UPDATE/DELETE; skipped =
-                // DDL + NOOP + REBALANCE + transactional control entries.
-                out.printf(Locale.ROOT, "  tailer_entries_accepted     = %d%n", response.getTailerEntriesAccepted());
-                out.printf(Locale.ROOT, "  tailer_entries_skipped      = %d%n", response.getTailerEntriesSkipped());
-                out.printf(Locale.ROOT, "  tailer_inserts              = %d%n", response.getTailerInserts());
-                out.printf(Locale.ROOT, "  tailer_updates              = %d%n", response.getTailerUpdates());
-                out.printf(Locale.ROOT, "  tailer_deletes              = %d%n", response.getTailerDeletes());
-                out.printf(Locale.ROOT, "  tailer_ddl                  = %d%n", response.getTailerDdl());
-                out.printf(Locale.ROOT, "  tailer_batches              = %d%n", response.getTailerBatches());
-                out.printf(Locale.ROOT, "  apply_queue_size/capacity   = %d / %d%n",
-                        response.getApplyQueueSize(), response.getApplyQueueCapacity());
-                out.printf(Locale.ROOT, "  apply_parallelism           = %d%n", response.getApplyParallelism());
-                out.printf(Locale.ROOT, "  loaded_index_count          = %d%n", response.getLoadedIndexCount());
-                out.printf(Locale.ROOT, "  total_estimated_memory_bytes= %d%n", response.getTotalEstimatedMemoryBytes());
-                out.printf(Locale.ROOT, "  jvm_heap                    = %d / %d bytes (%d%%)%n",
-                        response.getJvmHeapUsedBytes(), response.getJvmHeapMaxBytes(),
-                        response.getJvmHeapUsedPct());
+                for (Map.Entry<String, Object> e : map.entrySet()) {
+                    out.printf(Locale.ROOT, "  %-31s = %s%n", e.getKey(), e.getValue());
+                }
             }
         }
         return 0;
@@ -545,28 +537,34 @@ public final class IndexingAdminCli {
     }
 
     private static Map<String, Object> engineStatsToMap(GetEngineStatsResponse r) {
+        // Issue #463: walk the server's ordered (key, MetricValue) list and
+        // unbox each oneof case to the matching boxed Java type. Insertion
+        // order is preserved so both the text renderer and JsonWriter emit
+        // metrics in the same order the server intended.
         Map<String, Object> m = new LinkedHashMap<>();
-        m.put("uptime_millis", r.getUptimeMillis());
-        m.put("tailer_running", r.getTailerRunning());
-        m.put("tailer_watermark_ledger", r.getTailerWatermarkLedger());
-        m.put("tailer_watermark_offset", r.getTailerWatermarkOffset());
-        m.put("tailer_entries_processed", r.getTailerEntriesProcessed());
-        // Issue #459: per-operation-type tailer counters.
-        m.put("tailer_entries_accepted", r.getTailerEntriesAccepted());
-        m.put("tailer_entries_skipped", r.getTailerEntriesSkipped());
-        m.put("tailer_inserts", r.getTailerInserts());
-        m.put("tailer_updates", r.getTailerUpdates());
-        m.put("tailer_deletes", r.getTailerDeletes());
-        m.put("tailer_ddl", r.getTailerDdl());
-        m.put("tailer_batches", r.getTailerBatches());
-        m.put("apply_queue_size", r.getApplyQueueSize());
-        m.put("apply_queue_capacity", r.getApplyQueueCapacity());
-        m.put("apply_parallelism", r.getApplyParallelism());
-        m.put("loaded_index_count", r.getLoadedIndexCount());
-        m.put("total_estimated_memory_bytes", r.getTotalEstimatedMemoryBytes());
-        m.put("jvm_heap_used_bytes", r.getJvmHeapUsedBytes());
-        m.put("jvm_heap_max_bytes", r.getJvmHeapMaxBytes());
-        m.put("jvm_heap_used_pct", r.getJvmHeapUsedPct());
+        for (MetricEntry e : r.getMetricsList()) {
+            MetricValue v = e.getValue();
+            switch (v.getKindCase()) {
+                case INT64_VALUE:
+                    m.put(e.getKey(), v.getInt64Value());
+                    break;
+                case DOUBLE_VALUE:
+                    m.put(e.getKey(), v.getDoubleValue());
+                    break;
+                case BOOL_VALUE:
+                    m.put(e.getKey(), v.getBoolValue());
+                    break;
+                case STRING_VALUE:
+                    m.put(e.getKey(), v.getStringValue());
+                    break;
+                case KIND_NOT_SET:
+                default:
+                    // Server emitted an empty MetricValue. Skip the entry —
+                    // safer than crashing the CLI on a forward-compat case
+                    // we don't yet handle (e.g. a future bytes_value).
+                    break;
+            }
+        }
         return m;
     }
 

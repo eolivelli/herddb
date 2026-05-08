@@ -30,13 +30,17 @@ import herddb.indexing.proto.DescribeIndexResponse;
 import herddb.indexing.proto.GetEngineStatsResponse;
 import herddb.indexing.proto.GetInstanceInfoResponse;
 import herddb.indexing.proto.ListIndexesResponse;
+import herddb.indexing.proto.MetricEntry;
+import herddb.indexing.proto.MetricValue;
 import herddb.indexing.proto.PrimaryKeysChunk;
 import herddb.model.ColumnTypes;
 import herddb.model.Index;
 import herddb.utils.Bytes;
 import io.grpc.StatusRuntimeException;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.Set;
 import org.junit.After;
 import org.junit.Before;
@@ -216,17 +220,43 @@ public class IndexingServiceDiagnosticsGrpcTest {
         seedIndex("docs", "idx_docs", 4);
 
         GetEngineStatsResponse response = client.getEngineStats();
-        assertTrue(response.getUptimeMillis() >= 0);
-        assertTrue(response.getTailerRunning());
-        assertEquals(1, response.getLoadedIndexCount());
-        assertTrue(response.getApplyParallelism() >= 1);
-        assertTrue(response.getApplyQueueCapacity() > 0);
-        assertTrue(response.getTotalEstimatedMemoryBytes() > 0);
+        // Issue #463: response is now a generic (key, MetricValue) list. We
+        // index it by key for assertion lookups; nothing in this test cares
+        // about ordering — that's a property the indexing-admin CLI relies on
+        // and is exercised in IndexingAdminCliTest.testEngineStatsText.
+        Map<String, MetricValue> metrics = indexMetricsByKey(response);
+        assertTrue("uptime_millis", metrics.get("uptime_millis").getInt64Value() >= 0);
+        assertTrue("tailer_running", metrics.get("tailer_running").getBoolValue());
+        assertEquals("loaded_index_count", 1L,
+                metrics.get("loaded_index_count").getInt64Value());
+        assertTrue("apply_parallelism",
+                metrics.get("apply_parallelism").getInt64Value() >= 1);
+        assertTrue("apply_queue_capacity",
+                metrics.get("apply_queue_capacity").getInt64Value() > 0);
+        assertTrue("total_estimated_memory_bytes",
+                metrics.get("total_estimated_memory_bytes").getInt64Value() > 0);
         // JVM heap fields (issue #80).
-        assertTrue("jvm_heap_used_bytes should be > 0", response.getJvmHeapUsedBytes() > 0);
-        assertTrue("jvm_heap_max_bytes should be > 0", response.getJvmHeapMaxBytes() > 0);
-        assertTrue("jvm_heap_used_pct should be in [0,100]",
-                response.getJvmHeapUsedPct() >= 0 && response.getJvmHeapUsedPct() <= 100);
+        assertTrue("jvm_heap_used_bytes should be > 0",
+                metrics.get("jvm_heap_used_bytes").getInt64Value() > 0);
+        assertTrue("jvm_heap_max_bytes should be > 0",
+                metrics.get("jvm_heap_max_bytes").getInt64Value() > 0);
+        long pct = metrics.get("jvm_heap_used_pct").getInt64Value();
+        assertTrue("jvm_heap_used_pct should be in [0,100]", pct >= 0 && pct <= 100);
+        // Issue #463: the new shard-filter counter must be present and zero
+        // for a single-instance setup that hasn't routed any INSERT through
+        // applyInsert yet.
+        assertTrue("tailer_entries_shard_filtered must be present",
+                metrics.containsKey("tailer_entries_shard_filtered"));
+        assertEquals("tailer_entries_shard_filtered", 0L,
+                metrics.get("tailer_entries_shard_filtered").getInt64Value());
+    }
+
+    private static Map<String, MetricValue> indexMetricsByKey(GetEngineStatsResponse r) {
+        Map<String, MetricValue> m = new HashMap<>();
+        for (MetricEntry e : r.getMetricsList()) {
+            m.put(e.getKey(), e.getValue());
+        }
+        return m;
     }
 
     @Test

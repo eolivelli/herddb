@@ -24,6 +24,7 @@ import static org.junit.Assert.assertTrue;
 import herddb.codec.RecordSerializer;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
+import herddb.log.LogEntryType;
 import herddb.log.LogSequenceNumber;
 import herddb.model.ColumnTypes;
 import herddb.model.Index;
@@ -344,6 +345,280 @@ public class MultiInstanceBookKeeperShardingTest {
                         new float[]{1.0f, 2.0f, 3.0f}, numRecords);
                 assertEquals(numRecords, results.size());
             }
+
+        } finally {
+            for (EmbeddedIndexingService eis : services) {
+                try {
+                    eis.close();
+                } catch (Exception e) {
+                    // ignore
+                }
+            }
+        }
+    }
+
+    /**
+     * Issue #463: with 2 instances and {@code numShards=4}, every replica
+     * sees every INSERT entry (so {@code tailer_inserts} matches the workload
+     * size on each), but the shard filter rejects roughly half of them on
+     * each instance — those rejections must show up in the new
+     * {@code tailer_entries_shard_filtered} counter and the totals across
+     * the cluster must add up to exactly the workload size (every INSERT was
+     * rejected on exactly one of the two replicas). Drives the
+     * non-transactional fast path (each INSERT applied directly via
+     * {@code applySingleEntryForTest}) to keep this test isolated from the
+     * transaction-buffer code path covered by
+     * {@link #testTwoInstancesTransactionalInsertsBumpShardFilteredCounter}.
+     */
+    @Test
+    public void testTwoInstancesNonTransactionalInsertsBumpShardFilteredCounter()
+            throws Exception {
+        int numInstances = 2;
+        int numShards = 4;
+        int numRecords = 100;
+
+        Table table = createTable();
+        Index index = createIndex(numShards);
+
+        List<IndexingServiceEngine> engines = new ArrayList<>();
+        List<EmbeddedIndexingService> services = new ArrayList<>();
+
+        try {
+            for (int i = 0; i < numInstances; i++) {
+                Path logDir = folder.newFolder("sf-nontx-log-" + i).toPath();
+                Path dataDir = folder.newFolder("sf-nontx-data-" + i).toPath();
+                EmbeddedIndexingService eis = new EmbeddedIndexingService(
+                        logDir, dataDir, i, numInstances);
+                eis.start();
+                services.add(eis);
+                engines.add(eis.getEngine());
+            }
+
+            // DDL on every replica.
+            LogEntry createTableEntry = LogEntryFactory.createTable(table, null);
+            LogEntry createIndexEntry = LogEntryFactory.createIndex(index, null);
+            for (IndexingServiceEngine engine : engines) {
+                engine.applyEntry(new LogSequenceNumber(1, 1), createTableEntry);
+                engine.applyEntry(new LogSequenceNumber(1, 2), createIndexEntry);
+            }
+
+            // 100 non-transactional INSERTs delivered to BOTH replicas via
+            // processEntryForTest — same entrypoint the real tailer thread
+            // uses. processEntry() runs classifyForMetrics() (bumps
+            // tailer_inserts) AND dispatches to the apply pipeline (where
+            // applyInsert() bumps tailer_entries_shard_filtered for entries
+            // the shard filter rejects). Going through applySingleEntryForTest
+            // would bypass classifyForMetrics and leave tailer_inserts at 0.
+            for (int i = 0; i < numRecords; i++) {
+                Record record = RecordSerializer.makeRecord(table,
+                        "pk", "sf-nontx-" + i,
+                        "vec", new float[]{i * 1.0f, (i + 1) * 1.0f, (i + 2) * 1.0f});
+                LogEntry insert = LogEntryFactory.insert(table,
+                        record.key, record.value, null);
+                LogSequenceNumber lsn = new LogSequenceNumber(1, 10 + i);
+                for (IndexingServiceEngine engine : engines) {
+                    engine.processEntryForTest(lsn, insert);
+                }
+            }
+            for (IndexingServiceEngine engine : engines) {
+                engine.awaitPendingWorkForTest();
+            }
+
+            long sf0 = engines.get(0).getTailerEntriesShardFiltered();
+            long sf1 = engines.get(1).getTailerEntriesShardFiltered();
+            assertEquals(
+                    "every INSERT must have been shard-filtered on exactly one replica",
+                    numRecords, sf0 + sf1);
+            assertTrue("instance 0 must shard-filter at least one INSERT, got " + sf0,
+                    sf0 > 0);
+            assertTrue("instance 0 must accept at least one INSERT (sf0 < " + numRecords + "), got " + sf0,
+                    sf0 < numRecords);
+            assertTrue("instance 1 must shard-filter at least one INSERT, got " + sf1,
+                    sf1 > 0);
+            assertTrue("instance 1 must accept at least one INSERT (sf1 < " + numRecords + "), got " + sf1,
+                    sf1 < numRecords);
+            // tailer_inserts is bumped at classifyForMetrics time (intent) so
+            // it should match the workload size on EVERY replica regardless
+            // of the shard filter outcome.
+            assertEquals("instance 0 must see every INSERT in tailer_inserts",
+                    numRecords, engines.get(0).getTailerInserts());
+            assertEquals("instance 1 must see every INSERT in tailer_inserts",
+                    numRecords, engines.get(1).getTailerInserts());
+
+        } finally {
+            for (EmbeddedIndexingService eis : services) {
+                try {
+                    eis.close();
+                } catch (Exception e) {
+                    // ignore
+                }
+            }
+        }
+    }
+
+    /**
+     * Issue #463: VectorBench commits each batch of INSERTs in a single
+     * transaction (BEGIN + many transactional INSERTs + COMMIT), which routes
+     * through {@code transactionBuffer} → {@code applyBufferedEntries} →
+     * {@code submitDmlAsync} → {@code applyEntry} → {@code applyInsert}. This
+     * is a different code path from
+     * {@link #testTwoInstancesNonTransactionalInsertsBumpShardFilteredCounter},
+     * which exercises the non-tx fast path. We need to verify the shard
+     * filter (and its new {@code tailer_entries_shard_filtered} counter)
+     * still fire correctly when the entries arrive inside a transaction
+     * envelope — which is what the VectorBench production path actually does.
+     *
+     * <p>Splits 100 INSERTs across two transactions of 50 each, with keys
+     * deliberately chosen so each transaction contains a mix of shard-0/1/2/3
+     * keys (sequential PKs do this naturally). Drives the full BEGIN → 50
+     * INSERTs → COMMIT envelope through {@code processEntryForTest} on both
+     * replicas, then asserts the same cluster-level invariants as the non-tx
+     * test plus a search-fan-out check that proves the on-disk state is
+     * actually disjoint (i.e., the actual filter ran, not just the metric).
+     */
+    @Test
+    public void testTwoInstancesTransactionalInsertsBumpShardFilteredCounter()
+            throws Exception {
+        int numInstances = 2;
+        int numShards = 4;
+        int numRecords = 100;
+        int batchSize = 50;
+        long[] txIds = new long[]{42L, 43L};
+
+        Table table = createTable();
+        Index index = createIndex(numShards);
+
+        List<IndexingServiceEngine> engines = new ArrayList<>();
+        List<EmbeddedIndexingService> services = new ArrayList<>();
+
+        try {
+            for (int i = 0; i < numInstances; i++) {
+                Path logDir = folder.newFolder("sf-tx-log-" + i).toPath();
+                Path dataDir = folder.newFolder("sf-tx-data-" + i).toPath();
+                EmbeddedIndexingService eis = new EmbeddedIndexingService(
+                        logDir, dataDir, i, numInstances);
+                eis.start();
+                services.add(eis);
+                engines.add(eis.getEngine());
+            }
+
+            // DDL on every replica. CREATE_TABLE / CREATE_INDEX flow through
+            // applyEntry directly, not the transactional path — they're not
+            // part of the transaction envelope we're testing.
+            LogEntry createTableEntry = LogEntryFactory.createTable(table, null);
+            LogEntry createIndexEntry = LogEntryFactory.createIndex(index, null);
+            for (IndexingServiceEngine engine : engines) {
+                engine.applyEntry(new LogSequenceNumber(1, 1), createTableEntry);
+                engine.applyEntry(new LogSequenceNumber(1, 2), createIndexEntry);
+            }
+
+            // Drive 100 INSERTs across 2 transactions (50 each). Each INSERT
+            // has txId == txIds[batch], wrapped in BEGINTRANSACTION/COMMIT.
+            // Routed through processEntryForTest on BOTH replicas — same
+            // entrypoint the real BookKeeper tailer uses, so the
+            // transactionBuffer + applyBufferedEntries + submitDmlAsync path
+            // is exercised end-to-end.
+            long lsnOff = 10;
+            Set<String> allKeys = new HashSet<>();
+            for (int batch = 0; batch < numRecords / batchSize; batch++) {
+                long txId = txIds[batch];
+                LogEntry begin = LogEntryFactory.beginTransaction(txId);
+                LogSequenceNumber beginLsn = new LogSequenceNumber(1, lsnOff++);
+                for (IndexingServiceEngine engine : engines) {
+                    engine.processEntryForTest(beginLsn, begin);
+                }
+                for (int j = 0; j < batchSize; j++) {
+                    int globalIdx = batch * batchSize + j;
+                    String pk = "sf-tx-" + globalIdx;
+                    allKeys.add(pk);
+                    Record record = RecordSerializer.makeRecord(table,
+                            "pk", pk,
+                            "vec", new float[]{globalIdx * 1.0f,
+                                    (globalIdx + 1) * 1.0f, (globalIdx + 2) * 1.0f});
+                    // Build a transactional INSERT directly — LogEntryFactory.insert
+                    // takes a herddb.model.Transaction, but we only need the txId
+                    // for the tailer's BEGIN/COMMIT fan-out, so we construct the
+                    // LogEntry ourselves with a non-zero transactionId.
+                    LogEntry insert = new LogEntry(System.currentTimeMillis(),
+                            LogEntryType.INSERT, txId, table.tableId,
+                            record.key, record.value);
+                    LogSequenceNumber insertLsn = new LogSequenceNumber(1, lsnOff++);
+                    for (IndexingServiceEngine engine : engines) {
+                        engine.processEntryForTest(insertLsn, insert);
+                    }
+                }
+                LogEntry commit = LogEntryFactory.commitTransaction(txId);
+                LogSequenceNumber commitLsn = new LogSequenceNumber(1, lsnOff++);
+                for (IndexingServiceEngine engine : engines) {
+                    engine.processEntryForTest(commitLsn, commit);
+                }
+            }
+            // Drain the async DML pipeline on both replicas — applyBufferedEntries
+            // submits work to submitDmlAsync, which runs on the apply-worker pool.
+            for (IndexingServiceEngine engine : engines) {
+                engine.awaitPendingWorkForTest();
+            }
+
+            // Metric invariants — same shape as the non-tx test, proves the
+            // shard filter fires from the transactional code path too.
+            long sf0 = engines.get(0).getTailerEntriesShardFiltered();
+            long sf1 = engines.get(1).getTailerEntriesShardFiltered();
+            assertEquals(
+                    "every transactional INSERT must have been shard-filtered "
+                            + "on exactly one replica (got sf0=" + sf0 + ", sf1=" + sf1 + ")",
+                    numRecords, sf0 + sf1);
+            assertTrue("instance 0 must shard-filter at least one INSERT, got " + sf0,
+                    sf0 > 0);
+            assertTrue("instance 0 must accept at least one INSERT, got " + sf0,
+                    sf0 < numRecords);
+            assertTrue("instance 1 must shard-filter at least one INSERT, got " + sf1,
+                    sf1 > 0);
+            assertTrue("instance 1 must accept at least one INSERT, got " + sf1,
+                    sf1 < numRecords);
+            assertEquals("instance 0 must see every INSERT in tailer_inserts",
+                    numRecords, engines.get(0).getTailerInserts());
+            assertEquals("instance 1 must see every INSERT in tailer_inserts",
+                    numRecords, engines.get(1).getTailerInserts());
+
+            // Storage-level invariant: each replica's local index must
+            // physically hold ONLY the keys it accepted (i.e., not the
+            // shard-filtered ones), and the union across replicas must equal
+            // every key we inserted. Proves the actual filter — not just the
+            // metric — ran through the transaction-buffer path.
+            Set<String> keys0 = new HashSet<>();
+            for (Map.Entry<Bytes, Float> e : engines.get(0).search(
+                    "default", "mytable", "vidx",
+                    new float[]{1.0f, 2.0f, 3.0f}, numRecords)) {
+                keys0.add(new String(e.getKey().to_array(),
+                        java.nio.charset.StandardCharsets.UTF_8));
+            }
+            Set<String> keys1 = new HashSet<>();
+            for (Map.Entry<Bytes, Float> e : engines.get(1).search(
+                    "default", "mytable", "vidx",
+                    new float[]{1.0f, 2.0f, 3.0f}, numRecords)) {
+                keys1.add(new String(e.getKey().to_array(),
+                        java.nio.charset.StandardCharsets.UTF_8));
+            }
+            // |keys0| + |keys1| == numRecords ⇒ disjoint union (no key was
+            // accepted by both replicas — which would mean the shard filter
+            // failed open).
+            assertEquals(
+                    "no key may be present on both replicas (shard filter must "
+                            + "send each key to exactly one owner)",
+                    numRecords, keys0.size() + keys1.size());
+            Set<String> union = new HashSet<>(keys0);
+            union.addAll(keys1);
+            assertEquals(
+                    "union of per-replica keys must cover every inserted key",
+                    allKeys, union);
+            // Per-replica counts must match the negation of the shard-filter
+            // counter on the same replica: locally accepted == numRecords - shardFiltered.
+            assertEquals(
+                    "instance 0 local key set size must equal numRecords - shardFiltered0",
+                    numRecords - sf0, keys0.size());
+            assertEquals(
+                    "instance 1 local key set size must equal numRecords - shardFiltered1",
+                    numRecords - sf1, keys1.size());
 
         } finally {
             for (EmbeddedIndexingService eis : services) {

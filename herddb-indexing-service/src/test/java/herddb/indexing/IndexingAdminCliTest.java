@@ -223,8 +223,48 @@ public class IndexingAdminCliTest {
         assertEquals(0, rc);
         String out = stdout();
         assertTrue(out.contains("Engine stats:"));
-        assertTrue(out.contains("loaded_index_count          = 1"));
-        assertTrue(out.contains("tailer_running              = true"));
+        // Issue #463: keys are left-padded to 31 chars, followed by ` = `, then
+        // the value. Existing dashboards / scripts that relied on the previous
+        // 28-char alignment must be updated.
+        assertTrue("expected 31-char-padded loaded_index_count line, got:\n" + out,
+                out.contains("loaded_index_count              = 1"));
+        assertTrue("expected 31-char-padded tailer_running line, got:\n" + out,
+                out.contains("tailer_running                  = true"));
+        // Issue #463: the new shard-filter counter must appear in the
+        // human-readable text output, alongside the rest of the metrics.
+        // A freshly-started single-instance setup hasn't routed any INSERT
+        // through applyInsert, so the count must be exactly 0.
+        assertTrue("text output must include tailer_entries_shard_filtered, got:\n" + out,
+                out.contains("tailer_entries_shard_filtered   = 0"));
+    }
+
+    /**
+     * Issue #463: after refactoring {@code GetEngineStatsResponse} to a
+     * generic {@code repeated MetricEntry} list, the {@code --json} output
+     * must still produce a valid single JSON object containing every metric
+     * key. We don't pin the order — only that every expected key is present.
+     */
+    @Test
+    public void testEngineStatsJson() {
+        int rc = cli.run(new String[]{
+            "engine-stats",
+            "--server", service.getAddress(),
+            "--json"
+        });
+        assertEquals(0, rc);
+        String out = stdout().trim();
+        assertTrue("JSON output must be a single object, got:\n" + out,
+                out.startsWith("{") && out.endsWith("}"));
+        // Spot-check a few keys spanning all three value kinds the proto
+        // currently uses (int64, bool, plus the new shard-filter counter).
+        assertTrue("must include uptime_millis, got:\n" + out,
+                out.contains("\"uptime_millis\":"));
+        assertTrue("must include tailer_running, got:\n" + out,
+                out.contains("\"tailer_running\":true"));
+        assertTrue("must include loaded_index_count:1, got:\n" + out,
+                out.contains("\"loaded_index_count\":1"));
+        assertTrue("must include the new tailer_entries_shard_filtered:0, got:\n" + out,
+                out.contains("\"tailer_entries_shard_filtered\":0"));
     }
 
     @Test
