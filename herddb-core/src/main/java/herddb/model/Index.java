@@ -156,6 +156,29 @@ public class Index implements ColumnsList {
         }
     }
 
+    /**
+     * Returns a copy of this {@code Index} with one extra property added (or
+     * replaced if {@code key} is already present). Every other field —
+     * {@code uuid}, {@code name}, {@code table}, {@code tablespace},
+     * {@code type}, {@code columns}, {@code unique} — is preserved.
+     *
+     * <p>The original instance is not mutated; the returned instance keeps the
+     * same {@link #properties} immutability contract.
+     *
+     * <p>Issue #471: used by the server-side {@code CREATE VECTOR INDEX}
+     * handler to mark a freshly-created index with {@code rebuild=true} when
+     * the underlying table is non-empty, so the IndexingService can drive a
+     * back-fill pass off the latest table checkpoint.
+     */
+    public Index withProperty(String key, String value) {
+        if (key == null) {
+            throw new IllegalArgumentException("property key must not be null");
+        }
+        Map<String, String> newProperties = new HashMap<>(properties);
+        newProperties.put(key, value);
+        return new Index(uuid, name, table, tablespace, type, columns, unique, newProperties);
+    }
+
     public byte[] serialize() {
         ByteArrayOutputStream oo = new ByteArrayOutputStream();
         try (ExtendedDataOutputStream doo = new ExtendedDataOutputStream(oo)) {
