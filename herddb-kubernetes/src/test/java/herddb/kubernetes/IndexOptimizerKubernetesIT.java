@@ -296,11 +296,13 @@ public class IndexOptimizerKubernetesIT {
             try {
                 org.testcontainers.containers.Container.ExecResult result =
                         k3s.execInContainer("kubectl", "exec", podName, "--",
-                                "wget", "-qO-", "http://localhost:9853/metrics");
+                                "curl", "-s", "http://localhost:9853/metrics");
                 String metrics = result.getStdout();
+                LOG.log(Level.FINE, "metrics response (exit={0}): {1}",
+                        new Object[]{result.getExitCode(), metrics});
                 // Look for a line like: herddb_optimizer_runs_total 3
                 for (String line : metrics.split("\n")) {
-                    if (line.startsWith("herddb_optimizer_runs_total ") && !line.startsWith("#")) {
+                    if (line.startsWith("herddb_optimizer_runs_total ")) {
                         String[] parts = line.trim().split("\\s+");
                         if (parts.length >= 2) {
                             long val = Long.parseLong(parts[1].trim());
