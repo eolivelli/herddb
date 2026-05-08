@@ -380,33 +380,42 @@ public class SlabCacheFileStore implements AutoCloseable {
             channel.read(nio, fileOffset, null, new CompletionHandler<Integer, Void>() {
                 @Override
                 public void completed(Integer bytesRead, Void attachment) {
+                    // Order matters: unpin BEFORE completing the future so when a
+                    // caller's read.get() returns, the slot's pinCount has already
+                    // decremented and any racing markEvicted observes it as
+                    // unpinned (and recycles synchronously). Otherwise a single-
+                    // threaded test that evicts immediately after a successful read
+                    // can race the JDK callback's unpin and observe the slot still
+                    // pinned, deferring the recycle to a later async unpin and
+                    // leaving the next admit with no free cell.
                     try {
                         if (bytesRead != null && bytesRead > 0) {
                             byteBuf.writerIndex(bytesRead);
                         }
-                        result.complete(byteBuf);
                     } finally {
                         unpin(slot);
                     }
+                    result.complete(byteBuf);
                 }
 
                 @Override
                 public void failed(Throwable exc, Void attachment) {
+                    // Same unpin-before-complete contract as the success path.
                     try {
                         byteBuf.release();
-                        result.completeExceptionally(exc);
                     } finally {
                         unpin(slot);
                     }
+                    result.completeExceptionally(exc);
                 }
             });
         } catch (RuntimeException t) {
             try {
                 byteBuf.release();
-                result.completeExceptionally(t);
             } finally {
                 unpin(slot);
             }
+            result.completeExceptionally(t);
         }
         return result;
     }
