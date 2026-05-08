@@ -191,6 +191,84 @@ public final class OptimizerHttpServer implements AutoCloseable {
             sb.append("herddb_optimizer_ticks_skipped_not_leader_total ")
                     .append(engine.getTicksSkippedNotLeader()).append('\n');
 
+            // ----- Compaction failure / abort breakdown -----
+            sb.append("# HELP herddb_optimizer_merge_failures_total Merger.merge() invocations that threw.\n");
+            sb.append("# TYPE herddb_optimizer_merge_failures_total counter\n");
+            sb.append("herddb_optimizer_merge_failures_total ")
+                    .append(engine.getMergeFailuresTotal()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_merge_aborts_revalidate_failed_total"
+                    + " Merges aborted because input drifted under the optimizer between"
+                    + " candidate-pick and the post-merge revalidate.\n");
+            sb.append("# TYPE herddb_optimizer_merge_aborts_revalidate_failed_total counter\n");
+            sb.append("herddb_optimizer_merge_aborts_revalidate_failed_total ")
+                    .append(engine.getMergeAbortsRevalidateFailedTotal()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_merge_declined_total"
+                    + " Merger declined a candidate batch (e.g., not enough live entries).\n");
+            sb.append("# TYPE herddb_optimizer_merge_declined_total counter\n");
+            sb.append("herddb_optimizer_merge_declined_total ")
+                    .append(engine.getMergeDeclinedTotal()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_last_merge_duration_ms"
+                    + " Wall-clock millis of the last completed merge cycle (-1 if never run).\n");
+            sb.append("# TYPE herddb_optimizer_last_merge_duration_ms gauge\n");
+            sb.append("herddb_optimizer_last_merge_duration_ms ")
+                    .append(engine.getLastMergeDurationMs()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_last_run_at_seconds"
+                    + " Unix-time seconds at which the last tick body started (-1 if never run).\n");
+            sb.append("# TYPE herddb_optimizer_last_run_at_seconds gauge\n");
+            long lastRunMs = engine.getLastRunAtMillis();
+            sb.append("herddb_optimizer_last_run_at_seconds ")
+                    .append(lastRunMs >= 0 ? lastRunMs / 1000L : -1L).append('\n');
+
+            // ----- Observed segments (last-tick snapshot, by state) -----
+            sb.append("# HELP herddb_optimizer_observed_indexes"
+                    + " Number of indexes seen in the most recent tick.\n");
+            sb.append("# TYPE herddb_optimizer_observed_indexes gauge\n");
+            sb.append("herddb_optimizer_observed_indexes ")
+                    .append(engine.getObservedIndexes()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_observed_segments"
+                    + " Per-state segment count from the most recent tick across all"
+                    + " observed indexes. Labels: state in {active, deprecated, transferring,"
+                    + " provisional}.\n");
+            sb.append("# TYPE herddb_optimizer_observed_segments gauge\n");
+            sb.append("herddb_optimizer_observed_segments{state=\"active\"} ")
+                    .append(engine.getObservedActiveSegments()).append('\n');
+            sb.append("herddb_optimizer_observed_segments{state=\"deprecated\"} ")
+                    .append(engine.getObservedDeprecatedSegments()).append('\n');
+            sb.append("herddb_optimizer_observed_segments{state=\"transferring\"} ")
+                    .append(engine.getObservedTransferringSegments()).append('\n');
+            sb.append("herddb_optimizer_observed_segments{state=\"provisional\"} ")
+                    .append(engine.getObservedProvisionalSegments()).append('\n');
+
+            // ----- Segment relocations (ownership transfers driven by the optimizer) -----
+            // Counters are wired but stay at 0 until the production relocate-trigger
+            // path is enabled — the panel in Grafana is plumbed now so it lights up
+            // automatically when the wiring lands.
+            sb.append("# HELP herddb_optimizer_relocations_initiated_total"
+                    + " Ownership-transfer initiate (ACTIVE -> TRANSFERRING) CAS calls"
+                    + " issued by the optimizer.\n");
+            sb.append("# TYPE herddb_optimizer_relocations_initiated_total counter\n");
+            sb.append("herddb_optimizer_relocations_initiated_total ")
+                    .append(engine.getRelocationsInitiatedTotal()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_relocations_completed_total"
+                    + " Ownership-transfer complete (TRANSFERRING -> ACTIVE) CAS calls"
+                    + " observed at the registry.\n");
+            sb.append("# TYPE herddb_optimizer_relocations_completed_total counter\n");
+            sb.append("herddb_optimizer_relocations_completed_total ")
+                    .append(engine.getRelocationsCompletedTotal()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_relocations_aborted_total"
+                    + " Transfer attempts that aborted before {@code complete()} fired"
+                    + " (revalidate failure, takeover-side timeout, optimizer crash).\n");
+            sb.append("# TYPE herddb_optimizer_relocations_aborted_total counter\n");
+            sb.append("herddb_optimizer_relocations_aborted_total ")
+                    .append(engine.getRelocationsAbortedTotal()).append('\n');
+
             byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
             exchange.sendResponseHeaders(200, body.length);

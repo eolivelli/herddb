@@ -291,6 +291,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     private volatile StatsLogger statsLogger;
 
+    /**
+     * Single shared {@link herddb.indexing.segment.SegmentAssignmentMetrics}
+     * for the engine — subscribes to every {@code SegmentAssignmentWatcher}
+     * created by this IS instance so the gauges + counters reflect the
+     * union of segments owned across all indexes. Prometheus exposition
+     * happens through {@link #registerSegmentAssignmentMetrics}; the gauges
+     * stay at zero until the engine actually wires up an
+     * {@code SegmentAssignmentWatcher} (currently future-work — the metrics
+     * surface is live so the Grafana dashboard panels light up the moment
+     * the watcher integration lands).
+     */
+    private final herddb.indexing.segment.SegmentAssignmentMetrics segmentAssignmentMetrics =
+            new herddb.indexing.segment.SegmentAssignmentMetrics();
+
     private MetadataStorageManager metadataStorageManager;
     private boolean ownsMetadataStorageManager;
 
@@ -2919,6 +2933,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         this.statsLogger = statsLogger;
         registerTailerMetrics();
         registerShadowMetrics();
+        registerSegmentAssignmentMetrics();
         // Netty direct-memory counters (issue #246) so the unified JVM
         // dashboard can show pool-arena growth for the IS alongside the
         // main server and the remote file service. The gauges carry
@@ -2926,6 +2941,70 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         if (statsLogger != null) {
             herddb.core.stats.NettyMemoryMetrics.register(statsLogger);
         }
+    }
+
+    /**
+     * Returns the engine's shared {@link herddb.indexing.segment.SegmentAssignmentMetrics}
+     * observer. Visible so future code that constructs a
+     * {@link herddb.indexing.segment.SegmentAssignmentWatcher} can chain
+     * this observer onto its listener (the production integration path is
+     * not wired yet — see field doc).
+     */
+    public herddb.indexing.segment.SegmentAssignmentMetrics getSegmentAssignmentMetrics() {
+        return segmentAssignmentMetrics;
+    }
+
+    /**
+     * Registers Prometheus gauges + counters for the segmented-v2
+     * ownership-watcher activity (Grafana panel: "Segmented-v2 ownership"
+     * on the indexing-service dashboard).
+     */
+    private void registerSegmentAssignmentMetrics() {
+        StatsLogger sl = this.statsLogger;
+        if (sl == null) {
+            return;
+        }
+        StatsLogger ownership = sl.scope("segments_ownership");
+        ownership.registerGauge("owned", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return segmentAssignmentMetrics.getOwnedSegmentsCount();
+            }
+        });
+        ownership.registerGauge("loads_total", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return segmentAssignmentMetrics.getSegmentLoadsTotal();
+            }
+        });
+        ownership.registerGauge("releases_total", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return segmentAssignmentMetrics.getSegmentReleasesTotal();
+            }
+        });
+        ownership.registerGauge("pending_assignments_observed_total", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return segmentAssignmentMetrics.getPendingAssignmentsObservedTotal();
+            }
+        });
     }
 
     /**

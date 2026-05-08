@@ -122,6 +122,36 @@ public final class IndexOptimizerEngine {
     private final AtomicLong segmentsDeprecated = new AtomicLong();
     private final AtomicLong segmentsDeleted = new AtomicLong();
 
+    /**
+     * Compaction-side observability (Grafana panel: "Compaction"). The
+     * counters bump only on the leader path so a non-leader pod's metrics
+     * line up with the actual work it did.
+     */
+    private final AtomicLong mergeFailuresTotal = new AtomicLong();
+    private final AtomicLong mergeAbortsRevalidateFailedTotal = new AtomicLong();
+    private final AtomicLong mergeDeclinedTotal = new AtomicLong();
+    /** Last successful merge wall-clock duration in milliseconds; -1 means "no merge yet". */
+    private final AtomicLong lastMergeDurationMs = new AtomicLong(-1L);
+    /** Wall-clock millis when the last tick body STARTED running; -1 means "never run". */
+    private final AtomicLong lastRunAtMillis = new AtomicLong(-1L);
+    /** Number of indexes observed in the most recent tick (cardinality of {@code listIndexes}). */
+    private final AtomicLong observedIndexes = new AtomicLong();
+    /** Snapshot of segment counts from the most recent tick, by state. */
+    private final AtomicLong observedActiveSegments = new AtomicLong();
+    private final AtomicLong observedDeprecatedSegments = new AtomicLong();
+    private final AtomicLong observedTransferringSegments = new AtomicLong();
+    private final AtomicLong observedProvisionalSegments = new AtomicLong();
+    /**
+     * Optimizer-driven ownership relocations. The optimizer doesn't currently
+     * relocate segments itself (the protocol primitives in
+     * {@code OwnershipTransfer} are dormant in production), so these counters
+     * stay at 0 until the relocate path is wired. They are wired into the
+     * Grafana dashboard now so the panels are ready when the wiring lands.
+     */
+    private final AtomicLong relocationsInitiatedTotal = new AtomicLong();
+    private final AtomicLong relocationsCompletedTotal = new AtomicLong();
+    private final AtomicLong relocationsAbortedTotal = new AtomicLong();
+
     public IndexOptimizerEngine(SegmentRegistryClient registry,
                                 SegmentMerger merger,
                                 String tablespaceUuid,
@@ -241,6 +271,61 @@ public final class IndexOptimizerEngine {
         return segmentsDeleted.get();
     }
 
+    public long getMergeFailuresTotal() {
+        return mergeFailuresTotal.get();
+    }
+
+    public long getMergeAbortsRevalidateFailedTotal() {
+        return mergeAbortsRevalidateFailedTotal.get();
+    }
+
+    public long getMergeDeclinedTotal() {
+        return mergeDeclinedTotal.get();
+    }
+
+    /** Last successful merge duration in milliseconds, or {@code -1} if no merge has run. */
+    public long getLastMergeDurationMs() {
+        return lastMergeDurationMs.get();
+    }
+
+    /** Wall-clock millis at which the last tick body started, or {@code -1} if never run. */
+    public long getLastRunAtMillis() {
+        return lastRunAtMillis.get();
+    }
+
+    /** Number of indexes observed in the most recent tick (cardinality of {@code listIndexes}). */
+    public long getObservedIndexes() {
+        return observedIndexes.get();
+    }
+
+    public long getObservedActiveSegments() {
+        return observedActiveSegments.get();
+    }
+
+    public long getObservedDeprecatedSegments() {
+        return observedDeprecatedSegments.get();
+    }
+
+    public long getObservedTransferringSegments() {
+        return observedTransferringSegments.get();
+    }
+
+    public long getObservedProvisionalSegments() {
+        return observedProvisionalSegments.get();
+    }
+
+    public long getRelocationsInitiatedTotal() {
+        return relocationsInitiatedTotal.get();
+    }
+
+    public long getRelocationsCompletedTotal() {
+        return relocationsCompletedTotal.get();
+    }
+
+    public long getRelocationsAbortedTotal() {
+        return relocationsAbortedTotal.get();
+    }
+
     public long getTicksSkippedNotLeader() {
         return ticksSkippedNotLeader.get();
     }
@@ -256,15 +341,28 @@ public final class IndexOptimizerEngine {
         // the leader runs work; everyone else short-circuits. The runs counter still
         // ticks so observability sees liveness regardless of leadership.
         runs.incrementAndGet();
+        long now = clock.getAsLong();
+        lastRunAtMillis.set(now);
         if (leaderLock != null && !leaderLock.tryAcquire()) {
             ticksSkippedNotLeader.incrementAndGet();
             return;
         }
-        long now = clock.getAsLong();
         List<String> indexes = registry.listIndexes(tablespaceUuid);
+        observedIndexes.set(indexes.size());
+        // Reset per-tick observed-segment gauges; they are aggregated across
+        // all indexes inside runForIndex and represent the most recent
+        // top-of-tick snapshot.
+        long active = 0;
+        long deprecated = 0;
+        long transferring = 0;
+        long provisional = 0;
         for (String indexUuid : indexes) {
             try {
-                runForIndex(indexUuid, now);
+                long[] counts = runForIndex(indexUuid, now);
+                active += counts[0];
+                deprecated += counts[1];
+                transferring += counts[2];
+                provisional += counts[3];
             } catch (RuntimeException | SegmentRegistryException e) {
                 LOGGER.log(Level.WARNING, "optimizer tick failed for index " + indexUuid, e);
                 // Continue with the next index — a single index failure must not stop the
@@ -273,12 +371,26 @@ public final class IndexOptimizerEngine {
                 // exceptions; SegmentRegistryException covers our own typed failures.
             }
         }
+        observedActiveSegments.set(active);
+        observedDeprecatedSegments.set(deprecated);
+        observedTransferringSegments.set(transferring);
+        observedProvisionalSegments.set(provisional);
     }
 
-    private void runForIndex(String indexUuid, long now) throws SegmentRegistryException {
+    /**
+     * @return per-state segment counts observed in this tick — index 0 ACTIVE,
+     *         1 DEPRECATED, 2 TRANSFERRING, 3 PROVISIONAL. The caller
+     *         aggregates across indexes and exposes the totals via the
+     *         {@code observedXxxSegments} gauges so a Grafana panel can
+     *         display the registry's state distribution at the cadence of
+     *         the optimizer interval.
+     */
+    private long[] runForIndex(String indexUuid, long now) throws SegmentRegistryException {
         List<VersionedSegmentMetadata> all = registry.listSegments(tablespaceUuid, indexUuid);
         List<VersionedSegmentMetadata> active = new ArrayList<>();
         List<VersionedSegmentMetadata> deprecated = new ArrayList<>();
+        long transferringCount = 0;
+        long provisionalCount = 0;
         for (VersionedSegmentMetadata v : all) {
             switch (v.metadata().getState()) {
                 case ACTIVE:
@@ -287,11 +399,20 @@ public final class IndexOptimizerEngine {
                 case DEPRECATED:
                     deprecated.add(v);
                     break;
+                case TRANSFERRING:
+                    transferringCount++;
+                    break;
+                case PROVISIONAL:
+                    provisionalCount++;
+                    break;
                 default:
-                    // PROVISIONAL/TRANSFERRING/DELETED: ignored for merge picking.
+                    // DELETED: ignored for merge picking and for observability
+                    // (the znode is mid-reap and will disappear soon).
                     break;
             }
         }
+        long[] observed = new long[]{active.size(), deprecated.size(),
+                transferringCount, provisionalCount};
 
         // 1. Reap DEPRECATED segments whose retention has elapsed.
         for (VersionedSegmentMetadata v : deprecated) {
@@ -304,7 +425,7 @@ public final class IndexOptimizerEngine {
         // 2. Pick merge candidates from the ACTIVE pool.
         List<VersionedSegmentMetadata> candidates = mergePolicy.pickMergeCandidates(active);
         if (candidates.size() < 2) {
-            return;
+            return observed;
         }
 
         // 3. Run the merger.
@@ -313,17 +434,20 @@ public final class IndexOptimizerEngine {
             inputMetadata.add(v.metadata());
         }
         SegmentMetadata output;
+        long mergeStartMs = clock.getAsLong();
         try {
             output = merger.merge(inputMetadata, ownerSelector.getAsInt());
         } catch (Exception e) {
+            mergeFailuresTotal.incrementAndGet();
             LOGGER.log(Level.WARNING,
                     "merger failed for index " + indexUuid + " (" + candidates.size()
                             + " candidates); leaving inputs untouched", e);
-            return;
+            return observed;
         }
         if (output == null) {
             // Merger declined this batch (e.g., not enough live entries); skip publishing.
-            return;
+            mergeDeclinedTotal.incrementAndGet();
+            return observed;
         }
 
         // 4. Pre-publish validation (review item A9). Re-read each input's znode and
@@ -334,6 +458,7 @@ public final class IndexOptimizerEngine {
         //    inputs that get re-merged on the next tick into a SECOND output, with
         //    duplicate PKs across both ACTIVE outputs.
         if (!revalidateInputsStillActive(indexUuid, candidates)) {
+            mergeAbortsRevalidateFailedTotal.incrementAndGet();
             LOGGER.log(Level.INFO,
                     "optimizer aborted merge for index {0}: at least one input drifted under us",
                     indexUuid);
@@ -348,7 +473,7 @@ public final class IndexOptimizerEngine {
                         "merger.abandon failed for {0}: {1}",
                         new Object[]{output.getSegmentUuid(), abandonFailed.getMessage()});
             }
-            return;
+            return observed;
         }
 
         // 5. Publish the output and deprecate the inputs. We do this without a true
@@ -392,6 +517,12 @@ public final class IndexOptimizerEngine {
                         v.metadata().getSegmentUuid());
             }
         }
+        // Record successful merge duration. We capture it AFTER deprecate so
+        // the duration reflects the full publish-and-deprecate cycle visible
+        // to operators, not just the merger.merge() span.
+        long mergeEndMs = clock.getAsLong();
+        lastMergeDurationMs.set(Math.max(0L, mergeEndMs - mergeStartMs));
+        return observed;
     }
 
     /**

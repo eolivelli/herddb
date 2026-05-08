@@ -39,6 +39,33 @@ public final class InMemorySegmentMerger implements SegmentMerger {
     private final java.util.List<String> abandonedUuids =
             java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
+    /**
+     * Test hooks (all dormant by default — set per-test to exercise specific
+     * failure / decline / clock-advancing scenarios in {@code merge()}).
+     */
+    private volatile boolean failureMode;
+    private volatile boolean returnNull;
+    private volatile Runnable hook;
+
+    /** When set, every {@link #merge} call throws a synthetic failure. */
+    public void setFailureMode(boolean failureMode) {
+        this.failureMode = failureMode;
+    }
+
+    /** When set, every {@link #merge} call returns {@code null} (declines the batch). */
+    public void setReturnNull(boolean returnNull) {
+        this.returnNull = returnNull;
+    }
+
+    /**
+     * Hook invoked at the start of every {@link #merge}. Useful for advancing
+     * a fake clock to make {@code lastMergeDurationMs} testable, or to inject
+     * concurrent registry mutations between candidate-pick and revalidate.
+     */
+    public void setHook(Runnable hook) {
+        this.hook = hook;
+    }
+
     public long getInvocationCount() {
         return invocations.get();
     }
@@ -62,6 +89,16 @@ public final class InMemorySegmentMerger implements SegmentMerger {
     @Override
     public SegmentMetadata merge(List<SegmentMetadata> inputs, int newOwnerInstance) {
         invocations.incrementAndGet();
+        Runnable h = this.hook;
+        if (h != null) {
+            h.run();
+        }
+        if (failureMode) {
+            throw new RuntimeException("test-injected merge failure");
+        }
+        if (returnNull) {
+            return null;
+        }
         if (inputs == null || inputs.isEmpty()) {
             return null;
         }

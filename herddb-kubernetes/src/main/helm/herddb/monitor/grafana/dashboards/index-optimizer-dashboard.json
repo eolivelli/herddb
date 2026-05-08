@@ -1,0 +1,392 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Dashboard for the HerdDB index-optimizer — compaction activity, observed segments by state, ownership relocations.",
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "refresh": "30s",
+  "rows": [
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1101,
+          "title": "Optimizer Tick Liveness (runs/min)",
+          "description": "Rate of optimizer ticks. Constant rate proves the scheduler is alive; flat-line means the pod is stuck (or paused).",
+          "type": "graph",
+          "fill": 1,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "nullPointMode": "null",
+          "renderer": "flot",
+          "span": 6,
+          "stack": false,
+          "targets": [
+            {
+              "expr": "rate(herddb_optimizer_runs_total{job=\"index-optimizer\",instance=~\"$instance\"}[1m]) * 60",
+              "format": "time_series",
+              "legendFormat": "runs/min — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(herddb_optimizer_ticks_skipped_not_leader_total{job=\"index-optimizer\",instance=~\"$instance\"}[1m]) * 60",
+              "format": "time_series",
+              "legendFormat": "skipped (not leader)/min — {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 1102,
+          "title": "Time Since Last Tick",
+          "description": "Seconds since the optimizer's last runOnce body started. Should stay close to indexoptimizer.interval.ms / 1000. Spikes ⇒ scheduler stalled.",
+          "type": "graph",
+          "fill": 0,
+          "lines": true,
+          "linewidth": 1,
+          "nullPointMode": "null",
+          "renderer": "flot",
+          "span": 6,
+          "targets": [
+            {
+              "expr": "time() - herddb_optimizer_last_run_at_seconds{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "stale seconds — {{instance}}",
+              "refId": "A"
+            }
+          ],
+          "yaxes": [{"format": "s"}, {"format": "short"}]
+        }
+      ],
+      "title": "Optimizer Liveness"
+    },
+    {
+      "collapse": false,
+      "height": 280,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1110,
+          "title": "Compaction Throughput (segments/min)",
+          "description": "Per-minute rate of merged outputs published, deprecated inputs, and reaped segments.",
+          "type": "graph",
+          "fill": 2,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 8,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "rate(herddb_optimizer_segments_merged_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "merged/min — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(herddb_optimizer_segments_deprecated_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "deprecated/min — {{instance}}",
+              "refId": "B"
+            },
+            {
+              "expr": "rate(herddb_optimizer_segments_deleted_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "deleted/min — {{instance}}",
+              "refId": "C"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 1111,
+          "title": "Last Merge Duration",
+          "description": "Wall-clock duration of the most recent successful merge cycle.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "span": 4,
+          "targets": [
+            {
+              "expr": "herddb_optimizer_last_merge_duration_ms{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "last merge — {{instance}}",
+              "refId": "A"
+            }
+          ],
+          "yaxes": [{"format": "ms"}, {"format": "short"}]
+        }
+      ],
+      "title": "Compaction"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1120,
+          "title": "Compaction Failures & Aborts (per 5m)",
+          "description": "merge_failures_total — merger.merge() threw. revalidate_failed — input drifted under the optimizer between candidate-pick and revalidate. declined — merger returned null (not enough live entries).",
+          "type": "graph",
+          "fill": 2,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 12,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "increase(herddb_optimizer_merge_failures_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "failures — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "increase(herddb_optimizer_merge_aborts_revalidate_failed_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "revalidate-aborts — {{instance}}",
+              "refId": "B"
+            },
+            {
+              "expr": "increase(herddb_optimizer_merge_declined_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "declined — {{instance}}",
+              "refId": "C"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        }
+      ],
+      "title": "Compaction Failures"
+    },
+    {
+      "collapse": false,
+      "height": 280,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1130,
+          "title": "Observed Segments by State",
+          "description": "Top-of-tick snapshot of segment counts in the registry, summed across observed indexes. ACTIVE is the working set; high TRANSFERRING ⇒ ownership transfers in flight; rising DEPRECATED ⇒ retention reaper not keeping up; PROVISIONAL ⇒ orphan stage znodes (should be ~0 at quiescence).",
+          "type": "graph",
+          "fill": 4,
+          "lines": true,
+          "linewidth": 1,
+          "stack": true,
+          "span": 8,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "herddb_optimizer_observed_segments{job=\"index-optimizer\",instance=~\"$instance\",state=\"active\"}",
+              "format": "time_series",
+              "legendFormat": "ACTIVE — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "herddb_optimizer_observed_segments{job=\"index-optimizer\",instance=~\"$instance\",state=\"deprecated\"}",
+              "format": "time_series",
+              "legendFormat": "DEPRECATED — {{instance}}",
+              "refId": "B"
+            },
+            {
+              "expr": "herddb_optimizer_observed_segments{job=\"index-optimizer\",instance=~\"$instance\",state=\"transferring\"}",
+              "format": "time_series",
+              "legendFormat": "TRANSFERRING — {{instance}}",
+              "refId": "C"
+            },
+            {
+              "expr": "herddb_optimizer_observed_segments{job=\"index-optimizer\",instance=~\"$instance\",state=\"provisional\"}",
+              "format": "time_series",
+              "legendFormat": "PROVISIONAL — {{instance}}",
+              "refId": "D"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 1131,
+          "title": "Observed Indexes",
+          "description": "Cardinality of indexes the optimizer scans per tick. Should match the number of segmented-v2 indexes in the cluster.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "span": 4,
+          "targets": [
+            {
+              "expr": "herddb_optimizer_observed_indexes{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "indexes — {{instance}}",
+              "refId": "A"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        }
+      ],
+      "title": "Observed Segments"
+    },
+    {
+      "collapse": false,
+      "height": 280,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1140,
+          "title": "Segment Relocations (per 5m)",
+          "description": "Rate of optimizer-driven ownership transfers: initiated (ACTIVE→TRANSFERRING), completed (TRANSFERRING→ACTIVE under a new owner), aborted (transfer failed before complete fired). The relocate-trigger path is dormant in the current build; these counters stay at zero until the production wiring is enabled — the panel is plumbed so it lights up automatically when it lands.",
+          "type": "graph",
+          "fill": 2,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 8,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "increase(herddb_optimizer_relocations_initiated_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "initiated — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "increase(herddb_optimizer_relocations_completed_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "completed — {{instance}}",
+              "refId": "B"
+            },
+            {
+              "expr": "increase(herddb_optimizer_relocations_aborted_total{job=\"index-optimizer\",instance=~\"$instance\"}[5m])",
+              "format": "time_series",
+              "legendFormat": "aborted — {{instance}}",
+              "refId": "C"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 1141,
+          "title": "Relocations In Flight",
+          "description": "Initiated minus completed — approximate number of transfers currently in flight. Sustained non-zero ⇒ takeover-side IS is slow or stuck. Use TRANSFERRING gauge above to cross-check.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "span": 4,
+          "targets": [
+            {
+              "expr": "herddb_optimizer_relocations_initiated_total{job=\"index-optimizer\",instance=~\"$instance\"} - herddb_optimizer_relocations_completed_total{job=\"index-optimizer\",instance=~\"$instance\"} - herddb_optimizer_relocations_aborted_total{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "in-flight — {{instance}}",
+              "refId": "A"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        }
+      ],
+      "title": "Segment Relocations"
+    }
+  ],
+  "schemaVersion": 14,
+  "style": "dark",
+  "tags": ["herddb", "index-optimizer"],
+  "templating": {
+    "list": [
+      {
+        "allValue": ".+",
+        "current": {},
+        "datasource": "Prometheus",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Instance",
+        "multi": true,
+        "name": "instance",
+        "options": [],
+        "query": "label_values(herddb_optimizer_runs_total{job=\"index-optimizer\"}, instance)",
+        "refresh": 1,
+        "regex": "",
+        "sort": 0,
+        "type": "query",
+        "useTags": false
+      }
+    ]
+  },
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h"
+    ],
+    "time_options": [
+      "5m",
+      "15m",
+      "1h",
+      "6h",
+      "12h",
+      "24h",
+      "2d",
+      "7d",
+      "30d"
+    ]
+  },
+  "timezone": "",
+  "title": "HerdDB Index Optimizer",
+  "version": 1,
+  "uid": "index-optimizer"
+}
