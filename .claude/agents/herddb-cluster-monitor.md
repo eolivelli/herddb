@@ -107,8 +107,7 @@ kubectl exec herddb-tools-0 -- indexing-admin engine-stats \
 
 For each replica 0 to IS_REPLICAS-1, extract and report:
 - `tailer_watermark_ledger` / `tailer_watermark_offset` — how far the IS tailer has read
-- `apply_queue_size` / `apply_queue_capacity` — pending vector-insert queue; full (= capacity) means IS is at max throughput
-- `total_estimated_memory_bytes` — live HNSW graph memory; if this nears the IS internal limit (~2.3 GiB by default), IS will trigger a back-pressure checkpoint
+- `total_estimated_memory_bytes` — live HNSW graph memory; if this nears the IS internal limit, IS will trigger a back-pressure checkpoint
 - `jvm_heap_used_pct` — IS JVM heap utilisation
 - Parse memory in GiB (divide by 1e9)
 
@@ -203,7 +202,7 @@ TICK <num> SUMMARY
 Variant: k3s-local
 Phase: ingestion  rows=460000/1000000 (46%)  rate=3120 rows/s  commits=460 (recovered=0)
 PodStatus: 7 pods Running/Ready; server-0 restarts=1
-IS-0: vectors=372501 (81% of rows), apply_queue=2000/2000 (FULL), mem=1.46 GiB — WARN
+IS-0: vectors=372501 (81% of rows), mem=1.46 GiB — WARN
 IS-1: vectors=N/A (not deployed)
 ServerCkpt: last LSN=(10,649298) 2m ago
 ISCkpt: back-pressure 57s, checkpoint Phase B in progress
@@ -216,8 +215,7 @@ Field rules for ingestion ticks:
 - **rows / rate**: take `rows`, `total`, `ops_per_sec` from `GET /status`. Always show both the absolute count and the percentage.
 - **commits**: show `commits` and `recovered_commits` from `/status`. Non-zero `recovered_commits` means workers hit transient commit errors.
 - **IS-N vectors**: take `VECTORS` from `indexing-admin list-indexes`. Compute lag% = `(rows - vectors) / rows * 100`. With 1 IS replica, 100% of rows should be indexed. With 2 replicas and `--index-num-shards 4`, each IS targets ~50%. Flag WARN if lag > 10% sustained.
-- **IS-N apply_queue**: take `apply_queue_size` / `apply_queue_capacity` from `engine-stats`. FULL = IS is at max throughput.
-- **IS-N mem**: take `total_estimated_memory_bytes` from `engine-stats`, convert to GiB.
+- **IS-N mem**: take `total_estimated_memory_bytes` from `engine-stats`, convert to GiB. Warn if approaching the configured IS global limit.
 - **ServerCkpt**: last completed server checkpoint LSN and time since it completed.
 - **ISCkpt**: any back-pressure or checkpoint phase currently active in IS logs. If no checkpoint is active, omit this line.
 - **Bookie**: omit entirely when `blocked=0`, `rejected=0`, `skipThr=0`.
@@ -229,7 +227,7 @@ TICK <num> SUMMARY
 Variant: k3s-local
 Phase: checkpoint  Progress: n/a  (server checkpoint triggered by bench)
 PodStatus: 7 pods Running/Ready
-IS-0: vectors=1000000 (100% of rows), apply_queue=0/2000, mem=1.1 GiB — OK
+IS-0: vectors=1000000 (100% of rows), mem=1.1 GiB — OK
 ServerCkpt: in progress — last LSN=(10,649298) 3m ago
 ISCkpt: none active
 LogErrors: none detected
@@ -243,8 +241,8 @@ TICK <num> SUMMARY
 Variant: gke
 Phase: ingestion  rows=500000/1000000 (50%)  rate=4000 rows/s  commits=500 (recovered=0)
 PodStatus: 8 pods; herddb-indexing-service-1 has 2 restarts
-IS-0: vectors=480000 (96% of rows), apply_queue=1500/2000, mem=2.5 GiB — OK
-IS-1: vectors=20000 (4% of rows), apply_queue=2000/2000 (FULL), mem=0.1 GiB — WARN (lag 46%)
+IS-0: vectors=480000 (96% of rows), mem=2.5 GiB — OK
+IS-1: vectors=20000 (4% of rows), mem=0.1 GiB — WARN (lag 46%)
 ServerCkpt: last LSN=(5,230000) 1m ago
 ISCkpt: none active
 LogErrors: herddb-file-server-0 SEVERE: "ReadinessProbe failed"
@@ -255,7 +253,7 @@ Verdict: warning
 TICK <num> SUMMARY
 Phase: recall
 PodStatus: 8 pods; herddb-indexing-service-0 OOMKilled (phase=Failed)
-IS-0: vectors=N/A (pod restarted), apply_queue=N/A, mem=N/A — FATAL
+IS-0: vectors=N/A (pod restarted), mem=N/A — FATAL
 LogErrors: herddb-indexing-service-0 java.lang.OutOfMemoryError: Java heap space
 Verdict: fatal
 ```

@@ -181,8 +181,7 @@ kubectl exec herddb-tools-0 -- \
         --server herddb-indexing-service-<N>.herddb-indexing-service:9850 --json
 ```
 Fields to watch: `tailer_watermark_ledger`, `tailer_watermark_offset`,
-`apply_queue_size`, `apply_queue_capacity`, `total_estimated_memory_bytes`,
-`jvm_heap_used_pct`.
+`total_estimated_memory_bytes`, `jvm_heap_used_pct`.
 
 ```
 kubectl exec herddb-tools-0 -- \
@@ -410,7 +409,7 @@ Agent(
   Extract: phase, rows, total, ops_per_sec, commits, recovered_commits.
 
   For each IS get vector_count from `indexing-admin list-indexes` and
-  apply_queue + mem from `indexing-admin engine-stats --json`.
+  mem from `indexing-admin engine-stats --json`.
   Compute IS-N lag% = (rows - vector_count) / rows * 100.
   With 2 IS replicas and --index-num-shards 4, target is ~50% per instance.
   Flag WARN if an instance's lag > 10% for 2+ consecutive ticks.
@@ -424,8 +423,8 @@ Agent(
   Variant: gke
   Phase: <phase>  rows=X/total (X%)  rate=X rows/s  commits=X (recovered=X)
   PodStatus: <compact summary — Running/Ready counts, any restarts>
-  IS-0: vectors=X (X% of rows), apply_queue=X/2000, mem=X GiB — <OK|WARN>
-  IS-1: vectors=X (X% of rows), apply_queue=X/2000, mem=X GiB — <OK|WARN>
+  IS-0: vectors=X (X% of rows), mem=X GiB — <OK|WARN>
+  IS-1: vectors=X (X% of rows), mem=X GiB — <OK|WARN>
   ServerCkpt: last LSN=(<ledger>,<offset>) <N>m ago  [or: in progress]
   ISCkpt: <none active | back-pressure Xs, Phase B in progress | etc.>
   Bookie: [OMIT this line entirely unless blocked>0 or rejected>0 or skipThr>0]
@@ -441,7 +440,6 @@ Agent(
 - **commits**: show `commits` and `recovered_commits`. Non-zero recovered → warn.
 - **IS-N vectors**: use `VECTORS` from `indexing-admin list-indexes`. Compute lag% = `(rows - vectors) / rows * 100`. With 2 IS replicas and `--index-num-shards 4`, steady-state target is ~50% per instance. Flag WARN if lag > 10% for 2+ consecutive ticks.
 - **IS-N time-lag (issue #423)**: from `indexing-admin status --json`, read `tailer_lag_ms` and `durable_lag_ms`. Operator-friendly time-domain measure of how far behind real time the IS is. A growing `tailer_lag_ms` indicates the tailer is not keeping up with the commit log; a growing `durable_lag_ms` (with `tailer_lag_ms` flat) indicates checkpoints are stalling. Flag WARN if `tailer_lag_ms > 30000` (30 s) or `durable_lag_ms > 300000` (5 min). Skip the column when the value is `-1` ("unknown").
-- **IS-N apply_queue**: from `engine-stats`. `FULL` = IS at max throughput, lag will grow.
 - **IS-N mem**: `total_estimated_memory_bytes` from `engine-stats`, in GiB. Warn if > 18 GiB.
 - **ServerCkpt**: last `local checkpoint finish` line from server logs — LSN + age.
 - **ISCkpt**: any active back-pressure or checkpoint phase from IS logs. Omit if nothing active.

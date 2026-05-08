@@ -283,7 +283,7 @@ bookkeeper:
     # caused BK-0 to freeze for ~10 minutes while SortedLedgerStorage flushes were
     # running concurrently, blocking all addEntry writes. Setting to 1,000,000
     # (100× default) prevents the IS catch-up burst from triggering the gate.
-    maxReadRequestsInProgress: "1000000"
+    maxReadsInProgressLimit: "1000000"
   # Journal: pd-SSD (premium-rwo) — random write I/O, latency-sensitive.
   #   During a 1B bigann ingest run the bookie journal showed p99.9 write
   #   latency of 45–60 ms on pd-balanced (standard-rwo). This tail feeds a

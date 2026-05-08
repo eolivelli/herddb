@@ -172,8 +172,7 @@ Invoked via the zip's `bin/indexing-admin.sh` — no kubectl needed.
 $CLUSTER_DIR/bin/indexing-admin.sh engine-stats --server localhost:9850 --json
 ```
 Fields to watch: `tailer_watermark_ledger`, `tailer_watermark_offset`,
-`apply_queue_size`, `apply_queue_capacity`, `total_estimated_memory_bytes`,
-`jvm_heap_used_pct`.
+`total_estimated_memory_bytes`, `jvm_heap_used_pct`.
 
 ```
 $CLUSTER_DIR/bin/indexing-admin.sh describe-index --server localhost:9850 \
@@ -308,8 +307,7 @@ Each tick does:
    thread`, `DataStorageManagerException`, `timed out while acquiring
    checkpoint lock`, `forcing rollback of abandoned transaction`.
 5. `$CLUSTER_DIR/bin/indexing-admin.sh engine-stats --server localhost:9850 --json`
-   — grab `tailer_watermark_*`, `apply_queue_size`,
-   `total_estimated_memory_bytes`.
+   — grab `tailer_watermark_*`, `total_estimated_memory_bytes`.
 6. `$CLUSTER_DIR/bin/indexing-admin.sh list-indexes --server localhost:9850`
    — read the `VECTORS` column (authoritative indexed vector count).
    Compute lag% = `(rows - vectors) / rows * 100`. Flag WARN if lag >
@@ -322,7 +320,7 @@ TICK N SUMMARY
 Variant: local
 Phase: <phase>  rows=X/total (X%)  rate=X rows/s  commits=X (recovered=X)
 Processes: server pid=X RSS=X MB ; indexing-service pid=X RSS=X MB
-IS: vectors=X (X% of rows), apply_queue=X/cap, mem=X GiB — <OK|WARN>
+IS: vectors=X (X% of rows), mem=X GiB — <OK|WARN>
 ServerCkpt: last LSN=(<ledger>,<offset>) <N>m ago  [or: in progress]
 ISCkpt: <none active | back-pressure Xs, Phase B in progress | etc.>
 LogErrors: <none detected | verbatim error lines>
