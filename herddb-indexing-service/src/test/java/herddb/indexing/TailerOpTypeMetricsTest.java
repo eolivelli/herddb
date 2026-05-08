@@ -21,13 +21,17 @@
 package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import herddb.codec.RecordSerializer;
 import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
 import herddb.log.LogSequenceNumber;
 import herddb.model.ColumnTypes;
 import herddb.model.Index;
+import herddb.model.Record;
 import herddb.model.Table;
 import herddb.utils.Bytes;
+import herddb.utils.XXHash64Utils;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -275,5 +279,199 @@ public class TailerOpTypeMetricsTest {
         assertEquals("INSERT on table without vector index must NOT count "
                         + "as shard-filtered",
                 0L, engine.getTailerEntriesShardFiltered());
+    }
+
+    /**
+     * Issue #467 item 2: a table with TWO vector indexes that have
+     * <em>different</em> {@code numShards} values (2 and 3) can produce
+     * per-key split decisions — a key whose hash puts it on an odd shard
+     * for {@code numShards=2} but an even shard for {@code numShards=3}
+     * will be <em>accepted by the second index</em> even though the first
+     * rejected it. The documented contract is:
+     * <ul>
+     *   <li>{@code tailer_entries_shard_filtered} is incremented only when
+     *       <em>every</em> applicable vector index rejected the key.</li>
+     *   <li>Keys accepted by at least one index are NOT counted.</li>
+     * </ul>
+     * The test sets up instance 0 of 2 with one table + two indexes
+     * ({@code numShards=2} and {@code numShards=3}) then drives 120 INSERTs
+     * (a multiple of lcm(2,3)=6, so hash buckets are well-represented).
+     * Before driving the INSERTs it pre-classifies each key using the same
+     * {@link XXHash64Utils#hash} + {@code Math.floorMod} formula used by
+     * production, counts how many are rejected by <em>both</em> indexes,
+     * and asserts the engine counter matches. It additionally asserts that
+     * some keys triggered the "mixed acceptance" path (one index accepts,
+     * one rejects) — proving the test is not vacuous.
+     */
+    @Test
+    public void mixedAcceptanceInsertDoesNotBumpShardFiltered() throws Exception {
+        int numRecords = 120; // multiple of lcm(2, 3) = 6
+        int numShards2 = 2;
+        int numShards3 = 3;
+
+        // Instance 0 of 2 — shard filter fires for non-trivial numShards.
+        EmbeddedIndexingService multiService = new EmbeddedIndexingService(
+                folder.newFolder("ma-log").toPath(),
+                folder.newFolder("ma-data").toPath(),
+                0, 2);
+        multiService.start();
+        try {
+            IndexingServiceEngine engine = multiService.getEngine();
+            Table table = Table.builder()
+                    .name("matbl")
+                    .tablespace("local")
+                    .column("pk", ColumnTypes.STRING)
+                    .column("vec", ColumnTypes.FLOATARRAY)
+                    .primaryKey("pk")
+                    .build();
+
+            // Two indexes with different numShards on the same table.
+            Index idxA = Index.builder()
+                    .name("vidxA")
+                    .table("matbl")
+                    .tablespace("local")
+                    .type(Index.TYPE_VECTOR)
+                    .column("vec", ColumnTypes.FLOATARRAY)
+                    .property("numShards", String.valueOf(numShards2))
+                    .build();
+            Index idxB = Index.builder()
+                    .name("vidxB")
+                    .table("matbl")
+                    .tablespace("local")
+                    .type(Index.TYPE_VECTOR)
+                    .column("vec", ColumnTypes.FLOATARRAY)
+                    .property("numShards", String.valueOf(numShards3))
+                    .build();
+
+            // DDL via applyEntry so the schema tracker is seeded without
+            // touching the per-op metric counters we are about to assert.
+            engine.applyEntry(new LogSequenceNumber(1, 1),
+                    LogEntryFactory.createTable(table, null));
+            engine.applyEntry(new LogSequenceNumber(1, 2),
+                    LogEntryFactory.createIndex(idxA, null));
+            engine.applyEntry(new LogSequenceNumber(1, 3),
+                    LogEntryFactory.createIndex(idxB, null));
+
+            // Pre-classify every key using the same hash + floorMod formula
+            // as IndexingServiceEngine.isAcceptedLocally. n=2, instanceId=0.
+            int expectedShardFiltered = 0;
+            int mixedAcceptanceCount = 0;
+            for (int i = 0; i < numRecords; i++) {
+                Bytes key = Bytes.from_string("ma-" + i);
+                long hash = XXHash64Utils.hash(
+                        key.getBuffer(), key.getOffset(), key.getLength());
+                // idxA: numShards=2 → accepted if (hash%2)%2==0 → shard==0
+                boolean acceptedByA = Math.floorMod((int) hash, numShards2) % 2 == 0;
+                // idxB: numShards=3 → accepted if (hash%3)%2==0 → shard ∈ {0,2}
+                boolean acceptedByB = Math.floorMod((int) hash, numShards3) % 2 == 0;
+                if (!acceptedByA && !acceptedByB) {
+                    expectedShardFiltered++;
+                }
+                if (acceptedByA != acceptedByB) {
+                    mixedAcceptanceCount++;
+                }
+            }
+
+            // Sanity-check the test is actually exercising mixed decisions
+            // (otherwise the two-index setup adds nothing over a single-index
+            // test and we would not be testing the "at-least-one-accepts"
+            // branch at all).
+            assertTrue("with numShards=2 and numShards=3 across 120 keys, at "
+                    + "least one key must have divergent per-index decisions",
+                    mixedAcceptanceCount > 0);
+            // Similarly, at least one key must be rejected by both so the
+            // counter is non-trivially tested.
+            assertTrue("at least one key must be rejected by both indexes",
+                    expectedShardFiltered > 0);
+
+            // Drive all INSERTs through processEntryForTest (the path the
+            // real tailer uses) so classifyForMetrics fires on each one.
+            // The record value must be a properly serialised row (schema-aware
+            // bytes), not a raw string — applyInsert feeds it through
+            // RecordSerializer.accessRawDataFromValue to extract the vector.
+            for (int i = 0; i < numRecords; i++) {
+                Record record = RecordSerializer.makeRecord(table,
+                        "pk", "ma-" + i,
+                        "vec", new float[]{i * 1.0f, (i + 1) * 1.0f, (i + 2) * 1.0f});
+                engine.processEntryForTest(new LogSequenceNumber(1, 10 + i),
+                        LogEntryFactory.insert(table, record.key, record.value, null));
+            }
+            engine.awaitPendingWorkForTest();
+
+            assertEquals("shard-filter counter must match the pre-classified "
+                    + "both-reject count",
+                    expectedShardFiltered, engine.getTailerEntriesShardFiltered());
+            assertEquals("tailer_inserts must count every INSERT regardless of "
+                    + "shard-filter outcome",
+                    numRecords, engine.getTailerInserts());
+        } finally {
+            multiService.close();
+        }
+    }
+
+    /**
+     * Issue #467 item 5: UPDATE and DELETE entries on a sharded vector index
+     * must NOT increment {@code tailer_entries_shard_filtered}. The shard
+     * filter is INSERT-only: DELETE is always broadcast (so stale copies on
+     * non-owners are removed), and UPDATE's remove is also broadcast while
+     * only the add side is filtered — but neither bumps the counter. A
+     * focused single-instance test locks this documented scope explicitly so a
+     * future change that accidentally widens the filter to UPDATE or DELETE
+     * would fail loudly here rather than at the broader multi-instance tests.
+     */
+    @Test
+    public void updateAndDeleteOnShardedTableDoNotBumpShardFiltered() throws Exception {
+        // Instance 0 of 2, numShards=4 — shard filter is active.
+        EmbeddedIndexingService shardedService = new EmbeddedIndexingService(
+                folder.newFolder("ud-log").toPath(),
+                folder.newFolder("ud-data").toPath(),
+                0, 2);
+        shardedService.start();
+        try {
+            IndexingServiceEngine engine = shardedService.getEngine();
+            Table table = Table.builder()
+                    .name("udtbl")
+                    .tablespace("local")
+                    .column("pk", ColumnTypes.STRING)
+                    .column("vec", ColumnTypes.FLOATARRAY)
+                    .primaryKey("pk")
+                    .build();
+            Index index = Index.builder()
+                    .name("udidx")
+                    .table("udtbl")
+                    .tablespace("local")
+                    .type(Index.TYPE_VECTOR)
+                    .column("vec", ColumnTypes.FLOATARRAY)
+                    .property("numShards", "4")
+                    .build();
+
+            // DDL via applyEntry so counters start at zero before the DML.
+            engine.applyEntry(new LogSequenceNumber(1, 1),
+                    LogEntryFactory.createTable(table, null));
+            engine.applyEntry(new LogSequenceNumber(1, 2),
+                    LogEntryFactory.createIndex(index, null));
+
+            // Build a properly serialised record so the async applyUpdate path
+            // can decode the vector column without throwing "bad column type".
+            Record record = RecordSerializer.makeRecord(table,
+                    "pk", "ud-key",
+                    "vec", new float[]{1.0f, 2.0f, 3.0f});
+
+            // One UPDATE and one DELETE through the full tailer path.
+            engine.processEntryForTest(new LogSequenceNumber(1, 3),
+                    LogEntryFactory.update(table, record.key, record.value, null));
+            engine.processEntryForTest(new LogSequenceNumber(1, 4),
+                    LogEntryFactory.delete(table, record.key, null));
+            engine.awaitPendingWorkForTest();
+
+            assertEquals("tailer_updates must be 1", 1L, engine.getTailerUpdates());
+            assertEquals("tailer_deletes must be 1", 1L, engine.getTailerDeletes());
+            assertEquals("UPDATE and DELETE must NOT bump tailer_entries_shard_filtered",
+                    0L, engine.getTailerEntriesShardFiltered());
+            // tailer_inserts must remain zero — nothing was inserted.
+            assertEquals("tailer_inserts must remain 0", 0L, engine.getTailerInserts());
+        } finally {
+            shardedService.close();
+        }
     }
 }

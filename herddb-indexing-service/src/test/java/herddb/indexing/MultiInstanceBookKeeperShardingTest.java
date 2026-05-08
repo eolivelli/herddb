@@ -484,6 +484,13 @@ public class MultiInstanceBookKeeperShardingTest {
         int numRecords = 100;
         int batchSize = 50;
         long[] txIds = new long[]{42L, 43L};
+        // Issue #467: guard against silent leftover-insert data loss. The loop
+        // below iterates `numRecords / batchSize` times and drops the remainder
+        // entirely — so if someone changes numRecords to a non-multiple of
+        // batchSize, not all INSERTs are exercised and the metric assertions
+        // below will silently pass with the wrong counts.
+        assertEquals("numRecords must be an exact multiple of batchSize to avoid "
+                + "silent leftover INSERTs", 0, numRecords % batchSize);
 
         Table table = createTable();
         Index index = createIndex(numShards);
