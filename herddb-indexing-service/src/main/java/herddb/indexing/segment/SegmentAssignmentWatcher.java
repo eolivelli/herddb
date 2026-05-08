@@ -19,6 +19,7 @@
  */
 package herddb.indexing.segment;
 
+import io.netty.util.concurrent.FastThreadLocalThread;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -89,7 +90,7 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
                                     long refreshIntervalMs) {
         this(registry, instanceId, listener, refreshIntervalMs,
                 Executors.newSingleThreadScheduledExecutor(r -> {
-                    Thread t = new Thread(r, "segment-assignment-watcher-" + instanceId);
+                    FastThreadLocalThread t = new FastThreadLocalThread(r, "segment-assignment-watcher-" + instanceId);
                     t.setDaemon(true);
                     return t;
                 }));
