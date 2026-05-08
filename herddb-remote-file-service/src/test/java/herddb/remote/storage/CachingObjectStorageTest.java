@@ -170,6 +170,18 @@ public class CachingObjectStorageTest {
         return new CachingObjectStorage(inner, cacheDir, executor, maxBytes);
     }
 
+    /**
+     * Builds a {@link CachingObjectStorage} forced into the legacy per-file mode
+     * (slab disabled). Used by tests that exercise the {@link Files#exists}-based
+     * cache-file-on-disk semantics — those scenarios only apply to the fallback
+     * tier with the slab layout in place (issue #475).
+     */
+    private CachingObjectStorage buildLegacy(FakeObjectStorage inner, long maxBytes) throws Exception {
+        Path cacheDir = folder.newFolder("cache").toPath();
+        return new CachingObjectStorage(inner, cacheDir, executor, maxBytes,
+                CachingObjectStorage.SlabConfig.disabled());
+    }
+
     @Test
     public void testWriteReadFromCache() throws Exception {
         FakeObjectStorage inner = new FakeObjectStorage();
@@ -221,9 +233,8 @@ public class CachingObjectStorageTest {
             result.release();
         }
 
-        // Local cache file should have been written
-        Path cacheFile = caching.cacheFilePath("ts1/x.page");
-        assertTrue("cache file should exist", Files.exists(cacheFile));
+        // Entry should now be resident in the cache (in some tier).
+        assertTrue("cache entry should be resident", caching.isInCache("ts1/x.page"));
     }
 
     @Test
@@ -257,8 +268,7 @@ public class CachingObjectStorageTest {
             result.release();
         }
 
-        Path cacheFile = caching.cacheFilePath("del/1.page");
-        assertFalse("local cache file should be gone", Files.exists(cacheFile));
+        assertFalse("cache entry should no longer be resident", caching.isInCache("del/1.page"));
     }
 
     @Test
@@ -294,8 +304,8 @@ public class CachingObjectStorageTest {
             rc.release();
         }
 
-        assertFalse(Files.exists(caching.cacheFilePath("pfx/a.page")));
-        assertFalse(Files.exists(caching.cacheFilePath("pfx/b.page")));
+        assertFalse(caching.isInCache("pfx/a.page"));
+        assertFalse(caching.isInCache("pfx/b.page"));
     }
 
     @Test
@@ -315,12 +325,9 @@ public class CachingObjectStorageTest {
         caching.cleanUp();
         flushExecutor();
 
-        Path fileA = caching.cacheFilePath("blobs/a");
-        Path fileB = caching.cacheFilePath("blobs/b");
-        Path fileC = caching.cacheFilePath("blobs/c");
-        assertFalse("oldest entry should have been evicted and unlinked", Files.exists(fileA));
-        assertTrue("newer entry should remain on disk", Files.exists(fileB));
-        assertTrue("newest entry should remain on disk", Files.exists(fileC));
+        assertFalse("oldest entry should have been evicted", caching.isInCache("blobs/a"));
+        assertTrue("newer entry should remain", caching.isInCache("blobs/b"));
+        assertTrue("newest entry should remain", caching.isInCache("blobs/c"));
     }
 
     @Test
@@ -335,8 +342,8 @@ public class CachingObjectStorageTest {
         caching.cleanUp();
         flushExecutor();
 
-        Path cacheFile = caching.cacheFilePath("evict/big.page");
-        assertFalse("evicted entry's local file should be deleted", Files.exists(cacheFile));
+        assertFalse("evicted entry should no longer be resident",
+                caching.isInCache("evict/big.page"));
     }
 
     @Test
@@ -412,14 +419,15 @@ public class CachingObjectStorageTest {
 
     @Test
     public void testReadSurvivesConcurrentEviction() throws Exception {
+        // Legacy-mode test: simulate the per-file fallback path having its file
+        // unlinked under the cache LRU's feet, and verify the read falls through
+        // to inner.read instead of throwing.
         FakeObjectStorage inner = new FakeObjectStorage();
-        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+        CachingObjectStorage caching = buildLegacy(inner, 10 * 1024 * 1024);
 
         byte[] content = "race".getBytes();
         caching.write("race/1.page", content).get();
 
-        // Force eviction and wait for the listener to unlink the file.
-        caching.cacheFilePath("race/1.page");
         Path file = caching.cacheFilePath("race/1.page");
         Files.deleteIfExists(file);
 
@@ -471,10 +479,11 @@ public class CachingObjectStorageTest {
 
     @Test
     public void testAsyncReadFromCacheHandlesNoSuchFile() throws Exception {
-        // If a file is evicted after the cache membership check but before async open,
-        // the read should treat it as a cache miss and fall through to inner.read
+        // Legacy-mode test: simulate the per-file fallback path having its file
+        // unlinked between LRU lookup and async open. The read must treat that
+        // as a cache miss and fall through to inner.read.
         FakeObjectStorage inner = new FakeObjectStorage();
-        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+        CachingObjectStorage caching = buildLegacy(inner, 10 * 1024 * 1024);
 
         byte[] data = "race".getBytes();
         caching.write("race/1.page", data).get();
@@ -498,9 +507,9 @@ public class CachingObjectStorageTest {
 
     @Test
     public void testAsyncReadSliceFromCacheHandlesNoSuchFile() throws Exception {
-        // Similar to above but for readRange
+        // Similar to above but for readRange — also legacy-mode (per-file path).
         FakeObjectStorage inner = new FakeObjectStorage();
-        CachingObjectStorage caching = build(inner, 10 * 1024 * 1024);
+        CachingObjectStorage caching = buildLegacy(inner, 10 * 1024 * 1024);
 
         byte[] block = new byte[4096];
         for (int i = 0; i < block.length; i++) {
@@ -543,11 +552,9 @@ public class CachingObjectStorageTest {
         caching.writeBlock("multi.page", 0, block0).get();
         caching.writeBlock("multi.page", 1, block1).get();
 
-        // Verify cache files were written
-        Path file0 = caching.cacheFilePath("multi.page.multipart/0");
-        Path file1 = caching.cacheFilePath("multi.page.multipart/1");
-        assertTrue("block 0 cache file should exist", Files.exists(file0));
-        assertTrue("block 1 cache file should exist", Files.exists(file1));
+        // Verify both blocks are resident in the cache (in some tier).
+        assertTrue("block 0 should be cached", caching.isInCache("multi.page.multipart/0"));
+        assertTrue("block 1 should be cached", caching.isInCache("multi.page.multipart/1"));
 
         // Verify reads work
         ReadResult r0 = caching.readRange("multi.page", 0, 100, 1024).get();
@@ -620,15 +627,10 @@ public class CachingObjectStorageTest {
         caching.cleanUp();
         flushExecutor();
 
-        // Oldest blob should be evicted
-        Path fileA = caching.cacheFilePath("blobs/a");
-        assertFalse("oldest entry should have been evicted", Files.exists(fileA));
-
-        // Newer ones should remain
-        Path fileB = caching.cacheFilePath("blobs/b");
-        Path fileC = caching.cacheFilePath("blobs/c");
-        assertTrue("b should remain", Files.exists(fileB));
-        assertTrue("c should remain", Files.exists(fileC));
+        // Oldest blob should be evicted; newer ones should remain resident.
+        assertFalse("oldest entry should have been evicted", caching.isInCache("blobs/a"));
+        assertTrue("b should remain", caching.isInCache("blobs/b"));
+        assertTrue("c should remain", caching.isInCache("blobs/c"));
 
         // Verify reads still work (newer entries remain accessible)
         ReadResult rb = caching.read("blobs/b").get();
@@ -806,7 +808,7 @@ public class CachingObjectStorageTest {
         }
 
         // Data should not be cached
-        Path cacheFile = caching.cacheFilePath("fail/file.page");
-        assertFalse("cache file should not exist after failed write", Files.exists(cacheFile));
+        assertFalse("entry should not be resident after failed inner write",
+                caching.isInCache("fail/file.page"));
     }
 }

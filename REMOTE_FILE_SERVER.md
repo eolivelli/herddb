@@ -251,6 +251,48 @@ mvn test
 
 ---
 
+## On-disk cache layout (S3 mode, issue #475)
+
+When `storage.mode=s3`, the file server fronts the S3-compatible bucket with
+a local volatile disk cache (`CachingObjectStorage`). The on-disk layout
+is a **two-tier slab** rather than one file per cached object:
+
+- **Small tier** (`slab-small.dat`) — fixed-size cells, default 64 KiB,
+  default 25% of `cache.max.bytes`. Holds metadata, transaction records,
+  and other sub-block payloads.
+- **Large tier** (`slab-large.dat`) — fixed-size cells, default
+  `block.size` (4 MiB), default 75% of `cache.max.bytes`. Holds full
+  multipart blocks (the dominant ANN/HNSW workload).
+- **Per-file fallback** — entries larger than the largest tier's cell
+  size fall through to the original one-file-per-object path so
+  arbitrarily large objects remain cacheable.
+
+Both slab files are pre-allocated at boot and kept open as
+`AsynchronousFileChannel`s for the JVM lifetime, so admit/evict no longer
+pay `open`/`close`/`create`/`delete` syscalls per cached object. The
+in-memory index (`Map<key, Slot>`) is volatile: the slab files are
+deleted on construction and on close, and the index starts empty on every
+boot — matching the volatile-cache contract.
+
+Knobs (see `fileserver.properties`):
+
+| Key | Default |
+|---|---|
+| `cache.slab.enabled` | `true` |
+| `cache.slab.small.cell.bytes` | `65536` |
+| `cache.slab.small.fraction` | `0.25` |
+| `cache.slab.large.cell.bytes` | tracks `block.size` |
+| `cache.slab.large.fraction` | `0.75` |
+
+Setting `cache.slab.enabled=false` reverts to the legacy per-file layout.
+
+Per-tier metrics are exposed under `rfs_disk_cache_slab_small_*`,
+`rfs_disk_cache_slab_large_*` and `rfs_disk_cache_slab_fallback_*` and
+plotted by the bundled Grafana dashboard
+(`herddb-kubernetes/.../remote-file-service-dashboard.json`).
+
+---
+
 ## Limitations and known constraints
 
 - **No replication.** Each remote server stores a distinct subset of pages. If a server is lost, the pages on that server are lost. Add replication at the infrastructure level (DRBD, replicated block devices, etc.) if durability is required.
