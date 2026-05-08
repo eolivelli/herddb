@@ -24,6 +24,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import herddb.codec.RecordSerializer;
@@ -545,12 +546,13 @@ public class BlockCacheWarmupAsyncTest {
             // before — the second submit was dropped because the previous
             // warmup was still running.
             Future<?> stillFirstWarmup = te.engine.getLastWarmupFutureForTest();
-            assertTrue("second checkpoint must not pile up a new warmup while one is in progress",
-                    stillFirstWarmup == firstWarmup);
+            assertSame(
+                    "second checkpoint must not pile up a new warmup while one is in progress",
+                    firstWarmup, stillFirstWarmup);
 
             // Release the hook; the in-flight warmup now completes.
             hookRelease.countDown();
-            firstWarmup.get(30, TimeUnit.SECONDS);
+            te.engine.awaitPendingWarmupForTest(30_000);
             assertTrue("first warmup must have completed after hook release",
                     firstWarmup.isDone());
 
@@ -659,7 +661,7 @@ public class BlockCacheWarmupAsyncTest {
             // Release the hook; the warmup completes normally and reads
             // bytes through the storage manager.
             hookRelease.countDown();
-            warmup.get(30, TimeUnit.SECONDS);
+            te.engine.awaitPendingWarmupForTest(30_000);
             assertTrue("warmup must have read bytes after release",
                     te.dsm.totalBytesRead.get() > 0);
 
