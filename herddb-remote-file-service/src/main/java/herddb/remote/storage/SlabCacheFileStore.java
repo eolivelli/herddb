@@ -41,7 +41,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * One slab file with fixed-size cells, kept open for the JVM lifetime (issue #475).
+ * One slab file with fixed-size cells, kept open for the JVM lifetime
+ * (issue #475).
  * <p>
  * Replaces the per-object cache file in {@link CachingObjectStorage} with a single,
  * pre-allocated container divided into {@code cellSize}-sized slots. Each cached
