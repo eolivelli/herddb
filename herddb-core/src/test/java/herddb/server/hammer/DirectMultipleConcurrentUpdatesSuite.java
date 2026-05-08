@@ -199,15 +199,19 @@ public abstract class DirectMultipleConcurrentUpdatesSuite {
                     ));
                 }
                 for (Future f : futures) {
-                    // 90 s is strictly less than both outer @Test timeout values
-                    // (180 s for no-checkpoint variants, 240 s for checkpoint variants)
-                    // so a stuck future fires TimeoutException *before* JUnit interrupts
-                    // the test thread. The dumpOnFailure TestWatcher rule is a second
-                    // safety net for hangs that occur outside this loop (issue #417).
+                    // 120 s is strictly less than both outer @Test timeout values
+                    // (180 s for no-checkpoint variants, 300 s for checkpoint variants
+                    // after the issue #456 timeout raise), so a stuck future fires
+                    // TimeoutException *before* JUnit interrupts the test thread.
+                    // The dumpOnFailure TestWatcher rule is a second safety net for
+                    // hangs that occur outside this loop (issue #417).
+                    // Raised from 90 s to 120 s to give extra headroom on constrained
+                    // GitHub Actions ubuntu-latest runners (2 CPUs, forkCount=2,
+                    // issue #456).
                     try {
-                        f.get(90, TimeUnit.SECONDS);
+                        f.get(120, TimeUnit.SECONDS);
                     } catch (TimeoutException e) {
-                        dumpAllThreads("DirectMultipleConcurrentUpdatesSuite: future timed out after 90 s");
+                        dumpAllThreads("DirectMultipleConcurrentUpdatesSuite: future timed out after 120 s");
                         throw e;
                     }
                 }

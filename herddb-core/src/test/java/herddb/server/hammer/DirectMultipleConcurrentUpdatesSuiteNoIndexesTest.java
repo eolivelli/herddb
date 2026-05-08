@@ -36,14 +36,15 @@ public class DirectMultipleConcurrentUpdatesSuiteNoIndexesTest extends DirectMul
         performTest(true, 0, false, false);
     }
 
-    // Checkpoint variants: 240 s JUnit ceiling, 90 s inner per-future limit
+    // Checkpoint variants: 300 s JUnit ceiling (raised from 240 s per issue #456),
+    // 120 s inner per-future limit (raised from 90 s in the suite per issue #456).
     // (issue #417 — cuts 300 s+ CI hangs; dumpOnFailure rule captures thread dump).
-    @Test(timeout = 240_000)
+    @Test(timeout = 300_000)
     public void testWithCheckpoints() throws Exception {
         performTest(false, 2000, false, false);
     }
 
-    @Test(timeout = 240_000)
+    @Test(timeout = 300_000)
     public void testWithTransactionsWithCheckpoints() throws Exception {
         performTest(true, 2000, false, false);
     }
