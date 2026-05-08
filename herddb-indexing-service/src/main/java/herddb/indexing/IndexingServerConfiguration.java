@@ -156,6 +156,42 @@ public final class IndexingServerConfiguration {
     /** Hard-coded fallback: 32 MiB per segment. */
     public static final long PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES_DEFAULT = 32L * 1024 * 1024;
 
+    /**
+     * Whether the post-Phase-C cache warmup runs asynchronously on a dedicated
+     * single-thread executor (issue #472).
+     *
+     * <p>When {@code true} (the default) the watermark is published as soon as
+     * Phase C completes — the BFS warmup runs in parallel with subsequent
+     * search queries on a dedicated {@code indexing-warmup} thread. This
+     * removes the ~3 s blocking gap observed in the k3s-bench profile where
+     * the next checkpoint cannot start (single-thread {@code checkpointExecutor})
+     * and the watermark snapshot is held back for the duration of the warmup.
+     * Multiple in-flight requests are coalesced (the engine drops a new submit
+     * if a previous warmup is still running), so unbounded queueing cannot
+     * happen during pathological scheduling — the next post-checkpoint trigger
+     * will pick up the latest segment set.
+     *
+     * <p>When {@code false} the warmup runs inline on the
+     * {@code checkpointExecutor} thread before the watermark is saved
+     * (the original issue #322 behaviour). Useful when an operator wants the
+     * cache fully primed before WAITFORINDEXES queries can observe the new
+     * snapshot.
+     *
+     * <p>Resolved in the same priority order as
+     * {@link #PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_BYTES}: properties-file
+     * key &gt; JVM system property &gt; hard-coded default.
+     */
+    public static final String PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC =
+            "indexing.vector.segmentCacheWarmupAsync";
+    /**
+     * System-property fallback for {@link #PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC}.
+     * A value set in the properties file always wins over this system property.
+     */
+    public static final String SYSPROP_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC =
+            "herddb.vectorindex.segmentCacheWarmupAsync";
+    /** Hard-coded default: async warmup is enabled. */
+    public static final boolean PROPERTY_VECTOR_SEGMENT_CACHE_WARMUP_ASYNC_DEFAULT = true;
+
     // Compaction (checkpoint driver — existing)
     public static final String PROPERTY_COMPACTION_INTERVAL = "indexing.compaction.interval";
     public static final long PROPERTY_COMPACTION_INTERVAL_DEFAULT = 60000L;
