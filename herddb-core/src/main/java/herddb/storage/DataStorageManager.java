@@ -493,23 +493,49 @@ public abstract class DataStorageManager implements AutoCloseable {
      * pinned for {@code (tableSpace, uuid)}; the empty set means "no
      * checkpoint pinned".
      *
-     * <p>Why this exists: the createIndex pin-leak regression test in
-     * {@code CreateVectorIndexRebuildPropertyTest} needs a way to assert
+     * <p>Why this exists: the createIndex pin-leak regression tests in
+     * {@code CreateVectorIndexRebuildPropertyTest} need a way to assert
      * that a failed CREATE VECTOR INDEX did not leave a pinned
-     * checkpoint behind. The pin maps are intentionally private (callers
-     * should go through {@link #unPinTableCheckpoint} for any production
-     * mutation), but for testing we expose a read-only view.
+     * checkpoint behind, and that a successful one does hold the pin.
+     * The pin maps are intentionally private (callers should go through
+     * {@link #unPinTableCheckpoint} for any production mutation), but
+     * for testing we expose a read-only view.
      *
      * <p>The returned set is a defensive snapshot: callers may iterate
      * it freely without races against concurrent pin/unpin activity.
+     * The lookup happens inside the same synchronization block that the
+     * production write paths use ({@link #pinAndGetCheckpoints} and
+     * {@link #unPinCheckPoint}), so the snapshot is consistent.
      */
+    @com.google.common.annotations.VisibleForTesting
     public Set<LogSequenceNumber> pinnedTableCheckpointsForTest(String tableSpace, String uuid) {
-        Set<LogSequenceNumber> pins =
-                tableCheckpointPins.get(tableSpace + "_" + uuid);
-        if (pins == null) {
-            return Collections.emptySet();
-        }
         synchronized (tableCheckpointPins) {
+            Set<LogSequenceNumber> pins =
+                    tableCheckpointPins.get(tableSpace + "_" + uuid);
+            if (pins == null) {
+                return Collections.emptySet();
+            }
+            return new java.util.HashSet<>(pins);
+        }
+    }
+
+    /**
+     * Issue #471 — sibling of
+     * {@link #pinnedTableCheckpointsForTest(String, String)} for the
+     * index-checkpoint pin map. The PK BLink keyToPage and any
+     * pre-existing user secondary indexes are pinned at the same LSN
+     * inside {@code TableManager.doCheckpoint}; the rebuild test
+     * suite reads through this method to assert all three pin sets
+     * are aligned on the happy path.
+     */
+    @com.google.common.annotations.VisibleForTesting
+    public Set<LogSequenceNumber> pinnedIndexCheckpointsForTest(String tableSpace, String uuid) {
+        synchronized (indexCheckpointPins) {
+            Set<LogSequenceNumber> pins =
+                    indexCheckpointPins.get(tableSpace + "_" + uuid);
+            if (pins == null) {
+                return Collections.emptySet();
+            }
             return new java.util.HashSet<>(pins);
         }
     }

@@ -154,4 +154,48 @@ public class VectorIndexManagerRebuildLsnCodecTest {
         assertThrows(IllegalArgumentException.class,
                 () -> VectorIndexManager.decodeRebuildLsn(""));
     }
+
+    @Test
+    public void decode_rejectsBareColon() {
+        // Both components empty — Long.parseLong("") throws, but pin
+        // the rejection here so a future "be lenient" parser change
+        // cannot silently accept it as 0:0.
+        assertThrows(IllegalArgumentException.class,
+                () -> VectorIndexManager.decodeRebuildLsn(":"));
+    }
+
+    @Test
+    public void decode_rejectsEmptyLedger() {
+        assertThrows(IllegalArgumentException.class,
+                () -> VectorIndexManager.decodeRebuildLsn(":5"));
+    }
+
+    @Test
+    public void decode_rejectsEmptyOffset() {
+        assertThrows(IllegalArgumentException.class,
+                () -> VectorIndexManager.decodeRebuildLsn("5:"));
+    }
+
+    @Test
+    public void decode_rejectsLeadingPlus() {
+        // Long.parseLong("+1") returns 1, but the encoder never
+        // produces a '+' prefix — accepting one would break a defensive
+        // re-encode-and-compare round-trip check.
+        assertThrows(IllegalArgumentException.class,
+                () -> VectorIndexManager.decodeRebuildLsn("+1:5"));
+        assertThrows(IllegalArgumentException.class,
+                () -> VectorIndexManager.decodeRebuildLsn("1:+5"));
+    }
+
+    @Test
+    public void decode_rejectsLeadingZeroOnMultiDigit() {
+        // Long.parseLong("01") returns 1, but the encoder never
+        // produces a leading-zero shape — same reasoning as the '+'
+        // rejection above. Single zero "0" is fine and is exercised
+        // by roundTrip_zeroLedger_zeroOffset.
+        assertThrows(IllegalArgumentException.class,
+                () -> VectorIndexManager.decodeRebuildLsn("01:5"));
+        assertThrows(IllegalArgumentException.class,
+                () -> VectorIndexManager.decodeRebuildLsn("1:05"));
+    }
 }

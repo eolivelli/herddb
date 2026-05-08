@@ -2534,8 +2534,12 @@ public class TableSpaceManager {
             // for hours. The pin ensures the IS reads a coherent view for
             // the entire scan duration. The pin is unpinned by step 3 of
             // issue #471 (the IS-side rebuilder) — until then, abandoning
-            // the rebuild leaves a single pinned checkpoint per index that
-            // survives until the table is dropped.
+            // the rebuild leaves a single pinned checkpoint per index in
+            // the leader's IN-MEMORY pin maps that survives only until
+            // the leader process restarts (pins are not persisted to
+            // disk; on restart the cleanupAfterTableBoot reaper runs
+            // against the persisted activePages set, not against the
+            // in-memory pin set).
             //
             // For non-vector indexes the existing in-process rebuild path
             // on bootIndex/scanForIndexRebuild covers the back-fill, so
@@ -2569,6 +2573,20 @@ public class TableSpaceManager {
                                 new Object[]{originalIndex.tablespace, originalIndex.table,
                                         originalIndex.name, tableSize});
                         long checkpointStartNanos = System.nanoTime();
+                        // NOTE on partial-pin failure class: tableManager.checkpoint(true) takes
+                        // multiple pins inside doCheckpoint (PK BLink keyToPage, every
+                        // pre-existing secondary index, and the table itself). If
+                        // doCheckpoint throws AFTER taking some of those pins but
+                        // BEFORE returning the TableCheckpoint, the call site here
+                        // never observes the LSN to unpin. Background activator-driven
+                        // checkpoints tolerate this leak by retrying; foreground SQL
+                        // callers (this one) cannot. Until the doCheckpoint outer
+                        // try/finally is hardened to roll back partial pins, a CREATE
+                        // VECTOR INDEX that fails INSIDE checkpoint(true) leaves an
+                        // in-memory pin that survives until leader process restart.
+                        // We log SEVERELY in the catch path below so an operator
+                        // chasing a "page files won't be reclaimed" incident has a
+                        // breadcrumb. See PR #476 review for the deeper fix proposal.
                         AbstractTableManager.TableCheckpoint pinnedCheckpoint =
                                 tableManager.checkpoint(true);
                         long checkpointElapsedMillis =
@@ -2619,6 +2637,23 @@ public class TableSpaceManager {
             indexCreateSucceeded = true;
             return new DDLStatementExecutionResult(entry.transactionId);
         } catch (DataStorageManagerException err) {
+            // If this exception came from tableManager.checkpoint(true), a
+            // partial pin may already be in-memory on doCheckpoint's
+            // sequenceNumber and there is no path here to release it
+            // (we never observed the TableCheckpoint). The pin will
+            // survive until leader process restart. Log loudly so an
+            // operator can correlate it with disk-pressure incidents.
+            if (rebuildPinLsn == null
+                    && Index.TYPE_VECTOR.equals(statement.getIndexDefinition().type)) {
+                LOGGER.log(Level.SEVERE,
+                        "CREATE VECTOR INDEX {0}.{1}.{2} failed inside checkpoint(true);"
+                                + " a partial pin may have leaked on the leader's in-memory pin"
+                                + " maps and will only be reclaimed by a leader restart",
+                        new Object[]{
+                                statement.getIndexDefinition().tablespace,
+                                statement.getIndexDefinition().table,
+                                statement.getIndexDefinition().name});
+            }
             throw new StatementExecutionException(err);
         } finally {
             // Issue #471: release the rebuild pin on any failure between

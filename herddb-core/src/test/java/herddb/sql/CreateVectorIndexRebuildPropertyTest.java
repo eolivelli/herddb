@@ -408,6 +408,88 @@ public class CreateVectorIndexRebuildPropertyTest {
                     "rebuild pin at " + expected + " must be held after CREATE INDEX (pinned="
                             + pinned + ")",
                     pinned.contains(expected));
+
+            // The PK BLink keyToPage is pinned at the same LSN inside
+            // doCheckpoint; the IS does not need this pin (it scans
+            // table data pages, not BLink), but a future refactor that
+            // accidentally leaves the BLink pin behind on success while
+            // the table pin is correctly released would be silently
+            // wrong. The BLink registers in DSM under the synthetic name
+            // "<tableUuid>_primary" (see BLinkKeyToPageIndex.deriveIndexName).
+            String blinkIndexName = herddb.index.blink.BLinkKeyToPageIndex
+                    .deriveIndexName(tableUuid);
+            java.util.Set<herddb.log.LogSequenceNumber> blinkPinned =
+                    manager.getDataStorageManager()
+                            .pinnedIndexCheckpointsForTest(tableSpaceUuid, blinkIndexName);
+            assertTrue(
+                    "BLink keyToPage pin at " + expected + " must be held after CREATE INDEX (pinned="
+                            + blinkPinned + ")",
+                    blinkPinned.contains(expected));
+        }
+    }
+
+    @Test
+    public void nonEmptyTable_vectorIndexAfterPreExistingHashIndex_setsRebuildAndHoldsAllPins()
+            throws Exception {
+        // Cover the partial-pin scenario the most directly: with a
+        // pre-existing user secondary index, doCheckpoint takes pins
+        // sequentially across THREE distinct pin sites (the user hash
+        // index, the PK BLink, the table itself). On success all three
+        // pin sets must carry the same LSN; this test pins that
+        // contract.
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmpDir = folder.newFolder("tmp").toPath();
+
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmpDir)) {
+            manager.start();
+            bootstrapTablespaceAndTable(manager);
+            insertSomeRows(manager, 5);
+            // Pre-existing secondary index BEFORE the vector index.
+            execute(manager,
+                    "CREATE HASH INDEX hidx ON tblspace1.t1(n)",
+                    Collections.emptyList());
+
+            execute(manager,
+                    "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            Index vidx = getCreatedIndex(manager, "t1", "vidx");
+            String encoded = vidx.properties.get(VectorIndexManager.PROP_REBUILD_LSN);
+            assertNotNull(encoded);
+            herddb.log.LogSequenceNumber expected =
+                    VectorIndexManager.decodeRebuildLsn(encoded);
+
+            String tableSpaceUuid = manager.getTableSpaceManager("tblspace1")
+                    .getTableSpaceUUID();
+            String tableUuid = manager.getTableSpaceManager("tblspace1")
+                    .getTableManager("t1").getTable().uuid;
+            String hashIdxUuid = manager.getTableSpaceManager("tblspace1")
+                    .getIndexesOnTable("t1").get("hidx").getIndex().uuid;
+
+            String blinkIndexName = herddb.index.blink.BLinkKeyToPageIndex
+                    .deriveIndexName(tableUuid);
+            java.util.Set<herddb.log.LogSequenceNumber> tablePins =
+                    manager.getDataStorageManager()
+                            .pinnedTableCheckpointsForTest(tableSpaceUuid, tableUuid);
+            java.util.Set<herddb.log.LogSequenceNumber> blinkPins =
+                    manager.getDataStorageManager()
+                            .pinnedIndexCheckpointsForTest(tableSpaceUuid, blinkIndexName);
+            java.util.Set<herddb.log.LogSequenceNumber> hashPins =
+                    manager.getDataStorageManager()
+                            .pinnedIndexCheckpointsForTest(tableSpaceUuid, hashIdxUuid);
+            assertTrue("table pin at " + expected + " must be held (pinned=" + tablePins + ")",
+                    tablePins.contains(expected));
+            assertTrue("BLink pin at " + expected + " must be held (pinned=" + blinkPins + ")",
+                    blinkPins.contains(expected));
+            // The pre-existing hash index keeps its own pin at the LSN of
+            // its CREATE HASH INDEX flow (unrelated to the new vector
+            // index's rebuild LSN). What we verify here is just that
+            // some pin is held — i.e. the existing pre-existing-index
+            // pin path is not silently disabled by the new code.
+            assertTrue("hash index must have at least one pin (pinned=" + hashPins + ")",
+                    !hashPins.isEmpty());
         }
     }
 

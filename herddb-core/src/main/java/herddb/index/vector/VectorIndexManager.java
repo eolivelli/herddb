@@ -156,10 +156,20 @@ public class VectorIndexManager extends AbstractIndexManager {
      * Decodes the value written by {@link #encodeRebuildLsn} back into a
      * {@link LogSequenceNumber}. Issue #471.
      *
+     * <p>The decoder is strictly symmetric with the encoder: every shape
+     * the encoder produces is accepted, and every shape it does not
+     * produce is rejected. In particular, leading {@code +} and leading
+     * zeros are rejected — they would round-trip to the same value, but
+     * accepting them silently would let "tampered" forms (e.g.
+     * {@code "+1:0"} that compares unequal to {@code "1:0"}) survive a
+     * defensive re-encode-and-compare check.
+     *
      * @throws IllegalArgumentException if {@code encoded} is null, does
      *     not match the {@code "<ledgerId>:<offset>"} shape, contains
-     *     components that cannot be parsed as {@code long}, or contains
-     *     negative components.
+     *     components that cannot be parsed as {@code long}, contains
+     *     negative components, or contains components that the encoder
+     *     would not have produced (leading {@code +}, leading zeros on
+     *     a multi-digit number, empty components).
      */
     public static LogSequenceNumber decodeRebuildLsn(String encoded) {
         if (encoded == null) {
@@ -170,11 +180,15 @@ public class VectorIndexManager extends AbstractIndexManager {
             throw new IllegalArgumentException(
                     "rebuild LSN encoding must be '<ledgerId>:<offset>', got '" + encoded + "'");
         }
+        String ledgerStr = encoded.substring(0, colon);
+        String offsetStr = encoded.substring(colon + 1);
+        rejectNonCanonicalLongLiteral(ledgerStr, encoded);
+        rejectNonCanonicalLongLiteral(offsetStr, encoded);
         long ledgerId;
         long offset;
         try {
-            ledgerId = Long.parseLong(encoded.substring(0, colon));
-            offset = Long.parseLong(encoded.substring(colon + 1));
+            ledgerId = Long.parseLong(ledgerStr);
+            offset = Long.parseLong(offsetStr);
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(
                     "rebuild LSN components must be valid longs, got '" + encoded + "'", e);
@@ -184,6 +198,31 @@ public class VectorIndexManager extends AbstractIndexManager {
                     "rebuild LSN components must be non-negative, got '" + encoded + "'");
         }
         return new LogSequenceNumber(ledgerId, offset);
+    }
+
+    /**
+     * Rejects the lenient shapes that {@link Long#parseLong} would accept
+     * but {@link #encodeRebuildLsn} would never produce: empty strings,
+     * a leading {@code +}, and a leading {@code 0} on a multi-digit
+     * number. Negatives are NOT checked here — the call site checks them
+     * after the parseLong because we want the parse-failure path to fire
+     * first for shapes like {@code "abc"}.
+     */
+    private static void rejectNonCanonicalLongLiteral(String component, String encoded) {
+        if (component.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must not be empty, got '" + encoded + "'");
+        }
+        if (component.charAt(0) == '+') {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must not carry a '+' prefix, got '"
+                            + encoded + "'");
+        }
+        if (component.length() > 1 && component.charAt(0) == '0') {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must not carry a leading zero, got '"
+                            + encoded + "'");
+        }
     }
 
     /**
