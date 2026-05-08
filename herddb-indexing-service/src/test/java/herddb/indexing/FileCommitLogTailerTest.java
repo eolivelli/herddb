@@ -292,6 +292,69 @@ public class FileCommitLogTailerTest {
     }
 
     /**
+     * Issue #459: {@code FileCommitLogTailer.getBatchesProcessed()} must be
+     * {@code 0} on a freshly-constructed tailer, must move to {@code >= 1}
+     * once a non-empty poll cycle drains the initial entries, and must
+     * strictly advance after a second wave is appended to the active file —
+     * confirming the {@code processedAny → batchesProcessed++} branch in
+     * {@code FileCommitLogTailer.run()} is wired correctly. Also asserts
+     * the {@code batches <= entries} invariant.
+     */
+    @Test
+    public void testBatchesProcessedAdvancesAcrossPollCycles() throws Exception {
+        Path logDir = folder.newFolder("txlog-batches").toPath();
+
+        Path tablespaceDir = logDir.resolve("aaaa.txlog");
+        Files.createDirectory(tablespaceDir);
+        Path segmentFile = tablespaceDir.resolve("0000000000000001.txlog");
+
+        // First wave: 3 entries already on disk before the tailer starts.
+        writeTxlogFile(segmentFile, 1, 1, 3);
+
+        List<LogSequenceNumber> consumed = Collections.synchronizedList(new ArrayList<>());
+        try (FileCommitLogTailer tailer = new FileCommitLogTailer(logDir, null,
+                LogSequenceNumber.START_OF_TIME,
+                (lsn, entry) -> consumed.add(lsn))) {
+            assertEquals("freshly-constructed tailer reports zero batches",
+                    0L, tailer.getBatchesProcessed());
+
+            Thread t = new Thread(tailer);
+            t.start();
+
+            long deadline = System.currentTimeMillis() + 5000;
+            while (consumed.size() < 3 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals("first wave drained", 3, consumed.size());
+            long batchesAfterFirst = tailer.getBatchesProcessed();
+            assertTrue("at least one batch must be counted after the first wave: "
+                            + batchesAfterFirst,
+                    batchesAfterFirst >= 1L);
+
+            // Second wave: append two more entries to the active file. A
+            // subsequent poll cycle will pick them up — batches must advance.
+            appendTxlogEntries(segmentFile, 1, 4, 2);
+            deadline = System.currentTimeMillis() + 5000;
+            while (consumed.size() < 5 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals("second wave drained", 5, consumed.size());
+
+            long batchesAfterSecond = tailer.getBatchesProcessed();
+            assertTrue("batch counter must advance after the second wave: "
+                            + "before=" + batchesAfterFirst
+                            + " after=" + batchesAfterSecond,
+                    batchesAfterSecond > batchesAfterFirst);
+            assertTrue("batches (" + batchesAfterSecond + ") must be "
+                            + "<= entries (" + tailer.getEntriesProcessed() + ")",
+                    batchesAfterSecond <= tailer.getEntriesProcessed());
+
+            tailer.close();
+            t.join(5000);
+        }
+    }
+
+    /**
      * Tests that when the writer rolls to a new segment file, the tailer finishes
      * reading the old file and transitions to the new one.
      */

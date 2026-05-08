@@ -3399,6 +3399,253 @@
     },
     {
       "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "Per-operation-type rate of entries the IS tailer is classifying. Lets operators tell apart pure-INSERT ingest, UPDATE-heavy churn, DELETE bursts and DDL catch-up at a glance (issue #459).",
+          "fill": 1,
+          "id": 36,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 8,
+          "stack": true,
+          "targets": [
+            {
+              "expr": "rate(tailer_inserts{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "inserts/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(tailer_updates{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "updates/s [{{instance}}]",
+              "refId": "B"
+            },
+            {
+              "expr": "rate(tailer_deletes{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "deletes/s [{{instance}}]",
+              "refId": "C"
+            },
+            {
+              "expr": "rate(tailer_ddl{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "ddl/s [{{instance}}]",
+              "refId": "D"
+            }
+          ],
+          "thresholds": [],
+          "title": "CommitLog Tailer - Operation Mix (rate, stacked)",
+          "tooltip": {"shared": true, "sort": 0, "value_type": "individual"},
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "show": true},
+            {"format": "short", "show": true}
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "Accepted (INSERT/UPDATE/DELETE) vs skipped (DDL + NOOP + REBALANCE + transactional control) entries per second. Skipped/processed near 1 means the IS replica is filtering out most traffic — useful when validating the cross-replica shard filter (issue #459).",
+          "fill": 1,
+          "id": 37,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "rate(tailer_entries_accepted{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "accepted/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(tailer_entries_skipped{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "skipped/s [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "CommitLog Tailer - Accepted vs Skipped (rate)",
+          "tooltip": {"shared": true, "sort": 0, "value_type": "individual"},
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "ops", "show": true},
+            {"format": "short", "show": true}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "CommitLog Tailer - Operation Mix (issue #459)",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "Cumulative tailer counters: total entries the tailer has read, of which accepted (vector intent) vs skipped (DDL/control). Slope = ingest rate; the gap between processed and accepted+ddl is exactly the non-graph 'skipped' traffic.",
+          "fill": 1,
+          "id": 38,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 8,
+          "targets": [
+            {
+              "expr": "tailer_entries_processed{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "processed [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "tailer_entries_accepted{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "accepted [{{instance}}]",
+              "refId": "B"
+            },
+            {
+              "expr": "tailer_entries_skipped{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "skipped [{{instance}}]",
+              "refId": "C"
+            },
+            {
+              "expr": "tailer_ddl{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "ddl [{{instance}}]",
+              "refId": "D"
+            }
+          ],
+          "thresholds": [],
+          "title": "CommitLog Tailer - Cumulative Counters",
+          "tooltip": {"shared": true, "sort": 0, "value_type": "individual"},
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "decimals": 0, "show": true},
+            {"format": "short", "show": true}
+          ]
+        },
+        {
+          "aliasColors": {},
+          "bars": false,
+          "dashLength": 10,
+          "dashes": false,
+          "datasource": "Prometheus",
+          "description": "Tailer batch rate plus mean batch size (entries/batch). A 'mean batch size' that drops toward 1 with a steady entries/s usually means the underlying poll/follow loop is being woken up before each individual append lands — high overhead per entry (issue #459).",
+          "fill": 1,
+          "id": 39,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "min": false,
+            "show": true,
+            "total": false,
+            "values": true
+          },
+          "lines": true,
+          "linewidth": 1,
+          "links": [],
+          "nullPointMode": "null",
+          "span": 4,
+          "targets": [
+            {
+              "expr": "rate(tailer_batches{job=\"indexing-service\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "batches/s [{{instance}}]",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(tailer_entries_processed{job=\"indexing-service\",instance=~\"$instance\"}[1m]) / clamp_min(rate(tailer_batches{job=\"indexing-service\",instance=~\"$instance\"}[1m]), 1)",
+              "format": "time_series",
+              "intervalFactor": 2,
+              "legendFormat": "mean entries/batch [{{instance}}]",
+              "refId": "B"
+            }
+          ],
+          "thresholds": [],
+          "title": "CommitLog Tailer - Batches",
+          "tooltip": {"shared": true, "sort": 0, "value_type": "individual"},
+          "type": "graph",
+          "xaxis": {"mode": "time", "show": true},
+          "yaxes": [
+            {"format": "short", "show": true},
+            {"format": "short", "show": true}
+          ]
+        }
+      ],
+      "showTitle": true,
+      "title": "CommitLog Tailer - Batches & Cumulative (issue #459)",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
       "height": 150,
       "panels": [
         {

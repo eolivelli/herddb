@@ -198,6 +198,17 @@ public class IndexingServiceEngineDiagnosticsTest {
         assertTrue(service.getEngine().isTailerRunning());
         assertEquals(0L, service.getEngine().getTailerEntriesProcessed());
 
+        // Issue #459: the per-operation-type tailer counters must all be
+        // zero on a fresh engine. The TailerOpTypeMetricsTest covers their
+        // movement under driven entries; here we just guard the plumbing.
+        assertEquals(0L, service.getEngine().getTailerEntriesAccepted());
+        assertEquals(0L, service.getEngine().getTailerEntriesSkipped());
+        assertEquals(0L, service.getEngine().getTailerInserts());
+        assertEquals(0L, service.getEngine().getTailerUpdates());
+        assertEquals(0L, service.getEngine().getTailerDeletes());
+        assertEquals(0L, service.getEngine().getTailerDdl());
+        assertEquals(0L, service.getEngine().getTailerBatchesProcessed());
+
         // The apply queue is configured with the default parallelism and a
         // positive capacity; exact numbers depend on the host CPU count.
         assertTrue(service.getEngine().getApplyParallelism() >= 1);

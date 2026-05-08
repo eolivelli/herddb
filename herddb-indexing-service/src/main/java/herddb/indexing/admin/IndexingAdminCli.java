@@ -400,6 +400,16 @@ public final class IndexingAdminCli {
                 out.printf(Locale.ROOT, "  tailer_watermark            = %d/%d%n",
                         response.getTailerWatermarkLedger(), response.getTailerWatermarkOffset());
                 out.printf(Locale.ROOT, "  tailer_entries_processed    = %d%n", response.getTailerEntriesProcessed());
+                // Issue #459: per-operation-type breakdown of the tailer's
+                // commit-log workload. accepted = INSERT/UPDATE/DELETE; skipped =
+                // DDL + NOOP + REBALANCE + transactional control entries.
+                out.printf(Locale.ROOT, "  tailer_entries_accepted     = %d%n", response.getTailerEntriesAccepted());
+                out.printf(Locale.ROOT, "  tailer_entries_skipped      = %d%n", response.getTailerEntriesSkipped());
+                out.printf(Locale.ROOT, "  tailer_inserts              = %d%n", response.getTailerInserts());
+                out.printf(Locale.ROOT, "  tailer_updates              = %d%n", response.getTailerUpdates());
+                out.printf(Locale.ROOT, "  tailer_deletes              = %d%n", response.getTailerDeletes());
+                out.printf(Locale.ROOT, "  tailer_ddl                  = %d%n", response.getTailerDdl());
+                out.printf(Locale.ROOT, "  tailer_batches              = %d%n", response.getTailerBatches());
                 out.printf(Locale.ROOT, "  apply_queue_size/capacity   = %d / %d%n",
                         response.getApplyQueueSize(), response.getApplyQueueCapacity());
                 out.printf(Locale.ROOT, "  apply_parallelism           = %d%n", response.getApplyParallelism());
@@ -541,6 +551,14 @@ public final class IndexingAdminCli {
         m.put("tailer_watermark_ledger", r.getTailerWatermarkLedger());
         m.put("tailer_watermark_offset", r.getTailerWatermarkOffset());
         m.put("tailer_entries_processed", r.getTailerEntriesProcessed());
+        // Issue #459: per-operation-type tailer counters.
+        m.put("tailer_entries_accepted", r.getTailerEntriesAccepted());
+        m.put("tailer_entries_skipped", r.getTailerEntriesSkipped());
+        m.put("tailer_inserts", r.getTailerInserts());
+        m.put("tailer_updates", r.getTailerUpdates());
+        m.put("tailer_deletes", r.getTailerDeletes());
+        m.put("tailer_ddl", r.getTailerDdl());
+        m.put("tailer_batches", r.getTailerBatches());
         m.put("apply_queue_size", r.getApplyQueueSize());
         m.put("apply_queue_capacity", r.getApplyQueueCapacity());
         m.put("apply_parallelism", r.getApplyParallelism());

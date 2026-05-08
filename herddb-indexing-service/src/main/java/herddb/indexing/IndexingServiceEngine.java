@@ -67,6 +67,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -189,6 +190,45 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      */
     private volatile long lastDurableEntryTimestamp;
     private long entriesSinceLastCheckpoint;
+
+    /**
+     * Per-operation-type counters for the commit-log tailer (issue #459).
+     * Together with the existing {@code tailer.entries_processed} gauge, these
+     * let dashboards and supervision agents distinguish "the tailer is busy
+     * applying real vector writes" from "the tailer is mostly skipping
+     * non-vector traffic" or "the tailer is catching up on DDL". All counters
+     * are monotonically increasing since JVM start; rate is derived by
+     * Prometheus / consumers.
+     *
+     * <p>Counters are written from a single thread (the tailer thread) inside
+     * {@link #processEntry(LogSequenceNumber, LogEntry)} but read from
+     * arbitrary threads via the Prometheus gauge samples and gRPC handlers.
+     * {@link LongAdder} gives lock-free striped writes and a consistent
+     * (eventually-consistent) read.
+     *
+     * <p>Classification:
+     * <ul>
+     *   <li>INSERT/UPDATE/DELETE → bumps the matching per-op counter and
+     *       {@link #tailerEntriesAccepted} (intent to mutate the HNSW graph,
+     *       even if the entry's table has no vector index — the per-index
+     *       skip happens deeper in {@code applyInsert} / {@code applyUpdate} /
+     *       {@code applyDelete}).</li>
+     *   <li>DDL (CREATE_TABLE / ALTER_TABLE / DROP_TABLE / TRUNCATE_TABLE /
+     *       CREATE_INDEX / DROP_INDEX) → bumps {@link #tailerDdl} and
+     *       {@link #tailerEntriesSkipped} (no graph mutation; just schema).</li>
+     *   <li>Everything else (NOOP, REBALANCE, transactional control entries
+     *       BEGIN/COMMIT/ROLLBACK that are themselves not graph mutations)
+     *       → bumps {@link #tailerEntriesSkipped}. The buffered entries that a
+     *       COMMITTRANSACTION ultimately replays are themselves DML and were
+     *       already classified as accepted on their original arrival.</li>
+     * </ul>
+     */
+    private final LongAdder tailerEntriesAccepted = new LongAdder();
+    private final LongAdder tailerEntriesSkipped = new LongAdder();
+    private final LongAdder tailerInserts = new LongAdder();
+    private final LongAdder tailerUpdates = new LongAdder();
+    private final LongAdder tailerDeletes = new LongAdder();
+    private final LongAdder tailerDdl = new LongAdder();
 
     /**
      * Most recent {@link IndexingServiceRebalanceDescriptor} observed by the
@@ -1010,6 +1050,47 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         return t != null ? t.getEntriesProcessed() : 0L;
     }
 
+    /**
+     * Number of read batches the underlying tailer has completed since this
+     * engine started (issue #459). One batch is one poll/follow cycle that
+     * processed at least one entry. Returns {@code 0} when the tailer is not
+     * yet started.
+     */
+    public long getTailerBatchesProcessed() {
+        CommitLogTailing t = tailer;
+        return t != null ? t.getBatchesProcessed() : 0L;
+    }
+
+    /** Issue #459: entries the tailer counted as "accepted" (would mutate the HNSW graph). */
+    public long getTailerEntriesAccepted() {
+        return tailerEntriesAccepted.sum();
+    }
+
+    /** Issue #459: entries the tailer counted as "skipped" (DDL, NOOP, REBALANCE, transactional control). */
+    public long getTailerEntriesSkipped() {
+        return tailerEntriesSkipped.sum();
+    }
+
+    /** Issue #459: INSERT entries the tailer has classified. */
+    public long getTailerInserts() {
+        return tailerInserts.sum();
+    }
+
+    /** Issue #459: UPDATE entries the tailer has classified. */
+    public long getTailerUpdates() {
+        return tailerUpdates.sum();
+    }
+
+    /** Issue #459: DELETE entries the tailer has classified. */
+    public long getTailerDeletes() {
+        return tailerDeletes.sum();
+    }
+
+    /** Issue #459: DDL entries the tailer has classified. */
+    public long getTailerDdl() {
+        return tailerDdl.sum();
+    }
+
     public boolean isTailerRunning() {
         CommitLogTailing t = tailer;
         return t != null && t.isRunning();
@@ -1069,6 +1150,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         try {
             LOGGER.log(Level.FINEST, "Processing entry at LSN {0}, type={1}, txId={2}",
                     new Object[]{lsn, entry.type, entry.transactionId});
+            // Classify per-operation type for the issue-#459 metrics.
+            // Done unconditionally on every entry the tailer hands us, before
+            // the BEGIN/COMMIT/ROLLBACK fan-out below — buffered DML entries
+            // are counted at original arrival time, not at COMMIT replay time.
+            classifyForMetrics(entry);
             long txId = entry.transactionId;
 
             switch (entry.type) {
@@ -1123,6 +1209,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
     }
 
+    /**
+     * Replays the buffered entries of a transaction whose
+     * {@code COMMITTRANSACTION} we just observed.
+     *
+     * <p>Issue #459: each buffered entry was already classified by
+     * {@link #classifyForMetrics(LogEntry)} when it first arrived from the
+     * tailer (back when {@code processEntry()} placed it in the
+     * {@link TransactionBuffer}); replaying through {@code applySingleEntry}
+     * here MUST NOT re-classify, otherwise every transactional INSERT/UPDATE/
+     * DELETE would silently double-count.
+     */
     private void applyBufferedEntries(List<TransactionBuffer.BufferedLogEntry> entries) {
         for (TransactionBuffer.BufferedLogEntry be : entries) {
             applySingleEntry(be.getLsn(), be.getEntry());
@@ -1373,6 +1470,45 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 || type == LogEntryType.TRUNCATE_TABLE
                 || type == LogEntryType.CREATE_INDEX
                 || type == LogEntryType.DROP_INDEX;
+    }
+
+    /**
+     * Bumps the issue-#459 per-operation-type counters based on the entry's
+     * {@link LogEntry#type}. Always invoked from
+     * {@link #processEntry(LogSequenceNumber, LogEntry)} on the tailer thread,
+     * before the BEGIN/COMMIT/ROLLBACK fan-out, so each commit-log entry is
+     * classified exactly once at original arrival time.
+     */
+    private void classifyForMetrics(LogEntry entry) {
+        switch (entry.type) {
+            case LogEntryType.INSERT:
+                tailerInserts.increment();
+                tailerEntriesAccepted.increment();
+                break;
+            case LogEntryType.UPDATE:
+                tailerUpdates.increment();
+                tailerEntriesAccepted.increment();
+                break;
+            case LogEntryType.DELETE:
+                tailerDeletes.increment();
+                tailerEntriesAccepted.increment();
+                break;
+            case LogEntryType.CREATE_TABLE:
+            case LogEntryType.ALTER_TABLE:
+            case LogEntryType.DROP_TABLE:
+            case LogEntryType.TRUNCATE_TABLE:
+            case LogEntryType.CREATE_INDEX:
+            case LogEntryType.DROP_INDEX:
+                tailerDdl.increment();
+                tailerEntriesSkipped.increment();
+                break;
+            default:
+                // NOOP, TABLE_CONSISTENCY_CHECK, INDEXING_SERVICE_REBALANCE,
+                // BEGIN/COMMIT/ROLLBACKTRANSACTION — none of these mutate the
+                // HNSW graph directly.
+                tailerEntriesSkipped.increment();
+                break;
+        }
     }
 
     /**
@@ -2875,6 +3011,82 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             public Long getSample() {
                 CommitLogTailing t = tailer;
                 return t != null ? t.getEntriesProcessed() : 0L;
+            }
+        });
+        // Issue #459: per-operation-type counters. Each one is exposed as a
+        // monotonically increasing gauge — Prometheus / consumers compute
+        // rates by differencing successive snapshots. Names line up with the
+        // Prometheus metric names (tailer_<scope-leaf>) on which the
+        // indexing-service Grafana dashboard panels are wired.
+        tailerStats.registerGauge("entries_accepted", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return tailerEntriesAccepted.sum();
+            }
+        });
+        tailerStats.registerGauge("entries_skipped", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return tailerEntriesSkipped.sum();
+            }
+        });
+        tailerStats.registerGauge("inserts", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return tailerInserts.sum();
+            }
+        });
+        tailerStats.registerGauge("updates", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return tailerUpdates.sum();
+            }
+        });
+        tailerStats.registerGauge("deletes", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return tailerDeletes.sum();
+            }
+        });
+        tailerStats.registerGauge("ddl", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return tailerDdl.sum();
+            }
+        });
+        tailerStats.registerGauge("batches", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                CommitLogTailing t = tailer;
+                return t != null ? t.getBatchesProcessed() : 0L;
             }
         });
         tailerStats.registerGauge("running", new Gauge<Integer>() {
