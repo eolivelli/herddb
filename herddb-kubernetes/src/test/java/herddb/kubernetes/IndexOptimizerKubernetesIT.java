@@ -276,7 +276,9 @@ public class IndexOptimizerKubernetesIT {
         String optimizerPod = getComponentPodName("index-optimizer");
         LOG.info("Waiting for optimizer to tick (checking /metrics)...");
         long runs = waitForOptimizerTick(optimizerPod, 2, TimeUnit.MINUTES);
-        assertTrue("Expected at least 1 optimizer tick but got " + runs, runs >= 1);
+        assertTrue("Expected at least 1 optimizer tick but got " + runs
+                + " — see 'Last /metrics body' WARNING log above for the raw curl response",
+                runs >= 1);
 
         LOG.info("Test passed: index-optimizer started successfully, resolved 'herd' tablespace "
                 + "by name (no UUID needed), and the engine ticked " + runs + " time(s).");
@@ -292,16 +294,20 @@ public class IndexOptimizerKubernetesIT {
      */
     private long waitForOptimizerTick(String podName, long timeout, TimeUnit unit) throws Exception {
         long deadline = System.currentTimeMillis() + unit.toMillis(timeout);
+        String lastMetricsBody = "(no response received yet)";
         while (System.currentTimeMillis() < deadline) {
             try {
+                // -f: fail on HTTP errors, -s: suppress progress, -S: show errors.
+                // Together they exit non-zero on 4xx/5xx so the catch block logs it;
+                // without -f an error body would be captured as if it were metrics.
                 org.testcontainers.containers.Container.ExecResult result =
                         k3s.execInContainer("kubectl", "exec", podName, "--",
-                                "curl", "-s", "http://localhost:9853/metrics");
-                String metrics = result.getStdout();
+                                "curl", "-fsS", "http://localhost:9853/metrics");
+                lastMetricsBody = result.getStdout();
                 LOG.log(Level.FINE, "metrics response (exit={0}): {1}",
-                        new Object[]{result.getExitCode(), metrics});
+                        new Object[]{result.getExitCode(), lastMetricsBody});
                 // Look for a line like: herddb_optimizer_runs_total 3
-                for (String line : metrics.split("\n")) {
+                for (String line : lastMetricsBody.split("\n")) {
                     if (line.startsWith("herddb_optimizer_runs_total ")) {
                         String[] parts = line.trim().split("\\s+");
                         if (parts.length >= 2) {
@@ -313,11 +319,13 @@ public class IndexOptimizerKubernetesIT {
                     }
                 }
             } catch (Exception e) {
+                lastMetricsBody = "curl error: " + e.getMessage();
                 LOG.log(Level.FINE, "metrics check failed (will retry): {0}", e.getMessage());
             }
             Thread.sleep(5_000);
         }
-        // Return whatever we got last (may be 0 if the loop timed out)
+        // Timed out — log the last response at WARNING so CI logs contain enough context.
+        LOG.warning("waitForOptimizerTick timed out. Last /metrics body: " + lastMetricsBody);
         return 0L;
     }
 
