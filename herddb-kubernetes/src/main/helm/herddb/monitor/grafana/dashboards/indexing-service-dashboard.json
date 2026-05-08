@@ -5115,6 +5115,123 @@
       "showTitle": true,
       "title": "Vector Index Retention (Pending Deletes)",
       "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 280,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 700,
+          "title": "Owned Segments (per IS instance)",
+          "description": "Number of segmented-v2 segments where this IS instance is the canonical owner. The sum across instances should match the index-optimizer's observed_segments{state=active} gauge — a divergence flags a bookkeeping bug.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "segments_ownership_owned{job=\"indexing-service\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "owned — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "sum(segments_ownership_owned{job=\"indexing-service\"})",
+              "format": "time_series",
+              "legendFormat": "cluster total",
+              "refId": "B"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 701,
+          "title": "Segment Load / Release Rate (per 5m)",
+          "description": "Per-instance rate of segment loads (a not-owned → owned transition: initial assignment OR completed takeover) and releases (owned → not-owned: transferred away OR reaped). Sustained loads with no releases ⇒ this instance is accepting takeovers; loads ≈ releases ⇒ healthy round-robin rebalance.",
+          "type": "graph",
+          "fill": 2,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "rate(segments_ownership_loads_total{job=\"indexing-service\",instance=~\"$instance\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "loads/min — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(segments_ownership_releases_total{job=\"indexing-service\",instance=~\"$instance\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "releases/min — {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        }
+      ],
+      "showTitle": true,
+      "title": "Segmented-v2 Ownership",
+      "titleSize": "h6"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 710,
+          "title": "Pending Assignments Observed (per 5m)",
+          "description": "Rate of TRANSFERRING znodes observed with our id as pending owner. A flood of pending observations followed by no loads ⇒ takeovers are failing or the optimizer is redirecting them to other instances. Compare against loads/min in the panel above.",
+          "type": "graph",
+          "fill": 2,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 12,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "rate(segments_ownership_pending_assignments_observed_total{job=\"indexing-service\",instance=~\"$instance\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "pending obs/min — {{instance}}",
+              "refId": "A"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        }
+      ],
+      "showTitle": true,
+      "title": "Segmented-v2 Pending Assignments",
+      "titleSize": "h6"
     }
   ],
   "schemaVersion": 14,

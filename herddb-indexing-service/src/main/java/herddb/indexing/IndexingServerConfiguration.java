@@ -242,6 +242,51 @@ public final class IndexingServerConfiguration {
     public static final long PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_MAX_WAIT_MS_DEFAULT =
             300_000L;
 
+    /**
+     * When {@code true}, the IS does NOT run the per-store
+     * {@code vectorIndexCompactionLoop()} thread — compaction is delegated to
+     * the external index-optimizer service, which scans the segment registry
+     * and merges segments out-of-process. The IS still runs the tailer and
+     * checkpoint loop. Default {@code false} (legacy in-IS compaction).
+     */
+    public static final String PROPERTY_INDEX_OPTIMIZER_ENABLED = "indexing.optimizer.enabled";
+    public static final boolean PROPERTY_INDEX_OPTIMIZER_ENABLED_DEFAULT = false;
+
+    /**
+     * Pressure-driven IS-local compaction fallback (companion to the external
+     * index-optimizer). Even when {@link #PROPERTY_INDEX_OPTIMIZER_ENABLED} is
+     * {@code true}, the IS keeps a local compaction thread armed; it stays
+     * idle until the locally-observed segment count crosses
+     * {@code kickFraction × }{@link #PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_SEGMENTS}.
+     *
+     * <p>Steady state is still optimizer-driven: the local loop only fires when
+     * the optimizer cannot keep up with checkpoint output and the IS would
+     * otherwise hit the back-pressure ceiling and stall the tailer. Default is
+     * {@code 0.7} (350 of 500), giving the optimizer 70% of the budget before
+     * the IS-local fallback kicks in.
+     *
+     * <p>Must be in the open interval {@code (0.0, 1.0)}. Values outside that
+     * range are rejected at parse time so an operator cannot accidentally
+     * disable both compactors (set to 0) or render the fallback inert (set to
+     * 1.0+).
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION =
+            "vector.index.compaction.local.kick.fraction";
+    public static final double PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION_DEFAULT = 0.7d;
+
+    /**
+     * Master switch for the IS-local compaction fallback when
+     * {@link #PROPERTY_INDEX_OPTIMIZER_ENABLED} is {@code true}. When
+     * {@code false}, restores the pre-#357 behaviour: full delegation to the
+     * external optimizer, no local fallback. Operators who explicitly want
+     * single-actor compaction can set this to {@code false}, accepting that
+     * the tailer may stall on back-pressure if the optimizer is slow or
+     * temporarily unavailable. Default {@code true}.
+     */
+    public static final String PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_ENABLED_WITH_OPTIMIZER =
+            "vector.index.compaction.local.enabledWithOptimizer";
+    public static final boolean PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_ENABLED_WITH_OPTIMIZER_DEFAULT = true;
+
     // Apply parallelism
     public static final String PROPERTY_APPLY_PARALLELISM = "indexing.apply.parallelism";
     public static final int PROPERTY_APPLY_PARALLELISM_DEFAULT = 0; // 0 = auto: max(1, availableProcessors/2)

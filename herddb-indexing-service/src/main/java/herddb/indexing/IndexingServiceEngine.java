@@ -291,6 +291,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     private volatile StatsLogger statsLogger;
 
+    /**
+     * Single shared {@link herddb.indexing.segment.SegmentAssignmentMetrics}
+     * for the engine — subscribes to every {@code SegmentAssignmentWatcher}
+     * created by this IS instance so the gauges + counters reflect the
+     * union of segments owned across all indexes. Prometheus exposition
+     * happens through {@link #registerSegmentAssignmentMetrics}; the gauges
+     * stay at zero until the engine actually wires up an
+     * {@code SegmentAssignmentWatcher} (currently future-work — the metrics
+     * surface is live so the Grafana dashboard panels light up the moment
+     * the watcher integration lands).
+     */
+    private final herddb.indexing.segment.SegmentAssignmentMetrics segmentAssignmentMetrics =
+            new herddb.indexing.segment.SegmentAssignmentMetrics();
+
     private MetadataStorageManager metadataStorageManager;
     private boolean ownsMetadataStorageManager;
 
@@ -609,11 +623,26 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             final long vectorCompactionBackpressureMaxWaitMs = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_MAX_WAIT_MS,
                     IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_BACKPRESSURE_MAX_WAIT_MS_DEFAULT);
+            // Range validation for the kick fraction (must be in (0, 1)) is
+            // enforced inside {@link PersistentVectorStore#setLocalCompactionKickFraction};
+            // we let the setter throw IllegalArgumentException at start time
+            // rather than duplicating the check here.
+            final double vectorCompactionLocalKickFraction = config.getDouble(
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION,
+                    IndexingServerConfiguration.PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_KICK_FRACTION_DEFAULT);
+            final boolean vectorCompactionLocalEnabledWithOptimizer = config.getBoolean(
+                    IndexingServerConfiguration
+                            .PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_ENABLED_WITH_OPTIMIZER,
+                    IndexingServerConfiguration
+                            .PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_ENABLED_WITH_OPTIMIZER_DEFAULT);
             LOGGER.log(Level.INFO,
                     "vector index compaction: tieredEnabled={0}, backpressureSegments={1}, "
-                            + "backpressureMaxWaitMs={2}",
+                            + "backpressureMaxWaitMs={2}, localKickFraction={3},"
+                            + " localEnabledWithOptimizer={4}",
                     new Object[]{vectorCompactionTieredEnabled, vectorCompactionBackpressureSegments,
-                            vectorCompactionBackpressureMaxWaitMs});
+                            vectorCompactionBackpressureMaxWaitMs,
+                            vectorCompactionLocalKickFraction,
+                            vectorCompactionLocalEnabledWithOptimizer});
             final long maxLiveBytesPerCheckpoint = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT,
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT);
@@ -716,6 +745,9 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 store.setTieredCompactionEnabled(vectorCompactionTieredEnabled);
                 store.setCompactionBackpressureThreshold(vectorCompactionBackpressureSegments);
                 store.setCompactionBackpressureMaxWaitMs(vectorCompactionBackpressureMaxWaitMs);
+                store.setLocalCompactionKickFraction(vectorCompactionLocalKickFraction);
+                store.setLocalCompactionEnabledWithOptimizer(
+                        vectorCompactionLocalEnabledWithOptimizer);
                 try {
                     store.start();
                 } catch (Exception e) {
@@ -1353,6 +1385,28 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         "DROP cleanup for " + storeKeyForLog
                                 + ": failed to close vector store; resources may leak",
                         e);
+            }
+            // Segmented-v2 registry sweep: when a publisher is wired, drop
+            // every registry znode for this index BEFORE we delete the
+            // multipart files. Doing it in this order means a crash between
+            // the two steps leaves orphan multipart files (the optimizer's
+            // reaper or a future restart sweep can catch them) rather than
+            // orphan registry znodes that point at files no longer on disk
+            // (which would cause other IS instances to observe phantom
+            // segments and attempt failed ownership transfers).
+            if (store instanceof PersistentVectorStore) {
+                try {
+                    ((PersistentVectorStore) store).dropAllRegistryEntries();
+                } catch (RuntimeException e) {
+                    // dropAllRegistryEntries is itself best-effort and never
+                    // throws back to here, but defend in depth — a registry
+                    // sweep failure must not block the multipart cleanup.
+                    LOGGER.log(Level.WARNING,
+                            "DROP cleanup for " + storeKeyForLog
+                                    + ": registry sweep failed (orphan znodes will be reaped"
+                                    + " by next reconcile or optimizer pass)",
+                            e);
+                }
             }
             if (storeUUID != null && dataStorageManager != null && tableSpaceUUID != null) {
                 try {
@@ -2879,6 +2933,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         this.statsLogger = statsLogger;
         registerTailerMetrics();
         registerShadowMetrics();
+        registerSegmentAssignmentMetrics();
         // Netty direct-memory counters (issue #246) so the unified JVM
         // dashboard can show pool-arena growth for the IS alongside the
         // main server and the remote file service. The gauges carry
@@ -2886,6 +2941,70 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         if (statsLogger != null) {
             herddb.core.stats.NettyMemoryMetrics.register(statsLogger);
         }
+    }
+
+    /**
+     * Returns the engine's shared {@link herddb.indexing.segment.SegmentAssignmentMetrics}
+     * observer. Visible so future code that constructs a
+     * {@link herddb.indexing.segment.SegmentAssignmentWatcher} can chain
+     * this observer onto its listener (the production integration path is
+     * not wired yet — see field doc).
+     */
+    public herddb.indexing.segment.SegmentAssignmentMetrics getSegmentAssignmentMetrics() {
+        return segmentAssignmentMetrics;
+    }
+
+    /**
+     * Registers Prometheus gauges + counters for the segmented-v2
+     * ownership-watcher activity (Grafana panel: "Segmented-v2 ownership"
+     * on the indexing-service dashboard).
+     */
+    private void registerSegmentAssignmentMetrics() {
+        StatsLogger sl = this.statsLogger;
+        if (sl == null) {
+            return;
+        }
+        StatsLogger ownership = sl.scope("segments_ownership");
+        ownership.registerGauge("owned", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return segmentAssignmentMetrics.getOwnedSegmentsCount();
+            }
+        });
+        ownership.registerGauge("loads_total", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return segmentAssignmentMetrics.getSegmentLoadsTotal();
+            }
+        });
+        ownership.registerGauge("releases_total", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return segmentAssignmentMetrics.getSegmentReleasesTotal();
+            }
+        });
+        ownership.registerGauge("pending_assignments_observed_total", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+            @Override
+            public Long getSample() {
+                return segmentAssignmentMetrics.getPendingAssignmentsObservedTotal();
+            }
+        });
     }
 
     /**

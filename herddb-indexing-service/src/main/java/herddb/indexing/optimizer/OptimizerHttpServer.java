@@ -1,0 +1,280 @@
+/*
+ Licensed to Diennea S.r.l. under one
+ or more contributor license agreements. See the NOTICE file
+ distributed with this work for additional information
+ regarding copyright ownership. Diennea S.r.l. licenses this file
+ to you under the Apache License, Version 2.0 (the
+ "License"); you may not use this file except in compliance
+ with the License.  You may obtain a copy of the License at
+
+ http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing,
+ software distributed under the License is distributed on an
+ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ KIND, either express or implied.  See the License for the
+ specific language governing permissions and limitations
+ under the License.
+
+ */
+package herddb.indexing.optimizer;
+
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Minimal HTTP endpoint for observability of the optimizer service (review
+ * items E1 + E3). Exposes:
+ * <ul>
+ *   <li>{@code GET /health} — returns 200 with {@code OK} once the engine is
+ *       running. Used by Helm liveness/readiness probes.</li>
+ *   <li>{@code GET /metrics} — returns Prometheus-style plain-text counters
+ *       (runs, segments_merged, segments_deprecated, segments_deleted,
+ *       ticks_skipped_not_leader). Scrape-friendly.</li>
+ * </ul>
+ *
+ * <p>Built on the JDK's {@link HttpServer} so the optimizer doesn't drag in
+ * Jetty. The endpoint is single-threaded — these probes run at most a few
+ * times per second.
+ */
+public final class OptimizerHttpServer implements AutoCloseable {
+
+    private static final Logger LOGGER = Logger.getLogger(OptimizerHttpServer.class.getName());
+
+    private final HttpServer server;
+    private final IndexOptimizerEngine engine;
+    /**
+     * Heartbeat-staleness threshold for {@code /health} (review-item B6 from second
+     * pr-reviewer pass). When the engine's run counter has not advanced within this
+     * window, /health returns 503 so the Helm liveness probe restarts the pod.
+     * The default is twice the optimizer's tick interval — set via
+     * {@link OptimizerHttpServer#OptimizerHttpServer(String, int, IndexOptimizerEngine, long, LongSupplier)}.
+     */
+    private final long stalenessThresholdMillis;
+    private final LongSupplier clock;
+    private final AtomicLong lastObservedRuns = new AtomicLong(-1);
+    private final AtomicLong lastObservedRunsAtMillis = new AtomicLong(0);
+
+    /**
+     * Convenience constructor with a 2 × intervalMs default staleness threshold and the
+     * system clock. Equivalent to the test-friendly constructor with stalenessThreshold
+     * disabled (Long.MAX_VALUE) — kept for source compatibility with earlier code.
+     */
+    public OptimizerHttpServer(String bindHost, int port, IndexOptimizerEngine engine) throws IOException {
+        this(bindHost, port, engine, Long.MAX_VALUE, System::currentTimeMillis);
+    }
+
+    /**
+     * Full constructor wiring the heartbeat-staleness threshold and a clock for tests.
+     */
+    public OptimizerHttpServer(String bindHost, int port, IndexOptimizerEngine engine,
+                               long stalenessThresholdMillis, LongSupplier clock) throws IOException {
+        this.engine = engine;
+        this.stalenessThresholdMillis = stalenessThresholdMillis;
+        this.clock = clock;
+        this.server = HttpServer.create(new InetSocketAddress(bindHost, port), 0);
+        server.createContext("/health", new HealthHandler());
+        server.createContext("/metrics", new MetricsHandler());
+        // Single-threaded executor — these endpoints are admin-grade, not on the hot path.
+        server.setExecutor(Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "optimizer-http");
+            t.setDaemon(true);
+            return t;
+        }));
+    }
+
+    public void start() {
+        server.start();
+        LOGGER.log(Level.INFO, "optimizer admin endpoint listening on {0}",
+                server.getAddress());
+    }
+
+    /** Returns the bound port — useful for tests that bind to port 0. */
+    public int getBoundPort() {
+        return server.getAddress().getPort();
+    }
+
+    @Override
+    public void close() {
+        // Stop with a 0-second grace; this is a daemon admin endpoint.
+        server.stop(0);
+    }
+
+    private final class HealthHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // Liveness check (review-item B6): the engine's run counter must advance
+            // within stalenessThresholdMillis. We compare the current value against
+            // the last observation; when it has progressed we update both the
+            // counter snapshot and the timestamp. When it has NOT progressed for
+            // longer than the threshold, the pod is stuck and we return 503 so Helm
+            // restarts it.
+            long currentRuns = engine.getRuns();
+            long now = clock.getAsLong();
+            long observedRuns = lastObservedRuns.get();
+            long observedAt = lastObservedRunsAtMillis.get();
+            boolean healthy;
+            String reason;
+            if (stalenessThresholdMillis == Long.MAX_VALUE) {
+                // Liveness gating disabled — preserve the legacy "always 200" behavior.
+                healthy = true;
+                reason = "OK\n";
+            } else if (observedRuns == -1L) {
+                // First call: arm the heartbeat with the current value but mark fresh.
+                lastObservedRuns.set(currentRuns);
+                lastObservedRunsAtMillis.set(now);
+                healthy = true;
+                reason = "OK\n";
+            } else if (currentRuns > observedRuns) {
+                // Engine ticked since last health check — refresh the heartbeat.
+                lastObservedRuns.set(currentRuns);
+                lastObservedRunsAtMillis.set(now);
+                healthy = true;
+                reason = "OK\n";
+            } else {
+                long staleFor = now - observedAt;
+                if (staleFor > stalenessThresholdMillis) {
+                    healthy = false;
+                    reason = "STALE: engine has not ticked for " + staleFor + " ms (threshold "
+                            + stalenessThresholdMillis + " ms)\n";
+                } else {
+                    healthy = true;
+                    reason = "OK (stale " + staleFor + " ms)\n";
+                }
+            }
+
+            byte[] body = reason.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+            exchange.sendResponseHeaders(healthy ? 200 : 503, body.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(body);
+            }
+        }
+    }
+
+    private final class MetricsHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            StringBuilder sb = new StringBuilder(256);
+            // Prometheus exposition format. HELP/TYPE comments are optional but cheap.
+            sb.append("# HELP herddb_optimizer_runs_total Total optimizer ticks attempted.\n");
+            sb.append("# TYPE herddb_optimizer_runs_total counter\n");
+            sb.append("herddb_optimizer_runs_total ").append(engine.getRuns()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_segments_merged_total Output segments produced.\n");
+            sb.append("# TYPE herddb_optimizer_segments_merged_total counter\n");
+            sb.append("herddb_optimizer_segments_merged_total ")
+                    .append(engine.getSegmentsMerged()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_segments_deprecated_total Inputs marked DEPRECATED.\n");
+            sb.append("# TYPE herddb_optimizer_segments_deprecated_total counter\n");
+            sb.append("herddb_optimizer_segments_deprecated_total ")
+                    .append(engine.getSegmentsDeprecated()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_segments_deleted_total Reaped segments after retention.\n");
+            sb.append("# TYPE herddb_optimizer_segments_deleted_total counter\n");
+            sb.append("herddb_optimizer_segments_deleted_total ")
+                    .append(engine.getSegmentsDeleted()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_ticks_skipped_not_leader_total Ticks short-circuited because we lost the leader lock.\n");
+            sb.append("# TYPE herddb_optimizer_ticks_skipped_not_leader_total counter\n");
+            sb.append("herddb_optimizer_ticks_skipped_not_leader_total ")
+                    .append(engine.getTicksSkippedNotLeader()).append('\n');
+
+            // ----- Compaction failure / abort breakdown -----
+            sb.append("# HELP herddb_optimizer_merge_failures_total Merger.merge() invocations that threw.\n");
+            sb.append("# TYPE herddb_optimizer_merge_failures_total counter\n");
+            sb.append("herddb_optimizer_merge_failures_total ")
+                    .append(engine.getMergeFailuresTotal()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_merge_aborts_revalidate_failed_total"
+                    + " Merges aborted because input drifted under the optimizer between"
+                    + " candidate-pick and the post-merge revalidate.\n");
+            sb.append("# TYPE herddb_optimizer_merge_aborts_revalidate_failed_total counter\n");
+            sb.append("herddb_optimizer_merge_aborts_revalidate_failed_total ")
+                    .append(engine.getMergeAbortsRevalidateFailedTotal()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_merge_declined_total"
+                    + " Merger declined a candidate batch (e.g., not enough live entries).\n");
+            sb.append("# TYPE herddb_optimizer_merge_declined_total counter\n");
+            sb.append("herddb_optimizer_merge_declined_total ")
+                    .append(engine.getMergeDeclinedTotal()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_last_merge_duration_ms"
+                    + " Wall-clock millis of the last completed merge cycle (-1 if never run).\n");
+            sb.append("# TYPE herddb_optimizer_last_merge_duration_ms gauge\n");
+            sb.append("herddb_optimizer_last_merge_duration_ms ")
+                    .append(engine.getLastMergeDurationMs()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_last_run_at_seconds"
+                    + " Unix-time seconds at which the last tick body started (-1 if never run).\n");
+            sb.append("# TYPE herddb_optimizer_last_run_at_seconds gauge\n");
+            long lastRunMs = engine.getLastRunAtMillis();
+            sb.append("herddb_optimizer_last_run_at_seconds ")
+                    .append(lastRunMs >= 0 ? lastRunMs / 1000L : -1L).append('\n');
+
+            // ----- Observed segments (last-tick snapshot, by state) -----
+            sb.append("# HELP herddb_optimizer_observed_indexes"
+                    + " Number of indexes seen in the most recent tick.\n");
+            sb.append("# TYPE herddb_optimizer_observed_indexes gauge\n");
+            sb.append("herddb_optimizer_observed_indexes ")
+                    .append(engine.getObservedIndexes()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_observed_segments"
+                    + " Per-state segment count from the most recent tick across all"
+                    + " observed indexes. Labels: state in {active, deprecated, transferring,"
+                    + " provisional}.\n");
+            sb.append("# TYPE herddb_optimizer_observed_segments gauge\n");
+            sb.append("herddb_optimizer_observed_segments{state=\"active\"} ")
+                    .append(engine.getObservedActiveSegments()).append('\n');
+            sb.append("herddb_optimizer_observed_segments{state=\"deprecated\"} ")
+                    .append(engine.getObservedDeprecatedSegments()).append('\n');
+            sb.append("herddb_optimizer_observed_segments{state=\"transferring\"} ")
+                    .append(engine.getObservedTransferringSegments()).append('\n');
+            sb.append("herddb_optimizer_observed_segments{state=\"provisional\"} ")
+                    .append(engine.getObservedProvisionalSegments()).append('\n');
+
+            // ----- Segment relocations (ownership transfers driven by the optimizer) -----
+            // Counters are wired but stay at 0 until the production relocate-trigger
+            // path is enabled — the panel in Grafana is plumbed now so it lights up
+            // automatically when the wiring lands.
+            sb.append("# HELP herddb_optimizer_relocations_initiated_total"
+                    + " Ownership-transfer initiate (ACTIVE -> TRANSFERRING) CAS calls"
+                    + " issued by the optimizer.\n");
+            sb.append("# TYPE herddb_optimizer_relocations_initiated_total counter\n");
+            sb.append("herddb_optimizer_relocations_initiated_total ")
+                    .append(engine.getRelocationsInitiatedTotal()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_relocations_completed_total"
+                    + " Ownership-transfer complete (TRANSFERRING -> ACTIVE) CAS calls"
+                    + " observed at the registry.\n");
+            sb.append("# TYPE herddb_optimizer_relocations_completed_total counter\n");
+            sb.append("herddb_optimizer_relocations_completed_total ")
+                    .append(engine.getRelocationsCompletedTotal()).append('\n');
+
+            sb.append("# HELP herddb_optimizer_relocations_aborted_total"
+                    + " Transfer attempts that aborted before {@code complete()} fired"
+                    + " (revalidate failure, takeover-side timeout, optimizer crash).\n");
+            sb.append("# TYPE herddb_optimizer_relocations_aborted_total counter\n");
+            sb.append("herddb_optimizer_relocations_aborted_total ")
+                    .append(engine.getRelocationsAbortedTotal()).append('\n');
+
+            byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(body);
+            }
+        }
+    }
+}

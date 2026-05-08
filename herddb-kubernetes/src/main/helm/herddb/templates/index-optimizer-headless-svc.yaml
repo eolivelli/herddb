@@ -1,0 +1,17 @@
+{{- if .Values.indexOptimizer.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "herddb.fullname" . }}-index-optimizer
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: index-optimizer
+spec:
+  # Headless service required by the StatefulSet to give the singleton pod a
+  # stable DNS name. The optimizer does not currently expose any RPC ports,
+  # so no ports are declared (the service is purely for DNS / pod identity).
+  clusterIP: None
+  selector:
+    {{- include "herddb.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: index-optimizer
+{{- end }}

@@ -57,6 +57,9 @@ spec:
               mountPath: /var/lib/grafana/dashboards/indexing-service-dashboard.json
               subPath: indexing-service-dashboard.json
             - name: config
+              mountPath: /var/lib/grafana/dashboards/index-optimizer-dashboard.json
+              subPath: index-optimizer-dashboard.json
+            - name: config
               mountPath: /var/lib/grafana/dashboards/jvm-dashboard.json
               subPath: jvm-dashboard.json
             - name: config

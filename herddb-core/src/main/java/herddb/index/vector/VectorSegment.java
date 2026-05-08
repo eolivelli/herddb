@@ -70,6 +70,13 @@ class VectorSegment implements Closeable {
     }
 
     final int segmentId;
+    /**
+     * Globally-unique identifier for segmented-v2 indexes. {@code null} for legacy
+     * (v3 IndexStatus) segments — kept null on read for backward compatibility,
+     * populated when reading v4 IndexStatus. Stable across IS restarts so the
+     * external segment registry can be reconciled with IndexStatus deterministically.
+     */
+    String segmentUuid;
     volatile OnDiskGraphIndex onDiskGraph;
     Path onDiskGraphFile;
     ReaderSupplier onDiskReaderSupplier;

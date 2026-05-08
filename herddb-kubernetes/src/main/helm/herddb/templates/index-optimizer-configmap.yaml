@@ -1,0 +1,30 @@
+{{- if .Values.indexOptimizer.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "herddb.fullname" . }}-index-optimizer-config
+  labels:
+    {{- include "herddb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: index-optimizer
+data:
+  indexoptimizer.properties: |
+    indexoptimizer.http.host=0.0.0.0
+    indexoptimizer.http.port={{ .Values.indexOptimizer.httpPort | default 9853 }}
+    indexoptimizer.zookeeper.address={{ include "herddb.zkAddress" . }}
+    indexoptimizer.zookeeper.session.timeout={{ .Values.indexOptimizer.zkSessionTimeout | default 40000 }}
+    indexoptimizer.zookeeper.path=/herd
+    indexoptimizer.tablespace.uuid={{ required ".Values.indexOptimizer.tablespaceUuid is required when indexOptimizer.enabled=true" .Values.indexOptimizer.tablespaceUuid | quote }}
+    indexoptimizer.interval.ms={{ .Values.indexOptimizer.intervalMs | default 300000 }}
+    indexoptimizer.merge.min.count={{ .Values.indexOptimizer.minCount | default 4 }}
+    indexoptimizer.merge.max.count={{ .Values.indexOptimizer.maxCount | default 200 }}
+    indexoptimizer.merge.min.bytes={{ .Values.indexOptimizer.minBytes | default 268435456 }}
+    indexoptimizer.merge.max.bytes={{ .Values.indexOptimizer.maxBytes | default 1073741824 }}
+    indexoptimizer.retention.ms={{ .Values.indexOptimizer.retentionMs | default 600000 }}
+    {{- range $k, $v := .Values.indexOptimizer.extraConfig }}
+    {{ $k }}={{ $v }}
+    {{- end }}
+{{- if .Values.indexOptimizer.loggingProperties }}
+  logging.properties: |
+{{ .Values.indexOptimizer.loggingProperties | indent 4 }}
+{{- end }}
+{{- end }}

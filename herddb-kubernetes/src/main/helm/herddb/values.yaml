@@ -310,6 +310,52 @@ indexingService:
     # When set, the env vars are injected into the indexing-service pods from this secret.
     credentialsSecret: ""
 
+# Index Optimizer — singleton service that takes over vector-index compaction
+# from the IS. Enable together with indexingService.optimizerEnabled=true so
+# the IS suppresses its in-process compaction loop. Greenfield only: existing
+# legacy indexes keep the in-IS compaction path, only newly-created
+# segmented-v2 indexes are managed by this service.
+indexOptimizer:
+  enabled: false
+  # Tablespace UUID this optimizer manages — REQUIRED when enabled=true. The
+  # optimizer is single-tablespace for the MVP; multi-tablespace support is
+  # left for a future revision.
+  tablespaceUuid: ""
+  # HTTP admin endpoint port — exposes /health (probe target) and /metrics
+  # (Prometheus scrape). Set to 0 to disable.
+  httpPort: 9853
+  intervalMs: 300000
+  minCount: 4
+  maxCount: 200
+  minBytes: 268435456     # 256 MiB
+  maxBytes: 1073741824    # 1 GiB
+  retentionMs: 600000     # 10 min
+  zkSessionTimeout: 40000
+  javaOpts: ""
+  javaOptsExtra: ""
+  loggingProperties: ""
+  extraConfig: {}
+  # Local PVC used to stage merge-intermediate files before they are uploaded
+  # to remote storage. Sized for the largest concurrent merge: typically a few
+  # times maxBytes above. Mounted at /opt/herddb/optimizer-tmp.
+  storage:
+    tmp:
+      size: 20Gi
+      storageClass: ""
+  pdb:
+    enabled: false
+    minAvailable: 0
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "2"
+    limits:
+      memory: "1Gi"
+      cpu: "2"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 # Tools pod — sleep + pre-configured CLI for kubectl exec.
 # Runs as a StatefulSet with a persistent PVC for vector benchmark datasets.
 tools:

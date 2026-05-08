@@ -68,6 +68,8 @@ HerdDB's vector indexing uses a **two-component architecture** where vector inde
 
 5. **DML parallelism via striped workers.** The `IndexingServiceEngine` routes DML from committed transactions to a pool of single-threaded apply workers, striped by PK hash, ensuring per-key ordering while exploiting multi-core throughput.
 
+6. **Pluggable compaction (segmented-v2).** When `indexing.optimizer.enabled=true`, segments are registered in a ZooKeeper registry with mutable per-segment ownership and compaction is offloaded to a singleton `index-optimizer` service. Tombstones live in a per-segment overlay file in remote storage so segments stay byte-immutable across ownership transfers. See [Segmented-v2: external `index-optimizer` service & movable segment ownership](#segmented-v2-external-index-optimizer-service--movable-segment-ownership) for the full design.
+
 ---
 
 ## Modules
@@ -75,8 +77,8 @@ HerdDB's vector indexing uses a **two-component architecture** where vector inde
 | Module | Contains |
 |--------|----------|
 | `herddb-core` | `AbstractVectorStore`, `PersistentVectorStore`, `VectorIndexManager` (thin remote client), `VectorStorage`, `VectorSegment`, helper classes, SQL planner integration, `DataStorageManager`, `MemoryManager`, `BLink` |
-| `herddb-indexing-service` | `IndexingServer` (gRPC), `IndexingServiceEngine`, `IndexingServerConfiguration`, `InMemoryVectorStore`, `VectorStoreFactory`, `CommitLogTailer`, `SchemaTracker`, `TransactionBuffer`, `WatermarkStore`, Prometheus metrics |
-| `herddb-services` | `IndexingServiceMain` — standalone server entry point |
+| `herddb-indexing-service` | `IndexingServer` (gRPC), `IndexingServiceEngine`, `IndexingServerConfiguration`, `InMemoryVectorStore`, `VectorStoreFactory`, `CommitLogTailer`, `SchemaTracker`, `TransactionBuffer`, `WatermarkStore`, Prometheus metrics, **`herddb.indexing.segment`** (`SegmentRegistryClient`, `SegmentMetadata`, `SegmentAssignmentWatcher`, `OwnershipTransfer`, `TombstoneOverlayManager`, `SegmentRegistryPublisher`), **`herddb.indexing.optimizer`** (`IndexOptimizerMain`, `IndexOptimizerEngine`, `MergePolicy`, `SegmentMerger`, `OptimizerConfiguration`) |
+| `herddb-services` | `IndexingServiceMain` — standalone server entry point. The same launcher script (`bin/service`) also dispatches `index-optimizer` to `herddb.indexing.optimizer.IndexOptimizerMain`. |
 
 ---
 
@@ -600,9 +602,186 @@ This reclaims storage held by deleted or superseded PKs — the previous design 
 
 **Concurrency.** Compaction acquires `checkpointLock` only for the final atomic swap and metadata publish — the same lock checkpoint Phase C uses — so `IndexStatus` updates stay monotonic. The heavy rebuild and write run lock-free. Deletes arriving during a rebuild are tracked in `pendingCompactionDeletes` and replayed against the merged output before it becomes visible.
 
-**Background thread.** `PersistentVectorStore` runs a dedicated `vectorIndexCompactionThread` (separate from the checkpoint driver) that wakes every `vector.index.compaction.intervalMs` and invokes `VectorIndexCompactor.runCompactionIfNeeded(...)`. The thread is started only on primaries — shadow replicas never compact.
+**Background thread.** `PersistentVectorStore` runs a dedicated `vectorIndexCompactionThread` (separate from the checkpoint driver) that wakes every `vector.index.compaction.intervalMs` and invokes `VectorIndexCompactor.runCompactionIfNeeded(...)`. The thread is started only on primaries — shadow replicas never compact. **When the external `index-optimizer` service is enabled (see next section), this thread becomes a pressure-driven fallback: it stays armed but its cycle body short-circuits below `kickFraction × backpressureThreshold` segments, letting the optimizer drive steady state and only firing locally when accumulation indicates the optimizer is falling behind. See "Pressure-driven IS-local compaction fallback" in the next section for the protocol.**
 
 **Shadow acknowledgement.** Shadow replicas expose their loaded generation via the `GetShadowStatus` RPC; `IndexingServiceEngine` aggregates `min(appliedIndexStatusGeneration)` across all registered shadows. The leader passes that minimum to `reapExpiredPendingDeletes` before every physical delete pass.
+
+---
+
+## Segmented-v2: external `index-optimizer` service & movable segment ownership
+
+Legacy compaction (above) keeps every segment glued to the IS instance that created it: the segment's identity is `(indexUUID, segmentId)` where `segmentId` is a per-store integer counter. There is no way to reassign a segment to another instance, and the heavy graph-merge work runs on the IS hot path — competing with tailing, checkpoint, and search.
+
+**Segmented-v2** introduces three changes that lift those constraints, gated cluster-wide by `indexing.optimizer.enabled=true`:
+
+1. **Segments have a globally-unique UUID and live in a ZooKeeper registry.** Each sealed segment is registered at `/{basePath}/index-segments/{tablespaceUuid}/{indexUuid}/{segmentUuid}` with full metadata: state, owner instance, S3 paths for graph/map/tombstone overlay, LSN watermarks, generation, `replacedBy` lineage, retention deadline.
+2. **Segment ownership is mutable.** A CAS protocol on the znode moves a segment from one IS instance to another with no data loss and continuous read availability (a brief read-overlap is tolerated; the server-side `SearchResultMerger` dedups duplicate PKs by keeping the highest score).
+3. **Compaction runs in a dedicated singleton service, `index-optimizer`.** Packaged in `herddb-services` and deployed via the Helm chart as a StatefulSet with `replicas: 1` and a `tmp` PVC. The optimizer scans the registry, applies a merge policy, runs the merge, and drives the registry-side state machine. The IS suppresses its in-process compaction loop in this mode.
+
+This is **greenfield-only**: existing legacy indexes continue to use the in-IS compaction path and the `IndexStatus`-based segment list. Indexes created after the upgrade with `indexing.optimizer.enabled=true` opt into the segmented-v2 model.
+
+### Segment lifecycle state machine
+
+```
+            createSegment            initiate(Y)
+   (none) ─────────────────► ACTIVE ──────────────► TRANSFERRING
+                                ▲                          │
+                                │                          │ complete(Y)
+                                └──────────────────────────┘
+                                          ─►
+                                  (owner=Y, pending=NONE)
+
+   ACTIVE ──────────► DEPRECATED ──────────► DELETED ──► (znode removed)
+            optimizer            retention     remove
+            published merge      elapsed       znode + S3 files
+            output; sets
+            replacedBy[],
+            retentionUntilEpochMillis
+```
+
+`SegmentState` (in `herddb.indexing.segment.SegmentState`) enumerates: `PROVISIONAL`, `ACTIVE`, `TRANSFERRING`, `DEPRECATED`, `DELETED`. `PROVISIONAL` is reserved as a crash-recovery marker (paired with an ephemeral child znode) for an optimizer that died between uploading merged files and committing the registry CAS.
+
+### Tombstone overlay
+
+Sealed segments stay byte-immutable — but deletes/updates still need to be honored across ownership transfers. Each segment carries a sibling **tombstone overlay** in remote storage (`fileType = "tombstones-{generation}"`) that records the segment-local ordinals of deleted entries plus an LSN watermark.
+
+- The current owner's `TombstoneOverlayManager` accumulates tombstones in memory (`SortedSet<Integer>`) and flushes periodically: serialize → `DataStorageManager.writeMultipartIndexFile` → CAS the segment znode to update `tombstonePath` and `tombstoneLsn`. A failed CAS rolls back the just-uploaded overlay file (best-effort).
+- A new owner picks up an in-flight transfer by downloading the latest overlay (`TombstoneOverlayManager.loadOverlay`) and replacing its in-memory state via `replaceFromOverlay`. It then continues from the loaded LSN watermark.
+- Wire format v1 is documented in `TombstoneOverlay.java`: `[version, segmentUuid, tombstoneLsn, overlayGeneration, count, ordinals[]]`. The format is intentionally tiny (a few hundred bytes for sparse delete patterns) and bumps the generation on every flush so concurrent readers can pin a stable snapshot.
+
+### Ownership transfer protocol
+
+Two static helpers in `OwnershipTransfer` drive the transfer via CAS:
+
+1. **`OwnershipTransfer.initiate(registry, current, newOwner)`** — moves a segment from `ACTIVE` to `TRANSFERRING`, recording `pendingOwnerInstanceId = newOwner`. The current owner stays unchanged so reads keep flowing.
+2. **`OwnershipTransfer.complete(registry, current, newOwner)`** — invoked by the new owner after it has downloaded the artefacts and reloaded the overlay. CAS-flips the znode to `state = ACTIVE, owner = newOwner, pendingOwnerInstanceId = NO_INSTANCE`.
+
+Each IS instance runs a `SegmentAssignmentWatcher` per index that fires `SegmentAssignmentListener` callbacks (`onPendingAssignment`, `onSegmentAssigned`, `onSegmentReleased`) by diffing successive ZK reads against its local view. A 30 s heartbeat refresh defends against missed watcher fires during ZK reconnects.
+
+Under transfer, both the old and the new owner may briefly serve the same PK on a search query. The client-side `SearchResultMerger` (replacing the previous `PriorityQueue`-only merge in `IndexingServiceClient`) groups responses by PK and keeps the highest score before truncating to top-K — the visible duplicate is collapsed.
+
+### `index-optimizer` service
+
+A separate JVM, packaged inside `herddb-services` and launched via:
+
+```bash
+/opt/herddb/bin/service index-optimizer console /opt/herddb/conf/indexoptimizer.properties
+```
+
+The service is a singleton: at most one optimizer per cluster. Helm enforces this with `replicas: 1` on the StatefulSet (`herddb-kubernetes/.../templates/index-optimizer-statefulset.yaml`); a stray second optimizer cannot corrupt anything (every state transition is a ZK CAS) but will simply lose every race to the leader.
+
+`IndexOptimizerEngine.runOnce()` runs once per scheduled tick:
+
+1. List indexes for the configured tablespace.
+2. For each index, partition segments into `ACTIVE` / `DEPRECATED` (others ignored).
+3. **Reap** any DEPRECATED segments whose `retentionUntilEpochMillis` has elapsed: CAS to `DELETED`, then delete the znode.
+4. **Pick merge candidates** using `MergePolicy.SmallestFirstPolicy` — smallest-first up to `maxBytes`, fired when either segment count ≥ `maxCount` (the issue #285 ceiling, force-fires regardless of size) or count ≥ `minCount` AND aggregate size ≥ `minBytes`.
+5. **Run the merger**: `SegmentMerger.merge(inputs, newOwnerInstance)`. The production merger (out of scope for this initial change — TODO) reuses the existing `VectorIndexCompactor` rebuild path; tests use the bundled `InMemorySegmentMerger`.
+6. **Publish** the output (`createSegment`) and CAS-deprecate the inputs (`state = DEPRECATED, replacedBy = [output.uuid], retentionUntilEpochMillis`).
+
+Crash-recovery is implicit: the engine is stateless across runs, so a partial state at restart (e.g. output published but inputs not yet deprecated) is observed on the next tick and either re-attempted or healed by the next compaction cycle. ZK CAS prevents corruption.
+
+A pluggable SPI (`ServiceLoader<SegmentMerger>`) lets deployments register a real graph-aware merger; absent any provider, a `NoopMerger` fallback logs and declines every merge — useful for end-to-end registry-lifecycle integration tests.
+
+### Configuration
+
+IS-side (`IndexingServerConfiguration`):
+
+| Property | Default | Notes |
+|----------|---------|-------|
+| `indexing.optimizer.enabled` | `false` | When `true`, the IS-local `vectorIndexCompactionLoop` becomes pressure-driven (see below). Tailer + checkpoint loops still run. |
+| `vector.index.compaction.local.kick.fraction` | `0.7` | Fraction of `vector.index.compaction.backpressure.segments` above which the IS-local compaction fallback runs. Below this threshold the loop short-circuits and lets the optimizer drive steady state. Range: `(0.0, 1.0)`. |
+| `vector.index.compaction.local.enabledWithOptimizer` | `true` | Master switch for the IS-local fallback when the optimizer is enabled. Set to `false` to fully delegate compaction to the optimizer (the tailer may then stall on back-pressure if the optimizer cannot keep up). |
+
+#### Pressure-driven IS-local compaction fallback
+
+When `indexing.optimizer.enabled=true`, the IS-local compaction thread no longer disappears — it stays armed but only runs cycles when locally-observed segment count crosses `kickFraction × backpressureThreshold` (default `0.7 × 500 = 350`). Steady state remains optimizer-driven; the IS only kicks in when:
+
+- the optimizer is temporarily down,
+- it's leader-locked on a different tablespace,
+- or it's processing a long-running merge while a heavy ingest workload accumulates new sealed segments faster than it can drain them.
+
+The local fallback follows the same staged-publish protocol as the checkpoint:
+
+1. **Stage** the merged output via `SegmentRegistryPublisher.stageNewSegments` (PROVISIONAL znode).
+2. **Revalidate** every input is still ACTIVE in the registry. If a concurrent compactor (the optimizer or another IS) has already deprecated any input we ABORT — call `unstage` on the staged znode, queue the merged output's multipart files for the existing `pendingDeletes` retention reaper, and skip the in-memory swap.
+3. **Persist IndexStatus** locally (the merged output + remaining segments).
+4. **Commit** the staged znode (PROVISIONAL → ACTIVE) and **CAS-deprecate** every input (ACTIVE → DEPRECATED with `replacedBy=[mergedUuid]`).
+
+A per-input `VersionMismatch` during deprecate is benign — the optimizer raced us on that specific input; our merged output remains valid for the others, and the next optimizer tick folds the orphan ACTIVE input into a follow-up merge. Both compactors race freely; ZK CAS prevents corruption.
+
+The `addVectorInternal` hot path also pokes the local loop the instant segment count crosses the kick threshold (cheap int compare on the existing fast path), so the fallback responds within milliseconds, not the per-cycle interval.
+
+Operators can monitor whether the optimizer is keeping up via two new counters on `PersistentVectorStore`:
+
+- `getLocalCompactionPressureRunsTotal()` — number of fallback cycles fired. Non-zero, growing = optimizer is falling behind.
+- `getLocalCompactionSkippedBelowThresholdTotal()` — number of cycles short-circuited. Steady-state baseline.
+
+Optimizer-side (`OptimizerConfiguration`, `conf/indexoptimizer.properties`):
+
+| Property | Default | Notes |
+|----------|---------|-------|
+| `indexoptimizer.zookeeper.address` | `localhost:2181` | Must match the cluster's ZK. |
+| `indexoptimizer.zookeeper.path` | `/herd` | Must match `server.zookeeper.path`. |
+| `indexoptimizer.tablespace.uuid` | *(required)* | Single-tablespace per optimizer in the MVP. |
+| `indexoptimizer.interval.ms` | `300000` | Scheduler tick. |
+| `indexoptimizer.merge.min.count` | `4` | |
+| `indexoptimizer.merge.max.count` | `200` | Force-fire ceiling (issue #285 parity). |
+| `indexoptimizer.merge.min.bytes` | `268435456` (256 MiB) | |
+| `indexoptimizer.merge.max.bytes` | `1073741824` (1 GiB) | Per-run input cap. |
+| `indexoptimizer.retention.ms` | `600000` (10 min) | DEPRECATED → DELETED window. |
+
+Helm values (`indexOptimizer.*`):
+
+```yaml
+indexOptimizer:
+  enabled: false
+  tablespaceUuid: ""              # required when enabled=true
+  intervalMs: 300000
+  minCount: 4
+  maxCount: 200
+  minBytes: 268435456
+  maxBytes: 1073741824
+  retentionMs: 600000
+  storage:
+    tmp:
+      size: 20Gi                  # PVC for merge-intermediate files
+      storageClass: ""
+  resources:
+    requests: { memory: "1Gi", cpu: "2" }
+    limits:   { memory: "1Gi", cpu: "2" }
+```
+
+The StatefulSet mounts the PVC at `/opt/herddb/optimizer-tmp` and exposes it to the JVM via `-Dindexoptimizer.tmp.dir=…`; the merger uses it for staging files before multipart upload.
+
+### ZK znode shape
+
+Each segment znode stores a JSON-serialized `SegmentMetadata`:
+
+```
+segmentUuid, tablespaceUuid, tableName, indexUuid, indexName,
+state ∈ {PROVISIONAL, ACTIVE, TRANSFERRING, DEPRECATED, DELETED},
+ownerInstanceId, pendingOwnerInstanceId,
+graphPath, mapPath, tombstonePath,
+tombstoneLsnLedgerId, tombstoneLsnOffset,
+baseLsnLedgerId, baseLsnOffset,
+sizeBytes, vectorCount, generation,
+replacedBy[], retentionUntilEpochMillis, createdAtEpochMillis
+```
+
+CRUD operations are exposed by `SegmentRegistryClient` (`createSegment`, `getSegment`, `listSegments`, `casUpdateSegment`, `casDeleteSegment`, plus parent listings `listIndexes`, `listTablespaces`). Watcher arming is supported on both child and data znodes; the registry lazily creates parent znodes on first segment registration.
+
+### Production prerequisites — DO NOT enable `indexOptimizer.enabled=true` until ALL of the following are in place
+
+The current PR ships the registry-side state machine, the staged-publish protocol, the leader-lock, the in-process tombstone overlay, and the optimizer service itself, but it does NOT yet wire them through the IS hot path. Flipping the Helm chart's `indexOptimizer.enabled=true` against an IS that lacks these wirings will silently corrupt indexes (the optimizer would deprecate segments the IS still references, and on the next IS restart the segments would fail to load with file-not-found). Verify each prerequisite before enabling:
+
+1. **Real `SegmentMerger` SPI registered.** The default `IndexOptimizerMain` SPI loader returns a `NoopMerger` that declines every merge. A production deployment must register a `SegmentMerger` ServiceLoader file (see `META-INF/services/herddb.indexing.optimizer.SegmentMerger`) backed by a real graph-aware implementation extracted from `VectorIndexCompactor`. The merger must also implement the `abandon(SegmentMetadata)` callback to clean up multipart files when a revalidate-abort discards an output (review-item R4).
+2. **IS-side `SegmentAssignmentWatcher` wired in `IndexingServiceEngine`.** Every IS instance must run a watcher that, on `onSegmentReleased`, closes its local segment handle BEFORE the optimizer reaps the underlying files. Without this, ownership transfers and reaps run blind.
+3. **`indexoptimizer.safeMode.fileDeletion=false` opt-in.** The optimizer ships with safe-mode enabled by default; the reaper progresses the znode lifecycle (DEPRECATED → casDelete) but does NOT call `DataStorageManager.deleteMultipartIndexFile`. Disable safe-mode only after #2 above is verified end-to-end. Doing so requires a non-null `DataStorageManager` to be wired into `IndexOptimizerEngine`.
+4. **Per-index opt-in plumbed through `IndexingServiceEngine`.** `PROPERTY_INDEX_OPTIMIZER_ENABLED` is currently parsed but never read by the IS engine. Production code must call `PersistentVectorStore.setSegmentPublisher` and `setExternalCompactionEnabled` based on the per-index flag at construction time. Until this lands, only test code exercises the publisher attach path.
+5. **Rollback strategy documented.** Indexes written in v4 IndexStatus format cannot be loaded by a binary that only knows v3 — the v3-only loader fails fast with a clear `DataStorageManagerException` (review-item B4). If you need bidirectional compatibility for a phased rollout, gate `indexOptimizer.enabled` per-tenant and keep at least one tier on the v3-only binary.
+
+When all five are in place, follow the validation checklist in the PR description before flipping the production switch.
 
 ---
 

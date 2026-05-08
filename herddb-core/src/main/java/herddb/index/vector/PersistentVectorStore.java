@@ -273,6 +273,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * graph-merge compaction retention protocol.
      */
     private static final int METADATA_VERSION_MULTI_SEGMENT = 3;
+    /**
+     * Format version 4 adds a per-segment {@code segmentUuid} string. Written when ANY
+     * segment in the IndexStatus carries a non-null UUID (i.e. the index is in
+     * segmented-v2 mode); otherwise we keep writing v3 to preserve binary-compatible
+     * rollback for legacy clusters. The reader supports both versions.
+     */
+    private static final int METADATA_VERSION_MULTI_SEGMENT_V4 = 4;
 
     // -------------------------------------------------------------------------
     // Configuration
@@ -387,6 +394,47 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final AtomicInteger nextSegmentId = new AtomicInteger(0);
 
     /**
+     * Optional pluggable publisher invoked after each successful checkpoint to
+     * register the freshly-emitted segments with an external registry (the
+     * segmented-v2 ZooKeeper segment registry, see {@link SegmentPublisher}).
+     * {@code null} means no external publication; this is the legacy behaviour.
+     */
+    private volatile SegmentPublisher segmentPublisher;
+
+    /**
+     * When {@code true}, {@link #start()} does NOT spawn the in-IS
+     * {@link #vectorIndexCompactionLoop()} thread — compaction is expected to be
+     * driven by an external index-optimizer service (see
+     * {@code herddb.indexing.optimizer.IndexOptimizerEngine}). Tailer and
+     * checkpoint loops still run as normal.
+     */
+    private volatile boolean externalCompactionEnabled;
+
+    /**
+     * Cached "this index is segmented-v2 (has at least one UUID-stamped segment)"
+     * flag (review-item N1 from second pr-reviewer pass). Once flipped to
+     * {@code true} it stays true — even legacy v3 segments coexisting with a
+     * v4 segment in the same IndexStatus must be persisted in v4 format. Avoids
+     * re-scanning all sealed/mergeable/new lists on every checkpoint.
+     */
+    private volatile boolean segmentedV2Cached;
+
+    /**
+     * Test hook (package-private) — runs in Phase B AFTER the staged publish and
+     * BEFORE the IndexStatus persist. Used by {@code PublisherHotSwapTest} to swap
+     * {@link #segmentPublisher} mid-Phase-B and assert the captured snapshot is
+     * what handles the commit (review-item R3 from pr-reviewer pass 2). Distinct
+     * from {@link #checkpointPhaseBHook} (which fires at end of Phase B) — this
+     * one is specifically wedged between {@code stageNewSegmentsBestEffort} and
+     * {@code persistIndexStatusMultiSegment}.
+     *
+     * <p>Production code never sets this field. Tests outside this package use
+     * reflection to install the hook (no public setter — keeps the API surface
+     * clean per pr-reviewer pass-3 P3-4).
+     */
+    volatile Runnable betweenStageAndCommitHookForTests;
+
+    /**
      * Monotonically increasing IndexStatus generation. Each successful
      * call to {@link #persistIndexStatusMultiSegment} bumps this counter
      * and stamps every newly-produced segment with the new value.
@@ -467,6 +515,59 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * disable the safety timeout.
      */
     private volatile long compactionBackpressureMaxWaitMs = 300_000L;
+
+    /**
+     * Pressure-driven IS-local compaction kick fraction (companion to the external
+     * index-optimizer). When {@link #externalCompactionEnabled} is {@code true},
+     * the IS-local compaction loop stays idle until {@code segments.size()} crosses
+     * {@code localCompactionKickFraction × compactionBackpressureThreshold}. Above
+     * that threshold the local loop runs as a fallback, draining segments before
+     * the back-pressure ceiling stalls the tailer. Default is {@code 0.7} —
+     * giving the optimizer 70% of the segment budget before the IS kicks in.
+     */
+    private volatile double localCompactionKickFraction = 0.7d;
+
+    /**
+     * Master switch for the IS-local compaction fallback when
+     * {@link #externalCompactionEnabled} is {@code true}. When {@code false},
+     * suppresses the IS-local loop entirely (fully delegated to the external
+     * optimizer); the tailer may then stall on back-pressure if the optimizer
+     * cannot keep up. Default {@code true}: IS keeps a pressure-driven fallback
+     * so the cluster never wedges on a slow optimizer.
+     */
+    private volatile boolean localCompactionEnabledWithOptimizer = true;
+
+    /**
+     * Pre-computed value of {@link #currentLocalCompactionKickThreshold()},
+     * recomputed only inside {@link #setLocalCompactionKickFraction} and
+     * {@link #setCompactionBackpressureThreshold}. Read on every
+     * {@link #addVectorInternal} call (the wake-on-threshold-crossing fast
+     * path) so the per-add cost stays at a single volatile load + int
+     * compare instead of {@code Math.ceil(double × int)} + two volatile
+     * reads. Kept consistent with the configured fraction/threshold by the
+     * setters; never read or written outside of those.
+     */
+    private volatile int kickThresholdCached =
+            (int) Math.max(1L, Math.ceil(0.7d * 500));
+
+    /**
+     * Counter: number of times the IS-local compaction loop ran a full cycle
+     * <em>specifically</em> as a pressure-driven fallback (i.e., with
+     * {@link #externalCompactionEnabled} {@code true} and segment count above the
+     * kick threshold). Distinct from {@link #compactionRunsTotal} which counts
+     * every cycle regardless of mode.
+     */
+    final AtomicLong localCompactionPressureRunsTotal = new AtomicLong();
+
+    /**
+     * Counter: number of cycles the IS-local loop short-circuited because the
+     * segment count was below the kick threshold. Useful for verifying that
+     * steady-state ingest is being handled by the optimizer (high counter value
+     * = optimizer is keeping up; counter staying flat while
+     * {@link #localCompactionPressureRunsTotal} climbs = optimizer is falling
+     * behind).
+     */
+    final AtomicLong localCompactionSkippedBelowThresholdTotal = new AtomicLong();
 
     /**
      * Log a WARNING during Phase A when the total on-disk segment count
@@ -768,6 +869,26 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return compactionLivePkFilteredTotal.get();
     }
 
+    /**
+     * Number of times the IS-local compaction loop ran a full cycle as a
+     * pressure-driven fallback (companion to the external optimizer). Non-zero
+     * value = the optimizer is falling behind and the IS is draining segments
+     * to keep the tailer from stalling on back-pressure. Steady state should
+     * stay at zero (or grow only slowly) with the optimizer doing the work.
+     */
+    public long getLocalCompactionPressureRunsTotal() {
+        return localCompactionPressureRunsTotal.get();
+    }
+
+    /**
+     * Number of cycles the IS-local loop short-circuited because the segment
+     * count was below the kick threshold. High and growing = the optimizer is
+     * keeping up.
+     */
+    public long getLocalCompactionSkippedBelowThresholdTotal() {
+        return localCompactionSkippedBelowThresholdTotal.get();
+    }
+
     public long getCompactionLastDurationMs() {
         return compactionLastDurationMs.get();
     }
@@ -838,6 +959,55 @@ public class PersistentVectorStore extends AbstractVectorStore {
         if (seg.mapFilePath != null) {
             pendingDeletes.add(new PendingDelete(
                     encodeMultipartPath(segUuid, "map"), deadlineMs, sinceGen));
+        }
+    }
+
+    /**
+     * Cleanup helper for the abort paths in
+     * {@link #atomicSwapCompactionResult}: when a local compaction merge is
+     * aborted AFTER {@code rebuildSegment} has already uploaded the merged
+     * output's multipart files, this method (a) queues those files for
+     * retention-aware deletion via the existing {@code pendingDeletes}
+     * mechanism, and (b) closes the merged {@link VectorSegment} so its
+     * file handles + mmap'd buffers are released. Without this, every abort
+     * leaks up to {@code vector.index.compaction.maxBytes} of remote storage
+     * — and aborts are by-design steady-state behaviour of the pressure-
+     * driven local fallback when the optimizer races the IS.
+     *
+     * <p>The deadline is anchored to {@link #vectorIndexCompactionRetentionMs}
+     * (same window as the inputs of a successful merge would pay), giving
+     * any IS still loading the segment time to drop its reference. The
+     * {@code sinceGen} is the current generation: the merged output was
+     * never published in IndexStatus, so any generation ≥ the current one
+     * trivially "doesn't reference it" for the shadow-ack gating.
+     */
+    void queueMergedOutputForDeletion(VectorSegment mergedOutput) {
+        if (mergedOutput == null) {
+            return;
+        }
+        long deadlineMs = System.currentTimeMillis() + vectorIndexCompactionRetentionMs;
+        long sinceGen = currentIndexStatusGeneration.get();
+        String segUuid = indexUUID + "_seg" + mergedOutput.segmentId;
+        if (mergedOutput.graphFilePath != null) {
+            pendingDeletes.add(new PendingDelete(
+                    encodeMultipartPath(segUuid, "graph"), deadlineMs, sinceGen));
+        }
+        if (mergedOutput.mapFilePath != null) {
+            pendingDeletes.add(new PendingDelete(
+                    encodeMultipartPath(segUuid, "map"), deadlineMs, sinceGen));
+        }
+        try {
+            mergedOutput.close();
+        } catch (RuntimeException e) {
+            // Broad catch is intentional and limited to logging — close()
+            // surfaces BLink close failures and we must not let a stale handle
+            // mask the real abort reason. The next reap pass will still
+            // collect the multipart files queued above.
+            LOGGER.log(Level.WARNING,
+                    "vector store " + indexName
+                            + ": ignoring close failure for aborted merged segment "
+                            + mergedOutput.segmentId,
+                    e);
         }
     }
 
@@ -1303,15 +1473,38 @@ public class PersistentVectorStore extends AbstractVectorStore {
         final String mapFilePath;
         final long mapFileSize;
         final long estimatedSizeBytes;
+        /** Number of live vectors written to this segment. */
+        final long vectorCount;
+        /**
+         * Stable UUID stamped onto this segment for segmented-v2 indexes. Populated
+         * by {@link #stampSegmentUuid(String)} in Phase B once we know we will publish
+         * to a {@link SegmentPublisher}; carried through to {@link NewSegmentInfo} and
+         * persisted in v4 IndexStatus so the same UUID survives restarts. {@code null}
+         * for legacy (v3) indexes.
+         */
+        String segmentUuid;
 
         SegmentWriteResult(int segmentId, String graphFilePath, long graphFileSize,
                            String mapFilePath, long mapFileSize, long estimatedSizeBytes) {
+            this(segmentId, graphFilePath, graphFileSize, mapFilePath, mapFileSize,
+                    estimatedSizeBytes, 0L);
+        }
+
+        SegmentWriteResult(int segmentId, String graphFilePath, long graphFileSize,
+                           String mapFilePath, long mapFileSize, long estimatedSizeBytes,
+                           long vectorCount) {
             this.segmentId = segmentId;
             this.graphFilePath = graphFilePath;
             this.graphFileSize = graphFileSize;
             this.mapFilePath = mapFilePath;
             this.mapFileSize = mapFileSize;
             this.estimatedSizeBytes = estimatedSizeBytes;
+            this.vectorCount = vectorCount;
+        }
+
+        /** One-shot setter — Phase B stamps the UUID before Phase C persists IndexStatus. */
+        void stampSegmentUuid(String uuid) {
+            this.segmentUuid = uuid;
         }
     }
 
@@ -1358,18 +1551,30 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         dataStorageManager.initIndex(tableSpaceUUID, indexUUID);
 
-        // Try to load existing state
+        // Try to load existing state. We separate "no prior state, start empty" (a
+        // DataStorageManagerException from getIndexStatus when there is no checkpoint
+        // yet) from "prior state exists but loadFromStatus rejected it" (a
+        // DataStorageManagerException from loadFromStatus, e.g. unsupported metadata
+        // version on rollback — review-item B4 from the second pr-reviewer pass).
+        // The first is benign and we swallow it; the second is operator-actionable
+        // and we propagate it so the boot fails fast instead of silently emptying
+        // the index.
+        IndexStatus status = null;
         try {
-            IndexStatus status = dataStorageManager.getIndexStatus(
+            status = dataStorageManager.getIndexStatus(
                     tableSpaceUUID, indexUUID, LogSequenceNumber.START_OF_TIME);
-            if (status != null && status.indexData != null && status.indexData.length > 0) {
-                loadFromStatus(status);
-                this.loadedLsn = status.sequenceNumber;
-            }
         } catch (DataStorageManagerException e) {
             LOGGER.log(Level.INFO,
                     "no existing state for PersistentVectorStore {0}, starting empty: {1}",
                     new Object[]{indexName, e.getMessage()});
+        }
+        if (status != null && status.indexData != null && status.indexData.length > 0) {
+            // Do NOT swallow exceptions from loadFromStatus — they indicate the
+            // persisted state is unreadable by this binary (e.g. future format
+            // version), which is operator-actionable and must surface as a boot
+            // failure rather than a silent data-loss-equivalent regression.
+            loadFromStatus(status);
+            this.loadedLsn = status.sequenceNumber;
         }
 
         if (readOnly) {
@@ -1391,10 +1596,46 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         // Start background graph-merge compaction thread (separate cadence,
         // separate responsibilities from the checkpoint driver).
+        //
+        // Pressure-driven local fallback (companion to the external optimizer):
+        // when {@link #externalCompactionEnabled} is {@code true} the thread
+        // still runs but the cycle body short-circuits below the kick threshold
+        // — the optimizer drives steady-state compaction, the IS-local loop
+        // only fires when segment accumulation indicates the optimizer is
+        // falling behind. Operators who want full delegation (no local
+        // fallback) can set {@link #localCompactionEnabledWithOptimizer} to
+        // {@code false}; the cycle then short-circuits unconditionally.
         vectorIndexCompactionThread = new Thread(this::vectorIndexCompactionLoop,
                 "persistent-vector-store-vidxcompaction-" + indexName);
         vectorIndexCompactionThread.setDaemon(true);
         vectorIndexCompactionThread.start();
+        if (externalCompactionEnabled) {
+            LOGGER.log(Level.INFO,
+                    "PersistentVectorStore {0}: external compaction enabled — IS-local"
+                            + " compaction loop is pressure-driven (kickFraction={1},"
+                            + " enabledWithOptimizer={2})",
+                    new Object[]{indexName, localCompactionKickFraction,
+                            localCompactionEnabledWithOptimizer});
+        }
+
+        // Reconcile the segmented-v2 registry with IndexStatus on every start
+        // (review item A1+A3). This heals partial-publish state from a previous
+        // crash: PROVISIONAL znodes whose UUID is in IndexStatus get promoted
+        // to ACTIVE; PROVISIONAL znodes whose UUID is unknown get dropped;
+        // IndexStatus segments with no znode get re-registered. We catch broad
+        // Exception here on purpose — reconcile is best-effort, the IS must
+        // start regardless.
+        SegmentPublisher reconciler = this.segmentPublisher;
+        if (reconciler != null) {
+            try {
+                reconciler.reconcileWithIndexStatus(buildExistingSegmentsInfoForReconcile());
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING,
+                        "segment publisher.reconcileWithIndexStatus failed for {0}; "
+                                + "continuing with un-reconciled state", indexName);
+                LOGGER.log(Level.WARNING, "reconcile failure detail", e);
+            }
+        }
 
         LOGGER.log(Level.INFO, "PersistentVectorStore {0} started", indexName);
     }
@@ -1434,6 +1675,139 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     public void setCompactionBackpressureThreshold(int threshold) {
         this.compactionBackpressureThreshold = threshold;
+        recomputeKickThresholdCached();
+    }
+
+    /**
+     * Sets the IS-local compaction kick fraction (companion to the external
+     * optimizer). Must be in the open interval {@code (0.0, 1.0)}. Values
+     * outside that range are rejected to prevent silently disabling either the
+     * fallback (≥ 1.0) or both compactors (≤ 0.0).
+     */
+    public void setLocalCompactionKickFraction(double fraction) {
+        if (!(fraction > 0.0d && fraction < 1.0d)) {
+            throw new IllegalArgumentException(
+                    "localCompactionKickFraction must be in (0.0, 1.0), got " + fraction);
+        }
+        this.localCompactionKickFraction = fraction;
+        recomputeKickThresholdCached();
+    }
+
+    /**
+     * Recomputes {@link #kickThresholdCached} from the current fraction +
+     * back-pressure threshold. Called only by the two setters that mutate
+     * those inputs. Kept private to enforce the invariant that the cached
+     * value is always consistent with the configured fraction/threshold;
+     * callers never write {@code kickThresholdCached} directly.
+     */
+    private void recomputeKickThresholdCached() {
+        long t = (long) Math.ceil(localCompactionKickFraction * compactionBackpressureThreshold);
+        if (t > Integer.MAX_VALUE) {
+            this.kickThresholdCached = Integer.MAX_VALUE;
+        } else {
+            this.kickThresholdCached = (int) Math.max(1L, t);
+        }
+    }
+
+    /**
+     * Master switch for the IS-local compaction fallback when
+     * {@link #externalCompactionEnabled} is {@code true}. See
+     * {@link #localCompactionEnabledWithOptimizer}.
+     */
+    public void setLocalCompactionEnabledWithOptimizer(boolean enabled) {
+        this.localCompactionEnabledWithOptimizer = enabled;
+    }
+
+    /**
+     * Returns the current segment-count threshold above which the IS-local
+     * compaction loop wakes from idle and runs a cycle. Always rounded UP
+     * (ceiling) so a threshold of 1 segment is reachable even at small
+     * back-pressure caps. Public so tests and Prometheus exporters can read
+     * it directly. Reads {@link #kickThresholdCached} (a single volatile
+     * load) — the cache is recomputed inside the setters that change the
+     * inputs, so this method is allocation-free and branch-free.
+     */
+    public int currentLocalCompactionKickThreshold() {
+        return kickThresholdCached;
+    }
+
+    /**
+     * Installs (or replaces) the {@link SegmentPublisher} hook called after each
+     * successful checkpoint. Pass {@code null} to disable.
+     *
+     * <p><b>Per-index opt-in (future-work, see VECTOR.md "Production
+     * prerequisites"):</b> structurally the publisher reference is per
+     * {@link PersistentVectorStore} instance, so per-index opt-in is possible at
+     * the API level — but as of this writing no production caller exists. The
+     * {@code IndexingServiceEngine} does NOT currently read
+     * {@code indexing.optimizer.enabled} and never invokes this method. Tests
+     * exercise the per-index path (see {@code MixedModeIndexesTest}); production
+     * deployments should not enable {@code indexOptimizer.enabled=true} until
+     * this wiring lands and the prerequisites in VECTOR.md are satisfied.
+     *
+     * <p><b>Concurrency contract (review item C1):</b> changes take effect on the
+     * NEXT checkpoint cycle, not the in-flight one. The checkpoint Phase B reads
+     * the publisher reference once into a local snapshot and uses that snapshot
+     * for both stage and commit — so a publisher swapped (or cleared) midway
+     * never sees a torn read where stage went through the old publisher and
+     * commit through the new one. Callers that need a guarantee about the
+     * publisher being attached for a specific checkpoint should call this method
+     * BEFORE issuing the {@code addVector} that will be observed by that
+     * checkpoint.
+     */
+    public void setSegmentPublisher(SegmentPublisher publisher) {
+        this.segmentPublisher = publisher;
+    }
+
+    /**
+     * Drops every registry entry this store has published, via the wired
+     * {@link SegmentPublisher#dropAllSegmentsForIndex}. Invoked by the IS
+     * engine on DROP_INDEX or TRUNCATE_TABLE AFTER {@link #close()} and
+     * BEFORE the {@code DataStorageManager.dropIndex} call deletes the
+     * multipart files. No-op when no publisher is attached (legacy
+     * single-IS mode). Best-effort: a registry error is logged but does
+     * NOT propagate — the surrounding DROP/TRUNCATE flow must always
+     * complete the local cleanup regardless of registry state.
+     *
+     * <p>Without this hook the segmented-v2 registry would be left with
+     * orphan ACTIVE / TRANSFERRING / DEPRECATED znodes pointing at
+     * now-deleted multipart files; other IS instances watching the registry
+     * would observe phantom segments and (in the worst case) attempt
+     * ownership-transfers for files that no longer exist.
+     */
+    public void dropAllRegistryEntries() {
+        SegmentPublisher snapshot = this.segmentPublisher;
+        if (snapshot == null) {
+            return;
+        }
+        try {
+            snapshot.dropAllSegmentsForIndex();
+        } catch (RuntimeException e) {
+            // Plugin boundary — never let a registry hiccup block the local
+            // DROP/TRUNCATE flow. The next reconcile pass (or the operator)
+            // will catch any residual state.
+            LOGGER.log(Level.WARNING,
+                    "dropAllRegistryEntries failed for index {0}; local DROP/TRUNCATE"
+                            + " continues regardless: {1}",
+                    new Object[]{indexName, e.getMessage()});
+        }
+    }
+
+    /**
+     * When {@code true}, the in-IS compaction loop is suppressed. Must be set
+     * before {@link #start()} to influence the launch decision.
+     */
+    public void setExternalCompactionEnabled(boolean enabled) {
+        this.externalCompactionEnabled = enabled;
+    }
+
+    public boolean isExternalCompactionEnabled() {
+        return externalCompactionEnabled;
+    }
+
+    /** Visible for tests: the in-IS compaction thread (null when not running). */
+    Thread getVectorIndexCompactionThread() {
+        return vectorIndexCompactionThread;
     }
 
     /**
@@ -1691,6 +2065,34 @@ public class PersistentVectorStore extends AbstractVectorStore {
             return; // a cycle is already running
         }
         try {
+            // Pressure-driven gate: when an external optimizer is enabled, the
+            // IS-local loop only runs as a fallback. Steady-state compaction is
+            // the optimizer's job; the IS just drains accumulation when the
+            // optimizer falls behind. The gate is intentionally rechecked here
+            // (not just at thread launch) so an operator can flip the master
+            // switch at runtime without restarting the IS.
+            if (externalCompactionEnabled) {
+                if (!localCompactionEnabledWithOptimizer) {
+                    // Operator opted out of the local fallback. The optimizer
+                    // is the only compactor; the tailer will hit back-pressure
+                    // and stall if the optimizer cannot keep up.
+                    return;
+                }
+                int kickThreshold = kickThresholdCached;
+                int now = segments.size();
+                if (now < kickThreshold) {
+                    localCompactionSkippedBelowThresholdTotal.incrementAndGet();
+                    return;
+                }
+                localCompactionPressureRunsTotal.incrementAndGet();
+                LOGGER.log(Level.INFO,
+                        "vector store {0}: pressure-driven local compaction (segments={1},"
+                                + " kickThreshold={2}, backpressureThreshold={3}) — optimizer"
+                                + " is falling behind",
+                        new Object[]{indexName, now, kickThreshold,
+                                compactionBackpressureThreshold});
+            }
+
             long cycleStart = System.currentTimeMillis();
             long cycleId = compactionRunsTotal.incrementAndGet();
 
@@ -1783,7 +2185,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         // Nothing survived the filter — everything in these inputs
                         // is tombstoned or superseded. Skip the rebuild; just
                         // swap the inputs out and queue them for retention.
-                        atomicSwapCompactionResult(candidates, null, 0L);
+                        atomicSwapCompactionResult(candidates, null, 0L, 0L);
                         compactionSuccessesTotal.incrementAndGet();
                         compactionConsecutiveFailures.set(0);
                         long emptyCycleMs = System.currentTimeMillis() - cycleStart;
@@ -1816,7 +2218,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     }
 
                     atomicSwapCompactionResult(candidates, rebuild.mergedSegment,
-                            rebuild.bytesWritten);
+                            rebuild.bytesWritten, rebuild.vectorCount);
 
                     compactionSuccessesTotal.incrementAndGet();
                     compactionConsecutiveFailures.set(0);
@@ -1976,11 +2378,114 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * {@code segments} — if a concurrent checkpoint has moved an input
      * under us, aborts with {@code ABORTED_INPUT_GONE} instead of
      * silently dropping data.
+     *
+     * <p>When a {@link SegmentPublisher} is wired (segmented-v2 mode), this
+     * method also drives the registry-side staged-publish protocol around
+     * the local swap:
+     * <ol>
+     *   <li><b>Stage</b> the merged output as PROVISIONAL in the registry
+     *       BEFORE acquiring the local locks.</li>
+     *   <li><b>Revalidate</b> every input is still ACTIVE in the registry —
+     *       on drift (a concurrent optimizer or another IS deprecated an
+     *       input under us), abort with {@code ABORTED_INPUT_GONE}.</li>
+     *   <li><b>Persist IndexStatus</b> + in-memory swap (existing logic).</li>
+     *   <li><b>Commit</b> the staged znode (PROVISIONAL → ACTIVE) and
+     *       <b>CAS-deprecate</b> every input (post-lock, best-effort —
+     *       reconcile-on-restart heals failures).</li>
+     * </ol>
+     *
+     * <p>On any abort path (registry stage failure, registry revalidate
+     * failure, or in-memory drift), the merged output's already-uploaded
+     * multipart files are queued for the existing {@code pendingDeletes}
+     * retention reaper via {@link #queueMergedOutputForDeletion} and the
+     * merged {@link VectorSegment}'s file handles are released. Without
+     * this the abort path would leak up to
+     * {@code vector.index.compaction.maxBytes} of remote storage per
+     * occurrence — and aborts are by-design steady-state behaviour of the
+     * pressure-driven local fallback when the optimizer races the IS.
      */
     private void atomicSwapCompactionResult(List<VectorSegment> inputs,
                                             VectorSegment mergedOutput,
-                                            long bytesWritten)
+                                            long bytesWritten,
+                                            long mergedVectorCount)
             throws VectorIndexCompactor.CompactionException, DataStorageManagerException {
+        // Pre-lock registry coordination for the IS-local fallback path
+        // (companion to the external optimizer). When a publisher is wired up
+        // we MUST stage the merged output and revalidate the inputs in the
+        // registry BEFORE persisting IndexStatus locally, otherwise a
+        // concurrent optimizer may have already deprecated an input under us
+        // and we would silently produce a duplicate ACTIVE segment.
+        SegmentPublisher publisherSnapshot = this.segmentPublisher;
+        List<NewSegmentInfo> stagedInfo = null;
+        List<NewSegmentInfo> inputInfosForRegistry = null;
+        if (publisherSnapshot != null && mergedOutput != null) {
+            // Stamp UUID — same flow as Phase B: durable UUID survives a
+            // restart so we cannot double-register the same physical file.
+            if (mergedOutput.segmentUuid == null) {
+                mergedOutput.segmentUuid = java.util.UUID.randomUUID().toString();
+            }
+            long nextGen = currentIndexStatusGeneration.get() + 1;
+            NewSegmentInfo mergedInfo = new NewSegmentInfo(
+                    mergedOutput.segmentId, mergedOutput.segmentUuid,
+                    mergedOutput.graphFilePath, mergedOutput.graphFileSize,
+                    mergedOutput.mapFilePath, mergedOutput.mapFileSize,
+                    mergedOutput.estimatedSizeBytes, mergedVectorCount,
+                    nextGen, LogSequenceNumber.START_OF_TIME);
+            stagedInfo = java.util.Collections.singletonList(mergedInfo);
+
+            inputInfosForRegistry = new ArrayList<>(inputs.size());
+            for (VectorSegment in : inputs) {
+                // Legacy (v3) inputs without a UUID are not in the registry —
+                // skip them in the validate/deprecate set. The in-memory swap
+                // still happens below.
+                if (in.segmentUuid != null) {
+                    inputInfosForRegistry.add(new NewSegmentInfo(
+                            in.segmentId, in.segmentUuid,
+                            in.graphFilePath, in.graphFileSize,
+                            in.mapFilePath, in.mapFileSize,
+                            in.estimatedSizeBytes, /* vectorCount unknown for an existing input */ 0L,
+                            in.generation, LogSequenceNumber.START_OF_TIME));
+                }
+            }
+
+            try {
+                publisherSnapshot.stageNewSegments(stagedInfo);
+            } catch (RuntimeException stageFailed) {
+                // Stage failed (e.g. ZK unreachable). Abort the local merge.
+                // Stage failure means no PROVISIONAL znode was created (or
+                // creation was interrupted), so unstage is a no-op; we MUST
+                // still queue the rebuild's already-uploaded multipart files
+                // for cleanup, otherwise they leak indefinitely.
+                LOGGER.log(Level.WARNING,
+                        "vector store {0}: stage of merged segment failed; aborting"
+                                + " local compaction merge",
+                        new Object[]{indexName});
+                queueMergedOutputForDeletion(mergedOutput);
+                throw new VectorIndexCompactor.CompactionException(
+                        VectorIndexCompactor.FailureReason.METADATA_IO,
+                        "stage of merged segment failed: " + stageFailed.getMessage());
+            }
+
+            // Revalidate inputs are still ACTIVE in the registry. If a
+            // concurrent optimizer (or another IS) already deprecated any
+            // input we MUST abort: producing a merged output covering an
+            // already-deprecated input would yield two ACTIVE segments
+            // covering the same data, with duplicate PKs surfacing on search.
+            if (!publisherSnapshot.revalidateInputsActive(inputInfosForRegistry)) {
+                try {
+                    publisherSnapshot.unstage(stagedInfo);
+                } catch (RuntimeException ignored) {
+                    // best-effort — reconcile-on-restart will sweep any leftover
+                    // PROVISIONAL znode; our merged-output bytes are queued for
+                    // local-side deletion via queueMergedOutputForDeletion below.
+                }
+                queueMergedOutputForDeletion(mergedOutput);
+                throw new VectorIndexCompactor.CompactionException(
+                        VectorIndexCompactor.FailureReason.ABORTED_INPUT_GONE,
+                        "concurrent compactor deprecated at least one input under us");
+            }
+        }
+
         checkpointLock.lock();
         try {
             stateLock.writeLock().lock();
@@ -1993,6 +2498,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
                 for (VectorSegment in : inputs) {
                     if (!currentIds.contains(in.segmentId)) {
+                        // In-memory drift — undo the registry stage if any
+                        // and queue the merged output's bytes for cleanup so
+                        // they don't leak. The pre-existing version of this
+                        // branch (before the registry stage was added) only
+                        // had the empty rebuild.orphanPaths to fall back on
+                        // — that was a latent leak that became reachable
+                        // far more often once the new registry-revalidate
+                        // abort path landed alongside it.
+                        if (publisherSnapshot != null && stagedInfo != null) {
+                            try {
+                                publisherSnapshot.unstage(stagedInfo);
+                            } catch (RuntimeException ignored) {
+                                // best-effort — reconcile-on-restart will sweep
+                            }
+                        }
+                        queueMergedOutputForDeletion(mergedOutput);
                         throw new VectorIndexCompactor.CompactionException(
                                 VectorIndexCompactor.FailureReason.ABORTED_INPUT_GONE,
                                 "input segment " + in.segmentId + " disappeared from segment list");
@@ -2070,6 +2591,37 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         } finally {
             checkpointLock.unlock();
+        }
+
+        // Post-swap registry coordination. The IndexStatus is durable; if any
+        // of these calls fails the registry will be inconsistent until
+        // reconcile-on-restart (commit) or the next optimizer tick (deprecate).
+        // Best-effort by design — we never roll back a durable IndexStatus
+        // change because of a registry hiccup.
+        if (publisherSnapshot != null && stagedInfo != null) {
+            try {
+                publisherSnapshot.commitStagedSegments(stagedInfo);
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING,
+                        "vector store {0}: commit of merged segment failed; reconcile"
+                                + " on restart will heal: {1}",
+                        new Object[]{indexName, e.getMessage()});
+            }
+            if (inputInfosForRegistry != null && !inputInfosForRegistry.isEmpty()
+                    && mergedOutput != null) {
+                long retentionUntil = System.currentTimeMillis()
+                        + vectorIndexCompactionRetentionMs;
+                try {
+                    publisherSnapshot.deprecateInputs(inputInfosForRegistry,
+                            mergedOutput.segmentUuid, retentionUntil);
+                } catch (RuntimeException e) {
+                    LOGGER.log(Level.WARNING,
+                            "vector store {0}: deprecate of {1} input segments failed;"
+                                    + " optimizer will fold orphan ACTIVE inputs on next tick: {2}",
+                            new Object[]{indexName, inputInfosForRegistry.size(),
+                                    e.getMessage()});
+                }
+            }
         }
     }
 
@@ -2160,6 +2712,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     VectorSegment preloadCompactedSegment(SegmentWriteResult swr) throws IOException, DataStorageManagerException {
         VectorSegment seg = new VectorSegment(swr.segmentId);
+        seg.segmentUuid = swr.segmentUuid;
         seg.estimatedSizeBytes = swr.estimatedSizeBytes;
         seg.graphFilePath = swr.graphFilePath;
         seg.graphFileSize = swr.graphFileSize;
@@ -2505,9 +3058,30 @@ public class PersistentVectorStore extends AbstractVectorStore {
             waitForMemoryPressureRelief();
         }
 
+        // Pressure-driven local-compaction wake (companion to issue #354
+        // back-pressure). When an external optimizer is enabled the IS-local
+        // loop sleeps below the kick threshold; this poke wakes it the
+        // INSTANT segment count reaches the threshold instead of waiting for
+        // its idle interval to elapse, so we minimise the window where
+        // segments could keep accumulating toward the back-pressure ceiling.
+        // The {@code >=} matches the {@code <} gate in {@code runCompactionCycle}
+        // — at exactly {@code kickThreshold} segments the cycle runs, so the
+        // wake must fire at that boundary too. Cheap: a few volatile reads
+        // and an int compare on the existing fast path; the synchronized
+        // {@code wakeVectorIndexCompaction} is skipped entirely when a wake
+        // is already pending (sustained-pressure ingest would otherwise pay
+        // a redundant notify on every add).
+        int currentSegments = segments.size();
+        if (externalCompactionEnabled
+                && localCompactionEnabledWithOptimizer
+                && !vectorIndexCompactionWakeupPending
+                && currentSegments >= kickThresholdCached) {
+            wakeVectorIndexCompaction();
+        }
+
         // Segment-count back-pressure (issue #354): block when there are too
         // many on-disk segments to prevent unbounded accumulation.
-        if (segments.size() > compactionBackpressureThreshold) {
+        if (currentSegments > compactionBackpressureThreshold) {
             waitForSegmentCountRelief();
         }
 
@@ -3497,6 +4071,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 long freshGeneration = currentIndexStatusGeneration.get();
                 for (SegmentWriteResult swr : newSegmentResults) {
                     VectorSegment seg = new VectorSegment(swr.segmentId);
+                    seg.segmentUuid = swr.segmentUuid;
                     seg.estimatedSizeBytes = swr.estimatedSizeBytes;
                     seg.graphFilePath = swr.graphFilePath;
                     seg.graphFileSize = swr.graphFileSize;
@@ -3748,9 +4323,158 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // Order the results by segmentId so that the persisted IndexStatus and
         // the in-memory segment list are both deterministic.
         newSegmentResults.sort(java.util.Comparator.comparingInt(r -> r.segmentId));
+
+        // === Two-phase publish (review item A1+A3) ===
+        //
+        // 1. Stamp UUIDs (review item A2) before any persistence so the UUID is
+        //    durable in IndexStatus even if we crash mid-way.
+        // 2. STAGE: register PROVISIONAL znodes BEFORE IndexStatus persist.
+        // 3. Persist IndexStatus.
+        // 4. COMMIT: flip PROVISIONAL → ACTIVE.
+        //
+        // If we crash:
+        //   - between (1) and (2): no ZK record, no IndexStatus update — clean.
+        //   - between (2) and (3): PROVISIONAL znodes exist but their UUIDs are
+        //     not in IndexStatus. On next start, reconcile drops them.
+        //   - between (3) and (4): PROVISIONAL znodes exist AND their UUIDs are
+        //     in IndexStatus. On next start, reconcile promotes them to ACTIVE.
+        //
+        // Stage and commit failures are best-effort — the local IndexStatus has
+        // (or will have) the durable record; reconciliation on next start heals
+        // any gaps.
+        SegmentPublisher publisherSnapshot = this.segmentPublisher;
+        if (publisherSnapshot != null) {
+            for (SegmentWriteResult swr : newSegmentResults) {
+                if (swr.segmentUuid == null) {
+                    swr.stampSegmentUuid(java.util.UUID.randomUUID().toString());
+                }
+            }
+        }
+
+        List<NewSegmentInfo> publishInfo = (publisherSnapshot != null)
+                ? buildPublishInfo(newSegmentResults, sequenceNumber, currentIndexStatusGeneration.get() + 1)
+                : null;
+
+        if (publisherSnapshot != null) {
+            stageNewSegmentsBestEffort(publisherSnapshot, publishInfo);
+        }
+
+        // Test hook for review-item R3 (second pr-reviewer pass): invoked AFTER stage
+        // and BEFORE commit. Production code never sets this field; tests use it via
+        // reflection to exercise the publisher-snapshot torn-read protection by
+        // swapping the segmentPublisher field at this exact moment and asserting
+        // the snapshot (publisherSnapshot, captured above) is what actually receives
+        // the commit.
+        Runnable midCheckpointHook = betweenStageAndCommitHookForTests;
+        if (midCheckpointHook != null) {
+            midCheckpointHook.run();
+        }
+
         persistIndexStatusMultiSegment(sealedSegments, mergeableSegments, newSegmentResults, sequenceNumber);
 
+        if (publisherSnapshot != null) {
+            commitStagedSegmentsBestEffort(publisherSnapshot, publishInfo);
+        }
+
         return newSegmentResults;
+    }
+
+    /**
+     * Builds the {@link NewSegmentInfo} list for a checkpoint cycle from its
+     * {@link SegmentWriteResult}s. Used both by {@link #stageNewSegmentsBestEffort}
+     * (before IndexStatus persist) and {@link #commitStagedSegmentsBestEffort}
+     * (after) so the same identity flows through both phases.
+     */
+    private List<NewSegmentInfo> buildPublishInfo(
+            List<SegmentWriteResult> newSegmentResults, LogSequenceNumber sequenceNumber,
+            long generation) {
+        List<NewSegmentInfo> info = new ArrayList<>(newSegmentResults.size());
+        for (SegmentWriteResult swr : newSegmentResults) {
+            if (swr.segmentUuid == null) {
+                LOGGER.log(Level.WARNING,
+                        "skipping publish of segment {0} (segmentId={1}) — UUID was not stamped",
+                        new Object[]{indexName, swr.segmentId});
+                continue;
+            }
+            info.add(new NewSegmentInfo(
+                    swr.segmentId, swr.segmentUuid,
+                    swr.graphFilePath, swr.graphFileSize,
+                    swr.mapFilePath, swr.mapFileSize,
+                    swr.estimatedSizeBytes, swr.vectorCount, generation,
+                    sequenceNumber));
+        }
+        return info;
+    }
+
+    /**
+     * Best-effort {@link SegmentPublisher#stageNewSegments} call: registers
+     * PROVISIONAL znodes BEFORE IndexStatus is durable. Failures are logged but
+     * don't fail the checkpoint — the next reconciliation pass will heal any
+     * gaps. Broad catch is intentional: the publisher is a plugin boundary.
+     */
+    private void stageNewSegmentsBestEffort(SegmentPublisher publisher, List<NewSegmentInfo> info) {
+        if (info == null || info.isEmpty()) {
+            return;
+        }
+        try {
+            publisher.stageNewSegments(info);
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING,
+                    "segment publisher.stage failed for index {0} ({1} segments); "
+                            + "checkpoint will continue, reconcile-on-restart will heal",
+                    new Object[]{indexName, info.size()});
+            LOGGER.log(Level.WARNING, "stage failure detail", e);
+        }
+    }
+
+    /**
+     * Best-effort {@link SegmentPublisher#commitStagedSegments} call: flips
+     * PROVISIONAL znodes to ACTIVE after IndexStatus is durable. Failures are
+     * logged; the next reconciliation pass will promote any orphan PROVISIONAL
+     * whose UUID is now in IndexStatus.
+     */
+    private void commitStagedSegmentsBestEffort(SegmentPublisher publisher, List<NewSegmentInfo> info) {
+        if (info == null || info.isEmpty()) {
+            return;
+        }
+        try {
+            publisher.commitStagedSegments(info);
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING,
+                    "segment publisher.commit failed for index {0} ({1} segments); "
+                            + "checkpoint succeeded locally, reconcile-on-restart will heal",
+                    new Object[]{indexName, info.size()});
+            LOGGER.log(Level.WARNING, "commit failure detail", e);
+        }
+    }
+
+    /**
+     * Walks the in-memory segments (loaded from IndexStatus) and produces a
+     * {@link NewSegmentInfo} list suitable for {@link SegmentPublisher#reconcileWithIndexStatus}.
+     * Only segments with a non-null UUID participate (legacy segments are skipped).
+     * Called once at {@link #start()} when a publisher is attached.
+     */
+    private List<NewSegmentInfo> buildExistingSegmentsInfoForReconcile() {
+        List<NewSegmentInfo> info = new ArrayList<>(segments.size());
+        long generation = currentIndexStatusGeneration.get();
+        for (VectorSegment seg : segments) {
+            if (seg.segmentUuid == null) {
+                continue;
+            }
+            // baseLsn for already-loaded segments is unknown post-restart (the
+            // sequence-number was an attribute of the IndexStatus snapshot, not of
+            // the segment); use START_OF_TIME as a sentinel — the registry never
+            // overwrites baseLsn during reconcile so an existing znode keeps its
+            // original value.
+            info.add(new NewSegmentInfo(
+                    seg.segmentId, seg.segmentUuid,
+                    seg.graphFilePath, seg.graphFileSize,
+                    seg.mapFilePath, seg.mapFileSize,
+                    seg.estimatedSizeBytes, /* vectorCount unknown post-restart */ 0L,
+                    Math.max(seg.generation, generation),
+                    LogSequenceNumber.START_OF_TIME));
+        }
+        return info;
     }
 
     /**
@@ -4112,7 +4836,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     return new SegmentWriteResult(segmentId,
                             graphFilePath, graphSize,
                             mapFilePath, mapSize,
-                            graphSize + mapSize);
+                            graphSize + mapSize,
+                            shardSize);
                 } finally {
                     Files.deleteIfExists(mapFile);
                 }
@@ -4397,12 +5122,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
         ByteBuffer metaBuf = ByteBuffer.wrap(status.indexData);
 
         int version = metaBuf.getInt();
-        if (version != METADATA_VERSION_MULTI_SEGMENT) {
-            LOGGER.log(Level.SEVERE,
-                    "unsupported vector index metadata version {0} for {1} (only v{2} is supported),"
-                            + " starting empty — old experimental formats have been removed",
-                    new Object[]{version, indexName, METADATA_VERSION_MULTI_SEGMENT});
-            return;
+        if (version != METADATA_VERSION_MULTI_SEGMENT && version != METADATA_VERSION_MULTI_SEGMENT_V4) {
+            // Review-item B4 (second pr-reviewer pass): on rollback to a binary that
+            // doesn't know about a newer format version, the previous behaviour was to
+            // log SEVERE and "start empty" — i.e. silently drop every segment from the
+            // in-memory state while the underlying graph/map files still exist on
+            // remote storage. That makes queries return an empty result set without
+            // any indication to the operator that something went wrong. Fail-fast
+            // instead: an immediate boot failure is far easier to diagnose and far
+            // safer than a silent data-loss-equivalent regression.
+            throw new DataStorageManagerException(
+                    "unsupported vector index metadata version " + version + " for " + indexName
+                            + " (supported: v" + METADATA_VERSION_MULTI_SEGMENT
+                            + ", v" + METADATA_VERSION_MULTI_SEGMENT_V4
+                            + "). This typically means the index was upgraded by a newer"
+                            + " binary and is being rolled back to one that does not yet"
+                            + " support the new format. Either re-deploy a binary that"
+                            + " supports v" + version + " OR delete the index and re-create it.");
         }
 
         int dim = metaBuf.getInt();
@@ -4420,11 +5156,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.dimension = dim;
         newPageId.set(status.newPageId);
 
-        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha,
+                version);
     }
 
     private void loadMultiSegmentFormat(ByteBuffer metaBuf, int dim, long savedNextNodeId,
-                                         int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
+                                         int savedBeamWidth, float savedNeighborOverflow, float savedAlpha,
+                                         int formatVersion)
             throws IOException, DataStorageManagerException {
         java.io.DataInputStream dis = new java.io.DataInputStream(
                 new java.io.ByteArrayInputStream(metaBuf.array(), metaBuf.position(),
@@ -4459,6 +5197,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             String mapFilePath;
             long mapFileSize;
             long generation;
+            String segmentUuid = null;
             try {
                 segId = dis.readInt();
                 estimatedSize = dis.readLong();
@@ -4467,6 +5206,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 mapFilePath = dis.readUTF();
                 mapFileSize = dis.readLong();
                 generation = dis.readLong();
+                if (formatVersion >= METADATA_VERSION_MULTI_SEGMENT_V4) {
+                    String raw = dis.readUTF();
+                    segmentUuid = raw.isEmpty() ? null : raw;
+                }
             } catch (IOException e) {
                 throw new DataStorageManagerException("Failed to read segment metadata", e);
             }
@@ -4477,6 +5220,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
             seg.mapFilePath = mapFilePath.isEmpty() ? null : mapFilePath;
             seg.mapFileSize = mapFileSize;
             seg.generation = generation;
+            seg.segmentUuid = segmentUuid;
+            if (segmentUuid != null) {
+                segmentedV2Cached = true;
+            }
             segList.add(seg);
         }
 
@@ -4787,7 +5534,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 return new SegmentWriteResult(s.segmentId,
                         graphFilePath, graphFileSize,
                         mapFilePath, mapFileSize,
-                        graphFileSize + mapFileSize);
+                        graphFileSize + mapFileSize,
+                        partNodeToPk.size());
             } finally {
                 Files.deleteIfExists(mapTempFile);
             }
@@ -5018,9 +5766,49 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // Existing (sealed/mergeable) segments keep their stored generation.
         long newGeneration = currentIndexStatusGeneration.get() + 1;
 
+        // Decide format version: v4 if any segment carries a non-null UUID (i.e. the index
+        // is in segmented-v2 mode), otherwise v3 to keep binary-compatible rollback for
+        // legacy clusters that never opted into the optimizer. Once we've seen a UUID we
+        // remember it (segmentedV2Cached) so subsequent checkpoints skip the scan
+        // entirely (review-item N1 from second pr-reviewer pass).
+        boolean anyUuid = segmentedV2Cached;
+        if (!anyUuid) {
+            // Fastest probe first: freshly-emitted segments (whose UUIDs were stamped at
+            // the start of Phase C). Only scan the loaded segments if necessary — those
+            // are the ones that contain UUIDs persisted from a previous run.
+            for (SegmentWriteResult swr : newSegmentResults) {
+                if (swr.segmentUuid != null) {
+                    anyUuid = true;
+                    break;
+                }
+            }
+            if (!anyUuid) {
+                for (VectorSegment seg : sealedSegments) {
+                    if (seg.segmentUuid != null) {
+                        anyUuid = true;
+                        break;
+                    }
+                }
+            }
+            if (!anyUuid) {
+                for (VectorSegment seg : mergeableSegments) {
+                    if (seg.segmentUuid != null) {
+                        anyUuid = true;
+                        break;
+                    }
+                }
+            }
+            if (anyUuid) {
+                segmentedV2Cached = true;
+            }
+        }
+        final int formatVersion = anyUuid
+                ? METADATA_VERSION_MULTI_SEGMENT_V4
+                : METADATA_VERSION_MULTI_SEGMENT;
+
         VisibleByteArrayOutputStream baos = new VisibleByteArrayOutputStream(256);
         try (java.io.DataOutputStream dos = new java.io.DataOutputStream(baos)) {
-            dos.writeInt(METADATA_VERSION_MULTI_SEGMENT);
+            dos.writeInt(formatVersion);
             dos.writeInt(dimension);
             dos.writeInt(m);
             dos.writeInt(beamWidth);
@@ -5029,27 +5817,27 @@ public class PersistentVectorStore extends AbstractVectorStore {
             dos.writeByte(ADD_HIERARCHY ? 1 : 0);
             dos.writeByte(1); // fusedPQ
             // nextNodeId widened to int64 after issue #256. Format version
-            // stays at v3 — the loader refuses unknown versions, so mixing
-            // old + new clients on the same checkpoint directory fails loud
-            // at load time rather than silently truncating the counter.
+            // stays at v3 in legacy mode — the loader refuses unknown versions,
+            // so mixing old + new clients on the same checkpoint directory fails
+            // loud at load time rather than silently truncating the counter.
             dos.writeLong(nextNodeId.get());
             dos.writeLong(newGeneration);
             dos.writeInt(totalSegments);
 
             for (VectorSegment seg : sealedSegments) {
-                writeSegmentMeta(dos, seg.segmentId, seg.estimatedSizeBytes,
+                writeSegmentMeta(dos, seg.segmentId, seg.segmentUuid, seg.estimatedSizeBytes,
                         seg.graphFilePath, seg.graphFileSize,
-                        seg.mapFilePath, seg.mapFileSize, seg.generation);
+                        seg.mapFilePath, seg.mapFileSize, seg.generation, formatVersion);
             }
             for (VectorSegment seg : mergeableSegments) {
-                writeSegmentMeta(dos, seg.segmentId, seg.estimatedSizeBytes,
+                writeSegmentMeta(dos, seg.segmentId, seg.segmentUuid, seg.estimatedSizeBytes,
                         seg.graphFilePath, seg.graphFileSize,
-                        seg.mapFilePath, seg.mapFileSize, seg.generation);
+                        seg.mapFilePath, seg.mapFileSize, seg.generation, formatVersion);
             }
             for (SegmentWriteResult swr : newSegmentResults) {
-                writeSegmentMeta(dos, swr.segmentId, swr.estimatedSizeBytes,
+                writeSegmentMeta(dos, swr.segmentId, swr.segmentUuid, swr.estimatedSizeBytes,
                         swr.graphFilePath, swr.graphFileSize,
-                        swr.mapFilePath, swr.mapFileSize, newGeneration);
+                        swr.mapFilePath, swr.mapFileSize, newGeneration, formatVersion);
             }
 
             List<PendingDelete> snapshotPending = new ArrayList<>(pendingDeletes);
@@ -5074,10 +5862,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     private static void writeSegmentMeta(
             java.io.DataOutputStream dos,
-            int segmentId, long estimatedSizeBytes,
+            int segmentId, String segmentUuid, long estimatedSizeBytes,
             String graphFilePath, long graphFileSize,
             String mapFilePath, long mapFileSize,
-            long generation) throws IOException {
+            long generation, int formatVersion) throws IOException {
         dos.writeInt(segmentId);
         dos.writeLong(estimatedSizeBytes);
         dos.writeUTF(graphFilePath);
@@ -5085,6 +5873,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         dos.writeUTF(mapFilePath != null ? mapFilePath : "");
         dos.writeLong(mapFileSize);
         dos.writeLong(generation);
+        if (formatVersion >= METADATA_VERSION_MULTI_SEGMENT_V4) {
+            // The empty string is the on-wire representation of "no UUID assigned"
+            // — the v3 reader doesn't see this byte at all, the v4 reader maps it
+            // back to null on load.
+            dos.writeUTF(segmentUuid != null ? segmentUuid : "");
+        }
     }
 
     // -------------------------------------------------------------------------
