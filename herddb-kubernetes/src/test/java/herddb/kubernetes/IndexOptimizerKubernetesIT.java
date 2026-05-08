@@ -263,19 +263,14 @@ public class IndexOptimizerKubernetesIT {
         waitForComponent("index-optimizer", 5, TimeUnit.MINUTES);
         LOG.info("Index-optimizer pod is Ready — health endpoint returned 200.");
 
-        // Create a vector table and index so the optimizer has segments to scan.
+        // Create a vector table and index. The optimizer's runs counter increments at
+        // the start of every runOnce() tick regardless of whether any segments exist,
+        // so merely having a running engine is enough to assert liveness.
         HerdDBKubernetesIT.execSql(k3s, toolsPod,
                 "CREATE TABLE opt_test (id int primary key, vec floata not null)");
         HerdDBKubernetesIT.execSql(k3s, toolsPod,
                 "CREATE VECTOR INDEX vidx_opt ON opt_test(vec)");
         LOG.info("Vector table and index created.");
-
-        // Insert a handful of rows to generate activity in the indexing service.
-        for (int i = 1; i <= 5; i++) {
-            HerdDBKubernetesIT.execSql(k3s, toolsPod,
-                    "INSERT INTO opt_test (id, vec) VALUES (" + i + ", FLOATA(0.1,0.2,0.3))");
-        }
-        LOG.info("Inserted 5 rows.");
 
         // Wait for the optimizer to tick at least once (intervalMs=10s → 3 ticks in 60s).
         String optimizerPod = getComponentPodName("index-optimizer");
@@ -283,8 +278,8 @@ public class IndexOptimizerKubernetesIT {
         long runs = waitForOptimizerTick(optimizerPod, 2, TimeUnit.MINUTES);
         assertTrue("Expected at least 1 optimizer tick but got " + runs, runs >= 1);
 
-        LOG.info("Test passed: index-optimizer started, resolved 'herd' tablespace by name, "
-                + "and ticked " + runs + " time(s).");
+        LOG.info("Test passed: index-optimizer started successfully, resolved 'herd' tablespace "
+                + "by name (no UUID needed), and the engine ticked " + runs + " time(s).");
     }
 
     // -------------------------------------------------------------------------
