@@ -351,6 +351,14 @@ indexingService:
     # proportion to the direct-memory pressure they impose. Lower this
     # (e.g. "134217728" = 128 MiB) on tighter bench profiles.
     remote.file.client.max.inflight.read.bytes: "268435456"
+    # Caps bytes across in-flight writeFile/writeFileBlock/writeMultipartFile
+    # calls (issue #468). Set tighter than the read cap to bias the
+    # constrained k3s-local profile toward search reads: when Phase B
+    # compaction streams a 658 MB graph + 326 MB map file via 4 MiB blocks,
+    # 64 MiB caps the queue at 16 in-flight blocks (vs. ~165 unbounded)
+    # so concurrent ANN reads are not starved on the shared event-loop
+    # pool / file server.
+    remote.file.client.max.inflight.write.bytes: "67108864"
     # BookKeeper V2 wire protocol for the IS commit-log tailer (no protobuf framing
     # on readEntries). Code-level default since issue #392; kept here explicitly
     # for parity with the GKE example. Set to "false" to fall back to V3.

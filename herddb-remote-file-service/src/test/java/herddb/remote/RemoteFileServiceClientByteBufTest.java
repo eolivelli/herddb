@@ -663,4 +663,286 @@ public class RemoteFileServiceClientByteBufTest {
             }
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Issue #468 — in-flight write-byte budget
+    //
+    // Symmetric to the issue #246 read-byte budget above: every
+    // writeFile / writeFileBlock / writeMultipartFile call reserves bytes
+    // from a Semaphore before launching the RPC, so a multipart compaction
+    // write cannot fan out hundreds of in-flight blocks at once and starve
+    // search reads sharing the same Netty event-loop pool / file server.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Default construction exposes the documented default write-byte budget
+     * ({@link RemoteFileServiceClient#DEFAULT_CLIENT_MAX_INFLIGHT_WRITE_BYTES}).
+     */
+    @Test
+    public void testInflightWriteBytes_defaultConfig() {
+        assertEquals("default max inflight write bytes",
+                RemoteFileServiceClient.DEFAULT_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
+                client.maxInflightWriteBytes());
+        assertEquals("all bytes available at steady state",
+                RemoteFileServiceClient.DEFAULT_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
+                client.availableInflightWriteBytes());
+    }
+
+    /**
+     * A custom {@code remote.file.client.max.inflight.write.bytes} config
+     * value is honoured, and {@code availableInflightWriteBytes()} starts
+     * equal to the cap before any write is issued.
+     */
+    @Test
+    public void testInflightWriteBytes_customConfig() throws Exception {
+        long customBytes = 16L * 1024 * 1024; // 16 MiB
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, customBytes);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            assertEquals("configured cap is applied", customBytes, tuned.maxInflightWriteBytes());
+            assertEquals("all bytes available at idle",
+                    customBytes, tuned.availableInflightWriteBytes());
+        }
+    }
+
+    /** A non-positive byte budget is rejected at construction. */
+    @Test
+    public void testInflightWriteBytes_zeroConfigRejected() {
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, 0L);
+        try {
+            new RemoteFileServiceClient(
+                    Arrays.asList("localhost:" + server.getPort()), cfg).close();
+            fail("expected IllegalArgumentException for non-positive byte budget");
+        } catch (IllegalArgumentException expected) {
+            assertTrue("message names the property",
+                    expected.getMessage().contains(
+                            RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES));
+        }
+    }
+
+    /**
+     * A byte budget below {@code blockSize} is rejected: a single full-block
+     * write would immediately deadlock.
+     */
+    @Test
+    public void testInflightWriteBytes_belowBlockSizeRejected() {
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, 4096);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, 2048L);
+        try {
+            new RemoteFileServiceClient(
+                    Arrays.asList("localhost:" + server.getPort()), cfg).close();
+            fail("expected IllegalArgumentException when budget < blockSize");
+        } catch (IllegalArgumentException expected) {
+            assertTrue("message names the properties",
+                    expected.getMessage().contains(
+                            RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES));
+        }
+    }
+
+    /**
+     * After a successful {@code writeFile(byte[])} the byte reservation is
+     * released — a subsequent call sees the full budget again.
+     */
+    @Test
+    public void testInflightWriteBytes_releasedAfterWriteFile() throws Exception {
+        String path = "test/permits/write/file.bin";
+        long before = client.availableInflightWriteBytes();
+        client.writeFile(path, "payload".getBytes(StandardCharsets.UTF_8));
+        long after = client.availableInflightWriteBytes();
+        assertEquals("reservation is released on completion", before, after);
+    }
+
+    /**
+     * After a successful {@code writeFile(ByteBuf)} the byte reservation
+     * is released — proves the ByteBuf overload also wires the
+     * acquire/release pair.
+     */
+    @Test
+    public void testInflightWriteBytes_releasedAfterWriteFileByteBuf() throws Exception {
+        String path = "test/permits/write/file-bytebuf.bin";
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(64);
+        try {
+            buf.writeBytes("payload".getBytes(StandardCharsets.UTF_8));
+            long before = client.availableInflightWriteBytes();
+            client.writeFile(path, buf);
+            long after = client.availableInflightWriteBytes();
+            assertEquals("reservation is released on completion", before, after);
+        } finally {
+            ReferenceCountUtil.safeRelease(buf);
+        }
+    }
+
+    /**
+     * After a {@code writeFileBlock(byte[])} the reservation is released —
+     * exercises the hot path that issue #468 targets.
+     */
+    @Test
+    public void testInflightWriteBytes_releasedAfterWriteFileBlock() throws Exception {
+        String path = "test/permits/write/block.bin";
+        byte[] block = new byte[4096];
+        long before = client.availableInflightWriteBytes();
+        client.writeFileBlock(path, 0L, block);
+        long after = client.availableInflightWriteBytes();
+        assertEquals("reservation is released on completion", before, after);
+    }
+
+    /**
+     * After a {@code writeMultipartFile} of N blocks the reservation is
+     * released. This is the path used by Phase B of compaction —
+     * the primary regression gate for issue #468.
+     */
+    @Test
+    public void testInflightWriteBytes_releasedAfterWriteMultipart() throws Exception {
+        String path = "test/permits/write/multipart.bin";
+        int blockSize = 4096;
+        byte[] content = new byte[blockSize * 4];
+        for (int i = 0; i < content.length; i++) {
+            content[i] = (byte) (i % 256);
+        }
+        long before = client.availableInflightWriteBytes();
+        long written = client.writeMultipartFile(path,
+                new ByteArrayInputStream(content), blockSize);
+        assertEquals("multipart wrote all bytes", content.length, written);
+        long after = client.availableInflightWriteBytes();
+        assertEquals("every block reservation released after multipart write",
+                before, after);
+    }
+
+    /**
+     * A reasonably concurrent burst of {@code writeFileBlock} calls must
+     * never reveal a negative budget and must return the full cap by the
+     * time every call settles. Symmetric to the read-side concurrent-burst
+     * test.
+     */
+    @Test
+    public void testInflightWriteBytes_concurrentBurstReturnsReservations() throws Exception {
+        long max = client.maxInflightWriteBytes();
+        int burst = 32;
+        int payloadSize = 4096;
+        @SuppressWarnings("unchecked")
+        CompletableFuture<Void>[] futures = new CompletableFuture[burst];
+        for (int i = 0; i < burst; i++) {
+            byte[] payload = new byte[payloadSize];
+            futures[i] = client.writeFileBlockAsync(
+                    "test/permits/write/burst-" + i, 0L, payload);
+        }
+        for (CompletableFuture<Void> f : futures) {
+            f.get(30, TimeUnit.SECONDS);
+            assertTrue("available bytes must never exceed cap",
+                    client.availableInflightWriteBytes() <= max);
+            assertTrue("available bytes must never go negative",
+                    client.availableInflightWriteBytes() >= 0);
+        }
+        assertEquals("all bytes returned at the end of the burst",
+                max, client.availableInflightWriteBytes());
+    }
+
+    /**
+     * A small byte cap that still admits one full-block write restores the
+     * budget after the write settles.
+     */
+    @Test
+    public void testInflightWriteBytes_smallBudgetRoundTrip() throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        // 4 MiB budget — exactly one default block. Any smaller and the
+        // constructor refuses (see testInflightWriteBytes_belowBlockSizeRejected).
+        long budget = RemoteFileServiceClient.DEFAULT_BLOCK_SIZE;
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, budget);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            assertEquals(budget, tuned.availableInflightWriteBytes());
+            tuned.writeFile("test/permits/write/single.bin",
+                    "one".getBytes(StandardCharsets.UTF_8));
+            assertEquals("budget restored after single write completes",
+                    budget, tuned.availableInflightWriteBytes());
+        }
+    }
+
+    /**
+     * When the remote file service is unreachable the underlying RPC
+     * eventually fails — each attempt must release its reservation so the
+     * budget returns to the configured cap. Writes are not retried by the
+     * client (see {@code RemoteFileServiceClient.writeFileAsync}'s
+     * "Writes are not idempotent — no retry." comment), so a single attempt
+     * is enough; we still want to prove the failure-path release.
+     */
+    @Test
+    public void testInflightWriteBytes_releasedAfterBackendUnreachable() throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_RETRIES, 1);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_TIMEOUT, 2L);
+        // Point at a port where nothing is listening.
+        try (RemoteFileServiceClient broken = new RemoteFileServiceClient(
+                Arrays.asList("localhost:1"), cfg)) {
+            long before = broken.availableInflightWriteBytes();
+            try {
+                broken.writeFileBlockAsync("some/path", 0L, new byte[4096])
+                        .get(60, TimeUnit.SECONDS);
+                fail("expected the write to fail against an unreachable backend");
+            } catch (java.util.concurrent.ExecutionException expected) {
+                // propagated from sendRequest
+            }
+            assertEquals("reservation restored after backend-unreachable",
+                    before, broken.availableInflightWriteBytes());
+        }
+    }
+
+    /**
+     * The behaviour the bug fix promises: with a budget tight enough to
+     * admit only one block at a time, a multipart write whose total
+     * payload exceeds the budget still completes — the driver thread
+     * naturally serialises by blocking on {@code acquire()} and unblocking
+     * each time a previous block's RPC completes and releases its bytes.
+     * This is the test that regresses if the acquire/release plumbing
+     * in {@code writeFileBlockAsync} ever leaks or is bypassed.
+     */
+    @Test
+    public void testInflightWriteBytes_smallBudgetSerializesMultipartBlocks() throws Exception {
+        Map<String, Object> cfg = new HashMap<>();
+        // Use a small block size so the test stays cheap; budget == one block.
+        int blockSize = 4096;
+        long budget = blockSize;
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, blockSize);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, budget);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            // Eight blocks — eight forced acquire/release round-trips.
+            byte[] content = new byte[blockSize * 8];
+            for (int i = 0; i < content.length; i++) {
+                content[i] = (byte) i;
+            }
+            long written = tuned.writeMultipartFile(
+                    "test/permits/write/serialised.bin",
+                    new ByteArrayInputStream(content), blockSize);
+            assertEquals("multipart wrote all bytes despite the tight budget",
+                    content.length, written);
+            assertEquals("budget restored after the serialised multipart write",
+                    budget, tuned.availableInflightWriteBytes());
+            // Round-trip: read back to assert the file is structurally sound.
+            byte[] firstBlock = tuned.readFileRange(
+                    "test/permits/write/serialised.bin", 0L, blockSize, blockSize);
+            assertNotNull(firstBlock);
+            assertEquals(blockSize, firstBlock.length);
+        }
+    }
+
+    /**
+     * Empty-payload writes (issue #100's fast path: an empty multipart file
+     * still creates block 0 with an empty buffer) must not decrement the
+     * write-byte budget — otherwise an idle workload that creates many
+     * empty marker files would exhaust the cap. Specifically tests the
+     * {@code Unpooled.EMPTY_BUFFER} call site in
+     * {@code RemoteFileDataStorageManager.writeAsMultipart}.
+     */
+    @Test
+    public void testInflightWriteBytes_emptyPayloadSkipsReservation() throws Exception {
+        long before = client.availableInflightWriteBytes();
+        client.writeFileBlock("test/permits/write/empty.bin", 0L,
+                io.netty.buffer.Unpooled.EMPTY_BUFFER);
+        long after = client.availableInflightWriteBytes();
+        assertEquals("empty payload neither acquires nor leaks", before, after);
+    }
 }

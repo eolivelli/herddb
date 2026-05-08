@@ -247,6 +247,16 @@ indexingService:
   #     - steady-state gRPC transport (~256 MiB)
   #   Bench-validated baseline: MaxDirectMemorySize=10g for -Xmx=24g with
   #   remote.file.client.max.inflight.read.bytes=256 MiB (issue #246).
+  #
+  # Compaction/search fairness on the write plane (issue #468):
+  #   remote.file.client.max.inflight.write.bytes caps bytes across in-flight
+  #   writeFile/writeFileBlock/writeMultipartFile calls. Symmetric to the
+  #   read cap above — when Phase B compaction streams hundreds of MB of
+  #   merged graph + map files, this knob bounds peak write-plane network
+  #   pressure so concurrent ANN search reads on the read plane are not
+  #   starved on the shared event-loop pool / file server. Default 256 MiB.
+  #   Lower this (e.g. "67108864" = 64 MiB) on profiles where compaction
+  #   visibly hurts query p99 latency.
   javaOpts: ""
   javaOptsExtra: ""
   # Optional: override /opt/herddb/conf/logging.properties inside the pod.

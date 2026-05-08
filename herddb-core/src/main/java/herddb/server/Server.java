@@ -453,6 +453,9 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                 clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES,
                         configuration.getLong(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES,
                                 ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES_DEFAULT));
+                clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
+                        configuration.getLong(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
+                                ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_WRITE_BYTES_DEFAULT));
                 RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
                 RemoteFileClient client = factory.createClient(servers, clientConfig);
                 client.registerMetrics(statsLogger.scope("remote_file_client"));
@@ -594,6 +597,9 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
         clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES,
                 configuration.getLong(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES,
                         ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_READ_BYTES_DEFAULT));
+        clientConfig.put(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
+                configuration.getLong(ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
+                        ServerConfiguration.PROPERTY_REMOTE_FILE_CLIENT_MAX_INFLIGHT_WRITE_BYTES_DEFAULT));
         RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
         RemoteFileClient client = factory.createClient(servers, clientConfig);
         client.registerMetrics(statsLogger.scope("remote_file_client"));
