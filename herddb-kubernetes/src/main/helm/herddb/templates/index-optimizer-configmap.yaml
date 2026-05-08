@@ -12,7 +12,7 @@ metadata:
 data:
   indexoptimizer.properties: |
     indexoptimizer.http.host=0.0.0.0
-    indexoptimizer.http.port={{ .Values.indexOptimizer.httpPort | default 9853 }}
+    indexoptimizer.http.port={{ .Values.indexOptimizer.httpPort | default 9853 | int64 }}
     indexoptimizer.zookeeper.address={{ include "herddb.zkAddress" . }}
     indexoptimizer.zookeeper.session.timeout={{ .Values.indexOptimizer.zkSessionTimeout | default 40000 | int64 }}
     indexoptimizer.zookeeper.path=/herd
