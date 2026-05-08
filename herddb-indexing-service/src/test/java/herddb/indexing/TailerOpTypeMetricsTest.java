@@ -93,6 +93,7 @@ public class TailerOpTypeMetricsTest {
         assertEquals(0L, e.getTailerEntriesProcessed());
         assertEquals(0L, e.getTailerEntriesAccepted());
         assertEquals(0L, e.getTailerEntriesSkipped());
+        assertEquals(0L, e.getTailerEntriesShardFiltered());
         assertEquals(0L, e.getTailerInserts());
         assertEquals(0L, e.getTailerUpdates());
         assertEquals(0L, e.getTailerDeletes());
@@ -243,5 +244,36 @@ public class TailerOpTypeMetricsTest {
         assertEquals(1L, engine.getTailerDdl());
         assertEquals(0L, engine.getTailerEntriesAccepted());
         assertEquals(1L, engine.getTailerEntriesSkipped());
+    }
+
+    /**
+     * Issue #463: an INSERT on a table with no vector index must NOT bump
+     * {@code tailer_entries_shard_filtered}. The early return inside
+     * {@code applyInsert} (before the per-index shard-filter loop) signals a
+     * different reason than shard-filter rejection — operators distinguish
+     * "this replica chose not to index because it doesn't own the shard"
+     * (counted) from "the table is non-vector" (not counted).
+     */
+    @Test
+    public void singleInsertOnTableWithNoVectorIndexDoesNotBumpShardFiltered()
+            throws Exception {
+        IndexingServiceEngine engine = service.getEngine();
+        Table table = testTable();
+
+        // Register the table so applyInsert resolves the schema, but do NOT
+        // create a vector index for it. The applyInsert() body will hit the
+        // `vectorIndexes.isEmpty()` early return.
+        engine.processEntryForTest(new LogSequenceNumber(1, 1),
+                LogEntryFactory.createTable(table, null));
+        engine.processEntryForTest(new LogSequenceNumber(1, 2),
+                LogEntryFactory.insert(table, Bytes.from_string("k"),
+                        Bytes.from_string("v"), null));
+        engine.awaitPendingWorkForTest();
+
+        assertEquals("INSERT must still bump tailer_inserts",
+                1L, engine.getTailerInserts());
+        assertEquals("INSERT on table without vector index must NOT count "
+                        + "as shard-filtered",
+                0L, engine.getTailerEntriesShardFiltered());
     }
 }

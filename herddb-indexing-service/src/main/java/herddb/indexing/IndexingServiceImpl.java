@@ -36,6 +36,8 @@ import herddb.indexing.proto.IndexingServiceGrpc;
 import herddb.indexing.proto.ListIndexesRequest;
 import herddb.indexing.proto.ListIndexesResponse;
 import herddb.indexing.proto.ListPrimaryKeysRequest;
+import herddb.indexing.proto.MetricEntry;
+import herddb.indexing.proto.MetricValue;
 import herddb.indexing.proto.PrimaryKeysChunk;
 import herddb.indexing.proto.SearchRequest;
 import herddb.indexing.proto.SearchResponse;
@@ -414,30 +416,42 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
             long heapUsed = heap.getUsed();
             long heapMax = heap.getMax();
             int heapPct = heapMax > 0 ? (int) Math.min(100L, (100L * heapUsed) / heapMax) : -1;
-            GetEngineStatsResponse response = GetEngineStatsResponse.newBuilder()
-                    .setUptimeMillis(uptime)
-                    .setTailerWatermarkLedger(lsn != null ? lsn.ledgerId : -1L)
-                    .setTailerWatermarkOffset(lsn != null ? lsn.offset : -1L)
-                    .setTailerEntriesProcessed(engine.getTailerEntriesProcessed())
-                    .setTailerRunning(engine.isTailerRunning())
-                    .setApplyQueueSize(engine.getApplyQueueSize())
-                    .setApplyQueueCapacity(engine.getApplyQueueCapacity())
-                    .setTotalEstimatedMemoryBytes(engine.getTotalEstimatedMemoryBytes())
-                    .setLoadedIndexCount(engine.getLoadedIndexCount())
-                    .setApplyParallelism(engine.getApplyParallelism())
-                    .setJvmHeapUsedBytes(heapUsed)
-                    .setJvmHeapMaxBytes(heapMax)
-                    .setJvmHeapUsedPct(heapPct)
-                    // Issue #459: per-operation-type tailer counters.
-                    .setTailerEntriesAccepted(engine.getTailerEntriesAccepted())
-                    .setTailerEntriesSkipped(engine.getTailerEntriesSkipped())
-                    .setTailerInserts(engine.getTailerInserts())
-                    .setTailerUpdates(engine.getTailerUpdates())
-                    .setTailerDeletes(engine.getTailerDeletes())
-                    .setTailerDdl(engine.getTailerDdl())
-                    .setTailerBatches(engine.getTailerBatchesProcessed())
-                    .build();
-            responseObserver.onNext(response);
+
+            // Issue #463: the response is a flat (key, MetricValue) list — adding
+            // a metric is now `addInt64(b, "key", value)` server-side without a
+            // proto schema change. Order matters: the indexing-admin CLI walks
+            // the list in order to render its text output, so we emit metrics
+            // in the same order they used to appear when each was a typed
+            // proto field.
+            GetEngineStatsResponse.Builder b = GetEngineStatsResponse.newBuilder();
+            addInt64(b, "uptime_millis", uptime);
+            addBool(b, "tailer_running", engine.isTailerRunning());
+            addInt64(b, "tailer_watermark_ledger", lsn != null ? lsn.ledgerId : -1L);
+            addInt64(b, "tailer_watermark_offset", lsn != null ? lsn.offset : -1L);
+            addInt64(b, "tailer_entries_processed", engine.getTailerEntriesProcessed());
+            // Issue #459: per-operation-type tailer counters.
+            addInt64(b, "tailer_entries_accepted", engine.getTailerEntriesAccepted());
+            addInt64(b, "tailer_entries_skipped", engine.getTailerEntriesSkipped());
+            // Issue #463: INSERT entries this replica did not apply because
+            // every vector index for the table rejected the key via the shard
+            // filter. Lets operators verify cross-replica sharding without
+            // having to scrape Prometheus.
+            addInt64(b, "tailer_entries_shard_filtered", engine.getTailerEntriesShardFiltered());
+            addInt64(b, "tailer_inserts", engine.getTailerInserts());
+            addInt64(b, "tailer_updates", engine.getTailerUpdates());
+            addInt64(b, "tailer_deletes", engine.getTailerDeletes());
+            addInt64(b, "tailer_ddl", engine.getTailerDdl());
+            addInt64(b, "tailer_batches", engine.getTailerBatchesProcessed());
+            addInt64(b, "apply_queue_size", engine.getApplyQueueSize());
+            addInt64(b, "apply_queue_capacity", engine.getApplyQueueCapacity());
+            addInt64(b, "apply_parallelism", engine.getApplyParallelism());
+            addInt64(b, "loaded_index_count", engine.getLoadedIndexCount());
+            addInt64(b, "total_estimated_memory_bytes", engine.getTotalEstimatedMemoryBytes());
+            addInt64(b, "jvm_heap_used_bytes", heapUsed);
+            addInt64(b, "jvm_heap_max_bytes", heapMax);
+            addInt64(b, "jvm_heap_used_pct", heapPct);
+
+            responseObserver.onNext(b.build());
             responseObserver.onCompleted();
         } catch (RuntimeException e) {
             LOGGER.log(Level.SEVERE, "GetEngineStats failed", e);
@@ -446,6 +460,20 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .withCause(e)
                     .asRuntimeException());
         }
+    }
+
+    private static void addInt64(GetEngineStatsResponse.Builder b, String key, long value) {
+        b.addMetrics(MetricEntry.newBuilder()
+                .setKey(key)
+                .setValue(MetricValue.newBuilder().setInt64Value(value).build())
+                .build());
+    }
+
+    private static void addBool(GetEngineStatsResponse.Builder b, String key, boolean value) {
+        b.addMetrics(MetricEntry.newBuilder()
+                .setKey(key)
+                .setValue(MetricValue.newBuilder().setBoolValue(value).build())
+                .build());
     }
 
     @Override
