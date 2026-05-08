@@ -173,21 +173,30 @@ public final class VectorIndexRebuilder {
         }
         String vectorColumn = index.columnNames[0];
 
+        // Issue #471: write start-time BEFORE the isInterrupted
+        // check below so that an interrupt-before-start exit is still
+        // visible to operators (start > 0, end may be 0 or briefly
+        // 0 until the finally below writes it). This makes the
+        // metric promise "every exit path updates start AND end"
+        // hold uniformly, including the interrupt-before-start path.
+        long startNanos = System.nanoTime();
+        long startMillis = System.currentTimeMillis();
+        metrics.lastRebuildStartTimeMillis = startMillis;
+
         // Issue #471: cooperative cancellation — early-out if the
         // tailer thread is already interrupted before we even start.
         // This is the load-bearing check for the engine-shutdown
         // path; further checks per-page guard against the case where
         // the interrupt arrives mid-scan.
         if (Thread.currentThread().isInterrupted()) {
+            // Update the end-time before throwing so the gauge
+            // promise ("end >= start ⇔ no rebuild in flight") holds.
+            metrics.lastRebuildEndTimeMillis = System.currentTimeMillis();
             throw new RuntimeException(
                     "rebuild interrupted before start at LSN " + rebuildLsn
                             + " for " + index.tablespace + "." + index.table
                             + "." + index.name);
         }
-
-        long startNanos = System.nanoTime();
-        long startMillis = System.currentTimeMillis();
-        metrics.lastRebuildStartTimeMillis = startMillis;
 
         // Per-call counters — distinct from the engine-wide LongAdders
         // in metrics, which are cumulative across rebuilds. We need
@@ -205,6 +214,20 @@ public final class VectorIndexRebuilder {
         FullTableScanConsumer consumer = new FullTableScanConsumer() {
             @Override
             public void acceptTableStatus(TableStatus status) {
+                // Defence-in-depth: the DSM must return the
+                // checkpoint at exactly rebuildLsn; a future
+                // regression that returns a different checkpoint
+                // (e.g. because the pinned LSN was reclaimed by a
+                // periodic activator-driven cleanup) would silently
+                // back-fill from the wrong snapshot. Surface
+                // immediately.
+                if (!rebuildLsn.equals(status.sequenceNumber)) {
+                    throw new IllegalStateException(
+                            "rebuild scan returned checkpoint at " + status.sequenceNumber
+                                    + " but rebuild LSN is " + rebuildLsn
+                                    + " for " + index.tablespace + "." + index.table
+                                    + "." + index.name);
+                }
                 LOGGER.log(Level.INFO,
                         "rebuild {0}.{1}.{2}: pinned checkpoint at LSN {3}, {4} active pages",
                         new Object[]{index.tablespace, index.table, index.name,

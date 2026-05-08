@@ -2081,73 +2081,91 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * the watermark past the CREATE_INDEX entry.
      */
     private void triggerRebuildIfNeeded(LogEntry entry) {
-        Index index = Index.deserialize(entry.value.to_array());
-        if (!Index.TYPE_VECTOR.equals(index.type)) {
-            return;
-        }
-        String rebuildFlag = index.properties.get(VectorIndexManager.PROP_REBUILD);
-        if (!"true".equals(rebuildFlag)) {
-            return;
-        }
-        Table table = schemaTracker.getTable(index.table);
-        if (table == null) {
-            // We just applied the CREATE_INDEX entry to the tracker
-            // above; the table MUST be there. Surface this loudly —
-            // it is a real correctness bug if it ever fires, not a
-            // recoverable race.
-            throw new IllegalStateException(
-                    "rebuild requested for index " + index.tablespace + "." + index.table
-                            + "." + index.name + " but the table is not tracked");
-        }
-        AbstractVectorStore store = vectorStores.get(storeKey(index.table, index.name));
-        if (store == null) {
-            // createVectorStoreIfNeeded just ran — same surfacing.
-            throw new IllegalStateException(
-                    "rebuild requested for index " + index.tablespace + "." + index.table
-                            + "." + index.name + " but no vector store was created");
-        }
-        if (dataStorageManager == null) {
-            // Engine boots without a DSM in some test scenarios; the
-            // rebuild scan needs one. Surface the misconfiguration.
-            throw new IllegalStateException(
-                    "rebuild requested but the engine has no DataStorageManager");
-        }
-        if (tableSpaceUUID == null) {
-            // Defensive: should never happen because the tablespace
-            // is resolved during start() before any commit-log entry
-            // is delivered. But if a test path ever drives applyEntry
-            // before start(), surface the misuse explicitly rather
-            // than letting the DSM see a null tablespace.
-            throw new IllegalStateException(
-                    "rebuild requested before tablespace UUID was resolved");
-        }
-        VectorIndexRebuilder rebuilder = new VectorIndexRebuilder(
-                dataStorageManager, tableSpaceUUID, table, index, store,
-                key -> isAcceptedLocally(key, index),
-                rebuildMetrics);
+        // Issue #471: any failure inside this method (the pre-flight
+        // IllegalStateException paths AND any Throwable from the
+        // rebuilder) MUST escalate to EngineStatus.FAILED before
+        // bubbling up. processEntry's outer catch is `catch
+        // (Exception e)`, which silently absorbs RuntimeException
+        // and lets the next successful tailer entry advance
+        // lastProcessedLsn past the failed CREATE_INDEX — the silent
+        // data-loss path. Catching `Throwable` here also covers
+        // OutOfMemoryError from jvector graph allocation on the
+        // 20 B-row scan. The catch sets FAILED first, then re-throws
+        // so processEntry's catch sees the same throwable for
+        // logging.
+        boolean rebuildSucceeded = false;
+        Index index = null;
         try {
+            index = Index.deserialize(entry.value.to_array());
+            if (!Index.TYPE_VECTOR.equals(index.type)) {
+                rebuildSucceeded = true;
+                return;
+            }
+            String rebuildFlag = index.properties.get(VectorIndexManager.PROP_REBUILD);
+            if (!"true".equals(rebuildFlag)) {
+                rebuildSucceeded = true;
+                return;
+            }
+            Table table = schemaTracker.getTable(index.table);
+            if (table == null) {
+                // We just applied the CREATE_INDEX entry to the tracker
+                // above; the table MUST be there. Surface this loudly —
+                // it is a real correctness bug if it ever fires, not a
+                // recoverable race.
+                throw new IllegalStateException(
+                        "rebuild requested for index " + index.tablespace + "." + index.table
+                                + "." + index.name + " but the table is not tracked");
+            }
+            AbstractVectorStore store = vectorStores.get(storeKey(index.table, index.name));
+            if (store == null) {
+                // createVectorStoreIfNeeded just ran — same surfacing.
+                throw new IllegalStateException(
+                        "rebuild requested for index " + index.tablespace + "." + index.table
+                                + "." + index.name + " but no vector store was created");
+            }
+            if (dataStorageManager == null) {
+                // Engine boots without a DSM in some test scenarios; the
+                // rebuild scan needs one. Surface the misconfiguration.
+                throw new IllegalStateException(
+                        "rebuild requested but the engine has no DataStorageManager");
+            }
+            if (tableSpaceUUID == null) {
+                // Defensive: should never happen because the tablespace
+                // is resolved during start() before any commit-log entry
+                // is delivered. But if a test path ever drives applyEntry
+                // before start(), surface the misuse explicitly rather
+                // than letting the DSM see a null tablespace.
+                throw new IllegalStateException(
+                        "rebuild requested before tablespace UUID was resolved");
+            }
+            // Capture the deserialized Index in a separately-final
+            // local so the shard-predicate lambda below has an
+            // effectively-final reference to close over (the outer
+            // `index` is reassignable for the deserialization-throw
+            // diagnostic in the finally).
+            final Index indexForLambda = index;
+            VectorIndexRebuilder rebuilder = new VectorIndexRebuilder(
+                    dataStorageManager, tableSpaceUUID, table, index, store,
+                    key -> isAcceptedLocally(key, indexForLambda),
+                    rebuildMetrics);
             rebuilder.run();
-        } catch (RuntimeException rebuildErr) {
-            // Issue #471: a rebuild failure is engine-fatal. Without
-            // this escalation, processEntry's broad catch would
-            // swallow the exception, the next successful tailer entry
-            // would advance lastProcessedLsn past the failed
-            // CREATE_INDEX, the next checkpoint would persist that
-            // watermark, and the partially-back-filled vector store
-            // would become the permanent state on restart — a silent
-            // data-loss path. Set FAILED so processEntry early-returns
-            // on every subsequent entry; the engine sits idle until
-            // the pod restarts (a health check failure or operator
-            // intervention is expected to drive the restart). On
-            // restart the watermark is still pre-CREATE_INDEX, so the
-            // entry is replayed and the rebuild re-runs from scratch.
-            LOGGER.log(Level.SEVERE,
-                    "rebuild failed for index " + index.tablespace + "." + index.table
-                            + "." + index.name + "; engine entering FAILED state — "
-                            + "tailer will refuse to advance past this entry until restart",
-                    rebuildErr);
-            engineStatus = EngineStatus.FAILED;
-            throw rebuildErr;
+            rebuildSucceeded = true;
+        } finally {
+            if (!rebuildSucceeded) {
+                // Set FAILED before any throwable propagates so the
+                // very next processEntry call early-returns on
+                // FAILED state. Use the Index data we have (it may
+                // be null if Index.deserialize itself threw — that
+                // is a payload-corruption scenario, log without
+                // identity).
+                LOGGER.log(Level.SEVERE,
+                        "rebuild failed for {0}; engine entering FAILED state — "
+                                + "tailer will refuse to advance past this entry until restart",
+                        index != null
+                                ? (index.tablespace + "." + index.table + "." + index.name)
+                                : "<undeserializable index>");
+                engineStatus = EngineStatus.FAILED;
+            }
         }
     }
 

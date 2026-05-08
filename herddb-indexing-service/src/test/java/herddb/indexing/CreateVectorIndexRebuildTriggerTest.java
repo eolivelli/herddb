@@ -288,6 +288,128 @@ public class CreateVectorIndexRebuildTriggerTest {
     }
 
     @Test
+    public void rebuildErrorFromAddVector_putsEngineInFailedState() throws Exception {
+        // BLOCK-fix (round-2): pre-round-2, an Error (e.g.
+        // OutOfMemoryError) thrown from the rebuilder bypassed
+        // processEntry's catch(Exception) — the tailer thread died
+        // but the engine was never marked FAILED, so on a future
+        // restart the watermark could still appear ACTIVE. Round-2
+        // wraps triggerRebuildIfNeeded in a try/finally that sets
+        // FAILED on every non-success path, including Errors.
+        Table table = createTable();
+        Index index = createIndexWithRebuild();
+        Record rec = RecordSerializer.makeRecord(table,
+                "pk", "key0", "vec", new float[]{1f, 2f, 3f});
+        CountingFakeDsm dsm = new CountingFakeDsm(REBUILD_LSN,
+                Collections.singletonList(rec));
+
+        IndexingServiceEngine engine = buildEngineWithFailingStore(dsm);
+        try {
+            LogSequenceNumber createTableLsn = new LogSequenceNumber(1, 1);
+            engine.processEntryForTest(createTableLsn,
+                    LogEntryFactory.createTable(table, null));
+            // The Error escapes processEntry's catch(Exception). The
+            // test must accept the Error as the call's outcome — the
+            // load-bearing assertions are AFTER the catch (engine
+            // FAILED + watermark stuck), which prove the
+            // try/finally inside triggerRebuildIfNeeded ran the
+            // FAILED escalation BEFORE the Error propagated.
+            try {
+                engine.processEntryForTest(new LogSequenceNumber(1, 2),
+                        LogEntryFactory.createIndex(index, null));
+                fail("Error from addVector must propagate past processEntry's catch(Exception)");
+            } catch (Error expected) {
+                assertTrue("Error message should match the injection",
+                        expected.getMessage() != null
+                                && expected.getMessage().contains("simulated"));
+            }
+
+            assertEquals("Error from addVector must put engine into FAILED state",
+                    IndexingServiceEngine.EngineStatus.FAILED, engine.getEngineStatus());
+            assertEquals("watermark must NOT advance past CREATE_INDEX after Error",
+                    createTableLsn, engine.getLastProcessedLsn());
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    public void rebuildPreflightStateException_putsEngineInFailedState() throws Exception {
+        // Drive a CREATE_INDEX entry whose embedded Index references
+        // a table the SchemaTracker has NEVER seen. triggerRebuildIfNeeded
+        // hits its "table is not tracked" pre-flight throw. Without
+        // round-2's catch-all FAILED escalation, the exception would
+        // propagate through processEntry's catch(Exception) and the
+        // engine would stay ACTIVE — silent data loss after the next
+        // successful entry advances the watermark.
+        Index phantomIndex = Index.builder()
+                .name("vidx")
+                .table("phantomtable")  // SchemaTracker never sees a CREATE_TABLE for this
+                .tablespace("default")
+                .type(Index.TYPE_VECTOR)
+                .column("vec", ColumnTypes.FLOATARRAY)
+                .property(VectorIndexManager.PROP_REBUILD, "true")
+                .property(VectorIndexManager.PROP_REBUILD_LSN,
+                        VectorIndexManager.encodeRebuildLsn(REBUILD_LSN))
+                .build();
+
+        CountingFakeDsm dsm = new CountingFakeDsm(REBUILD_LSN, Collections.emptyList());
+        IndexingServiceEngine engine = buildEngine(dsm);
+        try {
+            // Apply a CREATE_TABLE for the REAL table so the engine
+            // looks normal. We deliberately do NOT register
+            // phantomtable, so triggerRebuildIfNeeded's "table is not
+            // tracked" pre-flight throw fires.
+            Table realTable = createTable();
+            LogSequenceNumber realCreateLsn = new LogSequenceNumber(1, 1);
+            engine.processEntryForTest(realCreateLsn,
+                    LogEntryFactory.createTable(realTable, null));
+            assertEquals("real CREATE_TABLE must advance the watermark",
+                    realCreateLsn, engine.getLastProcessedLsn());
+
+            engine.processEntryForTest(new LogSequenceNumber(1, 2),
+                    LogEntryFactory.createIndex(phantomIndex, null));
+
+            assertEquals("pre-flight failure must put engine into FAILED state",
+                    IndexingServiceEngine.EngineStatus.FAILED, engine.getEngineStatus());
+            assertEquals("watermark must NOT advance past phantom CREATE_INDEX",
+                    realCreateLsn, engine.getLastProcessedLsn());
+        } finally {
+            engine.close();
+        }
+    }
+
+    private IndexingServiceEngine buildEngineWithFailingStore(CountingFakeDsm dsm) throws Exception {
+        Path logDir = folder.newFolder("log").toPath();
+        Path dataDir = folder.newFolder("data").toPath();
+        Properties props = new Properties();
+        props.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "memory");
+        IndexingServerConfiguration config = new IndexingServerConfiguration(props);
+        IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, config);
+        MemoryMetadataStorageManager memMeta = new MemoryMetadataStorageManager();
+        memMeta.start();
+        memMeta.ensureDefaultTableSpace("local", "local", 0, 1);
+        engine.setMetadataStorageManager(memMeta);
+        engine.setDataStorageManager(dsm);
+        // Inject a vector store factory that returns stores whose
+        // addVector throws an Error — simulates OutOfMemoryError
+        // from jvector graph allocation. The Error must propagate
+        // through processEntry's catch(Exception) (which does NOT
+        // catch Error) but triggerRebuildIfNeeded's try/finally
+        // must still set FAILED before the Error escapes.
+        engine.setVectorStoreFactory((indexName, tableName, vectorColumnName,
+                                       dataDirectory, indexProperties) ->
+                new InMemoryVectorStore(vectorColumnName) {
+                    @Override
+                    public void addVector(herddb.utils.Bytes pk, float[] vector) {
+                        throw new Error("simulated OutOfMemoryError from rebuild");
+                    }
+                });
+        engine.start();
+        return engine;
+    }
+
+    @Test
     public void snapshotReplayWithRebuildTrueIndex_doesNotFireRebuilder() throws Exception {
         // Snapshot replay path: the engine starts with a non-empty
         // WatermarkSnapshot containing an index with rebuild=true.

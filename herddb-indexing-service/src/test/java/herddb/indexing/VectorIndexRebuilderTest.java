@@ -304,9 +304,14 @@ public class VectorIndexRebuilderTest {
             // contaminated.
             Thread.interrupted();
         }
-        assertTrue("end-time must be recorded even on interrupt",
-                metrics.lastRebuildEndTimeMillis == 0
-                        || metrics.lastRebuildEndTimeMillis > 0);
+        // Issue #471 round-2 fix: start-time and end-time must BOTH
+        // be recorded for the interrupt-before-start path so the
+        // gauge promise "start > 0 && end >= start ⇔ no rebuild in
+        // flight" holds uniformly.
+        assertTrue("start time must be recorded even on interrupt-before-start",
+                metrics.lastRebuildStartTimeMillis > 0);
+        assertTrue("end time must be at least start time even on interrupt",
+                metrics.lastRebuildEndTimeMillis >= metrics.lastRebuildStartTimeMillis);
         // The DSM scan never started.
         assertEquals(0L, metrics.recordsScanned.sum());
     }
