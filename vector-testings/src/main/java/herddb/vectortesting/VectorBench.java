@@ -532,6 +532,76 @@ public class VectorBench {
                 statusThread.start();
             }
 
+            // Optional during-ingestion query thread: every runQueriesDuringIngestionPeriodSeconds,
+            // run the full query workload via a dedicated QueryWorker on a fresh autocommit
+            // connection (independent of all ingest workers). Each round uses a single-threaded
+            // executor so the round completes before the next sleep begins.
+            // Recall is intentionally not computed here because the ground-truth file covers the
+            // complete dataset, not the partially ingested state.
+            Thread duringIngestionQueryThread = null;
+            if (config.runQueriesDuringIngestion) {
+                final long queryPeriodMs = (long) config.runQueriesDuringIngestionPeriodSeconds * 1000L;
+                final List<float[]> capturedQueryVectors = queryVectors;
+                final long capturedIngestStart = ingestStart;
+                duringIngestionQueryThread = new Thread(() -> {
+                    long nextRun = System.currentTimeMillis() + queryPeriodMs;
+                    int roundNumber = 0;
+                    while (!ingestDone.get()) {
+                        try {
+                            long now = System.currentTimeMillis();
+                            if (now < nextRun) {
+                                Thread.sleep(Math.min(500L, nextRun - now));
+                                continue;
+                            }
+                            nextRun = now + queryPeriodMs;
+                            roundNumber++;
+
+                            // Delegate to QueryWorker with:
+                            //   tolerateShortResults=true  — graph partially built, short results OK
+                            //   allResults=null            — no recall storage needed
+                            //   rate limiter=() -> null    — no throttling for sampling rounds
+                            MetricsCollector roundMetrics = new MetricsCollector();
+                            AtomicReference<String> roundStatus = new AtomicReference<>("");
+                            QueryWorker roundWorker = new QueryWorker(
+                                    config, capturedQueryVectors,
+                                    0, capturedQueryVectors.size(),
+                                    roundMetrics,
+                                    null,       // allResults=null: discard per-query id lists
+                                    roundStatus,
+                                    () -> null, // no rate limiter for sampling rounds
+                                    true);      // tolerateShortResults
+                            Thread roundThread = new Thread(roundWorker,
+                                    "vector-bench-ingest-query-round-" + roundNumber);
+                            roundThread.start();
+                            roundThread.join();
+
+                            MetricsCollector.Stats s = roundMetrics.computeStatsUncached();
+                            long queriesThisRound = roundMetrics.getCount();
+                            double elapsed = (System.nanoTime() - capturedIngestStart) / 1e9;
+                            double qps = elapsed > 0 ? queriesThisRound / elapsed : 0.0;
+                            LinkedHashMap<String, Object> fields = new LinkedHashMap<>();
+                            fields.put("round", roundNumber);
+                            fields.put("queries_run", queriesThisRound);
+                            fields.put("qps", round2(qps));
+                            fields.put("latency_mean_ms", round2(s.meanNanos() / 1e6));
+                            fields.put("latency_p50_ms", round2(s.p50Nanos() / 1e6));
+                            fields.put("latency_p99_ms", round2(s.p99Nanos() / 1e6));
+                            fields.put("latency_max_ms", round2(s.maxNanos() / 1e6));
+                            // Recall is intentionally omitted: the ground-truth file is for the
+                            // full dataset; computing recall against a partial ingest would be
+                            // misleading (and would require knowing the partial ground truth).
+                            fields.put("recall", "N/A (ingestion in progress)");
+                            out.status("ingest_query", elapsed, fields);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                }, "vector-bench-ingest-query");
+                duringIngestionQueryThread.setDaemon(true);
+                duringIngestionQueryThread.start();
+            }
+
             long vectorsEmitted = 0;
             try (DatasetLoader.VectorStream stream = loader.streamBaseVectors(config.resumeFrom, toIngest)) {
                 for (float[] vec : stream) {
@@ -590,6 +660,9 @@ public class VectorBench {
             progressThread.join();
             if (statusThread != null) {
                 statusThread.join();
+            }
+            if (duringIngestionQueryThread != null) {
+                duringIngestionQueryThread.join();
             }
             double ingestSecs = (System.nanoTime() - ingestStart) / 1e9;
             out.phaseDone("ingest", ingestSecs);
