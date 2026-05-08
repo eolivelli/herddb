@@ -683,6 +683,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
     private final AtomicLong totalCheckpointCount = new AtomicLong(0);
     private final AtomicLong totalFusedPQCheckpointCount = new AtomicLong(0);
     /**
+     * Wall-clock nanoseconds the most recent {@code atomicSwapCompactionResult}
+     * call held {@code stateLock.writeLock()} (issue #462). Diagnostic only — used
+     * by the lock-progress regression tests to assert the writeLock window stays
+     * tiny (≪ persist duration) so concurrent searches are not blocked behind
+     * the compaction-swap critical section.
+     */
+    private final AtomicLong lastCompactionSwapWriteLockNanos = new AtomicLong(0);
+    /**
+     * Wall-clock nanoseconds the most recent Phase C of
+     * {@code doCheckpointFusedPQThreePhase} held {@code stateLock.writeLock()}
+     * (issue #462). Diagnostic only — used by the lock-progress regression
+     * tests to assert the writeLock window stays tiny (≪ pending-deletes-apply
+     * duration) so concurrent searches are not blocked behind Phase C.
+     */
+    private final AtomicLong lastPhaseCWriteLockNanos = new AtomicLong(0);
+    /**
      * Number of times {@link #doCheckpointUnderLock} skipped a cycle because
      * the min-live-vectors gate tripped and the max-deferral bound had not
      * yet elapsed. Incremented only on the deferral path — not on the
@@ -1154,6 +1170,60 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /** Sets a hook that runs during Phase B of checkpoint. For testing. */
     public void setCheckpointPhaseBHook(Runnable hook) {
         this.checkpointPhaseBHook = hook;
+    }
+
+    /**
+     * Test hook fired inside {@code atomicSwapCompactionResult} (issue #462)
+     * after Stage 1 (validate + build {@code newSegments} + queue
+     * pending-deletes) finishes and BEFORE Stage 2 ({@code
+     * persistIndexStatusMultiSegment}). Lets unit tests assert the
+     * pre-persist invariant: {@code currentIndexStatusGeneration} unchanged,
+     * {@code this.segments} still references the OLD list, {@code
+     * mergedOutput.generation} already set to {@code oldGen + 1}.
+     * Hook runs under {@code checkpointLock} but NOT under
+     * {@code stateLock.writeLock()}.
+     */
+    private volatile Runnable atomicSwapPostBuildHook;
+
+    /** Sets the test hook fired between Stage 1 and Stage 2 of
+     * {@code atomicSwapCompactionResult}. For testing. */
+    public void setAtomicSwapPostBuildHookForTest(Runnable hook) {
+        this.atomicSwapPostBuildHook = hook;
+    }
+
+    /**
+     * Test hook fired inside {@code atomicSwapCompactionResult} (issue #462)
+     * after Stage 2 ({@code persistIndexStatusMultiSegment} returned
+     * successfully) and BEFORE Stage 3 (writeLock-protected
+     * publish + memory-counter swap). Lets unit tests assert the
+     * post-persist / pre-publish invariant: {@code
+     * currentIndexStatusGeneration} is now bumped, but {@code this.segments}
+     * still references the OLD list and {@code stateLock.isWriteLocked()
+     * == false}. Hook runs under {@code checkpointLock} but NOT under
+     * {@code stateLock.writeLock()}.
+     */
+    private volatile Runnable atomicSwapPostPersistHook;
+
+    /** Sets the test hook fired between Stage 2 and Stage 3 of
+     * {@code atomicSwapCompactionResult}. For testing. */
+    public void setAtomicSwapPostPersistHookForTest(Runnable hook) {
+        this.atomicSwapPostPersistHook = hook;
+    }
+
+    /**
+     * Test hook fired inside Phase C of {@code doCheckpointFusedPQThreePhase}
+     * (issue #462) after the pending-checkpoint-deletes apply finishes and
+     * BEFORE the Stage-2 writeLock acquisition. Lets the lock-progress
+     * regression test inject a "search now" probe at the precise window where
+     * the pre-fix code was holding the writeLock for seconds. Hook runs under
+     * {@code checkpointLock} but NOT under {@code stateLock.writeLock()}.
+     */
+    private volatile Runnable phaseCPostDeletesApplyHook;
+
+    /** Sets the test hook fired after Phase C's pending-deletes apply.
+     * For testing. */
+    public void setPhaseCPostDeletesApplyHookForTest(Runnable hook) {
+        this.phaseCPostDeletesApplyHook = hook;
     }
 
     // -------------------------------------------------------------------------
@@ -2403,6 +2473,43 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * {@code vector.index.compaction.maxBytes} of remote storage per
      * occurrence — and aborts are by-design steady-state behaviour of the
      * pressure-driven local fallback when the optimizer races the IS.
+     *
+     * <p><b>Three-stage local protocol (issue #462).</b> Inside the
+     * {@code checkpointLock}, the local IndexStatus persist + in-memory swap
+     * is split so the slow I/O does not hold {@code stateLock.writeLock()}.
+     * Without this split a single {@code writeLock} window spans
+     * {@link #persistIndexStatusMultiSegment} (local fsync + remote
+     * shared-metadata PUT of every segment's metadata) — at 18&nbsp;K
+     * segments that's seconds, long enough to starve concurrent searches
+     * waiting on {@code stateLock.readLock()}.
+     *
+     * <ol>
+     *   <li><b>Stage 1 (no writeLock).</b> Validate that every input is still
+     *   in {@code segments} (under {@code checkpointLock} no other writer can
+     *   be modifying it). Build {@code newSegments}; stamp
+     *   {@code mergedOutput.generation = currentIndexStatusGeneration + 1}
+     *   so the in-memory state matches what we are about to persist. Queue
+     *   inputs for retention-aware deletion (CopyOnWriteArrayList — thread
+     *   safe).</li>
+     *
+     *   <li><b>Stage 2 (no writeLock).</b> Run
+     *   {@link #persistIndexStatusMultiSegment} — the slow part. Lock-free
+     *   readers continue to see the OLD {@code this.segments} via the volatile
+     *   field; their search results are eventually consistent. {@code
+     *   currentIndexStatusGeneration} is bumped at the end of this call.</li>
+     *
+     *   <li><b>Stage 3 (writeLock — microseconds).</b> Atomically: register
+     *   the merged output's memory estimate, publish
+     *   {@code this.segments = newSegments}, unregister the inputs' memory
+     *   estimates, set {@code dirty}.</li>
+     * </ol>
+     *
+     * <p>Failure handling is preserved verbatim from the prior single-window
+     * implementation: {@code queueSegmentPendingDelete} runs <em>before</em>
+     * the persist (Stage 1), so a Stage-2 throw leaves {@code pendingDeletes}
+     * populated exactly as today and the in-memory {@code segments} is never
+     * republished. {@link #runCompactionCycle}'s existing {@code catch}
+     * blocks observe the failure and record it.
      */
     private void atomicSwapCompactionResult(List<VectorSegment> inputs,
                                             VectorSegment mergedOutput,
@@ -2488,81 +2595,92 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         checkpointLock.lock();
         try {
+            // ---------- STAGE 1 — validate + build (no writeLock). ----------
+            // checkpointLock is the outermost serialiser of segments mutations,
+            // so the volatile read of `this.segments` is stable for the
+            // duration of this method.
+            List<VectorSegment> current = this.segments;
+            Set<Integer> currentIds = new java.util.HashSet<>(current.size() * 2);
+            for (VectorSegment s : current) {
+                currentIds.add(s.segmentId);
+            }
+            for (VectorSegment in : inputs) {
+                if (!currentIds.contains(in.segmentId)) {
+                    // In-memory drift — undo the registry stage if any
+                    // and queue the merged output's bytes for cleanup so
+                    // they don't leak. Without this branch the abort path
+                    // would leak up to vector.index.compaction.maxBytes
+                    // of remote storage per occurrence.
+                    if (publisherSnapshot != null && stagedInfo != null) {
+                        try {
+                            publisherSnapshot.unstage(stagedInfo);
+                        } catch (RuntimeException ignored) {
+                            // best-effort — reconcile-on-restart will sweep
+                        }
+                    }
+                    queueMergedOutputForDeletion(mergedOutput);
+                    throw new VectorIndexCompactor.CompactionException(
+                            VectorIndexCompactor.FailureReason.ABORTED_INPUT_GONE,
+                            "input segment " + in.segmentId + " disappeared from segment list");
+                }
+            }
+
+            Set<Integer> inputIds = new java.util.HashSet<>(inputs.size() * 2);
+            for (VectorSegment in : inputs) {
+                inputIds.add(in.segmentId);
+            }
+            List<VectorSegment> newSegments =
+                    new java.util.concurrent.CopyOnWriteArrayList<>();
+            for (VectorSegment s : current) {
+                if (!inputIds.contains(s.segmentId)) {
+                    newSegments.add(s);
+                }
+            }
+            if (mergedOutput != null) {
+                // Fresh generation will be assigned by
+                // persistIndexStatusMultiSegment; we set it now so the
+                // in-memory state matches what we persist.
+                mergedOutput.generation = currentIndexStatusGeneration.get() + 1;
+                newSegments.add(mergedOutput);
+            }
+
+            // Queue inputs for retention-aware deletion. Same ordering as the
+            // pre-#462 implementation (queue BEFORE persist) so the failure
+            // semantics are unchanged.
+            for (VectorSegment in : inputs) {
+                queueSegmentPendingDelete(in, vectorIndexCompactionRetentionMs);
+            }
+
+            Runnable postBuildHook = atomicSwapPostBuildHook;
+            if (postBuildHook != null) {
+                postBuildHook.run();
+            }
+
+            // ---------- STAGE 2 — persist (no writeLock; the slow I/O). ----------
+            // checkpointLock is held; concurrent compaction/checkpoint cannot
+            // run. Concurrent searches read the OLD this.segments via the
+            // volatile field — eventually consistent until Stage 3 publishes.
+            List<VectorSegment> allSealedForPersist = new ArrayList<>(newSegments);
+            persistIndexStatusMultiSegment(
+                    allSealedForPersist,
+                    java.util.Collections.emptyList(),
+                    java.util.Collections.emptyList(),
+                    LogSequenceNumber.START_OF_TIME);
+
+            Runnable postPersistHook = atomicSwapPostPersistHook;
+            if (postPersistHook != null) {
+                postPersistHook.run();
+            }
+
+            // ---------- STAGE 3 — atomic publish (writeLock for ~µs). ----------
+            // Issue #455: keep the on-disk-segment memory counter in sync
+            // with the segments-list swap. The register/publish/unregister
+            // triple runs under one writeLock so the counter and the
+            // segments list flip together; concurrent addVector readers
+            // (which take the readLock) cannot observe a half-updated state.
+            long stage3Start = System.nanoTime();
             stateLock.writeLock().lock();
             try {
-                // Validate every input is still in the segment list.
-                List<VectorSegment> current = segments;
-                Set<Integer> currentIds = new java.util.HashSet<>();
-                for (VectorSegment s : current) {
-                    currentIds.add(s.segmentId);
-                }
-                for (VectorSegment in : inputs) {
-                    if (!currentIds.contains(in.segmentId)) {
-                        // In-memory drift — undo the registry stage if any
-                        // and queue the merged output's bytes for cleanup so
-                        // they don't leak. The pre-existing version of this
-                        // branch (before the registry stage was added) only
-                        // had the empty rebuild.orphanPaths to fall back on
-                        // — that was a latent leak that became reachable
-                        // far more often once the new registry-revalidate
-                        // abort path landed alongside it.
-                        if (publisherSnapshot != null && stagedInfo != null) {
-                            try {
-                                publisherSnapshot.unstage(stagedInfo);
-                            } catch (RuntimeException ignored) {
-                                // best-effort — reconcile-on-restart will sweep
-                            }
-                        }
-                        queueMergedOutputForDeletion(mergedOutput);
-                        throw new VectorIndexCompactor.CompactionException(
-                                VectorIndexCompactor.FailureReason.ABORTED_INPUT_GONE,
-                                "input segment " + in.segmentId + " disappeared from segment list");
-                    }
-                }
-
-                // Build new segment list.
-                List<VectorSegment> newSegments =
-                        new java.util.concurrent.CopyOnWriteArrayList<>();
-                Set<Integer> inputIds = new java.util.HashSet<>();
-                for (VectorSegment in : inputs) {
-                    inputIds.add(in.segmentId);
-                }
-                for (VectorSegment s : current) {
-                    if (!inputIds.contains(s.segmentId)) {
-                        newSegments.add(s);
-                    }
-                }
-                if (mergedOutput != null) {
-                    // Fresh generation will be assigned by
-                    // persistIndexStatusMultiSegment; we set it now so
-                    // the in-memory state matches what we persist.
-                    mergedOutput.generation = currentIndexStatusGeneration.get() + 1;
-                    newSegments.add(mergedOutput);
-                }
-
-                // Queue inputs for retention-aware deletion.
-                for (VectorSegment in : inputs) {
-                    queueSegmentPendingDelete(in, vectorIndexCompactionRetentionMs);
-                }
-
-                // Publish the new IndexStatus. Compaction reuses
-                // persistIndexStatusMultiSegment by passing sealed=all
-                // kept segments and newSegmentResults=empty (the merged
-                // output is already a VectorSegment, not a
-                // SegmentWriteResult).
-                List<VectorSegment> allSealedForPersist = new ArrayList<>(newSegments);
-                persistIndexStatusMultiSegment(
-                        allSealedForPersist,
-                        java.util.Collections.emptyList(),
-                        java.util.Collections.emptyList(),
-                        LogSequenceNumber.START_OF_TIME);
-
-                // Issue #455: keep the on-disk-segment memory counter in sync
-                // with the segments-list swap.  Capture the mergedOutput
-                // snapshot BEFORE publishing newSegments so the counter and
-                // the segments list flip together; inputs are unregistered
-                // immediately after the swap (their close() further down
-                // releases pkData / BLink).
                 if (mergedOutput != null) {
                     registerSegmentMemoryEstimate(mergedOutput);
                 }
@@ -2574,6 +2692,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
             } finally {
                 stateLock.writeLock().unlock();
             }
+            lastCompactionSwapWriteLockNanos.set(System.nanoTime() - stage3Start);
+
             // Close the inputs OUTSIDE the write lock: the searchers that
             // held a reference dropped it when we swapped `segments`.
             for (VectorSegment in : inputs) {
@@ -4107,7 +4227,65 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.provisionalMultipartFiles = null;
         consecutiveCheckpointFailures.set(0);
 
-        // Phase C: swap + cleanup (brief write lock)
+        // ---------- Phase C — two-stage protocol (issue #462). ----------
+        //
+        // Stage 1 (no writeLock; under checkpointLock):
+        //   - Build newSegments (sealed + mergeable + preloaded), reset their
+        //     dirty flags.
+        //   - Apply pendingCheckpointDeletes — O(P × N) at scale, the slow part.
+        //
+        // Stage 2 (writeLock for ~µs):
+        //   - Close snapshotShards' builders (no concurrent search references
+        //     them: the writeLock excludes readers; we also clear
+        //     frozenShards/deferredShards before releasing).
+        //   - Register memory for preloadedSegments.
+        //   - Publish this.segments = newSegments.
+        //   - Update nextNodeId, log summary, restore deferred → liveShards.
+        //   - Clear frozenShards / deferredShards / pendingCheckpointDeletes.
+        //
+        // Concurrency invariants the Stage-1 lock-free deletes-apply relies on:
+        //   - checkpointLock is held → no concurrent checkpoint/compaction
+        //     mutates `segments`.
+        //   - seg.deletePk is concurrent-safe with concurrent search readers
+        //     (BLink.delete is internally synchronized; offsets[ord]=-1 is
+        //     benign for readers, who skip ord<0 in acceptBits and
+        //     getPkForOrdinal).
+        //   - seg.deletePk is concurrent-safe with concurrent removeVector
+        //     callers (which only take readLock): BLink.delete returns the
+        //     ordinal to exactly one caller; the racing caller observes null
+        //     and skips the offsets/liveCount mutations, so liveCount is
+        //     decremented exactly once.
+
+        // Stage 1: build + apply pending deletes.
+        List<VectorSegment> newSegments = new java.util.concurrent.CopyOnWriteArrayList<>();
+        for (VectorSegment sealed : sealedSegments) {
+            sealed.dirty = false;
+            newSegments.add(sealed);
+        }
+        for (VectorSegment mergeable : mergeableSegments) {
+            mergeable.dirty = false;
+            newSegments.add(mergeable);
+        }
+        newSegments.addAll(preloadedSegments);
+
+        PagedPkSet pending = this.pendingCheckpointDeletes;
+        if (pending != null) {
+            pending.forEach(pk -> {
+                for (VectorSegment seg : newSegments) {
+                    if (seg.deletePk(pk)) {
+                        return;
+                    }
+                }
+            });
+        }
+
+        Runnable postDeletesApplyHook = phaseCPostDeletesApplyHook;
+        if (postDeletesApplyHook != null) {
+            postDeletesApplyHook.run();
+        }
+
+        // Stage 2: writeLock for the atomic state transition.
+        long stage2Start = System.nanoTime();
         stateLock.writeLock().lock();
         try {
             for (LiveGraphShard shard : snapshotShards) {
@@ -4118,31 +4296,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         // ignore
                     }
                 }
-            }
-
-            List<VectorSegment> newSegments = new java.util.concurrent.CopyOnWriteArrayList<>();
-            // Preserve existing sealed segments
-            for (VectorSegment sealed : sealedSegments) {
-                sealed.dirty = false;
-                newSegments.add(sealed);
-            }
-            // Preserve existing mergeable segments (old compaction targets)
-            for (VectorSegment mergeable : mergeableSegments) {
-                mergeable.dirty = false;
-                newSegments.add(mergeable);
-            }
-            // Add newly written segments from this checkpoint
-            newSegments.addAll(preloadedSegments);
-
-            PagedPkSet pending = this.pendingCheckpointDeletes;
-            if (pending != null) {
-                pending.forEach(pk -> {
-                    for (VectorSegment seg : newSegments) {
-                        if (seg.deletePk(pk)) {
-                            return;
-                        }
-                    }
-                });
             }
 
             // Issue #455: sealedSegments + mergeableSegments together cover
@@ -4201,6 +4354,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             CountDownLatch latch = this.checkpointPhaseComplete;
             this.checkpointPhaseComplete = null;
             stateLock.writeLock().unlock();
+            lastPhaseCWriteLockNanos.set(System.nanoTime() - stage2Start);
             if (latch != null) {
                 latch.countDown();
             }
@@ -6646,6 +6800,28 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
     public long getLastCheckpointVectorsProcessed() {
         return lastCheckpointVectorsProcessed.get();
+    }
+
+    /**
+     * Returns the wall-clock nanoseconds the most recent
+     * {@code atomicSwapCompactionResult} call held {@code stateLock.writeLock()}
+     * (issue #462). Used by the lock-progress regression tests to assert the
+     * writeLock window stays tiny (≪ persist duration) so concurrent searches
+     * are not blocked behind the compaction-swap critical section.
+     */
+    public long getLastCompactionSwapWriteLockNanos() {
+        return lastCompactionSwapWriteLockNanos.get();
+    }
+
+    /**
+     * Returns the wall-clock nanoseconds the most recent Phase C of
+     * {@code doCheckpointFusedPQThreePhase} held {@code stateLock.writeLock()}
+     * (issue #462). Used by the lock-progress regression tests to assert the
+     * writeLock window stays tiny (≪ pending-deletes-apply duration) so
+     * concurrent searches are not blocked behind Phase C.
+     */
+    public long getLastPhaseCWriteLockNanos() {
+        return lastPhaseCWriteLockNanos.get();
     }
 
     public long getLiveVectorsMemoryBytes() {
