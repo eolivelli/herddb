@@ -32,6 +32,7 @@ import herddb.remote.storage.InMemoryBlockCacheObjectStorage;
 import herddb.remote.storage.LocalObjectStorage;
 import herddb.remote.storage.ObjectStorage;
 import herddb.remote.storage.S3ObjectStorage;
+import herddb.remote.storage.SlabCacheFileStore;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
@@ -112,6 +113,18 @@ public class RemoteFileServer implements AutoCloseable {
      * storage, disk-cache index writer). Defaults to {@code ioThreads}.
      */
     public static final String CONFIG_METADATA_EXECUTOR_THREADS = "fileserver.metadata.executor.threads";
+
+    // -- Slab disk cache config (issue #475) -----------------------------------------
+    /** Config key: master switch for the slab disk-cache layout (default: enabled). */
+    public static final String CONFIG_CACHE_SLAB_ENABLED = "cache.slab.enabled";
+    /** Config key: cell size of the small slab tier in bytes (default: 64 KiB). */
+    public static final String CONFIG_CACHE_SLAB_SMALL_CELL_BYTES = "cache.slab.small.cell.bytes";
+    /** Config key: fraction of {@code cache.max.bytes} given to the small slab tier (default: 0.25). */
+    public static final String CONFIG_CACHE_SLAB_SMALL_FRACTION = "cache.slab.small.fraction";
+    /** Config key: cell size of the large slab tier in bytes (default: {@code block.size}, i.e. 4 MiB). */
+    public static final String CONFIG_CACHE_SLAB_LARGE_CELL_BYTES = "cache.slab.large.cell.bytes";
+    /** Config key: fraction of {@code cache.max.bytes} given to the large slab tier (default: 0.75). */
+    public static final String CONFIG_CACHE_SLAB_LARGE_FRACTION = "cache.slab.large.fraction";
 
     private final String host;
     private final int port;
@@ -517,14 +530,58 @@ public class RemoteFileServer implements AutoCloseable {
 
         S3ObjectStorage s3Storage = new S3ObjectStorage(s3Client, bucket, s3Prefix, statsLogger);
         try {
+            CachingObjectStorage.SlabConfig slabConfig = buildSlabConfig(cacheMaxBytes);
             CachingObjectStorage cache = new CachingObjectStorage(
-                    s3Storage, cacheDirPath, metadataExecutor, cacheMaxBytes);
+                    s3Storage, cacheDirPath, metadataExecutor, cacheMaxBytes, slabConfig);
             diskCache = cache;
             return cache;
         } catch (IOException e) {
             s3Client.close();
             throw e;
         }
+    }
+
+    /**
+     * Builds the slab-tier configuration from the server {@code config} (issue #475).
+     * Defaults: 64 KiB small cells getting 25% of the budget, 4 MiB (or {@link #blockSize})
+     * large cells getting 75%. Setting {@code cache.slab.enabled=false} reverts to the
+     * legacy per-file disk-cache layout.
+     */
+    private CachingObjectStorage.SlabConfig buildSlabConfig(long totalBudgetBytes) {
+        boolean slabEnabled = Boolean.parseBoolean(
+                config.getProperty(CONFIG_CACHE_SLAB_ENABLED, "true"));
+        if (!slabEnabled) {
+            LOGGER.log(Level.INFO, "Slab disk cache layout disabled — using legacy per-file path.");
+            return CachingObjectStorage.SlabConfig.disabled();
+        }
+        int smallCell = Integer.parseInt(
+                config.getProperty(CONFIG_CACHE_SLAB_SMALL_CELL_BYTES, "65536"));
+        double smallFraction = Double.parseDouble(
+                config.getProperty(CONFIG_CACHE_SLAB_SMALL_FRACTION, "0.25"));
+        // buildSlabConfig is called from buildS3ObjectStorage, which runs BEFORE
+        // start() assigns this.blockSize. Read block.size from config directly so the
+        // large-cell default tracks the configured block size.
+        int configuredBlockSize = Integer.parseInt(
+                config.getProperty("block.size", String.valueOf(DEFAULT_BLOCK_SIZE)));
+        int largeCellDefault = configuredBlockSize > 0 ? configuredBlockSize : DEFAULT_BLOCK_SIZE;
+        int largeCell = Integer.parseInt(
+                config.getProperty(CONFIG_CACHE_SLAB_LARGE_CELL_BYTES, String.valueOf(largeCellDefault)));
+        double largeFraction = Double.parseDouble(
+                config.getProperty(CONFIG_CACHE_SLAB_LARGE_FRACTION, "0.75"));
+        if (smallCell <= 0 || largeCell <= 0) {
+            throw new IllegalArgumentException("slab cell size must be > 0; got smallCell="
+                    + smallCell + " largeCell=" + largeCell);
+        }
+        if (smallFraction < 0 || largeFraction < 0 || smallFraction + largeFraction > 1.0001d) {
+            throw new IllegalArgumentException("slab fractions must be >= 0 and sum <= 1.0; got smallFraction="
+                    + smallFraction + " largeFraction=" + largeFraction);
+        }
+        long smallTier = (long) (totalBudgetBytes * smallFraction);
+        long largeTier = (long) (totalBudgetBytes * largeFraction);
+        LOGGER.log(Level.INFO,
+                "Slab disk cache: smallCell={0} smallTier={1} largeCell={2} largeTier={3}",
+                new Object[]{smallCell, smallTier, largeCell, largeTier});
+        return new CachingObjectStorage.SlabConfig(true, smallCell, smallTier, largeCell, largeTier);
     }
 
     /**
@@ -715,6 +772,76 @@ public class RemoteFileServer implements AutoCloseable {
             @Override
             public Long getSample() {
                 return cache.getMissBytes();
+            }
+        });
+        // Slab tier metrics (issue #475) — exposed under the same rfs_disk_cache_*
+        // namespace so the existing Grafana dashboard can pick them up alongside
+        // the legacy hit/miss/eviction counters. When the slab layout is disabled
+        // (cache.slab.enabled=false), the slab getters return null and the gauges
+        // simply report zero — keeping the dashboard rendering benign.
+        registerSlabGauges(scope, "slab_small", cache.getSmallSlab());
+        registerSlabGauges(scope, "slab_large", cache.getLargeSlab());
+        scope.registerGauge("slab_fallback_files", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.getFallbackFileCount();
+            }
+        });
+        scope.registerGauge("slab_fallback_bytes", new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return cache.getFallbackBytes();
+            }
+        });
+    }
+
+    /**
+     * Registers the eight per-tier gauges for one slab store ({@code slab_small} or
+     * {@code slab_large}). When {@code slab} is null (slab layout disabled), the
+     * gauges still register but report zero — the dashboard renders cleanly either
+     * way.
+     */
+    private static void registerSlabGauges(StatsLogger scope, String tierName,
+                                           SlabCacheFileStore slab) {
+        registerLongGauge(scope, tierName + "_cell_bytes",
+                () -> slab == null ? 0L : (long) slab.cellSize());
+        registerLongGauge(scope, tierName + "_total_cells",
+                () -> slab == null ? 0L : (long) slab.totalCells());
+        registerLongGauge(scope, tierName + "_live_cells",
+                () -> slab == null ? 0L : (long) slab.liveCells());
+        registerLongGauge(scope, tierName + "_free_cells",
+                () -> slab == null ? 0L : (long) slab.freeCells());
+        registerLongGauge(scope, tierName + "_bytes_in_use",
+                () -> slab == null ? 0L : slab.bytesInUse());
+        registerLongGauge(scope, tierName + "_admit_count",
+                () -> slab == null ? 0L : slab.admitCount());
+        registerLongGauge(scope, tierName + "_admit_full_count",
+                () -> slab == null ? 0L : slab.admitFullCount());
+        registerLongGauge(scope, tierName + "_evict_count",
+                () -> slab == null ? 0L : slab.evictCount());
+    }
+
+    private static void registerLongGauge(StatsLogger scope, String name,
+                                          java.util.function.LongSupplier supplier) {
+        scope.registerGauge(name, new Gauge<Long>() {
+            @Override
+            public Long getDefaultValue() {
+                return 0L;
+            }
+
+            @Override
+            public Long getSample() {
+                return supplier.getAsLong();
             }
         });
     }

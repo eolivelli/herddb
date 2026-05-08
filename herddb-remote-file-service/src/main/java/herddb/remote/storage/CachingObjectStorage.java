@@ -24,9 +24,9 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.RemovalListener;
 import com.github.benmanes.caffeine.cache.stats.CacheStats;
-import com.google.common.util.concurrent.Striped;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.buffer.Unpooled;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.AsynchronousFileChannel;
@@ -42,7 +42,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReadWriteLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
@@ -50,38 +49,104 @@ import java.util.stream.Stream;
 /**
  * Decorator that wraps an inner {@link ObjectStorage} (e.g. S3) with a local disk cache.
  * <p>
- * The cache is a pure on-disk LRU: byte[] values are NOT retained on the JVM heap.
- * Hot-data speed comes from the OS page cache, which manages its own memory pressure.
- * A Caffeine {@link Cache} indexes the disk tier: keys are object paths, values are the
- * on-disk file size in bytes. The cache is weight-bounded by {@code maxCacheBytes}
- * (the <b>disk</b> budget), and its eviction listener deletes the backing file.
+ * Issue #475 reworked the on-disk layout to avoid the per-object
+ * {@code open}/{@code close}/{@code create}/{@code delete} syscalls that the original
+ * one-file-per-object layout incurred. The cache now writes payloads into two
+ * {@link SlabCacheFileStore} tiers — a small-cell tier and a large-cell tier — kept
+ * open for the JVM lifetime, with an in-memory index. Anything larger than the largest
+ * tier's cell falls through to a per-file fallback (the original code path), which is
+ * required for the rare case of metadata objects bigger than the configured large cell.
  * <p>
- * Concurrent readers for the same missing key are deduplicated via an in-flight map so
- * only one {@code inner.read()} fires. Stripe-based read/write locks serialise disk
- * reads against evictions so that a deletion never races a concurrent reader.
+ * The cache is volatile: slab files are deleted on construction and on close, the cache
+ * directory is wiped on construction, and there is no persistent on-disk index — the
+ * Caffeine LRU starts empty on every boot. Caffeine's {@code maximumWeight} bounds the
+ * <b>logical</b> bytes resident in the cache (aggregated across both slab tiers and the
+ * fallback); the slab files themselves are pre-allocated to their per-tier byte budget.
  * <p>
- * The cache directory is cleared on construction. Cache files are stored flat in
- * {@code cacheDir} with {@code /} replaced by {@code _} in filenames.
+ * Concurrent readers for the same missing key are deduplicated via {@code inFlightReads}
+ * so only one {@code inner.read()} fires. Concurrent writers are deduplicated via
+ * {@code inFlightWrites}.
  * <p>
  * Metrics (issue #336): Caffeine {@code recordStats()} is enabled so callers can query
  * hit/miss/eviction counts via {@link #diskLruStats()}. Byte-level hit/miss counters are
- * maintained via {@link AtomicLong} fields incremented in {@link #readRange}. The maximum
- * cache weight can be changed at runtime via {@link #setMaxCacheBytes(long)}.
+ * maintained via {@link AtomicLong} fields incremented in {@link #readRange}. Slab-tier
+ * stats (issue #475) are exposed via {@link #getSmallSlab()} / {@link #getLargeSlab()}
+ * and the fallback-tier stats via {@link #getFallbackFileCount()} /
+ * {@link #getFallbackBytes()}. The maximum cache weight can be changed at runtime via
+ * {@link #setMaxCacheBytes(long)}.
  *
  * @author enrico.olivelli
  */
 public class CachingObjectStorage implements ObjectStorage {
 
     private static final Logger LOGGER = Logger.getLogger(CachingObjectStorage.class.getName());
-    private static final int STRIPES = 256;
+
+    /** Tier tag stored in {@link CacheEntry}. */
+    static final byte TIER_SMALL_SLAB = 0;
+    static final byte TIER_LARGE_SLAB = 1;
+    static final byte TIER_FALLBACK = 2;
+
+    /**
+     * Configuration knob for slab tiers (issue #475). When {@link #slabEnabled} is
+     * {@code false}, every admit goes through the per-file fallback path — the
+     * original layout from before the slab refactor.
+     */
+    public static final class SlabConfig {
+        public final boolean slabEnabled;
+        public final int smallCellBytes;
+        public final long smallTierBytes;
+        public final int largeCellBytes;
+        public final long largeTierBytes;
+
+        public SlabConfig(boolean slabEnabled, int smallCellBytes, long smallTierBytes,
+                          int largeCellBytes, long largeTierBytes) {
+            this.slabEnabled = slabEnabled;
+            this.smallCellBytes = smallCellBytes;
+            this.smallTierBytes = smallTierBytes;
+            this.largeCellBytes = largeCellBytes;
+            this.largeTierBytes = largeTierBytes;
+        }
+
+        /** Default config: slab enabled, 64 KiB small cells (25%), 4 MiB large cells (75%). */
+        public static SlabConfig defaultsFor(long totalBudgetBytes, int defaultLargeCellBytes) {
+            int smallCell = 64 * 1024;
+            long smallTier = Math.max(0L, totalBudgetBytes / 4);
+            long largeTier = Math.max(0L, totalBudgetBytes - smallTier);
+            int largeCell = defaultLargeCellBytes > 0 ? defaultLargeCellBytes : 4 * 1024 * 1024;
+            return new SlabConfig(true, smallCell, smallTier, largeCell, largeTier);
+        }
+
+        /** Disabled config: every admit goes through the legacy per-file path. */
+        public static SlabConfig disabled() {
+            return new SlabConfig(false, 0, 0L, 0, 0L);
+        }
+    }
+
+    /** In-LRU value: identifies which tier holds the payload. */
+    static final class CacheEntry {
+        final byte tier;
+        final int payloadLength;
+
+        CacheEntry(byte tier, int payloadLength) {
+            this.tier = tier;
+            this.payloadLength = payloadLength;
+        }
+    }
 
     private final ObjectStorage inner;
     private final Path cacheDir;
     private final ExecutorService executor;
-    private final Cache<String, Long> diskLru;
-    private final Striped<ReadWriteLock> locks = Striped.lazyWeakReadWriteLock(STRIPES);
+    private final Cache<String, CacheEntry> diskLru;
     private final ConcurrentHashMap<String, CompletableFuture<ByteBuf>> inFlightReads = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CompletableFuture<Void>> inFlightWrites = new ConcurrentHashMap<>();
+
+    private final boolean slabEnabled;
+    private final SlabCacheFileStore smallSlab;
+    private final SlabCacheFileStore largeSlab;
+    /** Number of live entries currently held in the per-file fallback tier. */
+    private final AtomicLong fallbackFileCount = new AtomicLong();
+    /** Bytes held in the per-file fallback tier (sum of payload sizes). */
+    private final AtomicLong fallbackBytes = new AtomicLong();
 
     /**
      * Bytes served from the on-disk cache in {@link #readRange} calls.
@@ -95,34 +160,71 @@ public class CachingObjectStorage implements ObjectStorage {
      */
     private final AtomicLong missBytes = new AtomicLong();
 
+    /**
+     * Legacy constructor: defaults the slab layout from {@code maxCacheBytes} (small
+     * tier 25%, large tier 75%, large cell 4 MiB). Kept for binary-compat with
+     * existing tests and the {@code RemoteFileServer} reflection wiring.
+     */
     public CachingObjectStorage(ObjectStorage inner, Path cacheDir, ExecutorService executor,
                                 long maxCacheBytes) throws IOException {
+        this(inner, cacheDir, executor, maxCacheBytes,
+                SlabConfig.defaultsFor(maxCacheBytes, 4 * 1024 * 1024));
+    }
+
+    public CachingObjectStorage(ObjectStorage inner, Path cacheDir, ExecutorService executor,
+                                long maxCacheBytes, SlabConfig slabConfig) throws IOException {
         this.inner = inner;
         this.cacheDir = cacheDir;
         this.executor = executor;
         clearCacheDir();
         Files.createDirectories(cacheDir);
 
+        this.slabEnabled = slabConfig.slabEnabled;
+        if (slabConfig.slabEnabled) {
+            int smallCells = slabConfig.smallCellBytes > 0
+                    ? (int) Math.min(Integer.MAX_VALUE, slabConfig.smallTierBytes / slabConfig.smallCellBytes)
+                    : 0;
+            int largeCells = slabConfig.largeCellBytes > 0
+                    ? (int) Math.min(Integer.MAX_VALUE, slabConfig.largeTierBytes / slabConfig.largeCellBytes)
+                    : 0;
+            this.smallSlab = new SlabCacheFileStore(cacheDir.resolve("slab-small.dat"),
+                    slabConfig.smallCellBytes > 0 ? slabConfig.smallCellBytes : 1, smallCells);
+            this.largeSlab = new SlabCacheFileStore(cacheDir.resolve("slab-large.dat"),
+                    slabConfig.largeCellBytes > 0 ? slabConfig.largeCellBytes : 1, largeCells);
+        } else {
+            this.smallSlab = null;
+            this.largeSlab = null;
+        }
+
         this.diskLru = Caffeine.newBuilder()
                 .maximumWeight(maxCacheBytes)
-                .weigher((String key, Long size) -> {
-                    long s = size == null ? 0L : size;
-                    return s > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) s;
+                .weigher((String key, CacheEntry entry) -> {
+                    if (entry == null) {
+                        return 0;
+                    }
+                    return entry.payloadLength;
                 })
                 // recordStats() is required for hit/miss/eviction counters exposed via
                 // diskLruStats(). The cost is negligible (a few AtomicLong increments
                 // per cache operation).
                 .recordStats()
-                .evictionListener((RemovalListener<String, Long>) (key, value, cause) -> {
-                    // Synchronous, best-effort delete. Runs on Caffeine's maintenance thread
-                    // (or inline on a put() that triggers eviction) — does NOT take the stripe
-                    // lock, because the stripe lock might already be held by the same thread
-                    // inside admitToDisk. Concurrent readers that lose the race get
-                    // NoSuchFileException and fall through to inner.read() via the
-                    // tryReadFromDisk / tryReadSliceFromDisk null-return contract.
-                    if (key != null) {
-                        deleteCacheFile(key);
+                // evictionListener fires ONLY for size/time-based eviction — not for
+                // explicit invalidate(...). This matches the original CachingObjectStorage
+                // contract: explicit invalidations call onEviction synchronously from
+                // invalidateAndDelete() so isInCache(...) and the slab/fallback gauges
+                // are immediately consistent. Using removalListener here would fire for
+                // explicit invalidations too and double-decrement the fallback counters.
+                .evictionListener((RemovalListener<String, CacheEntry>) (key, entry, cause) -> {
+                    // Best-effort cleanup of slab/fallback resources. For slab tiers,
+                    // markEvicted is fast (atomic ops + map.remove + free-list push);
+                    // for the fallback tier, we unlink the cache file. Concurrent
+                    // readers that lose the race get a null/miss and fall through to
+                    // inner.read() via the slab pin contract or via the
+                    // NoSuchFileException catch in the per-file path.
+                    if (key == null || entry == null) {
+                        return;
                     }
+                    onEviction(key, entry);
                 })
                 .build();
     }
@@ -140,54 +242,24 @@ public class CachingObjectStorage implements ObjectStorage {
         return diskLru.stats();
     }
 
-    /**
-     * Bytes served from the on-disk cache across all {@link #readRange} calls since pod start.
-     * Incremented once per successful disk-cache hit, before the I/O completes, so the counter
-     * counts <em>intended</em> hit bytes (matching the {@code length} parameter of readRange).
-     */
     public long getHitBytes() {
         return hitBytes.get();
     }
 
-    /**
-     * Bytes fetched from the inner storage (GCS / S3 fallback) across all {@link #readRange}
-     * calls since pod start. Incremented on every cache miss.
-     */
     public long getMissBytes() {
         return missBytes.get();
     }
 
-    /**
-     * Approximate number of entries currently tracked in the disk-LRU index.
-     * Safe to call from gauge samplers (Caffeine's {@code estimatedSize()} is thread-safe).
-     */
     public long estimatedEntries() {
         return diskLru.estimatedSize();
     }
 
-    /**
-     * Returns the current maximum weight (bytes) of the disk-cache LRU as reported
-     * by Caffeine's eviction policy. Returns 0 if the policy is not weight-based.
-     */
     public long getMaxCacheBytes() {
         return diskLru.policy().eviction()
                 .map(e -> e.getMaximum())
                 .orElse(0L);
     }
 
-    /**
-     * Dynamically resizes the disk-cache LRU to {@code newMaxBytes}.
-     * <p>
-     * The change is applied immediately via Caffeine's live policy API.
-     * If {@code newMaxBytes} is smaller than the current total weight, Caffeine will
-     * evict excess entries lazily on the next cache access or maintenance cycle.
-     * <p>
-     * <b>This change is NOT persistent</b>: a pod restart will revert to the value
-     * configured in {@code fileserver.properties} / Helm values (issue #336).
-     *
-     * @param newMaxBytes new maximum weight in bytes; must be &gt; 0
-     * @return the previous maximum, or 0 if the policy is not available
-     */
     public long setMaxCacheBytes(long newMaxBytes) {
         if (newMaxBytes <= 0) {
             throw new IllegalArgumentException("newMaxBytes must be > 0, got: " + newMaxBytes);
@@ -201,6 +273,38 @@ public class CachingObjectStorage implements ObjectStorage {
                 "Disk cache resized: previousMax={0} bytes, newMax={1} bytes",
                 new Object[]{prev[0], newMaxBytes});
         return prev[0];
+    }
+
+    // -----------------------------------------------------------------------
+    // Slab-tier introspection (issue #475)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Returns the small-cell slab tier, or {@code null} when {@code cache.slab.enabled=false}.
+     * Exposed primarily for Prometheus gauge wiring (see {@code RemoteFileServer}).
+     */
+    public SlabCacheFileStore getSmallSlab() {
+        return smallSlab;
+    }
+
+    /**
+     * Returns the large-cell slab tier, or {@code null} when {@code cache.slab.enabled=false}.
+     */
+    public SlabCacheFileStore getLargeSlab() {
+        return largeSlab;
+    }
+
+    public long getFallbackFileCount() {
+        return fallbackFileCount.get();
+    }
+
+    public long getFallbackBytes() {
+        return fallbackBytes.get();
+    }
+
+    /** Returns true if {@code path} is currently resident in any tier. */
+    public boolean isInCache(String path) {
+        return diskLru.getIfPresent(path) != null;
     }
 
     // -----------------------------------------------------------------------
@@ -223,16 +327,64 @@ public class CachingObjectStorage implements ObjectStorage {
         }
     }
 
+    /**
+     * Returns the fallback-tier cache-file path for {@code path}. Only meaningful
+     * for entries admitted via the fallback (per-file) path; slab-tier entries do
+     * not have an individual cache file. Used by {@link #onEviction} to unlink
+     * fallback files and by tests that explicitly verify fallback semantics.
+     */
     Path cacheFilePath(String path) {
         String safeName = path.replace('/', '_').replace('\\', '_');
         return cacheDir.resolve(safeName);
     }
 
+    private void onEviction(String key, CacheEntry entry) {
+        switch (entry.tier) {
+            case TIER_SMALL_SLAB:
+                if (smallSlab != null) {
+                    smallSlab.markEvicted(key);
+                }
+                break;
+            case TIER_LARGE_SLAB:
+                if (largeSlab != null) {
+                    largeSlab.markEvicted(key);
+                }
+                break;
+            case TIER_FALLBACK:
+                deleteFallbackFile(key, entry.payloadLength);
+                break;
+            default:
+                LOGGER.log(Level.WARNING, "Unknown cache tier {0} for key {1}",
+                        new Object[]{entry.tier, key});
+        }
+    }
+
+    private void deleteFallbackFile(String path, int payloadLength) {
+        try {
+            if (Files.deleteIfExists(cacheFilePath(path))) {
+                fallbackFileCount.decrementAndGet();
+                fallbackBytes.addAndGet(-payloadLength);
+            } else {
+                // File already gone (e.g. clearCacheDir on construction racing with
+                // a stale eviction notification, or a manual filesystem-level delete).
+                // Clamp the counters at zero to keep the gauges non-negative under
+                // any unexpected double-eviction.
+                fallbackFileCount.updateAndGet(v -> v > 0 ? v - 1 : 0);
+                fallbackBytes.updateAndGet(v -> v - payloadLength >= 0 ? v - payloadLength : 0);
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to delete fallback cache file: " + path, e);
+        }
+    }
+
     /**
-     * Asynchronously writes {@code bytes} to a cache file using {@link AsynchronousFileChannel}.
-     * Writes to a temp file then atomically renames it.
+     * Asynchronously writes {@code bytes} to a fallback cache file using
+     * {@link AsynchronousFileChannel}. Writes to a temp file then atomically renames.
+     * On any failure we delete BOTH the partially-written temp file and the target
+     * (the rename may have run before {@code completed} threw); leaving either
+     * behind would be a per-cache-lifetime leak.
      */
-    private CompletableFuture<Void> writeCacheFileAsync(String path, byte[] bytes) {
+    private CompletableFuture<Void> writeFallbackFileAsync(String path, byte[] bytes) {
         CompletableFuture<Void> result = new CompletableFuture<>();
         Path target = cacheFilePath(path);
         Path tmp = cacheDir.resolve(target.getFileName() + ".tmp");
@@ -248,9 +400,10 @@ public class CachingObjectStorage implements ObjectStorage {
                         channel.close();
                         Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
                         result.complete(null);
-                    } catch (Throwable t) {
-                        deleteCacheFile(path);
-                        result.completeExceptionally(t);
+                    } catch (IOException e) {
+                        bestEffortDelete(tmp);
+                        bestEffortDelete(target);
+                        result.completeExceptionally(e);
                     }
                 }
 
@@ -259,105 +412,60 @@ public class CachingObjectStorage implements ObjectStorage {
                     try {
                         channel.close();
                     } catch (IOException ignored) {
+                        // Channel close failure during error handling: safe to ignore.
                     }
-                    deleteCacheFile(path);
+                    bestEffortDelete(tmp);
+                    bestEffortDelete(target);
                     result.completeExceptionally(exc);
                 }
             });
-        } catch (Throwable t) {
-            deleteCacheFile(path);
+        } catch (IOException t) {
+            bestEffortDelete(tmp);
+            bestEffortDelete(target);
             result.completeExceptionally(t);
         }
 
         return result;
     }
 
-    /**
-     * Asynchronously writes {@code buf}'s readable bytes to a cache file using
-     * {@link AsynchronousFileChannel}. The caller must hold a refcount on
-     * {@code buf}; this method releases that refcount when the write completes
-     * (success or failure). The buffer's reader/writer indices are not modified.
-     */
-    private CompletableFuture<Void> writeCacheFileAsync(String path, ByteBuf buf) {
-        CompletableFuture<Void> result = new CompletableFuture<>();
-        Path target = cacheFilePath(path);
-        Path tmp = cacheDir.resolve(target.getFileName() + ".tmp");
-        int len = buf.readableBytes();
-
+    private void bestEffortDelete(Path target) {
         try {
-            AsynchronousFileChannel channel = AsynchronousFileChannel.open(
-                    tmp, StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-            // nioBuffer on a direct pooled ByteBuf returns a view, no copy.
-            ByteBuffer nio = buf.nioBuffer(buf.readerIndex(), len);
-            channel.write(nio, 0, null, new CompletionHandler<Integer, Void>() {
-                @Override
-                public void completed(Integer bytesWritten, Void attachment) {
-                    try {
-                        channel.close();
-                        Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-                        result.complete(null);
-                    } catch (Throwable t) {
-                        deleteCacheFile(path);
-                        result.completeExceptionally(t);
-                    } finally {
-                        buf.release();
-                    }
-                }
-
-                @Override
-                public void failed(Throwable exc, Void attachment) {
-                    try {
-                        channel.close();
-                    } catch (IOException ignored) {
-                    }
-                    deleteCacheFile(path);
-                    buf.release();
-                    result.completeExceptionally(exc);
-                }
-            });
-        } catch (Throwable t) {
-            deleteCacheFile(path);
-            buf.release();
-            result.completeExceptionally(t);
-        }
-
-        return result;
-    }
-
-    private void deleteCacheFile(String path) {
-        try {
-            Files.deleteIfExists(cacheFilePath(path));
+            Files.deleteIfExists(target);
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to delete cache file for path: " + path, e);
+            LOGGER.log(Level.WARNING, "Failed to delete fallback file: " + target, e);
         }
     }
 
     /**
-     * Asynchronously stores {@code content} on disk and registers it in the disk LRU.
+     * Asynchronously stores {@code content} in the cache and registers it in the disk LRU.
      * Returns a CompletableFuture that completes when the write is done.
      * Deduplicates concurrent writes to the same path via an in-flight map.
+     * <p>
+     * Tier selection (when {@code slabEnabled}):
+     * <ol>
+     *   <li>If {@code len &lt;= smallSlab.cellSize()} → try small slab first.</li>
+     *   <li>Otherwise / on small-tier-full: if {@code len &lt;= largeSlab.cellSize()} → try large slab.</li>
+     *   <li>Otherwise / on large-tier-full: fall through to the per-file fallback.</li>
+     * </ol>
+     * When {@code !slabEnabled}, every admit uses the per-file fallback.
      */
     private CompletableFuture<Void> admitToDisk(String path, byte[] content) {
         CompletableFuture<Void> pending = new CompletableFuture<>();
         CompletableFuture<Void> existing = inFlightWrites.putIfAbsent(path, pending);
         if (existing != null) {
-            // Another thread is already writing this path; attach to their future
             return existing;
         }
-
-        writeCacheFileAsync(path, content).whenComplete((v, err) -> {
+        admitChooseTier(path, content).whenComplete((v, err) -> {
             try {
                 if (err != null) {
                     pending.completeExceptionally(err);
                     return;
                 }
-                diskLru.put(path, (long) content.length);
                 pending.complete(null);
             } finally {
                 inFlightWrites.remove(path, pending);
             }
         });
-
         return pending;
     }
 
@@ -371,26 +479,168 @@ public class CachingObjectStorage implements ObjectStorage {
         CompletableFuture<Void> pending = new CompletableFuture<>();
         CompletableFuture<Void> existing = inFlightWrites.putIfAbsent(path, pending);
         if (existing != null) {
-            // Another thread is already writing this path; release our retain and attach.
             buf.release();
             return existing;
         }
-
-        int size = buf.readableBytes();
-        writeCacheFileAsync(path, buf).whenComplete((v, err) -> {
+        admitChooseTier(path, buf).whenComplete((v, err) -> {
             try {
                 if (err != null) {
                     pending.completeExceptionally(err);
                     return;
                 }
-                diskLru.put(path, (long) size);
                 pending.complete(null);
             } finally {
                 inFlightWrites.remove(path, pending);
             }
         });
-
         return pending;
+    }
+
+    private CompletableFuture<Void> admitChooseTier(String path, byte[] content) {
+        if (!slabEnabled) {
+            return admitToFallback(path, content);
+        }
+        int len = content.length;
+        // Try small tier if it fits.
+        if (smallSlab != null && len <= smallSlab.cellSize()) {
+            ByteBuf bufForSmall = wrapHeap(content);
+            return smallSlab.tryStore(path, bufForSmall).thenCompose(slot -> {
+                if (slot != null) {
+                    putEntry(path, new CacheEntry(TIER_SMALL_SLAB, len));
+                    return CompletableFuture.completedFuture(null);
+                }
+                return tryLargeOrFallback(path, content);
+            });
+        }
+        return tryLargeOrFallback(path, content);
+    }
+
+    private CompletableFuture<Void> tryLargeOrFallback(String path, byte[] content) {
+        int len = content.length;
+        if (largeSlab != null && len <= largeSlab.cellSize()) {
+            ByteBuf bufForLarge = wrapHeap(content);
+            return largeSlab.tryStore(path, bufForLarge).thenCompose(slot -> {
+                if (slot != null) {
+                    putEntry(path, new CacheEntry(TIER_LARGE_SLAB, len));
+                    return CompletableFuture.completedFuture(null);
+                }
+                return admitToFallback(path, content);
+            });
+        }
+        return admitToFallback(path, content);
+    }
+
+    /**
+     * Wraps a heap byte[] into a {@link ByteBuf} suitable for {@link SlabCacheFileStore#tryStore}.
+     * The slab path takes ownership of the refcount (releases when the async write
+     * completes). Using {@link Unpooled#wrappedBuffer(byte[])} avoids a heap→direct copy
+     * here; AsynchronousFileChannel internally stages a direct buffer for the actual write.
+     */
+    private static ByteBuf wrapHeap(byte[] content) {
+        return Unpooled.wrappedBuffer(content);
+    }
+
+    /**
+     * Inserts {@code entry} into the LRU under {@code path}, recycling any prior tier
+     * resources from the previous entry under the same key (e.g. an admit that
+     * promotes a fallback entry into a slab tier on rewrite).
+     */
+    private void putEntry(String path, CacheEntry entry) {
+        CacheEntry prev = diskLru.asMap().put(path, entry);
+        if (prev != null && prev != entry) {
+            // Recycle prior tier resources for this path. For slab tiers, the slab's
+            // own put() already overwrote the slot atomically — onEviction is a no-op.
+            // For the fallback tier this unlinks the prior cache file.
+            onEviction(path, prev);
+        }
+    }
+
+    private CompletableFuture<Void> admitChooseTier(String path, ByteBuf buf) {
+        int len = buf.readableBytes();
+        if (!slabEnabled) {
+            // Slab disabled: copy out and feed to the fallback path.
+            byte[] heap = new byte[len];
+            buf.getBytes(buf.readerIndex(), heap);
+            buf.release();
+            return admitToFallback(path, heap);
+        }
+        if (smallSlab != null && len <= smallSlab.cellSize()) {
+            ByteBuf retainedForSmall = buf.retainedDuplicate();
+            // whenComplete fires on BOTH success and exceptional completion so the
+            // outer buf retain (held alongside the retainedDuplicate handed to the
+            // slab) is released exactly once even when tryStore completes
+            // exceptionally — thenCompose only runs on successful completion and
+            // would otherwise leak the pooled direct buffer.
+            return smallSlab.tryStore(path, retainedForSmall)
+                    .whenComplete((slot, err) -> {
+                        if (err != null) {
+                            buf.release();
+                        }
+                    })
+                    .thenCompose(slot -> {
+                        if (slot != null) {
+                            putEntry(path, new CacheEntry(TIER_SMALL_SLAB, len));
+                            buf.release();
+                            return CompletableFuture.completedFuture(null);
+                        }
+                        return tryLargeOrFallbackBuf(path, buf);
+                    });
+        }
+        return tryLargeOrFallbackBuf(path, buf);
+    }
+
+    private CompletableFuture<Void> tryLargeOrFallbackBuf(String path, ByteBuf buf) {
+        int len = buf.readableBytes();
+        if (largeSlab != null && len <= largeSlab.cellSize()) {
+            ByteBuf retainedForLarge = buf.retainedDuplicate();
+            // Same exceptional-completion guard as admitChooseTier(ByteBuf): release
+            // the outer buf retain whether tryStore resolves with a slot, returns
+            // null (tier-full), or completes exceptionally.
+            return largeSlab.tryStore(path, retainedForLarge)
+                    .whenComplete((slot, err) -> {
+                        if (err != null) {
+                            buf.release();
+                        }
+                    })
+                    .thenCompose(slot -> {
+                        if (slot != null) {
+                            putEntry(path, new CacheEntry(TIER_LARGE_SLAB, len));
+                            buf.release();
+                            return CompletableFuture.completedFuture(null);
+                        }
+                        return copyAndFallback(path, buf);
+                    });
+        }
+        return copyAndFallback(path, buf);
+    }
+
+    private CompletableFuture<Void> copyAndFallback(String path, ByteBuf buf) {
+        int len = buf.readableBytes();
+        byte[] heap = new byte[len];
+        buf.getBytes(buf.readerIndex(), heap);
+        buf.release();
+        return admitToFallback(path, heap);
+    }
+
+    private CompletableFuture<Void> admitToFallback(String path, byte[] content) {
+        return writeFallbackFileAsync(path, content).thenApply(v -> {
+            CacheEntry entry = new CacheEntry(TIER_FALLBACK, content.length);
+            CacheEntry prev = diskLru.asMap().put(path, entry);
+            if (prev == null || prev.tier != TIER_FALLBACK) {
+                // Either there was no prior entry, or it was held in a slab tier.
+                // The new file occupies one fallback slot and contributes its bytes.
+                fallbackFileCount.incrementAndGet();
+                fallbackBytes.addAndGet(content.length);
+                if (prev != null) {
+                    // Recycle the prior slab slot.
+                    onEviction(path, prev);
+                }
+            } else {
+                // Same-tier overwrite — only adjust bytes by the delta.
+                fallbackBytes.addAndGet((long) content.length - prev.payloadLength);
+            }
+            return null;
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -420,27 +670,40 @@ public class CachingObjectStorage implements ObjectStorage {
     }
 
     /**
-     * Asynchronously attempts to read the full file from the on-disk cache using
-     * {@link AsynchronousFileChannel}. Returns a future that completes with {@code null}
-     * on miss (including {@link NoSuchFileException} from a concurrent eviction).
-     * Uses an optimistic lock-free approach: open the file directly; if it doesn't exist
-     * or is being evicted, fall through to the inner storage.
-     *
-     * Uses Netty pooled direct ByteBuf for zero-copy I/O. Caller MUST call
-     * {@link ReadResult#release()} when done to return the buffer to the pool.
+     * Asynchronously attempts to read the full file from the on-disk cache (any
+     * tier). Returns a future that completes with {@code null} on miss or
+     * concurrent eviction. Caller MUST call {@link ReadResult#release()} when done
+     * to return the buffer to the pool.
      */
     private CompletableFuture<ReadResult> tryReadFromDiskAsync(String path) {
-        if (diskLru.getIfPresent(path) == null) {
+        CacheEntry entry = diskLru.getIfPresent(path);
+        if (entry == null) {
             return CompletableFuture.completedFuture(null);
         }
+        switch (entry.tier) {
+            case TIER_SMALL_SLAB:
+                if (smallSlab == null) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return smallSlab.read(path).thenApply(buf -> buf == null ? null : ReadResult.found(buf));
+            case TIER_LARGE_SLAB:
+                if (largeSlab == null) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return largeSlab.read(path).thenApply(buf -> buf == null ? null : ReadResult.found(buf));
+            case TIER_FALLBACK:
+                return tryReadFromFallbackAsync(path);
+            default:
+                return CompletableFuture.completedFuture(null);
+        }
+    }
 
+    private CompletableFuture<ReadResult> tryReadFromFallbackAsync(String path) {
         CompletableFuture<ReadResult> result = new CompletableFuture<>();
         try {
             Path filePath = cacheFilePath(path);
-            // Open file directly; catch NoSuchFileException for eviction races
             AsynchronousFileChannel channel = AsynchronousFileChannel.open(filePath, StandardOpenOption.READ);
             long fileSize = channel.size();
-            // Allocate direct pooled ByteBuf for zero-copy efficient I/O
             ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer((int) fileSize);
             ByteBuffer nioBuffer = byteBuf.nioBuffer(0, (int) fileSize);
 
@@ -450,6 +713,7 @@ public class CachingObjectStorage implements ObjectStorage {
                     try {
                         channel.close();
                     } catch (IOException ignored) {
+                        // Channel close best-effort: data already in the buffer.
                     }
                     byteBuf.writerIndex(bytesRead);
                     result.complete(ReadResult.found(byteBuf));
@@ -460,18 +724,18 @@ public class CachingObjectStorage implements ObjectStorage {
                     try {
                         channel.close();
                     } catch (IOException ignored) {
+                        // Channel close best-effort during error handling.
                     }
-                    // Release pooled buffer on failure
                     byteBuf.release();
-                    // Treat as cache miss; fall through to inner storage
+                    // Treat as cache miss; fall through to inner storage.
                     result.complete(null);
                 }
             });
         } catch (NoSuchFileException e) {
-            // File was evicted after the getIfPresent check; treat as cache miss
+            // File was evicted after the LRU lookup; treat as cache miss.
             result.complete(null);
-        } catch (Throwable t) {
-            LOGGER.log(Level.WARNING, "Failed to read cache file for path: " + path, t);
+        } catch (IOException t) {
+            LOGGER.log(Level.WARNING, "Failed to read fallback cache file for path: " + path, t);
             result.complete(null);
         }
 
@@ -480,12 +744,8 @@ public class CachingObjectStorage implements ObjectStorage {
 
     /**
      * Loads {@code path} from the inner storage, deduplicating concurrent loads of the
-     * same key. On a successful load the bytes are written to disk and registered in
-     * the LRU before being returned.
-     * <p>
-     * The pooled {@link ByteBuf} from the inner storage is kept end-to-end: it is
-     * shared by the disk-write path and by every concurrent caller (each gets a
-     * {@code retainedDuplicate} via {@code pending.thenApply}). No heap copy.
+     * same key. On a successful load the bytes are written to the cache and registered
+     * before being returned.
      */
     private CompletableFuture<ReadResult> loadAndCache(String path) {
         CompletableFuture<ByteBuf> pending = new CompletableFuture<>();
@@ -520,7 +780,7 @@ public class CachingObjectStorage implements ObjectStorage {
             }
             ByteBuf buf = result.byteBuf();
             // Two extra retains:
-            //   +1 for admitToDisk (released inside writeCacheFileAsync when the disk write finishes).
+            //   +1 for admitToDisk (released inside the tier write when finished).
             //   +1 to keep buf alive across pending.complete so all dependents
             //      (original caller + any in-flight followers) can retainedDuplicate.
             // The original `result`'s refcount is dropped right after.
@@ -538,8 +798,6 @@ public class CachingObjectStorage implements ObjectStorage {
                             return;
                         }
                         try {
-                            // pending.complete fires all dependents synchronously here:
-                            // each does retainedDuplicate(buf), bumping refcount per caller.
                             pending.complete(buf);
                         } finally {
                             inFlightReads.remove(path, pending);
@@ -587,35 +845,42 @@ public class CachingObjectStorage implements ObjectStorage {
                 });
     }
 
-    /**
-     * Asynchronously reads only the requested slice from the on-disk block file using
-     * {@link AsynchronousFileChannel}. Returns a future that completes with {@code null}
-     * on miss (including {@link NoSuchFileException} from a concurrent eviction).
-     * Uses an optimistic lock-free approach: open the file directly; if it doesn't exist,
-     * fall through to the inner storage.
-     *
-     * Uses Netty pooled direct ByteBuf for zero-copy I/O. Caller MUST call
-     * {@link ReadResult#release()} when done to return the buffer to the pool.
-     */
     private CompletableFuture<ReadResult> tryReadSliceFromDiskAsync(String blockPath, int offsetInBlock, int length) {
-        Long size = diskLru.getIfPresent(blockPath);
-        if (size == null) {
+        CacheEntry entry = diskLru.getIfPresent(blockPath);
+        if (entry == null) {
             return CompletableFuture.completedFuture(null);
         }
+        switch (entry.tier) {
+            case TIER_SMALL_SLAB:
+                if (smallSlab == null) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return smallSlab.readRange(blockPath, offsetInBlock, length)
+                        .thenApply(buf -> buf == null ? null : ReadResult.found(buf));
+            case TIER_LARGE_SLAB:
+                if (largeSlab == null) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                return largeSlab.readRange(blockPath, offsetInBlock, length)
+                        .thenApply(buf -> buf == null ? null : ReadResult.found(buf));
+            case TIER_FALLBACK:
+                return tryReadSliceFromFallbackAsync(blockPath, offsetInBlock, length, entry.payloadLength);
+            default:
+                return CompletableFuture.completedFuture(null);
+        }
+    }
 
-        long blockLength = size;
+    private CompletableFuture<ReadResult> tryReadSliceFromFallbackAsync(
+            String blockPath, int offsetInBlock, int length, int blockLength) {
         if (offsetInBlock >= blockLength) {
             return CompletableFuture.completedFuture(ReadResult.notFound());
         }
-
-        int readable = (int) Math.min(length, blockLength - offsetInBlock);
+        int readable = Math.min(length, blockLength - offsetInBlock);
         CompletableFuture<ReadResult> result = new CompletableFuture<>();
 
         try {
             Path filePath = cacheFilePath(blockPath);
-            // Open file directly; catch NoSuchFileException for eviction races
             AsynchronousFileChannel channel = AsynchronousFileChannel.open(filePath, StandardOpenOption.READ);
-            // Allocate direct pooled ByteBuf for zero-copy efficient I/O
             ByteBuf byteBuf = PooledByteBufAllocator.DEFAULT.directBuffer(readable);
             ByteBuffer nioBuffer = byteBuf.nioBuffer(0, readable);
 
@@ -625,6 +890,7 @@ public class CachingObjectStorage implements ObjectStorage {
                     try {
                         channel.close();
                     } catch (IOException ignored) {
+                        // Channel close best-effort: data already in the buffer.
                     }
                     byteBuf.writerIndex(bytesRead);
                     result.complete(ReadResult.found(byteBuf));
@@ -635,18 +901,17 @@ public class CachingObjectStorage implements ObjectStorage {
                     try {
                         channel.close();
                     } catch (IOException ignored) {
+                        // Channel close best-effort during error handling.
                     }
-                    // Release pooled buffer on failure
                     byteBuf.release();
-                    // Treat as cache miss; fall through to inner storage
                     result.complete(null);
                 }
             });
         } catch (NoSuchFileException e) {
-            // File was evicted after the size check; treat as cache miss
             result.complete(null);
-        } catch (Throwable t) {
-            LOGGER.log(Level.WARNING, "Failed to read slice from cache file for path: " + blockPath, t);
+        } catch (IOException t) {
+            LOGGER.log(Level.WARNING,
+                    "Failed to read slice from fallback cache file for path: " + blockPath, t);
             result.complete(null);
         }
 
@@ -666,7 +931,6 @@ public class CachingObjectStorage implements ObjectStorage {
             }
             int to = Math.min(offsetInBlock + length, blockLength);
             int sliceLength = to - offsetInBlock;
-            // retainedSlice shares the underlying memory; no copy.
             return ReadResult.found(blockBuf.retainedSlice(blockBuf.readerIndex() + offsetInBlock, sliceLength));
         } finally {
             full.release();
@@ -684,13 +948,17 @@ public class CachingObjectStorage implements ObjectStorage {
     }
 
     /**
-     * Explicit invalidation path: removes the entry from the LRU and deletes the on-disk file.
-     * Caffeine's {@code evictionListener} only fires for size/time-based eviction, not for
-     * explicit {@code invalidate()}, so we must unlink the file ourselves here.
+     * Explicit invalidation path: removes the entry from the LRU and synchronously
+     * runs the per-tier cleanup. We do not rely on Caffeine's removal listener for
+     * explicit invalidations because it may fire asynchronously on Caffeine's
+     * default ForkJoinPool, which would leave the slab/fallback counters stale
+     * relative to {@code isInCache(path)}.
      */
     private void invalidateAndDelete(String path) {
-        diskLru.invalidate(path);
-        deleteCacheFile(path);
+        CacheEntry removed = diskLru.asMap().remove(path);
+        if (removed != null) {
+            onEviction(path, removed);
+        }
     }
 
     @Override
@@ -730,6 +998,29 @@ public class CachingObjectStorage implements ObjectStorage {
 
     @Override
     public void close() throws Exception {
-        inner.close();
+        try {
+            inner.close();
+        } finally {
+            IOException pending = null;
+            if (smallSlab != null) {
+                try {
+                    smallSlab.close();
+                } catch (IOException e) {
+                    pending = e;
+                }
+            }
+            if (largeSlab != null) {
+                try {
+                    largeSlab.close();
+                } catch (IOException e) {
+                    if (pending == null) {
+                        pending = e;
+                    }
+                }
+            }
+            if (pending != null) {
+                throw pending;
+            }
+        }
     }
 }
