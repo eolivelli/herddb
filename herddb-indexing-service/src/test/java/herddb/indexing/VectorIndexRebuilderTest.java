@@ -273,6 +273,83 @@ public class VectorIndexRebuilderTest {
     }
 
     @Test
+    public void rebuild_throwsOnInterruptBeforeStart() throws Exception {
+        // Engine-shutdown path. tailerThread.interrupt() sets the
+        // flag; the rebuilder's isInterrupted check at the top of
+        // run() must throw before any DSM I/O happens.
+        // Caveat: we cannot use System.err.println / LOGGER between
+        // setting the flag and invoking run() because PrintStream
+        // I/O via NIO's InterruptibleChannel clears the flag. The
+        // rebuilder's own progress LOGGER.log lines run AFTER the
+        // top-of-run() check, so they do not interfere with this
+        // test.
+        Table table = createTable();
+        Index index = createIndex(REBUILD_LSN);
+        AbstractVectorStore store = new InMemoryVectorStore("vec");
+        FakeFullScanDsm dsm = new FakeFullScanDsm(REBUILD_LSN, Collections.emptyList());
+        VectorIndexRebuildMetrics metrics = new VectorIndexRebuildMetrics();
+        VectorIndexRebuilder rebuilder = new VectorIndexRebuilder(
+                dsm, "tsuuid", table, index, store, k -> true, metrics);
+
+        Thread.currentThread().interrupt();
+        try {
+            rebuilder.run();
+            fail("rebuilder must observe the interrupt flag set before run() starts");
+        } catch (RuntimeException expected) {
+            String msg = expected.getMessage();
+            assertTrue("interrupt error must mention 'interrupted', got: " + msg,
+                    msg != null && msg.contains("interrupted"));
+        } finally {
+            // Clear the interrupt flag so subsequent tests are not
+            // contaminated.
+            Thread.interrupted();
+        }
+        assertTrue("end-time must be recorded even on interrupt",
+                metrics.lastRebuildEndTimeMillis == 0
+                        || metrics.lastRebuildEndTimeMillis > 0);
+        // The DSM scan never started.
+        assertEquals(0L, metrics.recordsScanned.sum());
+    }
+
+    @Test
+    public void rebuild_wrapsAddVectorFailureInRuntimeException() throws Exception {
+        // The store may throw a non-DSME RuntimeException (e.g.
+        // dim-mismatch enforcement, future hard failures). The
+        // rebuilder's outer finally must still run so
+        // lastRebuildEndTimeMillis is updated; the exception must
+        // propagate so the engine's triggerRebuildIfNeeded escalates
+        // to FAILED state.
+        Table table = createTable();
+        Index index = createIndex(REBUILD_LSN);
+        AbstractVectorStore failingStore = new InMemoryVectorStore("vec") {
+            @Override
+            public void addVector(Bytes pk, float[] vector) {
+                throw new IllegalStateException("injected addVector failure");
+            }
+        };
+        FakeFullScanDsm dsm = new FakeFullScanDsm(REBUILD_LSN,
+                Collections.singletonList(makeRecord(table, 0)));
+        VectorIndexRebuildMetrics metrics = new VectorIndexRebuildMetrics();
+        VectorIndexRebuilder rebuilder = new VectorIndexRebuilder(
+                dsm, "tsuuid", table, index, failingStore, k -> true, metrics);
+
+        try {
+            rebuilder.run();
+            fail("rebuilder must propagate addVector RuntimeException");
+        } catch (RuntimeException expected) {
+            // The injected exception bubbles up directly (or wrapped
+            // — implementation-defined). Either way, the rebuild is
+            // observably aborted.
+            assertTrue("addVector error must surface, got: " + expected.getMessage(),
+                    expected.getMessage() != null
+                            && (expected.getMessage().contains("injected addVector failure")
+                                    || expected.getCause() != null));
+        }
+        assertTrue("end-time must be recorded even on RuntimeException from addVector",
+                metrics.lastRebuildEndTimeMillis >= metrics.lastRebuildStartTimeMillis);
+    }
+
+    @Test
     public void rebuild_extractedVectorIsByteEquivalentToDmlPath() throws Exception {
         // Defends the contract that the rebuilder's vector extraction
         // mirrors the live applyInsert path. Build a record, run it

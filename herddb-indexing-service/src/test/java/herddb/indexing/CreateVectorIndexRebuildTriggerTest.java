@@ -22,6 +22,7 @@ package herddb.indexing;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import herddb.codec.RecordSerializer;
 import herddb.index.vector.VectorIndexManager;
 import herddb.log.LogEntry;
@@ -224,6 +225,69 @@ public class CreateVectorIndexRebuildTriggerTest {
     }
 
     @Test
+    public void rebuildFailure_putsEngineInFailedState_doesNotAdvanceWatermark() throws Exception {
+        // BLOCK-fix verification (round-1 of step 3 review): without
+        // engine-fatal escalation, processEntry's broad catch would
+        // swallow the rebuild's RuntimeException and the next
+        // successful entry would advance lastProcessedLsn past the
+        // failed CREATE_INDEX, the next checkpoint would persist the
+        // watermark past it, and the rebuild would never re-run.
+        // This test wires a CountingFakeDsm whose fullTableScan
+        // throws, drives the engine via processEntryForTest (the
+        // production tailer entry point — exercises the catch),
+        // then delivers a follow-up INSERT and asserts the watermark
+        // is NOT advanced past CREATE_INDEX.
+        Table table = createTable();
+        Index index = createIndexWithRebuild();
+
+        CountingFakeDsm dsm = new CountingFakeDsm(REBUILD_LSN, Collections.emptyList());
+        dsm.failNextScanWith = new DataStorageManagerException("injected scan failure");
+
+        IndexingServiceEngine engine = buildEngine(dsm);
+        try {
+            // Apply CREATE_TABLE through the live processEntry path
+            // (so lastProcessedLsn is set correctly).
+            LogSequenceNumber createTableLsn = new LogSequenceNumber(1, 1);
+            engine.processEntryForTest(createTableLsn,
+                    LogEntryFactory.createTable(table, null));
+            assertEquals("CREATE_TABLE must advance the watermark normally",
+                    createTableLsn, engine.getLastProcessedLsn());
+            assertEquals("engine must still be ACTIVE after CREATE_TABLE",
+                    IndexingServiceEngine.EngineStatus.ACTIVE, engine.getEngineStatus());
+
+            // Apply the failing CREATE_INDEX. processEntry's broad
+            // catch will swallow the RuntimeException, but the
+            // engine MUST set FAILED state and refuse to advance
+            // lastProcessedLsn for this entry.
+            LogSequenceNumber createIndexLsn = new LogSequenceNumber(1, 2);
+            engine.processEntryForTest(createIndexLsn,
+                    LogEntryFactory.createIndex(index, null));
+            assertEquals("rebuild failure must NOT advance the watermark past CREATE_INDEX",
+                    createTableLsn, engine.getLastProcessedLsn());
+            assertEquals("rebuild failure must put the engine into FAILED state",
+                    IndexingServiceEngine.EngineStatus.FAILED, engine.getEngineStatus());
+
+            // Deliver a follow-up INSERT — this is the load-bearing
+            // assertion. Pre-fix, processEntry's catch would have
+            // swallowed the rebuild error, and this INSERT (which
+            // succeeds at apply time on a non-vector table) would
+            // advance lastProcessedLsn past CREATE_INDEX. With the
+            // fix, processEntry early-returns on FAILED state and
+            // the watermark stays anchored at CREATE_TABLE.
+            LogSequenceNumber insertLsn = new LogSequenceNumber(1, 3);
+            float[] vec = new float[]{0.1f, 0.2f, 0.3f};
+            Record insertRecord = RecordSerializer.makeRecord(table,
+                    "pk", "key0", "vec", vec);
+            engine.processEntryForTest(insertLsn,
+                    LogEntryFactory.insert(table, insertRecord.key, insertRecord.value, null));
+            assertEquals("post-failure entries MUST NOT advance the watermark",
+                    createTableLsn, engine.getLastProcessedLsn());
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
     public void snapshotReplayWithRebuildTrueIndex_doesNotFireRebuilder() throws Exception {
         // Snapshot replay path: the engine starts with a non-empty
         // WatermarkSnapshot containing an index with rebuild=true.
@@ -286,6 +350,7 @@ public class CreateVectorIndexRebuildTriggerTest {
         private final LogSequenceNumber expectedLsn;
         private final List<Record> records;
         final AtomicInteger fullTableScanInvocations = new AtomicInteger(0);
+        DataStorageManagerException failNextScanWith;
 
         CountingFakeDsm(LogSequenceNumber expectedLsn, List<Record> records) {
             this.expectedLsn = expectedLsn;
@@ -298,6 +363,11 @@ public class CreateVectorIndexRebuildTriggerTest {
                                   FullTableScanConsumer consumer)
                 throws DataStorageManagerException {
             fullTableScanInvocations.incrementAndGet();
+            if (failNextScanWith != null) {
+                DataStorageManagerException toThrow = failNextScanWith;
+                failNextScanWith = null;
+                throw toThrow;
+            }
             TableStatus status = new TableStatus("vectable", expectedLsn,
                     Bytes.longToByteArray(0L), 1L, new HashMap<>());
             consumer.acceptTableStatus(status);

@@ -173,6 +173,18 @@ public final class VectorIndexRebuilder {
         }
         String vectorColumn = index.columnNames[0];
 
+        // Issue #471: cooperative cancellation — early-out if the
+        // tailer thread is already interrupted before we even start.
+        // This is the load-bearing check for the engine-shutdown
+        // path; further checks per-page guard against the case where
+        // the interrupt arrives mid-scan.
+        if (Thread.currentThread().isInterrupted()) {
+            throw new RuntimeException(
+                    "rebuild interrupted before start at LSN " + rebuildLsn
+                            + " for " + index.tablespace + "." + index.table
+                            + "." + index.name);
+        }
+
         long startNanos = System.nanoTime();
         long startMillis = System.currentTimeMillis();
         metrics.lastRebuildStartTimeMillis = startMillis;
@@ -201,6 +213,20 @@ public final class VectorIndexRebuilder {
 
             @Override
             public void acceptPage(long pageId, List<Record> records) {
+                // Issue #471: cooperative cancellation. If the engine
+                // is being shut down, the tailer thread is interrupted
+                // (IndexingServiceEngine.close → tailerThread.interrupt).
+                // Without this check, addVector's back-pressure waits
+                // would absorb the interrupt and the rebuild would
+                // continue burning CPU on the next-page fetch until
+                // the entire scan finished naturally — many hours on a
+                // 20 B-row table, well past any close() deadline.
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new RuntimeException(
+                            "rebuild interrupted at LSN " + rebuildLsn
+                                    + " for " + index.tablespace + "." + index.table
+                                    + "." + index.name);
+                }
                 for (Record record : records) {
                     localScanned[0]++;
                     metrics.recordsScanned.increment();
@@ -208,12 +234,14 @@ public final class VectorIndexRebuilder {
                         continue;
                     }
                     DataAccessorForFullRecord accessor = new DataAccessorForFullRecord(table, record);
-                    float[] vector = extractVector(accessor, vectorColumn);
+                    float[] vector = extractVector(accessor, vectorColumn, index);
                     if (vector == null) {
-                        // Null vectors are not indexable. Tolerate them
-                        // — the corresponding row exists in the table
-                        // and any subsequent UPDATE will land via the
-                        // tailer's applyUpdate path.
+                        // Null / type-mismatch vectors are not
+                        // indexable. Tolerate them — the corresponding
+                        // row exists in the table and any subsequent
+                        // UPDATE will land via the tailer's
+                        // applyUpdate path. extractVector logs a
+                        // type-mismatch WARNING (rate-limited).
                         continue;
                     }
                     // The blocking call: addVector respects the
@@ -253,44 +281,51 @@ public final class VectorIndexRebuilder {
         };
 
         try {
-            dsm.fullTableScan(tablespaceUUID, table.uuid, rebuildLsn, consumer);
-        } catch (DataStorageManagerException scanErr) {
-            // Update end-time even on failure so the gauge reflects
-            // "rebuild attempt completed" rather than leaving a
-            // stale start-time without an end-time.
-            metrics.lastRebuildEndTimeMillis = System.currentTimeMillis();
-            throw new RuntimeException(
-                    "rebuild scan failed for " + index.tablespace + "." + index.table
-                            + "." + index.name + " at " + rebuildLsn, scanErr);
-        }
-
-        // Seal the live shard so a crash immediately after the scan
-        // does not lose all the work. PersistentVectorStore.checkpoint
-        // is the only path that flushes the in-memory live shard to
-        // disk; without this call, the rebuild's records linger in
-        // RAM until the engine's next periodic checkpoint, and a
-        // restart in that window would force a full re-rebuild.
-        // Best-effort: a checkpoint failure is logged but does NOT
-        // fail the rebuild — the rebuild itself succeeded; the next
-        // engine-driven checkpoint will catch up.
-        if (store instanceof PersistentVectorStore) {
             try {
-                ((PersistentVectorStore) store).checkpoint();
-            } catch (DataStorageManagerException checkpointErr) {
-                LOGGER.log(Level.WARNING,
-                        "rebuild " + index.tablespace + "." + index.table + "." + index.name
-                                + ": post-rebuild checkpoint failed; rebuild data will be"
-                                + " sealed by the next engine-driven checkpoint",
-                        checkpointErr);
+                dsm.fullTableScan(tablespaceUUID, table.uuid, rebuildLsn, consumer);
+            } catch (DataStorageManagerException scanErr) {
+                throw new RuntimeException(
+                        "rebuild aborted for " + index.tablespace + "." + index.table
+                                + "." + index.name + " at " + rebuildLsn
+                                + " (scan or back-pressure failure)", scanErr);
             }
-        }
 
-        metrics.lastRebuildEndTimeMillis = System.currentTimeMillis();
-        long totalElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
-        LOGGER.log(Level.INFO,
-                "rebuild {0}.{1}.{2} done: scanned={3}, indexed={4}, total={5} ms",
-                new Object[]{index.tablespace, index.table, index.name,
-                        localScanned[0], localIndexed[0], totalElapsedMs});
+            // Seal the live shard so a crash immediately after the
+            // scan does not lose all the work. PersistentVectorStore.
+            // checkpoint is the only path that flushes the in-memory
+            // live shard to disk; without this call, the rebuild's
+            // records linger in RAM until the engine's next periodic
+            // checkpoint, and a restart in that window would force a
+            // full re-rebuild.
+            // Best-effort: a checkpoint failure is logged but does NOT
+            // fail the rebuild — the rebuild itself succeeded; the
+            // next engine-driven checkpoint will catch up.
+            if (store instanceof PersistentVectorStore) {
+                try {
+                    ((PersistentVectorStore) store).checkpoint();
+                } catch (DataStorageManagerException checkpointErr) {
+                    LOGGER.log(Level.WARNING,
+                            "rebuild " + index.tablespace + "." + index.table + "." + index.name
+                                    + ": post-rebuild checkpoint failed; rebuild data will be"
+                                    + " sealed by the next engine-driven checkpoint",
+                            checkpointErr);
+                }
+            }
+
+            long totalElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+            LOGGER.log(Level.INFO,
+                    "rebuild {0}.{1}.{2} done: scanned={3}, indexed={4}, total={5} ms",
+                    new Object[]{index.tablespace, index.table, index.name,
+                            localScanned[0], localIndexed[0], totalElapsedMs});
+        } finally {
+            // Update the end-time on EVERY exit — success, scan
+            // failure, addVector RuntimeException, interrupt, anything.
+            // The metric promise is "lastRebuildStartTimeMillis >
+            // lastRebuildEndTimeMillis ⇔ rebuild in flight"; without
+            // this finally the gauge would lie forever after any
+            // failure path that wasn't a DataStorageManagerException.
+            metrics.lastRebuildEndTimeMillis = System.currentTimeMillis();
+        }
     }
 
     /**
@@ -299,12 +334,46 @@ public final class VectorIndexRebuilder {
      * that path is load-bearing — a divergence would cause the
      * rebuild and the subsequent live DML to populate the vector
      * store with subtly different vector bytes.
+     *
+     * <p>Returns {@code null} when the column is missing, stored as
+     * SQL NULL, or carries a non-{@code float[]} value (a schema
+     * mismatch). The non-null type-mismatch case is logged at
+     * WARNING with rate-limiting (one log line per
+     * {@link #typeMismatchLogCounter} threshold crossing) so a
+     * silent-skip on every record cannot go undetected, but a
+     * mass-mismatch incident does not flood the log.
      */
-    private static float[] extractVector(DataAccessorForFullRecord accessor, String columnName) {
+    private float[] extractVector(DataAccessorForFullRecord accessor, String columnName, Index idx) {
         Object value = accessor.get(columnName);
+        if (value == null) {
+            return null;
+        }
         if (value instanceof float[]) {
             return (float[]) value;
         }
+        // Type mismatch — observable but rate-limited.
+        long mismatchCount = ++typeMismatchLogCounter;
+        if (mismatchCount == 1
+                || mismatchCount == 10
+                || mismatchCount == 100
+                || mismatchCount % 1000 == 0) {
+            LOGGER.log(Level.WARNING,
+                    "rebuild {0}.{1}.{2}: vector column {3} has unexpected type {4}"
+                            + " (mismatchCount={5}); record will be skipped",
+                    new Object[]{idx.tablespace, idx.table, idx.name,
+                            columnName, value.getClass().getName(), mismatchCount});
+        }
         return null;
     }
+
+    /**
+     * Per-rebuilder running count of records that had a non-null
+     * non-{@code float[]} value in the vector column. Used to
+     * rate-limit the WARNING log in {@link #extractVector} so a
+     * mass-mismatch incident does not flood the log. Not exposed as
+     * a metric; the operator-visible signal is
+     * {@code recordsScanned > 0 && recordsIndexed == 0} plus the
+     * WARNING line itself.
+     */
+    private long typeMismatchLogCounter = 0L;
 }

@@ -272,7 +272,35 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      *       to {@link #ACTIVE}.</li>
      * </ul>
      */
-    public enum EngineStatus { ACTIVE, JOINING }
+    /**
+     * Lifecycle states used by {@link #processEntry} and
+     * {@link #applyEntry} to decide whether a commit-log entry should
+     * be applied at all.
+     *
+     * <ul>
+     *   <li>{@link #ACTIVE}: normal — entries are applied; the watermark
+     *       advances on every successful apply.</li>
+     *   <li>{@link #JOINING}: the engine has no schema yet and drops every
+     *       commit-log entry except {@code INDEXING_SERVICE_REBALANCE}.
+     *       The first REBALANCE installs the schema and transitions the
+     *       engine to {@link #ACTIVE}.</li>
+     *   <li>{@link #FAILED}: a fatal apply-time error occurred (issue #471 —
+     *       a {@code rebuild=true} CREATE VECTOR INDEX whose IS-side
+     *       back-fill threw). The engine refuses to advance the tailer
+     *       past the failed entry: every subsequent
+     *       {@link #processEntry} call early-returns without
+     *       advancing {@code lastProcessedLsn} or
+     *       {@code entriesSinceLastCheckpoint}, so the watermark cannot
+     *       be persisted past the failed entry. On engine restart, the
+     *       failed entry is replayed from the still-stale watermark and
+     *       the rebuild re-runs from scratch. This avoids the
+     *       silent-data-loss path where a successful follow-up entry
+     *       would otherwise advance the watermark past a partially-
+     *       back-filled vector store, making the partial state
+     *       permanent.</li>
+     * </ul>
+     */
+    public enum EngineStatus { ACTIVE, JOINING, FAILED }
 
     private volatile EngineStatus engineStatus = EngineStatus.ACTIVE;
 
@@ -1308,6 +1336,22 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * Entry consumer callback invoked by the commit log tailer.
      */
     private void processEntry(LogSequenceNumber lsn, LogEntry entry) {
+        if (engineStatus == EngineStatus.FAILED) {
+            // Issue #471: the engine has been put into FAILED state by an
+            // unrecoverable apply-time error (typically a rebuild=true
+            // CREATE VECTOR INDEX whose IS-side back-fill threw). Do
+            // NOT advance lastProcessedLsn or entriesSinceLastCheckpoint
+            // — the watermark must stay anchored at the position before
+            // the failed entry so the rebuild is replayed from scratch
+            // on engine restart. We log at FINE not SEVERE: the SEVERE
+            // log was already emitted at the moment of the failure;
+            // repeating it on every subsequent entry would flood the
+            // log without adding information.
+            LOGGER.log(Level.FINE,
+                    "engine FAILED — dropping entry at LSN {0}, type={1} (replay on restart)",
+                    new Object[]{lsn, entry.type});
+            return;
+        }
         try {
             LOGGER.log(Level.FINEST, "Processing entry at LSN {0}, type={1}, txId={2}",
                     new Object[]{lsn, entry.type, entry.transactionId});
@@ -2068,11 +2112,43 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             throw new IllegalStateException(
                     "rebuild requested but the engine has no DataStorageManager");
         }
+        if (tableSpaceUUID == null) {
+            // Defensive: should never happen because the tablespace
+            // is resolved during start() before any commit-log entry
+            // is delivered. But if a test path ever drives applyEntry
+            // before start(), surface the misuse explicitly rather
+            // than letting the DSM see a null tablespace.
+            throw new IllegalStateException(
+                    "rebuild requested before tablespace UUID was resolved");
+        }
         VectorIndexRebuilder rebuilder = new VectorIndexRebuilder(
                 dataStorageManager, tableSpaceUUID, table, index, store,
                 key -> isAcceptedLocally(key, index),
                 rebuildMetrics);
-        rebuilder.run();
+        try {
+            rebuilder.run();
+        } catch (RuntimeException rebuildErr) {
+            // Issue #471: a rebuild failure is engine-fatal. Without
+            // this escalation, processEntry's broad catch would
+            // swallow the exception, the next successful tailer entry
+            // would advance lastProcessedLsn past the failed
+            // CREATE_INDEX, the next checkpoint would persist that
+            // watermark, and the partially-back-filled vector store
+            // would become the permanent state on restart — a silent
+            // data-loss path. Set FAILED so processEntry early-returns
+            // on every subsequent entry; the engine sits idle until
+            // the pod restarts (a health check failure or operator
+            // intervention is expected to drive the restart). On
+            // restart the watermark is still pre-CREATE_INDEX, so the
+            // entry is replayed and the rebuild re-runs from scratch.
+            LOGGER.log(Level.SEVERE,
+                    "rebuild failed for index " + index.tablespace + "." + index.table
+                            + "." + index.name + "; engine entering FAILED state — "
+                            + "tailer will refuse to advance past this entry until restart",
+                    rebuildErr);
+            engineStatus = EngineStatus.FAILED;
+            throw rebuildErr;
+        }
     }
 
     /**
