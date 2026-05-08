@@ -19,7 +19,10 @@
  */
 package herddb.indexing.optimizer;
 
+import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.indexing.segment.SegmentRegistryClient;
+import herddb.metadata.MetadataStorageManagerException;
+import herddb.model.TableSpace;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import java.io.FileInputStream;
 import java.util.Properties;
@@ -92,12 +95,38 @@ public final class IndexOptimizerMain {
         String basePath = configuration.getString(
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH,
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH_DEFAULT);
-        String tablespaceUuid = configuration.getString(
-                OptimizerConfiguration.PROPERTY_TABLESPACE_UUID, null);
-        if (tablespaceUuid == null || tablespaceUuid.isEmpty()) {
-            throw new IllegalArgumentException(OptimizerConfiguration.PROPERTY_TABLESPACE_UUID
-                    + " must be set");
+        String tablespaceName = configuration.getString(
+                OptimizerConfiguration.PROPERTY_TABLESPACE_NAME, null);
+        if (tablespaceName == null || tablespaceName.isEmpty()) {
+            throw new IllegalStateException(
+                    OptimizerConfiguration.PROPERTY_TABLESPACE_NAME + " must be set");
         }
+
+        // Resolve the tablespace UUID from the human-readable name by consulting
+        // the HerdDB cluster metadata in ZooKeeper.  We open a short-lived
+        // ZookeeperMetadataStorageManager exclusively for this lookup and close
+        // it immediately after so that the optimizer's permanent ZK connection
+        // (used by SegmentRegistryClient and OptimizerLeaderLock) is separate
+        // and independently reconnectable.
+        String tablespaceUuid;
+        try (ZookeeperMetadataStorageManager zkmeta =
+                new ZookeeperMetadataStorageManager(zkAddress, sessionTimeout, basePath)) {
+            zkmeta.start(false); // read-only: do not create/format cluster metadata paths
+            TableSpace ts = zkmeta.describeTableSpace(tablespaceName);
+            if (ts == null) {
+                throw new IllegalStateException(
+                        "No tablespace named '" + tablespaceName + "' found under "
+                        + basePath + "/tableSpaces — ensure the HerdDB cluster has started "
+                        + "and created its default tablespace before starting the optimizer.");
+            }
+            tablespaceUuid = ts.uuid;
+        } catch (MetadataStorageManagerException e) {
+            throw new IllegalStateException(
+                    "Failed to resolve tablespace '" + tablespaceName + "' from ZooKeeper: "
+                    + e.getMessage(), e);
+        }
+        LOGGER.log(Level.INFO, "Resolved tablespace name ''{0}'' to UUID {1}",
+                new Object[]{tablespaceName, tablespaceUuid});
 
         CountDownLatch zkConnected = new CountDownLatch(1);
         AtomicReference<ZooKeeper> zkRef = new AtomicReference<>();
@@ -114,28 +143,6 @@ public final class IndexOptimizerMain {
         this.zooKeeper = zk;
         this.registry = new SegmentRegistryClient(zkRef::get, basePath);
         registry.ensureRoot();
-
-        // Validate the configured tablespace UUID is present in the cluster's
-        // metadata (review item E4). Without this, a typo'd UUID makes the
-        // optimizer idle forever logging empty registry scans. The tablespace
-        // znode in cluster mode lives under {basePath}/replicas/{tablespaceUuid}
-        // — probe its existence and log a clear WARNING if missing.
-        try {
-            String tablespaceReplicaPath = basePath + "/replicas/" + tablespaceUuid;
-            org.apache.zookeeper.data.Stat st = zk.exists(tablespaceReplicaPath, false);
-            if (st == null) {
-                LOGGER.log(Level.WARNING,
-                        "tablespace {0} not found at {1} — optimizer will scan an empty registry"
-                                + " until the tablespace is created.",
-                        new Object[]{tablespaceUuid, tablespaceReplicaPath});
-            }
-        } catch (org.apache.zookeeper.KeeperException | InterruptedException e) {
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            LOGGER.log(Level.WARNING, "tablespace existence check failed (will continue): {0}",
-                    e.getMessage());
-        }
 
         long intervalMs = configuration.getLong(
                 OptimizerConfiguration.PROPERTY_INTERVAL_MS,
@@ -199,8 +206,8 @@ public final class IndexOptimizerMain {
         }
 
         LOGGER.log(Level.INFO,
-                "index-optimizer started: zk={0}, basePath={1}, tablespace={2}, intervalMs={3}, httpPort={4}",
-                new Object[]{zkAddress, basePath, tablespaceUuid, intervalMs, httpPort});
+                "index-optimizer started: zk={0}, basePath={1}, tablespace={2} (uuid={3}), intervalMs={4}, httpPort={5}",
+                new Object[]{zkAddress, basePath, tablespaceName, tablespaceUuid, intervalMs, httpPort});
     }
 
     private void tickSafe() {

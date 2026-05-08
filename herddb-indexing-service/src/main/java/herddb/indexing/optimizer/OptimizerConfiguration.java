@@ -19,6 +19,7 @@
  */
 package herddb.indexing.optimizer;
 
+import java.math.BigDecimal;
 import java.util.Properties;
 
 /**
@@ -41,10 +42,11 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_ZOOKEEPER_PATH_DEFAULT = "/herd";
 
     /**
-     * Tablespace UUID the optimizer manages. The optimizer is single-tablespace
-     * for the MVP; multi-tablespace coordination is left for a future revision.
+     * Tablespace name the optimizer manages (e.g. {@code "herd"} — the HerdDB default).
+     * The optimizer resolves the UUID from ZooKeeper at startup using
+     * {@link herddb.cluster.ZookeeperMetadataStorageManager#describeTableSpace(String)}.
      */
-    public static final String PROPERTY_TABLESPACE_UUID = "indexoptimizer.tablespace.uuid";
+    public static final String PROPERTY_TABLESPACE_NAME = "indexoptimizer.tablespace.name";
 
     /** Polling interval for the registry scan, in milliseconds. */
     public static final String PROPERTY_INTERVAL_MS = "indexoptimizer.interval.ms";
@@ -112,12 +114,25 @@ public final class OptimizerConfiguration {
 
     public int getInt(String key, int defaultValue) {
         String v = properties.getProperty(key);
-        return v == null ? defaultValue : Integer.parseInt(v);
+        if (v == null) {
+            return defaultValue;
+        }
+        // Integer.parseInt rejects scientific-notation strings (e.g. "2e+08") emitted
+        // by YAML/Helm for large integer literals. BigDecimal handles both forms;
+        // intValueExact() throws ArithmeticException on a fractional value, giving a
+        // clear startup error instead of silently truncating.
+        return new BigDecimal(v).intValueExact();
     }
 
     public long getLong(String key, long defaultValue) {
         String v = properties.getProperty(key);
-        return v == null ? defaultValue : Long.parseLong(v);
+        if (v == null) {
+            return defaultValue;
+        }
+        // Long.parseLong rejects scientific-notation strings (e.g. "2.68435456e+08")
+        // emitted by YAML/Helm for large integer literals. BigDecimal handles both
+        // forms; longValueExact() throws ArithmeticException on a fractional value.
+        return new BigDecimal(v).longValueExact();
     }
 
     public boolean getBoolean(String key, boolean defaultValue) {

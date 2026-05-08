@@ -69,27 +69,27 @@ public class IndexOptimizerHelmTemplateTest {
     }
 
     @Test
-    public void enabledOptimizerWithoutTablespaceUuidFailsLoud() throws Exception {
+    public void enabledOptimizerWithoutTablespaceNameFailsLoud() throws Exception {
         ProcessResult r = runHelm("template", "test", chartDir.toString(),
                 "--set", "indexOptimizer.enabled=true");
-        assertFalse("expected helm template to fail without tablespaceUuid", r.exitCode == 0);
+        assertFalse("expected helm template to fail without tablespaceName", r.exitCode == 0);
         assertTrue("error message must mention the required value:\n" + r.stderr,
-                r.stderr.contains("tablespaceUuid"));
+                r.stderr.contains("tablespaceName"));
     }
 
     @Test
     public void enabledOptimizerRendersStatefulSetConfigMapAndService() throws Exception {
         ProcessResult r = runHelm("template", "test", chartDir.toString(),
                 "--set", "indexOptimizer.enabled=true",
-                "--set", "indexOptimizer.tablespaceUuid=fake-uuid-123");
+                "--set", "indexOptimizer.tablespaceName=herd");
         assertEquals("helm template failed:\n" + r.stderr, 0, r.exitCode);
 
         String yaml = r.stdout;
         // ConfigMap with our properties.
         assertTrue("ConfigMap must be rendered",
                 yaml.contains("name: test-herddb-index-optimizer-config"));
-        assertTrue("ConfigMap must contain the tablespaceUuid",
-                yaml.contains("indexoptimizer.tablespace.uuid=\"fake-uuid-123\""));
+        assertTrue("ConfigMap must contain the tablespaceName",
+                yaml.contains("indexoptimizer.tablespace.name=herd"));
         assertTrue("ConfigMap must contain the interval",
                 yaml.contains("indexoptimizer.interval.ms=300000"));
 
@@ -119,7 +119,7 @@ public class IndexOptimizerHelmTemplateTest {
     public void customStorageSizeAndStorageClassFlowToVolumeClaimTemplate() throws Exception {
         ProcessResult r = runHelm("template", "test", chartDir.toString(),
                 "--set", "indexOptimizer.enabled=true",
-                "--set", "indexOptimizer.tablespaceUuid=t",
+                "--set", "indexOptimizer.tablespaceName=herd",
                 "--set", "indexOptimizer.storage.tmp.size=50Gi",
                 "--set", "indexOptimizer.storage.tmp.storageClass=fast-ssd");
         assertEquals(0, r.exitCode);

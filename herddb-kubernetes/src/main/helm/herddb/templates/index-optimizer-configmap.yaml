@@ -1,4 +1,7 @@
 {{- if .Values.indexOptimizer.enabled }}
+{{- if not .Values.indexOptimizer.tablespaceName }}
+{{- fail ".Values.indexOptimizer.tablespaceName is required when indexOptimizer.enabled=true" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -11,15 +14,15 @@ data:
     indexoptimizer.http.host=0.0.0.0
     indexoptimizer.http.port={{ .Values.indexOptimizer.httpPort | default 9853 }}
     indexoptimizer.zookeeper.address={{ include "herddb.zkAddress" . }}
-    indexoptimizer.zookeeper.session.timeout={{ .Values.indexOptimizer.zkSessionTimeout | default 40000 }}
+    indexoptimizer.zookeeper.session.timeout={{ .Values.indexOptimizer.zkSessionTimeout | default 40000 | int64 }}
     indexoptimizer.zookeeper.path=/herd
-    indexoptimizer.tablespace.uuid={{ required ".Values.indexOptimizer.tablespaceUuid is required when indexOptimizer.enabled=true" .Values.indexOptimizer.tablespaceUuid | quote }}
-    indexoptimizer.interval.ms={{ .Values.indexOptimizer.intervalMs | default 300000 }}
-    indexoptimizer.merge.min.count={{ .Values.indexOptimizer.minCount | default 4 }}
-    indexoptimizer.merge.max.count={{ .Values.indexOptimizer.maxCount | default 200 }}
-    indexoptimizer.merge.min.bytes={{ .Values.indexOptimizer.minBytes | default 268435456 }}
-    indexoptimizer.merge.max.bytes={{ .Values.indexOptimizer.maxBytes | default 1073741824 }}
-    indexoptimizer.retention.ms={{ .Values.indexOptimizer.retentionMs | default 600000 }}
+    indexoptimizer.tablespace.name={{ .Values.indexOptimizer.tablespaceName }}
+    indexoptimizer.interval.ms={{ .Values.indexOptimizer.intervalMs | default 300000 | int64 }}
+    indexoptimizer.merge.min.count={{ .Values.indexOptimizer.minCount | default 4 | int64 }}
+    indexoptimizer.merge.max.count={{ .Values.indexOptimizer.maxCount | default 200 | int64 }}
+    indexoptimizer.merge.min.bytes={{ .Values.indexOptimizer.minBytes | default 268435456 | int64 }}
+    indexoptimizer.merge.max.bytes={{ .Values.indexOptimizer.maxBytes | default 1073741824 | int64 }}
+    indexoptimizer.retention.ms={{ .Values.indexOptimizer.retentionMs | default 600000 | int64 }}
     {{- range $k, $v := .Values.indexOptimizer.extraConfig }}
     {{ $k }}={{ $v }}
     {{- end }}
