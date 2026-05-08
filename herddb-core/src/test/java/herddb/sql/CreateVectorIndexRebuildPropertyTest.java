@@ -352,6 +352,62 @@ public class CreateVectorIndexRebuildPropertyTest {
             execute(manager,
                     "CREATE TABLE tblspace1.t2 (id int primary key)",
                     Collections.emptyList());
+
+            // Issue #471: the rebuild pin must be released on failure.
+            // Without the unpin-on-failure path, the pin would survive
+            // for the leader's process lifetime and silently keep the
+            // pinned page files alive forever.
+            String tableSpaceUuid = manager.getTableSpaceManager("tblspace1")
+                    .getTableSpaceUUID();
+            String tableUuid = manager.getTableSpaceManager("tblspace1")
+                    .getTableManager("t1").getTable().uuid;
+            java.util.Set<herddb.log.LogSequenceNumber> pinned =
+                    manager.getDataStorageManager()
+                            .pinnedTableCheckpointsForTest(tableSpaceUuid, tableUuid);
+            assertTrue(
+                    "rebuild pin must be released after CREATE INDEX failure (pinned="
+                            + pinned + ")",
+                    pinned.isEmpty());
+        }
+    }
+
+    @Test
+    public void successfulCreate_holdsPinAtRebuildLsn() throws Exception {
+        // Symmetric counter to checkpointFailureLeavesNoStalePartialState:
+        // on the happy path the pin MUST be held at the LSN encoded in
+        // PROP_REBUILD_LSN — otherwise step 3's IS-side scan will race a
+        // periodic activator-driven checkpoint that reclaims the pages.
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmpDir = folder.newFolder("tmp").toPath();
+
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmpDir)) {
+            manager.start();
+            bootstrapTablespaceAndTable(manager);
+            insertSomeRows(manager, 5);
+
+            execute(manager,
+                    "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            Index idx = getCreatedIndex(manager, "t1", "vidx");
+            String encoded = idx.properties.get(VectorIndexManager.PROP_REBUILD_LSN);
+            assertNotNull("happy path must record _rebuildLsn", encoded);
+            herddb.log.LogSequenceNumber expected =
+                    VectorIndexManager.decodeRebuildLsn(encoded);
+
+            String tableSpaceUuid = manager.getTableSpaceManager("tblspace1")
+                    .getTableSpaceUUID();
+            String tableUuid = manager.getTableSpaceManager("tblspace1")
+                    .getTableManager("t1").getTable().uuid;
+            java.util.Set<herddb.log.LogSequenceNumber> pinned =
+                    manager.getDataStorageManager()
+                            .pinnedTableCheckpointsForTest(tableSpaceUuid, tableUuid);
+            assertTrue(
+                    "rebuild pin at " + expected + " must be held after CREATE INDEX (pinned="
+                            + pinned + ")",
+                    pinned.contains(expected));
         }
     }
 

@@ -2495,6 +2495,15 @@ public class TableSpaceManager {
             context.setTableSpaceLock(lockStamp);
             lockAcquired = true;
         }
+        // Issue #471: track the rebuild pin we may have taken so that we
+        // release it on any failure path between checkpoint(true) and a
+        // successful apply(). The pin lives in DataStorageManager's
+        // in-memory maps, so leaking it on a failed CREATE INDEX would
+        // pin page files for the leader's process lifetime even though
+        // the index was never created.
+        AbstractTableManager rebuildPinTableManager = null;
+        LogSequenceNumber rebuildPinLsn = null;
+        boolean indexCreateSucceeded = false;
         try {
             AbstractIndexManager exists = indexes.get(statement.getIndexDefinition().name);
             if (exists != null) {
@@ -2575,6 +2584,10 @@ public class TableSpaceManager {
                                             + originalIndex.tablespace + "." + originalIndex.table);
                         }
                         LogSequenceNumber pinnedLsn = pinnedCheckpoint.sequenceNumber;
+                        // Track the pin so we can release it if anything
+                        // between here and a successful apply() fails.
+                        rebuildPinTableManager = tableManager;
+                        rebuildPinLsn = pinnedLsn;
                         LOGGER.log(Level.INFO,
                                 "CREATE VECTOR INDEX {0}.{1}.{2}: pinned table checkpoint at {3} in {4} ms",
                                 new Object[]{originalIndex.tablespace, originalIndex.table,
@@ -2586,7 +2599,7 @@ public class TableSpaceManager {
                         indexToCreate = originalIndex
                                 .withProperty(VectorIndexManager.PROP_REBUILD, "true")
                                 .withProperty(VectorIndexManager.PROP_REBUILD_LSN,
-                                        pinnedLsn.ledgerId + ":" + pinnedLsn.offset);
+                                        VectorIndexManager.encodeRebuildLsn(pinnedLsn));
                     }
                 }
             }
@@ -2600,10 +2613,34 @@ public class TableSpaceManager {
 
             apply(pos, entry, false);
 
+            // Mark success: from here on the pin (if any) is owned by
+            // the future IS-side rebuild path, not by this method's
+            // error-recovery cleanup.
+            indexCreateSucceeded = true;
             return new DDLStatementExecutionResult(entry.transactionId);
         } catch (DataStorageManagerException err) {
             throw new StatementExecutionException(err);
         } finally {
+            // Issue #471: release the rebuild pin on any failure between
+            // checkpoint(true) and a successful apply(). Without this the
+            // pin would survive the leader's process lifetime even
+            // though the index was never created — a slow page-file
+            // leak. Unpin failures are logged but do not mask the
+            // original exception.
+            if (!indexCreateSucceeded
+                    && rebuildPinTableManager != null
+                    && rebuildPinLsn != null) {
+                try {
+                    rebuildPinTableManager.unpinCheckpoint(rebuildPinLsn);
+                    LOGGER.log(Level.INFO,
+                            "CREATE VECTOR INDEX failed; released rebuild pin at {0}",
+                            rebuildPinLsn);
+                } catch (DataStorageManagerException unpinErr) {
+                    LOGGER.log(Level.SEVERE,
+                            "CREATE VECTOR INDEX failed AND release of rebuild pin at "
+                                    + rebuildPinLsn + " also failed", unpinErr);
+                }
+            }
             if (lockAcquired) {
                 releaseWriteLock(context.getTableSpaceLock(), statement);
                 context.setTableSpaceLock(0);

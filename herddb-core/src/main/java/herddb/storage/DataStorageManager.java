@@ -487,6 +487,33 @@ public abstract class DataStorageManager implements AutoCloseable {
         unPinCheckPoint(tableSpace, uuid, status.sequenceNumber, indexCheckpointPins);
     }
 
+    /**
+     * Issue #471 — test-only observable for the pinned-checkpoint set
+     * tracked at this level. Returns a snapshot of the LSNs currently
+     * pinned for {@code (tableSpace, uuid)}; the empty set means "no
+     * checkpoint pinned".
+     *
+     * <p>Why this exists: the createIndex pin-leak regression test in
+     * {@code CreateVectorIndexRebuildPropertyTest} needs a way to assert
+     * that a failed CREATE VECTOR INDEX did not leave a pinned
+     * checkpoint behind. The pin maps are intentionally private (callers
+     * should go through {@link #unPinTableCheckpoint} for any production
+     * mutation), but for testing we expose a read-only view.
+     *
+     * <p>The returned set is a defensive snapshot: callers may iterate
+     * it freely without races against concurrent pin/unpin activity.
+     */
+    public Set<LogSequenceNumber> pinnedTableCheckpointsForTest(String tableSpace, String uuid) {
+        Set<LogSequenceNumber> pins =
+                tableCheckpointPins.get(tableSpace + "_" + uuid);
+        if (pins == null) {
+            return Collections.emptySet();
+        }
+        synchronized (tableCheckpointPins) {
+            return new java.util.HashSet<>(pins);
+        }
+    }
+
     private Map<Long, Integer> pinAndGetPages(
             String tableSpace, String name, Collection<Long> activePages,
             Map<String, Map<Long, Integer>> pagesPins, boolean pin

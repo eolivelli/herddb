@@ -94,7 +94,10 @@ public class VectorIndexManager extends AbstractIndexManager {
      * it observes a {@code CREATE_INDEX} entry with
      * {@link #PROP_REBUILD}{@code =true}. The value is encoded as
      * {@code "<ledgerId>:<offset>"} (two non-negative longs in decimal,
-     * separated by a single colon).
+     * separated by a single colon) — use {@link
+     * #encodeRebuildLsn(LogSequenceNumber)} and {@link
+     * #decodeRebuildLsn(String)} so the encoding stays symmetric across
+     * server and IndexingService.
      *
      * <p>Why it lives in the Index properties: the CREATE_INDEX log entry
      * is the only signal the IS receives — the IS does not have its own
@@ -107,17 +110,81 @@ public class VectorIndexManager extends AbstractIndexManager {
      * checkpoint at this LSN with {@link
      * herddb.core.AbstractTableManager#checkpoint(boolean)
      * tableManager.checkpoint(true)} so a periodic activator-driven
-     * checkpoint cannot reclaim the pages while the IS is scanning. Step 3
-     * of issue #471 adds a server-side unpin path triggered when the
-     * IndexingService publishes its post-rebuild watermark past the
-     * {@code CREATE_INDEX} LSN — until that lands, the pin lingers on the
-     * server's tableManager. Operators MUST be aware that
-     * abandoning a CREATE VECTOR INDEX (e.g. by destroying the IS without
-     * letting it complete the rebuild) leaves a single pinned checkpoint
-     * that survives until the table is dropped or until the unpin RPC is
-     * invoked manually.
+     * checkpoint cannot reclaim the pages while the IS is scanning.
+     *
+     * <p><b>Pin lifetime caveat</b>: pins live in the
+     * {@link herddb.storage.DataStorageManager}'s in-memory tracking maps,
+     * NOT on disk — they do not survive a leader restart. After a
+     * leader restart the pin is dropped and {@code cleanupAfterTableBoot}
+     * may reap the pinned pages. Step 3 of issue #471 must therefore
+     * either drive the rebuild to completion before any restart, or
+     * detect a non-empty {@code _rebuildLsn} on a freshly-recovered
+     * Index and re-checkpoint-and-pin the table from the leader before
+     * allowing the IS to scan. Step 3 also owns the unpin path:
+     * the server unpins once the IS publishes its post-rebuild watermark
+     * past the {@code CREATE_INDEX} LSN. {@code TableSpaceManager.createIndex}
+     * itself releases the pin if anything between {@code checkpoint(true)}
+     * and a successful {@code apply()} fails — abandoning a CREATE
+     * VECTOR INDEX during the call leaves no in-memory pin.
      */
     public static final String PROP_REBUILD_LSN = "_rebuildLsn";
+
+    /**
+     * Encodes a pinned {@link LogSequenceNumber} for transport in
+     * {@link #PROP_REBUILD_LSN}. Issue #471.
+     *
+     * <p>Both components must be non-negative — {@code LogSequenceNumber}
+     * domain values from a real checkpoint are always {@code >= 0}, and
+     * {@link LogSequenceNumber#START_OF_TIME} (which has no business
+     * being pinned for a rebuild) carries {@code -1} components, so
+     * rejecting negatives here surfaces a misuse loudly at the source
+     * instead of letting it travel through serialisation and confuse the
+     * IS later.
+     */
+    public static String encodeRebuildLsn(LogSequenceNumber lsn) {
+        if (lsn == null) {
+            throw new IllegalArgumentException("rebuild LSN must not be null");
+        }
+        if (lsn.ledgerId < 0 || lsn.offset < 0) {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must be non-negative, got " + lsn);
+        }
+        return lsn.ledgerId + ":" + lsn.offset;
+    }
+
+    /**
+     * Decodes the value written by {@link #encodeRebuildLsn} back into a
+     * {@link LogSequenceNumber}. Issue #471.
+     *
+     * @throws IllegalArgumentException if {@code encoded} is null, does
+     *     not match the {@code "<ledgerId>:<offset>"} shape, contains
+     *     components that cannot be parsed as {@code long}, or contains
+     *     negative components.
+     */
+    public static LogSequenceNumber decodeRebuildLsn(String encoded) {
+        if (encoded == null) {
+            throw new IllegalArgumentException("rebuild LSN encoding must not be null");
+        }
+        int colon = encoded.indexOf(':');
+        if (colon < 0 || encoded.indexOf(':', colon + 1) >= 0) {
+            throw new IllegalArgumentException(
+                    "rebuild LSN encoding must be '<ledgerId>:<offset>', got '" + encoded + "'");
+        }
+        long ledgerId;
+        long offset;
+        try {
+            ledgerId = Long.parseLong(encoded.substring(0, colon));
+            offset = Long.parseLong(encoded.substring(colon + 1));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must be valid longs, got '" + encoded + "'", e);
+        }
+        if (ledgerId < 0 || offset < 0) {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must be non-negative, got '" + encoded + "'");
+        }
+        return new LogSequenceNumber(ledgerId, offset);
+    }
 
     /**
      * Resolved lazily at every call so that the owning DBManager can
