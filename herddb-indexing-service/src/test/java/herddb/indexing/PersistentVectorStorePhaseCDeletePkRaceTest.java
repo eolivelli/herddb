@@ -211,6 +211,10 @@ public class PersistentVectorStorePhaseCDeletePkRaceTest {
             }
 
             // Remove workers: half delete the lower half, half delete the upper half.
+            // Catch Throwable (not just InterruptedException) so any
+            // unchecked exception or assertion failure inside removeVector
+            // is captured via workerError instead of being swallowed by
+            // the JVM's default uncaught-exception handler.
             int half = toDelete.size() / 2;
             for (int s = 0; s < removeThreads; s++) {
                 final int from = (s == 0) ? 0 : half;
@@ -223,6 +227,8 @@ public class PersistentVectorStorePhaseCDeletePkRaceTest {
                         }
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
+                    } catch (Throwable t2) {
+                        workerError.compareAndSet(null, t2);
                     } finally {
                         racersDone.countDown();
                     }
