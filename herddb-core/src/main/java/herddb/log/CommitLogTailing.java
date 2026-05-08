@@ -47,11 +47,27 @@ public interface CommitLogTailing extends Runnable, AutoCloseable {
 
     /**
      * Returns the total number of "read batches" the tailer has completed
-     * since it was created, where a batch is one underlying poll/follow cycle
-     * that processed at least one entry. A consumer can correlate this with
-     * {@link #getEntriesProcessed()} to spot pathological "many small batches"
-     * vs "few large batches" patterns. Defaults to {@code 0} so legacy
-     * implementations that do not track batches stay source-compatible.
+     * since it was created, where a batch is one underlying poll/follow
+     * cycle that <em>completed normally</em> after processing at least one
+     * entry. A consumer can correlate this with {@link #getEntriesProcessed()}
+     * to spot pathological "many small batches" vs "few large batches"
+     * patterns. Defaults to {@code 0} so legacy implementations that do
+     * not track batches stay source-compatible.
+     *
+     * <p><b>Caveat:</b> only completed cycles count. A poll/follow cycle
+     * that drained some entries and then threw (e.g.
+     * {@code LogNotAvailableException} from a transient BookKeeper hiccup
+     * inside {@code followTheLeader}, or an I/O error on a {@code .txlog}
+     * read) is <em>not</em> counted as a batch even though
+     * {@link #getEntriesProcessed()} already reflects the entries that
+     * landed before the throw. As a consequence,
+     * {@code entries_processed / batches_processed} is an
+     * <em>approximation</em> of the average batch size and may overshoot
+     * when the tailer is hitting transient errors. The reads themselves
+     * are also eventually-consistent across threads (the underlying
+     * counter is a plain non-volatile long updated only on the tailer
+     * thread), so a remote scrape may briefly observe a value lagging by
+     * one increment.
      */
     default long getBatchesProcessed() {
         return 0L;

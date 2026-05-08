@@ -1209,6 +1209,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
     }
 
+    /**
+     * Replays the buffered entries of a transaction whose
+     * {@code COMMITTRANSACTION} we just observed.
+     *
+     * <p>Issue #459: each buffered entry was already classified by
+     * {@link #classifyForMetrics(LogEntry)} when it first arrived from the
+     * tailer (back when {@code processEntry()} placed it in the
+     * {@link TransactionBuffer}); replaying through {@code applySingleEntry}
+     * here MUST NOT re-classify, otherwise every transactional INSERT/UPDATE/
+     * DELETE would silently double-count.
+     */
     private void applyBufferedEntries(List<TransactionBuffer.BufferedLogEntry> entries) {
         for (TransactionBuffer.BufferedLogEntry be : entries) {
             applySingleEntry(be.getLsn(), be.getEntry());

@@ -152,8 +152,12 @@ public class TailerOpTypeMetricsTest {
         engine.processEntryForTest(new LogSequenceNumber(1, lsnOff++),
                 LogEntryFactory.delete(table, Bytes.from_string("k0"), null));
 
-        // --- Non-DML/non-DDL: NOOP, BEGIN/COMMIT/ROLLBACKTRANSACTION. All
-        // counted as "skipped" (no graph mutation at this entry's arrival).
+        // --- Non-DML/non-DDL: NOOP, BEGIN/COMMIT/ROLLBACKTRANSACTION,
+        // TABLE_CONSISTENCY_CHECK, INDEXING_SERVICE_REBALANCE. All counted
+        // as "skipped" (no graph mutation at this entry's arrival). Including
+        // the latter two explicitly so reordering the classifier's `default`
+        // branch can't silently miss a real LogEntryType (review feedback
+        // on PR #460).
         engine.processEntryForTest(new LogSequenceNumber(1, lsnOff++),
                 LogEntryFactory.noop());
         engine.processEntryForTest(new LogSequenceNumber(1, lsnOff++),
@@ -162,26 +166,41 @@ public class TailerOpTypeMetricsTest {
                 LogEntryFactory.commitTransaction(42L));
         engine.processEntryForTest(new LogSequenceNumber(1, lsnOff++),
                 LogEntryFactory.rollbackTransaction(43L));
+        engine.processEntryForTest(new LogSequenceNumber(1, lsnOff++),
+                new LogEntry(System.currentTimeMillis(),
+                        herddb.log.LogEntryType.TABLE_CONSISTENCY_CHECK,
+                        0L, table.tableId, null, null));
+        // INDEXING_SERVICE_REBALANCE with a null payload is valid here:
+        // handleRebalanceEntry() logs and returns when entry.value is null,
+        // so the engine treats it as a no-op — but the classifier must still
+        // count it as one skipped entry, which is what we want to assert.
+        engine.processEntryForTest(new LogSequenceNumber(1, lsnOff++),
+                new LogEntry(System.currentTimeMillis(),
+                        herddb.log.LogEntryType.INDEXING_SERVICE_REBALANCE,
+                        0L, 0, null, null));
 
-        // --- Per-op assertions.
+        // --- Per-op assertions. The DML / DDL totals must be unaffected by
+        // the non-DML/non-DDL entries above.
         assertEquals("inserts", 3L, engine.getTailerInserts());
         assertEquals("updates", 2L, engine.getTailerUpdates());
         assertEquals("deletes", 1L, engine.getTailerDeletes());
         assertEquals("ddl: CREATE_TABLE+CREATE_INDEX+ALTER_TABLE+TRUNCATE_TABLE+DROP_INDEX+DROP_TABLE",
                 6L, engine.getTailerDdl());
 
-        // accepted == sum of inserts/updates/deletes; skipped == ddl + 4
-        // control entries (NOOP, BEGIN, COMMIT, ROLLBACK).
+        // accepted == sum of inserts/updates/deletes; skipped == ddl + 6
+        // control entries (NOOP, BEGIN, COMMIT, ROLLBACK,
+        // TABLE_CONSISTENCY_CHECK, INDEXING_SERVICE_REBALANCE).
         assertEquals("accepted", 6L, engine.getTailerEntriesAccepted());
-        assertEquals("skipped: 6 DDL + NOOP + BEGIN + COMMIT + ROLLBACK",
-                10L, engine.getTailerEntriesSkipped());
+        assertEquals("skipped: 6 DDL + NOOP + BEGIN + COMMIT + ROLLBACK + "
+                + "TABLE_CONSISTENCY_CHECK + INDEXING_SERVICE_REBALANCE",
+                12L, engine.getTailerEntriesSkipped());
 
         // The issue's primary contract: accepted + skipped == every entry
         // the tailer classified.
         long classified = engine.getTailerEntriesAccepted()
                 + engine.getTailerEntriesSkipped();
         assertEquals("accepted + skipped must equal the number of entries classified",
-                16L, classified);
+                18L, classified);
     }
 
     /**
