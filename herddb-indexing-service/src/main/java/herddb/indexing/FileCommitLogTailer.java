@@ -61,6 +61,7 @@ public class FileCommitLogTailer implements CommitLogTailing {
     private CommitFileReader activeReader;
     private Path activeReaderPath;
     private long entriesProcessed;
+    private long batchesProcessed;
 
     public FileCommitLogTailer(Path logDirectory, String tableSpaceUUID, LogSequenceNumber startFrom, EntryConsumer consumer) {
         this.logDirectory = logDirectory;
@@ -81,6 +82,12 @@ public class FileCommitLogTailer implements CommitLogTailing {
                 boolean processedAny = scanAndProcess();
                 long entriesThisPoll = entriesProcessed - entriesBefore;
                 if (processedAny) {
+                    // One poll cycle that produced at least one entry counts
+                    // as one read batch (issue #459). Surfaced via
+                    // getBatchesProcessed() and used by Prometheus / engine-stats
+                    // to distinguish "many tiny batches" (high per-cycle
+                    // overhead) from "few large batches" (efficient catch-up).
+                    batchesProcessed++;
                     totalEntriesProcessed += entriesThisPoll;
                     LOGGER.info("Poll #" + pollCount + ": processed " + entriesThisPoll
                             + " entries (total=" + totalEntriesProcessed + "), watermark=" + watermark);
@@ -285,6 +292,11 @@ public class FileCommitLogTailer implements CommitLogTailing {
     @Override
     public long getEntriesProcessed() {
         return entriesProcessed;
+    }
+
+    @Override
+    public long getBatchesProcessed() {
+        return batchesProcessed;
     }
 
     @Override

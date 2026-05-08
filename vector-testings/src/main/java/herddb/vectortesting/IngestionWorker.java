@@ -77,6 +77,15 @@ public class IngestionWorker implements Runnable {
     private final BenchRuntime runtime;
 
     /**
+     * Optional sliding-window tracker for issue #453 (windowed ingestion rate
+     * and commit latency in {@code GET /status}). Receives one
+     * {@link IngestionWindowTracker#recordCommit} call after every successful
+     * commit. May be {@code null} in unit tests that do not exercise the
+     * windowed-rate feature.
+     */
+    private final IngestionWindowTracker windowTracker;
+
+    /**
      * Base of the exponential back-off between commit retries, in milliseconds.
      * Defaults to 10 seconds per issue #153 (10s, 20s, 40s, ...); tests override
      * this to a tiny value to keep the suite fast.
@@ -84,8 +93,9 @@ public class IngestionWorker implements Runnable {
     long backoffBaseMillis = 10_000L;
 
     /**
-     * Constructs an {@code IngestionWorker} without a {@link BenchRuntime} reference.
-     * Used in unit tests that do not need live thread-count tracking.
+     * Constructs an {@code IngestionWorker} without a {@link BenchRuntime}
+     * reference or window tracker. Used in unit tests that do not need live
+     * thread-count tracking or windowed rate reporting.
      */
     public IngestionWorker(Config config, BlockingQueue<float[]> queue, AtomicBoolean done, AtomicLong rowId,
                            MetricsCollector metrics, AtomicReference<String> statusLine, long ingestStartNanos,
@@ -93,31 +103,32 @@ public class IngestionWorker implements Runnable {
                            IngestRateLimiterGroup rateLimiterGroup, int rateLimiterIndex) {
         this(config, queue, done, rowId, metrics, statusLine, ingestStartNanos,
                 commitsTotal, commitsRecovered, rowsCommitted,
-                rateLimiterGroup, rateLimiterIndex, null);
+                rateLimiterGroup, rateLimiterIndex, null, null);
     }
 
     /**
      * Convenience constructor used by unit tests that don't exercise the rate
      * limiter at all (flush / retry tests). Equivalent to passing
-     * {@code rateLimiterGroup == null}.
+     * {@code rateLimiterGroup == null} and {@code windowTracker == null}.
      */
     public IngestionWorker(Config config, BlockingQueue<float[]> queue, AtomicBoolean done, AtomicLong rowId,
                            MetricsCollector metrics, AtomicReference<String> statusLine, long ingestStartNanos,
                            AtomicLong commitsTotal, AtomicLong commitsRecovered, AtomicLong rowsCommitted) {
         this(config, queue, done, rowId, metrics, statusLine, ingestStartNanos,
-                commitsTotal, commitsRecovered, rowsCommitted, null, 0, null);
+                commitsTotal, commitsRecovered, rowsCommitted, null, 0, null, null);
     }
 
     /**
      * Constructs an {@code IngestionWorker} with an optional {@link BenchRuntime}
-     * for live thread-count tracking. Pass {@code null} for {@code runtime} when
-     * constructing workers in unit tests that do not need this feature.
+     * for live thread-count tracking and an optional {@link IngestionWindowTracker}
+     * for windowed rate reporting (issue #453). Pass {@code null} for either when
+     * constructing workers in unit tests that do not need those features.
      */
     public IngestionWorker(Config config, BlockingQueue<float[]> queue, AtomicBoolean done, AtomicLong rowId,
                            MetricsCollector metrics, AtomicReference<String> statusLine, long ingestStartNanos,
                            AtomicLong commitsTotal, AtomicLong commitsRecovered, AtomicLong rowsCommitted,
                            IngestRateLimiterGroup rateLimiterGroup, int rateLimiterIndex,
-                           BenchRuntime runtime) {
+                           BenchRuntime runtime, IngestionWindowTracker windowTracker) {
         this.config = config;
         this.queue = queue;
         this.done = done;
@@ -131,6 +142,7 @@ public class IngestionWorker implements Runnable {
         this.rateLimiterGroup = rateLimiterGroup;
         this.rateLimiterIndex = rateLimiterIndex;
         this.runtime = runtime;
+        this.windowTracker = windowTracker;
     }
 
     /** Package-private so {@link VectorBench}'s progress thread can format ETA consistently. */
@@ -514,6 +526,9 @@ public class IngestionWorker implements Runnable {
                 long latencyNanos = commitTransactionWithRetry(
                         ps, conn, pendingBatch, rowsInCurrentSubBatch, transactionStartNanos);
                 metrics.record(latencyNanos);
+                if (windowTracker != null) {
+                    windowTracker.recordCommit(latencyNanos, txnRows);
+                }
                 rowsIngested += txnRows;
                 pendingBatch.clear();
                 rowsInCurrentSubBatch = 0;
@@ -538,9 +553,13 @@ public class IngestionWorker implements Runnable {
         // commit whatever remains in the transaction. The commit unit may be
         // smaller than the configured transaction-size — that's fine.
         if (!pendingBatch.isEmpty()) {
+            int finalRows = pendingBatch.size();
             long latencyNanos = commitTransactionWithRetry(
                     ps, conn, pendingBatch, rowsInCurrentSubBatch, transactionStartNanos);
             metrics.record(latencyNanos);
+            if (windowTracker != null) {
+                windowTracker.recordCommit(latencyNanos, finalRows);
+            }
             pendingBatch.clear();
         }
     }

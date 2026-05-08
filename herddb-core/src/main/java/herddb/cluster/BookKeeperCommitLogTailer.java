@@ -52,6 +52,7 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
     private volatile LogSequenceNumber watermark;
     private volatile boolean running = true;
     private long entriesProcessed;
+    private long batchesProcessed;
     private int consecutiveErrors;
 
     private ZookeeperMetadataStorageManager metadataManager;
@@ -118,6 +119,7 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
                 consecutiveErrors = 0;
                 while (running) {
                     try {
+                        long entriesBefore = entriesProcessed;
                         commitLog.followTheLeader(watermark, (lsn, entry) -> {
                             if (!running) {
                                 return false;
@@ -127,6 +129,13 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
                             entriesProcessed++;
                             return running;
                         }, context);
+                        // One follow cycle that produced at least one entry
+                        // counts as one read batch (issue #459). Surfaced via
+                        // getBatchesProcessed() so engine-stats / Prometheus
+                        // can spot pathological "many tiny batches" patterns.
+                        if (entriesProcessed > entriesBefore) {
+                            batchesProcessed++;
+                        }
                         consecutiveErrors = 0;
                     } catch (LogNotAvailableException e) {
                         if (!running) {
@@ -280,6 +289,11 @@ public class BookKeeperCommitLogTailer implements CommitLogTailing {
     @Override
     public long getEntriesProcessed() {
         return entriesProcessed;
+    }
+
+    @Override
+    public long getBatchesProcessed() {
+        return batchesProcessed;
     }
 
     @Override

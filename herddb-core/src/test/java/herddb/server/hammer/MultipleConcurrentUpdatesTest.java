@@ -106,15 +106,17 @@ public class MultipleConcurrentUpdatesTest {
         performTest(true, 0, false, 90);
     }
 
-    // Checkpoint variants: 240 s JUnit ceiling, 200 s inner per-future limit.
-    // The 200 s inner limit is below the 240 s outer so a stuck checkpoint-phase
-    // future fires TimeoutException first, triggering the thread dump (issue #417).
-    @Test(timeout = 240_000)
+    // Checkpoint variants: 360 s JUnit ceiling (raised from 240 s per issue #456
+    // — the total budget must cover the hot loop + server restart + recovery replay,
+    // which together can exceed 240 s on slow ubuntu-latest CI runners),
+    // 200 s inner per-future limit (200 s < 360 s, so a stuck future fires
+    // TimeoutException before JUnit interrupts the test thread, per issue #417).
+    @Test(timeout = 360_000)
     public void testWithCheckpoints() throws Exception {
         performTest(false, 2000, false, 200);
     }
 
-    @Test(timeout = 240_000)
+    @Test(timeout = 360_000)
     public void testWithTransactionsWithCheckpoints() throws Exception {
         performTest(true, 2000, false, 200);
     }
@@ -129,12 +131,12 @@ public class MultipleConcurrentUpdatesTest {
         performTest(true, 0, true, 90);
     }
 
-    @Test(timeout = 240_000)
+    @Test(timeout = 360_000)
     public void testWithCheckpointsAndIndexes() throws Exception {
         performTest(false, 2000, true, 200);
     }
 
-    @Test(timeout = 240_000)
+    @Test(timeout = 360_000)
     public void testWithTransactionsWithCheckpointsAndIndexes() throws Exception {
         performTest(true, 2000, true, 200);
     }

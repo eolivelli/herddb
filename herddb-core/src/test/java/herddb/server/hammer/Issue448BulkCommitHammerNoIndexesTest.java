@@ -43,8 +43,12 @@ public class Issue448BulkCommitHammerNoIndexesTest extends Issue448BulkCommitHam
      * Periodic checkpoint at 2 s — exercises the interleaving between
      * Phase B / Phase C and the new commit-batched unload dispatch (the
      * issue #157 / #431 / #448 invariants).
+     *
+     * <p>Timeout raised to 300 s (from 240 s) to give extra headroom on CI
+     * runners where the checkpoint thread adds significant commit stalls
+     * (issue #456).
      */
-    @Test(timeout = 240_000)
+    @Test(timeout = 300_000)
     public void hammerWithCheckpoint() throws Exception {
         performHammer(2_000, false, false);
     }

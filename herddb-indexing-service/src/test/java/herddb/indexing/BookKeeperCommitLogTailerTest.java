@@ -150,6 +150,121 @@ public class BookKeeperCommitLogTailerTest {
         }
     }
 
+    /**
+     * Issue #459: {@code BookKeeperCommitLogTailer.getBatchesProcessed()}
+     * must be {@code 0} on a freshly-constructed tailer, must advance once
+     * the tailer drains the leader's first wave of entries, and must keep
+     * advancing as additional waves arrive — confirming the
+     * "{@code entriesProcessed > entriesBefore} → bump batchesProcessed"
+     * delta in {@code BookKeeperCommitLogTailer.run()} is wired correctly.
+     */
+    @Test
+    public void testBatchesProcessedAdvancesAcrossMultipleWaves() throws Exception {
+        String tableSpaceUUID = "test-ts-uuid-batches";
+
+        try (ZookeeperMetadataStorageManager metadataManager = new ZookeeperMetadataStorageManager(
+                testEnv.getAddress(), testEnv.getTimeout(), testEnv.getPath())) {
+            metadataManager.start();
+            metadataManager.ensureDefaultTableSpace(
+                    "writer-node", "writer-node", 0, 1);
+
+            ServerConfiguration serverConfig = new ServerConfiguration();
+            serverConfig.set(ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH,
+                    ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT);
+
+            try (BookkeeperCommitLogManager clManager = new BookkeeperCommitLogManager(
+                    metadataManager, serverConfig, NullStatsLogger.INSTANCE)) {
+                clManager.start();
+
+                BookkeeperCommitLog writerLog = clManager.createCommitLog(
+                        tableSpaceUUID, "default", "writer-node");
+                writerLog.startWriting(1);
+
+                Table table = Table.builder()
+                        .name("mytable")
+                        .tablespace("default")
+                        .column("pk", ColumnTypes.STRING)
+                        .column("data", ColumnTypes.STRING)
+                        .primaryKey("pk")
+                        .build();
+                CommitLogResult r1 = writerLog.log(LogEntryFactory.createTable(table, null), true);
+                assertNotNull(r1.getLogSequenceNumber());
+
+                // First wave.
+                int firstWave = 5;
+                for (int i = 0; i < firstWave; i++) {
+                    writerLog.log(LogEntryFactory.noop(), true);
+                }
+
+                List<LogSequenceNumber> received = new CopyOnWriteArrayList<>();
+                BookKeeperCommitLogTailer tailer = new BookKeeperCommitLogTailer(
+                        testEnv.getAddress(),
+                        testEnv.getTimeout(),
+                        testEnv.getPath(),
+                        ServerConfiguration.PROPERTY_BOOKKEEPER_LEDGERS_PATH_DEFAULT,
+                        tableSpaceUUID,
+                        LogSequenceNumber.START_OF_TIME,
+                        (lsn, entry) -> received.add(lsn)
+                );
+                Thread tailerThread = new Thread(tailer, "test-bk-tailer-batches");
+                tailerThread.setDaemon(true);
+
+                assertEquals("freshly-constructed tailer reports zero batches",
+                        0L, tailer.getBatchesProcessed());
+
+                tailerThread.start();
+                try {
+                    // Wait for the first wave (CREATE_TABLE + firstWave NOOPs)
+                    // to drain.
+                    long deadline = System.currentTimeMillis() + 30_000;
+                    while (received.size() < firstWave + 1
+                            && System.currentTimeMillis() < deadline) {
+                        Thread.sleep(100);
+                    }
+                    assertTrue("first wave drained: received=" + received.size(),
+                            received.size() >= firstWave + 1);
+                    long batchesAfterFirst = tailer.getBatchesProcessed();
+                    assertTrue("at least one batch must be counted after the "
+                                    + "first wave drained, got " + batchesAfterFirst,
+                            batchesAfterFirst >= 1L);
+
+                    // Second wave: append more entries while the tailer is
+                    // following.  followTheLeader() will return again after
+                    // these land, so batchesProcessed must strictly advance.
+                    int secondWave = 3;
+                    for (int i = 0; i < secondWave; i++) {
+                        writerLog.log(LogEntryFactory.noop(), true);
+                    }
+                    deadline = System.currentTimeMillis() + 30_000;
+                    while (received.size() < firstWave + 1 + secondWave
+                            && System.currentTimeMillis() < deadline) {
+                        Thread.sleep(100);
+                    }
+                    assertTrue("second wave drained: received=" + received.size(),
+                            received.size() >= firstWave + 1 + secondWave);
+
+                    // Assert progress: the per-batch counter must move strictly
+                    // forward (no off-by-one, no stuck-at-1).
+                    long batchesAfterSecond = tailer.getBatchesProcessed();
+                    assertTrue("batch counter must advance after the second wave: "
+                                    + "before=" + batchesAfterFirst
+                                    + " after=" + batchesAfterSecond,
+                            batchesAfterSecond > batchesAfterFirst);
+
+                    // Sanity: batches <= entries — every batch carries at
+                    // least one entry, so this invariant must always hold.
+                    assertTrue("batches (" + batchesAfterSecond + ") must be "
+                                    + "<= entries (" + tailer.getEntriesProcessed() + ")",
+                            batchesAfterSecond <= tailer.getEntriesProcessed());
+                } finally {
+                    tailer.close();
+                    tailerThread.join(5_000);
+                }
+                writerLog.close();
+            }
+        }
+    }
+
     @Test
     public void testSpeculativeReadsDisabledByDefault() throws Exception {
         // Issue #180: the tailer is a sequential follower; speculative reads

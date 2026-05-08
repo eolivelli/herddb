@@ -85,6 +85,37 @@ class VectorSegment implements Closeable {
     volatile boolean dirty;
 
     /**
+     * Snapshot of {@link #estimatedInMemoryBytes()} captured by
+     * {@link PersistentVectorStore}'s incremental on-disk-segment memory
+     * counter (issue #455).  Written when the segment is registered with the
+     * store (around the time it joins {@code PersistentVectorStore.segments})
+     * and cleared back to {@code 0} when the segment is unregistered, so the
+     * same value can be subtracted from the global counter that was added —
+     * even if the BLink page cache or {@code pkData} arrays have changed in
+     * between.
+     *
+     * <p>Written and read by the store while holding
+     * {@code stateLock.writeLock()} (or, for the close paths, while no other
+     * thread can observe the store any more); the field is package-private and
+     * only {@code PersistentVectorStore} touches it.  Not {@code volatile}:
+     * the lock discipline above provides the necessary happens-before for
+     * register/unregister pairs.
+     */
+    long cachedEstimatedInMemoryBytes;
+
+    /**
+     * {@code true} once the segment has been registered with
+     * {@link PersistentVectorStore}'s on-disk-segment memory counter
+     * (issue #455).  Used as the bookkeeping sentinel — distinct from
+     * {@link #cachedEstimatedInMemoryBytes} so that a legitimately-zero-byte
+     * snapshot (e.g. an empty post-load segment with empty pk arrays and an
+     * empty BLink) is not mistaken for "not yet registered".  Written and
+     * cleared under the same lock discipline as
+     * {@link #cachedEstimatedInMemoryBytes}.
+     */
+    boolean registeredInMemoryCounter;
+
+    /**
      * IndexStatus generation in which this segment was produced.
      * Monotonically increasing across checkpoints and compaction swaps.
      * Used by compaction to identify the authoritative segment for a PK

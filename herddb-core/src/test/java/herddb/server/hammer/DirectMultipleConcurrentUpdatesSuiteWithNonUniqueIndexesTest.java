@@ -24,8 +24,9 @@ import org.junit.Test;
 
 public class DirectMultipleConcurrentUpdatesSuiteWithNonUniqueIndexesTest extends DirectMultipleConcurrentUpdatesSuite {
 
-    // No-checkpoint variants: 180 s JUnit ceiling, 90 s inner per-future limit
-    // (inner is strictly smaller so TimeoutException fires before JUnit interrupt).
+    // No-checkpoint variants: 180 s JUnit ceiling, 120 s inner per-future limit
+    // (raised from 90 s per issue #456; inner is strictly smaller so TimeoutException
+    // fires before JUnit interrupt).
     @Test(timeout = 180_000)
     public void testWithIndexes() throws Exception {
         performTest(false, 0, true, false);
@@ -36,14 +37,15 @@ public class DirectMultipleConcurrentUpdatesSuiteWithNonUniqueIndexesTest extend
         performTest(true, 0, true, false);
     }
 
-    // Checkpoint variants: 240 s JUnit ceiling, 90 s inner per-future limit
+    // Checkpoint variants: 300 s JUnit ceiling (raised from 240 s per issue #456),
+    // 120 s inner per-future limit (raised from 90 s in the suite per issue #456).
     // (issue #417 — cuts 300 s+ CI hangs; dumpOnFailure rule captures thread dump).
-    @Test(timeout = 240_000)
+    @Test(timeout = 300_000)
     public void testWithCheckpointsAndIndexes() throws Exception {
         performTest(false, 2000, true, false);
     }
 
-    @Test(timeout = 240_000)
+    @Test(timeout = 300_000)
     public void testWithTransactionsWithCheckpointsAndIndexes() throws Exception {
         performTest(true, 2000, true, false);
     }

@@ -370,6 +370,26 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /** On-disk segments. */
     private volatile List<VectorSegment> segments = new java.util.concurrent.CopyOnWriteArrayList<>();
 
+    /**
+     * Incrementally-maintained sum of {@link VectorSegment#estimatedInMemoryBytes()}
+     * across every segment currently registered in {@link #segments}
+     * (issue #455).  Updated by {@link #registerSegmentMemoryEstimate} and
+     * {@link #unregisterSegmentMemoryEstimate} at every mutation point on
+     * the segments list, so {@link #estimatedMemoryUsageBytes()} can read it
+     * in O(1) instead of iterating every segment on every back-pressure check.
+     *
+     * <p>Each segment's contribution is captured as a snapshot at registration
+     * time and stored on the segment in
+     * {@link VectorSegment#cachedEstimatedInMemoryBytes}, so the same value can
+     * later be subtracted on unregistration even if the segment's underlying
+     * BLink page-cache or pkData arrays have shifted in between.  Subsequent
+     * BLink page loads/evictions are not reflected in this counter; the BLink
+     * page-cache footprint is bounded by the {@link MemoryManager}'s global
+     * index-page replacement policy budget, which the back-pressure code
+     * already enforces independently.
+     */
+    private final AtomicLong onDiskSegmentsEstimatedMemoryBytes = new AtomicLong(0);
+
     /** Counter for assigning unique segment IDs. */
     private final AtomicInteger nextSegmentId = new AtomicInteger(0);
 
@@ -1896,7 +1916,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         try {
             List<VectorSegment> old = segments;
             segments = new java.util.concurrent.CopyOnWriteArrayList<>();
+            // Issue #455: drop the old segments' contributions from the
+            // on-disk-segment memory counter before loadFromStatus re-registers
+            // the new ones.
             for (VectorSegment seg : old) {
+                unregisterSegmentMemoryEstimate(seg);
                 try {
                     seg.close();
                 } catch (Exception e) {
@@ -2533,7 +2557,19 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         java.util.Collections.emptyList(),
                         LogSequenceNumber.START_OF_TIME);
 
+                // Issue #455: keep the on-disk-segment memory counter in sync
+                // with the segments-list swap.  Capture the mergedOutput
+                // snapshot BEFORE publishing newSegments so the counter and
+                // the segments list flip together; inputs are unregistered
+                // immediately after the swap (their close() further down
+                // releases pkData / BLink).
+                if (mergedOutput != null) {
+                    registerSegmentMemoryEstimate(mergedOutput);
+                }
                 this.segments = newSegments;
+                for (VectorSegment in : inputs) {
+                    unregisterSegmentMemoryEstimate(in);
+                }
                 dirty.set(dirty.get() || totalLiveSize() > 0);
             } finally {
                 stateLock.writeLock().unlock();
@@ -2938,7 +2974,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
             latch.countDown();
             this.checkpointPhaseComplete = null;
         }
+        // Issue #455: drop every segment's contribution from the on-disk
+        // memory counter before closing them, so the counter goes back to 0
+        // (verified by PersistentVectorStoreEstimatedMemoryCounterTest).
         for (VectorSegment seg : segments) {
+            unregisterSegmentMemoryEstimate(seg);
             seg.close();
         }
         segments = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -3410,7 +3450,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
      *       CompletionTracker) — via JVector's own {@code ramBytesUsed()}</li>
      *   <li>pkToNode + nodeToPk ConcurrentHashMap entries (~100 bytes per entry × 2)</li>
      *   <li>Bytes PK objects (~50 bytes average)</li>
+     *   <li>On-disk segments' in-memory footprint (pkData / pkOffsets / pkLengths
+     *       arrays plus the BLink pk-to-ordinal tree, issue #360) — read in
+     *       O(1) from {@link #onDiskSegmentsEstimatedMemoryBytes}, an
+     *       incrementally-maintained counter populated by
+     *       {@link #registerSegmentMemoryEstimate} at every mutation of
+     *       {@link #segments} (issue #455).</li>
      * </ul>
+     *
+     * <p><strong>Snapshot semantics for the on-disk-segment portion.</strong>
+     * Each segment's contribution is captured as a snapshot at registration
+     * time, so subsequent BLink page-cache loads/evictions on already-
+     * registered segments are not reflected here.  Callers using this value
+     * for diagnostics should be aware that it tracks the static pkData /
+     * pkOffsets / pkLengths arrays exactly but only the registration-time
+     * snapshot of the dynamic BLink page-cache footprint; the live BLink
+     * footprint is bounded independently by the {@link MemoryManager} index
+     * page-replacement policy.
      */
     @Override
     public long estimatedMemoryUsageBytes() {
@@ -3430,27 +3486,119 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 total += shardMemoryBytes(shard);
             }
         }
-        // Include on-disk segments' in-memory footprint (issue #360).
-        // Each VectorSegment retains pkData/pkOffsets/pkLengths arrays and a
-        // BLink pk-to-ordinal tree whose internal BLink Node structures account
-        // for the 6-8 GiB gap observed between engine-stats estimated memory and
-        // actual G1 old-gen usage in the GKE benchmark.
-        for (VectorSegment seg : segments) {
-            total += seg.estimatedInMemoryBytes();
-        }
+        // On-disk segments: O(1) read of the incremental counter (issue #455).
+        total += onDiskSegmentsEstimatedMemoryBytes.get();
         return total;
     }
 
     /**
-     * Returns the sum of {@link VectorSegment#estimatedInMemoryBytes()} across all
-     * current on-disk segments.  Exposed for testing so that tests can assert the
-     * on-disk segment contribution separately from the live-shard contribution,
-     * which is non-zero even for empty shards (the underlying
-     * {@code OnHeapGraphIndex} retains a small fixed overhead).
+     * Returns the in-memory footprint of all currently registered on-disk
+     * {@link VectorSegment} objects (pkData/pkOffsets/pkLengths arrays plus
+     * the BLink pk-to-ordinal tree, snapshotted at segment registration time).
+     *
+     * <p>Exposed for testing so that tests can assert the on-disk segment
+     * contribution separately from the live-shard contribution, which is
+     * non-zero even for empty shards (the underlying {@code OnHeapGraphIndex}
+     * retains a small fixed overhead).
+     *
+     * <p>This is an O(1) read of the incremental counter
+     * {@link #onDiskSegmentsEstimatedMemoryBytes} (issue #455); it does not
+     * iterate over the segments list.
      *
      * @return estimated bytes held by all current on-disk segments
      */
     public long getOnDiskSegmentsEstimatedMemoryBytes() {
+        return onDiskSegmentsEstimatedMemoryBytes.get();
+    }
+
+    // -------------------------------------------------------------------------
+    // On-disk segment memory bookkeeping (issue #455)
+    //
+    // Every site that mutates {@link #segments} must call
+    // {@link #registerSegmentMemoryEstimate} for newly-added segments and
+    // {@link #unregisterSegmentMemoryEstimate} for segments being removed,
+    // so that {@link #onDiskSegmentsEstimatedMemoryBytes} stays consistent
+    // with the iterated sum of {@link VectorSegment#estimatedInMemoryBytes()}
+    // captured at registration time.  The unit test
+    // PersistentVectorStoreEstimatedMemoryCounterTest cross-checks the counter
+    // against the iterated sum at every lifecycle event.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Captures the segment's current memory estimate as a snapshot, stores it
+     * on the segment in {@link VectorSegment#cachedEstimatedInMemoryBytes},
+     * marks {@link VectorSegment#registeredInMemoryCounter}, and adds the
+     * snapshot to {@link #onDiskSegmentsEstimatedMemoryBytes}.  Must be called
+     * exactly once per segment, after pkData/pkOffsets/pkLengths and the BLink
+     * have been populated (i.e. after {@code loadFusedPQSegment}), while the
+     * caller holds {@code stateLock.writeLock()} (or, for the load path, while
+     * no other thread can observe the store yet).
+     *
+     * <p>If the segment is already registered the call is a no-op so retry
+     * paths cannot double-count.  The {@code registeredInMemoryCounter} flag
+     * is the bookkeeping sentinel — kept distinct from
+     * {@code cachedEstimatedInMemoryBytes} so that a legitimately-zero-byte
+     * snapshot (e.g. an empty post-load segment) is not mistaken for "not yet
+     * registered".
+     */
+    private void registerSegmentMemoryEstimate(VectorSegment seg) {
+        if (seg.registeredInMemoryCounter) {
+            // Already registered (e.g. recovery retry); avoid double-count.
+            return;
+        }
+        long bytes = seg.estimatedInMemoryBytes();
+        seg.cachedEstimatedInMemoryBytes = bytes;
+        seg.registeredInMemoryCounter = true;
+        if (bytes != 0) {
+            onDiskSegmentsEstimatedMemoryBytes.addAndGet(bytes);
+        }
+    }
+
+    /**
+     * Subtracts the snapshot captured by
+     * {@link #registerSegmentMemoryEstimate} from
+     * {@link #onDiskSegmentsEstimatedMemoryBytes} and clears the bookkeeping
+     * state on the segment.  Idempotent: a segment that was never registered
+     * (or was already unregistered) is a no-op.  Must be called while holding
+     * {@code stateLock.writeLock()} on every regular mutation path; the
+     * shutdown close paths run after the compaction/checkpoint threads have
+     * been joined and back-pressure waiters released, so no concurrent writer
+     * can race the unregister loop there.
+     */
+    private void unregisterSegmentMemoryEstimate(VectorSegment seg) {
+        if (!seg.registeredInMemoryCounter) {
+            return;
+        }
+        long bytes = seg.cachedEstimatedInMemoryBytes;
+        seg.cachedEstimatedInMemoryBytes = 0L;
+        seg.registeredInMemoryCounter = false;
+        if (bytes != 0) {
+            onDiskSegmentsEstimatedMemoryBytes.addAndGet(-bytes);
+        }
+    }
+
+    /**
+     * Test-only helper: returns the live sum of
+     * {@link VectorSegment#estimatedInMemoryBytes()} across every segment
+     * currently in {@link #segments}, without touching
+     * {@link #onDiskSegmentsEstimatedMemoryBytes}.
+     *
+     * <p>Tests use this as the independent ground truth against which the
+     * counter is compared (issue #455 — a missed register/unregister at any
+     * future mutation site would cause the two values to diverge).
+     *
+     * <p>The values may differ if the BLink page cache of an already-
+     * registered segment has loaded or evicted pages since registration; the
+     * tests only invoke this at clean lifecycle points where no such drift
+     * can occur (immediately after {@code start}, after a {@code checkpoint},
+     * after {@code runCompactionCycle}, after {@code reloadFromStatus}, and
+     * after the all-deleted checkpoint that resets {@code segments} to
+     * empty).
+     *
+     * @return iterated sum of {@code seg.estimatedInMemoryBytes()} across
+     *         the current segment list
+     */
+    public long sumOnDiskSegmentMemoryBytesByIterationForTesting() {
         long total = 0;
         for (VectorSegment seg : segments) {
             total += seg.estimatedInMemoryBytes();
@@ -3682,7 +3830,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
             int totalActiveVectors = (int) onDiskNodeToPkSize() + totalLiveVectors;
 
             if (totalActiveVectors == 0 && !segments.isEmpty()) {
+                // Issue #455: drop every segment's contribution from the
+                // on-disk memory counter before closing them.
                 for (VectorSegment seg : segments) {
+                    unregisterSegmentMemoryEstimate(seg);
                     seg.close();
                     dropSegmentBLinkStorage(seg);
                 }
@@ -3992,6 +4143,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         }
                     }
                 });
+            }
+
+            // Issue #455: sealedSegments + mergeableSegments together cover
+            // every segment that was previously in this.segments (their union
+            // was built by the Phase A partition loop), so they remain
+            // registered.  Only the freshly-built preloadedSegments need to
+            // join the on-disk memory counter here.
+            //
+            // Capture snapshots BEFORE publishing newSegments: if any
+            // estimatedInMemoryBytes() call were ever to throw (e.g. an
+            // unforeseen failure inside BLink.getUsedMemory()), unwinding
+            // before the publish leaves both this.segments and the counter
+            // consistent — no half-updated-counter window.
+            for (VectorSegment seg : preloadedSegments) {
+                registerSegmentMemoryEstimate(seg);
             }
 
             this.segments = newSegments;
@@ -5167,6 +5333,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
         long maxGeneration = loadedGeneration;
         for (VectorSegment seg : segList) {
             segments.add(seg);
+            // Issue #455: snapshot the segment's in-memory footprint into the
+            // on-disk counter so estimatedMemoryUsageBytes() is O(1).
+            registerSegmentMemoryEstimate(seg);
             if (seg.segmentId > maxSegId) {
                 maxSegId = seg.segmentId;
             }
@@ -6262,7 +6431,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
             latch.countDown();
             this.checkpointPhaseComplete = null;
         }
+        // Issue #455: drop every segment's contribution from the on-disk
+        // memory counter before closing them.
         for (VectorSegment seg : segments) {
+            unregisterSegmentMemoryEstimate(seg);
             seg.close();
         }
         segments = new java.util.concurrent.CopyOnWriteArrayList<>();
