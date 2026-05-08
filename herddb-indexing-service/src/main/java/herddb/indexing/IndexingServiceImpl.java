@@ -428,6 +428,14 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                     .setJvmHeapUsedBytes(heapUsed)
                     .setJvmHeapMaxBytes(heapMax)
                     .setJvmHeapUsedPct(heapPct)
+                    // Issue #459: per-operation-type tailer counters.
+                    .setTailerEntriesAccepted(engine.getTailerEntriesAccepted())
+                    .setTailerEntriesSkipped(engine.getTailerEntriesSkipped())
+                    .setTailerInserts(engine.getTailerInserts())
+                    .setTailerUpdates(engine.getTailerUpdates())
+                    .setTailerDeletes(engine.getTailerDeletes())
+                    .setTailerDdl(engine.getTailerDdl())
+                    .setTailerBatches(engine.getTailerBatchesProcessed())
                     .build();
             responseObserver.onNext(response);
             responseObserver.onCompleted();

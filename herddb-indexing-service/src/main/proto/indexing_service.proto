@@ -221,6 +221,22 @@ message GetEngineStatsResponse {
     int64 jvm_heap_used_bytes = 11;
     int64 jvm_heap_max_bytes = 12;
     int32 jvm_heap_used_pct = 13;
+    // Issue #459: per-operation-type tailer counters. All monotonically
+    // increasing since JVM start; rates are derived by the consumer.
+    // entries_accepted = INSERT + UPDATE + DELETE entries (intent to
+    // mutate the HNSW graph). entries_skipped = DDL + NOOP + REBALANCE +
+    // BEGIN/COMMIT/ROLLBACKTRANSACTION (no graph mutation).
+    int64 tailer_entries_accepted = 14;
+    int64 tailer_entries_skipped = 15;
+    int64 tailer_inserts = 16;
+    int64 tailer_updates = 17;
+    int64 tailer_deletes = 18;
+    int64 tailer_ddl = 19;
+    // Number of read batches the underlying tailer has completed: one
+    // poll/follow cycle that processed at least one entry counts as one
+    // batch. Together with tailer_entries_processed this lets operators
+    // spot pathological "many tiny batches" patterns.
+    int64 tailer_batches = 20;
 }
 
 message GetInstanceInfoRequest {

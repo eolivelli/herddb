@@ -46,6 +46,18 @@ public interface CommitLogTailing extends Runnable, AutoCloseable {
     long getEntriesProcessed();
 
     /**
+     * Returns the total number of "read batches" the tailer has completed
+     * since it was created, where a batch is one underlying poll/follow cycle
+     * that processed at least one entry. A consumer can correlate this with
+     * {@link #getEntriesProcessed()} to spot pathological "many small batches"
+     * vs "few large batches" patterns. Defaults to {@code 0} so legacy
+     * implementations that do not track batches stay source-compatible.
+     */
+    default long getBatchesProcessed() {
+        return 0L;
+    }
+
+    /**
      * Returns whether the tailer is currently running.
      */
     boolean isRunning();
