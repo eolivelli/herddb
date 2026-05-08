@@ -146,10 +146,28 @@ public class PersistentVectorStorePhaseCDeletePkRaceTest {
             // remove-vector and search calls.
             //
             // Pick a deterministic, disjoint slice of PKs for each thread
-            // so we can verify final state precisely.
+            // so we can verify final state precisely. The slice DELIBERATELY
+            // includes both:
+            //   - sealed-segment PKs (in [0, totalPks)) — removeVector
+            //     applies these directly via `for (seg : this.segments)`,
+            //   - frozen-shard / preloaded-segment PKs (in
+            //     [newLiveStart, newLiveStart + newLiveCount)) — these go
+            //     ONLY through pendingCheckpointDeletes, exercising the
+            //     pr-reviewer pass-1 BLOCK-1 silent-delete-loss path that
+            //     the Stage-2 re-apply guards against.
             List<Bytes> toDelete = new ArrayList<>();
-            for (int i = 0; i < 100; i++) {
+            int sealedSliceSize = 100;
+            for (int i = 0; i < sealedSliceSize; i++) {
                 toDelete.add(Bytes.from_int(i));
+            }
+            // Add the entire newLive slice — every one of these PKs landed
+            // in a frozen shard at Phase A, then in a preloaded segment
+            // after Phase B; deletes for them MUST be observed via the
+            // pendingCheckpointDeletes path (BLOCK-1 coverage).
+            int preloadedSliceStart = newLiveStart;
+            int preloadedSliceSize = newLiveCount;
+            for (int i = 0; i < preloadedSliceSize; i++) {
+                toDelete.add(Bytes.from_int(preloadedSliceStart + i));
             }
             Set<Bytes> deletedSnapshot = new HashSet<>(toDelete);
 
@@ -158,11 +176,15 @@ public class PersistentVectorStorePhaseCDeletePkRaceTest {
             int searchIterations = 100;
             CountDownLatch racersStart = new CountDownLatch(1);
             CountDownLatch racersDone = new CountDownLatch(searchThreads + removeThreads);
-            AtomicInteger searchExceptions = new AtomicInteger();
+            AtomicReference<Throwable> workerError = new AtomicReference<>();
             AtomicInteger searchesIssued = new AtomicInteger();
 
             // Search workers: hammer the store with searches that should
             // never crash and never include deleted PKs.
+            // Catch Throwable (not just RuntimeException) so an AssertionError
+            // from assertNotNull/assertTrue on the worker thread is captured
+            // and surfaced via workerError instead of being silently
+            // swallowed by the framework after the finally{}-block resolves.
             for (int s = 0; s < searchThreads; s++) {
                 final long seed = 1000 + s;
                 Thread t = new Thread(() -> {
@@ -170,18 +192,16 @@ public class PersistentVectorStorePhaseCDeletePkRaceTest {
                         racersStart.await();
                         Random r = new Random(seed);
                         for (int i = 0; i < searchIterations; i++) {
-                            try {
-                                List<Map.Entry<Bytes, Float>> results =
-                                        store.search(randomVector(r, dim), 10);
-                                assertNotNull("search returned null",
-                                        results);
-                                searchesIssued.incrementAndGet();
-                            } catch (RuntimeException re) {
-                                searchExceptions.incrementAndGet();
-                            }
+                            List<Map.Entry<Bytes, Float>> results =
+                                    store.search(randomVector(r, dim), 10);
+                            assertNotNull("search returned null",
+                                    results);
+                            searchesIssued.incrementAndGet();
                         }
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
+                    } catch (Throwable t2) {
+                        workerError.compareAndSet(null, t2);
                     } finally {
                         racersDone.countDown();
                     }
@@ -228,30 +248,42 @@ public class PersistentVectorStorePhaseCDeletePkRaceTest {
 
             // ---------- Race-result invariants ----------
 
-            // No exceptions from search threads.
-            assertEquals("search threads must not have surfaced any exceptions",
-                    0, searchExceptions.get());
+            // No exceptions or assertion failures from search workers.
+            if (workerError.get() != null) {
+                throw new AssertionError("search worker surfaced an exception/assertion failure",
+                        workerError.get());
+            }
             assertTrue("at least some searches completed during the race",
                     searchesIssued.get() > 0);
 
             // Final state: every deleted PK is GONE.
-            // Run several searches with random queries; deleted PKs must never appear.
+            //
+            // Run searches with topK large enough to materialise EVERY live
+            // PK across multiple random queries. With totalPks + newLiveCount
+            // ≈ 650 and topK = 1000, the ANN search exhausts the index so any
+            // deleted PK that wrongly survived in a segment WOULD appear in
+            // at least one of these results. This is the regression check
+            // for the BLOCK-1 fix (Stage 2 re-apply on preloaded segments)
+            // and the BLOCK-2 fix (Stage 3 re-apply on merged output).
+            int probeTopK = totalPks + newLiveCount + 100;
             for (int q = 0; q < 20; q++) {
                 List<Map.Entry<Bytes, Float>> results =
-                        store.search(randomVector(rng, dim), 100);
+                        store.search(randomVector(rng, dim), probeTopK);
                 for (Map.Entry<Bytes, Float> e : results) {
                     assertTrue("deleted PK " + e.getKey()
-                                    + " resurfaced in search results",
+                                    + " resurfaced in search results"
+                                    + " (BLOCK-1/BLOCK-2 regression: a delete"
+                                    + " that arrived during the lock-free apply"
+                                    + " survived in a preloaded/merged segment)",
                             !deletedSnapshot.contains(e.getKey()));
                 }
             }
 
             // Final size accounting matches: total - deletes - any deletes
-            // applied via pendingCheckpointDeletes in this cycle. We
-            // deleted exactly `toDelete.size()` PKs across both threads.
-            // Allow for `removeVector` racing with checkpoint Phase B-only
-            // ingestion: the precise size depends on whether the live
-            // newLive PKs are added to live-shard counts.
+            // applied via pendingCheckpointDeletes in this cycle. We deleted
+            // exactly `toDelete.size()` PKs across both threads (sealed slice
+            // [0, sealedSliceSize) PLUS preloaded slice
+            // [preloadedSliceStart, preloadedSliceStart + preloadedSliceSize)).
             // Expected size: totalPks (sealed, on-disk) + newLiveCount - toDelete.size()
             long expectedSize = (long) totalPks + newLiveCount - toDelete.size();
             assertEquals("store size after race must equal initial - deletions",

@@ -111,6 +111,7 @@ public class PersistentVectorStoreCompactionSwapFailureTest {
             long genBefore = store.getCurrentIndexStatusGeneration();
             long memCounterBefore = store.getOnDiskSegmentsEstimatedMemoryBytes();
             long compactionFailuresBefore = store.getCompactionFailuresMetadataIoTotal();
+            long swapWriteLockNanosBefore = store.getLastCompactionSwapWriteLockNanos();
 
             // Trigger the failure: next indexCheckpoint throws.
             throwOnNext.set(true);
@@ -136,6 +137,16 @@ public class PersistentVectorStoreCompactionSwapFailureTest {
             // Memory counter unchanged.
             assertEquals("on-disk-segment memory counter must be unchanged after failed swap",
                     memCounterBefore, store.getOnDiskSegmentsEstimatedMemoryBytes());
+
+            // Diagnostic counter unchanged: the writeLock was never acquired
+            // because Stage 2 (the persist) threw before Stage 3. The
+            // counter must reflect either the previous successful swap's
+            // value or 0 — NOT a fresh value updated on the failed cycle.
+            // Catches a future regression that incorrectly stamps the
+            // counter on the abort path.
+            assertEquals("lastCompactionSwapWriteLockNanos must be unchanged when Stage 2 throws"
+                            + " (Stage 3 is never reached, no new writeLock window)",
+                    swapWriteLockNanosBefore, store.getLastCompactionSwapWriteLockNanos());
 
             // Searches still work.
             float[] query = randomVector(rng, dim);

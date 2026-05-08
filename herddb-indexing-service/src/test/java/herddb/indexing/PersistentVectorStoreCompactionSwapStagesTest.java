@@ -21,7 +21,6 @@ package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.index.vector.PersistentVectorStore;
@@ -225,18 +224,13 @@ public class PersistentVectorStoreCompactionSwapStagesTest {
 
             // Null hooks must not throw — the swap protocol is the same as
             // when the hooks are not configured (production behaviour).
-            assertNull(noOp(store));
+            store.setAtomicSwapPostBuildHookForTest(null);
+            store.setAtomicSwapPostPersistHookForTest(null);
 
             store.runCompactionCycle();
 
             assertTrue("compaction reduced segments after null-hook cycle",
                     store.getSegmentCount() < before);
         }
-    }
-
-    private static Object noOp(PersistentVectorStore store) {
-        store.setAtomicSwapPostBuildHookForTest(null);
-        store.setAtomicSwapPostPersistHookForTest(null);
-        return null;
     }
 }

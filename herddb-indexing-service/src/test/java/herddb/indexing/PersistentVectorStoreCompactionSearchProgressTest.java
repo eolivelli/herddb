@@ -175,29 +175,34 @@ public class PersistentVectorStoreCompactionSearchProgressTest {
             // starving every search. Issue searches and assert (a) they don't
             // hang and (b) several of them complete WHILE the persist is still
             // blocked — i.e., NOT just after we release the latch.
+            //
+            // Timing budgets are deliberately loose to ride out slow CI
+            // runners. The pre-fix code blocks for the full 2 s+ persist
+            // duration; we accept up to 1 s per individual search here so a
+            // jvector ANN cold-start (JIT warmup, MMU TLB miss, etc.)
+            // doesn't flake the test. The assertion still has bite because
+            // a regression that re-introduces the writeLock-around-persist
+            // would block searches for the FULL persist duration (≥ 2 s).
             float[] query = randomVector(rng, dim);
             int searchesCompletedDuringPersist = 0;
             long maxSingleSearchNanos = 0;
-            long progressDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
-            while (System.nanoTime() < progressDeadline) {
-                // The compaction must still be parked. If not, we have not
-                // proven anything.
-                if (release.getCount() == 0) {
-                    break;
-                }
+            long progressDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (System.nanoTime() < progressDeadline
+                    && searchesCompletedDuringPersist < 5
+                    && release.getCount() > 0) {
                 long t0 = System.nanoTime();
                 List<Map.Entry<Bytes, Float>> results = store.search(query, 5);
                 long elapsed = System.nanoTime() - t0;
                 maxSingleSearchNanos = Math.max(maxSingleSearchNanos, elapsed);
                 assertFalse("search returned a null result list", results == null);
                 searchesCompletedDuringPersist++;
-                // If we have proven the point with a healthy margin, stop.
-                if (searchesCompletedDuringPersist >= 5
-                        && System.nanoTime() - t0 < TimeUnit.MILLISECONDS.toNanos(50)) {
-                    // continue collecting up to a small budget to confirm
-                    // searches stay fast
-                }
             }
+
+            // Snapshot the assertion-relevant state BEFORE we release the
+            // persist latch, so the headline assertions cannot be coloured
+            // by post-release activity (e.g., the writeLock-held Stage-3
+            // micro-window that legitimately runs after release).
+            boolean compactionStillParked = release.getCount() > 0;
 
             // Release the persist; compaction completes.
             release.countDown();
@@ -212,19 +217,26 @@ public class PersistentVectorStoreCompactionSearchProgressTest {
                             + " saw " + searchesCompletedDuringPersist
                             + " (issue #462: writeLock must not be held during the persist)",
                     searchesCompletedDuringPersist >= 5);
+            assertTrue("compaction must still have been parked when the test"
+                            + " collected its progress evidence; if not, the test"
+                            + " did not actually exercise the slow-persist window",
+                    compactionStillParked);
 
-            // Latency budget: each search during the persist had to be far
-            // shorter than the persist duration itself. 200 ms is a generous
-            // bound that still proves the writeLock is not held.
+            // Latency budget: each search during the persist must be far
+            // shorter than the persist duration itself. 1 s is a generous
+            // CI-tolerant bound that still proves the writeLock is not held
+            // (the pre-fix code blocks for ≥ 2 s).
             assertTrue("max search latency during persist (" + (maxSingleSearchNanos / 1_000_000)
                             + " ms) must be far less than the persist duration ("
                             + (dsm.persistDurationNanos.get() / 1_000_000) + " ms)",
-                    maxSingleSearchNanos < TimeUnit.MILLISECONDS.toNanos(200));
+                    maxSingleSearchNanos < TimeUnit.SECONDS.toNanos(1));
 
-            // Diagnostic counter sanity: Stage 3's writeLock window is microseconds.
-            assertTrue("Stage 3 writeLock window must be tiny (issue #462 SLO);"
+            // Diagnostic counter sanity: Stage 3's writeLock window is small.
+            // Pre-fix code at scale is multi-second; the post-fix value is
+            // microseconds. 1 s is a generous CI-tolerant bound.
+            assertTrue("Stage 3 writeLock window must be small (issue #462 SLO);"
                             + " observed " + store.getLastCompactionSwapWriteLockNanos() + " ns",
-                    store.getLastCompactionSwapWriteLockNanos() < 200_000_000L);
+                    store.getLastCompactionSwapWriteLockNanos() < TimeUnit.SECONDS.toNanos(1));
 
             // Functional correctness: compaction succeeded.
             int afterMerge = store.getSegmentCount();

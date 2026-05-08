@@ -2600,7 +2600,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
             // so the volatile read of `this.segments` is stable for the
             // duration of this method.
             List<VectorSegment> current = this.segments;
-            Set<Integer> currentIds = new java.util.HashSet<>(current.size() * 2);
+            // Canonical pre-sizing: HashSet rounds up to the next power of two,
+            // so we want capacity = ceil(size / loadFactor). 0.75f is the
+            // default load factor.
+            Set<Integer> currentIds = new java.util.HashSet<>(
+                    (int) (current.size() / 0.75f) + 1);
             for (VectorSegment s : current) {
                 currentIds.add(s.segmentId);
             }
@@ -2625,7 +2629,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 }
             }
 
-            Set<Integer> inputIds = new java.util.HashSet<>(inputs.size() * 2);
+            Set<Integer> inputIds = new java.util.HashSet<>(
+                    (int) (inputs.size() / 0.75f) + 1);
             for (VectorSegment in : inputs) {
                 inputIds.add(in.segmentId);
             }
@@ -2681,7 +2686,31 @@ public class PersistentVectorStore extends AbstractVectorStore {
             long stage3Start = System.nanoTime();
             stateLock.writeLock().lock();
             try {
+                // Re-apply pendingCompactionDeletes to merged under
+                // writeLock, catching any PKs that arrived after the
+                // lock-free lateDeletes.forEach in runCompactionCycle and
+                // during Stages 1+2 of this method (issue #462, pr-reviewer
+                // pass-1 BLOCK fix). Without this re-apply: a removeVector(X)
+                // arriving during Stages 1+2 finds X in an input segment
+                // (still in this.segments until Stage 3), seg.deletePk
+                // succeeds on the input — but the input is about to be
+                // discarded, lateDeletes.forEach already ran on merged, and
+                // X stays in merged. The set is closed in
+                // runCompactionCycle's finally block right after this method
+                // returns, so this is the last opportunity to apply.
+                //
+                // Cost: O(|pendingCompactionDeletes|) BLink scans on
+                // mergedOutput. Bounded by application's delete rate ×
+                // (lock-free Stage 1+2 duration). Each seg.deletePk on a
+                // missing PK is a single BLink search returning null, so
+                // entries already absorbed by lateDeletes.forEach return
+                // quickly and only the late-arrivers do meaningful work.
                 if (mergedOutput != null) {
+                    PagedPkSet lateDeletesReapply = this.pendingCompactionDeletes;
+                    if (lateDeletesReapply != null) {
+                        VectorSegment merged = mergedOutput;
+                        lateDeletesReapply.forEach(merged::deletePk);
+                    }
                     registerSegmentMemoryEstimate(mergedOutput);
                 }
                 this.segments = newSegments;
@@ -4296,6 +4325,37 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         // ignore
                     }
                 }
+            }
+
+            // Re-apply pendingCheckpointDeletes to preloadedSegments under
+            // writeLock to catch any PKs that arrived in the BLink-backed
+            // pending set after Stage 1's lock-free forEach (issue #462,
+            // pr-reviewer pass-1 BLOCK fix). BLink.scan is weakly consistent:
+            // late-arriver inserts that land left of the iterator's current
+            // position are missed by Stage 1.
+            //
+            // We restrict the re-apply to preloadedSegments (not all
+            // newSegments) because removeVector itself directly applies the
+            // delete to existing on-disk segments via its iteration of
+            // `this.segments` (see PersistentVectorStore.removeVector). The
+            // gap is only the preloaded segments that aren't in
+            // `this.segments` until Stage 2's publish below — removeVector
+            // can't see them, so the late-arriver path through
+            // pendingCheckpointDeletes is the only mechanism.
+            //
+            // Cost: O(|pending| × |preloadedSegments|) with preloadedSegments
+            // typically 1 segment. Each seg.deletePk on a missing PK is a
+            // single BLink search that returns null quickly, so this is fast
+            // even when most pending entries were already applied in Stage 1.
+            PagedPkSet pendingForReapply = this.pendingCheckpointDeletes;
+            if (pendingForReapply != null && !preloadedSegments.isEmpty()) {
+                pendingForReapply.forEach(pk -> {
+                    for (VectorSegment seg : preloadedSegments) {
+                        if (seg.deletePk(pk)) {
+                            return;
+                        }
+                    }
+                });
             }
 
             // Issue #455: sealedSegments + mergeableSegments together cover
