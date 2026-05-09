@@ -51,7 +51,7 @@ import java.util.Map;
  * three-field header with distinct {@code kind} values so the two formats can
  * coexist in the same index directory without ambiguity.</p>
  */
-final class IncrementalBLinkPageCodec {
+public final class IncrementalBLinkPageCodec {
 
     static final long PAGE_VERSION = 1L;
 
@@ -164,6 +164,40 @@ final class IncrementalBLinkPageCodec {
     // -------- size estimators (used by callers to pre-size the ByteBuf) --------
 
     /**
+     * Estimates the serialised size of a BLink node page (INNER or LEAF) for
+     * the given {@code data} map.
+     *
+     * <p>All three BLink page writers — {@code BLinkKeyToPageIndex},
+     * {@code IncrementalBLinkKeyToPageIndex}, and {@code PersistentVectorStore}
+     * — share the same wire format and delegate to this method for their
+     * {@code DataWriter.sizeEstimate()} overrides.
+     *
+     * <p>The estimate is exact for key lengths and page-ID VLong widths; it
+     * uses a conservative 9-byte maximum for the {@code POSITIVE_INFINITY}
+     * entry's VLong (the actual page-id VLong could be 1–9 bytes, but +inf
+     * entries are rare).
+     */
+    public static int nodePageSizeEstimate(Map<Bytes, Long> data) {
+        // vlong(1) + vlong(0) + byte(type) = 1 + 1 + 1 = 3
+        int estimate = 3;
+        for (Map.Entry<Bytes, Long> e : data.entrySet()) {
+            Bytes k = e.getKey();
+            if (k == Bytes.POSITIVE_INFINITY) {
+                // byte(INF_BLOCK) + vlong(pageId) — worst case 9 bytes
+                estimate += 1 + 9;
+            } else {
+                int keyLen = k.getLength();
+                // byte(KEY_VALUE_BLOCK) + vint(keyLen) + keyLen + vlong(pageId)
+                estimate += 1 + ByteBufUtils.varIntLen(keyLen) + keyLen
+                        + ByteBufUtils.varLongLen(e.getValue());
+            }
+        }
+        // byte(END_BLOCK)
+        estimate += 1;
+        return estimate;
+    }
+
+    /**
      * Estimates the serialised byte size of a snapshot-chunk page for the
      * given {@code nodes} list. Used by the caller to pre-size the backing
      * {@code ByteBuf} via {@code DataWriter.sizeEstimate()}.
@@ -216,8 +250,13 @@ final class IncrementalBLinkPageCodec {
      * {@code keys}, {@code bytes}, rightsep key bytes) and a conservative
      * 9-byte worst-case for the zig-zag-encoded {@code outlink} and
      * {@code rightlink} fields.
+     *
+     * <p>Handles all values that {@link #writeNodeMetadata} accepts:
+     * {@code null} rightsep encodes as a vint(-1) null marker (5 bytes);
+     * {@link Bytes#POSITIVE_INFINITY} encodes as a single-byte sentinel;
+     * any other {@code Bytes} encodes as vint(len) + len bytes.
      */
-    private static int nodeMetadataSizeEstimate(BLinkNodeMetadata<Bytes> node) {
+    static int nodeMetadataSizeEstimate(BLinkNodeMetadata<Bytes> node) {
         // boolean(1) + vlong(id) + vlong(storeId) + vint(keys) + vlong(bytes)
         //   + zlong(outlink)[worst 9] + zlong(rightlink)[worst 9] + byte(rightsep_type)
         int estimate = 1
@@ -228,7 +267,10 @@ final class IncrementalBLinkPageCodec {
                 + 9  // zlong(outlink): zig-zag may produce a large unsigned value
                 + 9  // zlong(rightlink): same
                 + 1; // rightsep type byte
-        if (node.rightsep != Bytes.POSITIVE_INFINITY) {
+        if (node.rightsep == null) {
+            // writeNodeMetadata emits writeArray(null) → writeNullArray() → vint(-1) = 5 bytes
+            estimate += 5;
+        } else if (node.rightsep != Bytes.POSITIVE_INFINITY) {
             int keyLen = node.rightsep.getLength();
             estimate += ByteBufUtils.varIntLen(keyLen) + keyLen;
         }

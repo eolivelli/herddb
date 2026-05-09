@@ -24,12 +24,12 @@ import herddb.core.MemoryManager;
 import herddb.index.blink.BLink;
 import herddb.index.blink.BLinkIndexDataStorage;
 import herddb.index.blink.BytesLongSizeEvaluator;
+import herddb.index.blink.IncrementalBLinkPageCodec;
 import herddb.log.LogSequenceNumber;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
 import herddb.utils.ByteBufDataOutput;
-import herddb.utils.ByteBufUtils;
 import herddb.utils.Bytes;
 import herddb.utils.VectorSearchRequestContext;
 import herddb.utils.VisibleByteArrayOutputStream;
@@ -6319,27 +6319,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
             writePage(pageId, data, BLINK_LEAF_NODE_PAGE);
         }
 
-        /**
-         * Estimates the serialised size of a BLink node page for pre-sizing
-         * the backing {@code ByteBuf}.
-         */
-        private static int nodePageSizeEstimate(Map<Bytes, Long> data) {
-            // vlong(1) + vlong(0) + byte(type) = 1 + 1 + 1 = 3
-            int estimate = 3;
-            for (Map.Entry<Bytes, Long> e : data.entrySet()) {
-                Bytes k = e.getKey();
-                if (k == Bytes.POSITIVE_INFINITY) {
-                    estimate += 1 + 9; // byte(INF_BLOCK) + vlong(pageId) worst case
-                } else {
-                    int keyLen = k.getLength();
-                    estimate += 1 + ByteBufUtils.varIntLen(keyLen) + keyLen
-                            + ByteBufUtils.varLongLen(e.getValue());
-                }
-            }
-            estimate += 1; // byte(END_BLOCK)
-            return estimate;
-        }
-
         private long writePage(long pageId, Map<Bytes, Long> data, byte type) throws IOException {
             if (pageId == NEW_PAGE) {
                 pageId = newPageId.getAndIncrement();
@@ -6371,7 +6350,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         }
                         @Override
                         public int sizeEstimate() {
-                            return nodePageSizeEstimate(data);
+                            return IncrementalBLinkPageCodec.nodePageSizeEstimate(data);
                         }
                     });
             return pageId;

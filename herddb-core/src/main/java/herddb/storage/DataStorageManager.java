@@ -148,6 +148,7 @@ public abstract class DataStorageManager implements AutoCloseable {
                 "Lazy page loading not supported by " + getClass().getName());
     }
 
+    @FunctionalInterface
     public interface DataWriter {
 
         /**
