@@ -131,16 +131,26 @@ public class VectorIndexManager extends AbstractIndexManager {
      * later step throws. Together these two recovery paths cover every
      * failure point BETWEEN pin sites.
      *
-     * <p><b>Success-path unpin is a planned follow-up.</b> When the
-     * IS rebuild completes successfully, the server is currently NOT
-     * notified, so the pin lingers in the leader's in-memory pin
-     * maps until the leader process restarts. The trade-off is
-     * bounded in-memory pin accumulation (one set of pins per
-     * CREATE VECTOR INDEX since the last restart) in exchange for
-     * not needing an IS→server unpin RPC in this PR. An explicit
-     * unpin signal — likely driven by the IS publishing a
-     * post-rebuild watermark past the {@code CREATE_INDEX} LSN —
-     * is intended for a follow-up.
+     * <p><b>Success-path unpin</b>: when the IS rebuild completes
+     * successfully and publishes a post-rebuild watermark past the
+     * {@code CREATE_INDEX} LSN, the leader's tablespace checkpoint
+     * flow ({@code TableSpaceManager.releaseCompletedRebuildPins})
+     * releases the pin on the next cycle. The release uses the
+     * existing {@link RemoteVectorIndexService#getMinProcessedLsn}
+     * RPC the IS already publishes for commit-log retention — no
+     * new RPC was needed. Pre-existing secondary-index pins
+     * registered at the same LSN are NOT released by this path
+     * (they leak their per-index pin until the leader restarts);
+     * releasing them as well is a smaller follow-up.
+     *
+     * <p><b>Restart caveat</b>: pins are in-memory only on the
+     * leader. If the IS rebuild has not completed when the leader
+     * restarts, the IS-side scan may observe
+     * {@code PageNotFoundException} and the engine escalates to
+     * {@code EngineStatus.FAILED}; on the next leader-side
+     * tablespace checkpoint after the IS catches up, the rebuild
+     * is replayed against a fresh pin. Persisting the pin map
+     * across leader restarts is a planned follow-up.
      *
      * <p>An internal failure inside a single
      * {@code dataStorageManager.tableCheckpoint} or
