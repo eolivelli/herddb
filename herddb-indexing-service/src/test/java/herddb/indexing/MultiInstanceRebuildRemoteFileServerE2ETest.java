@@ -122,17 +122,19 @@ public class MultiInstanceRebuildRemoteFileServerE2ETest {
     private static final int NUM_RECORDS = 60;
 
     private DBManager buildHerddbServer(Path dataPath, Path logsPath, Path metadataPath,
-                                        Path tmpPath, RemoteFileServiceClient client)
+                                        Path tmpPath, RemoteFileServiceClient client,
+                                        herddb.remote.SharedCheckpointMetadataManager shared)
             throws Exception {
         ServerConfiguration config = new ServerConfiguration();
         // JSQLParserPlanner — the CREATE VECTOR INDEX path lives there.
         config.set(ServerConfiguration.PROPERTY_PLANNER_TYPE,
                 ServerConfiguration.PLANNER_TYPE_JSQLPARSER);
-        // dataPath here doubles as the local metadata directory
-        // shared with the IS engines (see test-only comment on the
-        // test method).
         RemoteFileDataStorageManager dsm = new RemoteFileDataStorageManager(
                 dataPath, tmpPath, 1000, client);
+        // Wire the shared metadata manager so tableCheckpoint
+        // publishes TableStatus to shared remote storage where the
+        // IS engines can read it via the fallback path.
+        dsm.setSharedCheckpointMetadataManager(shared);
         DBManager manager = new DBManager("localhost",
                 new FileMetadataStorageManager(metadataPath),
                 dsm,
@@ -196,7 +198,9 @@ public class MultiInstanceRebuildRemoteFileServerE2ETest {
     private IndexingServiceEngine buildIsEngine(int instanceId, int numInstances,
                                                 RemoteFileServiceClient client,
                                                 Path metadata, Path tmpDir,
-                                                Path logDir, Path dataDir) throws Exception {
+                                                Path logDir, Path dataDir,
+                                                herddb.remote.SharedCheckpointMetadataManager shared)
+            throws Exception {
         Properties props = new Properties();
         // Use storage.type=memory so the engine does not overwrite our
         // explicitly-set DSM in start(). The IS-side rebuild reads from
@@ -216,6 +220,12 @@ public class MultiInstanceRebuildRemoteFileServerE2ETest {
         engine.setMetadataStorageManager(mem);
         RemoteFileDataStorageManager dsm = new RemoteFileDataStorageManager(
                 metadata, tmpDir, 1000, client);
+        // Wire the shared metadata manager so the IS engine's
+        // getTableStatus falls back to shared remote storage when its
+        // own local metadata directory does not have the file (issue
+        // #471 fix). Without this, a fresh IS engine cannot scan a
+        // table at the rebuild LSN.
+        dsm.setSharedCheckpointMetadataManager(shared);
         engine.setDataStorageManager(dsm);
         engine.setMemoryManager(new MemoryManager(
                 64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024));
@@ -224,29 +234,22 @@ public class MultiInstanceRebuildRemoteFileServerE2ETest {
     }
 
     /**
-     * <b>Test-only metadata sharing</b>: in production, the herddb
-     * server's {@code RemoteFileDataStorageManager} writes
-     * {@code TableStatus} / {@code IndexStatus} files to its local
-     * metadata directory and also publishes them to shared remote
-     * storage via {@link herddb.server.SharedCheckpointMetadata}.
-     * The IS-side DSM, however, reads {@code getTableStatus} from
-     * its OWN local metadata directory, NOT from shared storage —
-     * so a fresh IS engine pointing at a shared file server has no
-     * way to learn the herddb server's checkpoint LSN. To exercise
-     * the rebuild's page-reading path against actual remote
-     * storage, this test routes ALL DSMs at the same local
-     * metadata directory so the herddb server's tableCheckpoint
-     * writes are immediately visible to the IS engines' {@code
-     * getTableStatus} calls. This is NOT a faithful production
-     * topology — the metadata-sync gap is a known follow-up
-     * (tracked by step 6's pre-PR validation discussion) and is
-     * orthogonal to the rebuild contract this PR establishes.
+     * <b>Production-grade metadata propagation</b>: each DSM has its
+     * OWN local metadata directory (just like a real deployment),
+     * but every DSM is wired to the same
+     * {@link SharedCheckpointMetadataManager} so the herddb leader's
+     * {@code tableCheckpoint(true)} call publishes the
+     * {@code TableStatus} to shared remote storage, and each IS
+     * engine's {@code getTableStatus} call falls back to that shared
+     * storage when its own local metadata directory does not have
+     * the file. Without this fallback (issue #471 fix), a fresh IS
+     * engine cannot scan a table at the rebuild LSN because the
+     * herddb leader is the only writer of local metadata.
      */
     @Test
     public void threeInstances_rebuildFromSharedRemoteFileServer_eachOwnsItsShard()
             throws Exception {
         Path fileServerData = folder.newFolder("file-server").toPath();
-        Path sharedMetadata = folder.newFolder("shared-meta").toPath();
         Path serverData = folder.newFolder("server-data").toPath();
         Path serverLogs = folder.newFolder("server-logs").toPath();
         Path serverMeta = folder.newFolder("server-meta").toPath();
@@ -257,15 +260,18 @@ public class MultiInstanceRebuildRemoteFileServerE2ETest {
             fileServer.start();
             String fileServerAddr = "localhost:" + fileServer.getPort();
 
-            // The herddb server-side client; populates the file server
-            // with the table data. We pass `sharedMetadata` as the
-            // dsm's metadata directory so all DSMs (server + IS
-            // engines) share local metadata files (test-only — see
-            // method-level javadoc).
+            // The herddb server-side client + shared metadata
+            // manager. The shared manager publishes TableStatus
+            // writes to the file server so IS engines (separate
+            // local-metadata directories) can read them via the
+            // RemoteFileDataStorageManager.getTableStatus fallback
+            // path added by issue #471.
             try (RemoteFileServiceClient serverFsClient = new RemoteFileServiceClient(
-                    Collections.singletonList(fileServerAddr));
-                 DBManager manager = buildHerddbServer(sharedMetadata, serverLogs, serverMeta,
-                         serverTmp, serverFsClient)) {
+                    Collections.singletonList(fileServerAddr))) {
+                herddb.remote.SharedCheckpointMetadataManager sharedMeta =
+                        new herddb.remote.SharedCheckpointMetadataManager(serverFsClient);
+                try (DBManager manager = buildHerddbServer(serverData, serverLogs, serverMeta,
+                        serverTmp, serverFsClient, sharedMeta)) {
                 manager.start();
 
                 CreateTableSpaceStatement st1 = new CreateTableSpaceStatement(
@@ -322,17 +328,18 @@ public class MultiInstanceRebuildRemoteFileServerE2ETest {
                         RemoteFileServiceClient isClient = new RemoteFileServiceClient(
                                 Collections.singletonList(fileServerAddr));
                         isClients.add(isClient);
-                        // Test-only metadata sharing: every IS engine
-                        // points its local metadata at the same
-                        // directory the herddb server wrote to, so
-                        // the tableCheckpoint files are visible to
-                        // each engine's getTableStatus call.
-                        Path isMeta = sharedMetadata;
+                        // Each IS engine has its OWN local metadata
+                        // directory — no sharing. The
+                        // SharedCheckpointMetadataManager fallback
+                        // wired via setSharedCheckpointMetadataManager
+                        // is what makes the IS-side getTableStatus
+                        // see the herddb leader's TableStatus.
+                        Path isMeta = folder.newFolder("is-meta-" + i).toPath();
                         Path isTmp = folder.newFolder("is-tmp-" + i).toPath();
                         Path isLog = folder.newFolder("is-log-" + i).toPath();
                         Path isData = folder.newFolder("is-data-" + i).toPath();
                         IndexingServiceEngine engine = buildIsEngine(i, NUM_INSTANCES,
-                                isClient, isMeta, isTmp, isLog, isData);
+                                isClient, isMeta, isTmp, isLog, isData, sharedMeta);
                         engines.add(engine);
 
                         // Each engine MUST share the herddb server's
@@ -409,6 +416,7 @@ public class MultiInstanceRebuildRemoteFileServerE2ETest {
                         } catch (Exception ignore) {
                         }
                     }
+                }
                 }
             }
         }
