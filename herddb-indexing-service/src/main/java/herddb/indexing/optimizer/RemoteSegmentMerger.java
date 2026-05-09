@@ -174,9 +174,26 @@ public final class RemoteSegmentMerger implements SegmentMerger {
                                 + " skipping merge until IS recheckpoints the segment");
             }
             long mapFileSizeHint = m.getMapFileSize();
+            // Issue #485: derive graphFileSize from the existing znode fields
+            // (sizeBytes = graphFileSize + mapFileSize per
+            // PersistentVectorStore.SegmentWriteResult). The streaming merge
+            // path needs the exact graph size to drive the multipart reader;
+            // the legacy in-memory path ignores it. Compute and pass through
+            // unconditionally — the dispatcher in RemoteSegmentGraphMerger.merge
+            // chooses the path.
+            long graphFileSizeHint = m.getSizeBytes() - m.getMapFileSize();
+            if (graphFileSizeHint <= 0L) {
+                throw new LegacyMetadataException(m.getSegmentUuid(),
+                        m.getSizeBytes(),
+                        "input segment " + m.getSegmentUuid() + " has invalid"
+                                + " graphFileSize=" + graphFileSizeHint
+                                + " (sizeBytes=" + m.getSizeBytes()
+                                + " mapFileSize=" + m.getMapFileSize()
+                                + "); skipping merge until IS recheckpoints the segment");
+            }
             graphInputs.add(new RemoteSegmentGraphMerger.RemoteSegmentInput(
                     m.getTablespaceUuid(), m.getIndexUuid(), m.getSegmentUuid(),
-                    m.getSegmentId(), mapFileSizeHint, m.getGeneration(),
+                    m.getSegmentId(), mapFileSizeHint, graphFileSizeHint, m.getGeneration(),
                     tombstoned));
             if (m.getGeneration() > maxGeneration) {
                 maxGeneration = m.getGeneration();

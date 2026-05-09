@@ -24,10 +24,14 @@ import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
+import io.github.jbellis.jvector.disk.ReaderSupplierFactory;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.ImmutableGraphIndex;
 import io.github.jbellis.jvector.graph.OnHeapGraphIndex;
+import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
+import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexWriter;
+import io.github.jbellis.jvector.graph.disk.OrdinalMapper;
 import io.github.jbellis.jvector.graph.disk.feature.Feature;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.FusedPQ;
@@ -35,6 +39,8 @@ import io.github.jbellis.jvector.graph.disk.feature.InlineVectors;
 import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
 import io.github.jbellis.jvector.quantization.PQVectors;
 import io.github.jbellis.jvector.quantization.ProductQuantization;
+import io.github.jbellis.jvector.util.FixedBitSet;
+import io.github.jbellis.jvector.util.PhysicalCoreExecutor;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
@@ -169,6 +175,19 @@ public final class RemoteSegmentGraphMerger {
         public final long segmentId;
         public final long mapFileSize;
         /**
+         * Exact size of the segment's graph multipart file, in bytes.
+         * Used by the streaming-compaction path (issue #485) to drive the
+         * graph download without probing the remote object. Derived by the
+         * caller as {@code metadata.sizeBytes - metadata.mapFileSize}
+         * (since {@code sizeBytes = graphFileSize + mapFileSize} per
+         * {@link PersistentVectorStore.SegmentWriteResult}). The
+         * legacy in-memory merge path ignores this field.
+         *
+         * <p>Set to {@code 0} when unknown (the streaming path will refuse
+         * to merge such an input).
+         */
+        public final long graphFileSize;
+        /**
          * Generation as recorded in the registry znode. Used for tie-breaking
          * when the same primary key appears in multiple input segments — the
          * higher-generation source wins (mirrors the in-IS authority map's
@@ -184,14 +203,30 @@ public final class RemoteSegmentGraphMerger {
          */
         public final int[] tombstonedOrdinals;
 
+        /**
+         * Convenience constructor that defaults {@link #graphFileSize} to 0.
+         * Retained so the legacy merge path keeps working for callers that
+         * have not yet been updated to plumb the graph size through. The
+         * streaming path will refuse to merge any input whose graphFileSize
+         * is 0 — operators must update the SPI caller (e.g.,
+         * {@code RemoteSegmentMerger}) to pass the real value.
+         */
         public RemoteSegmentInput(String tablespaceUuid, String indexUuid, String segmentUuid,
                                   long segmentId, long mapFileSize, long generation,
                                   int[] tombstonedOrdinals) {
+            this(tablespaceUuid, indexUuid, segmentUuid, segmentId, mapFileSize,
+                    /* graphFileSize */ 0L, generation, tombstonedOrdinals);
+        }
+
+        public RemoteSegmentInput(String tablespaceUuid, String indexUuid, String segmentUuid,
+                                  long segmentId, long mapFileSize, long graphFileSize,
+                                  long generation, int[] tombstonedOrdinals) {
             this.tablespaceUuid = Objects.requireNonNull(tablespaceUuid, "tablespaceUuid");
             this.indexUuid = Objects.requireNonNull(indexUuid, "indexUuid");
             this.segmentUuid = Objects.requireNonNull(segmentUuid, "segmentUuid");
             this.segmentId = segmentId;
             this.mapFileSize = mapFileSize;
+            this.graphFileSize = graphFileSize;
             this.generation = generation;
             this.tombstonedOrdinals = tombstonedOrdinals == null
                     ? new int[0]
@@ -265,6 +300,47 @@ public final class RemoteSegmentGraphMerger {
             throw new IllegalArgumentException("dim must be positive: " + dim);
         }
 
+        // Issue #485 — streaming compaction. Run the on-disk merge engine
+        // when (a) the streaming flag is on, (b) there are at least two
+        // inputs (jvector's OnDiskGraphIndexCompactor rejects single-source
+        // construction), and (c) every input has a non-zero graphFileSize.
+        // Any other configuration falls back to the legacy in-memory rebuild.
+        if (VectorIndexCompactor.streamingCompactionEnabled
+                && inputs.size() >= 2
+                && allInputsHaveGraphFileSize(inputs)) {
+            return mergeStreaming(inputs, outputTablespaceUuid, outputIndexUuid,
+                    outputSegmentId, dim);
+        }
+        return mergeLegacy(inputs, outputTablespaceUuid, outputIndexUuid,
+                outputSegmentId, dim);
+    }
+
+    private static boolean allInputsHaveGraphFileSize(List<RemoteSegmentInput> inputs) {
+        for (RemoteSegmentInput in : inputs) {
+            if (in.graphFileSize <= 0L) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Legacy in-memory rebuild: reads each input's map file (carrying
+     * {@code (ordinal, pk, vector)} tuples), de-duplicates by PK across
+     * sources keeping the highest generation, builds a fresh
+     * {@code GraphIndexBuilder}, writes a FusedPQ + InlineVectors graph,
+     * and uploads both files. Memory cost is
+     * {@code O(numTotalNodes × dimension)} — the original 1 GB compaction
+     * cap was sized to keep this path within heap.
+     *
+     * <p>Issue #485 split this body out of {@link #merge} so the dispatcher
+     * can route to {@link #mergeStreaming} when the streaming flag is on.
+     */
+    private MergeOutput mergeLegacy(List<RemoteSegmentInput> inputs,
+                                    String outputTablespaceUuid,
+                                    String outputIndexUuid,
+                                    long outputSegmentId,
+                                    int dim) throws IOException, DataStorageManagerException {
         long startNanos = System.nanoTime();
 
         // 1. Stream each input's map file to a local temp file. We never hold
@@ -408,6 +484,487 @@ public final class RemoteSegmentGraphMerger {
             LOGGER.log(Level.WARNING,
                     "merger output cleanup failed for {0}/{1}: {2}",
                     new Object[]{multipartUuid, fileType, e.getMessage()});
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Streaming compaction (issue #485): drives OnDiskGraphIndexCompactor on
+    // local copies of each input's graph + map files.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Streaming N:1 merge driven by jvector's
+     * {@link io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor}.
+     * Memory cost is bounded by
+     * {@code O(taskWindowSize × maxDegree × float[dim])} instead of the
+     * legacy path's {@code O(numTotalNodes × dim)}, lifting the historical
+     * 1 GB cap on per-cycle byte input.
+     *
+     * <p>High-level flow:
+     * <ol>
+     *   <li>Download every input's graph + map files into local temp files.</li>
+     *   <li>Walk each map file once to build per-source {@code Bytes[ord]} PK
+     *       arrays. This is bounded by the union of input PKs, far smaller
+     *       than the per-vector allocation the legacy path performs.</li>
+     *   <li>Build a global authority map (highest-generation source per PK
+     *       wins; ties go to the first-observed source for determinism, same
+     *       rule the legacy path uses).</li>
+     *   <li>Build per-source {@link FixedBitSet} of live ordinals
+     *       ({@code alive ⇔ PK is authoritative AND ord ∉ tombstoneSet}).</li>
+     *   <li>Open each input's graph as {@link OnDiskGraphIndex}, assert
+     *       {@code INLINE_VECTORS} via
+     *       {@link VectorIndexCompactor#requireInlineVectorsFeature(int, java.util.Map)}.</li>
+     *   <li>Build per-source {@link VectorIndexCompactor.DenseLiveOrdinalMapper}
+     *       so the merged graph is dense {@code 0..keptCount-1}.</li>
+     *   <li>Run {@code OnDiskGraphIndexCompactor.compact(...)}.</li>
+     *   <li>Walk each source's live ordinals and emit
+     *       {@code (newOrd, pk, vec)} tuples to the output map file (vector
+     *       read via {@link OnDiskGraphIndex.View#getVectorInto}).</li>
+     *   <li>Upload both files; on a partial upload failure, best-effort
+     *       delete the half-published graph so the caller's
+     *       {@link #abandon} does not need to track a stale uuid.</li>
+     * </ol>
+     */
+    private MergeOutput mergeStreaming(List<RemoteSegmentInput> inputs,
+                                       String outputTablespaceUuid,
+                                       String outputIndexUuid,
+                                       long outputSegmentId,
+                                       int dim) throws IOException, DataStorageManagerException {
+        long startNanos = System.nanoTime();
+        int n = inputs.size();
+        List<Path> mapTemps = new ArrayList<>(n);
+        List<Path> graphTemps = new ArrayList<>(n);
+        List<ReaderSupplier> readerSuppliers = new ArrayList<>(n);
+        long droppedTombstones = 0L;
+        long droppedDuplicates = 0L;
+
+        try {
+            // 1. Download every input's graph + map files.
+            for (RemoteSegmentInput in : inputs) {
+                mapTemps.add(downloadMapFile(in));
+                graphTemps.add(downloadGraphFile(in));
+            }
+
+            // 2. Walk every map file once: per-source PK arrays + per-source size.
+            //    Validates the same wire-level invariants accumulateAuthority does
+            //    (entryCount cap, pkLen cap, dim match) so corrupt inputs are caught
+            //    before we hand them to the compactor.
+            List<Bytes[]> perSourcePks = new ArrayList<>(n);
+            for (int s = 0; s < n; s++) {
+                perSourcePks.add(readPksFromMapFile(mapTemps.get(s), inputs.get(s), dim));
+            }
+
+            // 3. Build authority across all sources. Ties go to the first-observed
+            //    source so the streaming path matches the legacy mergeLegacy ordering.
+            //    Value: long[] of {generation, sourceIdx, ord}.
+            Map<Bytes, long[]> authority = new HashMap<>();
+            for (int s = 0; s < n; s++) {
+                RemoteSegmentInput in = inputs.get(s);
+                BitSet tombstoneSet = buildTombstoneSet(in.tombstonedOrdinals);
+                Bytes[] pks = perSourcePks.get(s);
+                for (int ord = 0; ord < pks.length; ord++) {
+                    Bytes pk = pks[ord];
+                    if (pk == null) {
+                        continue;
+                    }
+                    if (tombstoneSet.get(ord)) {
+                        droppedTombstones++;
+                        continue;
+                    }
+                    long[] existing = authority.get(pk);
+                    if (existing == null) {
+                        authority.put(pk, new long[]{in.generation, s, ord});
+                    } else if (in.generation > existing[0]) {
+                        // Strictly newer — displace the existing winner; the
+                        // displaced entry becomes a duplicate-drop.
+                        existing[0] = in.generation;
+                        existing[1] = s;
+                        existing[2] = ord;
+                        droppedDuplicates++;
+                    } else {
+                        // Equal-or-lower generation: this entry loses, existing
+                        // winner stays. Matches mergeLegacy's first-observed rule.
+                        droppedDuplicates++;
+                    }
+                }
+            }
+            if (authority.isEmpty()) {
+                LOGGER.log(Level.INFO,
+                        "RemoteSegmentGraphMerger (streaming): every input vector was"
+                                + " tombstoned or duplicated (inputs={0},"
+                                + " droppedTombstones={1}, droppedDuplicates={2});"
+                                + " declining merge",
+                        new Object[]{n, droppedTombstones, droppedDuplicates});
+                return null;
+            }
+
+            // 4. Build per-source FixedBitSet from authority winners.
+            List<FixedBitSet> liveBitsets = new ArrayList<>(n);
+            for (int s = 0; s < n; s++) {
+                int srcSize = perSourcePks.get(s).length;
+                liveBitsets.add(new FixedBitSet(Math.max(1, srcSize)));
+            }
+            int keptCount = 0;
+            for (Map.Entry<Bytes, long[]> e : authority.entrySet()) {
+                long[] winner = e.getValue();
+                int srcIdx = (int) winner[1];
+                int ord = (int) winner[2];
+                liveBitsets.get(srcIdx).set(ord);
+                keptCount++;
+            }
+
+            // 5. Open OnDiskGraphIndex per input + INLINE_VECTORS guard.
+            List<OnDiskGraphIndex> sources = new ArrayList<>(n);
+            for (int s = 0; s < n; s++) {
+                ReaderSupplier rs = ReaderSupplierFactory.open(graphTemps.get(s));
+                readerSuppliers.add(rs);
+                OnDiskGraphIndex odg;
+                try {
+                    odg = OnDiskGraphIndex.load(rs);
+                } catch (RuntimeException re) {
+                    throw new IOException("OnDiskGraphIndex.load failed for input "
+                            + inputs.get(s).segmentUuid + " (streaming merge)", re);
+                }
+                try {
+                    VectorIndexCompactor.requireInlineVectorsFeature(s, odg.getFeatures());
+                } catch (VectorIndexCompactor.CompactionException ce) {
+                    // Translate to IOException at the merger's contract boundary
+                    // (the SPI contract is IOException / DataStorageManagerException;
+                    // CompactionException is internal to VectorIndexCompactor).
+                    throw new IOException(ce.getMessage(), ce);
+                }
+                sources.add(odg);
+            }
+
+            // 6. Build dense per-source mappers. Align bitset length to the
+            //    graph's level-0 size (jvector validates the bitset bounds).
+            List<OrdinalMapper> mappers = new ArrayList<>(n);
+            int globalBase = 0;
+            for (int s = 0; s < n; s++) {
+                int srcSize = sources.get(s).size(0);
+                FixedBitSet live = liveBitsets.get(s);
+                if (live.length() != srcSize) {
+                    FixedBitSet aligned = new FixedBitSet(Math.max(1, srcSize));
+                    int last = Math.min(live.length(), srcSize);
+                    for (int ord = 0; ord < last; ord++) {
+                        if (live.get(ord)) {
+                            aligned.set(ord);
+                        }
+                    }
+                    liveBitsets.set(s, aligned);
+                    live = aligned;
+                }
+                VectorIndexCompactor.DenseLiveOrdinalMapper mapper =
+                        new VectorIndexCompactor.DenseLiveOrdinalMapper(live, srcSize, globalBase);
+                mappers.add(mapper);
+                globalBase += mapper.liveCount();
+            }
+
+            // 7. Run the streaming compactor + write the output map file.
+            Path graphOutTemp = Files.createTempFile(tmpDirectory,
+                    "herddb-merger-stream-graph-", ".idx");
+            Path mapOutTemp = Files.createTempFile(tmpDirectory,
+                    "herddb-merger-stream-map-", ".tmp");
+            String multipartUuid = outputIndexUuid + "_seg" + outputSegmentId;
+            boolean uploadedGraph = false;
+            boolean uploadedMap = false;
+            String graphPath = null;
+            String mapPath = null;
+            long graphSize;
+            long mapSize;
+            try {
+                OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
+                        sources, liveBitsets, mappers, similarity,
+                        PhysicalCoreExecutor.pool());
+                try {
+                    compactor.compact(graphOutTemp);
+                } catch (java.io.FileNotFoundException | RuntimeException e) {
+                    throw new IOException("OnDiskGraphIndexCompactor.compact failed"
+                            + " (streaming merge)", e);
+                }
+                writeStreamingOutputMapFile(sources, perSourcePks, liveBitsets, mappers,
+                        mapOutTemp, dim);
+                graphSize = Files.size(graphOutTemp);
+                mapSize = Files.size(mapOutTemp);
+
+                // 8. Upload. On a partial upload (graph succeeded, map failed)
+                //    best-effort delete the orphan graph so the caller's
+                //    abandon path doesn't see a half-published output.
+                graphPath = dataStorageManager.writeMultipartIndexFile(
+                        outputTablespaceUuid, multipartUuid, "graph",
+                        graphOutTemp, /* progress */ null);
+                uploadedGraph = true;
+                mapPath = dataStorageManager.writeMultipartIndexFile(
+                        outputTablespaceUuid, multipartUuid, "map",
+                        mapOutTemp, /* progress */ null);
+                uploadedMap = true;
+            } finally {
+                try {
+                    Files.deleteIfExists(graphOutTemp);
+                } catch (IOException ignored) {
+                    // best-effort; orphan tmp does not affect remote state.
+                }
+                try {
+                    Files.deleteIfExists(mapOutTemp);
+                } catch (IOException ignored) {
+                    // same.
+                }
+                if (uploadedGraph && !uploadedMap) {
+                    try {
+                        dataStorageManager.deleteMultipartIndexFile(
+                                outputTablespaceUuid, multipartUuid, "graph");
+                    } catch (DataStorageManagerException cleanupErr) {
+                        // Broad catch (storage is the plugin boundary):
+                        // log and continue; orphan is a leak the caller must
+                        // reap, not corruption.
+                        LOGGER.log(Level.WARNING,
+                                "streaming merger orphan-graph cleanup failed for {0}: {1}",
+                                new Object[]{multipartUuid, cleanupErr.getMessage()});
+                    }
+                }
+            }
+
+            long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+            LOGGER.log(Level.INFO,
+                    "RemoteSegmentGraphMerger (streaming): merged {0} inputs into segment"
+                            + " {1}/{2}_seg{3} ({4} kept, {5} tombstoned, {6} duplicates"
+                            + " dropped, {7} ms)",
+                    new Object[]{n, outputTablespaceUuid, outputIndexUuid,
+                            outputSegmentId, keptCount, droppedTombstones, droppedDuplicates,
+                            elapsedMs});
+            return new MergeOutput(outputTablespaceUuid, outputIndexUuid, outputSegmentId,
+                    graphPath, graphSize, mapPath, mapSize,
+                    keptCount, droppedTombstones, droppedDuplicates);
+        } finally {
+            for (ReaderSupplier rs : readerSuppliers) {
+                try {
+                    rs.close();
+                } catch (IOException e) {
+                    LOGGER.log(Level.FINE,
+                            "ignoring reader-supplier close failure (streaming merge)", e);
+                }
+            }
+            for (Path p : mapTemps) {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException ignored) {
+                    // best-effort tmp cleanup
+                }
+            }
+            for (Path p : graphTemps) {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException ignored) {
+                    // same
+                }
+            }
+        }
+    }
+
+    /**
+     * Walks one input's downloaded map file and returns an array indexed by
+     * source-local ordinal whose entries are the per-ordinal {@link Bytes}
+     * primary key (or {@code null} for ordinals that were never written).
+     * Each {@code (ordinal, pkLen, pk, dim, floats)} tuple is validated
+     * against the same caps {@link #accumulateAuthority} enforces, then the
+     * float payload is skipped (the streaming path reads vectors from the
+     * graph file later).
+     */
+    private Bytes[] readPksFromMapFile(Path mapFile, RemoteSegmentInput in, int expectedDim)
+            throws IOException {
+        try (DataInputStream dis = new DataInputStream(
+                new BufferedInputStream(new FileInputStream(mapFile.toFile()),
+                        DOWNLOAD_CHUNK_SIZE))) {
+            int entryCount = dis.readInt();
+            if (entryCount < 0 || entryCount > MAX_ENTRIES_PER_MAP_FILE) {
+                throw new IOException("malformed map file " + mapFile
+                        + ": entryCount " + entryCount
+                        + " outside [0, " + MAX_ENTRIES_PER_MAP_FILE + "]");
+            }
+            // Two-pass: first sweep to discover maxOrdinal so we can size the
+            // output array tightly. We could pre-allocate generously but for
+            // very large segments that wastes substantial memory.
+            // Cheaper: collect (ord, pk) into an ArrayList, find max, then
+            // populate the array. Single allocation, no resizing.
+            ArrayList<int[]> ordsAndLen = new ArrayList<>(entryCount);
+            ArrayList<byte[]> pkBytes = new ArrayList<>(entryCount);
+            int maxOrd = -1;
+            for (int i = 0; i < entryCount; i++) {
+                int ordinal = dis.readInt();
+                if (ordinal < 0) {
+                    throw new IOException("malformed map file " + mapFile
+                            + ": negative ordinal " + ordinal + " at entry " + i);
+                }
+                int pkLen = dis.readInt();
+                if (pkLen < 0 || pkLen > MAX_PK_LEN) {
+                    throw new IOException("malformed map file " + mapFile
+                            + ": pkLen " + pkLen + " outside [0, " + MAX_PK_LEN
+                            + "] at entry " + i);
+                }
+                byte[] raw = new byte[pkLen];
+                dis.readFully(raw);
+                int floatCount = dis.readInt();
+                if (floatCount != expectedDim) {
+                    throw new IOException("dimension mismatch in input " + mapFile
+                            + " (segment " + in.segmentUuid + "): expected " + expectedDim
+                            + ", got " + floatCount + " at entry " + i);
+                }
+                skipFully(dis, (long) floatCount * Float.BYTES);
+                ordsAndLen.add(new int[]{ordinal, pkLen});
+                pkBytes.add(raw);
+                if (ordinal > maxOrd) {
+                    maxOrd = ordinal;
+                }
+            }
+            // Use Math.max(1, maxOrd + 1): an empty map file → array of length 1
+            // so FixedBitSet construction never sees length 0.
+            Bytes[] pks = new Bytes[Math.max(1, maxOrd + 1)];
+            for (int i = 0; i < entryCount; i++) {
+                int[] ol = ordsAndLen.get(i);
+                pks[ol[0]] = Bytes.from_array(pkBytes.get(i));
+            }
+            return pks;
+        }
+    }
+
+    /**
+     * Writes the output map file for the streaming path. Walks each source's
+     * live bitset in (sourceIdx, oldOrd) ascending order, reads the vector
+     * via {@link OnDiskGraphIndex.View#getVectorInto}, and emits the
+     * {@code (newOrd, pkLen, pk, dim, floats)} tuple. Wire format matches
+     * {@code PersistentVectorStore.writeFusedPQMapDataToTempFile} verbatim
+     * so the indexing-service can reload the merged segment with no
+     * format-detection logic.
+     */
+    private void writeStreamingOutputMapFile(
+            List<OnDiskGraphIndex> sources,
+            List<Bytes[]> perSourcePks,
+            List<FixedBitSet> liveBitsets,
+            List<OrdinalMapper> mappers,
+            Path mapTempFile,
+            int dim) throws IOException {
+        boolean ok = false;
+        try (BufferedOutputStream bos = new BufferedOutputStream(
+                new FileOutputStream(mapTempFile.toFile()), DOWNLOAD_CHUNK_SIZE);
+             DataOutputStream dos = new DataOutputStream(bos)) {
+            // Total entry count = sum of live cardinalities — equals authority.size()
+            // by construction; recompute to keep the writer self-contained.
+            int entryCount = 0;
+            for (FixedBitSet b : liveBitsets) {
+                entryCount += b.cardinality();
+            }
+            dos.writeInt(entryCount);
+            VectorFloat<?> tmp = VTS.createFloatVector(dim);
+            for (int s = 0; s < sources.size(); s++) {
+                OnDiskGraphIndex odg = sources.get(s);
+                FixedBitSet live = liveBitsets.get(s);
+                OrdinalMapper mapper = mappers.get(s);
+                Bytes[] pks = perSourcePks.get(s);
+                int srcSize = odg.size(0);
+                OnDiskGraphIndex.View view;
+                try {
+                    view = (OnDiskGraphIndex.View) odg.getView();
+                } catch (RuntimeException re) {
+                    throw new IOException("getView failed for source " + s
+                            + " (streaming merge map writer)", re);
+                }
+                try {
+                    for (int ord = 0; ord < srcSize; ord++) {
+                        if (!live.get(ord)) {
+                            continue;
+                        }
+                        Bytes pk = (ord < pks.length) ? pks[ord] : null;
+                        if (pk == null) {
+                            // Should never happen — the bitset is built from
+                            // per-source PK presence + authority.
+                            throw new IOException("streaming merge: live ordinal "
+                                    + ord + " in source " + s + " has no PK");
+                        }
+                        try {
+                            view.getVectorInto(ord, tmp, 0);
+                        } catch (RuntimeException re) {
+                            throw new IOException("getVectorInto failed at ord "
+                                    + ord + " of source " + s
+                                    + " (streaming merge map writer)", re);
+                        }
+                        if (tmp.length() != dim) {
+                            throw new IOException("dimension mismatch at ord " + ord
+                                    + " of source " + s + ": expected " + dim
+                                    + " got " + tmp.length());
+                        }
+                        int newOrdinal = mapper.oldToNew(ord);
+                        byte[] pkBytes = pk.to_array();
+                        dos.writeInt(newOrdinal);
+                        dos.writeInt(pkBytes.length);
+                        dos.write(pkBytes);
+                        dos.writeInt(dim);
+                        for (int j = 0; j < dim; j++) {
+                            dos.writeInt(Float.floatToIntBits(tmp.get(j)));
+                        }
+                    }
+                } finally {
+                    try {
+                        view.close();
+                    } catch (IOException e) {
+                        LOGGER.log(Level.FINE,
+                                "ignoring view close in streaming merge map writer", e);
+                    }
+                }
+            }
+            ok = true;
+        } finally {
+            if (!ok) {
+                try {
+                    Files.deleteIfExists(mapTempFile);
+                } catch (IOException ignored) {
+                    // best-effort
+                }
+            }
+        }
+    }
+
+    /**
+     * Mirrors {@link #downloadMapFile} for the graph file. Required by the
+     * streaming path so the merger can open each input's graph as an
+     * {@link OnDiskGraphIndex} and feed it to {@code OnDiskGraphIndexCompactor}.
+     */
+    private Path downloadGraphFile(RemoteSegmentInput in)
+            throws IOException, DataStorageManagerException {
+        Path tempFile = Files.createTempFile(tmpDirectory, "herddb-merger-input-graph-", ".tmp");
+        boolean ok = false;
+        try {
+            String multipartUuid = in.indexUuid + "_seg" + in.segmentId;
+            if (dataStorageManager.supportsDirectMultipartDownload()) {
+                dataStorageManager.downloadMultipartIndexFile(
+                        in.tablespaceUuid, multipartUuid, "graph", in.graphFileSize, tempFile);
+            } else {
+                ReaderSupplier supplier = dataStorageManager.multipartIndexReaderSupplier(
+                        in.tablespaceUuid, multipartUuid, "graph", in.graphFileSize);
+                try (RandomAccessReader reader = supplier.get();
+                     FileOutputStream fos = new FileOutputStream(tempFile.toFile());
+                     BufferedOutputStream bos = new BufferedOutputStream(fos, DOWNLOAD_CHUNK_SIZE)) {
+                    reader.seek(0L);
+                    byte[] buf = new byte[DOWNLOAD_CHUNK_SIZE];
+                    long remaining = in.graphFileSize;
+                    while (remaining > 0L) {
+                        int toRead = (int) Math.min(buf.length, remaining);
+                        byte[] chunk = (toRead == buf.length) ? buf : new byte[toRead];
+                        reader.readFully(chunk);
+                        bos.write(chunk, 0, toRead);
+                        remaining -= toRead;
+                    }
+                }
+            }
+            ok = true;
+            return tempFile;
+        } finally {
+            if (!ok) {
+                try {
+                    Files.deleteIfExists(tempFile);
+                } catch (IOException ignored) {
+                    // best-effort
+                }
+            }
         }
     }
 
