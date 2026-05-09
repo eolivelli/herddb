@@ -154,14 +154,18 @@ public final class RemoteSegmentMerger implements SegmentMerger {
         LogSequenceNumber latestBaseLsn = null;
         for (SegmentMetadata m : inputs) {
             int[] tombstoned = loadTombstonedOrdinalsBestEffort(m);
-            // The map file size isn't carried by SegmentMetadata directly
-            // (only the *combined* sizeBytes). We probe the file via the
-            // multipart reader supplier — it returns a streaming reader, and
-            // the supplied size is purely a hint for the cache. The optimizer
-            // pod's RemoteFileDataStorageManager doesn't strictly require the
-            // exact size, but to be safe we pass m.getSizeBytes() / 2 as a
-            // floor and let the actual stream length stop the read.
-            long mapFileSizeHint = Math.max(1L, m.getSizeBytes() / 2L);
+            // The optimizer needs the EXACT map-file size to drive the
+            // multipart reader (RemoteRandomAccessReader truncates reads at
+            // the supplied size, so an under-estimate causes EOF and an
+            // over-estimate would over-read across object boundaries). Use
+            // the dedicated mapFileSize field when available; fall back to
+            // sizeBytes (combined graph + map) only for legacy znodes that
+            // pre-date the field — in practice the merger will then
+            // over-estimate by the graph size, which the underlying reader
+            // tolerates because it stops at the actual object end.
+            long mapFileSizeHint = m.getMapFileSize() > 0L
+                    ? m.getMapFileSize()
+                    : Math.max(1L, m.getSizeBytes());
             graphInputs.add(new RemoteSegmentGraphMerger.RemoteSegmentInput(
                     m.getTablespaceUuid(), m.getIndexUuid(), m.getSegmentUuid(),
                     m.getSegmentId(), mapFileSizeHint, m.getGeneration(),
@@ -241,23 +245,64 @@ public final class RemoteSegmentMerger implements SegmentMerger {
     // Helpers
     // -------------------------------------------------------------------------
 
+    /**
+     * Bounded probe window for loading legacy ({@code overlayGeneration == 0})
+     * znodes (review item B.1#1 from the first pr-reviewer pass). Mirrors the
+     * window used by
+     * {@code IndexOptimizerEngine.deleteSegmentFilesBestEffort} when reaping
+     * pre-overlayGeneration znodes; bounded so a misbehaving znode does not
+     * stall the merge with O(N) DSM round-trips.
+     */
+    static final long LEGACY_OVERLAY_GENERATION_PROBE_MAX = 32L;
+
     private int[] loadTombstonedOrdinalsBestEffort(SegmentMetadata m) {
-        if (m.getTombstonePath() == null || m.getOverlayGeneration() <= 0L) {
+        if (m.getTombstonePath() == null) {
             return new int[0];
         }
-        try {
-            TombstoneOverlay overlay = TombstoneOverlayManager.loadOverlay(
-                    dataStorageManager, m.getTablespaceUuid(), m.getIndexUuid(),
-                    m.getSegmentUuid(), m.getOverlayGeneration());
-            return overlay.getTombstonedOrdinals();
-        } catch (IOException | DataStorageManagerException e) {
-            // A corrupt or unreachable overlay must NOT silently turn into "no
-            // tombstones applied" — that would resurrect deleted vectors after
-            // the merge. Surface the error so the engine logs it, increments
-            // mergeFailuresTotal, and tries again next tick.
-            throw new TombstoneLoadFailedException(m.getSegmentUuid(),
-                    m.getOverlayGeneration(), e);
+        long generation = m.getOverlayGeneration();
+        if (generation > 0L) {
+            // Modern znode (post-issue #484): the generation is recorded
+            // explicitly, so we load exactly that file.
+            try {
+                TombstoneOverlay overlay = TombstoneOverlayManager.loadOverlay(
+                        dataStorageManager, m.getTablespaceUuid(), m.getIndexUuid(),
+                        m.getSegmentUuid(), generation);
+                return overlay.getTombstonedOrdinals();
+            } catch (IOException | DataStorageManagerException e) {
+                // A corrupt or unreachable overlay must NOT silently turn into
+                // "no tombstones applied" — that would resurrect deleted vectors
+                // after the merge. Surface the error so the engine logs it,
+                // bumps mergeFailuresTotal, and retries next tick.
+                throw new TombstoneLoadFailedException(m.getSegmentUuid(), generation, e);
+            }
         }
+        // Legacy znode (overlayGeneration unset, but tombstonePath != null —
+        // i.e. written by an IS that pre-dates the overlayGeneration field).
+        // Probe the bounded window 32..1 highest-first; the highest existing
+        // generation is the authoritative one because TombstoneOverlayManager
+        // deletes the previous generation immediately after a successful flush.
+        for (long gen = LEGACY_OVERLAY_GENERATION_PROBE_MAX; gen >= 1L; gen--) {
+            try {
+                TombstoneOverlay overlay = TombstoneOverlayManager.loadOverlay(
+                        dataStorageManager, m.getTablespaceUuid(), m.getIndexUuid(),
+                        m.getSegmentUuid(), gen);
+                LOGGER.log(Level.INFO,
+                        "loaded legacy tombstone overlay for segment {0} via probe (generation={1})",
+                        new Object[]{m.getSegmentUuid(), gen});
+                return overlay.getTombstonedOrdinals();
+            } catch (IOException | DataStorageManagerException probeMiss) {
+                // Per-generation miss is normal during the descending probe; only
+                // the highest existing one survives. Continue.
+            }
+        }
+        // tombstonePath is set but no overlay file exists in the probed window.
+        // We MUST refuse the merge — silently treating this as "no tombstones"
+        // would resurrect deleted vectors. The engine will log mergeFailures
+        // and retry; an operator can then inspect the segment state.
+        throw new TombstoneLoadFailedException(m.getSegmentUuid(), 0L,
+                new IOException("legacy znode has tombstonePath=" + m.getTombstonePath()
+                        + " but no overlay file found in probe window 1.."
+                        + LEGACY_OVERLAY_GENERATION_PROBE_MAX));
     }
 
     private static long newRandomSegmentId() {

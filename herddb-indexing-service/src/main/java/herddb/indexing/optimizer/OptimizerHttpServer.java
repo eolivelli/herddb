@@ -62,6 +62,14 @@ public final class OptimizerHttpServer implements AutoCloseable {
      */
     private final long stalenessThresholdMillis;
     private final LongSupplier clock;
+    /**
+     * Predicate consulted by the {@code /health} handler. When it returns
+     * {@code true}, the handler short-circuits to 503 — the optimizer's ZK
+     * session has expired (or some other unrecoverable lifecycle event has
+     * fired), so Helm should restart the pod regardless of the heartbeat
+     * counter (review item B.3 from the first pr-reviewer pass).
+     */
+    private final java.util.function.BooleanSupplier criticalFailure;
     private final AtomicLong lastObservedRuns = new AtomicLong(-1);
     private final AtomicLong lastObservedRunsAtMillis = new AtomicLong(0);
 
@@ -71,17 +79,32 @@ public final class OptimizerHttpServer implements AutoCloseable {
      * disabled (Long.MAX_VALUE) — kept for source compatibility with earlier code.
      */
     public OptimizerHttpServer(String bindHost, int port, IndexOptimizerEngine engine) throws IOException {
-        this(bindHost, port, engine, Long.MAX_VALUE, System::currentTimeMillis);
+        this(bindHost, port, engine, Long.MAX_VALUE, System::currentTimeMillis,
+                /* criticalFailure */ () -> false);
     }
 
     /**
-     * Full constructor wiring the heartbeat-staleness threshold and a clock for tests.
+     * Three-arg constructor wiring the heartbeat-staleness threshold and a clock
+     * for tests. Equivalent to the four-arg constructor with no critical-failure
+     * gate.
      */
     public OptimizerHttpServer(String bindHost, int port, IndexOptimizerEngine engine,
                                long stalenessThresholdMillis, LongSupplier clock) throws IOException {
+        this(bindHost, port, engine, stalenessThresholdMillis, clock,
+                /* criticalFailure */ () -> false);
+    }
+
+    /**
+     * Full constructor wiring the heartbeat-staleness threshold, a clock, and a
+     * critical-failure gate (e.g. ZK session expiry detection).
+     */
+    public OptimizerHttpServer(String bindHost, int port, IndexOptimizerEngine engine,
+                               long stalenessThresholdMillis, LongSupplier clock,
+                               java.util.function.BooleanSupplier criticalFailure) throws IOException {
         this.engine = engine;
         this.stalenessThresholdMillis = stalenessThresholdMillis;
         this.clock = clock;
+        this.criticalFailure = criticalFailure == null ? () -> false : criticalFailure;
         this.server = HttpServer.create(new InetSocketAddress(bindHost, port), 0);
         server.createContext("/health", new HealthHandler());
         server.createContext("/metrics", new MetricsHandler());
@@ -113,6 +136,20 @@ public final class OptimizerHttpServer implements AutoCloseable {
     private final class HealthHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
+            // Critical-failure gate (review item B.3 from the first pr-reviewer
+            // pass): when the ZooKeeper session has expired, the pod is
+            // silently broken — the persistent-recursive watch is dead and the
+            // leader-lock znode is gone. Force 503 so Helm restarts us.
+            if (criticalFailure.getAsBoolean()) {
+                byte[] body = "FAILED: critical lifecycle failure (e.g. ZK session expired)\n"
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+                exchange.sendResponseHeaders(503, body.length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(body);
+                }
+                return;
+            }
             // Liveness check (review-item B6): the engine's run counter must advance
             // within stalenessThresholdMillis. We compare the current value against
             // the last observation; when it has progressed we update both the

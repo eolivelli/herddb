@@ -127,6 +127,7 @@ public class RemoteSegmentMergerTest {
                 .mapPath(mapPath)
                 .baseLsn(new LogSequenceNumber(1L, 100L * generation))
                 .sizeBytes(mapSize * 2L)  // arbitrary — not consulted by the merger
+                .mapFileSize(mapSize)
                 .vectorCount(VECTORS_PER_SEGMENT)
                 .generation(generation)
                 .createdAtEpochMillis(0L)

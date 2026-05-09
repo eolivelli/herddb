@@ -181,6 +181,41 @@ public class OptimizerHttpServerTest {
         }
     }
 
+    @Test
+    public void healthReturns503WhenCriticalFailureFlagSet() throws Exception {
+        // Issue #484 (review item B.3 from the first pr-reviewer pass): the
+        // /health endpoint must consult an injected critical-failure
+        // predicate so a ZK session expiry can trip Helm's liveness probe
+        // even if the engine is still ticking on the periodic safety-net.
+        java.util.concurrent.atomic.AtomicBoolean criticalFailure =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        OptimizerHttpServer http2 = new OptimizerHttpServer("127.0.0.1", 0, engine,
+                /* stalenessThresholdMillis */ Long.MAX_VALUE,
+                System::currentTimeMillis,
+                criticalFailure::get);
+        try {
+            http2.start();
+            // Pre-condition: engine OK, no critical failure → 200.
+            engine.runOnce();
+            int ok = headStatus("http://127.0.0.1:" + http2.getBoundPort() + "/health");
+            assertEquals(200, ok);
+
+            // Trip the critical-failure flag (simulating ZK session expiry).
+            criticalFailure.set(true);
+            int failed = headStatus("http://127.0.0.1:" + http2.getBoundPort() + "/health");
+            assertEquals("/health must return 503 when critical-failure flag is set",
+                    503, failed);
+
+            // Clearing the flag returns the endpoint to 200.
+            criticalFailure.set(false);
+            int recovered = headStatus("http://127.0.0.1:" + http2.getBoundPort() + "/health");
+            assertEquals("/health must recover to 200 once the flag clears",
+                    200, recovered);
+        } finally {
+            http2.close();
+        }
+    }
+
     private static int headStatus(String url) throws Exception {
         java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
                 new java.net.URL(url).openConnection();

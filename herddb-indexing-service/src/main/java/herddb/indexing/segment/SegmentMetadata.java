@@ -52,6 +52,8 @@ public final class SegmentMetadata {
     public static final long NO_LSN_OFFSET = -1L;
     public static final long NO_RETENTION = -1L;
     public static final long NO_SEGMENT_ID = -1L;
+    /** Sentinel for {@link #mapFileSize} when the field was not populated. */
+    public static final long UNKNOWN_FILE_SIZE = 0L;
 
     /**
      * Current znode JSON schema version (review item D5). Bumped when a
@@ -124,6 +126,15 @@ public final class SegmentMetadata {
     private final long baseLsnLedgerId;
     private final long baseLsnOffset;
     private final long sizeBytes;
+    /**
+     * Exact size of the map file in bytes (additive in issue #484). The
+     * optimizer's {@code RemoteSegmentMerger} needs this to correctly stream
+     * the input map file from remote storage — {@code sizeBytes} aggregates
+     * graph + map sizes and isn't enough to bound the read. Defaults to
+     * {@link #UNKNOWN_FILE_SIZE} (0L) when not set; in that case the merger
+     * falls back to {@code sizeBytes} as an upper-bound hint.
+     */
+    private final long mapFileSize;
     private final long vectorCount;
     private final long generation;
     private final List<String> replacedBy;
@@ -151,6 +162,7 @@ public final class SegmentMetadata {
             @JsonProperty("baseLsnLedgerId") long baseLsnLedgerId,
             @JsonProperty("baseLsnOffset") long baseLsnOffset,
             @JsonProperty("sizeBytes") long sizeBytes,
+            @JsonProperty("mapFileSize") long mapFileSize,
             @JsonProperty("vectorCount") long vectorCount,
             @JsonProperty("generation") long generation,
             @JsonProperty("replacedBy") List<String> replacedBy,
@@ -178,6 +190,7 @@ public final class SegmentMetadata {
         this.baseLsnLedgerId = baseLsnLedgerId;
         this.baseLsnOffset = baseLsnOffset;
         this.sizeBytes = sizeBytes;
+        this.mapFileSize = mapFileSize;
         this.vectorCount = vectorCount;
         this.generation = generation;
         this.replacedBy = replacedBy == null
@@ -263,6 +276,10 @@ public final class SegmentMetadata {
         return sizeBytes;
     }
 
+    public long getMapFileSize() {
+        return mapFileSize;
+    }
+
     public long getVectorCount() {
         return vectorCount;
     }
@@ -335,6 +352,7 @@ public final class SegmentMetadata {
                 .overlayGeneration(overlayGeneration)
                 .baseLsn(baseLsnLedgerId, baseLsnOffset)
                 .sizeBytes(sizeBytes)
+                .mapFileSize(mapFileSize)
                 .vectorCount(vectorCount)
                 .generation(generation)
                 .replacedBy(replacedBy)
@@ -363,6 +381,7 @@ public final class SegmentMetadata {
                 && baseLsnLedgerId == that.baseLsnLedgerId
                 && baseLsnOffset == that.baseLsnOffset
                 && sizeBytes == that.sizeBytes
+                && mapFileSize == that.mapFileSize
                 && vectorCount == that.vectorCount
                 && generation == that.generation
                 && retentionUntilEpochMillis == that.retentionUntilEpochMillis
@@ -425,6 +444,7 @@ public final class SegmentMetadata {
         private long baseLsnLedgerId = NO_LSN_LEDGER_ID;
         private long baseLsnOffset = NO_LSN_OFFSET;
         private long sizeBytes;
+        private long mapFileSize = UNKNOWN_FILE_SIZE;
         private long vectorCount;
         private long generation;
         private List<String> replacedBy = Collections.emptyList();
@@ -535,6 +555,11 @@ public final class SegmentMetadata {
             return this;
         }
 
+        public Builder mapFileSize(long value) {
+            this.mapFileSize = value;
+            return this;
+        }
+
         public Builder vectorCount(long value) {
             this.vectorCount = value;
             return this;
@@ -569,7 +594,7 @@ public final class SegmentMetadata {
                     segmentUuid, tablespaceUuid, tableName, indexUuid, indexName,
                     state, ownerInstanceId, pendingOwnerInstanceId, segmentId, graphPath, mapPath,
                     tombstonePath, tombstoneLsnLedgerId, tombstoneLsnOffset, overlayGeneration,
-                    baseLsnLedgerId, baseLsnOffset, sizeBytes, vectorCount, generation,
+                    baseLsnLedgerId, baseLsnOffset, sizeBytes, mapFileSize, vectorCount, generation,
                     replacedBy, retentionUntilEpochMillis, createdAtEpochMillis);
         }
     }

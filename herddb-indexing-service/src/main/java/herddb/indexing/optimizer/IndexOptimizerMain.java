@@ -129,6 +129,15 @@ public final class IndexOptimizerMain {
     /** Number of distinct ZK events observed by the persistent-recursive watcher. */
     private final AtomicLong watcherEvents = new AtomicLong();
     /**
+     * Set to {@code true} when the ZooKeeper session expires. Once set, the
+     * persistent-recursive watch is dead, the leader-lock ephemeral znode is
+     * gone, and any registry read against {@link #zooKeeper} will fail —
+     * which means the pod is silently broken. The HTTP {@code /health}
+     * handler consults this flag and returns 503 so Helm's liveness probe
+     * restarts the pod (review item B.3 from the first pr-reviewer pass).
+     */
+    private final AtomicBoolean sessionExpired = new AtomicBoolean(false);
+    /**
      * Debounce window for the event-driven tick. {@code volatile} for the same
      * reason as {@link #scheduler}: the ZK watcher thread reads it without
      * holding the {@code IndexOptimizerMain} monitor (issue #484).
@@ -170,6 +179,15 @@ public final class IndexOptimizerMain {
 
     public long getWatcherEvents() {
         return watcherEvents.get();
+    }
+
+    /**
+     * Returns {@code true} when the ZooKeeper session has expired. The HTTP
+     * health handler uses this to flip {@code /health} to 503 so Helm's
+     * liveness probe restarts the pod.
+     */
+    public boolean isSessionExpired() {
+        return sessionExpired.get();
     }
 
     public synchronized void start() throws Exception {
@@ -230,8 +248,25 @@ public final class IndexOptimizerMain {
         CountDownLatch zkConnected = new CountDownLatch(1);
         AtomicReference<ZooKeeper> zkRef = new AtomicReference<>();
         ZooKeeper zk = new ZooKeeper(zkAddress, sessionTimeout, (WatchedEvent event) -> {
-            if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
-                zkConnected.countDown();
+            switch (event.getState()) {
+                case SyncConnected:
+                    zkConnected.countDown();
+                    break;
+                case Expired:
+                    // Session expiry kills the persistent-recursive watch and the
+                    // leader-lock ephemeral znode. The pod is silently broken from
+                    // here on; flag /health to 503 so Helm restarts us (review item
+                    // B.3 from the first pr-reviewer pass).
+                    if (sessionExpired.compareAndSet(false, true)) {
+                        LOGGER.log(Level.SEVERE,
+                                "ZooKeeper session expired — /health will return 503"
+                                        + " so the pod is restarted.");
+                    }
+                    break;
+                default:
+                    // Disconnected / AuthFailed / etc. — log at FINE; the ZK client
+                    // recovers from transient disconnects on its own.
+                    break;
             }
         });
         zkRef.set(zk);
@@ -320,7 +355,8 @@ public final class IndexOptimizerMain {
             // from second pr-reviewer pass).
             this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine,
                     /* stalenessThresholdMillis */ 2L * intervalMs,
-                    System::currentTimeMillis);
+                    System::currentTimeMillis,
+                    /* criticalFailure */ this::isSessionExpired);
             this.httpServer.start();
         }
 

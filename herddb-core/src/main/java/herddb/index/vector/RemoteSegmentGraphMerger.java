@@ -110,6 +110,21 @@ public final class RemoteSegmentGraphMerger {
     /** Block size used for streaming downloads via the multipart reader. */
     private static final int DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
 
+    /**
+     * Sanity caps for the input map-file header values. A corrupt or partially
+     * uploaded multipart file can carry garbage int32 values; we surface those
+     * as {@link IOException} rather than letting them coerce us into giant
+     * allocations or unbounded loops (review item B.2#3 from the first
+     * pr-reviewer pass).
+     *
+     * <p>{@code MAX_ENTRIES} matches the per-segment cap used by the in-IS
+     * compactor ({@code MAX_TOMBSTONED_ORDINALS = 1<<28}); a single segment
+     * never holds more vectors than that. {@code MAX_PK_LEN} bounds the
+     * per-entry primary-key length.
+     */
+    static final int MAX_ENTRIES_PER_MAP_FILE = 1 << 28;
+    static final int MAX_PK_LEN = 1 << 16;
+
     private static final VectorTypeSupport VTS =
             VectorizationProvider.getInstance().getVectorTypeSupport();
 
@@ -274,7 +289,7 @@ public final class RemoteSegmentGraphMerger {
                 Path mapFile = mapTempFiles.get(i);
                 BitSet tombstoneSet = buildTombstoneSet(in.tombstonedOrdinals);
                 long[] perInputCounters = new long[2]; // [tombstones, duplicates]
-                accumulateAuthority(in, mapFile, tombstoneSet, authority, perInputCounters);
+                accumulateAuthority(in, mapFile, tombstoneSet, authority, perInputCounters, dim);
                 droppedTombstones += perInputCounters[0];
                 droppedDuplicates += perInputCounters[1];
             }
@@ -420,9 +435,21 @@ public final class RemoteSegmentGraphMerger {
                     while (remaining > 0L) {
                         int toRead = (int) Math.min(buf.length, remaining);
                         byte[] chunk = (toRead == buf.length) ? buf : new byte[toRead];
-                        reader.readFully(chunk);
-                        bos.write(chunk, 0, toRead);
-                        remaining -= toRead;
+                        try {
+                            reader.readFully(chunk);
+                            bos.write(chunk, 0, toRead);
+                            remaining -= toRead;
+                        } catch (java.io.EOFException eof) {
+                            // The supplied {@code in.mapFileSize} may overestimate the
+                            // actual file size for legacy znodes whose
+                            // {@link SegmentMetadata#mapFileSize} field is unset (see
+                            // {@code RemoteSegmentMerger}'s mapFileSizeHint fallback).
+                            // Treat EOF on a too-large hint as "end of file" rather than
+                            // an error — the parser layer (accumulateAuthority) will fail
+                            // fast on a truncated entryCount/pkLen if the read was actually
+                            // short.
+                            break;
+                        }
                     }
                 }
             }
@@ -463,26 +490,50 @@ public final class RemoteSegmentGraphMerger {
      * inserts the surviving (pk, vector) into the authority map or — if
      * a same-PK entry from an earlier input had a higher generation —
      * counts it as a duplicate-drop.
+     *
+     * <p>Validates every {@code int} read from the file against
+     * {@link #MAX_ENTRIES_PER_MAP_FILE} / {@link #MAX_PK_LEN} / {@code dim}
+     * so a corrupt or partially-uploaded input cannot coerce the merger
+     * into a giant allocation or a corrupt graph (review items B.1#2 and
+     * B.2#3 from the first pr-reviewer pass).
      */
     private void accumulateAuthority(RemoteSegmentInput in, Path mapFile,
                                      BitSet tombstoneSet,
                                      Map<Bytes, AuthorityEntry> authority,
-                                     long[] perInputCounters) throws IOException {
+                                     long[] perInputCounters,
+                                     int expectedDim) throws IOException {
         try (DataInputStream dis = new DataInputStream(
                 new BufferedInputStream(new FileInputStream(mapFile.toFile()),
                         DOWNLOAD_CHUNK_SIZE))) {
             int entryCount = dis.readInt();
+            if (entryCount < 0 || entryCount > MAX_ENTRIES_PER_MAP_FILE) {
+                throw new IOException("malformed map file " + mapFile
+                        + ": entryCount " + entryCount
+                        + " outside [0, " + MAX_ENTRIES_PER_MAP_FILE + "]");
+            }
             for (int i = 0; i < entryCount; i++) {
                 int ordinal = dis.readInt();
+                if (ordinal < 0) {
+                    throw new IOException("malformed map file " + mapFile
+                            + ": negative ordinal " + ordinal + " at entry " + i);
+                }
                 int pkLen = dis.readInt();
-                if (pkLen < 0) {
-                    throw new IOException("malformed map file " + mapFile + ": negative pkLen " + pkLen);
+                if (pkLen < 0 || pkLen > MAX_PK_LEN) {
+                    throw new IOException("malformed map file " + mapFile
+                            + ": pkLen " + pkLen + " outside [0, " + MAX_PK_LEN
+                            + "] at entry " + i);
                 }
                 byte[] pkBytes = new byte[pkLen];
                 dis.readFully(pkBytes);
                 int floatCount = dis.readInt();
-                if (floatCount < 0) {
-                    throw new IOException("malformed map file " + mapFile + ": negative floatCount " + floatCount);
+                if (floatCount != expectedDim) {
+                    // Dimension-mismatch: refuse to merge. Silently building a graph
+                    // with mismatched-dimension vectors would corrupt the InlineVectors
+                    // feature and tank recall on every search (review item B.1#2 from
+                    // the first pr-reviewer pass).
+                    throw new IOException("dimension mismatch in input " + mapFile
+                            + " (segment " + in.segmentUuid + "): expected " + expectedDim
+                            + ", got " + floatCount + " at entry " + i);
                 }
                 if (tombstoneSet.get(ordinal)) {
                     // Skip the floats; we still need to consume them to keep the stream aligned.

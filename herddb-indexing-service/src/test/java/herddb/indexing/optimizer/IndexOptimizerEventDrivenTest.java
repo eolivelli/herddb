@@ -178,9 +178,16 @@ public class IndexOptimizerEventDrivenTest {
                     main.getWatcherEvents() > 0);
 
             // Wait for the engine's first tick to actually drain (so the leader
-            // lock is held and getRuns() reflects the work).
-            Thread.sleep(100);
-            assertTrue(main.getEngine().getRuns() > 0L);
+            // lock is held and getRuns() reflects the work). We poll because
+            // runEventDrivenTick increments getEventDrivenTicks BEFORE running
+            // tickSafe, so the run counter lags the event-driven count slightly.
+            deadline = System.currentTimeMillis() + 5_000L;
+            while (System.currentTimeMillis() < deadline
+                    && main.getEngine().getRuns() == 0L) {
+                Thread.sleep(20);
+            }
+            assertTrue("engine.runs must increment within 5s of event-driven tick",
+                    main.getEngine().getRuns() > 0L);
 
             // === Part 2: prove the persistent-recursive watch survives a second
             //  burst — i.e. it does NOT need re-arming after the first event,
@@ -203,6 +210,89 @@ public class IndexOptimizerEventDrivenTest {
             // assert it has run more than 0 (the count fluctuates with debouncing).
             assertTrue(main.getEngine().getRuns() > 0L);
         } finally {
+            main.shutdown();
+        }
+    }
+
+    @Test
+    public void eventsDuringLongTickScheduleFollowUp() throws Exception {
+        // Verifies that events arriving DURING a long-running tick get coalesced
+        // into a follow-up tick that fires automatically once the in-progress
+        // tick finishes — proving the persistent-recursive watch keeps
+        // delivering even when the engine is busy. This is the core
+        // "no-event-is-lost" guarantee of the event-driven path.
+        Properties props = new Properties();
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkServer.getConnectString());
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT, "30000");
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH, BASE_PATH);
+        props.setProperty(OptimizerConfiguration.PROPERTY_TABLESPACE_NAME, TS_NAME);
+        // Periodic interval disabled — we only want event-driven ticks.
+        props.setProperty(OptimizerConfiguration.PROPERTY_INTERVAL_MS, "3600000");
+        // Short debounce so the follow-up tick lands within the assertion window.
+        props.setProperty(OptimizerConfiguration.PROPERTY_EVENT_DEBOUNCE_MS, "50");
+        props.setProperty(OptimizerConfiguration.PROPERTY_HTTP_PORT, "0");
+        props.setProperty(OptimizerConfiguration.PROPERTY_RETENTION_MS, "60000");
+
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+        merger.setReturnNull(true); // we don't want segment churn
+        // Inject a 1-second sleep into the merger's invocation so the first
+        // tick takes ~1 s. Events published during that window must trigger a
+        // follow-up tick (not be lost) once the in-progress tick releases the
+        // single-threaded scheduler.
+        java.util.concurrent.atomic.AtomicLong sleepingHookInvocations =
+                new java.util.concurrent.atomic.AtomicLong();
+        merger.setHook(() -> {
+            sleepingHookInvocations.incrementAndGet();
+            try {
+                Thread.sleep(800);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        IndexOptimizerMain main = new IndexOptimizerMain(
+                new OptimizerConfiguration(props), merger);
+        try {
+            main.start();
+            long ticksAtStart = main.getEventDrivenTicks();
+
+            // Publish two segments to fire the first event-driven tick (which
+            // sleeps 800 ms inside the merger). Wait for the tick to start.
+            registry.createSegment(sampleSegment("warm-1", 100L));
+            registry.createSegment(sampleSegment("warm-2", 100L));
+
+            long deadline = System.currentTimeMillis() + 3_000L;
+            while (System.currentTimeMillis() < deadline
+                    && main.getEventDrivenTicks() <= ticksAtStart) {
+                Thread.sleep(20);
+            }
+            assertTrue("first event-driven tick must start within 3 s",
+                    main.getEventDrivenTicks() > ticksAtStart);
+
+            // While the first tick is mid-flight (sleeping inside the merger
+            // hook), publish another batch. The watch fires; the wakeup is
+            // coalesced into a follow-up tick that must land AFTER the
+            // current one finishes.
+            long ticksAfterFirst = main.getEventDrivenTicks();
+            for (int i = 0; i < 4; i++) {
+                registry.createSegment(sampleSegment("during-tick-" + i, 100L));
+            }
+
+            // Wait for the second tick to land. Allow up to 5 s — the first
+            // tick has up to 800 ms left, the debounce adds 50 ms, then the
+            // second tick runs.
+            deadline = System.currentTimeMillis() + 5_000L;
+            while (System.currentTimeMillis() < deadline
+                    && main.getEventDrivenTicks() <= ticksAfterFirst) {
+                Thread.sleep(20);
+            }
+            assertTrue("follow-up event-driven tick must fire after the busy tick releases"
+                            + " the scheduler (got " + main.getEventDrivenTicks()
+                            + ", was " + ticksAfterFirst + ")",
+                    main.getEventDrivenTicks() > ticksAfterFirst);
+        } finally {
+            // Detach the hook before shutdown so the scheduler can drain quickly.
+            merger.setHook(null);
             main.shutdown();
         }
     }
