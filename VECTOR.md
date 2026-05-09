@@ -723,7 +723,7 @@ Optimizer-side (`OptimizerConfiguration`, `conf/indexoptimizer.properties`):
 |----------|---------|-------|
 | `indexoptimizer.zookeeper.address` | `localhost:2181` | Must match the cluster's ZK. |
 | `indexoptimizer.zookeeper.path` | `/herd` | Must match `server.zookeeper.path`. |
-| `indexoptimizer.tablespace.uuid` | *(required)* | Single-tablespace per optimizer in the MVP. |
+| `indexoptimizer.tablespace.name` | *(required)* | Human-readable tablespace name (e.g. `herd`); UUID resolved from ZooKeeper at startup. Issue #481. |
 | `indexoptimizer.interval.ms` | `300000` | Scheduler tick. |
 | `indexoptimizer.merge.min.count` | `4` | |
 | `indexoptimizer.merge.max.count` | `200` | Force-fire ceiling (issue #285 parity). |
@@ -736,12 +736,12 @@ Helm values (`indexOptimizer.*`):
 ```yaml
 indexOptimizer:
   enabled: false
-  tablespaceUuid: ""              # required when enabled=true
+  tablespaceName: ""              # human-readable name, e.g. "herd"; UUID resolved at startup (#481)
   intervalMs: 300000
   minCount: 4
   maxCount: 200
-  minBytes: 268435456
-  maxBytes: 1073741824
+  minBytes: "268435456"           # quoted string to prevent YAML float conversion (#480)
+  maxBytes: "1073741824"
   retentionMs: 600000
   storage:
     tmp:

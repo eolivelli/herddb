@@ -23,11 +23,13 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.indexing.segment.SegmentMetadata;
 import herddb.indexing.segment.SegmentRegistryClient;
 import herddb.indexing.segment.SegmentState;
 import herddb.indexing.segment.VersionedSegmentMetadata;
 import herddb.log.LogSequenceNumber;
+import herddb.model.TableSpace;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
@@ -45,10 +47,15 @@ import org.junit.Test;
  * Bootstraps the full {@link IndexOptimizerMain} against a real curator-test
  * ZK and verifies that the scheduler ticks the engine and applies the merge
  * policy end-to-end.
+ *
+ * <p>Issue #481: tests also verify that the optimizer resolves the tablespace
+ * UUID from the human-readable name via
+ * {@link ZookeeperMetadataStorageManager#describeTableSpace(String)}.
  */
 public class IndexOptimizerMainTest {
 
     private static final String BASE_PATH = "/herd-test-step5-main";
+    private static final String TS_NAME = "mytablespace";
     private static final String TS_UUID = "tsuid";
     private static final String IDX_UUID = "idxuid";
 
@@ -81,6 +88,27 @@ public class IndexOptimizerMainTest {
         }
     }
 
+    /**
+     * Registers a {@link TableSpace} with the given name and UUID into the
+     * ZookeeperMetadataStorageManager so the optimizer can resolve it by name.
+     */
+    private void registerTablespace(String name, String uuid) throws Exception {
+        try (ZookeeperMetadataStorageManager zkmeta =
+                new ZookeeperMetadataStorageManager(
+                        zkServer.getConnectString(), 30000, BASE_PATH)) {
+            // start(true) so it creates the cluster metadata paths (tableSpaces, replicas, etc.)
+            zkmeta.start(true);
+            TableSpace ts = TableSpace.builder()
+                    .name(name)
+                    .uuid(uuid)
+                    .leader("node1")
+                    .replica("node1")
+                    .expectedReplicaCount(1)
+                    .build();
+            zkmeta.registerTableSpace(ts);
+        }
+    }
+
     private SegmentMetadata sampleSegment(String segUuid, long sizeBytes) {
         return SegmentMetadata.builder()
                 .segmentUuid(segUuid)
@@ -102,6 +130,9 @@ public class IndexOptimizerMainTest {
 
     @Test
     public void mainBootstrapTicksEngineAndCompletesMerge() throws Exception {
+        // Register the tablespace so the optimizer can resolve the UUID by name.
+        registerTablespace(TS_NAME, TS_UUID);
+
         // Pre-seed enough segments to force-fire (maxCount=2 < 3 segments).
         for (int i = 0; i < 3; i++) {
             registry.createSegment(sampleSegment("seg-" + i, 100L));
@@ -111,7 +142,7 @@ public class IndexOptimizerMainTest {
         props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkServer.getConnectString());
         props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT, "30000");
         props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH, BASE_PATH);
-        props.setProperty(OptimizerConfiguration.PROPERTY_TABLESPACE_UUID, TS_UUID);
+        props.setProperty(OptimizerConfiguration.PROPERTY_TABLESPACE_NAME, TS_NAME);
         props.setProperty(OptimizerConfiguration.PROPERTY_INTERVAL_MS, "100");
         props.setProperty(OptimizerConfiguration.PROPERTY_MIN_COUNT, "4");
         props.setProperty(OptimizerConfiguration.PROPERTY_MAX_COUNT, "2");
@@ -148,20 +179,82 @@ public class IndexOptimizerMainTest {
         }
     }
 
+    /**
+     * Verifies that the optimizer resolves the tablespace UUID from the human-readable
+     * name via ZookeeperMetadataStorageManager when only the name is configured.
+     */
     @Test
-    public void missingTablespaceUuidFailsFast() {
+    public void resolveTablespaceUuidByName() throws Exception {
+        registerTablespace("herd", "resolved-uuid-abc");
+
         Properties props = new Properties();
         props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkServer.getConnectString());
-        // No tablespace UUID set.
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT, "30000");
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH, BASE_PATH);
+        // Only name — no UUID.
+        props.setProperty(OptimizerConfiguration.PROPERTY_TABLESPACE_NAME, "herd");
+        props.setProperty(OptimizerConfiguration.PROPERTY_INTERVAL_MS, "60000"); // long interval — we don't need ticks
+        props.setProperty(OptimizerConfiguration.PROPERTY_RETENTION_MS, "60000");
+
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+        IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(props), merger);
+        try {
+            // start() must succeed and resolve the UUID without error
+            main.start();
+            assertNotNull("engine must be initialised after start()", main.getEngine());
+        } finally {
+            main.shutdown();
+        }
+    }
+
+    /**
+     * When neither tablespace name nor UUID is configured, start() must throw
+     * an {@link IllegalStateException} before touching ZooKeeper.
+     */
+    @Test
+    public void missingTablespaceNameFailsFast() {
+        Properties props = new Properties();
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkServer.getConnectString());
+        // No tablespace name set.
         IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(props),
                 new InMemorySegmentMerger());
         try {
             main.start();
-            fail("expected IllegalArgumentException");
-        } catch (IllegalArgumentException ok) {
-            assertTrue(ok.getMessage().contains("tablespace.uuid"));
+            fail("expected IllegalStateException");
+        } catch (IllegalStateException ok) {
+            assertTrue("message must mention the property name, got: " + ok.getMessage(),
+                    ok.getMessage().contains("tablespace.name"));
         } catch (Exception other) {
-            fail("expected IllegalArgumentException but got " + other);
+            fail("expected IllegalStateException but got " + other);
+        } finally {
+            main.shutdown();
+        }
+    }
+
+    /**
+     * When the configured tablespace name does not exist in ZooKeeper, start()
+     * must throw an {@link IllegalStateException} with a clear message.
+     */
+    @Test
+    public void unknownTablespaceNameFailsFast() throws Exception {
+        // No tablespace registered — ZK path does not exist.
+        Properties props = new Properties();
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkServer.getConnectString());
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT, "30000");
+        props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH, BASE_PATH);
+        props.setProperty(OptimizerConfiguration.PROPERTY_TABLESPACE_NAME, "nonexistent");
+        props.setProperty(OptimizerConfiguration.PROPERTY_RETENTION_MS, "60000");
+
+        IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(props),
+                new InMemorySegmentMerger());
+        try {
+            main.start();
+            fail("expected IllegalStateException for unknown tablespace name");
+        } catch (IllegalStateException ok) {
+            assertTrue("message must mention the tablespace name, got: " + ok.getMessage(),
+                    ok.getMessage().contains("nonexistent"));
+        } catch (Exception other) {
+            fail("expected IllegalStateException but got " + other);
         } finally {
             main.shutdown();
         }

@@ -371,6 +371,14 @@ indexingService:
       memory: "20Gi"
       cpu: "4"
 
+indexOptimizer:
+  enabled: true
+  # Human-readable tablespace name — UUID resolved from ZooKeeper at startup.
+  # No manual UUID log-scraping required.
+  tablespaceName: "herd"
+  # Short interval for bench cycles; increase for production workloads.
+  intervalMs: 300000
+
 tools:
   enabled: true
   storage:

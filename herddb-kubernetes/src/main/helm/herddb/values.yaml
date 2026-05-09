@@ -327,18 +327,20 @@ indexingService:
 # segmented-v2 indexes are managed by this service.
 indexOptimizer:
   enabled: false
-  # Tablespace UUID this optimizer manages — REQUIRED when enabled=true. The
-  # optimizer is single-tablespace for the MVP; multi-tablespace support is
-  # left for a future revision.
-  tablespaceUuid: ""
+  # Human-readable tablespace name this optimizer manages — REQUIRED when
+  # enabled=true (e.g. "herd", the HerdDB default). The optimizer resolves
+  # the UUID from ZooKeeper at startup; no manual UUID lookup is needed.
+  tablespaceName: ""
   # HTTP admin endpoint port — exposes /health (probe target) and /metrics
   # (Prometheus scrape). Set to 0 to disable.
   httpPort: 9853
   intervalMs: 300000
   minCount: 4
   maxCount: 200
-  minBytes: 268435456     # 256 MiB
-  maxBytes: 1073741824    # 1 GiB
+  # Quoted as strings to prevent the Go YAML parser from emitting scientific
+  # notation (e.g. 2.68435456e+08) which Java's Long.parseLong cannot parse.
+  minBytes: "268435456"   # 256 MiB
+  maxBytes: "1073741824"  # 1 GiB
   retentionMs: 600000     # 10 min
   zkSessionTimeout: 40000
   javaOpts: ""
