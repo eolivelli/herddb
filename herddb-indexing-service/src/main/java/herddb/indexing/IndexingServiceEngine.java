@@ -30,6 +30,9 @@ import herddb.index.vector.PersistentVectorStore;
 import herddb.index.vector.ReadOnlyVectorStore;
 import herddb.index.vector.VectorIndexManager;
 import herddb.index.vector.VectorMemoryBudget;
+import herddb.indexing.segment.SegmentRegistryClient;
+import herddb.indexing.segment.SegmentRegistryException;
+import herddb.indexing.segment.SegmentRegistryPublisher;
 import herddb.log.CommitLogTailing;
 import herddb.log.IndexingServiceRebalanceDescriptor;
 import herddb.log.LogEntry;
@@ -365,6 +368,30 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     private volatile String tableSpaceUUID;
 
     /**
+     * Issue #491 — segmented-v2 ZK segment registry handle, populated in
+     * {@link #start()} when {@link IndexingServerConfiguration#PROPERTY_INDEX_OPTIMIZER_ENABLED}
+     * is {@code true} AND the metadata storage manager is a
+     * {@link ZookeeperMetadataStorageManager} (i.e. cluster mode). When set,
+     * the production {@code vectorStoreFactory} attaches a
+     * {@link SegmentRegistryPublisher} to every freshly-created
+     * {@link PersistentVectorStore} so that each successful checkpoint
+     * publishes its sealed segments as ACTIVE znodes — making them visible
+     * to the external index-optimizer service.
+     *
+     * <p>Stays {@code null} when the property is absent / false (legacy
+     * single-IS mode) OR when the metadata storage manager is non-ZK
+     * (standalone mode + property accidentally set — surfaced as a WARNING
+     * log so operators notice the misconfiguration). The factory branch
+     * checks for null and silently falls back to legacy behaviour in both
+     * cases.
+     *
+     * <p>{@code volatile} because reads happen on the tailer thread (when it
+     * invokes the factory on a CREATE_INDEX) while the field is published
+     * from the engine-bootstrap thread inside {@link #start()}.
+     */
+    private volatile SegmentRegistryClient segmentRegistry;
+
+    /**
      * Shared multipart-block cache used by {@link RemoteRandomAccessReader} on
      * the vector-search hot path. Created in {@link #start()} from
      * {@link IndexingServerConfiguration#PROPERTY_VECTOR_SEGMENT_PAGE_CACHE_MAX_BYTES}
@@ -614,6 +641,18 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         this.vectorStoreFactory = factory;
     }
 
+    /**
+     * Issue #491: visible-for-tests accessor for the engine's currently-installed
+     * vector store factory. After {@link #start()} this is the production factory
+     * built around the configured storage type (or the in-memory fallback). Tests
+     * use it to invoke the production lambda directly and assert the per-store
+     * wiring (publisher attached, external compaction enabled, etc.) without
+     * having to spin up a real BookKeeper commit-log tailer.
+     */
+    VectorStoreFactory getVectorStoreFactory() {
+        return vectorStoreFactory;
+    }
+
     public void setMemoryManager(MemoryManager memoryManager) {
         this.memoryManager = memoryManager;
         LOGGER.log(Level.INFO, "MemoryManager set: maxDataUsedMemory={0} MB, maxLogicalPageSize={1}",
@@ -841,6 +880,34 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 store.setLocalCompactionKickFraction(vectorCompactionLocalKickFraction);
                 store.setLocalCompactionEnabledWithOptimizer(
                         vectorCompactionLocalEnabledWithOptimizer);
+                // Issue #491: when the external index-optimizer is enabled cluster-wide
+                // (indexing.optimizer.enabled=true) AND the metadata storage manager is
+                // ZK-backed, attach a SegmentRegistryPublisher BEFORE start() so that:
+                //   - the reconcile sweep at start() heals any partial-publish state
+                //     left by a previous crash;
+                //   - every subsequent successful checkpoint stages PROVISIONAL znodes
+                //     and commits them to ACTIVE — making the segments visible to the
+                //     IndexOptimizerEngine;
+                //   - the IS-local compaction loop flips into pressure-driven mode
+                //     (kickFraction × backpressure cap) instead of being the sole
+                //     driver, leaving steady-state compaction to the optimizer.
+                // Both setSegmentPublisher and setExternalCompactionEnabled MUST be
+                // called before start() — see their Javadoc. Reading the engine fields
+                // at lambda-invocation time is safe because the tailer (the only caller
+                // of the factory) starts AFTER tableSpaceUUID is resolved and AFTER
+                // segmentRegistry is set in start().
+                SegmentRegistryClient registrySnapshot = this.segmentRegistry;
+                if (registrySnapshot != null && tableSpaceUUID != null) {
+                    SegmentRegistryPublisher publisher = new SegmentRegistryPublisher(
+                            registrySnapshot, tableSpaceUUID, tableName,
+                            autoIndexUUID, indexName, instanceId);
+                    store.setSegmentPublisher(publisher);
+                    store.setExternalCompactionEnabled(true);
+                    LOGGER.log(Level.INFO,
+                            "PersistentVectorStore {0} (table={1}, indexUuid={2}) wired with"
+                                    + " SegmentRegistryPublisher; external compaction enabled",
+                            new Object[]{indexName, tableName, autoIndexUUID});
+                }
                 try {
                     store.start();
                 } catch (Exception e) {
@@ -973,6 +1040,57 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             metadataStorageManager.start();
             LOGGER.log(Level.INFO, "MetadataStorageManager started: {0}",
                     metadataStorageManager.getClass().getName());
+        }
+
+        // Issue #491: wire the segmented-v2 ZK registry when the external
+        // index-optimizer is enabled. Done here (after metadataStorageManager
+        // is started, before the vector-store factory ever runs) so that
+        // every store created by the production factory observes a non-null
+        // registry handle and attaches a SegmentRegistryPublisher. Without
+        // this wiring the optimizer pod observes zero indexes because no
+        // checkpoint ever publishes its segments to ZK.
+        boolean indexOptimizerEnabled = config.getBoolean(
+                IndexingServerConfiguration.PROPERTY_INDEX_OPTIMIZER_ENABLED,
+                IndexingServerConfiguration.PROPERTY_INDEX_OPTIMIZER_ENABLED_DEFAULT);
+        if (indexOptimizerEnabled) {
+            if (metadataStorageManager instanceof ZookeeperMetadataStorageManager) {
+                ZookeeperMetadataStorageManager zkMeta =
+                        (ZookeeperMetadataStorageManager) metadataStorageManager;
+                SegmentRegistryClient registry = new SegmentRegistryClient(
+                        zkMeta::getZooKeeper, zkMeta.getBasePath());
+                try {
+                    registry.ensureRoot();
+                } catch (SegmentRegistryException e) {
+                    // Registry root creation is part of cluster bootstrap; if it
+                    // fails the optimizer cannot work either way. Surface as a
+                    // checked failure rather than silently dropping the wiring.
+                    throw new IOException(
+                            "Failed to ensure segment registry root in ZK at "
+                                    + zkMeta.getBasePath()
+                                    + SegmentRegistryClient.REGISTRY_SUBPATH, e);
+                }
+                this.segmentRegistry = registry;
+                LOGGER.log(Level.INFO,
+                        "Segment registry wired at {0}; vector index segments will be"
+                                + " published to ZK and the IS-local compaction loop will run"
+                                + " in pressure-driven fallback mode (indexing.optimizer.enabled=true)",
+                        registry.getRegistryRootPath());
+            } else {
+                // Standalone mode (FileMetadataStorageManager) plus
+                // optimizer.enabled=true is a misconfiguration: the optimizer
+                // pod requires ZooKeeper. Log loud and continue without a
+                // registry — production deployments will notice the warning
+                // in the IS startup logs and either remove the property or
+                // switch to cluster mode.
+                LOGGER.log(Level.WARNING,
+                        "{0}=true but metadata storage manager is {1} (not ZK-backed);"
+                                + " the segment registry cannot be wired and the external"
+                                + " optimizer will see zero indexes. Either set server.mode=cluster"
+                                + " or unset {0}.",
+                        new Object[]{
+                                IndexingServerConfiguration.PROPERTY_INDEX_OPTIMIZER_ENABLED,
+                                metadataStorageManager.getClass().getName()});
+            }
         }
 
         // Resolve tablespace name to UUID, polling until available or interrupted
@@ -1175,6 +1293,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
 
     public String getTableSpaceUUID() {
         return tableSpaceUUID;
+    }
+
+    /**
+     * Issue #491: returns the segmented-v2 ZK registry handle wired during
+     * {@link #start()}, or {@code null} when {@link IndexingServerConfiguration#PROPERTY_INDEX_OPTIMIZER_ENABLED}
+     * was unset / false at startup OR when the metadata storage manager was
+     * non-ZK at startup. Visible for tests; production code does not need to
+     * access the registry directly (the production factory does).
+     */
+    SegmentRegistryClient getSegmentRegistry() {
+        return segmentRegistry;
     }
 
     public long getStartTimeMillis() {

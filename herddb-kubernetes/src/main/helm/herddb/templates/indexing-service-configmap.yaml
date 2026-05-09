@@ -22,6 +22,17 @@ data:
     indexing.log.type=bookkeeper
     server.bookkeeper.ledgers.path=/ledgers
     {{- end }}
+    {{- if .Values.indexOptimizer.enabled }}
+    # Issue #491: when the external index-optimizer service is enabled, the IS
+    # MUST publish every freshly-emitted segment to the ZK segment registry,
+    # otherwise the optimizer observes zero indexes. Auto-derived from
+    # indexOptimizer.enabled so operators do not have to keep two flags in sync.
+    # Side-effect: this also flips the per-store IS-local compaction loop into
+    # pressure-driven fallback mode (kickFraction × backpressure cap) so the
+    # optimizer drives steady-state compaction. Override per-store via
+    # vector.index.compaction.local.enabledWithOptimizer / .local.kick.fraction.
+    indexing.optimizer.enabled=true
+    {{- end }}
     {{- if and .Values.indexingService.s3 .Values.indexingService.s3.directEnabled }}
     indexing.s3.direct.enabled=true
     {{- if .Values.indexingService.s3.endpoint }}

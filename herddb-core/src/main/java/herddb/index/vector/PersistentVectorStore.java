@@ -1805,15 +1805,18 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * Installs (or replaces) the {@link SegmentPublisher} hook called after each
      * successful checkpoint. Pass {@code null} to disable.
      *
-     * <p><b>Per-index opt-in (future-work, see VECTOR.md "Production
-     * prerequisites"):</b> structurally the publisher reference is per
-     * {@link PersistentVectorStore} instance, so per-index opt-in is possible at
-     * the API level — but as of this writing no production caller exists. The
-     * {@code IndexingServiceEngine} does NOT currently read
-     * {@code indexing.optimizer.enabled} and never invokes this method. Tests
-     * exercise the per-index path (see {@code MixedModeIndexesTest}); production
-     * deployments should not enable {@code indexOptimizer.enabled=true} until
-     * this wiring lands and the prerequisites in VECTOR.md are satisfied.
+     * <p><b>Production wiring (issue #491):</b> the publisher reference is per
+     * {@link PersistentVectorStore} instance, so per-index attachment is possible
+     * at the API level. In production the
+     * {@code IndexingServiceEngine}'s vector-store factory attaches a
+     * {@code SegmentRegistryPublisher} to every store it creates whenever
+     * {@code indexing.optimizer.enabled=true} and the metadata storage manager
+     * is ZK-backed. Outside that path callers must invoke this method
+     * explicitly (see {@code MixedModeIndexesTest} for a per-index attachment
+     * pattern). Operators enabling {@code indexOptimizer.enabled=true} must
+     * still satisfy the remaining production prerequisites listed in VECTOR.md
+     * (real {@code SegmentMerger} SPI, {@code SegmentAssignmentWatcher}
+     * wired, etc.).
      *
      * <p><b>Concurrency contract (review item C1):</b> changes take effect on the
      * NEXT checkpoint cycle, not the in-flight one. The checkpoint Phase B reads

@@ -279,11 +279,27 @@ public final class IndexingServerConfiguration {
             300_000L;
 
     /**
-     * When {@code true}, the IS does NOT run the per-store
-     * {@code vectorIndexCompactionLoop()} thread — compaction is delegated to
-     * the external index-optimizer service, which scans the segment registry
-     * and merges segments out-of-process. The IS still runs the tailer and
-     * checkpoint loop. Default {@code false} (legacy in-IS compaction).
+     * When {@code true}, the {@link herddb.indexing.IndexingServiceEngine} (issue #491):
+     * <ul>
+     *   <li>builds a {@code SegmentRegistryClient} from the (ZK-backed) metadata
+     *       storage manager during {@code start()},</li>
+     *   <li>attaches a {@code SegmentRegistryPublisher} to every freshly-created
+     *       {@code PersistentVectorStore} so each successful checkpoint publishes
+     *       its sealed segments to the segment registry — making them visible
+     *       to the external index-optimizer service,</li>
+     *   <li>flips the per-store {@code vectorIndexCompactionLoop()} into
+     *       pressure-driven fallback mode (kickFraction × backpressure cap)
+     *       instead of being the sole driver, leaving steady-state compaction
+     *       to the optimizer.</li>
+     * </ul>
+     * Tailer and checkpoint loops still run. Default {@code false} (legacy
+     * single-actor IS compaction). When set to {@code true} with a non-ZK
+     * metadata storage manager (standalone mode) the engine logs a WARNING and
+     * starts without a registry — the optimizer cannot work in standalone mode.
+     *
+     * <p>The Helm chart's IS {@code ConfigMap} auto-emits this property when
+     * {@code indexOptimizer.enabled=true}, so operators do not have to keep
+     * two flags in sync.
      */
     public static final String PROPERTY_INDEX_OPTIMIZER_ENABLED = "indexing.optimizer.enabled";
     public static final boolean PROPERTY_INDEX_OPTIMIZER_ENABLED_DEFAULT = false;

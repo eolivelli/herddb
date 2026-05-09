@@ -321,9 +321,13 @@ indexingService:
     credentialsSecret: ""
 
 # Index Optimizer — singleton service that takes over vector-index compaction
-# from the IS. Enable together with indexingService.optimizerEnabled=true so
-# the IS suppresses its in-process compaction loop. Greenfield only: existing
-# legacy indexes keep the in-IS compaction path, only newly-created
+# from the IS. When indexOptimizer.enabled=true the IS configmap auto-emits
+# indexing.optimizer.enabled=true (issue #491) so every IS pod publishes its
+# freshly-emitted segments to the ZK segment registry and flips its per-store
+# local compaction loop into pressure-driven fallback mode — making the
+# external optimizer the steady-state compaction driver. No additional
+# indexingService.* flag has to be set in lock-step. Greenfield only:
+# existing legacy indexes keep the in-IS compaction path, only newly-created
 # segmented-v2 indexes are managed by this service.
 indexOptimizer:
   enabled: false
