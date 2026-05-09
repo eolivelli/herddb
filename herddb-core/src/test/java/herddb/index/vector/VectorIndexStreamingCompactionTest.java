@@ -25,8 +25,10 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.mem.MemoryDataStorageManager;
+import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -34,6 +36,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongConsumer;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -297,6 +302,219 @@ public class VectorIndexStreamingCompactionTest {
             // Same surviving PK set as the ground truth: this is the
             // observable equivalence between the legacy and streaming paths.
             assertEquals(expectedSurvivors, mergedSegmentPkSet(merged));
+        }
+    }
+
+    /**
+     * Issue #485 review item B.3#1: the {@code < 2 candidates} fallback to
+     * the legacy in-memory rebuild must trigger when the policy hands a
+     * single-segment cycle to the streaming entry point. Build exactly one
+     * segment + a non-trivial live shard, force a 1-segment compaction
+     * candidate by tightening {@code minCount=1}, and observe the legacy
+     * synthetic-shard path firing via {@link
+     * VectorIndexCompactor#syntheticShardObserverForTest}.
+     */
+    @Test
+    public void streamingFallsBackToLegacyForSingleCandidate() throws Exception {
+        VectorIndexCompactor.streamingCompactionEnabled = true;
+        long fallbackBefore = VectorIndexCompactor.getStreamingFallbackToLegacyTotal();
+        AtomicReference<PersistentVectorStore.LiveGraphShard> observed =
+                new AtomicReference<>();
+        VectorIndexCompactor.syntheticShardObserverForTest = observed::set;
+        try {
+            Path tmpDir = tmpFolder.newFolder().toPath();
+            MemoryDataStorageManager dsm = new MemoryDataStorageManager();
+            MemoryManager mm = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+            try (PersistentVectorStore store = new PersistentVectorStore(
+                    "testidx", "testtable", "tstblspace", "vector_col",
+                    tmpDir, dsm, mm,
+                    16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                    /*compactionIntervalMs*/ Long.MAX_VALUE)) {
+                // minCount=1, maxCount=1: hand the streaming entry point a
+                // single-candidate cycle so the < 2 sources fallback fires.
+                store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE,
+                        /*minCount*/ 1, /*maxCount*/ Integer.MAX_VALUE,
+                        /*retentionMs*/ 0);
+                store.start();
+                Random rng = new Random(11);
+                List<Bytes> insertedPks = new ArrayList<>();
+                // First segment: 200 rows -> checkpoint -> exactly one on-disk segment.
+                for (int i = 0; i < 200; i++) {
+                    Bytes pk = Bytes.from_int(i);
+                    insertedPks.add(pk);
+                    store.addVector(pk, vec(rng, 16));
+                }
+                store.checkpoint();
+                // Live shard: 50 more rows still in memory (will be folded in via
+                // authority-by-PK-from-live-shards during rebuild).
+                for (int i = 200; i < 250; i++) {
+                    Bytes pk = Bytes.from_int(i);
+                    insertedPks.add(pk);
+                    store.addVector(pk, vec(rng, 16));
+                }
+                assertEquals("setup must produce exactly one on-disk segment",
+                        1, store.getSegmentCount());
+
+                store.runCompactionCycle();
+
+                // The fallback metric must have advanced (this is the only way
+                // the single-candidate path can run without throwing).
+                long fallbackAfter = VectorIndexCompactor.getStreamingFallbackToLegacyTotal();
+                assertTrue("fallback-to-legacy counter must advance: before="
+                                + fallbackBefore + " after=" + fallbackAfter,
+                        fallbackAfter == fallbackBefore + 1);
+
+                // The synthetic-shard observer must have been invoked: that's
+                // the legacy path's signature event.
+                assertNotNull("legacy synthetic-shard path must have run on fallback",
+                        observed.get());
+
+                // Compaction succeeded (the single-segment "rebuild" repackages
+                // the segment by walking authoritative PKs).
+                assertEquals(1, store.getCompactionSuccessesTotal());
+                assertEquals(0, store.getCompactionConsecutiveFailures());
+            }
+        } finally {
+            VectorIndexCompactor.syntheticShardObserverForTest = null;
+        }
+    }
+
+    /**
+     * Issue #485 review item B.3#2: the {@code INLINE_VECTORS} guard must
+     * fire as {@code CompactionException(CORRUPTION, ...)} when a candidate's
+     * graph lacks the feature. HerdDB writers always include {@code
+     * INLINE_VECTORS} today, so the guard is dormant in production — but a
+     * regression in any of the three writer sites would silently produce a
+     * corrupt streaming output without this assertion in place.
+     *
+     * <p>The guard is exposed as a small package-private helper
+     * ({@link VectorIndexCompactor#requireInlineVectorsFeature(int, java.util.Map)})
+     * so the test does not need to mock a full {@link
+     * io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex} instance —
+     * {@code OnDiskGraphIndex}'s only constructor is {@code private}, which
+     * makes a non-reflection mock impossible. Testing the guard at this level
+     * still locks in the invariant: the helper is the single call site
+     * referenced by {@code rebuildSegmentStreaming}.
+     */
+    @Test
+    public void streamingRejectsCandidateWithoutInlineVectors() throws Exception {
+        // Empty feature map → guard must throw CORRUPTION.
+        try {
+            VectorIndexCompactor.requireInlineVectorsFeature(42, java.util.Collections.emptyMap());
+            org.junit.Assert.fail("requireInlineVectorsFeature must throw on empty feature map");
+        } catch (VectorIndexCompactor.CompactionException expected) {
+            assertEquals(VectorIndexCompactor.FailureReason.CORRUPTION, expected.reason);
+            assertTrue("error message must reference INLINE_VECTORS, got: "
+                            + expected.getMessage(),
+                    expected.getMessage() != null
+                            && expected.getMessage().contains("INLINE_VECTORS"));
+            assertTrue("error message must reference the segment id, got: "
+                            + expected.getMessage(),
+                    expected.getMessage().contains("42"));
+        }
+
+        // null map → guard must throw CORRUPTION (defensive against jvector
+        // contract drift; same outcome as empty map for symmetry).
+        try {
+            VectorIndexCompactor.requireInlineVectorsFeature(7, null);
+            org.junit.Assert.fail("requireInlineVectorsFeature must throw on null feature map");
+        } catch (VectorIndexCompactor.CompactionException expected) {
+            assertEquals(VectorIndexCompactor.FailureReason.CORRUPTION, expected.reason);
+        }
+
+        // Map containing INLINE_VECTORS → guard must NOT throw. Use the FUSED_PQ
+        // FeatureId as a noise key alongside INLINE_VECTORS to confirm the guard
+        // looks for the right key, not any-key-present.
+        java.util.Map<io.github.jbellis.jvector.graph.disk.feature.FeatureId, Object> ok =
+                new java.util.HashMap<>();
+        ok.put(io.github.jbellis.jvector.graph.disk.feature.FeatureId.INLINE_VECTORS,
+                new Object()); // sentinel value — guard only consults containsKey()
+        VectorIndexCompactor.requireInlineVectorsFeature(0, ok); // no exception
+        ok.put(io.github.jbellis.jvector.graph.disk.feature.FeatureId.FUSED_PQ,
+                new Object());
+        VectorIndexCompactor.requireInlineVectorsFeature(0, ok); // still no exception
+
+        // Map containing only FUSED_PQ → guard must throw (a single non-INLINE
+        // feature must not pass the guard).
+        java.util.Map<io.github.jbellis.jvector.graph.disk.feature.FeatureId, Object> wrongKey =
+                new java.util.HashMap<>();
+        wrongKey.put(io.github.jbellis.jvector.graph.disk.feature.FeatureId.FUSED_PQ,
+                new Object());
+        try {
+            VectorIndexCompactor.requireInlineVectorsFeature(99, wrongKey);
+            org.junit.Assert.fail("requireInlineVectorsFeature must throw when only FUSED_PQ is present");
+        } catch (VectorIndexCompactor.CompactionException expected) {
+            assertEquals(VectorIndexCompactor.FailureReason.CORRUPTION, expected.reason);
+        }
+    }
+
+    /**
+     * Issue #485 review item B.1#1 (orphan tracking on partial upload failure).
+     *
+     * <p>The streaming path uploads the merged graph and map files in two
+     * sequential {@code writeMultipartIndexFile} calls. A failure in either
+     * call must route both candidate orphan paths through {@code pendingDeletes}
+     * so the retention reaper can sweep them. Pre-fix the rebuild method
+     * rethrew the raw {@code IOException} / {@code DataStorageManagerException}
+     * and the outer cycle's {@code catch (IOException)} arm did not consult
+     * the orphans list.
+     *
+     * <p>This test forces the FIRST multipart write (graph) to fail,
+     * which means nothing is uploaded — but the orphan-tracking code is
+     * conservative and queues both anyway. A future enhancement could make
+     * the orphan list precise; locking in the current behaviour as the
+     * regression gate.
+     */
+    @Test
+    public void streamingFailedUploadQueuesOrphansForRetentionSweep() throws Exception {
+        VectorIndexCompactor.streamingCompactionEnabled = true;
+        Path tmpDir = tmpFolder.newFolder().toPath();
+        FailingDsm dsm = new FailingDsm();
+        try (PersistentVectorStore store = createStore(tmpDir, dsm)) {
+            store.start();
+            // Build 5 segments so the streaming path runs (>= 2 sources).
+            Random rng = new Random(33);
+            for (int c = 0; c < 5; c++) {
+                for (int i = 0; i < 200; i++) {
+                    store.addVector(Bytes.from_int(c * 10_000 + i), vec(rng, 16));
+                }
+                store.checkpoint();
+            }
+            int pendingBefore = store.getPendingDeletesSnapshot().size();
+
+            // Arm the DSM to fail the next multipart write (the graph upload).
+            dsm.failNextMultipartWrites.set(1);
+            store.runCompactionCycle();
+
+            // Failure metric must have advanced.
+            assertTrue("compaction failure metric must have advanced",
+                    store.getCompactionFailuresWriteIoTotal()
+                            + store.getCompactionFailuresMetadataIoTotal() > 0);
+
+            // Both orphan multipart entries (graph + map) must be queued for
+            // retention-aware deletion regardless of which upload step failed.
+            List<PersistentVectorStore.PendingDelete> pendingAfter =
+                    store.getPendingDeletesSnapshot();
+            assertTrue("orphan tracking must queue both graph and map entries:"
+                            + " pendingBefore=" + pendingBefore
+                            + " pendingAfter.size=" + pendingAfter.size(),
+                    pendingAfter.size() >= pendingBefore + 2);
+        }
+    }
+
+    /** Minimal failure-injection DSM. Counts the next N {@code writeMultipartIndexFile} calls and throws. */
+    private static final class FailingDsm extends MemoryDataStorageManager {
+        final AtomicInteger failNextMultipartWrites = new AtomicInteger(0);
+
+        @Override
+        public String writeMultipartIndexFile(String tableSpace, String uuid,
+                                              String fileType, Path tempFile,
+                                              LongConsumer progress)
+                throws IOException, DataStorageManagerException {
+            if (failNextMultipartWrites.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                throw new IOException("injected multipart write failure (issue #485 test)");
+            }
+            return super.writeMultipartIndexFile(tableSpace, uuid, fileType, tempFile, progress);
         }
     }
 

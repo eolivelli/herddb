@@ -2315,11 +2315,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     LOGGER.log(Level.WARNING,
                             "vector store " + indexName + ": compaction failed ("
                                     + e.reason + ")", e);
-                    // Clean up orphaned output files if any were written.
+                    // Clean up orphaned output files. Orphans may come from two
+                    // places: a successful rebuild that subsequently failed (carried
+                    // on rebuild.orphanPaths), or a rebuild that threw before the
+                    // RebuildResult was constructed (carried on e.orphanPaths —
+                    // issue #485 review item: pre-fix the rethrown IOException
+                    // dropped the orphan list with the stack frame).
+                    long now = System.currentTimeMillis();
+                    long sinceGen = currentIndexStatusGeneration.get();
                     if (rebuild != null && rebuild.orphanPaths != null) {
-                        long now = System.currentTimeMillis();
-                        long sinceGen = currentIndexStatusGeneration.get();
                         for (String[] orphan : rebuild.orphanPaths) {
+                            this.pendingDeletes.add(new PendingDelete(
+                                    encodeMultipartPath(orphan[0], orphan[1]),
+                                    now, sinceGen));
+                        }
+                    }
+                    if (e.orphanPaths != null) {
+                        for (String[] orphan : e.orphanPaths) {
                             this.pendingDeletes.add(new PendingDelete(
                                     encodeMultipartPath(orphan[0], orphan[1]),
                                     now, sinceGen));
@@ -2956,6 +2968,31 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     ProductQuantization getCachedPqForTest() {
         return cachedPQ;
+    }
+
+    /**
+     * Process-wide switch for the streaming compaction engine introduced
+     * in issue #485. When {@code true}, vector-index compaction is driven
+     * by jvector's {@code OnDiskGraphIndexCompactor} (memory bounded by
+     * {@code O(taskWindowSize × maxDegree × float[dim])}); when {@code
+     * false}, the legacy in-memory {@code GraphIndexBuilder} rebuild path
+     * is used instead.
+     *
+     * <p>Public façade over {@link VectorIndexCompactor#streamingCompactionEnabled}
+     * (the underlying class is package-private). Called by
+     * {@code IndexingServiceEngine.start()} when the
+     * {@code vector.index.compaction.streaming.enabled} config key is
+     * resolved at IS startup. Operators may also set the flag via the
+     * {@code herddb.vectorindex.streamingCompactionEnabled} system
+     * property — the config key wins.
+     */
+    public static void setStreamingCompactionEnabled(boolean enabled) {
+        VectorIndexCompactor.streamingCompactionEnabled = enabled;
+    }
+
+    /** Returns the current value of {@link #setStreamingCompactionEnabled(boolean)}. */
+    public static boolean isStreamingCompactionEnabled() {
+        return VectorIndexCompactor.streamingCompactionEnabled;
     }
 
     /**
