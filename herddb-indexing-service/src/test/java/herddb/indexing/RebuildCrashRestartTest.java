@@ -167,7 +167,10 @@ public class RebuildCrashRestartTest {
             // FAILED the engine's existing checkpoint code persists
             // whatever lastProcessedLsn currently is, which is the
             // pre-CREATE_INDEX value. No data loss because the
-            // CREATE_INDEX entry itself is not in the snapshot.
+            // snapshot's LSN is pre-CREATE_INDEX, so on engine
+            // restart the CREATE_INDEX is replayed from the commit
+            // log and the rebuild re-fires (see comment below for
+            // the schema-replay detail).
             engine1.forceCheckpointAndSaveWatermark();
 
             WatermarkSnapshot persistedAfterFailure = sharedWatermark.load();
