@@ -78,11 +78,23 @@ public class RemoteSegmentMergerLegacyOverlayTest {
 
     private MemoryDataStorageManager dsm;
     private Path tmpDir;
+    private boolean savedStreamingFlag;
 
     @Before
     public void setUp() throws Exception {
         dsm = new MemoryDataStorageManager();
         tmpDir = tmp.newFolder("merger-tmp").toPath();
+        // Issue #485: synthetic inputs with no real graph multipart file —
+        // force the legacy in-memory rebuild path.
+        savedStreamingFlag =
+                herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled();
+        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
+    }
+
+    @org.junit.After
+    public void tearDown() {
+        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(
+                savedStreamingFlag);
     }
 
     private SegmentMetadata writeInputAndPublishOverlay(

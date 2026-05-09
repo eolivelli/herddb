@@ -83,11 +83,28 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
 
     private MemoryDataStorageManager dsm;
     private Path tmpDir;
+    private boolean savedStreamingFlag;
 
     @Before
     public void setUp() throws Exception {
         dsm = new MemoryDataStorageManager();
         tmpDir = tmp.newFolder("merger-tmp").toPath();
+        // Issue #485: this suite uses synthetic inputs with only a fake map
+        // file (no real graph multipart object). The streaming compaction
+        // path (default-on per issue #485) requires a real graph file per
+        // input, so this suite can only be exercised via the legacy
+        // in-memory rebuild. Force the legacy path; streaming coverage
+        // lives in RemoteSegmentGraphMergerStreamingTest, which produces
+        // real graphs via PersistentVectorStore.
+        savedStreamingFlag =
+                herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled();
+        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
+    }
+
+    @org.junit.After
+    public void tearDown() {
+        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(
+                savedStreamingFlag);
     }
 
     private SegmentMetadata writeLegacyInput(String segUuid, long segId, int seed) throws Exception {
