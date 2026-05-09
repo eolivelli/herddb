@@ -559,7 +559,8 @@ public class RemoteFileDataStorageManager extends DataStorageManager
         // Use a direct ByteBuf so that Bytes.writeTo(ByteBuf) for off-heap-backed
         // keys (IndexKeySlab slabs) performs a direct-to-direct copy with no heap
         // byte[] allocation per key (issue #497).
-        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(4096);
+        // Pre-size using the writer's estimate (+16 for outer version/flags VLongs and hash).
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(writer.sizeEstimate() + 16);
         try {
             herddb.utils.ByteBufUtils.writeVLong(buf, 1); // outer version
             herddb.utils.ByteBufUtils.writeVLong(buf, 0); // outer flags

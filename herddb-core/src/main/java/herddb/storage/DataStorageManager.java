@@ -148,7 +148,6 @@ public abstract class DataStorageManager implements AutoCloseable {
                 "Lazy page loading not supported by " + getClass().getName());
     }
 
-    @FunctionalInterface
     public interface DataWriter {
 
         /**
@@ -163,6 +162,22 @@ public abstract class DataStorageManager implements AutoCloseable {
          * performs a zero-copy direct-to-direct copy (issue #497).
          */
         void write(ByteBufDataOutput out) throws IOException;
+
+        /**
+         * Returns a best-effort estimate of the payload size in bytes written
+         * by {@link #write}. Used by {@code DataStorageManager} implementations
+         * to pre-size the backing {@code ByteBuf} so the first write rarely
+         * triggers an expansion. The estimate does <em>not</em> need to include
+         * the outer framing bytes added by the DSM (outer version / flags /
+         * hash footer), as the DSM adds a constant-size margin itself.
+         *
+         * <p>The default (4 KiB) is suitable when the payload size is not
+         * known in advance. Override to provide a tighter estimate and avoid
+         * buffer-copy expansions on large pages.
+         */
+        default int sizeEstimate() {
+            return 4096;
+        }
     }
 
     public abstract void writeIndexPage(String tableSpace, String uuid, long pageId, DataWriter writer);

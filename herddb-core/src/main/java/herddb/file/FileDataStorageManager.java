@@ -943,7 +943,8 @@ public class FileDataStorageManager extends DataStorageManager {
         // write the whole range to the OutputStream in a single call. The ByteBuf
         // auto-expands as the DataWriter appends data, and returns to the pool on
         // release, giving similar recycling behaviour to RecyclableByteArrayOutputStream.
-        ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(4096);
+        // Pre-size using the writer's estimate (+16 for outer version/flags VLongs and hash).
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(writer.sizeEstimate() + 16);
         try {
             herddb.utils.ByteBufUtils.writeVLong(buf, 1); // outer version
             herddb.utils.ByteBufUtils.writeVLong(buf, 0); // outer flags for future implementations

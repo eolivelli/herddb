@@ -23,6 +23,7 @@ package herddb.index.blink;
 import herddb.index.blink.BLinkMetadata.BLinkNodeMetadata;
 import herddb.utils.ByteBufCursor;
 import herddb.utils.ByteBufDataOutput;
+import herddb.utils.ByteBufUtils;
 import herddb.utils.Bytes;
 import herddb.utils.HerdDBByteBufAllocators;
 import herddb.utils.IndexKeySlab;
@@ -158,6 +159,80 @@ final class IncrementalBLinkPageCodec {
         for (long id : deadStoreIds) {
             out.writeVLong(id);
         }
+    }
+
+    // -------- size estimators (used by callers to pre-size the ByteBuf) --------
+
+    /**
+     * Estimates the serialised byte size of a snapshot-chunk page for the
+     * given {@code nodes} list. Used by the caller to pre-size the backing
+     * {@code ByteBuf} via {@code DataWriter.sizeEstimate()}.
+     */
+    static int snapshotChunkSizeEstimate(
+            long epoch, int chunkIndex, int totalChunks,
+            List<BLinkNodeMetadata<Bytes>> nodes) {
+        // PAGE_VERSION(vlong) + PAGE_FLAGS(vlong) + PAGE_KIND(byte)
+        //   + epoch(vlong) + chunkIndex(vint) + totalChunks(vint) + count(vint)
+        int estimate = 1 + 1 + 1
+                + ByteBufUtils.varLongLen(epoch)
+                + ByteBufUtils.varIntLen(chunkIndex)
+                + ByteBufUtils.varIntLen(totalChunks)
+                + ByteBufUtils.varIntLen(nodes.size());
+        for (BLinkNodeMetadata<Bytes> node : nodes) {
+            estimate += nodeMetadataSizeEstimate(node);
+        }
+        return estimate;
+    }
+
+    /**
+     * Estimates the serialised byte size of a delta page.
+     */
+    static int deltaSizeEstimate(
+            long epoch,
+            List<BLinkNodeMetadata<Bytes>> upserted,
+            long[] removedNodeIds,
+            long[] deadStoreIds) {
+        // PAGE_VERSION + PAGE_FLAGS + PAGE_KIND + epoch + 3 vint counts
+        int estimate = 1 + 1 + 1
+                + ByteBufUtils.varLongLen(epoch)
+                + ByteBufUtils.varIntLen(upserted.size())
+                + ByteBufUtils.varIntLen(removedNodeIds.length)
+                + ByteBufUtils.varIntLen(deadStoreIds.length);
+        for (BLinkNodeMetadata<Bytes> node : upserted) {
+            estimate += nodeMetadataSizeEstimate(node);
+        }
+        for (long id : removedNodeIds) {
+            estimate += ByteBufUtils.varLongLen(id);
+        }
+        for (long id : deadStoreIds) {
+            estimate += ByteBufUtils.varLongLen(id);
+        }
+        return estimate;
+    }
+
+    /**
+     * Estimates the serialised size of one {@link BLinkNodeMetadata} record.
+     * Uses exact lengths for known fields ({@code id}, {@code storeId},
+     * {@code keys}, {@code bytes}, rightsep key bytes) and a conservative
+     * 9-byte worst-case for the zig-zag-encoded {@code outlink} and
+     * {@code rightlink} fields.
+     */
+    private static int nodeMetadataSizeEstimate(BLinkNodeMetadata<Bytes> node) {
+        // boolean(1) + vlong(id) + vlong(storeId) + vint(keys) + vlong(bytes)
+        //   + zlong(outlink)[worst 9] + zlong(rightlink)[worst 9] + byte(rightsep_type)
+        int estimate = 1
+                + ByteBufUtils.varLongLen(node.id)
+                + ByteBufUtils.varLongLen(node.storeId)
+                + ByteBufUtils.varIntLen(node.keys)
+                + ByteBufUtils.varLongLen(node.bytes)
+                + 9  // zlong(outlink): zig-zag may produce a large unsigned value
+                + 9  // zlong(rightlink): same
+                + 1; // rightsep type byte
+        if (node.rightsep != Bytes.POSITIVE_INFINITY) {
+            int keyLen = node.rightsep.getLength();
+            estimate += ByteBufUtils.varIntLen(keyLen) + keyLen;
+        }
+        return estimate;
     }
 
     static DeltaContents readDelta(ByteBufCursor in) throws IOException {

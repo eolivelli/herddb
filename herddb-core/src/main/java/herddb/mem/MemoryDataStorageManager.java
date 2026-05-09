@@ -292,7 +292,7 @@ public class MemoryDataStorageManager extends DataStorageManager {
             long pageId, DataWriter writer
     ) throws DataStorageManagerException {
 
-        ByteBuf buf = Unpooled.buffer(1024);
+        ByteBuf buf = Unpooled.buffer(writer.sizeEstimate());
         try {
             writer.write(new ByteBufDataOutput(buf));
             byte[] data = new byte[buf.writerIndex()];

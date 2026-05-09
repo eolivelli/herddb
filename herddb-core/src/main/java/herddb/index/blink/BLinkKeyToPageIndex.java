@@ -45,6 +45,7 @@ import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
 import herddb.utils.ByteArrayCursor;
 import herddb.utils.ByteBufDataOutput;
+import herddb.utils.ByteBufUtils;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataOutputStream;
 import herddb.utils.HerdDBByteBufAllocators;
@@ -1043,42 +1044,73 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
             createPage(pageId, data, LEAF_NODE_PAGE);
         }
 
+        /**
+         * Estimates the serialised size of a BLink node page (INNER or LEAF).
+         * Used to pre-size the backing {@code ByteBuf} via
+         * {@code DataWriter.sizeEstimate()} so the first write rarely triggers
+         * a buffer expansion on large pages.
+         */
+        private static int nodePageSizeEstimate(Map<Bytes, Long> data) {
+            // vlong(1) + vlong(0) + byte(type) = 1 + 1 + 1 = 3
+            int estimate = 3;
+            for (Map.Entry<Bytes, Long> e : data.entrySet()) {
+                Bytes k = e.getKey();
+                if (k == Bytes.POSITIVE_INFINITY) {
+                    // byte(INF_BLOCK) + vlong(pageId) — worst case 9 bytes
+                    estimate += 1 + 9;
+                } else {
+                    int keyLen = k.getLength();
+                    // byte(KEY_VALUE_BLOCK) + vint(keyLen) + keyLen + vlong(pageId)
+                    estimate += 1 + ByteBufUtils.varIntLen(keyLen) + keyLen
+                            + ByteBufUtils.varLongLen(e.getValue());
+                }
+            }
+            // byte(END_BLOCK)
+            estimate += 1;
+            return estimate;
+        }
+
         private long createPage(long pageId, Map<Bytes, Long> data, byte type) throws IOException {
             /* Write/overwrite switch */
             if (pageId == NEW_PAGE) {
                 pageId = newPageId.getAndIncrement();
             }
 
-            DataStorageManager.DataWriter writer = (ByteBufDataOutput out) -> {
+            DataStorageManager.DataWriter writer = new DataStorageManager.DataWriter() {
+                @Override
+                public void write(ByteBufDataOutput out) throws IOException {
+                    /* Data version */
+                    out.writeVLong(1);
 
-                /* Data version */
-                out.writeVLong(1);
+                    /* flags for future implementations, actually unused */
+                    out.writeVLong(0);
 
-                /* flags for future implementations, actually unused */
-                out.writeVLong(0);
+                    out.writeByte(type);
 
-                out.writeByte(type);
-
-                data.forEach((x, y) -> {
-                    try {
-                        if (x == Bytes.POSITIVE_INFINITY) {
-                            // Handle special case for +inf key
-                            out.writeByte(NODE_PAGE_INF_BLOCK);
-                            out.writeVLong(y);
-                        } else {
-                            out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
-                            // writeArray(Bytes) calls Bytes.writeTo(ByteBuf):
-                            // zero-copy for off-heap IndexKeySlab keys (issue #497).
-                            out.writeArray(x);
-                            out.writeVLong(y);
+                    data.forEach((x, y) -> {
+                        try {
+                            if (x == Bytes.POSITIVE_INFINITY) {
+                                // Handle special case for +inf key
+                                out.writeByte(NODE_PAGE_INF_BLOCK);
+                                out.writeVLong(y);
+                            } else {
+                                out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
+                                // writeArray(Bytes) calls Bytes.writeTo(ByteBuf):
+                                // zero-copy for off-heap IndexKeySlab keys (issue #497).
+                                out.writeArray(x);
+                                out.writeVLong(y);
+                            }
+                        } catch (IOException e) {
+                            throw new UncheckedIOException("Unexpected IOException during node page write preparation", e);
                         }
-                    } catch (IOException e) {
-                        throw new UncheckedIOException("Unexpected IOException during node page write preparation", e);
-                    }
-                });
+                    });
 
-                out.writeByte(NODE_PAGE_END_BLOCK);
-
+                    out.writeByte(NODE_PAGE_END_BLOCK);
+                }
+                @Override
+                public int sizeEstimate() {
+                    return nodePageSizeEstimate(data);
+                }
             };
 
             /*
