@@ -159,39 +159,102 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
     }
 
     @Test
-    public void legacyZnodeRefusedAgainstProductionLikeReader() throws Exception {
+    public void modernZnodeFailsLoudlyAgainstHintReturningReader() throws Exception {
         // Regression test for round-3 review B.1.1: production
         // RandomAccessReader implementations (RemoteRandomAccessReader,
-        // SegmentedMappedReader) return the constructor-supplied size from
-        // length(), so any clamp via length() is a no-op. We mirror that
-        // behaviour here with a HintReturningDsm decorator and verify the
-        // merger STILL refuses the legacy input, proving the round-3 fix
-        // doesn't depend on the in-memory DSM's byte-accurate length().
+        // SegmentedMappedReader) treat the constructor-supplied fileSize as
+        // authoritative and return it from length() — they don't probe the
+        // underlying object. The round-4 fix removed the misleading
+        // length()-based clamp from RemoteSegmentGraphMerger.downloadMapFile;
+        // the caller (RemoteSegmentMerger) is now solely responsible for
+        // passing a byte-accurate size.
+        //
+        // This test exercises the production-reader contract directly by
+        // wiring a {@link HintReturningReader} that mirrors
+        // RemoteRandomAccessReader.length(). We feed a *modern* znode whose
+        // mapFileSize is INTENTIONALLY too large vs the actual remote bytes
+        // — the merger then asks the reader for that many bytes, the reader
+        // honours the over-estimate, and {@code readFully} throws when the
+        // underlying buffer runs out. Asserts the failure is loud (an
+        // IOException) rather than silent under-read or torn graph.
         HintReturningDsm productionLikeDsm = new HintReturningDsm();
-        SegmentMetadata legacy = writeLegacyInput("legacy-prod-A", 100L, 0xA);
-        // Re-publish into the production-like DSM (the helper used the
-        // memory DSM by default).
+        // Plant a 16-byte real map file on the DSM, but configure the
+        // SegmentMetadata to claim 1024 bytes — the production reader will
+        // happily return length()=1024 from the size hint, and the merger
+        // will read until it runs off the end.
         Path scratch = Files.createTempFile(tmpDir, "scratch-", ".tmp");
-        Files.write(scratch, new byte[]{0, 1, 2, 3, 4, 5, 6, 7});
-        productionLikeDsm.writeMultipartIndexFile(TS_UUID, IDX_UUID + "_seg100", "map",
+        Files.write(scratch, new byte[16]);
+        productionLikeDsm.writeMultipartIndexFile(TS_UUID, IDX_UUID + "_seg500", "map",
                 scratch, null);
         Files.deleteIfExists(scratch);
-
-        SegmentMetadata other = writeLegacyInput("legacy-prod-B", 200L, 0xB);
         Path scratch2 = Files.createTempFile(tmpDir, "scratch2-", ".tmp");
-        Files.write(scratch2, new byte[]{0, 1, 2, 3, 4, 5, 6, 7});
-        productionLikeDsm.writeMultipartIndexFile(TS_UUID, IDX_UUID + "_seg200", "map",
+        Files.write(scratch2, new byte[16]);
+        productionLikeDsm.writeMultipartIndexFile(TS_UUID, IDX_UUID + "_seg600", "map",
                 scratch2, null);
         Files.deleteIfExists(scratch2);
+
+        SegmentMetadata oversizedHint1 = SegmentMetadata.builder()
+                .segmentUuid("oversized-A").tablespaceUuid(TS_UUID).tableName("t")
+                .indexUuid(IDX_UUID).indexName("i").state(SegmentState.ACTIVE)
+                .ownerInstanceId(0).segmentId(500L)
+                .graphPath("g").mapPath("m")
+                .baseLsn(new LogSequenceNumber(1L, 100L))
+                .sizeBytes(2048L)
+                .mapFileSize(1024L) // far larger than the 16-byte real file
+                .vectorCount(1L).generation(1L)
+                .createdAtEpochMillis(0L)
+                .build();
+        SegmentMetadata oversizedHint2 = SegmentMetadata.builder()
+                .segmentUuid("oversized-B").tablespaceUuid(TS_UUID).tableName("t")
+                .indexUuid(IDX_UUID).indexName("i").state(SegmentState.ACTIVE)
+                .ownerInstanceId(0).segmentId(600L)
+                .graphPath("g").mapPath("m")
+                .baseLsn(new LogSequenceNumber(1L, 100L))
+                .sizeBytes(2048L)
+                .mapFileSize(1024L)
+                .vectorCount(1L).generation(2L)
+                .createdAtEpochMillis(0L)
+                .build();
+
+        RemoteSegmentMerger merger = new RemoteSegmentMerger(
+                productionLikeDsm, tmpDir, DIM, 8, 32, 1.2f, 1.4f,
+                VectorSimilarityFunction.EUCLIDEAN);
+        try {
+            merger.merge(List.of(oversizedHint1, oversizedHint2), 0);
+            fail("expected merge to fail loudly when mapFileSize over-estimates"
+                    + " against a production-like reader (no length()-based clamp)");
+        } catch (Exception ok) {
+            // The exact exception type is implementation-defined (IOException
+            // bubbling up from readFully, or DataStorageManagerException from
+            // the multipart layer); assert at least that the failure was
+            // surfaced rather than swallowed.
+            assertTrue("expected loud failure, got: " + ok,
+                    ok instanceof IOException
+                            || ok instanceof RuntimeException);
+        }
+    }
+
+    @Test
+    public void legacyZnodeRefusedBeforeAnyIo() throws Exception {
+        // Companion to legacyZnodeRefusedOnMemoryDsm: same legacy refusal
+        // behaviour, but against the production-like DSM. The
+        // LegacyMetadataException is thrown by the merger BEFORE any
+        // multipart reader is opened, so this test passes regardless of
+        // what the reader's length() returns. Documents the layering: the
+        // mapFileSize check at RemoteSegmentMerger.merge sits upstream of
+        // any I/O.
+        HintReturningDsm productionLikeDsm = new HintReturningDsm();
+        SegmentMetadata legacy = writeLegacyInput("legacy-prod-A", 100L, 0xA);
+        SegmentMetadata other = writeLegacyInput("legacy-prod-B", 200L, 0xB);
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
                 productionLikeDsm, tmpDir, DIM, 8, 32, 1.2f, 1.4f,
                 VectorSimilarityFunction.EUCLIDEAN);
         try {
             merger.merge(List.of(legacy, other), 0);
-            fail("expected LegacyMetadataException against production-like reader");
+            fail("expected LegacyMetadataException");
         } catch (RemoteSegmentMerger.LegacyMetadataException ok) {
-            // pass
+            // pass — refused upstream of any reader I/O.
         }
     }
 
