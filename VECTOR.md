@@ -607,6 +607,25 @@ This reclaims storage held by deleted or superseded PKs — the previous design 
 
 **Shadow acknowledgement.** Shadow replicas expose their loaded generation via the `GetShadowStatus` RPC; `IndexingServiceEngine` aggregates `min(appliedIndexStatusGeneration)` across all registered shadows. The leader passes that minimum to `reapExpiredPendingDeletes` before every physical delete pass.
 
+### Streaming compaction engine (issue #485)
+
+By default (`vector.index.compaction.streaming.enabled=true`), HerdDB drives compaction through jvector's `OnDiskGraphIndexCompactor` — a streaming N:1 graph-merge engine that works directly on the candidates' on-disk graphs, never materialising a full `OnHeapGraphIndex` in heap. Memory cost is bounded by `O(taskWindowSize × maxDegree × float[dim])` instead of `O(numTotalNodes × dimension)`, lifting the historical 1 GB cap on `vector.index.compaction.maxBytes` (the cap was sized for the in-memory rebuild's heap budget, not for I/O or disk).
+
+The same flag governs both compaction sites:
+
+- **IS-local path** — `VectorIndexCompactor.rebuildSegment` opens each candidate's already-loaded `seg.onDiskGraph`, builds per-source `FixedBitSet` of authoritative live ordinals, hands them to `OnDiskGraphIndexCompactor.compact(localTempFile)`, then walks each surviving ordinal to emit the merged map file. Output ordinals are dense `0..keptCount-1` via a primitive-int `DenseLiveOrdinalMapper` (avoids the per-source-record-sized waste a sparse `OffsetMapper` would leave behind). The merged segment's PQ codebook is retrained internally by jvector's `PQRetrainer` on a balanced sample of the compaction inputs; HerdDB invalidates `cachedPQ` after a successful streaming swap so the next checkpoint trains a fresh codebook from the current global distribution.
+- **Optimizer-pod path** — `RemoteSegmentGraphMerger.mergeStreaming` downloads each input's graph + map files into a local scratch directory, opens the graph as `OnDiskGraphIndex`, builds the same authority + dense-mapper machinery, runs `OnDiskGraphIndexCompactor.compact(...)`, and uploads both the merged graph and a freshly-emitted map file. The optimizer pod's heap can be sized for the streaming cost rather than the full graph size. `RemoteSegmentMerger` derives each input's `graphFileSize` as `metadata.sizeBytes - metadata.mapFileSize` (no on-disk schema change required — `sizeBytes` already aggregates both files).
+
+Both paths assert the candidate carries the `INLINE_VECTORS` feature (required by `OnDiskGraphIndexCompactor` to read source vectors during the graph rewrite). HerdDB writes the feature unconditionally at every checkpoint site, so the assertion is a fail-fast invariant guard rather than a fallback gate. The flag may be flipped to `false` (system property `herddb.vectorindex.streamingCompactionEnabled`, or via the IS configuration) to revert to the legacy in-memory rebuild — kept as an operator escape hatch for the lifetime of the rollout.
+
+**Fallback to legacy.** Three guard rails route a cycle to the legacy in-memory path even when the flag is on:
+
+- The IS-local path falls through if only one candidate survives the policy filter (jvector's `OnDiskGraphIndexCompactor` requires `sources.size() >= 2`). The fallback increments `VectorIndexCompactor.STREAMING_FALLBACK_TO_LEGACY_TOTAL` and logs at `INFO` for operational visibility.
+- The optimizer-pod path falls through when any input has `graphFileSize <= 0` (defensive against legacy znodes; `RemoteSegmentMerger` rejects such inputs at the SPI boundary in production).
+- Both paths surface a missing `INLINE_VECTORS` as `CompactionException(CORRUPTION, ...)` rather than masking it: HerdDB writes the feature unconditionally, so a missing entry signals a regression that should fail the cycle loudly.
+
+**Orphan tracking on partial upload.** Upload of the merged graph and map files is two sequential remote calls. Either may succeed independently; if the second fails, the first's multipart object is queued in `pendingDeletes` (IS-local path) or best-effort-deleted from the DSM (optimizer path) so the retention reaper sweeps the leak. `CompactionException` carries an `orphanPaths` field that `runCompactionCycle`'s `catch (CompactionException)` arm drains into the same retention pipeline as the swap-out inputs.
+
 ---
 
 ## Segmented-v2: external `index-optimizer` service & movable segment ownership
