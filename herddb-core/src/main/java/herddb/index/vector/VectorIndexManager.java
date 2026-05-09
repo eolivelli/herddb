@@ -132,10 +132,15 @@ public class VectorIndexManager extends AbstractIndexManager {
      * failure point BETWEEN pin sites.
      *
      * <p><b>Success-path unpin</b>: when the IS rebuild completes
-     * successfully and publishes a post-rebuild watermark past the
-     * {@code CREATE_INDEX} LSN, the leader's tablespace checkpoint
-     * flow ({@code TableSpaceManager.releaseCompletedRebuildPins})
-     * releases the pin on the next cycle. The release uses the
+     * successfully and publishes a post-rebuild watermark
+     * <em>strictly</em> past the pinned LSN, the leader's
+     * tablespace checkpoint flow
+     * ({@code TableSpaceManager.releaseCompletedRebuildPins})
+     * releases the pin on the next cycle. Strict-after (not
+     * at-or-after) is required because the IS's
+     * {@code lastProcessedLsn} only advances past
+     * {@code CREATE_INDEX_LSN} once {@code applyEntry} for that
+     * entry returns — i.e. once the rebuild has completed. The release uses the
      * existing {@link RemoteVectorIndexService#getMinProcessedLsn}
      * RPC the IS already publishes for commit-log retention — no
      * new RPC was needed. Pre-existing secondary-index pins

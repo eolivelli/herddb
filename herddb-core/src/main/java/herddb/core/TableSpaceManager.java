@@ -3430,12 +3430,32 @@ public class TableSpaceManager {
 
     /**
      * Issue #471: walks {@link #pendingRebuildPins} and releases any
-     * pin whose LSN the IndexingService has caught up past. A pin is
-     * "caught up" when {@code computeTailersRetentionFloor()} returns
-     * an LSN at or after the pinned LSN — the IS has durably
-     * persisted state past the {@code CREATE VECTOR INDEX} entry, so
-     * the pinned table-checkpoint pages are no longer needed and the
-     * activator's normal cleanup can reclaim them.
+     * pin whose LSN the IndexingService has caught up STRICTLY past
+     * (i.e. {@code tailersFloor.after(pinLsn)}, not at-or-equal). A
+     * pin is "caught up" when {@code computeTailersRetentionFloor()}
+     * returns an LSN strictly greater than the pinned LSN — the IS's
+     * tailer has not only processed the {@code CREATE_INDEX} entry
+     * (which would advance {@code lastProcessedLsn} to
+     * {@code pinLsn + 1} or later) but also durably persisted that
+     * state via a successful watermark save.
+     *
+     * <p><b>Why strict-greater, not equal-or-greater:</b> while the
+     * IS-side {@code triggerRebuildIfNeeded} is synchronously
+     * running the rebuild scan inside {@code applyEntry} for the
+     * {@code CREATE_INDEX} entry, its {@code lastProcessedLsn} has
+     * NOT yet advanced past the previous entry — which can be
+     * exactly {@code pinLsn} (the last DML LSN before this
+     * CREATE_INDEX). If a concurrent
+     * {@code checkpointAndSaveWatermark} on the IS publishes
+     * {@code lastDurableLsn = pinLsn} during that window, an
+     * at-or-equal release would unpin while the rebuild is still
+     * mid-scan; subsequent activator-driven page reclamation could
+     * reap pages the IS still needs and the rebuild would fail with
+     * {@code PageNotFoundException}. Strict-greater closes that
+     * window: the floor only crosses {@code pinLsn} once the IS's
+     * applyEntry for {@code CREATE_INDEX} has returned (rebuild
+     * complete) AND a subsequent watermark save has captured a
+     * later {@code lastProcessedLsn}.
      *
      * <p>Called from the tablespace checkpoint paths. Failures to
      * unpin (e.g. transient {@link DataStorageManagerException}) are
@@ -3470,8 +3490,10 @@ public class TableSpaceManager {
                 Map.Entry<LogSequenceNumber, String> pinEntry = it.next();
                 LogSequenceNumber pinLsn = pinEntry.getKey();
                 String tableName = pinEntry.getValue();
-                // tailersFloor >= pinLsn  ⇔  tailersFloor.after(pinLsn) || tailersFloor.equals(pinLsn)
-                if (!tailersFloor.after(pinLsn) && !tailersFloor.equals(pinLsn)) {
+                // Release ONLY when tailersFloor is STRICTLY after
+                // pinLsn — see method javadoc for the at-equal
+                // race against an in-progress IS rebuild.
+                if (!tailersFloor.after(pinLsn)) {
                     continue;
                 }
                 AbstractTableManager tm = tables.get(tableName);
@@ -3552,7 +3574,8 @@ public class TableSpaceManager {
             return true;
         } catch (DataStorageManagerException unpinErr) {
             String msg = unpinErr.getMessage();
-            if (msg != null && msg.contains("Cannot unpin a not pinned checkpoint")) {
+            if (msg != null
+                    && msg.startsWith(DataStorageManager.NOT_PINNED_MESSAGE_PREFIX)) {
                 // Idempotent / benign: another path already released
                 // the pin, or this pin was never registered. Either
                 // way the post-condition (no in-memory pin at this

@@ -195,11 +195,19 @@ public class CreateVectorIndexRebuildPinReleaseTest {
     }
 
     @Test
-    public void rebuildPin_releasedWhenIsLsnEqualsPinLsn() throws Exception {
-        // Boundary: tailersFloor.equals(pinLsn) must also release —
-        // the IS has durably persisted state EXACTLY at the rebuild
-        // LSN, which is sufficient (the IS has read the pinned
-        // pages and persisted the resulting vector data).
+    public void rebuildPin_NOT_releasedAtExactEqualLsn() throws Exception {
+        // Boundary: tailersFloor.equals(pinLsn) must NOT release.
+        // Reason: the IS-side rebuild runs synchronously inside
+        // applyEntry for the CREATE_INDEX entry; while it is
+        // in-flight, lastProcessedLsn has NOT yet advanced past
+        // pinLsn. A concurrent IS-side
+        // checkpointAndSaveWatermark could publish
+        // lastDurableLsn = pinLsn at that moment. An at-equal
+        // release would unpin while the rebuild is still
+        // mid-scan, leading to PageNotFoundException and
+        // permanent rebuild failure. Strict-greater closes the
+        // window — see TableSpaceManager.releaseCompletedRebuildPins
+        // javadoc for the full rationale.
         Path dataPath = folder.newFolder("data").toPath();
         Path logsPath = folder.newFolder("logs").toPath();
         Path metadataPath = folder.newFolder("metadata").toPath();
@@ -220,11 +228,55 @@ public class CreateVectorIndexRebuildPinReleaseTest {
             TableSpaceManager tsm = manager.getTableSpaceManager("tblspace1");
             assertEquals(1, tsm.pendingRebuildPinCountForTest());
 
-            // Publish exactly the pin LSN.
+            // Publish exactly the pin LSN — this models the race
+            // where the IS publishes lastDurableLsn = pinLsn while
+            // the rebuild is still in-flight.
             remoteService.publishedMinLsn.set(rebuildLsn);
             manager.checkpoint();
 
-            assertEquals("pin must release at exact-equal IS catch-up LSN",
+            assertEquals("pin MUST NOT release at exact-equal IS catch-up LSN — "
+                            + "the IS rebuild may still be mid-scan",
+                    1, tsm.pendingRebuildPinCountForTest());
+            assertTrue("DSM table-checkpoint pin must still hold rebuildLsn",
+                    pinnedTableCheckpoints(manager).contains(rebuildLsn));
+        }
+    }
+
+    @Test
+    public void rebuildPin_releasedAtPinLsnPlusOne() throws Exception {
+        // Positive boundary symmetric to
+        // rebuildPin_NOT_releasedAtExactEqualLsn: a tailersFloor
+        // strictly one tick past the pin LSN MUST release. This
+        // is the smallest "rebuild has completed" signal: the IS's
+        // applyEntry for CREATE_INDEX has returned (rebuild done)
+        // AND a subsequent watermark save has captured a later
+        // lastProcessedLsn.
+        Path dataPath = folder.newFolder("data").toPath();
+        Path logsPath = folder.newFolder("logs").toPath();
+        Path metadataPath = folder.newFolder("metadata").toPath();
+        Path tmpDir = folder.newFolder("tmp").toPath();
+
+        StubbableRemoteVectorIndexService remoteService =
+                new StubbableRemoteVectorIndexService();
+        try (DBManager manager = buildManager(dataPath, logsPath, metadataPath, tmpDir,
+                remoteService)) {
+            manager.start();
+            bootstrapTablespaceAndTable(manager);
+            insertSomeRows(manager, 5);
+            execute(manager,
+                    "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
+                    Collections.emptyList());
+
+            LogSequenceNumber rebuildLsn = readPinnedLsnFromIndex(manager);
+            TableSpaceManager tsm = manager.getTableSpaceManager("tblspace1");
+            assertEquals(1, tsm.pendingRebuildPinCountForTest());
+
+            LogSequenceNumber pinLsnPlusOne = new LogSequenceNumber(
+                    rebuildLsn.ledgerId, rebuildLsn.offset + 1L);
+            remoteService.publishedMinLsn.set(pinLsnPlusOne);
+            manager.checkpoint();
+
+            assertEquals("pin must release when IS catch-up is strictly past pinLsn",
                     0, tsm.pendingRebuildPinCountForTest());
         }
     }
@@ -338,17 +390,22 @@ public class CreateVectorIndexRebuildPinReleaseTest {
             // later LSN than the first.
             assertTrue("v2 pin LSN must be after v1 pin LSN", lsn2.after(lsn1));
 
-            // Publish IS catch-up only past v1's LSN. Only v1's pin
-            // must release; v2's pin must remain.
-            remoteService.publishedMinLsn.set(lsn1);
-            manager.checkpoint();
-            assertEquals("only v1's pin must release on IS catch-up to v1 LSN",
-                    1, tsm.pendingRebuildPinCountForTest());
-
-            // Publish IS catch-up past v2's LSN. v2's pin must release.
+            // Publish IS catch-up STRICTLY past v1's LSN (using
+            // v2's LSN as the catch-up point — it's strictly
+            // greater than v1's). Only v1's pin must release; v2's
+            // pin must remain (tailersFloor == v2's pinLsn ≠
+            // strictly-greater).
             remoteService.publishedMinLsn.set(lsn2);
             manager.checkpoint();
-            assertEquals("v2's pin must release after IS caught up past v2 LSN",
+            assertEquals("only v1's pin must release on IS catch-up strictly past v1 LSN",
+                    1, tsm.pendingRebuildPinCountForTest());
+
+            // Publish IS catch-up strictly past v2's LSN. v2's pin
+            // must release.
+            LogSequenceNumber pastV2 = new LogSequenceNumber(lsn2.ledgerId, lsn2.offset + 1L);
+            remoteService.publishedMinLsn.set(pastV2);
+            manager.checkpoint();
+            assertEquals("v2's pin must release after IS caught up strictly past v2 LSN",
                     0, tsm.pendingRebuildPinCountForTest());
         }
     }

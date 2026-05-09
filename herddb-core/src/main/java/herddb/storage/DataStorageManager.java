@@ -459,13 +459,26 @@ public abstract class DataStorageManager implements AutoCloseable {
         return pinAndGetCheckpoints(tableSpace, uuid, status.sequenceNumber, indexCheckpointPins, pin);
     }
 
+    /**
+     * Issue #471: prefix of the message thrown by
+     * {@link #unPinTableCheckpoint} and {@link #unPinIndexCheckpoint}
+     * when the requested LSN is not held in the pin map. Exposed as
+     * a constant so callers can match the benign "already
+     * unpinned / never pinned" case via
+     * {@code msg.startsWith(NOT_PINNED_MESSAGE_PREFIX)} without
+     * relying on a string substring that could silently break if
+     * the message were ever rephrased.
+     */
+    public static final String NOT_PINNED_MESSAGE_PREFIX =
+            "Cannot unpin a not pinned checkpoint";
+
     public void unPinTableCheckpoint(String tableSpace, String uuid, LogSequenceNumber sequenceNumber)
             throws DataStorageManagerException {
 
         final TableStatus status = getTableStatus(tableSpace, uuid, sequenceNumber);
 
         if (status == null) {
-            throw new DataStorageManagerException("Cannot unpin a not pinned checkpoint "
+            throw new DataStorageManagerException(NOT_PINNED_MESSAGE_PREFIX + " "
                     + tableSpace + "." + uuid + "." + sequenceNumber.ledgerId + "." + sequenceNumber.offset);
         }
 
@@ -479,7 +492,7 @@ public abstract class DataStorageManager implements AutoCloseable {
         final IndexStatus status = getIndexStatus(tableSpace, uuid, sequenceNumber);
 
         if (status == null) {
-            throw new DataStorageManagerException("Cannot unpin a not pinned checkpoint "
+            throw new DataStorageManagerException(NOT_PINNED_MESSAGE_PREFIX + " "
                     + tableSpace + "." + uuid + "." + sequenceNumber.ledgerId + "." + sequenceNumber.offset);
         }
 
