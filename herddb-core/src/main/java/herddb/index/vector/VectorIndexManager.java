@@ -116,13 +116,11 @@ public class VectorIndexManager extends AbstractIndexManager {
      * {@link herddb.storage.DataStorageManager}'s in-memory tracking maps,
      * NOT on disk — they do not survive a leader restart. After a
      * leader restart the pin is dropped and {@code cleanupAfterTableBoot}
-     * may reap the pinned pages. Step 3 of issue #471 must therefore
-     * either drive the rebuild to completion before any restart, or
+     * may reap the pinned pages. The IS rebuild must therefore either
+     * drive the back-fill to completion before any leader restart, or
      * detect a non-empty {@code _rebuildLsn} on a freshly-recovered
      * Index and re-checkpoint-and-pin the table from the leader before
-     * allowing the IS to scan. Step 3 also owns the unpin path:
-     * the server unpins once the IS publishes its post-rebuild watermark
-     * past the {@code CREATE_INDEX} LSN.
+     * allowing the IS to scan.
      *
      * <p>{@code TableSpaceManager.createIndex} releases the pin if
      * anything between {@code checkpoint(true)} and a successful
@@ -132,6 +130,17 @@ public class VectorIndexManager extends AbstractIndexManager {
      * secondary index, the PK BLink keyToPage, the table itself) if a
      * later step throws. Together these two recovery paths cover every
      * failure point BETWEEN pin sites.
+     *
+     * <p><b>Success-path unpin is a planned follow-up.</b> When the
+     * IS rebuild completes successfully, the server is currently NOT
+     * notified, so the pin lingers in the leader's in-memory pin
+     * maps until the leader process restarts. The trade-off is
+     * bounded in-memory pin accumulation (one set of pins per
+     * CREATE VECTOR INDEX since the last restart) in exchange for
+     * not needing an IS→server unpin RPC in this PR. An explicit
+     * unpin signal — likely driven by the IS publishing a
+     * post-rebuild watermark past the {@code CREATE_INDEX} LSN —
+     * is intended for a follow-up.
      *
      * <p>An internal failure inside a single
      * {@code dataStorageManager.tableCheckpoint} or
