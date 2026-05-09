@@ -20,11 +20,8 @@
 package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.fail;
 import herddb.codec.RecordSerializer;
 import herddb.index.vector.VectorIndexManager;
-import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
 import herddb.log.LogSequenceNumber;
 import herddb.mem.MemoryDataStorageManager;
@@ -40,7 +37,6 @@ import herddb.utils.Bytes;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
@@ -181,26 +177,29 @@ public class RebuildCrashRestartTest {
             engine1.close();
         }
 
-        // Engine 2: working DSM, same shared watermark. On start it
-        // hydrates schema from the snapshot — the snapshot DOES
-        // include the CREATE_TABLE but does NOT include the failed
-        // CREATE_INDEX (it was never applied successfully). So engine
-        // 2 starts the tailer at the CREATE_TABLE LSN. We then drive
-        // the CREATE_INDEX entry through the tailer ourselves
+        // Engine 2: working DSM, same shared watermark. On start
+        // it hydrates schema from the snapshot — note that the
+        // snapshot DOES include BOTH the CREATE_TABLE AND the
+        // failed CREATE_INDEX, because applyEntry's switch case
+        // for CREATE_INDEX runs schemaTracker.applyEntry and
+        // createVectorStoreIfNeeded BEFORE triggerRebuildIfNeeded.
+        // So at the moment engine 1 enters FAILED, the schema state
+        // is already mutated and the snapshot captures it.
+        // installSchemaFromSnapshot on engine 2 re-installs the
+        // index via createVectorStoreIfNeeded (the schema-only
+        // path, no rebuild). We then re-deliver the same
+        // CREATE_INDEX entry through processEntryForTest
         // (simulating BookKeeper redelivering the entry from the
-        // commit log). The rebuild now succeeds.
+        // commit log starting at the persisted watermark LSN); the
+        // engine's applyEntry treats it as a duplicate at the
+        // schema level (createVectorStoreIfNeeded sees the existing
+        // store and skips) but still fires triggerRebuildIfNeeded —
+        // which is what re-runs the back-fill on a working DSM.
         WorkingFakeDsm workingDsm = new WorkingFakeDsm(REBUILD_LSN, records);
         IndexingServiceEngine engine2 = buildEngine(workingDsm, sharedWatermark);
         try {
             assertEquals("engine 2 must boot in ACTIVE state (FAILED is per-process)",
                     IndexingServiceEngine.EngineStatus.ACTIVE, engine2.getEngineStatus());
-            // Replay CREATE_INDEX. Note: since the snapshot replay
-            // path covers CREATE_TABLE already (engine 1 had applied
-            // it), engine 2 sees CREATE_INDEX as a NEW entry on the
-            // tailer. (In production, the tailer reads from the
-            // BookKeeper ledger starting at the persisted watermark
-            // LSN+1 and re-delivers CREATE_INDEX; here we drive
-            // applyEntry directly.)
             engine2.processEntryForTest(new LogSequenceNumber(1, 2),
                     LogEntryFactory.createIndex(index, null));
 
@@ -238,11 +237,11 @@ public class RebuildCrashRestartTest {
 
         // Engine 1 first: succeed, then close. The shared watermark
         // store is now at the CREATE_INDEX LSN.
-        WorkingFakeDsm workingDsm = new WorkingFakeDsm(REBUILD_LSN, records);
+        WorkingFakeDsm engine1Dsm = new WorkingFakeDsm(REBUILD_LSN, records);
         InMemoryWatermarkStore sharedWatermark =
                 new InMemoryWatermarkStore(WatermarkSnapshot.START_OF_TIME);
 
-        IndexingServiceEngine engine1 = buildEngine(workingDsm, sharedWatermark);
+        IndexingServiceEngine engine1 = buildEngine(engine1Dsm, sharedWatermark);
         try {
             engine1.processEntryForTest(new LogSequenceNumber(1, 1),
                     LogEntryFactory.createTable(table, null));
@@ -259,23 +258,22 @@ public class RebuildCrashRestartTest {
             engine1.close();
         }
 
-        // Engine 2: same watermark store. On start, the snapshot
-        // replay path runs against the persisted snapshot. There
-        // must be NO additional fullTableScan invocation.
-        int firstEngineScanCount = workingDsm.fullTableScanInvocations.get();
-        IndexingServiceEngine engine2 = buildEngine(workingDsm, sharedWatermark);
+        // Engine 2: FRESH DSM (not shared with engine 1, whose
+        // close() called dsm.close() which clears
+        // MemoryDataStorageManager state). The shared watermark
+        // store carries the post-CREATE_INDEX snapshot. Engine 2
+        // boots, hydrates schema via installSchemaFromSnapshot
+        // (the schema-only path), and must NOT fire any
+        // fullTableScan because the live applyEntry path is not
+        // re-entered for the snapshot's synthetic CREATE_INDEX.
+        WorkingFakeDsm engine2Dsm = new WorkingFakeDsm(REBUILD_LSN, records);
+        IndexingServiceEngine engine2 = buildEngine(engine2Dsm, sharedWatermark);
         try {
-            // Sanity: snapshot replay created the vector store via
-            // createVectorStoreIfNeeded (the schema-only path).
-            assertEquals("snapshot replay must NOT fire a second fullTableScan",
-                    firstEngineScanCount,
-                    workingDsm.fullTableScanInvocations.get());
-            // Engine 2 should be ACTIVE — no rebuild was fired, so
-            // FAILED never engaged.
-            assertEquals(IndexingServiceEngine.EngineStatus.ACTIVE,
+            assertEquals("snapshot replay must NOT fire fullTableScan on engine 2",
+                    0, engine2Dsm.fullTableScanInvocations.get());
+            assertEquals("engine 2 must boot ACTIVE",
+                    IndexingServiceEngine.EngineStatus.ACTIVE,
                     engine2.getEngineStatus());
-            // The rebuild metrics were reset on engine 2's
-            // construction (fresh VectorIndexRebuildMetrics).
             assertEquals("engine 2 must report zero rebuild activity",
                     0L, engine2.getRebuildMetricsForTest().recordsScanned.sum());
         } finally {

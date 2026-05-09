@@ -39,7 +39,6 @@ import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
@@ -51,25 +50,41 @@ import org.junit.rules.TemporaryFolder;
 import org.junit.rules.Timeout;
 
 /**
- * Issue #471 — verifies that the rebuild's per-record
- * {@link herddb.index.vector.AbstractVectorStore#addVector} call respects
- * the {@link PersistentVectorStore} back-pressure layers and that a
- * heavily back-pressured rebuild completes without deadlocking.
+ * Issue #471 — verifies that the rebuild engages and survives the
+ * {@link PersistentVectorStore} segment-count back-pressure path
+ * (issue #354) when the rebuild scan must add records into a store
+ * that already carries more sealed segments than the back-pressure
+ * threshold.
  *
- * <p>The test configures a {@code PersistentVectorStore} with a tiny
- * {@code maxLiveGraphSize=4} and {@code compactionBackpressureThreshold=2},
- * so segment rotation fires every 4 inserts and the segment-count
- * back-pressure path must engage repeatedly during a 100-record
- * rebuild. The load-bearing assertion is that the rebuild
- * <strong>completes</strong> — without back-pressure-aware ingest the
- * test would either deadlock or fail with an unbounded segment-count
- * exception.
+ * <p>Test setup:
+ * <ul>
+ *   <li>{@code maxLiveGraphSize=4}: small live-shard cap so each
+ *       pre-seed cycle reliably produces a sealed segment.</li>
+ *   <li>{@code compactionBackpressureThreshold=2}: tight threshold
+ *       so the back-pressure path engages quickly.</li>
+ *   <li>IS-local compaction loop disabled
+ *       ({@code compactionIntervalMs=Long.MAX_VALUE}) so the
+ *       pre-seeded segments do NOT get drained while we set up.</li>
+ *   <li>{@code compactionBackpressureMaxWaitMs=500} ms: small safety
+ *       timeout so the test does not deadlock — when compaction is
+ *       disabled, the back-pressure wait force-releases and the
+ *       rebuild proceeds. This is the same safety-net path that
+ *       protects production from a hung compaction subsystem.</li>
+ * </ul>
  *
- * <p>This is the smallest reproducer of the 20 B-row scenario the user
- * called out: at production scale, compaction cannot keep up with
- * ingest if the rebuilder bypasses the back-pressure path. Here we
- * compress the same dynamic into ~100 inserts so the test runs in
- * sub-second time on CI.
+ * <p>The load-bearing assertion is that the rebuild
+ * <strong>completes</strong> AND that
+ * {@code getSegmentCountBackpressureTotal()} reports at least one
+ * back-pressure event. Without the rebuilder calling the public
+ * {@code addVector} (i.e. if a future regression introduced a
+ * fast-path that bypasses the back-pressure layers), the counter
+ * would stay at zero and the test would fail.
+ *
+ * <p>This is the smallest reproducer of the 20 B-row scenario the
+ * user called out: at production scale, compaction cannot keep up
+ * with ingest if the rebuilder bypasses the back-pressure path.
+ * Here we compress the same dynamic into ~10 records on a tightly
+ * configured store, so the test runs in sub-second time on CI.
  *
  * @author enrico.olivelli
  */
@@ -84,7 +99,6 @@ public class VectorIndexRebuilderBackpressureTest {
     private static final LogSequenceNumber REBUILD_LSN = new LogSequenceNumber(7L, 13L);
 
     private int savedMinLive;
-    private long savedDeferral;
 
     @Before
     public void disableMinLiveGate() {
@@ -93,14 +107,12 @@ public class VectorIndexRebuilderBackpressureTest {
         // the gate so the rebuild's post-scan store.checkpoint() call
         // actually flushes the small live shard for assertion purposes.
         savedMinLive = PersistentVectorStore.minLiveVectorsForCheckpoint;
-        savedDeferral = PersistentVectorStore.maxCheckpointDeferralMs;
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
     }
 
     @After
     public void restoreMinLiveGate() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = savedMinLive;
-        PersistentVectorStore.maxCheckpointDeferralMs = savedDeferral;
     }
 
     private Table createTable() {
@@ -126,6 +138,14 @@ public class VectorIndexRebuilderBackpressureTest {
                 .build();
     }
 
+    /**
+     * Builds a store with a tiny live-shard cap, a tiny
+     * segment-count back-pressure threshold, and the IS-local
+     * compaction loop DISABLED so pre-seeded segments persist into
+     * the rebuild. The back-pressure safety timeout is set to
+     * 500 ms so the test does not deadlock when the wait
+     * force-releases.
+     */
     private PersistentVectorStore buildBackpressuredStore(Path tmpDir) {
         MemoryDataStorageManager dsm = new MemoryDataStorageManager();
         MemoryManager mm = new MemoryManager(128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
@@ -133,21 +153,55 @@ public class VectorIndexRebuilderBackpressureTest {
                 "tstblspace", "vec", tmpDir, dsm, mm,
                 16, 100, 1.2f, 1.4f, true, 2_000_000_000L,
                 /* maxLiveGraphSize */ 4,
-                Long.MAX_VALUE,
+                /* compactionIntervalMs */ Long.MAX_VALUE,
                 VectorSimilarityFunction.EUCLIDEAN);
-        // Aggressive segment-count back-pressure: 2 sealed segments
-        // before addVector blocks. Combined with maxLiveGraphSize=4,
-        // the rebuild is forced to (a) rotate after every 4 inserts,
-        // (b) hit the segment-count cap repeatedly, and (c) wait for
-        // background compaction to drain. The same code path applies
-        // at 20 B-row production scale.
-        store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE, 2,
-                Integer.MAX_VALUE, 0);
+        // Disable the IS-local compaction loop so pre-seeded
+        // segments persist into the rebuild. (configureCompaction's
+        // 4th arg is `minCount` per its signature, NOT the
+        // back-pressure threshold — that is set via the dedicated
+        // setter below.)
+        store.configureCompaction(Long.MAX_VALUE, 1L, Long.MAX_VALUE,
+                Integer.MAX_VALUE, Integer.MAX_VALUE, 0);
+        // Tight back-pressure threshold: the rebuild's first
+        // addVector observes segments.size() > 2 and enters
+        // waitForSegmentCountRelief.
+        store.setCompactionBackpressureThreshold(2);
+        // 500 ms safety timeout — when the wait fails to drain
+        // (because compaction is disabled), the safety path
+        // force-releases, the rebuilder's addVector returns, and
+        // the test completes instead of deadlocking. The same
+        // safety path protects production against a hung compactor.
+        store.setCompactionBackpressureMaxWaitMs(500L);
         return store;
     }
 
+    /**
+     * Pre-seeds the store with at least {@code targetSegments}
+     * sealed on-disk segments, using primary keys disjoint from the
+     * rebuild's keys ({@code "preseed-N"} vs. {@code "keyN"}). After
+     * this returns, the store's {@code segments.size()} is &gt;=
+     * {@code targetSegments}, so the very first {@code addVector}
+     * call from the rebuild path will enter
+     * {@code waitForSegmentCountRelief}.
+     */
+    private void preSeedSegments(PersistentVectorStore store, Table table,
+                                 int targetSegments) throws Exception {
+        // Each preSeed cycle: insert maxLiveGraphSize+1 vectors to
+        // force a rotation, then call store.checkpoint() to seal
+        // the rotated live shard into a sealed segment.
+        int seedIdx = 0;
+        for (int seg = 0; seg < targetSegments; seg++) {
+            for (int i = 0; i <= 4; i++) {
+                store.addVector(Bytes.from_string("preseed-" + (seedIdx++)),
+                        new float[]{seg * 0.01f, i * 0.01f, 0f});
+            }
+            // Seal: convert live shards into on-disk segments.
+            store.checkpoint();
+        }
+    }
+
     @Test
-    public void rebuild_completesUnderHeavyBackpressure_withoutDeadlock() throws Exception {
+    public void rebuild_engagesAndSurvivesSegmentCountBackpressure() throws Exception {
         Path tmpDir = folder.newFolder("vstore").toPath();
 
         Table table = createTable();
@@ -155,14 +209,26 @@ public class VectorIndexRebuilderBackpressureTest {
         PersistentVectorStore store = buildBackpressuredStore(tmpDir);
         try {
             store.start();
-            // 100 records — at maxLiveGraphSize=4 that is ~25
-            // rotations, more than enough to hit the segment-count
-            // back-pressure cap (which is 2) repeatedly. If the
-            // rebuilder were not back-pressure-aware, this scan would
-            // produce 25 sealed segments without bound and OOM the
-            // segment map; if addVector did not block on the cap,
-            // the test would deadlock instead.
-            int numRecords = 100;
+
+            // Pre-seed segments above the back-pressure threshold (=2).
+            // The IS-local compaction loop is disabled in this test
+            // (compactionIntervalMs=Long.MAX_VALUE), so segments
+            // persist until the rebuild's addVector reads them.
+            preSeedSegments(store, table, 4);
+            int segmentsAfterPreSeed = store.getSegmentCount();
+            assertTrue("preSeed must leave > 2 segments, got " + segmentsAfterPreSeed,
+                    segmentsAfterPreSeed > 2);
+            long backpressureBefore = store.getSegmentCountBackpressureTotal();
+
+            // 5 records — small enough to keep the test under the
+            // 60 s timeout when each addVector waits up to 500 ms in
+            // the back-pressure safety path. Each addVector observes
+            // segments.size() > 2 and enters waitForSegmentCountRelief;
+            // compaction is disabled so the wait force-releases at
+            // 500 ms; addVector returns and the next record is
+            // attempted. Total back-pressure wait time per record:
+            // up to 500 ms; total test runtime: ~2.5 s.
+            int numRecords = 5;
             List<Record> records = new ArrayList<>();
             for (int i = 0; i < numRecords; i++) {
                 records.add(RecordSerializer.makeRecord(table,
@@ -180,29 +246,35 @@ public class VectorIndexRebuilderBackpressureTest {
             rebuilder.run();
             long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
 
-            // Load-bearing: rebuild completed without deadlock.
+            // Load-bearing: rebuild completed.
             assertEquals("every record must reach the store",
                     (long) numRecords, metrics.recordsScanned.sum());
             assertEquals("every record must be indexed (predicate accepts all)",
                     (long) numRecords, metrics.recordsIndexed.sum());
-            // Wall-clock sanity: a deadlocking rebuild would have hit
-            // the @Rule Timeout(60s); a successful one finishes in
-            // single-digit seconds even on a constrained CI runner.
-            assertTrue("rebuild must finish in well under the test timeout (got "
+            // Sanity: must finish in less than the test timeout.
+            assertTrue("rebuild must finish under the test timeout (got "
                             + elapsedMs + " ms)",
                     elapsedMs < 30_000L);
-            // The store must observably reflect the inserts.
-            assertEquals("store size must equal records inserted",
-                    numRecords, store.size());
+            // Load-bearing: the segment-count back-pressure path
+            // must have engaged at least once. A regression that
+            // bypasses addVector's back-pressure (e.g. by exposing a
+            // raw insert path the rebuilder accidentally calls) would
+            // skip waitForSegmentCountRelief and this counter would
+            // stay at zero.
+            long backpressureAfter = store.getSegmentCountBackpressureTotal();
+            assertTrue("segment-count back-pressure must have engaged at least once "
+                            + "(before=" + backpressureBefore + ", after=" + backpressureAfter + ")",
+                    backpressureAfter > backpressureBefore);
         } finally {
             store.close();
         }
     }
 
     /**
-     * Same record-store pair, smaller record count — sanity check that
-     * the back-pressure-instrumented store does NOT regress the basic
-     * "rebuild populates the store" contract under default conditions.
+     * Sanity check: with a fresh store (no pre-seed), the rebuild
+     * still populates correctly. Locks down the basic correctness
+     * path so a regression that broke the back-pressure interaction
+     * does not also silently break the no-back-pressure path.
      */
     @Test
     public void rebuild_basicSmallScan_populatesStoreWithBackpressureStore() throws Exception {

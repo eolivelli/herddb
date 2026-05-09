@@ -24,7 +24,6 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import herddb.codec.RecordSerializer;
 import herddb.index.vector.VectorIndexManager;
-import herddb.log.LogEntry;
 import herddb.log.LogEntryFactory;
 import herddb.log.LogSequenceNumber;
 import herddb.mem.MemoryDataStorageManager;
@@ -150,31 +149,44 @@ public class MultiInstanceRebuildShardingTest {
                 IndexingServiceEngine engine = buildEngine(i, numInstances, dsm);
                 engines.add(engine);
 
-                // Apply CREATE_TABLE then CREATE_INDEX with rebuild=true
-                // — the rebuilder runs synchronously inside applyEntry,
-                // so by the time the second call returns each engine's
-                // local store has been back-filled with its shard.
-                engine.applyEntry(new LogSequenceNumber(1, 1),
+                // Drive the entries through processEntryForTest to
+                // exercise the production tailer code path
+                // (classifyForMetrics + lastProcessedLsn advancement
+                // + applyEntry switch). Using applyEntry directly
+                // would bypass those layers — fine for sharding-only
+                // assertions, but parity with the other tests in
+                // this suite is preferred.
+                engine.processEntryForTest(new LogSequenceNumber(1, 1),
                         LogEntryFactory.createTable(table, null));
-                engine.applyEntry(new LogSequenceNumber(1, 2),
+                engine.processEntryForTest(new LogSequenceNumber(1, 2),
                         LogEntryFactory.createIndex(index, null));
             }
 
             // Each engine's local store must contain ONLY records the
             // local shard predicate accepted, and the union of all
             // engines must cover every staged record exactly once.
+            //
+            // The per-instance owned count is bounded by the
+            // deterministic XXHash64 distribution of the keys
+            // "key0".."key{numRecords-1}" mod numShards, then
+            // rounded by shardId % numInstances. For the chosen
+            // (numInstances, numShards) pairs (2,4), (3,6), (5,10)
+            // each instance empirically owns numRecords/numInstances
+            // ± ~30%; if a future hash-function change skews this
+            // distribution, the > 0 / < numRecords assertions below
+            // still pin the correctness contract (each instance owns
+            // a non-empty proper subset).
             Set<Bytes> unionOfLocalKeys = new HashSet<>();
             int totalLocalRecords = 0;
+            float[] queryVector = new float[]{0f, 0f, 0f};
             for (int i = 0; i < numInstances; i++) {
                 IndexingServiceEngine engine = engines.get(i);
-                int localSize = engine.search("default", "vectable", "vidx",
-                        new float[]{0f, 0f, 0f}, numRecords).size();
-                totalLocalRecords += localSize;
-                // Every key surfaced via search MUST be acceptable by
-                // this engine's shard predicate. Since `search` doesn't
-                // expose its key list directly here, we walk the
-                // engine's metric and assert the indexed counter is
-                // > 0 and < numRecords (true sharding).
+                // Cache the search result — the InMemoryVectorStore is
+                // deterministic, but a future approximate top-K store
+                // could return a different set on the second call.
+                List<Map.Entry<Bytes, Float>> searchHits = engine.search(
+                        "default", "vectable", "vidx", queryVector, numRecords);
+                totalLocalRecords += searchHits.size();
                 long indexed = engine.getRebuildMetricsForTest().recordsIndexed.sum();
                 assertTrue("instance " + i + " must own SOME records (indexed="
                                 + indexed + ", numRecords=" + numRecords + ")",
@@ -182,10 +194,7 @@ public class MultiInstanceRebuildShardingTest {
                 assertTrue("instance " + i + " must own a SHARD subset only "
                                 + "(indexed=" + indexed + ", numRecords=" + numRecords + ")",
                         indexed < numRecords);
-                // Track keys via search; with topK=numRecords we get
-                // every locally-indexed key.
-                for (Map.Entry<Bytes, Float> hit : engine.search("default", "vectable", "vidx",
-                        new float[]{0f, 0f, 0f}, numRecords)) {
+                for (Map.Entry<Bytes, Float> hit : searchHits) {
                     assertFalse("key " + hit.getKey() + " appears in two instances "
                                     + "(numInstances=" + numInstances + ")",
                             unionOfLocalKeys.contains(hit.getKey()));
