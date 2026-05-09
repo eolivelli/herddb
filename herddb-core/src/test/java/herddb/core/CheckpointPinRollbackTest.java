@@ -20,6 +20,7 @@
 package herddb.core;
 
 import static herddb.core.TestUtils.execute;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import herddb.core.indexes.MockRemoteVectorIndexService;
@@ -45,7 +46,6 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.junit.rules.Timeout;
-import static org.junit.Assert.assertEquals;
 
 /**
  * Issue #471 — verifies that {@link TableManager#doCheckpoint} rolls back
