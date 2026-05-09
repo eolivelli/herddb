@@ -311,6 +311,20 @@ public final class RemoteSegmentGraphMerger {
             return mergeStreaming(inputs, outputTablespaceUuid, outputIndexUuid,
                     outputSegmentId, dim);
         }
+        if (VectorIndexCompactor.streamingCompactionEnabled) {
+            // Streaming is on, but the dispatch fence rejected the cycle —
+            // log so operators correlate optimizer-pod compaction behavior with
+            // the IS-side STREAMING_FALLBACK_TO_LEGACY_TOTAL counter.
+            String reason;
+            if (inputs.size() < 2) {
+                reason = "fewer than 2 inputs (got " + inputs.size() + ")";
+            } else {
+                reason = "one or more inputs has graphFileSize <= 0";
+            }
+            LOGGER.log(Level.INFO,
+                    "RemoteSegmentGraphMerger: falling back to legacy in-memory rebuild "
+                            + "(streaming flag is on but {0})", reason);
+        }
         return mergeLegacy(inputs, outputTablespaceUuid, outputIndexUuid,
                 outputSegmentId, dim);
     }
