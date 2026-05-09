@@ -391,7 +391,21 @@ indexOptimizer:
     maxInflightReadBytes: "268435456"   # 256 MiB
     maxInflightWriteBytes: "268435456"  # 256 MiB
   zkSessionTimeout: 40000
-  javaOpts: ""
+  # JVM options for the optimizer process. The optimizer needs enough heap and
+  # direct memory to execute PQ retraining + graph-merge in a single JVM:
+  #   -Xms/-Xmx: heap for PQ codebook training, intermediate graph structures,
+  #     and the jvector merge working set. For gist1m M=16 (1M × 960-dim) the
+  #     PQ training reservoir alone requires ~350 MB; the graph merge adds
+  #     several more GB of working set. 6 g is the minimum for gist1m-class
+  #     merges without OOMKill (issue #499 Bug 1).
+  #   --add-modules jdk.incubator.vector: enables Panama Vector API for
+  #     jvector's SIMD distance kernels.
+  #   -XX:MaxDirectMemorySize: cap for non-Netty JVM direct buffers.
+  #   -Djava.net.preferIPv4Stack=true: avoids IPv6 resolution delays in
+  #     Kubernetes pods that only have IPv4 routes.
+  # Default: 6 g heap + 1 g direct. Override per-bench if the input segments
+  # are larger (e.g. bigann-100M M=16 needs at least 12 g heap).
+  javaOpts: "-Xms6g -Xmx6g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -XX:MaxDirectMemorySize=1g"
   javaOptsExtra: ""
   loggingProperties: ""
   extraConfig: {}
@@ -405,12 +419,16 @@ indexOptimizer:
   pdb:
     enabled: false
     minAvailable: 0
+  # Memory sized to hold the optimizer's heap (javaOpts -Xmx) plus JVM
+  # non-heap overhead (~1 GiB for code-cache, metaspace, thread stacks)
+  # plus direct memory (MaxDirectMemorySize). For the default 6 g heap
+  # + 1 g direct: 6 + 1 + 1 = 8 GiB container (issue #499 Bug 1).
   resources:
     requests:
-      memory: "1Gi"
+      memory: "8Gi"
       cpu: "2"
     limits:
-      memory: "1Gi"
+      memory: "8Gi"
       cpu: "2"
   nodeSelector: {}
   tolerations: []

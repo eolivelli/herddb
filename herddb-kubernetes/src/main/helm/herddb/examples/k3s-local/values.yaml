@@ -391,6 +391,27 @@ indexOptimizer:
     neighborOverflow: 1.2
     alpha: 1.4
     similarity: "DOT_PRODUCT"
+  # Memory budget for gist1m M=16 merges (issue #499 Bug 1).
+  #
+  # For a full 8-segment gist1m merge (8 × ~125k vectors, 960-dim):
+  #   PQ codebook retraining reservoir: 96k samples × 960 × 4 B = 353 MB
+  #   jvector OnDiskGraphIndexCompactor working set: ~2–4 GiB
+  #   JVM overhead (code cache, metaspace, thread stacks): ~1 GiB
+  # Total peak: ≈ 6 GiB heap + 1 GiB direct → 8 GiB container.
+  # The previous 4 GiB container caused OOMKill at PQ training time.
+  #
+  #   -Xms6g -Xmx6g: heap fixed at 6 g to avoid GC pauses during long merges
+  #   --add-modules jdk.incubator.vector: Panama Vector API for SIMD kernels
+  #   -XX:MaxDirectMemorySize=1g: cap for non-Netty JVM direct buffers
+  #   -Djava.net.preferIPv4Stack=true: avoids IPv6 resolution in k3s-local
+  javaOpts: "-Xms6g -Xmx6g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -XX:MaxDirectMemorySize=1g"
+  resources:
+    requests:
+      memory: "8Gi"
+      cpu: "2"
+    limits:
+      memory: "8Gi"
+      cpu: "2"
 
 tools:
   enabled: true
