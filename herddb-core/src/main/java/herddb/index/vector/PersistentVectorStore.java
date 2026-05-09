@@ -1695,8 +1695,26 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // IndexStatus segments with no znode get re-registered. We catch broad
         // Exception here on purpose — reconcile is best-effort, the IS must
         // start regardless.
+        //
+        // Issue #499 Bug 2: legacy (v3) segments have null UUIDs and were previously
+        // skipped during reconcile, so the external optimizer never saw them in ZK.
+        // buildExistingSegmentsInfoForReconcile() now stamps fresh UUIDs in-place on
+        // null-UUID VectorSegments. We detect whether any were stamped by counting
+        // null UUIDs before the call, then immediately persist the IndexStatus so the
+        // new UUIDs survive the next restart. The persist runs before the store is
+        // considered fully started and before handing control to callers. We catch
+        // broad Exception on the persist too — a failure here is recoverable: the
+        // next checkpoint will re-stamp and re-persist the UUIDs.
         SegmentPublisher reconciler = this.segmentPublisher;
         if (reconciler != null) {
+            // Count segments with null UUID before the call so we know whether
+            // buildExistingSegmentsInfoForReconcile() stamped any fresh UUIDs.
+            long nullUuidCountBefore = 0;
+            for (VectorSegment seg : this.segments) {
+                if (seg.segmentUuid == null) {
+                    nullUuidCountBefore++;
+                }
+            }
             try {
                 reconciler.reconcileWithIndexStatus(buildExistingSegmentsInfoForReconcile());
             } catch (Exception e) {
@@ -1704,6 +1722,39 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         "segment publisher.reconcileWithIndexStatus failed for {0}; "
                                 + "continuing with un-reconciled state", indexName);
                 LOGGER.log(Level.WARNING, "reconcile failure detail", e);
+            }
+            // If any legacy segments were stamped with fresh UUIDs, persist the
+            // updated IndexStatus immediately so the UUIDs survive the next restart.
+            // Without this persist, a restart before the next checkpoint would lose
+            // the stamped UUIDs and force a new round of stamps (and ZK re-registrations)
+            // on the following start.
+            if (nullUuidCountBefore > 0) {
+                try {
+                    List<VectorSegment> currentSegs = this.segments;
+                    List<VectorSegment> sealedForPersist = new ArrayList<>();
+                    List<VectorSegment> mergeableForPersist = new ArrayList<>();
+                    for (VectorSegment seg : currentSegs) {
+                        if (seg.isSealed(maxSegmentSize)) {
+                            sealedForPersist.add(seg);
+                        } else {
+                            mergeableForPersist.add(seg);
+                        }
+                    }
+                    persistIndexStatusMultiSegment(sealedForPersist, mergeableForPersist,
+                            java.util.Collections.emptyList(), this.loadedLsn);
+                    LOGGER.log(Level.INFO,
+                            "persisted updated IndexStatus for {0} after stamping {1}"
+                                    + " legacy segment(s) with fresh UUIDs (issue #499)",
+                            new Object[]{indexName, nullUuidCountBefore});
+                } catch (Exception e) {
+                    // Best-effort: the next checkpoint will re-stamp and re-persist.
+                    // The IS must start regardless of this persist failure.
+                    LOGGER.log(Level.WARNING,
+                            "failed to persist UUID-stamped IndexStatus for {0}; "
+                                    + "next checkpoint will re-stamp (issue #499): {1}",
+                            new Object[]{indexName, e.getMessage()});
+                    LOGGER.log(Level.WARNING, "persist failure detail", e);
+                }
             }
         }
 
@@ -4814,15 +4865,36 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /**
      * Walks the in-memory segments (loaded from IndexStatus) and produces a
      * {@link NewSegmentInfo} list suitable for {@link SegmentPublisher#reconcileWithIndexStatus}.
-     * Only segments with a non-null UUID participate (legacy segments are skipped).
-     * Called once at {@link #start()} when a publisher is attached.
+     *
+     * <p>Segments that already carry a non-null UUID (v4 IndexStatus) are included as-is.
+     * Legacy (v3 IndexStatus) segments whose {@code segmentUuid} field is {@code null} are
+     * stamped with a fresh {@link java.util.UUID#randomUUID()} in-place on the
+     * {@link VectorSegment} object so that:
+     * <ol>
+     *   <li>The ZK segment registry is populated on the very first optimizer-enabled IS
+     *       start, making existing segments visible to the external optimizer (issue #499
+     *       Bug 2).</li>
+     *   <li>The caller ({@link #start()}) detects the stamp and immediately persists the
+     *       updated IndexStatus so the same UUID survives the next restart (the stamp is
+     *       idempotent: on the second start the UUID is already non-null and is reused).</li>
+     * </ol>
+     *
+     * @return the list of {@link NewSegmentInfo} entries to pass to
+     *     {@link SegmentPublisher#reconcileWithIndexStatus}; never {@code null}
      */
     private List<NewSegmentInfo> buildExistingSegmentsInfoForReconcile() {
         List<NewSegmentInfo> info = new ArrayList<>(segments.size());
         long generation = currentIndexStatusGeneration.get();
         for (VectorSegment seg : segments) {
             if (seg.segmentUuid == null) {
-                continue;
+                // Legacy (v3) segment — stamp a fresh UUID so the external optimizer
+                // can see it in ZK. The UUID is stored on the VectorSegment in memory;
+                // start() will call persistIndexStatusMultiSegment to make it durable
+                // before the IS becomes fully operational (issue #499 Bug 2).
+                seg.segmentUuid = java.util.UUID.randomUUID().toString();
+                LOGGER.log(Level.INFO,
+                        "stamped legacy segment {0} with UUID {1} for reconcile (index {2})",
+                        new Object[]{seg.segmentId, seg.segmentUuid, indexName});
             }
             // baseLsn for already-loaded segments is unknown post-restart (the
             // sequence-number was an attribute of the IndexStatus snapshot, not of
