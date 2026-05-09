@@ -175,10 +175,12 @@ public final class VectorIndexRebuilder {
 
         // Issue #471: write start-time BEFORE the isInterrupted
         // check below so that an interrupt-before-start exit is still
-        // visible to operators (start > 0, end may be 0 or briefly
-        // 0 until the finally below writes it). This makes the
-        // metric promise "every exit path updates start AND end"
-        // hold uniformly, including the interrupt-before-start path.
+        // visible to operators (start > 0, end is updated either
+        // before throwing or in the finally below). The earlier
+        // throws (missing PROP_REBUILD_LSN, malformed columnNames)
+        // are developer-error guards that fire before any rebuild
+        // attempt and are deliberately not metric-instrumented —
+        // they signal a caller bug, not a rebuild outcome.
         long startNanos = System.nanoTime();
         long startMillis = System.currentTimeMillis();
         metrics.lastRebuildStartTimeMillis = startMillis;

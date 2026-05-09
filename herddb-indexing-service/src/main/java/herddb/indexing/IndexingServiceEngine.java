@@ -2088,11 +2088,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // (Exception e)`, which silently absorbs RuntimeException
         // and lets the next successful tailer entry advance
         // lastProcessedLsn past the failed CREATE_INDEX — the silent
-        // data-loss path. Catching `Throwable` here also covers
-        // OutOfMemoryError from jvector graph allocation on the
-        // 20 B-row scan. The catch sets FAILED first, then re-throws
-        // so processEntry's catch sees the same throwable for
-        // logging.
+        // data-loss path. The finally block below sets FAILED before
+        // any throwable propagates: for Exception paths processEntry's
+        // catch then logs and absorbs them; for Error paths
+        // (e.g. OutOfMemoryError from jvector graph allocation on a
+        // 20 B-row scan) the tailer thread dies after FAILED is
+        // already published, so on restart the watermark is still
+        // pre-CREATE_INDEX and the rebuild replays.
         boolean rebuildSucceeded = false;
         Index index = null;
         try {
@@ -2138,11 +2140,7 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 throw new IllegalStateException(
                         "rebuild requested before tablespace UUID was resolved");
             }
-            // Capture the deserialized Index in a separately-final
-            // local so the shard-predicate lambda below has an
-            // effectively-final reference to close over (the outer
-            // `index` is reassignable for the deserialization-throw
-            // diagnostic in the finally).
+            // Effectively-final capture for the lambda below.
             final Index indexForLambda = index;
             VectorIndexRebuilder rebuilder = new VectorIndexRebuilder(
                     dataStorageManager, tableSpaceUUID, table, index, store,
