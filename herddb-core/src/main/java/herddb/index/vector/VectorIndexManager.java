@@ -73,6 +73,197 @@ public class VectorIndexManager extends AbstractIndexManager {
     public static final String PROP_MAX_SEGMENT_SIZE = "maxSegmentSize";
     public static final String PROP_MAX_LIVE_GRAPH_SIZE = "maxLiveGraphSize";
     public static final String PROP_NUM_SHARDS = "numShards";
+    /**
+     * Issue #471: marker that the IndexingService must back-fill the
+     * pre-existing table data into this newly-created vector index. Set by
+     * {@code TableSpaceManager.createIndex} when {@code CREATE VECTOR INDEX}
+     * runs against a non-empty table; consumed by
+     * {@code IndexingServiceEngine.applyEntry} on the live tailer path to
+     * trigger a {@code DataStorageManager.fullTableScan}-driven rebuild
+     * against the table checkpoint pinned at CREATE INDEX time. The value
+     * is the literal string {@code "true"}; any other value (including
+     * absent) means "no rebuild needed". The flag is one-shot: it travels
+     * in the {@code CREATE_INDEX} log entry only and is never re-applied
+     * on snapshot replay (the watermark advances past the entry once the
+     * rebuild completes).
+     */
+    public static final String PROP_REBUILD = "rebuild";
+    /**
+     * Issue #471: leading-underscore "internal" Index property carrying the
+     * pinned table-checkpoint LSN that the IndexingService must scan when
+     * it observes a {@code CREATE_INDEX} entry with
+     * {@link #PROP_REBUILD}{@code =true}. The value is encoded as
+     * {@code "<ledgerId>:<offset>"} (two non-negative longs in decimal,
+     * separated by a single colon) — use {@link
+     * #encodeRebuildLsn(LogSequenceNumber)} and {@link
+     * #decodeRebuildLsn(String)} so the encoding stays symmetric across
+     * server and IndexingService.
+     *
+     * <p>Why it lives in the Index properties: the CREATE_INDEX log entry
+     * is the only signal the IS receives — the IS does not have its own
+     * RPC channel back to the herddb server's tablespace manager, so the
+     * LSN must travel with the entry. The leading underscore marks the
+     * key as engine-internal so user-supplied {@code WITH} clauses cannot
+     * collide with it.
+     *
+     * <p><b>Pin ownership contract</b>: the herddb server pins the
+     * checkpoint at this LSN with {@link
+     * herddb.core.AbstractTableManager#checkpoint(boolean)
+     * tableManager.checkpoint(true)} so a periodic activator-driven
+     * checkpoint cannot reclaim the pages while the IS is scanning.
+     *
+     * <p><b>Pin lifetime caveat</b>: pins live in the
+     * {@link herddb.storage.DataStorageManager}'s in-memory tracking maps,
+     * NOT on disk — they do not survive a leader restart. After a
+     * leader restart the pin is dropped and {@code cleanupAfterTableBoot}
+     * may reap the pinned pages. The IS rebuild must therefore either
+     * drive the back-fill to completion before any leader restart, or
+     * detect a non-empty {@code _rebuildLsn} on a freshly-recovered
+     * Index and re-checkpoint-and-pin the table from the leader before
+     * allowing the IS to scan.
+     *
+     * <p>{@code TableSpaceManager.createIndex} releases the pin if
+     * anything between {@code checkpoint(true)} and a successful
+     * {@code apply()} fails (so an aborted CREATE VECTOR INDEX leaves
+     * no pin). {@code TableManager.doCheckpoint} also rolls back the
+     * pins it took at each of its sequential pin sites (per pre-existing
+     * secondary index, the PK BLink keyToPage, the table itself) if a
+     * later step throws. Together these two recovery paths cover every
+     * failure point BETWEEN pin sites.
+     *
+     * <p><b>Success-path unpin</b>: when the IS rebuild completes
+     * successfully and publishes a post-rebuild watermark
+     * <em>strictly</em> past the pinned LSN, the leader's
+     * tablespace checkpoint flow
+     * ({@code TableSpaceManager.releaseCompletedRebuildPins})
+     * releases the pin on the next cycle. Strict-after (not
+     * at-or-after) is required because the IS's
+     * {@code lastProcessedLsn} only advances past
+     * {@code CREATE_INDEX_LSN} once {@code applyEntry} for that
+     * entry returns — i.e. once the rebuild has completed. The release uses the
+     * existing {@link RemoteVectorIndexService#getMinProcessedLsn}
+     * RPC the IS already publishes for commit-log retention — no
+     * new RPC was needed. Pre-existing secondary-index pins
+     * registered at the same LSN are NOT released by this path
+     * (they leak their per-index pin until the leader restarts);
+     * releasing them as well is a smaller follow-up.
+     *
+     * <p><b>Restart caveat</b>: pins are in-memory only on the
+     * leader. If the IS rebuild has not completed when the leader
+     * restarts, the IS-side scan may observe
+     * {@code PageNotFoundException} and the engine escalates to
+     * {@code EngineStatus.FAILED}; on the next leader-side
+     * tablespace checkpoint after the IS catches up, the rebuild
+     * is replayed against a fresh pin. Persisting the pin map
+     * across leader restarts is a planned follow-up.
+     *
+     * <p>An internal failure inside a single
+     * {@code dataStorageManager.tableCheckpoint} or
+     * {@code dataStorageManager.indexCheckpoint} call AFTER its
+     * post-write pin step (e.g. a page-files listing IOException
+     * inside {@code FileDataStorageManager}, or remote listing failures
+     * in {@code RemoteFileDataStorageManager}) can still leave a pin
+     * in the in-memory map in the rare case where I/O fails after the
+     * file write succeeded. That sub-window is pre-existing and not
+     * specific to this feature; tracked as a follow-up.
+     */
+    public static final String PROP_REBUILD_LSN = "_rebuildLsn";
+
+    /**
+     * Encodes a pinned {@link LogSequenceNumber} for transport in
+     * {@link #PROP_REBUILD_LSN}. Issue #471.
+     *
+     * <p>Both components must be non-negative — {@code LogSequenceNumber}
+     * domain values from a real checkpoint are always {@code >= 0}, and
+     * {@link LogSequenceNumber#START_OF_TIME} (which has no business
+     * being pinned for a rebuild) carries {@code -1} components, so
+     * rejecting negatives here surfaces a misuse loudly at the source
+     * instead of letting it travel through serialisation and confuse the
+     * IS later.
+     */
+    public static String encodeRebuildLsn(LogSequenceNumber lsn) {
+        if (lsn == null) {
+            throw new IllegalArgumentException("rebuild LSN must not be null");
+        }
+        if (lsn.ledgerId < 0 || lsn.offset < 0) {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must be non-negative, got " + lsn);
+        }
+        return lsn.ledgerId + ":" + lsn.offset;
+    }
+
+    /**
+     * Decodes the value written by {@link #encodeRebuildLsn} back into a
+     * {@link LogSequenceNumber}. Issue #471.
+     *
+     * <p>The decoder is strictly symmetric with the encoder: every shape
+     * the encoder produces is accepted, and every shape it does not
+     * produce is rejected. In particular, leading {@code +} and leading
+     * zeros are rejected — they would round-trip to the same value, but
+     * accepting them silently would let "tampered" forms (e.g.
+     * {@code "+1:0"} that compares unequal to {@code "1:0"}) survive a
+     * defensive re-encode-and-compare check.
+     *
+     * @throws IllegalArgumentException if {@code encoded} is null, does
+     *     not match the {@code "<ledgerId>:<offset>"} shape, contains
+     *     components that cannot be parsed as {@code long}, contains
+     *     negative components, or contains components that the encoder
+     *     would not have produced (leading {@code +}, leading zeros on
+     *     a multi-digit number, empty components).
+     */
+    public static LogSequenceNumber decodeRebuildLsn(String encoded) {
+        if (encoded == null) {
+            throw new IllegalArgumentException("rebuild LSN encoding must not be null");
+        }
+        int colon = encoded.indexOf(':');
+        if (colon < 0 || encoded.indexOf(':', colon + 1) >= 0) {
+            throw new IllegalArgumentException(
+                    "rebuild LSN encoding must be '<ledgerId>:<offset>', got '" + encoded + "'");
+        }
+        String ledgerStr = encoded.substring(0, colon);
+        String offsetStr = encoded.substring(colon + 1);
+        rejectNonCanonicalLongLiteral(ledgerStr, encoded);
+        rejectNonCanonicalLongLiteral(offsetStr, encoded);
+        long ledgerId;
+        long offset;
+        try {
+            ledgerId = Long.parseLong(ledgerStr);
+            offset = Long.parseLong(offsetStr);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must be valid longs, got '" + encoded + "'", e);
+        }
+        if (ledgerId < 0 || offset < 0) {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must be non-negative, got '" + encoded + "'");
+        }
+        return new LogSequenceNumber(ledgerId, offset);
+    }
+
+    /**
+     * Rejects the lenient shapes that {@link Long#parseLong} would accept
+     * but {@link #encodeRebuildLsn} would never produce: empty strings,
+     * a leading {@code +}, and a leading {@code 0} on a multi-digit
+     * number. Negatives are NOT checked here — the call site checks them
+     * after the parseLong because we want the parse-failure path to fire
+     * first for shapes like {@code "abc"}.
+     */
+    private static void rejectNonCanonicalLongLiteral(String component, String encoded) {
+        if (component.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must not be empty, got '" + encoded + "'");
+        }
+        if (component.charAt(0) == '+') {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must not carry a '+' prefix, got '"
+                            + encoded + "'");
+        }
+        if (component.length() > 1 && component.charAt(0) == '0') {
+            throw new IllegalArgumentException(
+                    "rebuild LSN components must not carry a leading zero, got '"
+                            + encoded + "'");
+        }
+    }
 
     /**
      * Resolved lazily at every call so that the owning DBManager can

@@ -272,7 +272,35 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      *       to {@link #ACTIVE}.</li>
      * </ul>
      */
-    public enum EngineStatus { ACTIVE, JOINING }
+    /**
+     * Lifecycle states used by {@link #processEntry} and
+     * {@link #applyEntry} to decide whether a commit-log entry should
+     * be applied at all.
+     *
+     * <ul>
+     *   <li>{@link #ACTIVE}: normal — entries are applied; the watermark
+     *       advances on every successful apply.</li>
+     *   <li>{@link #JOINING}: the engine has no schema yet and drops every
+     *       commit-log entry except {@code INDEXING_SERVICE_REBALANCE}.
+     *       The first REBALANCE installs the schema and transitions the
+     *       engine to {@link #ACTIVE}.</li>
+     *   <li>{@link #FAILED}: a fatal apply-time error occurred (issue #471 —
+     *       a {@code rebuild=true} CREATE VECTOR INDEX whose IS-side
+     *       back-fill threw). The engine refuses to advance the tailer
+     *       past the failed entry: every subsequent
+     *       {@link #processEntry} call early-returns without
+     *       advancing {@code lastProcessedLsn} or
+     *       {@code entriesSinceLastCheckpoint}, so the watermark cannot
+     *       be persisted past the failed entry. On engine restart, the
+     *       failed entry is replayed from the still-stale watermark and
+     *       the rebuild re-runs from scratch. This avoids the
+     *       silent-data-loss path where a successful follow-up entry
+     *       would otherwise advance the watermark past a partially-
+     *       back-filled vector store, making the partial state
+     *       permanent.</li>
+     * </ul>
+     */
+    public enum EngineStatus { ACTIVE, JOINING, FAILED }
 
     private volatile EngineStatus engineStatus = EngineStatus.ACTIVE;
 
@@ -316,6 +344,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      */
     private final herddb.indexing.segment.SegmentAssignmentMetrics segmentAssignmentMetrics =
             new herddb.indexing.segment.SegmentAssignmentMetrics();
+
+    /**
+     * Issue #471 — engine-wide counters and timings for the
+     * {@code rebuild=true} back-fill pass driven by
+     * {@link VectorIndexRebuilder}. Registered with the engine's
+     * {@link StatsLogger} during {@link #start()} so the {@code
+     * rebuild.records_scanned}, {@code rebuild.records_indexed},
+     * {@code rebuild.last_start_time_ms}, and {@code
+     * rebuild.last_end_time_ms} gauges show up in Prometheus.
+     */
+    private final VectorIndexRebuildMetrics rebuildMetrics = new VectorIndexRebuildMetrics();
 
     private MetadataStorageManager metadataStorageManager;
     private boolean ownsMetadataStorageManager;
@@ -1297,6 +1336,22 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * Entry consumer callback invoked by the commit log tailer.
      */
     private void processEntry(LogSequenceNumber lsn, LogEntry entry) {
+        if (engineStatus == EngineStatus.FAILED) {
+            // Issue #471: the engine has been put into FAILED state by an
+            // unrecoverable apply-time error (typically a rebuild=true
+            // CREATE VECTOR INDEX whose IS-side back-fill threw). Do
+            // NOT advance lastProcessedLsn or entriesSinceLastCheckpoint
+            // — the watermark must stay anchored at the position before
+            // the failed entry so the rebuild is replayed from scratch
+            // on engine restart. We log at FINE not SEVERE: the SEVERE
+            // log was already emitted at the moment of the failure;
+            // repeating it on every subsequent entry would flood the
+            // log without adding information.
+            LOGGER.log(Level.FINE,
+                    "engine FAILED — dropping entry at LSN {0}, type={1} (replay on restart)",
+                    new Object[]{lsn, entry.type});
+            return;
+        }
         try {
             LOGGER.log(Level.FINEST, "Processing entry at LSN {0}, type={1}, txId={2}",
                     new Object[]{lsn, entry.type, entry.transactionId});
@@ -1913,6 +1968,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
             case LogEntryType.CREATE_INDEX:
                 schemaTracker.applyEntry(entry);
                 createVectorStoreIfNeeded(entry);
+                // Issue #471: only the LIVE tailer path drives the
+                // back-fill. The synthetic CREATE_INDEX entries built
+                // by installSchemaFromSnapshot / installSchemaFromDescriptor
+                // call createVectorStoreIfNeeded directly and never
+                // re-enter applyEntry, so they cannot accidentally
+                // re-fire the rebuild on snapshot replay.
+                triggerRebuildIfNeeded(entry);
                 break;
 
             case LogEntryType.DROP_INDEX: {
@@ -1992,6 +2054,117 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         registerIndexMetrics(index.tablespace, index.table, index.name, store);
         LOGGER.log(Level.INFO, "Created vector store for index {0} on column {1} with properties {2}",
                 new Object[]{index.name, vectorColumnName, index.properties});
+    }
+
+    /**
+     * Issue #471 — invoked from the live {@code applyEntry} CREATE_INDEX
+     * branch to back-fill a freshly-created vector index from the
+     * pinned table checkpoint, when the server-side
+     * {@code TableSpaceManager.createIndex} flow has marked the index
+     * with {@code rebuild=true}.
+     *
+     * <p>Synchronous on the tailer thread by design: the engine's
+     * {@code lastProcessedLsn} cannot advance past the
+     * {@code CREATE_INDEX} entry until {@code applyEntry} returns, so
+     * a crash mid-rebuild keeps the watermark at LSN &lt;
+     * {@code CREATE_INDEX} and the entry is replayed on restart. The
+     * rebuilder uses only the public
+     * {@link AbstractVectorStore#addVector} path, so all three of
+     * {@code PersistentVectorStore}'s back-pressure layers apply
+     * unchanged.
+     *
+     * <p>Snapshot-replay paths
+     * ({@link #installSchemaFromSnapshot}, {@link #installSchemaFromDescriptor})
+     * call {@link #createVectorStoreIfNeeded} directly and never
+     * re-enter {@code applyEntry}, so this method cannot accidentally
+     * re-fire the rebuild after a successful checkpoint has advanced
+     * the watermark past the CREATE_INDEX entry.
+     */
+    private void triggerRebuildIfNeeded(LogEntry entry) {
+        // Issue #471: any failure inside this method (the pre-flight
+        // IllegalStateException paths AND any Throwable from the
+        // rebuilder) MUST escalate to EngineStatus.FAILED before
+        // bubbling up. processEntry's outer catch is `catch
+        // (Exception e)`, which silently absorbs RuntimeException
+        // and lets the next successful tailer entry advance
+        // lastProcessedLsn past the failed CREATE_INDEX — the silent
+        // data-loss path. The finally block below sets FAILED before
+        // any throwable propagates: for Exception paths processEntry's
+        // catch then logs and absorbs them; for Error paths
+        // (e.g. OutOfMemoryError from jvector graph allocation on a
+        // 20 B-row scan) the tailer thread dies after FAILED is
+        // already published, so on restart the watermark is still
+        // pre-CREATE_INDEX and the rebuild replays.
+        boolean rebuildSucceeded = false;
+        Index index = null;
+        try {
+            index = Index.deserialize(entry.value.to_array());
+            if (!Index.TYPE_VECTOR.equals(index.type)) {
+                rebuildSucceeded = true;
+                return;
+            }
+            String rebuildFlag = index.properties.get(VectorIndexManager.PROP_REBUILD);
+            if (!"true".equals(rebuildFlag)) {
+                rebuildSucceeded = true;
+                return;
+            }
+            Table table = schemaTracker.getTable(index.table);
+            if (table == null) {
+                // We just applied the CREATE_INDEX entry to the tracker
+                // above; the table MUST be there. Surface this loudly —
+                // it is a real correctness bug if it ever fires, not a
+                // recoverable race.
+                throw new IllegalStateException(
+                        "rebuild requested for index " + index.tablespace + "." + index.table
+                                + "." + index.name + " but the table is not tracked");
+            }
+            AbstractVectorStore store = vectorStores.get(storeKey(index.table, index.name));
+            if (store == null) {
+                // createVectorStoreIfNeeded just ran — same surfacing.
+                throw new IllegalStateException(
+                        "rebuild requested for index " + index.tablespace + "." + index.table
+                                + "." + index.name + " but no vector store was created");
+            }
+            if (dataStorageManager == null) {
+                // Engine boots without a DSM in some test scenarios; the
+                // rebuild scan needs one. Surface the misconfiguration.
+                throw new IllegalStateException(
+                        "rebuild requested but the engine has no DataStorageManager");
+            }
+            if (tableSpaceUUID == null) {
+                // Defensive: should never happen because the tablespace
+                // is resolved during start() before any commit-log entry
+                // is delivered. But if a test path ever drives applyEntry
+                // before start(), surface the misuse explicitly rather
+                // than letting the DSM see a null tablespace.
+                throw new IllegalStateException(
+                        "rebuild requested before tablespace UUID was resolved");
+            }
+            // Effectively-final capture for the lambda below.
+            final Index indexForLambda = index;
+            VectorIndexRebuilder rebuilder = new VectorIndexRebuilder(
+                    dataStorageManager, tableSpaceUUID, table, index, store,
+                    key -> isAcceptedLocally(key, indexForLambda),
+                    rebuildMetrics);
+            rebuilder.run();
+            rebuildSucceeded = true;
+        } finally {
+            if (!rebuildSucceeded) {
+                // Set FAILED before any throwable propagates so the
+                // very next processEntry call early-returns on
+                // FAILED state. Use the Index data we have (it may
+                // be null if Index.deserialize itself threw — that
+                // is a payload-corruption scenario, log without
+                // identity).
+                LOGGER.log(Level.SEVERE,
+                        "rebuild failed for {0}; engine entering FAILED state — "
+                                + "tailer will refuse to advance past this entry until restart",
+                        index != null
+                                ? (index.tablespace + "." + index.table + "." + index.name)
+                                : "<undeserializable index>");
+                engineStatus = EngineStatus.FAILED;
+            }
+        }
     }
 
     /**
@@ -3269,6 +3442,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         registerTailerMetrics();
         registerShadowMetrics();
         registerSegmentAssignmentMetrics();
+        // Issue #471: register the rebuild gauges
+        // (rebuild.records_scanned, rebuild.records_indexed,
+        // rebuild.last_start_time_ms, rebuild.last_end_time_ms) so
+        // operators can see rebuild progress + status without scraping
+        // logs. The class is a no-op when statsLogger == null.
+        rebuildMetrics.register(statsLogger);
         // Netty direct-memory counters (issue #246) so the unified JVM
         // dashboard can show pool-arena growth for the IS alongside the
         // main server and the remote file service. The gauges carry
@@ -3287,6 +3466,17 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      */
     public herddb.indexing.segment.SegmentAssignmentMetrics getSegmentAssignmentMetrics() {
         return segmentAssignmentMetrics;
+    }
+
+    /**
+     * Issue #471 — read-only accessor for the engine-wide rebuild
+     * counters (records scanned, records indexed, last start/end
+     * timestamps). Used by the rebuild test suite to assert that a
+     * triggered rebuild actually visited records and inserted the
+     * expected subset.
+     */
+    public VectorIndexRebuildMetrics getRebuildMetricsForTest() {
+        return rebuildMetrics;
     }
 
     /**

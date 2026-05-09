@@ -1532,7 +1532,47 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     @Override
     public TableStatus getTableStatus(String tableSpace, String uuid,
             LogSequenceNumber sequenceNumber) throws DataStorageManagerException {
-        return localMetadataManager.getTableStatus(tableSpace, uuid, sequenceNumber);
+        // Issue #471: read replicas (e.g. the IndexingService rebuilder)
+        // do not write metadata locally — the herddb leader writes
+        // TableStatus to ITS local metadata directory and publishes to
+        // shared remote storage via SharedCheckpointMetadataManager.
+        // Fall back to shared storage when the local file is missing
+        // so a fresh read replica can scan a table at a checkpoint LSN
+        // it never wrote itself. The fallback is opt-in: a leader
+        // without a SharedCheckpointMetadataManager configured (or a
+        // standalone test setup) keeps the local-only behavior, so
+        // existing call sites are unchanged.
+        try {
+            return localMetadataManager.getTableStatus(tableSpace, uuid, sequenceNumber);
+        } catch (DataStorageManagerException localErr) {
+            SharedCheckpointMetadataManager shared = this.sharedCheckpointMetadataManager;
+            if (shared == null) {
+                throw localErr;
+            }
+            TableStatus sharedStatus;
+            try {
+                sharedStatus = shared.readTableStatus(tableSpace, uuid, sequenceNumber);
+            } catch (DataStorageManagerException sharedErr) {
+                // Shared also failed — surface the LOCAL error (more
+                // recognizable for operators) but suppress the
+                // shared error so it shows up in the logs.
+                localErr.addSuppressed(sharedErr);
+                throw localErr;
+            }
+            // SharedCheckpointMetadataManager.readTableStatus returns
+            // a "new table" sentinel (empty activePages, lsn=
+            // START_OF_TIME) when the path does not exist on the
+            // shared backend. That sentinel is NOT what the caller
+            // asked for — re-throw the original local error so the
+            // caller can react to a genuinely-missing checkpoint.
+            if (sharedStatus == null
+                    || sharedStatus.activePages == null
+                    || (sharedStatus.activePages.isEmpty()
+                            && LogSequenceNumber.START_OF_TIME.equals(sharedStatus.sequenceNumber))) {
+                throw localErr;
+            }
+            return sharedStatus;
+        }
     }
 
     @Override

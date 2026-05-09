@@ -3977,6 +3977,28 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         TableCheckpoint result;
 
         /*
+         * Issue #471: track the pins taken during this checkpoint so we
+         * can roll them back if any subsequent step throws. The pins
+         * live in {@link DataStorageManager}'s in-memory tracking maps
+         * and survive only until the leader process restarts; without
+         * this rollback, a foreground caller of {@code checkpoint(true)}
+         * (e.g. {@code CREATE VECTOR INDEX} on a non-empty table) that
+         * fails partway through would leak one or more pins for the
+         * leader's process lifetime. Background activator-driven
+         * callers tolerate the leak by retrying, but foreground SQL
+         * callers cannot.
+         *
+         * Each entry is a {@link Runnable} that releases ONE specific
+         * pin; populated only when {@code pin == true}. The outer
+         * finally below runs them in reverse order if {@code
+         * checkpointSucceeded == false}, swallowing any individual
+         * unpin failure with a SEVERE log so a single rollback step
+         * cannot mask the original exception.
+         */
+        final List<Runnable> pinRollbacks = pin ? new ArrayList<>() : null;
+        boolean checkpointSucceeded = false;
+
+        /*
          * Outer try/finally for issue #403 (and pre-existing Phase B leak):
          * guarantees {@code checkPointRunning} is cleared whether the failure
          * originates inside Phase A (under checkpointLock write), Phase B (no
@@ -4255,6 +4277,24 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
             for (AbstractIndexManager indexManager : indexes.values()) {
                 // Checkpoint at the same position as this TableManager's sequenceNumber
                 actions.addAll(indexManager.checkpoint(sequenceNumber, pin));
+                if (pin) {
+                    // Issue #471: register the rollback BEFORE the next pin
+                    // call, so a failure in the next iteration releases the
+                    // one we just took. The closure captures the index
+                    // manager + LSN by reference; both are effectively
+                    // final for the lifetime of this method.
+                    final AbstractIndexManager pinnedIndex = indexManager;
+                    pinRollbacks.add(() -> {
+                        try {
+                            pinnedIndex.unpinCheckpoint(sequenceNumber);
+                        } catch (DataStorageManagerException unpinErr) {
+                            LOGGER.log(Level.SEVERE,
+                                    "checkpoint rollback: failed to unpin secondary index "
+                                            + pinnedIndex.getIndex().name + " at " + sequenceNumber,
+                                    unpinErr);
+                        }
+                    });
+                }
             }
         }
         maybeWarnOnActionAccumulation(actions);
@@ -4550,6 +4590,21 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         /* === runs concurrently with DML / commits.   See issue #403. === */
         /* ============================================================== */
         actions.addAll(keyToPage.persistCheckpoint(pkIndexSnapshot));
+        if (pin) {
+            // Issue #471: register the BLink keyToPage unpin BEFORE the
+            // next pin call. The BLink registers in DSM under the
+            // synthetic name "<tableUuid>_primary" and pins at
+            // postFlushSequenceNumber (NOT the Phase A sequenceNumber).
+            pinRollbacks.add(() -> {
+                try {
+                    keyToPage.unpinCheckpoint(postFlushSequenceNumber);
+                } catch (DataStorageManagerException unpinErr) {
+                    LOGGER.log(Level.SEVERE,
+                            "checkpoint rollback: failed to unpin PK BLink keyToPage at "
+                                    + postFlushSequenceNumber, unpinErr);
+                }
+            });
+        }
         maybeWarnOnActionAccumulation(actions);
         keytopagecheckpoint = System.currentTimeMillis();
         LOGGER.log(Level.INFO,
@@ -4561,6 +4616,23 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                 "checkpoint {0}.{1} Phase C: writing table status to storage ({2} active pages)",
                 new Object[]{table.tablespace, table.name, tableStatus.activePages.size()});
         actions.addAll(dataStorageManager.tableCheckpoint(tableSpaceUUID, table.uuid, tableStatus, pin));
+        if (pin) {
+            // Issue #471: register the table-level unpin. This is the
+            // last pin doCheckpoint takes; nothing after this point
+            // should throw, but we register the rollback for symmetry
+            // with the previous two pin sites and so a future refactor
+            // that adds work after the table pin keeps the contract.
+            pinRollbacks.add(() -> {
+                try {
+                    dataStorageManager.unPinTableCheckpoint(
+                            tableSpaceUUID, table.uuid, postFlushSequenceNumber);
+                } catch (DataStorageManagerException unpinErr) {
+                    LOGGER.log(Level.SEVERE,
+                            "checkpoint rollback: failed to unpin table " + table.name
+                                    + " at " + postFlushSequenceNumber, unpinErr);
+                }
+            });
+        }
         maybeWarnOnActionAccumulation(actions);
         tablecheckpoint = System.currentTimeMillis();
         LOGGER.log(Level.INFO,
@@ -4582,6 +4654,13 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
                     new Object[]{table.name, sequenceNumber, pageSet.toString()});
         }
 
+        // Issue #471: place the success flag AFTER the trailing LOGGER
+        // calls so that an unlikely LOGGER throw still triggers the
+        // partial-pin rollback. This is the last statement of the
+        // outer try body — the next thing the JVM runs is the outer
+        // finally, which inspects checkpointSucceeded.
+        checkpointSucceeded = true;
+
         } finally {
             // Safety net: if an exception escaped Phase C before the inner write-lock
             // finally ran (e.g. drain timeout, interrupted wait, test hook failure),
@@ -4593,6 +4672,23 @@ public final class TableManager implements AbstractTableManager, Page.Owner {
         }
 
         } finally {
+            // Issue #471: roll back any pins taken before the failure.
+            // pinRollbacks is null when pin == false, so this branch is
+            // a single null-check on the no-pin path. Run in REVERSE
+            // order so the most recently pinned site is unpinned first.
+            // Each individual rollback swallows its own error with a
+            // SEVERE log so a single failed unpin cannot mask the
+            // original exception that aborted the checkpoint.
+            if (!checkpointSucceeded && pinRollbacks != null) {
+                for (int i = pinRollbacks.size() - 1; i >= 0; i--) {
+                    try {
+                        pinRollbacks.get(i).run();
+                    } catch (RuntimeException rollbackErr) {
+                        LOGGER.log(Level.SEVERE,
+                                "checkpoint rollback step " + i + " threw", rollbackErr);
+                    }
+                }
+            }
             // Outer finally for issue #403: clears checkPointRunning whether
             // the failure originates inside Phase A (the inner Phase A finally
             // releases the write lock), Phase B (no lock), the under-lock part
