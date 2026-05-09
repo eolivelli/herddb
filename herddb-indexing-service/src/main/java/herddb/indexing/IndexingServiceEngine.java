@@ -780,14 +780,26 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                             .PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_ENABLED_WITH_OPTIMIZER,
                     IndexingServerConfiguration
                             .PROPERTY_VECTOR_INDEX_COMPACTION_LOCAL_ENABLED_WITH_OPTIMIZER_DEFAULT);
+            // Streaming compaction (issue #485): config key takes precedence over
+            // the herddb.vectorindex.streamingCompactionEnabled system property
+            // at IS startup. The flag is process-wide because the optimizer-pod
+            // path (RemoteSegmentGraphMerger) consults the same static.
+            final boolean vectorCompactionStreamingEnabled = config.getBoolean(
+                    IndexingServerConfiguration
+                            .PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED,
+                    IndexingServerConfiguration
+                            .PROPERTY_VECTOR_INDEX_COMPACTION_STREAMING_ENABLED_DEFAULT);
+            herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(
+                    vectorCompactionStreamingEnabled);
             LOGGER.log(Level.INFO,
                     "vector index compaction: tieredEnabled={0}, backpressureSegments={1}, "
                             + "backpressureMaxWaitMs={2}, localKickFraction={3},"
-                            + " localEnabledWithOptimizer={4}",
+                            + " localEnabledWithOptimizer={4}, streamingEnabled={5}",
                     new Object[]{vectorCompactionTieredEnabled, vectorCompactionBackpressureSegments,
                             vectorCompactionBackpressureMaxWaitMs,
                             vectorCompactionLocalKickFraction,
-                            vectorCompactionLocalEnabledWithOptimizer});
+                            vectorCompactionLocalEnabledWithOptimizer,
+                            vectorCompactionStreamingEnabled});
             final long maxLiveBytesPerCheckpoint = config.getLong(
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT,
                     IndexingServerConfiguration.PROPERTY_VECTOR_MAX_LIVE_BYTES_PER_CHECKPOINT_DEFAULT);

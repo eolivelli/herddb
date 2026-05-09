@@ -79,11 +79,25 @@ public class RemoteSegmentMergerTest {
 
     private MemoryDataStorageManager dsm;
     private Path tmpDir;
+    private boolean savedStreamingFlag;
 
     @Before
     public void setUp() throws Exception {
         dsm = new MemoryDataStorageManager();
         tmpDir = tmp.newFolder("merger-tmp").toPath();
+        // Issue #485: this suite produces synthetic inputs with only a map
+        // file (no real graph file) and arbitrary sizeBytes, so it can only
+        // be exercised via the legacy in-memory rebuild. The streaming path
+        // (default-on as of issue #485) requires a real graph multipart file
+        // per input. Force the legacy path here; streaming coverage lives in
+        // RemoteSegmentMergerStreamingTest, which produces real graph files.
+        savedStreamingFlag = herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled();
+        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(false);
+    }
+
+    @org.junit.After
+    public void tearDown() {
+        herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(savedStreamingFlag);
     }
 
     private SegmentMetadata writeInputSegmentToDsm(String uuid, long segmentId,

@@ -24,10 +24,18 @@ import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
+import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor;
+import io.github.jbellis.jvector.graph.disk.OrdinalMapper;
+import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
+import io.github.jbellis.jvector.util.FixedBitSet;
+import io.github.jbellis.jvector.util.PhysicalCoreExecutor;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -85,6 +93,47 @@ final class VectorIndexCompactor {
     static volatile java.util.function.Consumer<PersistentVectorStore.LiveGraphShard>
             syntheticShardObserverForTest;
 
+    /**
+     * Master switch for the streaming compaction engine introduced in issue
+     * #485. When {@code true}, {@link #rebuildSegment} delegates to
+     * {@link io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor}
+     * instead of building a fresh in-memory {@link GraphIndexBuilder}. The
+     * streaming engine bounds memory by {@code taskWindowSize × maxDegree}
+     * instead of {@code numTotalNodes × dimension}, lifting the conservative
+     * 1 GB cap previously baked into {@code vector.index.compaction.maxBytes}.
+     *
+     * <p>The same flag governs the optimizer-pod path
+     * ({@link RemoteSegmentGraphMerger}).
+     *
+     * <p>Default: {@code true}. Operators may flip via the
+     * {@code herddb.vectorindex.streamingCompactionEnabled} system property.
+     * The non-streaming path is retained as an escape hatch for the lifetime
+     * of the issue #485 rollout.
+     *
+     * <p>Non-final to allow tests to flip the flag in a {@code @Before} /
+     * {@code @After} block without process restart.
+     */
+    static volatile boolean streamingCompactionEnabled =
+            Boolean.parseBoolean(System.getProperty(
+                    "herddb.vectorindex.streamingCompactionEnabled", "true"));
+
+    /**
+     * Process-wide counter of times the streaming path fell back to the
+     * legacy in-memory rebuild because {@code OnDiskGraphIndexCompactor}'s
+     * {@code sources.size() >= 2} precondition was not met (i.e. only one
+     * candidate slipped through). Surfaced for operational visibility — a
+     * non-zero value with high cadence indicates the compaction policy is
+     * picking single-candidate cycles and the streaming path is effectively
+     * idle. Per-process (not per-store) since the flag itself is per-process.
+     */
+    static final java.util.concurrent.atomic.AtomicLong STREAMING_FALLBACK_TO_LEGACY_TOTAL =
+            new java.util.concurrent.atomic.AtomicLong(0);
+
+    /** Test-only / metrics accessor for {@link #STREAMING_FALLBACK_TO_LEGACY_TOTAL}. */
+    public static long getStreamingFallbackToLegacyTotal() {
+        return STREAMING_FALLBACK_TO_LEGACY_TOTAL.get();
+    }
+
     /** Reasons a compaction run can fail; carried through to metrics. */
     enum FailureReason {
         READ_IO,
@@ -99,15 +148,38 @@ final class VectorIndexCompactor {
     static final class CompactionException extends Exception {
         private static final long serialVersionUID = 1L;
         final FailureReason reason;
+        /**
+         * Multipart files that were partially uploaded (or might have been)
+         * before the failure was detected. Each entry is {@code {segUuid,
+         * fileType}} and is consumed by
+         * {@code PersistentVectorStore.runCompactionCycle}'s
+         * {@code catch (CompactionException)} arm to queue retention-aware
+         * deletes. May be empty but never {@code null}.
+         *
+         * <p>Issue #485 review item: previously the rebuild methods rethrew
+         * {@code IOException} / {@code DataStorageManagerException} on upload
+         * failure, dropping the orphan list with the stack frame. Wrapping
+         * them into {@link CompactionException} with this field attached
+         * lets the outer cycle's existing orphan-handling code fire on
+         * every failure path.
+         */
+        final List<String[]> orphanPaths;
 
         CompactionException(FailureReason reason, String message) {
-            super(message);
-            this.reason = reason;
+            this(reason, message, null, null);
         }
 
         CompactionException(FailureReason reason, String message, Throwable cause) {
+            this(reason, message, cause, null);
+        }
+
+        CompactionException(FailureReason reason, String message, Throwable cause,
+                            List<String[]> orphanPaths) {
             super(message, cause);
             this.reason = reason;
+            this.orphanPaths = (orphanPaths == null)
+                    ? java.util.Collections.emptyList()
+                    : new ArrayList<>(orphanPaths);
         }
     }
 
@@ -500,7 +572,6 @@ final class VectorIndexCompactor {
             throws CompactionException, IOException, DataStorageManagerException {
 
         int dim = store.compactionDimension();
-        List<String[]> orphans = new ArrayList<>();
         int totalCandidateVectors = 0;
         for (VectorSegment seg : candidates) {
             totalCandidateVectors += Math.max(0, seg.liveCount.get());
@@ -508,13 +579,24 @@ final class VectorIndexCompactor {
 
         int keptCount = 0;
         int filteredCount = 0;
+        // Per-source live bitsets. Built in lock-step with the count below so the
+        // streaming path (issue #485) can hand them straight to OnDiskGraphIndexCompactor
+        // without a second walk over each candidate's pkOffsets array.
+        List<FixedBitSet> liveBitsets = new ArrayList<>(candidates.size());
 
-        // First pass: count how many vectors we will actually keep.
+        // First pass: count how many vectors we will actually keep, and build
+        // per-source live bitsets covering candidate ordinals at the same time.
         for (VectorSegment seg : candidates) {
             int[] offsets = seg.pkOffsets;
             int[] lengths = seg.pkLengths;
             byte[] data = seg.pkData;
+            // length == 0 is a valid empty bitset; length < 1 is rejected by FixedBitSet.
+            // Use Math.max(1, ...) so an empty candidate still produces a placeholder
+            // bitset (it will simply have cardinality 0 — never indexed by liveCount).
+            int sourceSize = (offsets == null) ? 0 : offsets.length;
+            FixedBitSet live = new FixedBitSet(Math.max(1, sourceSize));
             if (offsets == null || data == null || lengths == null) {
+                liveBitsets.add(live);
                 continue;
             }
             for (int ord = 0; ord < offsets.length; ord++) {
@@ -529,8 +611,10 @@ final class VectorIndexCompactor {
                     filteredCount++;
                 } else {
                     keptCount++;
+                    live.set(ord);
                 }
             }
+            liveBitsets.add(live);
         }
         if (keptCount == 0) {
             LOGGER.log(Level.INFO, "compaction: all {0} candidate vectors are obsolete — skipping rebuild",
@@ -538,99 +622,17 @@ final class VectorIndexCompactor {
             return null;
         }
 
-        // Reserve a contiguous global nodeId range + force a live-shard
-        // rotation (issue #255). The synthetic shard uses its own per-shard
-        // VectorStorage keyed by a local ordinal 0..keptCount (issue #256),
-        // so no coordination with the live shards' storage is needed.
-        long startNodeId = store.allocateCompactionNodeIds(keptCount);
-
-        // Build a synthetic LiveGraphShard anchored at startNodeId with its
-        // own isolated VectorStorage of exactly the size we need.
-        ConcurrentHashMap<Bytes, Integer> pkToNode = new ConcurrentHashMap<>(keptCount);
-        ConcurrentHashMap<Integer, Bytes> nodeToPk = new ConcurrentHashMap<>(keptCount);
-        VectorStorage syntheticStorage = new VectorStorage(keptCount);
-        VectorStorageRandomAccessVectorValues ravv =
-                new VectorStorageRandomAccessVectorValues(
-                        syntheticStorage, dim, keptCount);
-        BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(
-                ravv, store.compactionSimilarity());
-        GraphIndexBuilder builder = new GraphIndexBuilder(
-                bsp, dim,
-                List.of(store.graphBuilderM()),
-                store.graphBuilderBeamWidth(),
-                store.graphBuilderNeighborOverflow(),
-                store.graphBuilderAlpha(),
-                /* addHierarchy */ false,
-                /* refineFinalGraph */ false,
-                ForkJoinPool.commonPool(),
-                ForkJoinPool.commonPool(),
-                keptCount);
-
-        AtomicInteger localOrdCounter = new AtomicInteger(0);
-        PersistentVectorStore.LiveGraphShard synthetic = new PersistentVectorStore.LiveGraphShard(
-                pkToNode, nodeToPk, ravv, builder, syntheticStorage, startNodeId);
-        java.util.function.Consumer<PersistentVectorStore.LiveGraphShard> observer =
-                syntheticShardObserverForTest;
-        if (observer != null) {
-            observer.accept(synthetic);
+        // Issue #485 — streaming compaction via jvector's OnDiskGraphIndexCompactor.
+        // The on-disk-merge path bounds memory by O(taskWindowSize × maxDegree)
+        // instead of O(numTotalNodes × dimension), lifting the in-memory cap that
+        // previously forced vector.index.compaction.maxBytes ≤ 1 GB.
+        if (streamingCompactionEnabled) {
+            return rebuildSegmentStreaming(store, candidates, authority, dim,
+                    keptCount, filteredCount, liveBitsets);
         }
 
-        boolean success = false;
-        VectorSegment mergedSegment = null;
-        try {
-            populateSyntheticShard(store, candidates, authority, synthetic,
-                    localOrdCounter);
-
-            // Cleanup the builder (diversifies edges / refines).
-            try {
-                builder.cleanup();
-            } catch (RuntimeException e) {
-                // GraphIndexBuilder.cleanup can throw unchecked on invalid state;
-                // treat as WRITE_IO since the rebuild's internal state is corrupted.
-                throw new CompactionException(FailureReason.WRITE_IO,
-                        "GraphIndexBuilder.cleanup failed during compaction rebuild", e);
-            }
-
-            int segmentId = store.newSegmentId();
-            PersistentVectorStore.SegmentWriteResult swr;
-            try {
-                swr = store.writeSyntheticShard(synthetic, segmentId, dim);
-            } catch (IOException | DataStorageManagerException e) {
-                orphans.add(new String[]{
-                        store.indexUUID() + "_seg" + segmentId, "graph"});
-                orphans.add(new String[]{
-                        store.indexUUID() + "_seg" + segmentId, "map"});
-                throw e;
-            }
-            if (swr == null) {
-                // Defensive: writeShardAsFusedPQSegment returns null when
-                // the shard is empty. We already checked keptCount > 0, so
-                // this shouldn't happen — treat as corruption.
-                throw new CompactionException(FailureReason.CORRUPTION,
-                        "writeSyntheticShard returned null for non-empty compaction shard");
-            }
-
-            mergedSegment = store.preloadCompactedSegment(swr);
-            success = true;
-            return new RebuildResult(mergedSegment,
-                    swr.graphFileSize + swr.mapFileSize, keptCount, filteredCount, orphans);
-        } finally {
-            try {
-                builder.close();
-            } catch (IOException e) {
-                LOGGER.log(Level.FINE, "ignoring builder close failure in compaction", e);
-            }
-            // No store-side release needed: the synthetic shard owns its own
-            // VectorStorage (issue #256), so it is reclaimed by the GC when
-            // this method returns.
-            if (!success && mergedSegment != null) {
-                try {
-                    mergedSegment.close();
-                } catch (RuntimeException e) {
-                    LOGGER.log(Level.FINE, "ignoring merged-segment close failure", e);
-                }
-            }
-        }
+        return rebuildSegmentLegacy(store, candidates, authority, dim,
+                keptCount, filteredCount);
     }
 
     /**
@@ -706,6 +708,569 @@ final class VectorIndexCompactor {
                     view.close();
                 } catch (IOException e) {
                     LOGGER.log(Level.FINE, "ignoring view close in compaction", e);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Streaming compaction (issue #485) — driven by OnDiskGraphIndexCompactor.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Asserts the {@code INLINE_VECTORS} feature is present on a streaming
+     * compaction candidate's feature map. Extracted so the guard can be
+     * unit-tested in isolation (issue #485 review item B.3#2): mocking
+     * {@link OnDiskGraphIndex} requires reflective access to its
+     * package-private internals; lifting the check to a {@code Map}-keyed
+     * helper sidesteps that.
+     *
+     * <p>Package-private for tests.
+     *
+     * @param segmentId numeric id of the candidate segment, included in the
+     *                  error message for diagnosis
+     * @param features  the feature map returned by
+     *                  {@link OnDiskGraphIndex#getFeatures()}
+     * @throws CompactionException with {@link FailureReason#CORRUPTION} when
+     *                  the map does not contain {@code INLINE_VECTORS}
+     */
+    static void requireInlineVectorsFeature(int segmentId,
+            java.util.Map<FeatureId, ?> features) throws CompactionException {
+        if (features == null || !features.containsKey(FeatureId.INLINE_VECTORS)) {
+            throw new CompactionException(FailureReason.CORRUPTION,
+                    "candidate segment " + segmentId
+                            + " missing INLINE_VECTORS feature (required by"
+                            + " OnDiskGraphIndexCompactor)");
+        }
+    }
+
+    /**
+     * Drives a streaming N:1 compaction via
+     * {@link OnDiskGraphIndexCompactor}. Reads each candidate's existing
+     * {@link OnDiskGraphIndex}, writes a merged graph with dense output
+     * ordinals {@code 0..keptCount-1}, builds the matching map file, and
+     * hands off to {@link PersistentVectorStore#writeStreamingCompactedSegment}
+     * for upload + bookkeeping. Memory cost is bounded by
+     * {@code taskWindowSize × maxDegree × float[dimension]} — independent of
+     * the merged graph size — so the per-cycle byte cap is no longer
+     * dictated by heap pressure.
+     *
+     * <p>Every candidate segment is required to carry the
+     * {@link FeatureId#INLINE_VECTORS} feature (needed by the compactor to
+     * read source vectors during graph rewrite). HerdDB always writes this
+     * feature, so a missing entry is surfaced as
+     * {@link FailureReason#CORRUPTION}.
+     */
+    private static RebuildResult rebuildSegmentStreaming(
+            PersistentVectorStore store,
+            List<VectorSegment> candidates,
+            CompactionAuthorityMap authority,
+            int dim,
+            int keptCount,
+            int filteredCount,
+            List<FixedBitSet> liveBitsets)
+            throws CompactionException, IOException, DataStorageManagerException {
+
+        // Surface missing graph references / missing INLINE_VECTORS as CORRUPTION
+        // so the outer cycle records the failure cleanly instead of letting an
+        // unchecked exception escape the jvector boundary. Guards are split out
+        // into package-private helpers so they're testable in isolation
+        // (issue #485 review item B.3#2).
+        for (VectorSegment seg : candidates) {
+            OnDiskGraphIndex odg = seg.onDiskGraph;
+            if (odg == null) {
+                throw new CompactionException(FailureReason.CORRUPTION,
+                        "candidate segment " + seg.segmentId
+                                + " has no on-disk graph (streaming compaction)");
+            }
+            requireInlineVectorsFeature(seg.segmentId, odg.getFeatures());
+        }
+
+        // Build per-source dense ordinal mappers so the merged segment occupies
+        // exactly keptCount records on disk (no holes for tombstoned/superseded
+        // ordinals). With OffsetMapper the inline level-0 area would be sized
+        // for sum(srcSize) ordinals, wasting up to one record per dead slot.
+        List<OrdinalMapper> mappers = new ArrayList<>(candidates.size());
+        List<OnDiskGraphIndex> sources = new ArrayList<>(candidates.size());
+        int globalBase = 0;
+        for (int s = 0; s < candidates.size(); s++) {
+            VectorSegment seg = candidates.get(s);
+            FixedBitSet live = liveBitsets.get(s);
+            OnDiskGraphIndex odg = seg.onDiskGraph;
+            int sourceSize = odg.size(0);
+            // Defensive: align bitset length with the source's level-0 size, since
+            // OnDiskGraphIndexCompactor's validateLiveNodesBounds rejects any mismatch.
+            FixedBitSet aligned;
+            if (live.length() == sourceSize) {
+                aligned = live;
+            } else {
+                aligned = new FixedBitSet(Math.max(1, sourceSize));
+                int last = Math.min(live.length(), sourceSize);
+                for (int ord = 0; ord < last; ord++) {
+                    if (live.get(ord)) {
+                        aligned.set(ord);
+                    }
+                }
+                liveBitsets.set(s, aligned);
+            }
+            sources.add(odg);
+            DenseLiveOrdinalMapper mapper =
+                    new DenseLiveOrdinalMapper(aligned, sourceSize, globalBase);
+            mappers.add(mapper);
+            globalBase += mapper.liveCount();
+        }
+        if (globalBase != keptCount) {
+            // Must hold by construction; surface as CORRUPTION rather than asserting
+            // so a hypothetical bitset-vs-counter mismatch fails the cycle, not the JVM.
+            throw new CompactionException(FailureReason.CORRUPTION,
+                    "streaming compaction bitset/keptCount mismatch: keptCount="
+                            + keptCount + " bitsetTotal=" + globalBase);
+        }
+
+        // OnDiskGraphIndexCompactor requires at least two sources.  When a single
+        // candidate slips through (e.g., the maxCount trigger fired with a single
+        // residual segment) fall back to the legacy in-memory path: building an
+        // OnDiskGraphIndexCompactor over one source is rejected at construction.
+        if (sources.size() < 2) {
+            STREAMING_FALLBACK_TO_LEGACY_TOTAL.incrementAndGet();
+            LOGGER.log(Level.INFO,
+                    "streaming compaction: only {0} candidate(s); falling back to legacy"
+                            + " in-memory rebuild (fallbackTotal={1})",
+                    new Object[]{sources.size(), STREAMING_FALLBACK_TO_LEGACY_TOTAL.get()});
+            return rebuildSegmentLegacy(store, candidates, authority, dim,
+                    keptCount, filteredCount);
+        }
+
+        Path graphTemp = Files.createTempFile(
+                store.tmpDirectory(), "herddb-vector-compact-graph-", ".idx");
+        Path mapTemp = Files.createTempFile(
+                store.tmpDirectory(), "herddb-vector-compact-map-", ".tmp");
+        boolean success = false;
+        VectorSegment mergedSegment = null;
+        List<String[]> orphans = new ArrayList<>();
+        int segmentId = store.newSegmentId();
+        // Also reserve a contiguous nodeId range for parity with the legacy path.
+        // Issue #255 (live-shard rotation): the rebuild may run alongside a live
+        // shard append; allocating the range here forces a rotation so the
+        // merged segment's nodeIds never collide with subsequently-allocated
+        // live-shard ones. The streaming path doesn't use the actual reserved
+        // value (all output ordinals are dense 0..keptCount-1), but the rotation
+        // side-effect still matters.
+        long startNodeId = store.allocateCompactionNodeIds(keptCount);
+        try {
+            // OnDiskGraphIndexCompactor is not AutoCloseable: it self-shuts-down
+            // a fork-join pool inside compact() iff it owns one. We hand in
+            // PhysicalCoreExecutor.pool() so the compactor never owns its executor.
+            OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
+                    sources, liveBitsets, mappers, store.compactionSimilarity(),
+                    PhysicalCoreExecutor.pool());
+            try {
+                compactor.compact(graphTemp);
+            } catch (java.io.FileNotFoundException | RuntimeException e) {
+                // jvector boundary — wrap unchecked OR FileNotFoundException
+                // (declared on compact()) failures so they never reach the
+                // outer cycle's orphan-blind catch (IOException) arm. No
+                // orphans yet: this fires before any upload.
+                throw new CompactionException(FailureReason.WRITE_IO,
+                        "OnDiskGraphIndexCompactor.compact failed for segment "
+                                + segmentId, e);
+            }
+
+            try {
+                writeStreamingCompactedMapFile(candidates, liveBitsets, mappers,
+                        mapTemp, dim, keptCount);
+            } catch (RuntimeException e) {
+                throw new CompactionException(FailureReason.WRITE_IO,
+                        "streaming compaction map-file build failed for segment "
+                                + segmentId, e);
+            }
+
+            PersistentVectorStore.SegmentWriteResult swr;
+            try {
+                swr = store.writeStreamingCompactedSegment(
+                        graphTemp, mapTemp, segmentId, keptCount);
+            } catch (IOException | DataStorageManagerException e) {
+                // Either upload (graph or map) may have completed before the
+                // failure surfaced — track both as orphans regardless and let
+                // the outer cycle queue retention-aware deletes via
+                // pendingDeletes (issue #485 review item B.1#1).
+                List<String[]> failureOrphans = new ArrayList<>(2);
+                failureOrphans.add(new String[]{
+                        store.indexUUID() + "_seg" + segmentId, "graph"});
+                failureOrphans.add(new String[]{
+                        store.indexUUID() + "_seg" + segmentId, "map"});
+                FailureReason reason = (e instanceof DataStorageManagerException)
+                        ? FailureReason.METADATA_IO : FailureReason.WRITE_IO;
+                throw new CompactionException(reason,
+                        "writeStreamingCompactedSegment failed for segment "
+                                + segmentId, e, failureOrphans);
+            }
+            if (swr == null) {
+                throw new CompactionException(FailureReason.CORRUPTION,
+                        "writeStreamingCompactedSegment returned null for non-empty"
+                                + " streaming compaction shard (keptCount=" + keptCount + ")");
+            }
+
+            // Upload succeeded — both files exist remotely. Pre-populate orphans
+            // so any subsequent failure (preloadCompactedSegment, etc.) routes
+            // them through pendingDeletes for retention-aware cleanup.
+            orphans.add(new String[]{
+                    store.indexUUID() + "_seg" + segmentId, "graph"});
+            orphans.add(new String[]{
+                    store.indexUUID() + "_seg" + segmentId, "map"});
+
+            try {
+                mergedSegment = store.preloadCompactedSegment(swr);
+            } catch (IOException | DataStorageManagerException e) {
+                FailureReason reason = (e instanceof DataStorageManagerException)
+                        ? FailureReason.METADATA_IO : FailureReason.READ_IO;
+                throw new CompactionException(reason,
+                        "preloadCompactedSegment failed for streaming output segment "
+                                + segmentId, e, orphans);
+            }
+
+            // Issue #485: the streaming engine retrains its own PQ codebook via
+            // PQRetrainer (balanced sample over compaction inputs). The store's
+            // cachedPQ now reflects a stale distribution; invalidate so the next
+            // checkpoint trains fresh. Hoisting the retrained codebook back into
+            // cachedPQ would save K-Means cost but bias the cache toward the
+            // compaction-input subset of the index (not necessarily a better
+            // representative than what getOrTrainPQ would produce next time).
+            store.invalidateCachedPq();
+
+            success = true;
+            LOGGER.log(Level.INFO,
+                    "streaming compaction: merged {0} segment(s) into segment {1} "
+                            + "(kept={2}, filtered={3}, startNodeId={4})",
+                    new Object[]{candidates.size(), segmentId, keptCount,
+                            filteredCount, startNodeId});
+            return new RebuildResult(mergedSegment,
+                    swr.graphFileSize + swr.mapFileSize, keptCount, filteredCount, orphans);
+        } finally {
+            try {
+                Files.deleteIfExists(graphTemp);
+            } catch (IOException e) {
+                LOGGER.log(Level.FINE, "ignoring streaming graph temp delete failure", e);
+            }
+            try {
+                Files.deleteIfExists(mapTemp);
+            } catch (IOException e) {
+                LOGGER.log(Level.FINE, "ignoring streaming map temp delete failure", e);
+            }
+            if (!success && mergedSegment != null) {
+                try {
+                    mergedSegment.close();
+                } catch (RuntimeException e) {
+                    LOGGER.log(Level.FINE,
+                            "ignoring merged-segment close failure (streaming)", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * Writes the per-(newOrdinal, pk, vector) map file expected by
+     * {@link PersistentVectorStore#preloadCompactedSegment} / the existing
+     * {@code loadFusedPQSegment} reader. Wire format mirrors
+     * {@code writeFusedPQMapDataToTempFile}:
+     * <pre>
+     *   int entryCount
+     *   per entry: int newOrdinal, int pkLen, byte[pkLen] pk, int floatCount, int[floatCount] floats
+     * </pre>
+     *
+     * <p>Entries are emitted in (sourceIndex, oldOrdinal) ascending order so
+     * vectors are read sequentially from each source's
+     * {@link OnDiskGraphIndex.View} — disk-friendly and reproducible.
+     */
+    private static void writeStreamingCompactedMapFile(
+            List<VectorSegment> candidates,
+            List<FixedBitSet> liveBitsets,
+            List<OrdinalMapper> mappers,
+            Path mapTempFile,
+            int dimension,
+            int keptCount) throws IOException {
+        boolean ok = false;
+        try (java.io.BufferedOutputStream bos = new java.io.BufferedOutputStream(
+                java.nio.file.Files.newOutputStream(mapTempFile),
+                64 * 1024);
+             java.io.DataOutputStream dos = new java.io.DataOutputStream(bos)) {
+            dos.writeInt(keptCount);
+            for (int s = 0; s < candidates.size(); s++) {
+                VectorSegment seg = candidates.get(s);
+                FixedBitSet live = liveBitsets.get(s);
+                OrdinalMapper mapper = mappers.get(s);
+                int[] offsets = seg.pkOffsets;
+                int[] lengths = seg.pkLengths;
+                byte[] data = seg.pkData;
+                if (offsets == null || data == null || lengths == null) {
+                    continue;
+                }
+                OnDiskGraphIndex.View view;
+                try {
+                    view = (OnDiskGraphIndex.View) seg.onDiskGraph.getView();
+                } catch (RuntimeException e) {
+                    throw new IOException("failed to open view on candidate segment "
+                            + seg.segmentId + " (streaming map writer)", e);
+                }
+                try {
+                    VectorFloat<?> tmp = io.github.jbellis.jvector.vector.VectorizationProvider
+                            .getInstance().getVectorTypeSupport()
+                            .createFloatVector(dimension);
+                    for (int ord = 0; ord < offsets.length; ord++) {
+                        if (!live.get(ord)) {
+                            continue;
+                        }
+                        int newOrdinal = mapper.oldToNew(ord);
+                        int off = offsets[ord];
+                        int len = lengths[ord];
+                        try {
+                            view.getVectorInto(ord, tmp, 0);
+                        } catch (RuntimeException e) {
+                            throw new IOException("failed to read vector at ord " + ord
+                                    + " of segment " + seg.segmentId
+                                    + " (streaming map writer)", e);
+                        }
+                        if (tmp.length() != dimension) {
+                            throw new IOException("dimension mismatch at ord " + ord
+                                    + " of segment " + seg.segmentId
+                                    + ": expected " + dimension + " got " + tmp.length());
+                        }
+                        dos.writeInt(newOrdinal);
+                        dos.writeInt(len);
+                        dos.write(data, off, len);
+                        dos.writeInt(dimension);
+                        for (int j = 0; j < dimension; j++) {
+                            dos.writeInt(Float.floatToIntBits(tmp.get(j)));
+                        }
+                    }
+                } finally {
+                    try {
+                        view.close();
+                    } catch (IOException e) {
+                        LOGGER.log(Level.FINE,
+                                "ignoring view close in streaming map writer", e);
+                    }
+                }
+            }
+            ok = true;
+        } finally {
+            if (!ok) {
+                try {
+                    Files.deleteIfExists(mapTempFile);
+                } catch (IOException ignored) {
+                    // Best-effort cleanup; the outer rebuild will log if needed.
+                }
+            }
+        }
+    }
+
+    /**
+     * Dense per-source {@link OrdinalMapper}: walks the live-bitset once and
+     * assigns each live ordinal a unique global new ordinal in
+     * {@code [newBase, newBase + liveCount)}. Dead ordinals are
+     * {@link OrdinalMapper#OMITTED}.
+     *
+     * <p>{@link OnDiskGraphIndexCompactor} only invokes
+     * {@link #oldToNew(int)} on ordinals it has already filtered through
+     * {@code liveNodes.get(s).get(node)}, so the mapper is only ever asked
+     * for live ordinals. {@code newToOld} is exposed for completeness but
+     * unused by the compactor; it is implemented correctly anyway so this
+     * mapper is a well-formed {@link OrdinalMapper}.
+     *
+     * <p>Uses primitive {@code int[]} backing arrays — no boxing — so memory
+     * cost is {@code 8 × sourceSize} bytes per source instead of
+     * {@code ~48 × liveCount} for a {@code Map<Integer, Integer>}-backed
+     * {@link OrdinalMapper.MapMapper}. For million-vector segments this
+     * difference matters.
+     */
+    static final class DenseLiveOrdinalMapper implements OrdinalMapper {
+
+        private final int newBase;
+        private final int liveCount;
+        private final int[] oldToNewArr; // size = sourceSize; OMITTED for dead ordinals.
+        private final int[] newToOldArr; // size = liveCount; sparse mapping back.
+
+        DenseLiveOrdinalMapper(FixedBitSet liveBits, int sourceSize, int newBase) {
+            if (liveBits == null) {
+                throw new IllegalArgumentException("liveBits must not be null");
+            }
+            if (sourceSize < 0) {
+                throw new IllegalArgumentException(
+                        "sourceSize must be >= 0, got " + sourceSize);
+            }
+            if (newBase < 0) {
+                throw new IllegalArgumentException(
+                        "newBase must be >= 0, got " + newBase);
+            }
+            this.newBase = newBase;
+            this.oldToNewArr = new int[sourceSize];
+            Arrays.fill(this.oldToNewArr, OMITTED);
+            // Cardinality bounded by sourceSize, so int suffices.
+            int counted = 0;
+            for (int ord = 0; ord < sourceSize; ord++) {
+                if (liveBits.get(ord)) {
+                    counted++;
+                }
+            }
+            this.liveCount = counted;
+            this.newToOldArr = new int[counted];
+            int newOrd = newBase;
+            int idx = 0;
+            for (int ord = 0; ord < sourceSize; ord++) {
+                if (liveBits.get(ord)) {
+                    this.oldToNewArr[ord] = newOrd;
+                    this.newToOldArr[idx++] = ord;
+                    newOrd++;
+                }
+            }
+        }
+
+        int liveCount() {
+            return liveCount;
+        }
+
+        @Override
+        public int maxOrdinal() {
+            // jvector takes the global max across all mappers; for a dense layout,
+            // (newBase + liveCount - 1) is the highest output ordinal this source
+            // contributes. When liveCount == 0 we return newBase - 1 so the global
+            // max remains correct (the caller guards against an empty cycle).
+            return newBase + liveCount - 1;
+        }
+
+        @Override
+        public int oldToNew(int oldOrdinal) {
+            if (oldOrdinal < 0 || oldOrdinal >= oldToNewArr.length) {
+                return OMITTED;
+            }
+            return oldToNewArr[oldOrdinal];
+        }
+
+        @Override
+        public int newToOld(int newOrdinal) {
+            int idx = newOrdinal - newBase;
+            if (idx < 0 || idx >= liveCount) {
+                return OMITTED;
+            }
+            return newToOldArr[idx];
+        }
+    }
+
+    /**
+     * Legacy in-memory rebuild path. Identical to the body that previously
+     * lived inside {@link #rebuildSegment} prior to issue #485 — split out so
+     * the dispatcher can choose between streaming and legacy paths cleanly.
+     */
+    private static RebuildResult rebuildSegmentLegacy(
+            PersistentVectorStore store,
+            List<VectorSegment> candidates,
+            CompactionAuthorityMap authority,
+            int dim,
+            int keptCount,
+            int filteredCount)
+            throws CompactionException, IOException, DataStorageManagerException {
+
+        List<String[]> orphans = new ArrayList<>();
+
+        long startNodeId = store.allocateCompactionNodeIds(keptCount);
+
+        ConcurrentHashMap<Bytes, Integer> pkToNode = new ConcurrentHashMap<>(keptCount);
+        ConcurrentHashMap<Integer, Bytes> nodeToPk = new ConcurrentHashMap<>(keptCount);
+        VectorStorage syntheticStorage = new VectorStorage(keptCount);
+        VectorStorageRandomAccessVectorValues ravv =
+                new VectorStorageRandomAccessVectorValues(
+                        syntheticStorage, dim, keptCount);
+        BuildScoreProvider bsp = BuildScoreProvider.randomAccessScoreProvider(
+                ravv, store.compactionSimilarity());
+        GraphIndexBuilder builder = new GraphIndexBuilder(
+                bsp, dim,
+                List.of(store.graphBuilderM()),
+                store.graphBuilderBeamWidth(),
+                store.graphBuilderNeighborOverflow(),
+                store.graphBuilderAlpha(),
+                /* addHierarchy */ false,
+                /* refineFinalGraph */ false,
+                ForkJoinPool.commonPool(),
+                ForkJoinPool.commonPool(),
+                keptCount);
+
+        AtomicInteger localOrdCounter = new AtomicInteger(0);
+        PersistentVectorStore.LiveGraphShard synthetic = new PersistentVectorStore.LiveGraphShard(
+                pkToNode, nodeToPk, ravv, builder, syntheticStorage, startNodeId);
+        java.util.function.Consumer<PersistentVectorStore.LiveGraphShard> observer =
+                syntheticShardObserverForTest;
+        if (observer != null) {
+            observer.accept(synthetic);
+        }
+
+        boolean success = false;
+        VectorSegment mergedSegment = null;
+        try {
+            populateSyntheticShard(store, candidates, authority, synthetic,
+                    localOrdCounter);
+
+            try {
+                builder.cleanup();
+            } catch (RuntimeException e) {
+                throw new CompactionException(FailureReason.WRITE_IO,
+                        "GraphIndexBuilder.cleanup failed during compaction rebuild", e);
+            }
+
+            int segmentId = store.newSegmentId();
+            PersistentVectorStore.SegmentWriteResult swr;
+            try {
+                swr = store.writeSyntheticShard(synthetic, segmentId, dim);
+            } catch (IOException | DataStorageManagerException e) {
+                // Issue #485 review item B.1#1: wrap the upload failure in a
+                // CompactionException carrying the orphan list so the outer
+                // cycle's pendingDeletes drainer fires (the previous rethrow
+                // dropped orphans with the stack frame).
+                List<String[]> failureOrphans = new ArrayList<>(2);
+                failureOrphans.add(new String[]{
+                        store.indexUUID() + "_seg" + segmentId, "graph"});
+                failureOrphans.add(new String[]{
+                        store.indexUUID() + "_seg" + segmentId, "map"});
+                FailureReason reason = (e instanceof DataStorageManagerException)
+                        ? FailureReason.METADATA_IO : FailureReason.WRITE_IO;
+                throw new CompactionException(reason,
+                        "writeSyntheticShard failed for segment " + segmentId,
+                        e, failureOrphans);
+            }
+            if (swr == null) {
+                throw new CompactionException(FailureReason.CORRUPTION,
+                        "writeSyntheticShard returned null for non-empty compaction shard");
+            }
+
+            // Upload succeeded — track orphans so a preload failure still
+            // routes through pendingDeletes for cleanup.
+            orphans.add(new String[]{
+                    store.indexUUID() + "_seg" + segmentId, "graph"});
+            orphans.add(new String[]{
+                    store.indexUUID() + "_seg" + segmentId, "map"});
+
+            try {
+                mergedSegment = store.preloadCompactedSegment(swr);
+            } catch (IOException | DataStorageManagerException e) {
+                FailureReason reason = (e instanceof DataStorageManagerException)
+                        ? FailureReason.METADATA_IO : FailureReason.READ_IO;
+                throw new CompactionException(reason,
+                        "preloadCompactedSegment failed for legacy output segment "
+                                + segmentId, e, orphans);
+            }
+            success = true;
+            return new RebuildResult(mergedSegment,
+                    swr.graphFileSize + swr.mapFileSize, keptCount, filteredCount, orphans);
+        } finally {
+            try {
+                builder.close();
+            } catch (IOException e) {
+                LOGGER.log(Level.FINE, "ignoring builder close failure in compaction", e);
+            }
+            if (!success && mergedSegment != null) {
+                try {
+                    mergedSegment.close();
+                } catch (RuntimeException e) {
+                    LOGGER.log(Level.FINE, "ignoring merged-segment close failure", e);
                 }
             }
         }

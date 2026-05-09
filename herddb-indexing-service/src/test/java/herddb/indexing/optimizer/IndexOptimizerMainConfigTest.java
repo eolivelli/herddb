@@ -154,4 +154,68 @@ public class IndexOptimizerMainConfigTest {
         assertTrue("backward-compat helper must still return NoopMerger fallback",
                 m instanceof IndexOptimizerMain.NoopMerger);
     }
+
+    /**
+     * Issue #485 (PR #494 final-review item B.1): the optimizer pod runs in
+     * a separate process and does not see the IS-side
+     * {@code vector.index.compaction.streaming.enabled} key. Operators must
+     * set {@code indexoptimizer.merge.streaming.enabled} on the optimizer's
+     * own configuration to flip the streaming engine off there.
+     *
+     * <p>Verifies that {@link IndexOptimizerMain#start()} reads the key and
+     * propagates the value to the process-wide
+     * {@code VectorIndexCompactor.streamingCompactionEnabled} static.
+     */
+    @Test
+    public void optimizerHonorsStreamingCompactionConfigKey() throws Exception {
+        boolean originalFlag =
+                herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled();
+        try {
+            // Set the key to false and assert the static was flipped after start().
+            Properties propsOff = baseProps();
+            propsOff.setProperty(
+                    OptimizerConfiguration.PROPERTY_MERGE_STREAMING_ENABLED, "false");
+            IndexOptimizerMain mainOff = new IndexOptimizerMain(
+                    new OptimizerConfiguration(propsOff));
+            try {
+                mainOff.start();
+                assertEquals("streaming flag must be false after start() with config key=false",
+                        false,
+                        herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled());
+            } finally {
+                mainOff.shutdown();
+            }
+
+            // Set the key to true and assert the static was flipped back.
+            Properties propsOn = baseProps();
+            propsOn.setProperty(
+                    OptimizerConfiguration.PROPERTY_MERGE_STREAMING_ENABLED, "true");
+            IndexOptimizerMain mainOn = new IndexOptimizerMain(
+                    new OptimizerConfiguration(propsOn));
+            try {
+                mainOn.start();
+                assertEquals("streaming flag must be true after start() with config key=true",
+                        true,
+                        herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled());
+            } finally {
+                mainOn.shutdown();
+            }
+
+            // Unset the key entirely → default = true.
+            Properties propsDefault = baseProps();
+            // (no streaming key set)
+            IndexOptimizerMain mainDefault = new IndexOptimizerMain(
+                    new OptimizerConfiguration(propsDefault));
+            try {
+                mainDefault.start();
+                assertEquals("streaming flag must default to true when key is absent",
+                        true,
+                        herddb.index.vector.PersistentVectorStore.isStreamingCompactionEnabled());
+            } finally {
+                mainDefault.shutdown();
+            }
+        } finally {
+            herddb.index.vector.PersistentVectorStore.setStreamingCompactionEnabled(originalFlag);
+        }
+    }
 }

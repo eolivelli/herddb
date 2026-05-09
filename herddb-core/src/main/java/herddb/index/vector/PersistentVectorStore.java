@@ -2318,11 +2318,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     LOGGER.log(Level.WARNING,
                             "vector store " + indexName + ": compaction failed ("
                                     + e.reason + ")", e);
-                    // Clean up orphaned output files if any were written.
+                    // Clean up orphaned output files. Orphans may come from two
+                    // places: a successful rebuild that subsequently failed (carried
+                    // on rebuild.orphanPaths), or a rebuild that threw before the
+                    // RebuildResult was constructed (carried on e.orphanPaths —
+                    // issue #485 review item: pre-fix the rethrown IOException
+                    // dropped the orphan list with the stack frame).
+                    long now = System.currentTimeMillis();
+                    long sinceGen = currentIndexStatusGeneration.get();
                     if (rebuild != null && rebuild.orphanPaths != null) {
-                        long now = System.currentTimeMillis();
-                        long sinceGen = currentIndexStatusGeneration.get();
                         for (String[] orphan : rebuild.orphanPaths) {
+                            this.pendingDeletes.add(new PendingDelete(
+                                    encodeMultipartPath(orphan[0], orphan[1]),
+                                    now, sinceGen));
+                        }
+                    }
+                    if (e.orphanPaths != null) {
+                        for (String[] orphan : e.orphanPaths) {
                             this.pendingDeletes.add(new PendingDelete(
                                     encodeMultipartPath(orphan[0], orphan[1]),
                                     now, sinceGen));
@@ -2856,10 +2868,144 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return similarityFunction;
     }
 
+    /**
+     * Package-private accessor for the configured scratch directory. Used by
+     * {@link VectorIndexCompactor#rebuildSegmentStreaming} (issue #485) when
+     * it needs a local temp file for the merged graph + map files.
+     */
+    Path tmpDirectory() {
+        return tmpDirectory;
+    }
+
     SegmentWriteResult writeSyntheticShard(LiveGraphShard syntheticShard,
                                            int segmentId,
                                            int dim) throws IOException, DataStorageManagerException {
         return writeShardAsFusedPQSegment(syntheticShard, segmentId, dim);
+    }
+
+    /**
+     * Uploads a streaming-compaction output (issue #485). The merged graph
+     * and map files have already been produced locally by
+     * {@link io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor}
+     * (graph) and {@code VectorIndexCompactor.writeStreamingCompactedMapFile}
+     * (map). This helper just uploads both via the multipart API and mirrors
+     * the bookkeeping that {@link #writeShardAsFusedPQSegment} performs:
+     * compaction-progress counters, multipart provisional-file tracking, and
+     * a {@link SegmentWriteResult} suitable for handing back to
+     * {@link #preloadCompactedSegment}.
+     *
+     * <p>The caller is responsible for deleting both temp files (their
+     * lifecycle is owned by the streaming rebuild loop).
+     */
+    SegmentWriteResult writeStreamingCompactedSegment(Path graphTempFile,
+                                                      Path mapTempFile,
+                                                      int segmentId,
+                                                      long vectorCount)
+            throws IOException, DataStorageManagerException {
+        if (graphTempFile == null || mapTempFile == null) {
+            throw new IllegalArgumentException(
+                    "writeStreamingCompactedSegment: graph and map temp files must be non-null");
+        }
+        compactionNodesTotal.addAndGet(vectorCount);
+        writingGraphActive.incrementAndGet();
+        try {
+            String segUuid = indexUUID + "_seg" + segmentId;
+
+            // Upload graph
+            long graphSize = Files.size(graphTempFile);
+            uploadBytesTotal.addAndGet(graphSize);
+            String graphFilePath;
+            uploadingActive.incrementAndGet();
+            try {
+                graphFilePath = dataStorageManager.writeMultipartIndexFile(
+                        tableSpaceUUID, segUuid, "graph",
+                        graphTempFile, uploadBytesDone::addAndGet);
+            } finally {
+                uploadingActive.decrementAndGet();
+            }
+            trackProvisionalMultipartFile(segUuid, "graph");
+
+            // Upload map
+            long mapSize = Files.size(mapTempFile);
+            uploadBytesTotal.addAndGet(mapSize);
+            String mapFilePath;
+            uploadingActive.incrementAndGet();
+            try {
+                mapFilePath = dataStorageManager.writeMultipartIndexFile(
+                        tableSpaceUUID, segUuid, "map",
+                        mapTempFile, uploadBytesDone::addAndGet);
+            } finally {
+                uploadingActive.decrementAndGet();
+            }
+            trackProvisionalMultipartFile(segUuid, "map");
+            compactionNodesDone.addAndGet(vectorCount);
+            return new SegmentWriteResult(segmentId,
+                    graphFilePath, graphSize,
+                    mapFilePath, mapSize,
+                    graphSize + mapSize,
+                    vectorCount);
+        } finally {
+            writingGraphActive.decrementAndGet();
+        }
+    }
+
+    /**
+     * Invalidates {@link #cachedPQ} (issue #485). Called after a streaming
+     * compaction successfully swaps in a merged segment whose PQ codebook
+     * was retrained internally by jvector's {@code PQRetrainer} on a balanced
+     * sample of the compaction inputs. The cached codebook now reflects a
+     * stale distribution; nulling it forces the next FusedPQ-eligible
+     * checkpoint to retrain (one extra K-Means run) instead of reusing the
+     * stale codebook.
+     */
+    void invalidateCachedPq() {
+        this.cachedPQ = null;
+        this.pqSegmentsSinceTraining.set(0);
+    }
+
+    /**
+     * Test-only accessor: returns the currently-cached PQ codebook (or
+     * {@code null} when none). Used by streaming-compaction tests (issue
+     * #485) to assert that {@link #invalidateCachedPq()} fires after a
+     * successful streaming swap.
+     */
+    ProductQuantization getCachedPqForTest() {
+        return cachedPQ;
+    }
+
+    /**
+     * Process-wide switch for the streaming compaction engine introduced
+     * in issue #485. When {@code true}, vector-index compaction is driven
+     * by jvector's {@code OnDiskGraphIndexCompactor} (memory bounded by
+     * {@code O(taskWindowSize × maxDegree × float[dim])}); when {@code
+     * false}, the legacy in-memory {@code GraphIndexBuilder} rebuild path
+     * is used instead.
+     *
+     * <p>Public façade over {@link VectorIndexCompactor#streamingCompactionEnabled}
+     * (the underlying class is package-private). Called by
+     * {@code IndexingServiceEngine.start()} when the
+     * {@code vector.index.compaction.streaming.enabled} config key is
+     * resolved at IS startup. Operators may also set the flag via the
+     * {@code herddb.vectorindex.streamingCompactionEnabled} system
+     * property — the config key wins.
+     */
+    public static void setStreamingCompactionEnabled(boolean enabled) {
+        VectorIndexCompactor.streamingCompactionEnabled = enabled;
+    }
+
+    /** Returns the current value of {@link #setStreamingCompactionEnabled(boolean)}. */
+    public static boolean isStreamingCompactionEnabled() {
+        return VectorIndexCompactor.streamingCompactionEnabled;
+    }
+
+    /**
+     * Test-only accessor: returns a defensive snapshot of the on-disk
+     * segment list. Used by streaming-compaction tests (issue #485) to walk
+     * the merged segment's {@code pkOffsets / pkLengths / pkData} and assert
+     * deletion equivalence + dense-ordinal output.
+     */
+    List<VectorSegment> getOnDiskSegmentsSnapshotForTest() {
+        return new ArrayList<>(segments);
     }
 
     VectorSegment preloadCompactedSegment(SegmentWriteResult swr) throws IOException, DataStorageManagerException {
