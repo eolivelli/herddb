@@ -383,24 +383,50 @@ All detailed documentation lives alongside the code in the repo root:
 | [KUBERNETES.md](./KUBERNETES.md) | Building Docker images, pushing to a registry, deploying via the Helm chart. |
 | [CLAUDE.md](./CLAUDE.md) | Contributor guidelines — CI gates, hammer-test regression suite, exception-handling policy. |
 
-## Agentic QA
+## Claude Code Agents
 
-Cluster-level regressions are caught by two Claude Code agent
-definitions checked into the repository. Each one stands up a full
-stack (HerdDB + indexing service + Remote File Service + BookKeeper +
-ZooKeeper + object store) and runs a vector-search benchmark workload
-end-to-end, producing a markdown report — or, on failure, opening a
-GitHub issue with pod logs attached.
+A set of Claude Code agent definitions are checked into the repository
+under [`.claude/agents/`](./.claude/agents/). They automate the most
+common developer workflows — from reviewing and landing a PR to running
+a full benchmark and filing a GitHub issue when something goes wrong.
 
-| Agent | Target | Object store |
+### Development workflow
+
+| Agent | Purpose |
+|---|---|
+| [`pr-worker`](./.claude/agents/pr-worker.md) | Autonomously resolves a GitHub issue end-to-end: creates an isolated git worktree and Maven local repo, drafts an implementation plan (pausing for approval), implements the fix with tests, runs pre-PR validation, submits a PR against master, monitors CI, and cleans up on merge. |
+| [`pr-reviewer`](./.claude/agents/pr-reviewer.md) | Strict, picky pull-request reviewer. Reads the PR diff and local branch, hunts for uncovered corner cases, missing tests, newly introduced flaky tests, correctness or protocol bugs, and performance regressions on hot paths. Returns `APPROVE`, `REQUEST_CHANGES`, or `BLOCK`. |
+
+### Benchmark harnesses
+
+Each bench agent installs HerdDB from the `herddb-services` zip,
+runs a workload end-to-end, produces a markdown report, and opens a
+GitHub issue with logs attached on failure.
+
+| Agent | Target | Workload |
 |---|---|---|
-| [`.claude/agents/herddb-k3s-bench.md`](./.claude/agents/herddb-k3s-bench.md) | local k3s-in-docker | MinIO |
-| [`.claude/agents/herddb-gke-bench.md`](./.claude/agents/herddb-gke-bench.md) | existing GKE cluster | Google Cloud Storage |
+| [`herddb-k3s-bench`](./.claude/agents/herddb-k3s-bench.md) | local k3s-in-docker (MinIO) | vector-search (full stack: server + indexing service + Remote File Service + BookKeeper) |
+| [`herddb-gke-bench`](./.claude/agents/herddb-gke-bench.md) | existing GKE cluster (Google Cloud Storage) | vector-search (full stack) |
+| [`herddb-local-bench`](./.claude/agents/herddb-local-bench.md) | local host, no containers | vector-search (server + indexing service only, no BookKeeper) |
+| [`ycsb-bench`](./.claude/agents/ycsb-bench.md) | local host, no containers | YCSB via JDBC (server only, standalone mode) |
 
-These are developer-facing regression harnesses, not a user feature.
-The underlying shell scripts they drive live under
+The shell scripts driven by the Kubernetes bench agents live under
 [`herddb-kubernetes/src/main/helm/herddb/examples/`](./herddb-kubernetes/src/main/helm/herddb/examples/)
-and can also be run by hand.
+and the local bench scripts live under
+[`herddb-services/examples/`](./herddb-services/examples/).
+Both sets can be run by hand independently of the agents.
+
+### Diagnostics and utilities
+
+| Agent | Purpose |
+|---|---|
+| [`herddb-dataset-generator`](./.claude/agents/herddb-dataset-generator.md) | Generate vector datasets for benchmarks — synthetic (via Ollama) or standard (BIGANN, GIST1M). Drops them into `$HERDDB_TESTS_HOME` and optionally uploads to GCS. |
+| [`herddb-checkpoint-analyzer`](./.claude/agents/herddb-checkpoint-analyzer.md) | Analyze server and/or indexing-service checkpoint dynamics from a live cluster or collected logs. Detects lock timeouts, slow phases, and growing trends; returns a verdict with recommended actions. |
+| [`herddb-commitlog-inspector`](./.claude/agents/herddb-commitlog-inspector.md) | Investigate BookKeeper commit-log issues using `herddb-cli`. Use when diagnosing checkpoint LSN mismatches, duplicate-key recovery errors, or cross-ledger transaction problems. |
+| [`herddb-cluster-monitor`](./.claude/agents/herddb-cluster-monitor.md) | Run a single supervision tick on a live HerdDB cluster and return a compact (~300-token) TICK SUMMARY. Used as a sub-agent by bench harnesses to reduce context bloat. |
+| [`herddb-issue-triage`](./.claude/agents/herddb-issue-triage.md) | Triage open GitHub issues against the master commit log and close those already solved or obsolete with a proper referencing message. |
+| [`herddb-flaky-tests`](./.claude/agents/herddb-flaky-tests.md) | Detect flaky tests by scanning the last N merged PRs for failed CI runs and (on explicit approval) open one GitHub issue per failing test class. |
+| [`ci-watch`](./.claude/agents/ci-watch.md) | Watch GitHub Actions checks for a PR, poll until all checks resolve, then report results with failure log excerpts. Spawn in background while waiting for CI. |
 
 ## License
 
