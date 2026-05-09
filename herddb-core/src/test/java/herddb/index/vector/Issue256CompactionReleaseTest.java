@@ -57,15 +57,24 @@ public class Issue256CompactionReleaseTest {
     @Rule
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
+    private boolean savedStreamingFlag;
+
     @Before
     public void disableDeferral() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
+        // The synthetic-shard reclamation invariant only exists on the legacy
+        // in-memory rebuild path. The streaming path (issue #485) doesn't
+        // construct a LiveGraphShard at all, so its observer never fires.
+        // Force the legacy path for this suite.
+        savedStreamingFlag = VectorIndexCompactor.streamingCompactionEnabled;
+        VectorIndexCompactor.streamingCompactionEnabled = false;
     }
 
     @After
     public void tearDown() {
         PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
         VectorIndexCompactor.syntheticShardObserverForTest = null;
+        VectorIndexCompactor.streamingCompactionEnabled = savedStreamingFlag;
     }
 
     private static float[] vec(Random rng, int dim) {
