@@ -218,6 +218,28 @@ public class TableSpaceManager {
     private final AtomicInteger nextTableId = new AtomicInteger(1);
     private final ConcurrentHashMap<String, AbstractIndexManager> indexes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Map<String, AbstractIndexManager>> indexesByTable = new ConcurrentHashMap<>();
+
+    /**
+     * Issue #471: pending rebuild-checkpoint pins held against the
+     * leader's {@link DataStorageManager}, keyed by
+     * {@code tableUuid → (pinnedLsn → tableName)}. A pin is registered
+     * here after a successful {@code CREATE VECTOR INDEX} on a non-empty
+     * table; {@link #releaseCompletedRebuildPins} walks the map on every
+     * tablespace checkpoint and releases pins whose LSN the
+     * IndexingService has caught up past (i.e. the IS has durably
+     * persisted the rebuild result and no longer needs the pinned
+     * pages). The map is in-memory only — on a leader restart the pins
+     * are dropped and {@code cleanupAfterTableBoot} may reap the
+     * pinned pages; if the IS rebuild has not yet completed when the
+     * leader restarts, the IS-side scan may observe
+     * {@code PageNotFoundException} and surface a rebuild failure
+     * (which the engine escalates to {@code EngineStatus.FAILED}).
+     * Persisting the pin map across leader restarts is a planned
+     * follow-up.
+     */
+    private final ConcurrentHashMap<String,
+            ConcurrentHashMap<LogSequenceNumber, String>> pendingRebuildPins =
+            new ConcurrentHashMap<>();
     private final StampedLock generalLock = new StampedLock();
     /**
      * Serializes concurrent checkpoint calls. When tryLock fails a checkpoint is already running — the new call
@@ -2624,8 +2646,21 @@ public class TableSpaceManager {
 
             apply(pos, entry, false);
 
-            // Mark success: from here on the pin (if any) is owned by
-            // the future IS-side rebuild path, not by this method's
+            // Issue #471: hand the pin off to the
+            // releaseCompletedRebuildPins / checkpoint flow. From
+            // here on, this method's error-recovery finally MUST NOT
+            // unpin (the pin is now legitimate state the IS will
+            // consume); releaseCompletedRebuildPins owns the unpin
+            // on success.
+            if (rebuildPinTableManager != null && rebuildPinLsn != null) {
+                String tableUuid = rebuildPinTableManager.getTable().uuid;
+                String tableName = rebuildPinTableManager.getTable().name;
+                pendingRebuildPins
+                        .computeIfAbsent(tableUuid, k -> new ConcurrentHashMap<>())
+                        .put(rebuildPinLsn, tableName);
+            }
+            // Mark success: from here on the pin (if any) is tracked
+            // by pendingRebuildPins above, not by this method's
             // error-recovery cleanup.
             indexCreateSucceeded = true;
             return new DDLStatementExecutionResult(entry.transactionId);
@@ -3106,6 +3141,11 @@ public class TableSpaceManager {
                         log.dropOldLedgers(logSequenceNumber, tailersFloor);
                         // Notify shared-storage read replicas of the new checkpoint
                         publishCheckpointLsnToMetadata(logSequenceNumber);
+                        // Issue #471: release rebuild pins whose IS
+                        // has caught up. Same `leader` gate as the
+                        // ledger drop above — the unpin is only safe
+                        // on the leader, where the pin is held.
+                        releaseCompletedRebuildPins();
                     }
                     _logSequenceNumber = log.getLastSequenceNumber();
                 } catch (DataStorageManagerException | LogNotAvailableException ex) {
@@ -3260,6 +3300,10 @@ public class TableSpaceManager {
                                     "{0} checkpoint {1}: published checkpoint LSN to metadata in {2} ms",
                                     new Object[]{nodeId, tableSpaceName, publishElapsed});
                         }
+                        // Issue #471: release rebuild pins whose IS
+                        // has caught up. The unpin is only safe on
+                        // the leader, where the pin is held.
+                        releaseCompletedRebuildPins();
                     }
 
                     _logSequenceNumber = log.getLastSequenceNumber();
@@ -3382,6 +3426,167 @@ public class TableSpaceManager {
         }
         // null = no external tailer constraint (no vector indexes in this tablespace).
         return floor;
+    }
+
+    /**
+     * Issue #471: walks {@link #pendingRebuildPins} and releases any
+     * pin whose LSN the IndexingService has caught up past. A pin is
+     * "caught up" when {@code computeTailersRetentionFloor()} returns
+     * an LSN at or after the pinned LSN — the IS has durably
+     * persisted state past the {@code CREATE VECTOR INDEX} entry, so
+     * the pinned table-checkpoint pages are no longer needed and the
+     * activator's normal cleanup can reclaim them.
+     *
+     * <p>Called from the tablespace checkpoint paths. Failures to
+     * unpin (e.g. transient {@link DataStorageManagerException}) are
+     * logged at WARNING and the pin is kept in the map for retry on
+     * the next checkpoint. The IS being unreachable (where
+     * {@code computeTailersRetentionFloor} returns
+     * {@link LogSequenceNumber#START_OF_TIME}) deliberately blocks
+     * the unpin — we cannot safely conclude the IS no longer needs
+     * the pages.
+     */
+    private void releaseCompletedRebuildPins() {
+        if (pendingRebuildPins.isEmpty()) {
+            return;
+        }
+        LogSequenceNumber tailersFloor = computeTailersRetentionFloor();
+        if (tailersFloor == null
+                || LogSequenceNumber.START_OF_TIME.equals(tailersFloor)) {
+            // Either no IS instances exist for this tablespace (no
+            // pin to release because no rebuild is in flight — but
+            // the map could carry pins from a previous IS instance
+            // that has since gone away; we keep them rather than
+            // silently leaking unpinned pages), or every IS is
+            // unreachable. Defer release.
+            return;
+        }
+        for (Map.Entry<String, ConcurrentHashMap<LogSequenceNumber, String>> tableEntry
+                : pendingRebuildPins.entrySet()) {
+            String mapTableUuid = tableEntry.getKey();
+            ConcurrentHashMap<LogSequenceNumber, String> pinsForTable = tableEntry.getValue();
+            Iterator<Map.Entry<LogSequenceNumber, String>> it = pinsForTable.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<LogSequenceNumber, String> pinEntry = it.next();
+                LogSequenceNumber pinLsn = pinEntry.getKey();
+                String tableName = pinEntry.getValue();
+                // tailersFloor >= pinLsn  ⇔  tailersFloor.after(pinLsn) || tailersFloor.equals(pinLsn)
+                if (!tailersFloor.after(pinLsn) && !tailersFloor.equals(pinLsn)) {
+                    continue;
+                }
+                AbstractTableManager tm = tables.get(tableName);
+                if (tm == null) {
+                    // Table was dropped while the rebuild pin was
+                    // outstanding — the DROP_TABLE handler already
+                    // wipes the on-storage data, so the pin is
+                    // moot. Drop it.
+                    LOGGER.log(Level.INFO,
+                            "rebuild pin {0} on dropped table {1}.{2}: discarding entry",
+                            new Object[]{pinLsn, tableSpaceName, tableName});
+                    it.remove();
+                    continue;
+                }
+                // Targeted unpin: release ONLY the table pin and the
+                // PK BLink pin, NOT a walk over the current
+                // indexesByTable map. {@link TableManager#unpinCheckpoint}
+                // would iterate every secondary index that exists
+                // RIGHT NOW — including the freshly-created vector
+                // index that was NOT pinned at this LSN (it didn't
+                // exist when {@link tableManager#checkpoint(true)}
+                // ran). The first such "not pinned" error would
+                // throw and prevent the table-level unpin from
+                // running. The narrow direct-DSM path below avoids
+                // that hazard.
+                //
+                // Pre-existing secondary indexes that DID get pinned
+                // by doCheckpoint at this LSN are NOT released by
+                // this loop — they leak their per-index pin until
+                // the leader process restarts. The leak is bounded
+                // (one index pin per pre-existing secondary index
+                // per CREATE VECTOR INDEX) and the table pin
+                // released here is what unblocks the activator's
+                // table-page reclamation. Releasing the per-index
+                // pins as well requires capturing the
+                // pre-existing-index UUID list at pin time —
+                // tracked as a follow-up.
+                String tableUuid = tm.getTable().uuid;
+                String blinkIndexName = herddb.index.blink.BLinkKeyToPageIndex
+                        .deriveIndexName(tableUuid);
+                boolean tableUnpinned = tryRelease("table", tableSpaceName, tableName, pinLsn,
+                        () -> dataStorageManager.unPinTableCheckpoint(
+                                tableSpaceUUID, tableUuid, pinLsn));
+                boolean blinkUnpinned = tryRelease("BLink keyToPage", tableSpaceName,
+                        tableName, pinLsn,
+                        () -> dataStorageManager.unPinIndexCheckpoint(
+                                tableSpaceUUID, blinkIndexName, pinLsn));
+                if (tableUnpinned && blinkUnpinned) {
+                    LOGGER.log(Level.INFO,
+                            "released rebuild pins for {0}.{1} at {2} (IS catch-up floor {3})",
+                            new Object[]{tableSpaceName, tableName, pinLsn, tailersFloor});
+                    it.remove();
+                }
+                // If either step failed transiently, keep the pin
+                // in the map — the next checkpoint cycle retries.
+            }
+            // Clean up empty inner maps so the outer map does not
+            // leak the table key indefinitely.
+            if (pinsForTable.isEmpty()) {
+                pendingRebuildPins.remove(mapTableUuid, pinsForTable);
+            }
+        }
+    }
+
+    /**
+     * Helper for {@link #releaseCompletedRebuildPins}: runs a single
+     * unpin step. Treats the "Cannot unpin a not pinned checkpoint"
+     * {@link DataStorageManagerException} as benign (the pin was
+     * already released, or never held — either way the post-condition
+     * holds), and returns {@code true} so the surrounding bookkeeping
+     * removes the pin entry. Other exceptions log a WARNING and
+     * return {@code false} so the entry stays in the map for retry.
+     */
+    private boolean tryRelease(String label, String tableSpace, String tableName,
+                               LogSequenceNumber pinLsn, UnpinAction action) {
+        try {
+            action.run();
+            return true;
+        } catch (DataStorageManagerException unpinErr) {
+            String msg = unpinErr.getMessage();
+            if (msg != null && msg.contains("Cannot unpin a not pinned checkpoint")) {
+                // Idempotent / benign: another path already released
+                // the pin, or this pin was never registered. Either
+                // way the post-condition (no in-memory pin at this
+                // LSN) holds.
+                LOGGER.log(Level.FINE,
+                        "rebuild pin release: {0} for {1}.{2} at {3} was not held — "
+                                + "treating as already released",
+                        new Object[]{label, tableSpace, tableName, pinLsn});
+                return true;
+            }
+            LOGGER.log(Level.WARNING,
+                    "failed to release " + label + " rebuild pin for "
+                            + tableSpace + "." + tableName + " at " + pinLsn
+                            + "; will retry on next checkpoint",
+                    unpinErr);
+            return false;
+        }
+    }
+
+    @FunctionalInterface
+    private interface UnpinAction {
+        void run() throws DataStorageManagerException;
+    }
+
+    /**
+     * Issue #471 — test-only accessor: returns the count of
+     * outstanding rebuild pins this manager is tracking.
+     */
+    public int pendingRebuildPinCountForTest() {
+        int total = 0;
+        for (Map<LogSequenceNumber, String> pins : pendingRebuildPins.values()) {
+            total += pins.size();
+        }
+        return total;
     }
 
     private CompletableFuture<StatementExecutionResult> beginTransactionAsync(StatementEvaluationContext context, boolean releaseLock) throws StatementExecutionException {
