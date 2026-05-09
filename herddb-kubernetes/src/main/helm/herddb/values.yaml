@@ -334,14 +334,58 @@ indexOptimizer:
   # HTTP admin endpoint port — exposes /health (probe target) and /metrics
   # (Prometheus scrape). Set to 0 to disable.
   httpPort: 9853
+  # Periodic safety-net interval for the registry scan. Issue #484 made the
+  # optimizer event-driven (a ZK persistent-recursive watch on the registry
+  # tablespace path schedules a tick on every children-changed event), so
+  # this value can be left long without sacrificing responsiveness — it only
+  # fires when ZK has been completely silent for the whole interval.
   intervalMs: 300000
+  # Minimum number of mergeable segments. Honoured by the legacy
+  # SmallestFirstPolicy; the AggressivePolicy that production runs always
+  # fires on ≥2 sub-target segments so this is effectively unused. Retained
+  # for backward compatibility.
   minCount: 4
+  # Maximum number of segments the optimizer will pick per cycle (cap on
+  # write amplification per merge run).
   maxCount: 200
   # Quoted as strings to prevent the Go YAML parser from emitting scientific
   # notation (e.g. 2.68435456e+08) which Java's Long.parseLong cannot parse.
   minBytes: "268435456"   # 256 MiB
-  maxBytes: "1073741824"  # 1 GiB
+  maxBytes: "1073741824"  # 1 GiB — per-cycle byte budget (write-amplification cap)
+  # Issue #484: per-graph "graduated" cap. Segments at or above this size
+  # are excluded from the merge candidate set. Default 8 GiB so production
+  # workloads converge to a single large graph; raise it to drive even
+  # larger merges or lower it to tier the graph layout.
+  targetMaxBytes: "8589934592"  # 8 GiB
   retentionMs: 600000     # 10 min
+  # Issue #484: debounce window for the event-driven path. Bursts of
+  # children-changed events from the persistent-recursive watch coalesce
+  # into a single tick after this many millis of quiet. 0 disables
+  # debouncing.
+  eventDebounceMs: 500
+  # Issue #484: parameters used by the production RemoteSegmentMerger when
+  # it rebuilds a merged graph. The defaults match the IS-side
+  # PersistentVectorStore so the merged segment has identical recall
+  # characteristics. The vector dimension `dim` MUST be set explicitly when
+  # the optimizer is enabled because SegmentMetadata znodes do not carry
+  # the dimension as a first-class field.
+  merger:
+    dim: 0          # REQUIRED when indexOptimizer.enabled=true (e.g. 960 for GIST1M)
+    M: 16
+    beamWidth: 100
+    neighborOverflow: 1.2
+    alpha: 1.4
+    similarity: "DOT_PRODUCT"  # one of DOT_PRODUCT, COSINE, EUCLIDEAN
+  # Issue #484: configuration for the optimizer's connection to the remote
+  # file service (used by the merger to download input segment files and
+  # upload the merged graph). Empty `servers` means "discover via ZK at
+  # /herd/file-servers" — the typical production setup.
+  remoteFileClient:
+    servers: ""
+    timeoutSeconds: 60
+    retries: 3
+    maxInflightReadBytes: "268435456"   # 256 MiB
+    maxInflightWriteBytes: "268435456"  # 256 MiB
   zkSessionTimeout: 40000
   javaOpts: ""
   javaOptsExtra: ""

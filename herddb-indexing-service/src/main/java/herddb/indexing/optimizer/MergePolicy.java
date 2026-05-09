@@ -95,4 +95,95 @@ public interface MergePolicy {
             return new ArrayList<>();
         }
     }
+
+    /**
+     * Aggressive merge policy (issue #484): the optimizer keeps merging
+     * graphs until every segment has reached {@code targetMaxBytes}. Any
+     * segment whose {@code sizeBytes} is already at or above the target is
+     * "graduated" — left alone forever; everything else is mergeable.
+     *
+     * <p>Trigger: as long as at least two segments are below
+     * {@code targetMaxBytes}, the policy fires. There are deliberately no
+     * minimum-count or minimum-bytes thresholds — those would cause the
+     * optimizer to leave small graphs un-merged for hours under sustained
+     * load, which is precisely the failure mode this policy fixes.
+     *
+     * <p>Selection: smallest-first; the picked set is capped at
+     * {@code perCycleMaxBytes} of input data per cycle (write-amplification
+     * budget) and at {@code maxCount} segments. The 2-segment minimum
+     * always overrides those caps so a cycle with two segments whose sum
+     * exceeds the byte cap still proceeds.
+     */
+    final class AggressivePolicy implements MergePolicy {
+        private final long targetMaxBytes;
+        private final long perCycleMaxBytes;
+        private final int maxCount;
+
+        public AggressivePolicy(long targetMaxBytes, long perCycleMaxBytes, int maxCount) {
+            if (targetMaxBytes <= 0L) {
+                throw new IllegalArgumentException("targetMaxBytes must be positive: " + targetMaxBytes);
+            }
+            if (perCycleMaxBytes <= 0L) {
+                throw new IllegalArgumentException("perCycleMaxBytes must be positive: " + perCycleMaxBytes);
+            }
+            if (maxCount < 2) {
+                throw new IllegalArgumentException("maxCount must be >= 2: " + maxCount);
+            }
+            this.targetMaxBytes = targetMaxBytes;
+            this.perCycleMaxBytes = perCycleMaxBytes;
+            this.maxCount = maxCount;
+        }
+
+        public long getTargetMaxBytes() {
+            return targetMaxBytes;
+        }
+
+        public long getPerCycleMaxBytes() {
+            return perCycleMaxBytes;
+        }
+
+        public int getMaxCount() {
+            return maxCount;
+        }
+
+        @Override
+        public List<VersionedSegmentMetadata> pickMergeCandidates(
+                List<VersionedSegmentMetadata> activeSegments) {
+            if (activeSegments == null || activeSegments.size() < 2) {
+                return new ArrayList<>();
+            }
+            // Filter out graduated segments; only sub-target ones are mergeable.
+            List<VersionedSegmentMetadata> mergeable = new ArrayList<>();
+            for (VersionedSegmentMetadata v : activeSegments) {
+                long size = Math.max(0L, v.metadata().getSizeBytes());
+                if (size < targetMaxBytes) {
+                    mergeable.add(v);
+                }
+            }
+            if (mergeable.size() < 2) {
+                return new ArrayList<>();
+            }
+            mergeable.sort(Comparator.comparingLong(v -> v.metadata().getSizeBytes()));
+
+            List<VersionedSegmentMetadata> picked = new ArrayList<>();
+            long pickedBytes = 0L;
+            for (VersionedSegmentMetadata v : mergeable) {
+                long size = Math.max(0L, v.metadata().getSizeBytes());
+                // Always allow the first two so a cycle with two large
+                // sub-target segments still fires; after that, respect the
+                // per-cycle byte and count caps.
+                if (picked.size() >= 2) {
+                    if (pickedBytes + size > perCycleMaxBytes) {
+                        break;
+                    }
+                    if (picked.size() >= maxCount) {
+                        break;
+                    }
+                }
+                picked.add(v);
+                pickedBytes += size;
+            }
+            return picked.size() >= 2 ? picked : new ArrayList<>();
+        }
+    }
 }

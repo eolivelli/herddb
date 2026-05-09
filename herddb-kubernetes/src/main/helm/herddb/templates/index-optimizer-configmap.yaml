@@ -22,7 +22,32 @@ data:
     indexoptimizer.merge.max.count={{ .Values.indexOptimizer.maxCount | default 200 | int64 }}
     indexoptimizer.merge.min.bytes={{ .Values.indexOptimizer.minBytes | default 268435456 | int64 }}
     indexoptimizer.merge.max.bytes={{ .Values.indexOptimizer.maxBytes | default 1073741824 | int64 }}
+    indexoptimizer.merge.target.bytes={{ .Values.indexOptimizer.targetMaxBytes | default 8589934592 | int64 }}
     indexoptimizer.retention.ms={{ .Values.indexOptimizer.retentionMs | default 600000 | int64 }}
+    indexoptimizer.event.debounce.ms={{ .Values.indexOptimizer.eventDebounceMs | default 500 | int64 }}
+    {{- if .Values.indexOptimizer.merger }}
+    {{- with .Values.indexOptimizer.merger }}
+    {{- if .dim }}
+    indexoptimizer.merge.dim={{ .dim | int64 }}
+    {{- end }}
+    indexoptimizer.merge.M={{ .M | default 16 | int64 }}
+    indexoptimizer.merge.beamWidth={{ .beamWidth | default 100 | int64 }}
+    indexoptimizer.merge.neighborOverflow={{ .neighborOverflow | default 1.2 }}
+    indexoptimizer.merge.alpha={{ .alpha | default 1.4 }}
+    indexoptimizer.merge.similarity={{ .similarity | default "DOT_PRODUCT" }}
+    {{- end }}
+    {{- end }}
+    {{- if .Values.indexOptimizer.remoteFileClient }}
+    {{- with .Values.indexOptimizer.remoteFileClient }}
+    {{- if .servers }}
+    indexoptimizer.remote.file.servers={{ .servers }}
+    {{- end }}
+    indexoptimizer.remote.file.client.timeout={{ .timeoutSeconds | default 60 | int64 }}
+    indexoptimizer.remote.file.client.retries={{ .retries | default 3 | int64 }}
+    indexoptimizer.remote.file.client.max.inflight.read.bytes={{ .maxInflightReadBytes | default 268435456 | int64 }}
+    indexoptimizer.remote.file.client.max.inflight.write.bytes={{ .maxInflightWriteBytes | default 268435456 | int64 }}
+    {{- end }}
+    {{- end }}
     {{- range $k, $v := .Values.indexOptimizer.extraConfig }}
     {{ $k }}={{ $v }}
     {{- end }}

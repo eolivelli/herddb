@@ -133,7 +133,9 @@ public class IndexOptimizerMainTest {
         // Register the tablespace so the optimizer can resolve the UUID by name.
         registerTablespace(TS_NAME, TS_UUID);
 
-        // Pre-seed enough segments to force-fire (maxCount=2 < 3 segments).
+        // Pre-seed three small segments. The AggressivePolicy fires whenever ≥2
+        // sub-target segments exist; with maxCount=100 all three are merged
+        // into a single output in one cycle.
         for (int i = 0; i < 3; i++) {
             registry.createSegment(sampleSegment("seg-" + i, 100L));
         }
@@ -144,11 +146,14 @@ public class IndexOptimizerMainTest {
         props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH, BASE_PATH);
         props.setProperty(OptimizerConfiguration.PROPERTY_TABLESPACE_NAME, TS_NAME);
         props.setProperty(OptimizerConfiguration.PROPERTY_INTERVAL_MS, "100");
-        props.setProperty(OptimizerConfiguration.PROPERTY_MIN_COUNT, "4");
-        props.setProperty(OptimizerConfiguration.PROPERTY_MAX_COUNT, "2");
-        props.setProperty(OptimizerConfiguration.PROPERTY_MIN_BYTES, "9999999999");
+        props.setProperty(OptimizerConfiguration.PROPERTY_MAX_COUNT, "100");
         props.setProperty(OptimizerConfiguration.PROPERTY_MAX_BYTES, "9999999999");
+        props.setProperty(OptimizerConfiguration.PROPERTY_TARGET_MAX_BYTES, "9999999999");
         props.setProperty(OptimizerConfiguration.PROPERTY_RETENTION_MS, "60000");
+        // Disable event-driven debounce so the test's deterministic single-tick
+        // assertion (1 merge invocation) doesn't race with watcher-driven
+        // wakeups from the createSegment / deprecate side-effects.
+        props.setProperty(OptimizerConfiguration.PROPERTY_EVENT_DEBOUNCE_MS, "60000");
 
         InMemorySegmentMerger merger = new InMemorySegmentMerger();
         IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(props), merger);

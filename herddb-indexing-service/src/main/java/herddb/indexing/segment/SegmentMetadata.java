@@ -51,7 +51,7 @@ public final class SegmentMetadata {
     public static final long NO_LSN_LEDGER_ID = -1L;
     public static final long NO_LSN_OFFSET = -1L;
     public static final long NO_RETENTION = -1L;
-    public static final int NO_SEGMENT_ID = -1;
+    public static final long NO_SEGMENT_ID = -1L;
 
     /**
      * Current znode JSON schema version (review item D5). Bumped when a
@@ -93,19 +93,34 @@ public final class SegmentMetadata {
     private final int ownerInstanceId;
     private final int pendingOwnerInstanceId;
     /**
-     * Original IS-local int segment-id under which the multipart graph/map files
-     * were written. Needed by the optimizer's reaper to call
+     * IS-local segment-id under which the multipart graph/map files were
+     * written. Needed by the optimizer's reaper to call
      * {@code DataStorageManager.deleteMultipartIndexFile(tableSpace,
      * indexUuid + "_seg" + segmentId, "graph"/"map")} (review item A8).
      * Defaults to {@link #NO_SEGMENT_ID} (-1) when unknown — in that case the
      * reaper skips file deletion and only removes the znode.
+     *
+     * <p>Widened to {@code long} (issue #484) so the optimizer-side merger can
+     * mint full 63-bit random ids for its merged outputs without colliding
+     * with the IS-side {@code VectorSegment.segmentId} space.
      */
-    private final int segmentId;
+    private final long segmentId;
     private final String graphPath;
     private final String mapPath;
     private final String tombstonePath;
     private final long tombstoneLsnLedgerId;
     private final long tombstoneLsnOffset;
+    /**
+     * Generation of the overlay file at {@link #tombstonePath} (additive in
+     * issue #484). The optimizer's merger needs this to reconstruct the
+     * exact multipart file type — {@code TombstoneOverlayManager.fileTypeFor}
+     * is {@code "tombstones-{generation}"} — when calling
+     * {@code TombstoneOverlayManager.loadOverlay} to apply tombstones during
+     * a graph merge. Defaults to 0L when the segment carries no overlay
+     * (i.e. {@code tombstonePath == null}); also 0L for znode payloads
+     * predating this field, which is treated the same as "no overlay".
+     */
+    private final long overlayGeneration;
     private final long baseLsnLedgerId;
     private final long baseLsnOffset;
     private final long sizeBytes;
@@ -126,12 +141,13 @@ public final class SegmentMetadata {
             @JsonProperty("state") SegmentState state,
             @JsonProperty("ownerInstanceId") int ownerInstanceId,
             @JsonProperty("pendingOwnerInstanceId") int pendingOwnerInstanceId,
-            @JsonProperty("segmentId") int segmentId,
+            @JsonProperty("segmentId") long segmentId,
             @JsonProperty("graphPath") String graphPath,
             @JsonProperty("mapPath") String mapPath,
             @JsonProperty("tombstonePath") String tombstonePath,
             @JsonProperty("tombstoneLsnLedgerId") long tombstoneLsnLedgerId,
             @JsonProperty("tombstoneLsnOffset") long tombstoneLsnOffset,
+            @JsonProperty("overlayGeneration") long overlayGeneration,
             @JsonProperty("baseLsnLedgerId") long baseLsnLedgerId,
             @JsonProperty("baseLsnOffset") long baseLsnOffset,
             @JsonProperty("sizeBytes") long sizeBytes,
@@ -158,6 +174,7 @@ public final class SegmentMetadata {
         this.tombstonePath = tombstonePath;
         this.tombstoneLsnLedgerId = tombstoneLsnLedgerId;
         this.tombstoneLsnOffset = tombstoneLsnOffset;
+        this.overlayGeneration = overlayGeneration;
         this.baseLsnLedgerId = baseLsnLedgerId;
         this.baseLsnOffset = baseLsnOffset;
         this.sizeBytes = sizeBytes;
@@ -206,7 +223,7 @@ public final class SegmentMetadata {
         return pendingOwnerInstanceId;
     }
 
-    public int getSegmentId() {
+    public long getSegmentId() {
         return segmentId;
     }
 
@@ -228,6 +245,10 @@ public final class SegmentMetadata {
 
     public long getTombstoneLsnOffset() {
         return tombstoneLsnOffset;
+    }
+
+    public long getOverlayGeneration() {
+        return overlayGeneration;
     }
 
     public long getBaseLsnLedgerId() {
@@ -311,6 +332,7 @@ public final class SegmentMetadata {
                 .mapPath(mapPath)
                 .tombstonePath(tombstonePath)
                 .tombstoneLsn(tombstoneLsnLedgerId, tombstoneLsnOffset)
+                .overlayGeneration(overlayGeneration)
                 .baseLsn(baseLsnLedgerId, baseLsnOffset)
                 .sizeBytes(sizeBytes)
                 .vectorCount(vectorCount)
@@ -337,6 +359,7 @@ public final class SegmentMetadata {
                 && pendingOwnerInstanceId == that.pendingOwnerInstanceId
                 && tombstoneLsnLedgerId == that.tombstoneLsnLedgerId
                 && tombstoneLsnOffset == that.tombstoneLsnOffset
+                && overlayGeneration == that.overlayGeneration
                 && baseLsnLedgerId == that.baseLsnLedgerId
                 && baseLsnOffset == that.baseLsnOffset
                 && sizeBytes == that.sizeBytes
@@ -392,12 +415,13 @@ public final class SegmentMetadata {
         private SegmentState state = SegmentState.ACTIVE;
         private int ownerInstanceId = NO_INSTANCE;
         private int pendingOwnerInstanceId = NO_INSTANCE;
-        private int segmentId = NO_SEGMENT_ID;
+        private long segmentId = NO_SEGMENT_ID;
         private String graphPath;
         private String mapPath;
         private String tombstonePath;
         private long tombstoneLsnLedgerId = NO_LSN_LEDGER_ID;
         private long tombstoneLsnOffset = NO_LSN_OFFSET;
+        private long overlayGeneration = 0L;
         private long baseLsnLedgerId = NO_LSN_LEDGER_ID;
         private long baseLsnOffset = NO_LSN_OFFSET;
         private long sizeBytes;
@@ -447,7 +471,7 @@ public final class SegmentMetadata {
             return this;
         }
 
-        public Builder segmentId(int value) {
+        public Builder segmentId(long value) {
             this.segmentId = value;
             return this;
         }
@@ -470,6 +494,11 @@ public final class SegmentMetadata {
         public Builder tombstoneLsn(long ledgerId, long offset) {
             this.tombstoneLsnLedgerId = ledgerId;
             this.tombstoneLsnOffset = offset;
+            return this;
+        }
+
+        public Builder overlayGeneration(long value) {
+            this.overlayGeneration = value;
             return this;
         }
 
@@ -539,7 +568,7 @@ public final class SegmentMetadata {
             return new SegmentMetadata(SCHEMA_VERSION,
                     segmentUuid, tablespaceUuid, tableName, indexUuid, indexName,
                     state, ownerInstanceId, pendingOwnerInstanceId, segmentId, graphPath, mapPath,
-                    tombstonePath, tombstoneLsnLedgerId, tombstoneLsnOffset,
+                    tombstonePath, tombstoneLsnLedgerId, tombstoneLsnOffset, overlayGeneration,
                     baseLsnLedgerId, baseLsnOffset, sizeBytes, vectorCount, generation,
                     replacedBy, retentionUntilEpochMillis, createdAtEpochMillis);
         }

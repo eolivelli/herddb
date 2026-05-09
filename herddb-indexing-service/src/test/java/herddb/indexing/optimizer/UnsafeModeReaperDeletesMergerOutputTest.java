@@ -108,7 +108,7 @@ public class UnsafeModeReaperDeletesMergerOutputTest {
         }
     }
 
-    private SegmentMetadata sampleSegment(String uuid, int segmentId) {
+    private SegmentMetadata sampleSegment(String uuid, long segmentId) {
         return SegmentMetadata.builder()
                 .segmentUuid(uuid).tablespaceUuid(TS_UUID).tableName("docs")
                 .indexUuid(IDX_UUID).indexName("docs_v1").state(SegmentState.ACTIVE)
@@ -138,7 +138,7 @@ public class UnsafeModeReaperDeletesMergerOutputTest {
         public SegmentMetadata merge(List<SegmentMetadata> inputs, int newOwnerInstance)
                 throws Exception {
             String mergedUuid = UUID.randomUUID().toString();
-            int mergedId = (int) nextSegmentId.getAndIncrement();
+            long mergedId = nextSegmentId.getAndIncrement();
             String multipartUuid = inputs.get(0).getIndexUuid() + "_seg" + mergedId;
 
             Path graph = Files.createTempFile(tmpDir, "graph-", ".bin");
@@ -179,7 +179,7 @@ public class UnsafeModeReaperDeletesMergerOutputTest {
         // (under the indexUUID + "_seg" + segmentId multipart path the reaper will
         // probe). This makes the "files deleted at reap" assertion below meaningful.
         for (int i = 0; i < 3; i++) {
-            int segId = 100 + i;
+            long segId = 100L + i;
             registry.createSegment(sampleSegment("input-" + i, segId));
             String multipartUuid = IDX_UUID + "_seg" + segId;
             Path graph = Files.createTempFile(tmpDir, "input-graph-", ".bin");
@@ -213,7 +213,7 @@ public class UnsafeModeReaperDeletesMergerOutputTest {
         VersionedSegmentMetadata mergedOutput = all.stream()
                 .filter(v -> v.metadata().getState() == SegmentState.ACTIVE)
                 .findFirst().orElseThrow();
-        int mergedSegmentId = mergedOutput.metadata().getSegmentId();
+        long mergedSegmentId = mergedOutput.metadata().getSegmentId();
         assertTrue("merger must produce a real segmentId, not the sentinel",
                 mergedSegmentId != SegmentMetadata.NO_SEGMENT_ID);
 
