@@ -430,25 +430,15 @@ public final class RemoteSegmentGraphMerger {
                      FileOutputStream fos = new FileOutputStream(tempFile.toFile());
                      BufferedOutputStream bos = new BufferedOutputStream(fos, DOWNLOAD_CHUNK_SIZE)) {
                     reader.seek(0L);
-                    // Determine the ACTUAL number of bytes to read. The supplied
-                    // {@code in.mapFileSize} may overestimate the real file
-                    // size for legacy znodes whose
-                    // {@link SegmentMetadata#mapFileSize} field is unset (the
-                    // merger then falls back to the combined {@code sizeBytes}
-                    // hint). We use {@link RandomAccessReader#length()} when
-                    // available to get the byte-accurate size; if it throws
-                    // (some implementations don't support it), we trust the
-                    // hint and let any tail-EOF surface as an
-                    // {@link IOException} the caller handles.
-                    long actualBytes;
-                    try {
-                        long readerLen = reader.length();
-                        actualBytes = Math.min(readerLen, in.mapFileSize);
-                    } catch (UnsupportedOperationException unsupported) {
-                        actualBytes = in.mapFileSize;
-                    }
+                    // The caller (RemoteSegmentMerger) refuses inputs whose
+                    // mapFileSize is unset (issue #484 round 3), so by the
+                    // time we get here in.mapFileSize is the EXACT byte size
+                    // of the remote map file. Read exactly that many bytes
+                    // in chunks; readFully will throw IOException if the
+                    // remote file is shorter than advertised, which is the
+                    // right failure mode for a corrupt or truncated upload.
                     byte[] buf = new byte[DOWNLOAD_CHUNK_SIZE];
-                    long remaining = actualBytes;
+                    long remaining = in.mapFileSize;
                     while (remaining > 0L) {
                         int toRead = (int) Math.min(buf.length, remaining);
                         byte[] chunk = (toRead == buf.length) ? buf : new byte[toRead];

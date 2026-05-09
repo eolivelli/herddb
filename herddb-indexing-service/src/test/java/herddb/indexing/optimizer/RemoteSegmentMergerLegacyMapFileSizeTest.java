@@ -22,11 +22,14 @@ package herddb.indexing.optimizer;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import herddb.indexing.segment.SegmentMetadata;
 import herddb.indexing.segment.SegmentState;
 import herddb.log.LogSequenceNumber;
 import herddb.mem.MemoryDataStorageManager;
-import herddb.utils.Bytes;
+import herddb.storage.DataStorageManagerException;
+import io.github.jbellis.jvector.disk.RandomAccessReader;
+import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
@@ -34,6 +37,7 @@ import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 import java.io.BufferedOutputStream;
 import java.io.DataOutputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -44,18 +48,25 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 /**
- * Verifies the legacy fallback in {@link RemoteSegmentMerger#merge} for
- * znodes that pre-date the {@code mapFileSize} field added in issue #484
- * round 2 (review item B.1.4).
+ * Verifies the merger's handling of <em>legacy</em> znodes — those whose
+ * {@code SegmentMetadata.mapFileSize} field is unset (issue #484, round-3
+ * review item B.1.1).
  *
- * <p>For legacy znodes ({@code mapFileSize == 0}), the merger uses
- * {@code sizeBytes} (graph + map combined) as an upper-bound size hint
- * for the multipart reader; the download path uses the reader's
- * {@link io.github.jbellis.jvector.disk.RandomAccessReader#length()} to
- * clamp the read to the actual file size, so the over-estimate is
- * harmless. This test exercises that path end-to-end against
- * {@link MemoryDataStorageManager} and verifies the merged output is
- * byte-accurate (no truncation, no resurrection of dropped tail entries).
+ * <p>The production storage readers ({@code RemoteRandomAccessReader},
+ * {@code SegmentedMappedReader}) treat the {@code fileSize} passed at
+ * construction as authoritative — they don't probe the underlying object —
+ * and the direct-multipart-download path computes block count from that
+ * size and throws "Block N not found" past the actual file end. Silently
+ * over-reading would corrupt the merged graph; trying to clamp the read
+ * via {@code RandomAccessReader.length()} is a no-op on every production
+ * reader because {@code length()} returns the constructor-supplied size
+ * unchanged.
+ *
+ * <p>The merger therefore refuses legacy inputs outright with
+ * {@link RemoteSegmentMerger.LegacyMetadataException}. The engine catches
+ * the exception, bumps {@code mergeFailuresTotal}, and moves on — the
+ * next IS checkpoint rewrites the znode with {@code mapFileSize} set,
+ * unsticking the segment.
  */
 public class RemoteSegmentMergerLegacyMapFileSizeTest {
 
@@ -102,11 +113,7 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
             }
         }
         long actualMapSize = Files.size(mapFile);
-        // Simulate "graphFileSize ≈ 3× mapFileSize" — the typical ratio for a
-        // small dim. The combined sizeBytes hint will overestimate map size by
-        // 4×, so the legacy fallback MUST clamp via reader.length() to avoid
-        // reading past the actual file.
-        long combinedSizeHint = actualMapSize * 4L;
+        long combinedSizeHint = actualMapSize * 4L; // mimic graph + map combined
         String multipartUuid = IDX_UUID + "_seg" + segId;
         String mapPath = dsm.writeMultipartIndexFile(TS_UUID, multipartUuid, "map", mapFile, null);
         Files.deleteIfExists(mapFile);
@@ -121,46 +128,76 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
                 .baseLsn(new LogSequenceNumber(1L, 100L))
                 .sizeBytes(combinedSizeHint)
                 // Legacy: mapFileSize INTENTIONALLY left at the default 0L.
-                // The merger must fall back to sizeBytes as the size hint
-                // and then clamp via reader.length() to read only the real
-                // map bytes (issue #484 round-2 fix).
                 .vectorCount(VECTORS_PER_SEGMENT).generation(1L)
                 .createdAtEpochMillis(0L)
                 .build();
     }
 
     @Test
-    public void legacyZnodeWithUnsetMapFileSizeStillProducesByteAccurateMerge() throws Exception {
+    public void legacyZnodeRefusedOnMemoryDsm() throws Exception {
         SegmentMetadata a = writeLegacyInput("legacy-mfs-A", 100L, 0xA);
         SegmentMetadata b = writeLegacyInput("legacy-mfs-B", 200L, 0xB);
 
-        // Sanity: the metadata indeed carries mapFileSize == 0 (the field
-        // defaults to UNKNOWN_FILE_SIZE when not set).
+        // Sanity: both inputs carry mapFileSize == 0.
         assertEquals(SegmentMetadata.UNKNOWN_FILE_SIZE, a.getMapFileSize());
         assertEquals(SegmentMetadata.UNKNOWN_FILE_SIZE, b.getMapFileSize());
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
                 dsm, tmpDir, DIM, /* M */ 8, /* beam */ 32, 1.2f, 1.4f,
                 VectorSimilarityFunction.EUCLIDEAN);
-
-        SegmentMetadata merged = merger.merge(List.of(a, b), /* newOwnerInstance */ 0);
-        assertNotNull("merger must succeed on legacy mapFileSize == 0 inputs", merged);
-        assertEquals("every input vector must survive (no tail truncation)",
-                2L * VECTORS_PER_SEGMENT, merged.getVectorCount());
-        assertTrue("merged segmentId must be a real value, not the sentinel",
-                merged.getSegmentId() != SegmentMetadata.NO_SEGMENT_ID);
-        // The merger's OWN output must populate the new field so subsequent
-        // merges of this output don't fall back to the legacy path.
-        assertTrue("merger output must populate mapFileSize",
-                merged.getMapFileSize() > 0L);
+        try {
+            merger.merge(List.of(a, b), /* newOwnerInstance */ 0);
+            fail("expected LegacyMetadataException for legacy znode without mapFileSize");
+        } catch (RemoteSegmentMerger.LegacyMetadataException ok) {
+            // The first input that the merger encounters trips the check; we
+            // assert at least one of the segment uuids appears in the message.
+            assertTrue("error message should reference the legacy segment: "
+                            + ok.getMessage(),
+                    ok.getMessage().contains("legacy-mfs-")
+                            && ok.getMessage().contains("predating issue #484"));
+        }
     }
 
     @Test
-    public void modernZnodeWithExplicitMapFileSizeBypassesFallback() throws Exception {
-        // Mirror of the legacy test, but the inputs explicitly set
-        // mapFileSize via the builder. This is the production path post-#484
-        // and is the most heavily exercised code path; included here as an
-        // adjacent control case.
+    public void legacyZnodeRefusedAgainstProductionLikeReader() throws Exception {
+        // Regression test for round-3 review B.1.1: production
+        // RandomAccessReader implementations (RemoteRandomAccessReader,
+        // SegmentedMappedReader) return the constructor-supplied size from
+        // length(), so any clamp via length() is a no-op. We mirror that
+        // behaviour here with a HintReturningDsm decorator and verify the
+        // merger STILL refuses the legacy input, proving the round-3 fix
+        // doesn't depend on the in-memory DSM's byte-accurate length().
+        HintReturningDsm productionLikeDsm = new HintReturningDsm();
+        SegmentMetadata legacy = writeLegacyInput("legacy-prod-A", 100L, 0xA);
+        // Re-publish into the production-like DSM (the helper used the
+        // memory DSM by default).
+        Path scratch = Files.createTempFile(tmpDir, "scratch-", ".tmp");
+        Files.write(scratch, new byte[]{0, 1, 2, 3, 4, 5, 6, 7});
+        productionLikeDsm.writeMultipartIndexFile(TS_UUID, IDX_UUID + "_seg100", "map",
+                scratch, null);
+        Files.deleteIfExists(scratch);
+
+        SegmentMetadata other = writeLegacyInput("legacy-prod-B", 200L, 0xB);
+        Path scratch2 = Files.createTempFile(tmpDir, "scratch2-", ".tmp");
+        Files.write(scratch2, new byte[]{0, 1, 2, 3, 4, 5, 6, 7});
+        productionLikeDsm.writeMultipartIndexFile(TS_UUID, IDX_UUID + "_seg200", "map",
+                scratch2, null);
+        Files.deleteIfExists(scratch2);
+
+        RemoteSegmentMerger merger = new RemoteSegmentMerger(
+                productionLikeDsm, tmpDir, DIM, 8, 32, 1.2f, 1.4f,
+                VectorSimilarityFunction.EUCLIDEAN);
+        try {
+            merger.merge(List.of(legacy, other), 0);
+            fail("expected LegacyMetadataException against production-like reader");
+        } catch (RemoteSegmentMerger.LegacyMetadataException ok) {
+            // pass
+        }
+    }
+
+    @Test
+    public void modernZnodeWithExplicitMapFileSizeMerges() throws Exception {
+        // Control: with mapFileSize set, the merge proceeds normally.
         Path mapA = Files.createTempFile(tmpDir, "modern-A-", ".tmp");
         try (BufferedOutputStream bos = new BufferedOutputStream(
                 new FileOutputStream(mapA.toFile()));
@@ -184,10 +221,10 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
                 .segmentUuid("modern-A").tablespaceUuid(TS_UUID).tableName("t")
                 .indexUuid(IDX_UUID).indexName("i").state(SegmentState.ACTIVE)
                 .ownerInstanceId(0).segmentId(300L)
-                .graphPath("g").mapPath(Bytes.from_string("map").toString())
+                .graphPath("g").mapPath("m")
                 .baseLsn(new LogSequenceNumber(1L, 100L))
                 .sizeBytes(realSize * 4L)
-                .mapFileSize(realSize) // explicit
+                .mapFileSize(realSize)
                 .vectorCount(10L).generation(1L)
                 .createdAtEpochMillis(0L)
                 .build();
@@ -228,5 +265,103 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
         SegmentMetadata merged = merger.merge(List.of(modern1, modern2), 0);
         assertNotNull(merged);
         assertEquals(20L, merged.getVectorCount());
+        // The merger's own output must populate mapFileSize so a future
+        // merge of this output goes straight through the modern path.
+        assertTrue("merger output must populate mapFileSize: " + merged.getMapFileSize(),
+                merged.getMapFileSize() > 0L);
+    }
+
+    /**
+     * DSM whose multipart reader behaves like {@code RemoteRandomAccessReader}:
+     * {@code length()} returns the constructor-supplied {@code fileSize} hint
+     * unchanged, regardless of the actual underlying object size. This is the
+     * production semantics that defeats any naive {@code length()}-based clamp.
+     */
+    private static final class HintReturningDsm extends MemoryDataStorageManager {
+        @Override
+        public ReaderSupplier multipartIndexReaderSupplier(String tableSpace, String uuid,
+                                                            String fileType, long fileSize)
+                throws DataStorageManagerException {
+            ReaderSupplier delegate = super.multipartIndexReaderSupplier(tableSpace, uuid, fileType, fileSize);
+            return () -> {
+                RandomAccessReader inner = delegate.get();
+                return new HintReturningReader(inner, fileSize);
+            };
+        }
+    }
+
+    /**
+     * Wraps a real {@link RandomAccessReader} but pretends {@link #length()}
+     * returns the size hint from construction. Mirrors
+     * {@code RemoteRandomAccessReader.length()} semantics.
+     */
+    private static final class HintReturningReader implements RandomAccessReader {
+        private final RandomAccessReader delegate;
+        private final long lenHint;
+
+        HintReturningReader(RandomAccessReader delegate, long lenHint) {
+            this.delegate = delegate;
+            this.lenHint = lenHint;
+        }
+
+        @Override
+        public long length() {
+            return lenHint;
+        }
+
+        @Override
+        public void seek(long offset) throws IOException {
+            delegate.seek(offset);
+        }
+
+        @Override
+        public long getPosition() throws IOException {
+            return delegate.getPosition();
+        }
+
+        @Override
+        public int readInt() throws IOException {
+            return delegate.readInt();
+        }
+
+        @Override
+        public float readFloat() throws IOException {
+            return delegate.readFloat();
+        }
+
+        @Override
+        public long readLong() throws IOException {
+            return delegate.readLong();
+        }
+
+        @Override
+        public void readFully(byte[] dest) throws IOException {
+            delegate.readFully(dest);
+        }
+
+        @Override
+        public void readFully(java.nio.ByteBuffer buffer) throws IOException {
+            delegate.readFully(buffer);
+        }
+
+        @Override
+        public void readFully(long[] vector) throws IOException {
+            delegate.readFully(vector);
+        }
+
+        @Override
+        public void read(int[] ints, int offset, int count) throws IOException {
+            delegate.read(ints, offset, count);
+        }
+
+        @Override
+        public void read(float[] floats, int offset, int count) throws IOException {
+            delegate.read(floats, offset, count);
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
+        }
     }
 }

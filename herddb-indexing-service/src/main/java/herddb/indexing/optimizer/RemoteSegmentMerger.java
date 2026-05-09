@@ -155,17 +155,25 @@ public final class RemoteSegmentMerger implements SegmentMerger {
         for (SegmentMetadata m : inputs) {
             int[] tombstoned = loadTombstonedOrdinalsBestEffort(m);
             // The optimizer needs the EXACT map-file size to drive the
-            // multipart reader (RemoteRandomAccessReader truncates reads at
-            // the supplied size, so an under-estimate causes EOF and an
-            // over-estimate would over-read across object boundaries). Use
-            // the dedicated mapFileSize field when available; fall back to
-            // sizeBytes (combined graph + map) only for legacy znodes that
-            // pre-date the field — in practice the merger will then
-            // over-estimate by the graph size, which the underlying reader
-            // tolerates because it stops at the actual object end.
-            long mapFileSizeHint = m.getMapFileSize() > 0L
-                    ? m.getMapFileSize()
-                    : Math.max(1L, m.getSizeBytes());
+            // multipart reader. Production readers (RemoteRandomAccessReader,
+            // SegmentedMappedReader) treat the size passed at construction
+            // as authoritative — they don't probe the underlying object —
+            // and the direct-multipart-download path computes block count
+            // from that size and throws "Block N not found" past the actual
+            // file end (review item B.1.1 from the third pr-reviewer pass).
+            // We therefore refuse to merge any input whose znode predates
+            // the {@code mapFileSize} field (issue #484): a clean failure
+            // mode is much better than a half-read map file producing a
+            // corrupt graph. The next IS checkpoint will rewrite the znode
+            // with {@code mapFileSize} set and unstick the segment.
+            if (m.getMapFileSize() <= 0L) {
+                throw new LegacyMetadataException(m.getSegmentUuid(),
+                        m.getSizeBytes(),
+                        "input segment " + m.getSegmentUuid() + " has no mapFileSize"
+                                + " (legacy znode predating issue #484);"
+                                + " skipping merge until IS recheckpoints the segment");
+            }
+            long mapFileSizeHint = m.getMapFileSize();
             graphInputs.add(new RemoteSegmentGraphMerger.RemoteSegmentInput(
                     m.getTablespaceUuid(), m.getIndexUuid(), m.getSegmentUuid(),
                     m.getSegmentId(), mapFileSizeHint, m.getGeneration(),
@@ -337,6 +345,25 @@ public final class RemoteSegmentMerger implements SegmentMerger {
             super("failed to load tombstone overlay generation " + overlayGeneration
                     + " for segment " + segmentUuid + " — refusing to merge to avoid"
                     + " resurrecting deleted vectors", cause);
+        }
+    }
+
+    /**
+     * Thrown when the merger encounters an input segment whose znode predates
+     * issue #484 (i.e. {@code mapFileSize <= 0}). Production storage readers
+     * treat the size passed at construction as authoritative and would happily
+     * over-read past the actual map-file end, producing torn graphs and
+     * "Block N not found" errors deeper in the multipart pipeline. Refusing
+     * the merge lets the engine bump {@code mergeFailuresTotal} and proceed
+     * to the next index; the next IS checkpoint will rewrite the legacy
+     * znode with {@code mapFileSize} set, unsticking the segment.
+     */
+    public static final class LegacyMetadataException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        public LegacyMetadataException(String segmentUuid, long sizeBytes, String message) {
+            super(message + " (segmentUuid=" + segmentUuid
+                    + ", combinedSizeBytes=" + sizeBytes + ")");
         }
     }
 }
