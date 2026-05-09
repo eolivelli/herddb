@@ -1,0 +1,38 @@
+suite: indexing-service ConfigMap
+templates:
+  - templates/indexing-service-configmap.yaml
+tests:
+  # Issue #491: when the external index-optimizer is enabled, the IS configmap
+  # MUST emit indexing.optimizer.enabled=true so each IS pod publishes its
+  # checkpoint segments to the ZK segment registry. Without this, the optimizer
+  # observes zero indexes and no merge ever fires.
+  - it: should emit indexing.optimizer.enabled=true when indexOptimizer.enabled is true
+    set:
+      indexingService.enabled: true
+      indexOptimizer.enabled: true
+      indexOptimizer.tablespaceName: "herd"
+      indexOptimizer.merger.dim: 960
+    asserts:
+      - matchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "indexing\\.optimizer\\.enabled=true"
+
+  - it: should NOT emit indexing.optimizer.enabled when indexOptimizer.enabled is false
+    set:
+      indexingService.enabled: true
+      indexOptimizer.enabled: false
+    asserts:
+      - notMatchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "indexing\\.optimizer\\.enabled"
+
+  - it: should still let extraConfig override indexing.optimizer.enabled when needed
+    set:
+      indexingService.enabled: true
+      indexOptimizer.enabled: false
+      indexingService.extraConfig:
+        indexing.optimizer.enabled: "true"
+    asserts:
+      - matchRegex:
+          path: data["indexingservice.properties"]
+          pattern: "indexing\\.optimizer\\.enabled=true"
