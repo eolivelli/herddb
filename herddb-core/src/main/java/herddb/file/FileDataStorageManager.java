@@ -40,6 +40,7 @@ import herddb.storage.IndexStatus;
 import herddb.storage.TableStatus;
 import herddb.utils.ByteArrayCursor;
 import herddb.utils.ByteBufCursor;
+import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
 import herddb.utils.CleanDirectoryFileVisitor;
 import herddb.utils.DeleteFileVisitor;
@@ -56,6 +57,8 @@ import herddb.utils.SystemInstrumentation;
 import herddb.utils.SystemProperties;
 import herddb.utils.VisibleByteArrayOutputStream;
 import herddb.utils.XXHash64Utils;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.util.Recycler;
 import java.io.BufferedInputStream;
 import java.io.IOError;
@@ -936,20 +939,28 @@ public class FileDataStorageManager extends DataStorageManager {
     }
 
     private long writeIndexPage(DataWriter writer, ManagedFile file, OutputStream stream) throws IOException {
-        try (RecyclableByteArrayOutputStream oo = getWriteBuffer();
-             ExtendedDataOutputStream dataOutput = new ExtendedDataOutputStream(oo)) {
-            dataOutput.writeVLong(1); // version
-            dataOutput.writeVLong(0); // flags for future implementations
-            writer.write(dataOutput);
-            dataOutput.flush();
-            long hash = hashWritesEnabled ? XXHash64Utils.hash(oo.getBuffer(), 0, oo.size()) : NO_HASH_PRESENT;
-            dataOutput.writeLong(hash);
-            dataOutput.flush();
-            stream.write(oo.getBuffer(), 0, oo.size());
+        // Use a pooled heap ByteBuf so we can access buf.array() for hashing and
+        // write the whole range to the OutputStream in a single call. The ByteBuf
+        // auto-expands as the DataWriter appends data, and returns to the pool on
+        // release, giving similar recycling behaviour to RecyclableByteArrayOutputStream.
+        // Pre-size using the writer's estimate (+16 for outer version/flags VLongs and hash).
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.heapBuffer(writer.sizeEstimate() + 16);
+        try {
+            herddb.utils.ByteBufUtils.writeVLong(buf, 1); // outer version
+            herddb.utils.ByteBufUtils.writeVLong(buf, 0); // outer flags for future implementations
+            writer.write(new ByteBufDataOutput(buf));
+            int payloadLen = buf.writerIndex();
+            long hash = hashWritesEnabled
+                    ? XXHash64Utils.hash(buf.array(), buf.arrayOffset(), payloadLen)
+                    : NO_HASH_PRESENT;
+            buf.writeLong(hash);
+            stream.write(buf.array(), buf.arrayOffset(), buf.writerIndex());
             if (file != null) { // O_DIRECT does not need fsync
                 file.sync();
             }
-            return oo.size();
+            return buf.writerIndex();
+        } finally {
+            buf.release();
         }
     }
 

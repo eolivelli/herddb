@@ -42,6 +42,7 @@ import herddb.sql.SQLRecordKeyFunction;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
+import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
 import herddb.utils.HerdDBByteBufAllocators;
 import herddb.utils.IndexKeySlab;
@@ -820,9 +821,19 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
             List<BLinkNodeMetadata<Bytes>> slice = nodes.subList(from, to);
             long pageId = allocatePageId();
             final int chunkIndex = i;
-            dataStorageManager.writeIndexPage(tableSpace, indexName, pageId, out -> {
-                IncrementalBLinkPageCodec.writeSnapshotChunk(out, epoch, chunkIndex, totalChunks, slice);
-            });
+            dataStorageManager.writeIndexPage(tableSpace, indexName, pageId,
+                    new DataStorageManager.DataWriter() {
+                        @Override
+                        public void write(ByteBufDataOutput out) throws IOException {
+                            IncrementalBLinkPageCodec.writeSnapshotChunk(
+                                    out, epoch, chunkIndex, totalChunks, slice);
+                        }
+                        @Override
+                        public int sizeEstimate() {
+                            return IncrementalBLinkPageCodec.snapshotChunkSizeEstimate(
+                                    epoch, chunkIndex, totalChunks, slice);
+                        }
+                    });
             refs.add(new IncrementalBLinkManifest.SnapshotChunkRef(pageId, i, totalChunks));
         }
         return refs;
@@ -834,9 +845,18 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
             throws DataStorageManagerException {
         long[] removedArr = toArray(removedIds);
         long[] deadArr = toArray(deadStoreIds);
-        dataStorageManager.writeIndexPage(tableSpace, indexName, pageId, out -> {
-            IncrementalBLinkPageCodec.writeDelta(out, epoch, upserted, removedArr, deadArr);
-        });
+        dataStorageManager.writeIndexPage(tableSpace, indexName, pageId,
+                new DataStorageManager.DataWriter() {
+                    @Override
+                    public void write(ByteBufDataOutput out) throws IOException {
+                        IncrementalBLinkPageCodec.writeDelta(out, epoch, upserted, removedArr, deadArr);
+                    }
+                    @Override
+                    public int sizeEstimate() {
+                        return IncrementalBLinkPageCodec.deltaSizeEstimate(
+                                epoch, upserted, removedArr, deadArr);
+                    }
+                });
     }
 
     private static long[] toArray(List<Long> list) {
@@ -991,26 +1011,35 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
 
         private long createPage(long pageId, Map<Bytes, Long> data, byte type) throws IOException {
             long pid = (pageId == NEW_PAGE) ? allocatePageId() : pageId;
-            DataStorageManager.DataWriter writer = out -> {
-                out.writeVLong(1);
-                out.writeVLong(0);
-                out.writeByte(type);
-                data.forEach((x, y) -> {
-                    try {
-                        if (x == Bytes.POSITIVE_INFINITY) {
-                            out.writeByte(NODE_PAGE_INF_BLOCK);
-                            out.writeVLong(y);
-                        } else {
-                            out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
-                            out.writeArray(x.to_array());
-                            out.writeVLong(y);
+            DataStorageManager.DataWriter writer = new DataStorageManager.DataWriter() {
+                @Override
+                public void write(ByteBufDataOutput out) throws IOException {
+                    out.writeVLong(1);
+                    out.writeVLong(0);
+                    out.writeByte(type);
+                    data.forEach((x, y) -> {
+                        try {
+                            if (x == Bytes.POSITIVE_INFINITY) {
+                                out.writeByte(NODE_PAGE_INF_BLOCK);
+                                out.writeVLong(y);
+                            } else {
+                                out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
+                                // writeArray(Bytes) calls Bytes.writeTo(ByteBuf):
+                                // zero-copy for off-heap IndexKeySlab keys (issue #497).
+                                out.writeArray(x);
+                                out.writeVLong(y);
+                            }
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(
+                                    "Unexpected IOException during node page write preparation", e);
                         }
-                    } catch (IOException e) {
-                        throw new UncheckedIOException(
-                                "Unexpected IOException during node page write preparation", e);
-                    }
-                });
-                out.writeByte(NODE_PAGE_END_BLOCK);
+                    });
+                    out.writeByte(NODE_PAGE_END_BLOCK);
+                }
+                @Override
+                public int sizeEstimate() {
+                    return IncrementalBLinkPageCodec.nodePageSizeEstimate(data);
+                }
             };
 
             /*

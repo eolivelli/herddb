@@ -44,6 +44,7 @@ import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
 import herddb.utils.ByteArrayCursor;
+import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataOutputStream;
 import herddb.utils.HerdDBByteBufAllocators;
@@ -750,7 +751,11 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
                     edos.writeBoolean(hasInf);
 
                     if (!hasInf) {
-                        edos.writeArray(node.rightsep.to_array());
+                        // writeArray(Bytes) on ExtendedDataOutputStream now uses
+                        // Bytes.writeTo(OutputStream) — avoids an extra heap copy
+                        // for off-heap rightsep keys stored in an IndexKeySlab
+                        // (issue #497).
+                        edos.writeArray(node.rightsep);
                     }
                 }
 
@@ -1044,34 +1049,41 @@ public class BLinkKeyToPageIndex implements KeyToPageIndex {
                 pageId = newPageId.getAndIncrement();
             }
 
-            DataStorageManager.DataWriter writer = out -> {
+            DataStorageManager.DataWriter writer = new DataStorageManager.DataWriter() {
+                @Override
+                public void write(ByteBufDataOutput out) throws IOException {
+                    /* Data version */
+                    out.writeVLong(1);
 
-                /* Data version */
-                out.writeVLong(1);
+                    /* flags for future implementations, actually unused */
+                    out.writeVLong(0);
 
-                /* flags for future implementations, actually unused */
-                out.writeVLong(0);
+                    out.writeByte(type);
 
-                out.writeByte(type);
-
-                data.forEach((x, y) -> {
-                    try {
-                        if (x == Bytes.POSITIVE_INFINITY) {
-                            // Handle special case for +inf key
-                            out.writeByte(NODE_PAGE_INF_BLOCK);
-                            out.writeVLong(y);
-                        } else {
-                            out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
-                            out.writeArray(x.to_array());
-                            out.writeVLong(y);
+                    data.forEach((x, y) -> {
+                        try {
+                            if (x == Bytes.POSITIVE_INFINITY) {
+                                // Handle special case for +inf key
+                                out.writeByte(NODE_PAGE_INF_BLOCK);
+                                out.writeVLong(y);
+                            } else {
+                                out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
+                                // writeArray(Bytes) calls Bytes.writeTo(ByteBuf):
+                                // zero-copy for off-heap IndexKeySlab keys (issue #497).
+                                out.writeArray(x);
+                                out.writeVLong(y);
+                            }
+                        } catch (IOException e) {
+                            throw new UncheckedIOException("Unexpected IOException during node page write preparation", e);
                         }
-                    } catch (IOException e) {
-                        throw new UncheckedIOException("Unexpected IOException during node page write preparation", e);
-                    }
-                });
+                    });
 
-                out.writeByte(NODE_PAGE_END_BLOCK);
-
+                    out.writeByte(NODE_PAGE_END_BLOCK);
+                }
+                @Override
+                public int sizeEstimate() {
+                    return IncrementalBLinkPageCodec.nodePageSizeEstimate(data);
+                }
             };
 
             /*

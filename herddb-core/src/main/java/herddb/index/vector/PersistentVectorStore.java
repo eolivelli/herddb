@@ -24,10 +24,12 @@ import herddb.core.MemoryManager;
 import herddb.index.blink.BLink;
 import herddb.index.blink.BLinkIndexDataStorage;
 import herddb.index.blink.BytesLongSizeEvaluator;
+import herddb.index.blink.IncrementalBLinkPageCodec;
 import herddb.log.LogSequenceNumber;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
+import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
 import herddb.utils.VectorSearchRequestContext;
 import herddb.utils.VisibleByteArrayOutputStream;
@@ -6467,26 +6469,36 @@ public class PersistentVectorStore extends AbstractVectorStore {
             if (pageId == NEW_PAGE) {
                 pageId = newPageId.getAndIncrement();
             }
-            dataStorageManager.writeIndexPage(tableSpaceUUID, storeName, pageId, out -> {
-                out.writeVLong(1);
-                out.writeVLong(0);
-                out.writeByte(type);
-                data.forEach((x, y) -> {
-                    try {
-                        if (x == Bytes.POSITIVE_INFINITY) {
-                            out.writeByte(NODE_PAGE_INF_BLOCK);
-                            out.writeVLong(y);
-                        } else {
-                            out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
-                            out.writeArray(x.to_array());
-                            out.writeVLong(y);
+            dataStorageManager.writeIndexPage(tableSpaceUUID, storeName, pageId,
+                    new DataStorageManager.DataWriter() {
+                        @Override
+                        public void write(ByteBufDataOutput out) throws IOException {
+                            out.writeVLong(1);
+                            out.writeVLong(0);
+                            out.writeByte(type);
+                            data.forEach((x, y) -> {
+                                try {
+                                    if (x == Bytes.POSITIVE_INFINITY) {
+                                        out.writeByte(NODE_PAGE_INF_BLOCK);
+                                        out.writeVLong(y);
+                                    } else {
+                                        out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
+                                        // writeArray(Bytes) calls Bytes.writeTo(ByteBuf):
+                                        // zero-copy for off-heap IndexKeySlab keys (issue #497).
+                                        out.writeArray(x);
+                                        out.writeVLong(y);
+                                    }
+                                } catch (IOException e) {
+                                    throw new java.io.UncheckedIOException(e);
+                                }
+                            });
+                            out.writeByte(NODE_PAGE_END_BLOCK);
                         }
-                    } catch (IOException e) {
-                        throw new java.io.UncheckedIOException(e);
-                    }
-                });
-                out.writeByte(NODE_PAGE_END_BLOCK);
-            });
+                        @Override
+                        public int sizeEstimate() {
+                            return IncrementalBLinkPageCodec.nodePageSizeEstimate(data);
+                        }
+                    });
             return pageId;
         }
     }

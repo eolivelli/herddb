@@ -22,8 +22,9 @@ package herddb.index.blink;
 
 import herddb.index.blink.BLinkMetadata.BLinkNodeMetadata;
 import herddb.utils.ByteBufCursor;
+import herddb.utils.ByteBufDataOutput;
+import herddb.utils.ByteBufUtils;
 import herddb.utils.Bytes;
-import herddb.utils.ExtendedDataOutputStream;
 import herddb.utils.HerdDBByteBufAllocators;
 import herddb.utils.IndexKeySlab;
 import java.io.IOException;
@@ -50,7 +51,7 @@ import java.util.Map;
  * three-field header with distinct {@code kind} values so the two formats can
  * coexist in the same index directory without ambiguity.</p>
  */
-final class IncrementalBLinkPageCodec {
+public final class IncrementalBLinkPageCodec {
 
     static final long PAGE_VERSION = 1L;
 
@@ -80,7 +81,7 @@ final class IncrementalBLinkPageCodec {
     // ---------------- snapshot chunk ----------------
 
     static void writeSnapshotChunk(
-            ExtendedDataOutputStream out,
+            ByteBufDataOutput out,
             long epoch, int chunkIndex, int totalChunks,
             List<BLinkNodeMetadata<Bytes>> nodes
     ) throws IOException {
@@ -132,7 +133,7 @@ final class IncrementalBLinkPageCodec {
     // ---------------- delta ----------------
 
     static void writeDelta(
-            ExtendedDataOutputStream out,
+            ByteBufDataOutput out,
             long epoch,
             List<BLinkNodeMetadata<Bytes>> upserted,
             long[] removedNodeIds,
@@ -158,6 +159,122 @@ final class IncrementalBLinkPageCodec {
         for (long id : deadStoreIds) {
             out.writeVLong(id);
         }
+    }
+
+    // -------- size estimators (used by callers to pre-size the ByteBuf) --------
+
+    /**
+     * Estimates the serialised size of a BLink node page (INNER or LEAF) for
+     * the given {@code data} map.
+     *
+     * <p>All three BLink page writers — {@code BLinkKeyToPageIndex},
+     * {@code IncrementalBLinkKeyToPageIndex}, and {@code PersistentVectorStore}
+     * — share the same wire format and delegate to this method for their
+     * {@code DataWriter.sizeEstimate()} overrides.
+     *
+     * <p>The estimate is exact for key lengths and page-ID VLong widths; it
+     * uses a conservative 9-byte maximum for the {@code POSITIVE_INFINITY}
+     * entry's VLong (the actual page-id VLong could be 1–9 bytes, but +inf
+     * entries are rare).
+     */
+    public static int nodePageSizeEstimate(Map<Bytes, Long> data) {
+        // vlong(1) + vlong(0) + byte(type) = 1 + 1 + 1 = 3
+        int estimate = 3;
+        for (Map.Entry<Bytes, Long> e : data.entrySet()) {
+            Bytes k = e.getKey();
+            if (k == Bytes.POSITIVE_INFINITY) {
+                // byte(INF_BLOCK) + vlong(pageId) — worst case 9 bytes
+                estimate += 1 + 9;
+            } else {
+                int keyLen = k.getLength();
+                // byte(KEY_VALUE_BLOCK) + vint(keyLen) + keyLen + vlong(pageId)
+                estimate += 1 + ByteBufUtils.varIntLen(keyLen) + keyLen
+                        + ByteBufUtils.varLongLen(e.getValue());
+            }
+        }
+        // byte(END_BLOCK)
+        estimate += 1;
+        return estimate;
+    }
+
+    /**
+     * Estimates the serialised byte size of a snapshot-chunk page for the
+     * given {@code nodes} list. Used by the caller to pre-size the backing
+     * {@code ByteBuf} via {@code DataWriter.sizeEstimate()}.
+     */
+    static int snapshotChunkSizeEstimate(
+            long epoch, int chunkIndex, int totalChunks,
+            List<BLinkNodeMetadata<Bytes>> nodes) {
+        // PAGE_VERSION(vlong) + PAGE_FLAGS(vlong) + PAGE_KIND(byte)
+        //   + epoch(vlong) + chunkIndex(vint) + totalChunks(vint) + count(vint)
+        int estimate = 1 + 1 + 1
+                + ByteBufUtils.varLongLen(epoch)
+                + ByteBufUtils.varIntLen(chunkIndex)
+                + ByteBufUtils.varIntLen(totalChunks)
+                + ByteBufUtils.varIntLen(nodes.size());
+        for (BLinkNodeMetadata<Bytes> node : nodes) {
+            estimate += nodeMetadataSizeEstimate(node);
+        }
+        return estimate;
+    }
+
+    /**
+     * Estimates the serialised byte size of a delta page.
+     */
+    static int deltaSizeEstimate(
+            long epoch,
+            List<BLinkNodeMetadata<Bytes>> upserted,
+            long[] removedNodeIds,
+            long[] deadStoreIds) {
+        // PAGE_VERSION + PAGE_FLAGS + PAGE_KIND + epoch + 3 vint counts
+        int estimate = 1 + 1 + 1
+                + ByteBufUtils.varLongLen(epoch)
+                + ByteBufUtils.varIntLen(upserted.size())
+                + ByteBufUtils.varIntLen(removedNodeIds.length)
+                + ByteBufUtils.varIntLen(deadStoreIds.length);
+        for (BLinkNodeMetadata<Bytes> node : upserted) {
+            estimate += nodeMetadataSizeEstimate(node);
+        }
+        for (long id : removedNodeIds) {
+            estimate += ByteBufUtils.varLongLen(id);
+        }
+        for (long id : deadStoreIds) {
+            estimate += ByteBufUtils.varLongLen(id);
+        }
+        return estimate;
+    }
+
+    /**
+     * Estimates the serialised size of one {@link BLinkNodeMetadata} record.
+     * Uses exact lengths for known fields ({@code id}, {@code storeId},
+     * {@code keys}, {@code bytes}, rightsep key bytes) and a conservative
+     * 9-byte worst-case for the zig-zag-encoded {@code outlink} and
+     * {@code rightlink} fields.
+     *
+     * <p>Handles all values that {@link #writeNodeMetadata} accepts:
+     * {@code null} rightsep encodes as a vint(-1) null marker (5 bytes);
+     * {@link Bytes#POSITIVE_INFINITY} encodes as a single-byte sentinel;
+     * any other {@code Bytes} encodes as vint(len) + len bytes.
+     */
+    static int nodeMetadataSizeEstimate(BLinkNodeMetadata<Bytes> node) {
+        // boolean(1) + vlong(id) + vlong(storeId) + vint(keys) + vlong(bytes)
+        //   + zlong(outlink)[worst 9] + zlong(rightlink)[worst 9] + byte(rightsep_type)
+        int estimate = 1
+                + ByteBufUtils.varLongLen(node.id)
+                + ByteBufUtils.varLongLen(node.storeId)
+                + ByteBufUtils.varIntLen(node.keys)
+                + ByteBufUtils.varLongLen(node.bytes)
+                + 9  // zlong(outlink): zig-zag may produce a large unsigned value
+                + 9  // zlong(rightlink): same
+                + 1; // rightsep type byte
+        if (node.rightsep == null) {
+            // writeNodeMetadata emits writeArray(null) → writeNullArray() → vint(-1) = 5 bytes
+            estimate += 5;
+        } else if (node.rightsep != Bytes.POSITIVE_INFINITY) {
+            int keyLen = node.rightsep.getLength();
+            estimate += ByteBufUtils.varIntLen(keyLen) + keyLen;
+        }
+        return estimate;
     }
 
     static DeltaContents readDelta(ByteBufCursor in) throws IOException {
@@ -205,7 +322,7 @@ final class IncrementalBLinkPageCodec {
 
     // ---------------- shared node-metadata codec ----------------
 
-    private static void writeNodeMetadata(ExtendedDataOutputStream out, BLinkNodeMetadata<Bytes> node)
+    private static void writeNodeMetadata(ByteBufDataOutput out, BLinkNodeMetadata<Bytes> node)
             throws IOException {
         out.writeBoolean(node.leaf);
         out.writeVLong(node.id);
@@ -218,7 +335,9 @@ final class IncrementalBLinkPageCodec {
             out.writeByte(RIGHTSEP_INF);
         } else {
             out.writeByte(RIGHTSEP_BYTES);
-            out.writeArray(node.rightsep.to_array());
+            // writeArray(Bytes) uses Bytes.writeTo(ByteBuf) — zero-copy for
+            // off-heap-backed rightsep keys (issue #497).
+            out.writeArray(node.rightsep);
         }
     }
 
@@ -281,9 +400,9 @@ final class IncrementalBLinkPageCodec {
                 byte[] rs = in.readArray();
                 if (rs == null) {
                     // The writer never emits a null rightsep array (it always
-                    // calls writeArray on a non-null Bytes.to_array()), so a
-                    // null here means the on-disk page is corrupted. Fail
-                    // fast with an actionable message.
+                    // calls writeArray on a non-null Bytes), so a null here
+                    // means the on-disk page is corrupted. Fail fast with an
+                    // actionable message.
                     throw new IOException("corrupted node metadata: null rightsep at index " + i);
                 }
                 rightsepBytes[i] = rs;

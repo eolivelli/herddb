@@ -224,6 +224,59 @@ public class ByteBufUtils {
         return zigZagDecode(readVInt(buffer));
     }
 
+    /**
+     * Returns the number of bytes that {@link #writeVInt} would emit for {@code i}.
+     * Encodes in 7 bits per byte; negative values always occupy 5 bytes.
+     */
+    public static int varIntLen(int i) {
+        if ((i & ~0x7F) == 0) {
+            return 1;
+        }
+        if ((i & ~0x3FFF) == 0) {
+            return 2;
+        }
+        if ((i & ~0x1FFFFF) == 0) {
+            return 3;
+        }
+        if ((i & ~0xFFFFFFF) == 0) {
+            return 4;
+        }
+        return 5; // covers values >= 268435456 and all negative ints
+    }
+
+    /**
+     * Returns the number of bytes that {@link #writeVLong} would emit for {@code i}.
+     * Encodes in 7 bits per byte; {@link #writeVLong} rejects negative values,
+     * so this method is only meaningful for {@code i >= 0}.
+     */
+    public static int varLongLen(long i) {
+        if (i < 0x80L) {
+            return 1;
+        }
+        if (i < 0x4000L) {
+            return 2;
+        }
+        if (i < 0x200000L) {
+            return 3;
+        }
+        if (i < 0x10000000L) {
+            return 4;
+        }
+        if (i < 0x800000000L) {
+            return 5;
+        }
+        if (i < 0x40000000000L) {
+            return 6;
+        }
+        if (i < 0x2000000000000L) {
+            return 7;
+        }
+        if (i < 0x100000000000000L) {
+            return 8;
+        }
+        return 9; // up to Long.MAX_VALUE = 0x7FFFFFFFFFFFFFFF
+    }
+
     public static void writeVLong(ByteBuf buffer, long i) {
         if (i < 0) {
             throw new IllegalArgumentException("cannot write negative vLong (got: " + i + ")");

@@ -106,8 +106,16 @@ public final class ExtendedDataOutputStream extends DataOutputStream {
         if (data == null) {
             writeNullArray();
         } else {
-            writeVInt(data.getLength());
-            write(data.getBuffer(), data.getOffset(), data.getLength());
+            int len = data.getLength();
+            writeVInt(len);
+            // Use Bytes.writeTo(OutputStream) so that off-heap-backed instances
+            // copy via ByteBuf.getBytes(int, OutputStream, int) without first
+            // materialising a heap byte[] (issue #497). The 'out' field is the
+            // protected OutputStream from FilterOutputStream; we update 'written'
+            // manually to keep DataOutputStream.size() accurate.
+            data.writeTo(out);
+            int temp = written + len;
+            written = temp < 0 ? Integer.MAX_VALUE : temp;
         }
     }
 

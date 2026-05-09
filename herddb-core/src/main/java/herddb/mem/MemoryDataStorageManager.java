@@ -37,11 +37,14 @@ import herddb.storage.FullTableScanConsumer;
 import herddb.storage.IndexStatus;
 import herddb.storage.TableStatus;
 import herddb.utils.ByteBufCursor;
+import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
 import herddb.utils.ExtendedDataInputStream;
 import herddb.utils.ExtendedDataOutputStream;
 import herddb.utils.SimpleByteArrayInputStream;
 import herddb.utils.VisibleByteArrayOutputStream;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -289,20 +292,17 @@ public class MemoryDataStorageManager extends DataStorageManager {
             long pageId, DataWriter writer
     ) throws DataStorageManagerException {
 
-        Bytes page_wrapper;
-        try (ByteArrayOutputStream out = new ByteArrayOutputStream(1024);
-             ExtendedDataOutputStream eout = new ExtendedDataOutputStream(out)) {
-
-            writer.write(eout);
-
-            eout.flush();
-
-            page_wrapper = Bytes.from_array(out.toByteArray());
+        ByteBuf buf = Unpooled.buffer(writer.sizeEstimate());
+        try {
+            writer.write(new ByteBufDataOutput(buf));
+            byte[] data = new byte[buf.writerIndex()];
+            buf.getBytes(0, data);
+            indexpages.put(tableSpace + "." + indexName + "_" + pageId, Bytes.from_array(data));
         } catch (IOException ex) {
             throw new DataStorageManagerException(ex);
+        } finally {
+            buf.release();
         }
-
-        indexpages.put(tableSpace + "." + indexName + "_" + pageId, page_wrapper);
     }
 
     @Override

@@ -36,9 +36,12 @@ import herddb.sql.SQLRecordKeyFunction;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
+import herddb.utils.ByteBufDataOutput;
+import herddb.utils.ByteBufUtils;
 import herddb.utils.Bytes;
 import herddb.utils.DataAccessor;
 import herddb.utils.Holder;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -240,25 +243,42 @@ public class MemoryHashIndexManager extends AbstractIndexManager {
         long pageId = newPageId.getAndIncrement();
         Holder<Long> count = new Holder<>();
 
-        dataStorageManager.writeIndexPage(tableSpaceUUID, index.uuid, pageId, (out) -> {
-
-            long entries = 0;
-            out.writeVLong(1); // version
-            out.writeVLong(0); // flags for future implementations
-            out.writeVInt(data.size());
-            for (Map.Entry<Bytes, List<Bytes>> entry : data.entrySet()) {
-                out.writeArray(entry.getKey());
-                List<Bytes> entrydata = entry.getValue();
-                out.writeVInt(entrydata.size());
-                for (Bytes v : entrydata) {
-                    out.writeArray(v);
-                    ++entries;
-                }
-            }
-
-            count.value = entries;
-
-        });
+        dataStorageManager.writeIndexPage(tableSpaceUUID, index.uuid, pageId,
+                new DataStorageManager.DataWriter() {
+                    @Override
+                    public void write(ByteBufDataOutput out) throws IOException {
+                        long entries = 0;
+                        out.writeVLong(1); // version
+                        out.writeVLong(0); // flags for future implementations
+                        out.writeVInt(data.size());
+                        for (Map.Entry<Bytes, List<Bytes>> entry : data.entrySet()) {
+                            out.writeArray(entry.getKey());
+                            List<Bytes> entrydata = entry.getValue();
+                            out.writeVInt(entrydata.size());
+                            for (Bytes v : entrydata) {
+                                out.writeArray(v);
+                                ++entries;
+                            }
+                        }
+                        count.value = entries;
+                    }
+                    @Override
+                    public int sizeEstimate() {
+                        // vlong(1) + vlong(0) + vint(data.size())
+                        int est = 1 + 1 + ByteBufUtils.varIntLen(data.size());
+                        for (Map.Entry<Bytes, List<Bytes>> entry : data.entrySet()) {
+                            int klen = entry.getKey().getLength();
+                            est += ByteBufUtils.varIntLen(klen) + klen;
+                            List<Bytes> vals = entry.getValue();
+                            est += ByteBufUtils.varIntLen(vals.size());
+                            for (Bytes v : vals) {
+                                int vlen = v.getLength();
+                                est += ByteBufUtils.varIntLen(vlen) + vlen;
+                            }
+                        }
+                        return est;
+                    }
+                });
 
         IndexStatus indexStatus = new IndexStatus(index.name, sequenceNumber, newPageId.get(), Collections.singleton(pageId), null);
         result.addAll(dataStorageManager.indexCheckpoint(tableSpaceUUID, index.uuid, indexStatus, pin));
