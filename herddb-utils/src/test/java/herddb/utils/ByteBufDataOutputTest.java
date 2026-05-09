@@ -255,33 +255,4 @@ public class ByteBufDataOutputTest {
                         out -> out.writeUtf8String("Hello, 世界!"));
     }
 
-    // -------------------------------------------------------------------------
-    // toByteBuf
-    // -------------------------------------------------------------------------
-
-    @Test
-    public void testToByteBufHeapBacked() {
-        byte[] raw = {1, 2, 3, 4, 5};
-        Bytes b = Bytes.from_array(raw);
-        ByteBuf view = b.toByteBuf();
-        byte[] read = new byte[view.readableBytes()];
-        view.readBytes(read);
-        assertArrayEquals(raw, read);
-    }
-
-    @Test
-    public void testToByteBufOffHeap() {
-        byte[] raw = {10, 20, 30};
-        IndexKeySlab slab = new IndexKeySlab(raw.length, HerdDBByteBufAllocators.indexPagesAllocator());
-        int off = slab.append(raw);
-        Bytes b = slab.wrap(off, raw.length);
-
-        ByteBuf view = b.toByteBuf();
-        byte[] read = new byte[view.readableBytes()];
-        view.readBytes(read);
-        assertArrayEquals(raw, read);
-
-        // The original Bytes must still be off-heap (toByteBuf must not materialise).
-        assertTrue("toByteBuf must not materialise off-heap Bytes", b.isOffHeap());
-    }
 }

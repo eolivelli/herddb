@@ -23,7 +23,6 @@ package herddb.utils;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
-import io.netty.buffer.Unpooled;
 import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -745,40 +744,6 @@ public final class Bytes implements Comparable<Bytes>, SizeAwareObject {
         if (local != null) {
             local.getBytes(local.readerIndex(), out, length);
             return;
-        }
-        throw new IllegalStateException("Bytes already released");
-    }
-
-    /**
-     * Returns a <em>non-owning</em>, transient {@link ByteBuf} view over the
-     * bytes backing this {@code Bytes} instance without copying any data:
-     * <ul>
-     *   <li>Off-heap: a {@code slice} of the underlying {@code ByteBuf} at the
-     *       current {@code readerIndex} with length {@link #getLength()}. No
-     *       reference-count is bumped — the caller must not use the returned
-     *       buffer after this {@code Bytes} is released or after
-     *       {@code release()} / lazy materialisation runs.</li>
-     *   <li>On-heap: {@link Unpooled#wrappedBuffer(byte[], int, int)} over the
-     *       backing array at the stored offset. The returned buffer is
-     *       heap-backed, not Netty-pooled, and carries no ref-count semantics.</li>
-     * </ul>
-     *
-     * <p>This method is intended for callers that need to pass the bytes to a
-     * {@link ByteBuf}-accepting write method (e.g.
-     * {@code ByteBuf.writeBytes(ByteBuf, int, int)}) and will not retain the
-     * returned view beyond the immediate call site.
-     *
-     * @throws IllegalStateException if this {@code Bytes} has already been
-     *         released without prior lazy materialisation.
-     */
-    public ByteBuf toByteBuf() {
-        ByteBuf local = offHeap;
-        byte[] data = buffer;
-        if (data != null) {
-            return Unpooled.wrappedBuffer(data, offset, length);
-        }
-        if (local != null) {
-            return local.slice(local.readerIndex(), length);
         }
         throw new IllegalStateException("Bytes already released");
     }
