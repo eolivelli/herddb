@@ -155,6 +155,16 @@ public class SegmentRegistryPublisherIntegrationTest {
             assertEquals(-1L, m.getBaseLsnOffset());
             assertTrue("sizeBytes must be > 0", m.getSizeBytes() > 0);
             assertTrue("generation must be >= 1", m.getGeneration() >= 1);
+            // Issue #484 (round-2 review): mapFileSize must be plumbed from
+            // NewSegmentInfo into the znode so the optimizer-side merger
+            // can drive the multipart reader correctly. Without this the
+            // merger falls into a legacy size-hint fallback that's broken
+            // on the production direct-multipart-download path.
+            assertTrue("mapFileSize must be > 0 (issue #484): " + m.getMapFileSize(),
+                    m.getMapFileSize() > 0L);
+            assertTrue("mapFileSize (" + m.getMapFileSize() + ") must be <= sizeBytes ("
+                    + m.getSizeBytes() + ") since sizeBytes aggregates graph + map",
+                    m.getMapFileSize() <= m.getSizeBytes());
         }
 
         long totalRegisteredVectors = 0L;

@@ -542,6 +542,12 @@ public final class SegmentRegistryPublisher implements SegmentPublisher {
                 .mapPath(info.getMapFilePath())
                 .baseLsn(info.getBaseLsn())
                 .sizeBytes(info.getEstimatedSizeBytes())
+                // Issue #484 (round-2 review): the optimizer-side merger
+                // requires the EXACT map-file size to drive the multipart
+                // reader (see RemoteSegmentMerger). Without this line every
+                // merge would fall through to a legacy fallback that is
+                // broken on the production direct-multipart-download path.
+                .mapFileSize(info.getMapFileSize())
                 .vectorCount(info.getVectorCount())
                 .generation(info.getGeneration())
                 .createdAtEpochMillis(now)

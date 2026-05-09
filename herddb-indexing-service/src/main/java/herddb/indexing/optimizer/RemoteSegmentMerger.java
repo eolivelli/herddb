@@ -210,6 +210,10 @@ public final class RemoteSegmentMerger implements SegmentMerger {
                 .tombstoneLsn(SegmentMetadata.NO_LSN_LEDGER_ID, SegmentMetadata.NO_LSN_OFFSET)
                 .overlayGeneration(0L)
                 .sizeBytes(output.totalSizeBytes())
+                // Populate the new mapFileSize field (issue #484 round 2)
+                // so any future merge of this output goes straight through
+                // the modern multipart-reader code path.
+                .mapFileSize(output.mapFileSize)
                 .vectorCount(output.vectorCount)
                 .generation(maxGeneration + 1L)
                 .createdAtEpochMillis(System.currentTimeMillis());

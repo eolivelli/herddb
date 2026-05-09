@@ -129,12 +129,20 @@ public final class IndexOptimizerMain {
     /** Number of distinct ZK events observed by the persistent-recursive watcher. */
     private final AtomicLong watcherEvents = new AtomicLong();
     /**
-     * Set to {@code true} when the ZooKeeper session expires. Once set, the
-     * persistent-recursive watch is dead, the leader-lock ephemeral znode is
-     * gone, and any registry read against {@link #zooKeeper} will fail —
-     * which means the pod is silently broken. The HTTP {@code /health}
-     * handler consults this flag and returns 503 so Helm's liveness probe
-     * restarts the pod (review item B.3 from the first pr-reviewer pass).
+     * Set to {@code true} when the ZooKeeper session expires (or auth
+     * fails). Once set, the persistent-recursive watch is dead, the
+     * leader-lock ephemeral znode is gone, and any registry read against
+     * {@link #zooKeeper} will fail — which means the pod is silently
+     * broken. The HTTP {@code /health} handler consults this flag and
+     * returns 503 so Helm's liveness probe restarts the pod (review item
+     * B.3 from the first pr-reviewer pass).
+     *
+     * <p>The flag is intentionally <strong>one-way</strong>: once tripped,
+     * the only recovery is process restart, which Helm performs in
+     * response to the 503 health check. We do not try to re-establish the
+     * ZK session in-process because the leader-lock would have to be
+     * re-acquired and the persistent-recursive watch re-armed under tight
+     * race conditions — far simpler and safer to let Helm replace us.
      */
     private final AtomicBoolean sessionExpired = new AtomicBoolean(false);
     /**
@@ -253,19 +261,22 @@ public final class IndexOptimizerMain {
                     zkConnected.countDown();
                     break;
                 case Expired:
+                case AuthFailed:
                     // Session expiry kills the persistent-recursive watch and the
-                    // leader-lock ephemeral znode. The pod is silently broken from
-                    // here on; flag /health to 503 so Helm restarts us (review item
-                    // B.3 from the first pr-reviewer pass).
+                    // leader-lock ephemeral znode; AuthFailed is similarly
+                    // unrecoverable (credentials are wrong / revoked). Either way
+                    // the pod is silently broken from here on; flag /health to
+                    // 503 so Helm restarts us (review item B.3 from the first
+                    // pr-reviewer pass; AuthFailed coverage from round 2).
                     if (sessionExpired.compareAndSet(false, true)) {
                         LOGGER.log(Level.SEVERE,
-                                "ZooKeeper session expired — /health will return 503"
-                                        + " so the pod is restarted.");
+                                "ZooKeeper {0} — /health will return 503 so the pod is restarted.",
+                                event.getState());
                     }
                     break;
                 default:
-                    // Disconnected / AuthFailed / etc. — log at FINE; the ZK client
-                    // recovers from transient disconnects on its own.
+                    // Disconnected / etc. — log at FINE; the ZK client recovers
+                    // from transient disconnects on its own.
                     break;
             }
         });

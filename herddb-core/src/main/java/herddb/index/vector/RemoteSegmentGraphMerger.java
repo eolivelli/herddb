@@ -430,26 +430,31 @@ public final class RemoteSegmentGraphMerger {
                      FileOutputStream fos = new FileOutputStream(tempFile.toFile());
                      BufferedOutputStream bos = new BufferedOutputStream(fos, DOWNLOAD_CHUNK_SIZE)) {
                     reader.seek(0L);
+                    // Determine the ACTUAL number of bytes to read. The supplied
+                    // {@code in.mapFileSize} may overestimate the real file
+                    // size for legacy znodes whose
+                    // {@link SegmentMetadata#mapFileSize} field is unset (the
+                    // merger then falls back to the combined {@code sizeBytes}
+                    // hint). We use {@link RandomAccessReader#length()} when
+                    // available to get the byte-accurate size; if it throws
+                    // (some implementations don't support it), we trust the
+                    // hint and let any tail-EOF surface as an
+                    // {@link IOException} the caller handles.
+                    long actualBytes;
+                    try {
+                        long readerLen = reader.length();
+                        actualBytes = Math.min(readerLen, in.mapFileSize);
+                    } catch (UnsupportedOperationException unsupported) {
+                        actualBytes = in.mapFileSize;
+                    }
                     byte[] buf = new byte[DOWNLOAD_CHUNK_SIZE];
-                    long remaining = in.mapFileSize;
+                    long remaining = actualBytes;
                     while (remaining > 0L) {
                         int toRead = (int) Math.min(buf.length, remaining);
                         byte[] chunk = (toRead == buf.length) ? buf : new byte[toRead];
-                        try {
-                            reader.readFully(chunk);
-                            bos.write(chunk, 0, toRead);
-                            remaining -= toRead;
-                        } catch (java.io.EOFException eof) {
-                            // The supplied {@code in.mapFileSize} may overestimate the
-                            // actual file size for legacy znodes whose
-                            // {@link SegmentMetadata#mapFileSize} field is unset (see
-                            // {@code RemoteSegmentMerger}'s mapFileSizeHint fallback).
-                            // Treat EOF on a too-large hint as "end of file" rather than
-                            // an error — the parser layer (accumulateAuthority) will fail
-                            // fast on a truncated entryCount/pkLen if the read was actually
-                            // short.
-                            break;
-                        }
+                        reader.readFully(chunk);
+                        bos.write(chunk, 0, toRead);
+                        remaining -= toRead;
                     }
                 }
             }
