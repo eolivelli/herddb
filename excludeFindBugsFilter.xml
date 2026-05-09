@@ -71,4 +71,19 @@
         <Class name="herddb.vectortesting.VectorBench"/>
         <Bug pattern="SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE"/>
     </Match>
+    <!--
+      IndexOptimizerMain (issue #484): the scheduler / eventDebounceMs / tablespaceUuid
+      fields are written exactly once inside the synchronized start() and then read
+      from background threads (the ZK persistent-recursive watcher thread, the
+      single-threaded scheduler) without holding the IndexOptimizerMain monitor.
+      The pattern is safe lazy publication via volatile: start() registers the
+      ZK watch as the very last step, so the reader threads cannot observe the
+      fields before start() has finished initialising them. SpotBugs' percentage
+      heuristic flags the pattern anyway because shutdown() also writes these
+      fields under the monitor.
+    -->
+    <Match>
+        <Class name="herddb.indexing.optimizer.IndexOptimizerMain"/>
+        <Bug pattern="IS2_INCONSISTENT_SYNC"/>
+    </Match>
 </FindBugsFilter>

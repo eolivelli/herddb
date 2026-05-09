@@ -216,6 +216,12 @@ public class IndexOptimizerKubernetesIT {
         values.put("indexOptimizer.tablespaceName", "herd");
         // 10 seconds so we see ticks quickly during the test
         values.put("indexOptimizer.intervalMs", "10000");
+        // Issue #484: configure the merger explicitly so the optimizer
+        // constructs a real RemoteSegmentMerger (not the NoopMerger
+        // fallback) and the production wiring is exercised end-to-end. The
+        // dim is arbitrary because this IT doesn't ingest data — the merger
+        // never actually runs against a non-empty registry.
+        values.put("indexOptimizer.merger.dim", "64");
         values.put("indexOptimizer.javaOpts", INFRA_JAVA_OPTS);
         values.put("indexOptimizer.resources.requests.memory", "384Mi");
         values.put("indexOptimizer.resources.requests.cpu", "0.5");

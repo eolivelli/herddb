@@ -102,6 +102,96 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_HTTP_HOST = "indexoptimizer.http.host";
     public static final String PROPERTY_HTTP_HOST_DEFAULT = "0.0.0.0";
 
+    // -------------------------------------------------------------------------
+    // Aggressive merge policy + event-driven scheduling (issue #484)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Per-graph "graduated" cap used by the {@link MergePolicy.AggressivePolicy}.
+     * Segments at or above this size are excluded from the merge candidate set
+     * — they are considered "done". Default 8 GiB.
+     */
+    public static final String PROPERTY_TARGET_MAX_BYTES = "indexoptimizer.merge.target.bytes";
+    public static final long PROPERTY_TARGET_MAX_BYTES_DEFAULT = 8L * 1024L * 1024L * 1024L;
+
+    /**
+     * Local scratch directory used by the merger to stage downloaded map
+     * files and the merged graph + map outputs before upload. Helm injects
+     * a PVC mount at {@code /opt/herddb/optimizer-tmp} via the
+     * {@code -Dindexoptimizer.tmp.dir=...} system property.
+     */
+    public static final String PROPERTY_TMP_DIR = "indexoptimizer.tmp.dir";
+
+    /**
+     * Debounce window for the ZK persistent-recursive watch that drives
+     * event-driven scheduling. Bursts of children-changed events are
+     * coalesced into a single {@code runOnce()} after this many millis of
+     * quiet, so a hundred new segments at ingest peak still produce a
+     * single tick. 0 disables debouncing (every event triggers a tick).
+     */
+    public static final String PROPERTY_EVENT_DEBOUNCE_MS = "indexoptimizer.event.debounce.ms";
+    public static final long PROPERTY_EVENT_DEBOUNCE_MS_DEFAULT = 500L;
+
+    // jvector params used by the merger when rebuilding the merged graph.
+    // Defaults aligned to {@code PersistentVectorStore} so the merged segment
+    // has the same recall characteristics as in-IS-built segments.
+
+    /** jvector graph degree (edges per node). */
+    public static final String PROPERTY_MERGE_M = "indexoptimizer.merge.M";
+    public static final int PROPERTY_MERGE_M_DEFAULT = 16;
+
+    /** jvector beam-width during graph build. */
+    public static final String PROPERTY_MERGE_BEAM_WIDTH = "indexoptimizer.merge.beamWidth";
+    public static final int PROPERTY_MERGE_BEAM_WIDTH_DEFAULT = 100;
+
+    /** jvector neighbor-overflow factor during graph build. */
+    public static final String PROPERTY_MERGE_NEIGHBOR_OVERFLOW = "indexoptimizer.merge.neighborOverflow";
+    public static final float PROPERTY_MERGE_NEIGHBOR_OVERFLOW_DEFAULT = 1.2f;
+
+    /** jvector alpha factor during graph build. */
+    public static final String PROPERTY_MERGE_ALPHA = "indexoptimizer.merge.alpha";
+    public static final float PROPERTY_MERGE_ALPHA_DEFAULT = 1.4f;
+
+    /**
+     * Vector similarity used by the merger. Must match the value used by the
+     * IS that produced the inputs, otherwise PQ training and graph
+     * construction will be incoherent. Accepted values match
+     * {@code io.github.jbellis.jvector.vector.VectorSimilarityFunction}:
+     * {@code DOT_PRODUCT}, {@code COSINE}, {@code EUCLIDEAN}.
+     */
+    public static final String PROPERTY_MERGE_SIMILARITY = "indexoptimizer.merge.similarity";
+    public static final String PROPERTY_MERGE_SIMILARITY_DEFAULT = "DOT_PRODUCT";
+
+    // -------------------------------------------------------------------------
+    // Remote file service client (issue #484: merger needs a DataStorageManager
+    // pointing at remote storage to download/upload segment files). The
+    // optimizer accepts a comma-separated static list OR — when empty —
+    // discovers servers via ZooKeeper at the standard
+    // {@code /herd/file-servers} path.
+    // -------------------------------------------------------------------------
+
+    /** Comma-separated list of remote file-service endpoints. Empty → ZK discovery. */
+    public static final String PROPERTY_REMOTE_FILE_SERVERS = "indexoptimizer.remote.file.servers";
+    public static final String PROPERTY_REMOTE_FILE_SERVERS_DEFAULT = "";
+
+    /** Per-call deadline for the remote-file client, in seconds. */
+    public static final String PROPERTY_REMOTE_FILE_TIMEOUT = "indexoptimizer.remote.file.client.timeout";
+    public static final long PROPERTY_REMOTE_FILE_TIMEOUT_DEFAULT = 60L;
+
+    /** Max retries on idempotent remote-file operations. */
+    public static final String PROPERTY_REMOTE_FILE_RETRIES = "indexoptimizer.remote.file.client.retries";
+    public static final int PROPERTY_REMOTE_FILE_RETRIES_DEFAULT = 3;
+
+    /** Back-pressure cap on outstanding read bytes on the remote-file client. */
+    public static final String PROPERTY_REMOTE_FILE_MAX_INFLIGHT_READ_BYTES =
+            "indexoptimizer.remote.file.client.max.inflight.read.bytes";
+    public static final long PROPERTY_REMOTE_FILE_MAX_INFLIGHT_READ_BYTES_DEFAULT = 256L * 1024L * 1024L;
+
+    /** Back-pressure cap on outstanding write bytes on the remote-file client. */
+    public static final String PROPERTY_REMOTE_FILE_MAX_INFLIGHT_WRITE_BYTES =
+            "indexoptimizer.remote.file.client.max.inflight.write.bytes";
+    public static final long PROPERTY_REMOTE_FILE_MAX_INFLIGHT_WRITE_BYTES_DEFAULT = 256L * 1024L * 1024L;
+
     private final Properties properties;
 
     public OptimizerConfiguration(Properties properties) {
@@ -138,5 +228,13 @@ public final class OptimizerConfiguration {
     public boolean getBoolean(String key, boolean defaultValue) {
         String v = properties.getProperty(key);
         return v == null ? defaultValue : Boolean.parseBoolean(v);
+    }
+
+    public float getFloat(String key, float defaultValue) {
+        String v = properties.getProperty(key);
+        if (v == null) {
+            return defaultValue;
+        }
+        return Float.parseFloat(v);
     }
 }

@@ -376,8 +376,21 @@ indexOptimizer:
   # Human-readable tablespace name — UUID resolved from ZooKeeper at startup.
   # No manual UUID log-scraping required.
   tablespaceName: "herd"
-  # Short interval for bench cycles; increase for production workloads.
+  # Periodic safety-net interval. Issue #484 made the optimizer event-driven
+  # via a ZK persistent-recursive watch, so the periodic cadence is only a
+  # fallback for the rare case ZK delivers no event. 5 min is fine for bench
+  # workloads; production may want longer.
   intervalMs: 300000
+  # Issue #484: aggressive merge policy + RemoteSegmentMerger require a
+  # vector dimension up-front (SegmentMetadata znodes do NOT carry it).
+  # Override per-bench: GIST1M is 960, SIFT* is 128, etc.
+  merger:
+    dim: 960
+    M: 16
+    beamWidth: 100
+    neighborOverflow: 1.2
+    alpha: 1.4
+    similarity: "DOT_PRODUCT"
 
 tools:
   enabled: true

@@ -100,7 +100,7 @@ public class ReaperFileDeletionTest {
         }
     }
 
-    private SegmentMetadata buildSegment(String segUuid, int segId, String tombstonePath) {
+    private SegmentMetadata buildSegment(String segUuid, long segId, String tombstonePath) {
         return SegmentMetadata.builder()
                 .segmentUuid(segUuid)
                 .tablespaceUuid(TS_UUID)

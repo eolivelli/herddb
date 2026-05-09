@@ -242,6 +242,7 @@ public final class TombstoneOverlayManager {
         SegmentMetadata updated = current.metadata().toBuilder()
                 .tombstonePath(multipartPath)
                 .tombstoneLsn(snapshotLsn)
+                .overlayGeneration(snapshotGeneration)
                 .build();
         VersionedSegmentMetadata after;
         try {

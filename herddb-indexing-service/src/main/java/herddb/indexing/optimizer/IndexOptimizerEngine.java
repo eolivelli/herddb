@@ -644,16 +644,23 @@ public final class IndexOptimizerEngine {
         if (m.getTombstonePath() != null) {
             String tombstoneUuid = TombstoneOverlayManager.multipartUuidFor(
                     m.getIndexUuid(), m.getSegmentUuid());
-            // We don't know the exact generation at this point (the znode tracks
-            // tombstoneLsn but not the generation explicitly). Probe a window of recent
-            // generations to clean up any current + a safety window of stragglers. This
-            // is bounded to keep the call O(window) — typical N=1.
-            // Hot-path note: this only runs at retention time (every retentionMs, default
-            // 10 min) — not per search/insert. Worst-case O(generationWindow) DSM calls
-            // per reaped segment, all idempotent.
-            for (long gen = 1; gen <= 32; gen++) {
+            // Issue #484: SegmentMetadata now records the overlay generation
+            // explicitly so the reaper deletes the correct file directly
+            // instead of probing a fixed window of generations. Older payloads
+            // (overlayGeneration == 0) fall back to a bounded probe so a v1
+            // znode written before the field existed still gets cleaned up.
+            long latestGen = m.getOverlayGeneration();
+            if (latestGen > 0L) {
                 tryDeleteMultipart(m.getTablespaceUuid(), tombstoneUuid,
-                        "tombstones-" + gen, m.getSegmentUuid());
+                        TombstoneOverlayManager.fileTypeFor(latestGen), m.getSegmentUuid());
+            } else {
+                // Compatibility probe for znodes written before overlayGeneration
+                // was added. Hot-path note: this only runs at retention (every
+                // retentionMs, default 10 min) — never on the search/insert path.
+                for (long gen = 1; gen <= 32; gen++) {
+                    tryDeleteMultipart(m.getTablespaceUuid(), tombstoneUuid,
+                            TombstoneOverlayManager.fileTypeFor(gen), m.getSegmentUuid());
+                }
             }
         }
     }
