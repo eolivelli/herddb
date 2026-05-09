@@ -386,11 +386,11 @@ public final class RemoteSegmentGraphMerger {
             //    consistency, not about a specific layout.
             BuildArtefacts artefacts = buildGraph(authority, dim, keptCount);
 
-            // 4. Write the graph and map files locally.
-            Path graphTempFile = Files.createTempFile(tmpDirectory,
-                    "herddb-merger-graph-", ".idx");
-            Path mapOutTempFile = Files.createTempFile(tmpDirectory,
-                    "herddb-merger-map-", ".tmp");
+            // 4. Write the graph and map files locally. Allocate inside the
+            //    outer try so a failure on the second createTempFile call
+            //    doesn't leak the first one (issue #485 review item B.7#2).
+            Path graphTempFile = null;
+            Path mapOutTempFile = null;
             boolean uploadedGraph = false;
             boolean uploadedMap = false;
             String graphPath = null;
@@ -399,6 +399,10 @@ public final class RemoteSegmentGraphMerger {
             long mapSize;
             String multipartUuid = outputIndexUuid + "_seg" + outputSegmentId;
             try {
+                graphTempFile = Files.createTempFile(tmpDirectory,
+                        "herddb-merger-graph-", ".idx");
+                mapOutTempFile = Files.createTempFile(tmpDirectory,
+                        "herddb-merger-map-", ".tmp");
                 writeGraph(artefacts, dim, graphTempFile);
                 graphSize = Files.size(graphTempFile);
                 writeMapFile(artefacts, mapOutTempFile);
@@ -415,8 +419,12 @@ public final class RemoteSegmentGraphMerger {
                         mapOutTempFile, /* progress */ null);
                 uploadedMap = true;
             } finally {
-                Files.deleteIfExists(graphTempFile);
-                Files.deleteIfExists(mapOutTempFile);
+                if (graphTempFile != null) {
+                    Files.deleteIfExists(graphTempFile);
+                }
+                if (mapOutTempFile != null) {
+                    Files.deleteIfExists(mapOutTempFile);
+                }
                 // Close the builder; we no longer need any of its in-memory state.
                 try {
                     artefacts.builder.close();
@@ -522,7 +530,7 @@ public final class RemoteSegmentGraphMerger {
      *       read via {@link OnDiskGraphIndex.View#getVectorInto}).</li>
      *   <li>Upload both files; on a partial upload failure, best-effort
      *       delete the half-published graph so the caller's
-     *       {@link #abandon} does not need to track a stale uuid.</li>
+     *       {@link #deleteOutput} does not need to track a stale uuid.</li>
      * </ol>
      */
     private MergeOutput mergeStreaming(List<RemoteSegmentInput> inputs,
@@ -661,10 +669,11 @@ public final class RemoteSegmentGraphMerger {
             }
 
             // 7. Run the streaming compactor + write the output map file.
-            Path graphOutTemp = Files.createTempFile(tmpDirectory,
-                    "herddb-merger-stream-graph-", ".idx");
-            Path mapOutTemp = Files.createTempFile(tmpDirectory,
-                    "herddb-merger-stream-map-", ".tmp");
+            //    Allocate both temp files before the inner try so a failure
+            //    on the second allocation doesn't leak the first; allocations
+            //    happen inside the outer try so the existing finally cleans up.
+            Path graphOutTemp = null;
+            Path mapOutTemp = null;
             String multipartUuid = outputIndexUuid + "_seg" + outputSegmentId;
             boolean uploadedGraph = false;
             boolean uploadedMap = false;
@@ -673,6 +682,11 @@ public final class RemoteSegmentGraphMerger {
             long graphSize;
             long mapSize;
             try {
+                graphOutTemp = Files.createTempFile(tmpDirectory,
+                        "herddb-merger-stream-graph-", ".idx");
+                mapOutTemp = Files.createTempFile(tmpDirectory,
+                        "herddb-merger-stream-map-", ".tmp");
+
                 OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
                         sources, liveBitsets, mappers, similarity,
                         PhysicalCoreExecutor.pool());
@@ -699,15 +713,19 @@ public final class RemoteSegmentGraphMerger {
                         mapOutTemp, /* progress */ null);
                 uploadedMap = true;
             } finally {
-                try {
-                    Files.deleteIfExists(graphOutTemp);
-                } catch (IOException ignored) {
-                    // best-effort; orphan tmp does not affect remote state.
+                if (graphOutTemp != null) {
+                    try {
+                        Files.deleteIfExists(graphOutTemp);
+                    } catch (IOException ignored) {
+                        // best-effort; orphan tmp does not affect remote state.
+                    }
                 }
-                try {
-                    Files.deleteIfExists(mapOutTemp);
-                } catch (IOException ignored) {
-                    // same.
+                if (mapOutTemp != null) {
+                    try {
+                        Files.deleteIfExists(mapOutTemp);
+                    } catch (IOException ignored) {
+                        // same.
+                    }
                 }
                 if (uploadedGraph && !uploadedMap) {
                     try {
