@@ -22,8 +22,8 @@ package herddb.index.blink;
 
 import herddb.index.blink.BLinkMetadata.BLinkNodeMetadata;
 import herddb.utils.ByteBufCursor;
+import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
-import herddb.utils.ExtendedDataOutputStream;
 import herddb.utils.HerdDBByteBufAllocators;
 import herddb.utils.IndexKeySlab;
 import java.io.IOException;
@@ -80,7 +80,7 @@ final class IncrementalBLinkPageCodec {
     // ---------------- snapshot chunk ----------------
 
     static void writeSnapshotChunk(
-            ExtendedDataOutputStream out,
+            ByteBufDataOutput out,
             long epoch, int chunkIndex, int totalChunks,
             List<BLinkNodeMetadata<Bytes>> nodes
     ) throws IOException {
@@ -132,7 +132,7 @@ final class IncrementalBLinkPageCodec {
     // ---------------- delta ----------------
 
     static void writeDelta(
-            ExtendedDataOutputStream out,
+            ByteBufDataOutput out,
             long epoch,
             List<BLinkNodeMetadata<Bytes>> upserted,
             long[] removedNodeIds,
@@ -205,7 +205,7 @@ final class IncrementalBLinkPageCodec {
 
     // ---------------- shared node-metadata codec ----------------
 
-    private static void writeNodeMetadata(ExtendedDataOutputStream out, BLinkNodeMetadata<Bytes> node)
+    private static void writeNodeMetadata(ByteBufDataOutput out, BLinkNodeMetadata<Bytes> node)
             throws IOException {
         out.writeBoolean(node.leaf);
         out.writeVLong(node.id);
@@ -218,7 +218,9 @@ final class IncrementalBLinkPageCodec {
             out.writeByte(RIGHTSEP_INF);
         } else {
             out.writeByte(RIGHTSEP_BYTES);
-            out.writeArray(node.rightsep.to_array());
+            // writeArray(Bytes) uses Bytes.writeTo(ByteBuf) — zero-copy for
+            // off-heap-backed rightsep keys (issue #497).
+            out.writeArray(node.rightsep);
         }
     }
 
@@ -281,9 +283,9 @@ final class IncrementalBLinkPageCodec {
                 byte[] rs = in.readArray();
                 if (rs == null) {
                     // The writer never emits a null rightsep array (it always
-                    // calls writeArray on a non-null Bytes.to_array()), so a
-                    // null here means the on-disk page is corrupted. Fail
-                    // fast with an actionable message.
+                    // calls writeArray on a non-null Bytes), so a null here
+                    // means the on-disk page is corrupted. Fail fast with an
+                    // actionable message.
                     throw new IOException("corrupted node metadata: null rightsep at index " + i);
                 }
                 rightsepBytes[i] = rs;

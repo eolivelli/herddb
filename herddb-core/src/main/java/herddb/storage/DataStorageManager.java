@@ -30,7 +30,7 @@ import herddb.model.Record;
 import herddb.model.Table;
 import herddb.model.Transaction;
 import herddb.utils.ByteBufCursor;
-import herddb.utils.ExtendedDataOutputStream;
+import herddb.utils.ByteBufDataOutput;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Collection;
@@ -151,7 +151,18 @@ public abstract class DataStorageManager implements AutoCloseable {
     @FunctionalInterface
     public interface DataWriter {
 
-        void write(ExtendedDataOutputStream out) throws IOException;
+        /**
+         * Serialises one index page into {@code out}. Implementations write
+         * their payload directly into the supplied {@link ByteBufDataOutput};
+         * the surrounding framing (outer version / flags / hash footer) is
+         * added by the {@code DataStorageManager} implementation.
+         *
+         * <p>For off-heap-backed {@link herddb.utils.Bytes} keys use
+         * {@link ByteBufDataOutput#writeArray(herddb.utils.Bytes)} — it calls
+         * {@link herddb.utils.Bytes#writeTo(io.netty.buffer.ByteBuf)} which
+         * performs a zero-copy direct-to-direct copy (issue #497).
+         */
+        void write(ByteBufDataOutput out) throws IOException;
     }
 
     public abstract void writeIndexPage(String tableSpace, String uuid, long pageId, DataWriter writer);

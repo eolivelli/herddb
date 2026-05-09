@@ -36,6 +36,7 @@ import herddb.sql.SQLRecordKeyFunction;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
+import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
 import herddb.utils.DataAccessor;
 import herddb.utils.Holder;
@@ -240,7 +241,7 @@ public class MemoryHashIndexManager extends AbstractIndexManager {
         long pageId = newPageId.getAndIncrement();
         Holder<Long> count = new Holder<>();
 
-        dataStorageManager.writeIndexPage(tableSpaceUUID, index.uuid, pageId, (out) -> {
+        dataStorageManager.writeIndexPage(tableSpaceUUID, index.uuid, pageId, (ByteBufDataOutput out) -> {
 
             long entries = 0;
             out.writeVLong(1); // version

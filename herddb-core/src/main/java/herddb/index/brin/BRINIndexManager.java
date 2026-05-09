@@ -45,13 +45,14 @@ import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
 import herddb.utils.ByteBufCursor;
+import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
 import herddb.utils.DataAccessor;
-import herddb.utils.ExtendedDataOutputStream;
 import herddb.utils.HerdDBByteBufAllocators;
 import herddb.utils.IndexKeySlab;
 import herddb.utils.SystemProperties;
-import java.io.ByteArrayOutputStream;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import java.io.IOException;
 import java.util.AbstractMap;
 import java.util.ArrayList;
@@ -134,17 +135,18 @@ public class BRINIndexManager extends AbstractIndexManager {
         }
 
         byte[] serialize() throws IOException {
-            try (ByteArrayOutputStream out = new ByteArrayOutputStream(1024);
-                 ExtendedDataOutputStream eout = new ExtendedDataOutputStream(out)) {
-                serialize(eout);
-
-                eout.flush();
-
-                return out.toByteArray();
+            ByteBuf buf = Unpooled.buffer(1024);
+            try {
+                serialize(new ByteBufDataOutput(buf));
+                byte[] result = new byte[buf.writerIndex()];
+                buf.getBytes(0, result);
+                return result;
+            } finally {
+                buf.release();
             }
         }
 
-        void serialize(ExtendedDataOutputStream out) throws IOException {
+        void serialize(ByteBufDataOutput out) throws IOException {
             out.writeVLong(3); // version
             out.writeVLong(0); // flags for future implementations
 
@@ -586,7 +588,8 @@ public class BRINIndexManager extends AbstractIndexManager {
                 contents.pageData = values;
 
                 long pageId = newPageId.getAndIncrement();
-                dataStorageManager.writeIndexPage(tableSpaceUUID, index.uuid, pageId, (out) -> contents.serialize(out));
+                dataStorageManager.writeIndexPage(tableSpaceUUID, index.uuid, pageId,
+                        (ByteBufDataOutput out) -> contents.serialize(out));
 
                 return pageId;
             } catch (DataStorageManagerException err) {

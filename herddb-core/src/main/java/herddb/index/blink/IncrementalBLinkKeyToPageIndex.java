@@ -42,6 +42,7 @@ import herddb.sql.SQLRecordKeyFunction;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
+import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
 import herddb.utils.HerdDBByteBufAllocators;
 import herddb.utils.IndexKeySlab;
@@ -991,7 +992,7 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
 
         private long createPage(long pageId, Map<Bytes, Long> data, byte type) throws IOException {
             long pid = (pageId == NEW_PAGE) ? allocatePageId() : pageId;
-            DataStorageManager.DataWriter writer = out -> {
+            DataStorageManager.DataWriter writer = (ByteBufDataOutput out) -> {
                 out.writeVLong(1);
                 out.writeVLong(0);
                 out.writeByte(type);
@@ -1002,7 +1003,9 @@ public class IncrementalBLinkKeyToPageIndex implements KeyToPageIndex {
                             out.writeVLong(y);
                         } else {
                             out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
-                            out.writeArray(x.to_array());
+                            // writeArray(Bytes) calls Bytes.writeTo(ByteBuf):
+                            // zero-copy for off-heap IndexKeySlab keys (issue #497).
+                            out.writeArray(x);
                             out.writeVLong(y);
                         }
                     } catch (IOException e) {

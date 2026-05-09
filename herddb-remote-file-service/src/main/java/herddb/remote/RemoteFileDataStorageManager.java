@@ -42,10 +42,9 @@ import herddb.storage.FullTableScanConsumer;
 import herddb.storage.IndexStatus;
 import herddb.storage.TableStatus;
 import herddb.utils.ByteBufCursor;
-import herddb.utils.ExtendedDataOutputStream;
+import herddb.utils.ByteBufDataOutput;
 import herddb.utils.XXHash64Utils;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufOutputStream;
 import io.netty.buffer.PooledByteBufAllocator;
 import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
@@ -557,30 +556,27 @@ public class RemoteFileDataStorageManager extends DataStorageManager
     // -------------------------------------------------------------------------
 
     private ByteBuf serializeIndexPage(DataWriter writer) throws IOException {
+        // Use a direct ByteBuf so that Bytes.writeTo(ByteBuf) for off-heap-backed
+        // keys (IndexKeySlab slabs) performs a direct-to-direct copy with no heap
+        // byte[] allocation per key (issue #497).
         ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(4096);
         try {
-            ByteBufOutputStream bufOut = new ByteBufOutputStream(buf);
+            herddb.utils.ByteBufUtils.writeVLong(buf, 1); // outer version
+            herddb.utils.ByteBufUtils.writeVLong(buf, 0); // outer flags
+            writer.write(new ByteBufDataOutput(buf));
+            int payloadLen = buf.writerIndex();
+            long hash;
             if (pageHashWritesEnabled) {
-                XXHash64Utils.HashingOutputStream hashOut = new XXHash64Utils.HashingOutputStream(bufOut);
-                try (ExtendedDataOutputStream out = new ExtendedDataOutputStream(hashOut)) {
-                    out.writeVLong(1); // version
-                    out.writeVLong(0); // flags
-                    writer.write(out);
-                    out.flush();
-                    long hash = hashOut.hash(); // hash of data bytes only, before footer
-                    out.writeLong(hash); // footer
-                    out.flush();
-                }
+                // One heap allocation per page (not per key): copy the payload
+                // bytes to a temporary array for XXHash64 computation.
+                // This is far cheaper than the per-key to_array() it replaces.
+                byte[] tmp = new byte[payloadLen];
+                buf.getBytes(0, tmp, 0, payloadLen);
+                hash = XXHash64Utils.hash(tmp, 0, payloadLen);
             } else {
-                try (ExtendedDataOutputStream out = new ExtendedDataOutputStream(bufOut)) {
-                    out.writeVLong(1); // version
-                    out.writeVLong(0); // flags
-                    writer.write(out);
-                    out.flush();
-                    out.writeLong(0L); // NO_HASH_PRESENT footer
-                    out.flush();
-                }
+                hash = 0L; // NO_HASH_PRESENT
             }
+            buf.writeLong(hash); // footer
         } catch (IOException e) {
             buf.release();
             throw e;

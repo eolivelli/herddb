@@ -28,6 +28,7 @@ import herddb.log.LogSequenceNumber;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import herddb.storage.IndexStatus;
+import herddb.utils.ByteBufDataOutput;
 import herddb.utils.Bytes;
 import herddb.utils.VectorSearchRequestContext;
 import herddb.utils.VisibleByteArrayOutputStream;
@@ -6321,7 +6322,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             if (pageId == NEW_PAGE) {
                 pageId = newPageId.getAndIncrement();
             }
-            dataStorageManager.writeIndexPage(tableSpaceUUID, storeName, pageId, out -> {
+            dataStorageManager.writeIndexPage(tableSpaceUUID, storeName, pageId, (ByteBufDataOutput out) -> {
                 out.writeVLong(1);
                 out.writeVLong(0);
                 out.writeByte(type);
@@ -6332,7 +6333,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             out.writeVLong(y);
                         } else {
                             out.writeByte(NODE_PAGE_KEY_VALUE_BLOCK);
-                            out.writeArray(x.to_array());
+                            // writeArray(Bytes) calls Bytes.writeTo(ByteBuf):
+                            // zero-copy for off-heap IndexKeySlab keys (issue #497).
+                            out.writeArray(x);
                             out.writeVLong(y);
                         }
                     } catch (IOException e) {
