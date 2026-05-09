@@ -269,17 +269,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
     static final int CHUNK_SIZE = 1_048_576;
 
     /**
-     * Multi-segment multipart metadata format. Carries per-segment
-     * {@code generation}, a per-IndexStatus monotonic generation
-     * counter, and a {@code pendingDeletes} list driving the
-     * graph-merge compaction retention protocol.
-     */
-    private static final int METADATA_VERSION_MULTI_SEGMENT = 3;
-    /**
-     * Format version 4 adds a per-segment {@code segmentUuid} string. Written when ANY
-     * segment in the IndexStatus carries a non-null UUID (i.e. the index is in
-     * segmented-v2 mode); otherwise we keep writing v3 to preserve binary-compatible
-     * rollback for legacy clusters. The reader supports both versions.
+     * Multi-segment multipart metadata format, version 4. Carries per-segment
+     * {@code generation}, a per-IndexStatus monotonic generation counter, a
+     * {@code pendingDeletes} list driving the graph-merge compaction retention
+     * protocol, and a mandatory per-segment {@code segmentUuid} string used by
+     * the external optimizer's ZooKeeper segment registry.
+     *
+     * <p>Version 3 (which lacked the {@code segmentUuid} field) is no longer
+     * supported for reading or writing. Any attempt to load a v3 index will
+     * result in a clear boot failure with instructions to delete and re-create
+     * the index.
      */
     private static final int METADATA_VERSION_MULTI_SEGMENT_V4 = 4;
 
@@ -412,14 +411,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     private volatile boolean externalCompactionEnabled;
 
-    /**
-     * Cached "this index is segmented-v2 (has at least one UUID-stamped segment)"
-     * flag (review-item N1 from second pr-reviewer pass). Once flipped to
-     * {@code true} it stays true — even legacy v3 segments coexisting with a
-     * v4 segment in the same IndexStatus must be persisted in v4 format. Avoids
-     * re-scanning all sealed/mergeable/new lists on every checkpoint.
-     */
-    private volatile boolean segmentedV2Cached;
+    // segmentedV2Cached removed: v3 format is no longer supported; all indexes
+    // are written in v4 format (which always includes segmentUuid per segment).
 
     /**
      * Test hook (package-private) — runs in Phase B AFTER the staged publish and
@@ -1548,11 +1541,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
         /** Number of live vectors written to this segment. */
         final long vectorCount;
         /**
-         * Stable UUID stamped onto this segment for segmented-v2 indexes. Populated
-         * by {@link #stampSegmentUuid(String)} in Phase B once we know we will publish
-         * to a {@link SegmentPublisher}; carried through to {@link NewSegmentInfo} and
-         * persisted in v4 IndexStatus so the same UUID survives restarts. {@code null}
-         * for legacy (v3) indexes.
+         * Stable UUID stamped onto this segment once we know we will publish to a
+         * {@link SegmentPublisher}. Populated by {@link #stampSegmentUuid(String)} in
+         * Phase B; carried through to {@link NewSegmentInfo} and persisted in the v4
+         * IndexStatus so the same UUID survives restarts. {@code null} when no publisher
+         * is attached (i.e. the external optimizer is not enabled for this store).
          */
         String segmentUuid;
 
@@ -2545,6 +2538,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
         if (publisherSnapshot != null && mergedOutput != null) {
             // Stamp UUID — same flow as Phase B: durable UUID survives a
             // restart so we cannot double-register the same physical file.
+            // mergedOutput.segmentUuid should always be null here (freshly merged),
+            // but guard defensively in case a future caller pre-stamps it.
             if (mergedOutput.segmentUuid == null) {
                 mergedOutput.segmentUuid = java.util.UUID.randomUUID().toString();
             }
@@ -2559,9 +2554,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
             inputInfosForRegistry = new ArrayList<>(inputs.size());
             for (VectorSegment in : inputs) {
-                // Legacy (v3) inputs without a UUID are not in the registry —
-                // skip them in the validate/deprecate set. The in-memory swap
-                // still happens below.
+                // All segments in v4-format indexes carry a UUID. A null UUID here
+                // means a segment was checkpointed before a publisher was ever attached
+                // (the very first checkpoint after the publisher feature was enabled).
+                // Such segments are not registered in ZK yet; they will be picked up by
+                // the next reconcile pass. Skip them in the validate/deprecate set.
                 if (in.segmentUuid != null) {
                     inputInfosForRegistry.add(new NewSegmentInfo(
                             in.segmentId, in.segmentUuid,
@@ -4749,6 +4746,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * {@link SegmentWriteResult}s. Used both by {@link #stageNewSegmentsBestEffort}
      * (before IndexStatus persist) and {@link #commitStagedSegmentsBestEffort}
      * (after) so the same identity flows through both phases.
+     *
+     * <p>All {@link SegmentWriteResult}s passed here must already have their
+     * {@code segmentUuid} stamped by the caller (the Phase B publish block).
+     * Any entry with a null UUID is skipped with a warning — this should not
+     * happen in normal operation.
      */
     private List<NewSegmentInfo> buildPublishInfo(
             List<SegmentWriteResult> newSegmentResults, LogSequenceNumber sequenceNumber,
@@ -4756,6 +4758,8 @@ public class PersistentVectorStore extends AbstractVectorStore {
         List<NewSegmentInfo> info = new ArrayList<>(newSegmentResults.size());
         for (SegmentWriteResult swr : newSegmentResults) {
             if (swr.segmentUuid == null) {
+                // Defensive: should not occur because the Phase B loop stamps
+                // every UUID before calling this method.
                 LOGGER.log(Level.WARNING,
                         "skipping publish of segment {0} (segmentId={1}) — UUID was not stamped",
                         new Object[]{indexName, swr.segmentId});
@@ -4816,14 +4820,25 @@ public class PersistentVectorStore extends AbstractVectorStore {
     /**
      * Walks the in-memory segments (loaded from IndexStatus) and produces a
      * {@link NewSegmentInfo} list suitable for {@link SegmentPublisher#reconcileWithIndexStatus}.
-     * Only segments with a non-null UUID participate (legacy segments are skipped).
      * Called once at {@link #start()} when a publisher is attached.
+     *
+     * <p>All segments in a v4 IndexStatus should carry a UUID. A null UUID can only
+     * appear for a segment checkpointed before the publisher was first attached (the
+     * first checkpoint after the optimizer feature was enabled writes UUIDs only for
+     * newly-emitted segments, not for pre-existing ones loaded from a v4 status). Such
+     * segments are skipped here; they will be picked up by the next checkpoint that
+     * re-seals them with a freshly assigned UUID.
      */
     private List<NewSegmentInfo> buildExistingSegmentsInfoForReconcile() {
         List<NewSegmentInfo> info = new ArrayList<>(segments.size());
         long generation = currentIndexStatusGeneration.get();
         for (VectorSegment seg : segments) {
             if (seg.segmentUuid == null) {
+                // No UUID: this segment was checkpointed before the publisher was
+                // attached. Skip it — the next checkpoint will assign a UUID.
+                LOGGER.log(Level.FINE,
+                        "segment {0} (index {1}) has no UUID; skipping reconcile entry",
+                        new Object[]{seg.segmentId, indexName});
                 continue;
             }
             // baseLsn for already-loaded segments is unknown post-restart (the
@@ -5487,23 +5502,26 @@ public class PersistentVectorStore extends AbstractVectorStore {
         ByteBuffer metaBuf = ByteBuffer.wrap(status.indexData);
 
         int version = metaBuf.getInt();
-        if (version != METADATA_VERSION_MULTI_SEGMENT && version != METADATA_VERSION_MULTI_SEGMENT_V4) {
-            // Review-item B4 (second pr-reviewer pass): on rollback to a binary that
-            // doesn't know about a newer format version, the previous behaviour was to
-            // log SEVERE and "start empty" — i.e. silently drop every segment from the
-            // in-memory state while the underlying graph/map files still exist on
-            // remote storage. That makes queries return an empty result set without
-            // any indication to the operator that something went wrong. Fail-fast
-            // instead: an immediate boot failure is far easier to diagnose and far
-            // safer than a silent data-loss-equivalent regression.
+        if (version == 3) {
+            // v3 format (no per-segment segmentUuid) is no longer supported.
+            // v3 indexes were written before the external optimizer's ZooKeeper
+            // segment registry was introduced. Delete the index and re-create it
+            // to produce a v4 checkpoint with per-segment UUIDs.
+            throw new DataStorageManagerException(
+                    "vector index metadata version 3 is no longer supported for index " + indexName
+                            + ". The v3 format lacks per-segment UUIDs required by the external"
+                            + " optimizer. Delete the index and re-create it to produce a v4"
+                            + " checkpoint, or downgrade to a binary that supports v3.");
+        }
+        if (version != METADATA_VERSION_MULTI_SEGMENT_V4) {
+            // Unknown future version — the previous binary cannot read it.
+            // Fail fast: an immediate boot failure is far easier to diagnose
+            // than a silent data-loss-equivalent regression.
             throw new DataStorageManagerException(
                     "unsupported vector index metadata version " + version + " for " + indexName
-                            + " (supported: v" + METADATA_VERSION_MULTI_SEGMENT
-                            + ", v" + METADATA_VERSION_MULTI_SEGMENT_V4
-                            + "). This typically means the index was upgraded by a newer"
-                            + " binary and is being rolled back to one that does not yet"
-                            + " support the new format. Either re-deploy a binary that"
-                            + " supports v" + version + " OR delete the index and re-create it.");
+                            + " (this binary supports v" + METADATA_VERSION_MULTI_SEGMENT_V4
+                            + "). Either re-deploy a binary that supports v" + version
+                            + " OR delete the index and re-create it.");
         }
 
         int dim = metaBuf.getInt();
@@ -5514,20 +5532,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
         /* boolean savedAddHierarchy = */ metaBuf.get();
         /* boolean savedFusedPQ = */ metaBuf.get();
 
-        // nextNodeId is serialised as int64 after issue #256 — the in-place
-        // v3 rewrite breaks backward-compatibility on purpose.
         long savedNextNodeId = metaBuf.getLong();
 
         this.dimension = dim;
         newPageId.set(status.newPageId);
 
-        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha,
-                version);
+        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
     }
 
     private void loadMultiSegmentFormat(ByteBuffer metaBuf, int dim, long savedNextNodeId,
-                                         int savedBeamWidth, float savedNeighborOverflow, float savedAlpha,
-                                         int formatVersion)
+                                         int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
             throws IOException, DataStorageManagerException {
         java.io.DataInputStream dis = new java.io.DataInputStream(
                 new java.io.ByteArrayInputStream(metaBuf.array(), metaBuf.position(),
@@ -5562,7 +5576,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             String mapFilePath;
             long mapFileSize;
             long generation;
-            String segmentUuid = null;
+            String segmentUuid;
             try {
                 segId = dis.readInt();
                 estimatedSize = dis.readLong();
@@ -5571,10 +5585,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 mapFilePath = dis.readUTF();
                 mapFileSize = dis.readLong();
                 generation = dis.readLong();
-                if (formatVersion >= METADATA_VERSION_MULTI_SEGMENT_V4) {
-                    String raw = dis.readUTF();
-                    segmentUuid = raw.isEmpty() ? null : raw;
-                }
+                // v4 format always includes a segmentUuid field. An empty string
+                // means the segment has no UUID (should not occur in v4 except during
+                // a checkpoint that was written before the publisher was first attached;
+                // treated as null for reconcile purposes).
+                String raw = dis.readUTF();
+                segmentUuid = raw.isEmpty() ? null : raw;
             } catch (IOException e) {
                 throw new DataStorageManagerException("Failed to read segment metadata", e);
             }
@@ -5586,9 +5602,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
             seg.mapFileSize = mapFileSize;
             seg.generation = generation;
             seg.segmentUuid = segmentUuid;
-            if (segmentUuid != null) {
-                segmentedV2Cached = true;
-            }
             segList.add(seg);
         }
 
@@ -6131,49 +6144,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // Existing (sealed/mergeable) segments keep their stored generation.
         long newGeneration = currentIndexStatusGeneration.get() + 1;
 
-        // Decide format version: v4 if any segment carries a non-null UUID (i.e. the index
-        // is in segmented-v2 mode), otherwise v3 to keep binary-compatible rollback for
-        // legacy clusters that never opted into the optimizer. Once we've seen a UUID we
-        // remember it (segmentedV2Cached) so subsequent checkpoints skip the scan
-        // entirely (review-item N1 from second pr-reviewer pass).
-        boolean anyUuid = segmentedV2Cached;
-        if (!anyUuid) {
-            // Fastest probe first: freshly-emitted segments (whose UUIDs were stamped at
-            // the start of Phase C). Only scan the loaded segments if necessary — those
-            // are the ones that contain UUIDs persisted from a previous run.
-            for (SegmentWriteResult swr : newSegmentResults) {
-                if (swr.segmentUuid != null) {
-                    anyUuid = true;
-                    break;
-                }
-            }
-            if (!anyUuid) {
-                for (VectorSegment seg : sealedSegments) {
-                    if (seg.segmentUuid != null) {
-                        anyUuid = true;
-                        break;
-                    }
-                }
-            }
-            if (!anyUuid) {
-                for (VectorSegment seg : mergeableSegments) {
-                    if (seg.segmentUuid != null) {
-                        anyUuid = true;
-                        break;
-                    }
-                }
-            }
-            if (anyUuid) {
-                segmentedV2Cached = true;
-            }
-        }
-        final int formatVersion = anyUuid
-                ? METADATA_VERSION_MULTI_SEGMENT_V4
-                : METADATA_VERSION_MULTI_SEGMENT;
+        // Always write v4 format: v3 (which lacked the segmentUuid field) is no
+        // longer supported for reading or writing (issue #499).
 
         VisibleByteArrayOutputStream baos = new VisibleByteArrayOutputStream(256);
         try (java.io.DataOutputStream dos = new java.io.DataOutputStream(baos)) {
-            dos.writeInt(formatVersion);
+            dos.writeInt(METADATA_VERSION_MULTI_SEGMENT_V4);
             dos.writeInt(dimension);
             dos.writeInt(m);
             dos.writeInt(beamWidth);
@@ -6181,10 +6157,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
             dos.writeFloat(alpha);
             dos.writeByte(ADD_HIERARCHY ? 1 : 0);
             dos.writeByte(1); // fusedPQ
-            // nextNodeId widened to int64 after issue #256. Format version
-            // stays at v3 in legacy mode — the loader refuses unknown versions,
-            // so mixing old + new clients on the same checkpoint directory fails
-            // loud at load time rather than silently truncating the counter.
             dos.writeLong(nextNodeId.get());
             dos.writeLong(newGeneration);
             dos.writeInt(totalSegments);
@@ -6192,17 +6164,17 @@ public class PersistentVectorStore extends AbstractVectorStore {
             for (VectorSegment seg : sealedSegments) {
                 writeSegmentMeta(dos, seg.segmentId, seg.segmentUuid, seg.estimatedSizeBytes,
                         seg.graphFilePath, seg.graphFileSize,
-                        seg.mapFilePath, seg.mapFileSize, seg.generation, formatVersion);
+                        seg.mapFilePath, seg.mapFileSize, seg.generation);
             }
             for (VectorSegment seg : mergeableSegments) {
                 writeSegmentMeta(dos, seg.segmentId, seg.segmentUuid, seg.estimatedSizeBytes,
                         seg.graphFilePath, seg.graphFileSize,
-                        seg.mapFilePath, seg.mapFileSize, seg.generation, formatVersion);
+                        seg.mapFilePath, seg.mapFileSize, seg.generation);
             }
             for (SegmentWriteResult swr : newSegmentResults) {
                 writeSegmentMeta(dos, swr.segmentId, swr.segmentUuid, swr.estimatedSizeBytes,
                         swr.graphFilePath, swr.graphFileSize,
-                        swr.mapFilePath, swr.mapFileSize, newGeneration, formatVersion);
+                        swr.mapFilePath, swr.mapFileSize, newGeneration);
             }
 
             List<PendingDelete> snapshotPending = new ArrayList<>(pendingDeletes);
@@ -6230,7 +6202,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             int segmentId, String segmentUuid, long estimatedSizeBytes,
             String graphFilePath, long graphFileSize,
             String mapFilePath, long mapFileSize,
-            long generation, int formatVersion) throws IOException {
+            long generation) throws IOException {
         dos.writeInt(segmentId);
         dos.writeLong(estimatedSizeBytes);
         dos.writeUTF(graphFilePath);
@@ -6238,12 +6210,9 @@ public class PersistentVectorStore extends AbstractVectorStore {
         dos.writeUTF(mapFilePath != null ? mapFilePath : "");
         dos.writeLong(mapFileSize);
         dos.writeLong(generation);
-        if (formatVersion >= METADATA_VERSION_MULTI_SEGMENT_V4) {
-            // The empty string is the on-wire representation of "no UUID assigned"
-            // — the v3 reader doesn't see this byte at all, the v4 reader maps it
-            // back to null on load.
-            dos.writeUTF(segmentUuid != null ? segmentUuid : "");
-        }
+        // v4 format always includes segmentUuid. Empty string represents "no UUID assigned"
+        // (written for segments that predate the publisher attachment; read back as null).
+        dos.writeUTF(segmentUuid != null ? segmentUuid : "");
     }
 
     // -------------------------------------------------------------------------

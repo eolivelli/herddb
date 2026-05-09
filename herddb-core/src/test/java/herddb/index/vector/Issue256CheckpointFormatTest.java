@@ -38,17 +38,18 @@ import org.junit.rules.TemporaryFolder;
 
 /**
  * Targets the checkpoint-metadata format change from issue #256: the
- * {@code nextNodeId} field in v3 metadata is rewritten in place from
- * {@code int32} to {@code int64} (no back-compat per project decision).
+ * {@code nextNodeId} field was rewritten from {@code int32} to {@code int64}
+ * (no back-compat per project decision). Issue #499 additionally dropped v3
+ * format support entirely; all checkpoints are now written in v4 format.
  *
  * <p>Two cases:
  * <ol>
  *   <li>A large {@code nextNodeId} round-trips through {@code writeLong}
  *       / {@code readLong} unscathed.</li>
- *   <li>A checkpoint blob matching the OLD layout ({@code writeInt} for
- *       {@code nextNodeId}, same v3 magic) must not silently migrate —
- *       the loader's behaviour is locked in so a future refactor can't
- *       reintroduce a half-way back-compat path.</li>
+ *   <li>A checkpoint blob using the OLD {@code writeInt} width for
+ *       {@code nextNodeId} must not silently migrate — the loader's behaviour
+ *       is locked in so a future refactor can't reintroduce a half-way
+ *       back-compat path.</li>
  * </ol>
  */
 public class Issue256CheckpointFormatTest {
@@ -113,10 +114,11 @@ public class Issue256CheckpointFormatTest {
         // + bw (int) + neighborOverflow (float) + alpha (float) + addHierarchy (byte)
         // + fusedPQ (byte) + nextNodeId (long). Total header size = 4*4 + 4*2 + 2 + 8 = 34.
         // Issue #256 moved nextNodeId from writeInt to writeLong at that offset.
+        // Issue #499 dropped v3 support; all checkpoints are now written in v4 format.
         byte[] raw = readRawIndexStatus(dsm, uuid);
         ByteBuffer bb = ByteBuffer.wrap(raw);
         int version = bb.getInt();
-        assertEquals("version must still be 3 (in-place rewrite per user decision)", 3, version);
+        assertEquals("version must be 4 (v3 dropped per issue #499)", 4, version);
         bb.getInt(); // dim
         bb.getInt(); // m
         bb.getInt(); // beamWidth
@@ -139,15 +141,14 @@ public class Issue256CheckpointFormatTest {
     }
 
     /**
-     * Locks in the "no silent v3 back-compat" decision: if we hand-craft
-     * a v3 metadata blob using the OLD {@code writeInt} width for
-     * {@code nextNodeId}, the loader is NOT allowed to treat it as valid
-     * and silently promote the (now-misaligned) fields behind it. The
-     * expected outcome is either a clean "start empty" or a loud
-     * exception. The test asserts that whichever path we take, the
-     * restored {@code nextNodeId} is either zero (start empty) or a
-     * recognisably-corrupt value that would NOT compare equal to the
-     * value we would have observed under the old format.
+     * Locks in the "no silent misalignment" decision: if we hand-craft a metadata
+     * blob using the OLD {@code writeInt} width for {@code nextNodeId} (truncating
+     * the 8-byte long to 4 bytes), the loader is NOT allowed to treat it as valid
+     * and silently promote the (now-misaligned) fields behind it. The expected
+     * outcome is either a clean "start empty" or a loud exception. The test asserts
+     * that whichever path we take, the restored {@code nextNodeId} is either zero
+     * (start empty) or a recognisably-corrupt value that would NOT compare equal to
+     * the value we would have observed under the old format.
      */
     @Test
     public void oldInt32LayoutIsNotSilentlyAccepted() throws Exception {
@@ -168,15 +169,14 @@ public class Issue256CheckpointFormatTest {
             assertTrue(store.checkpoint());
         }
 
-        // Hand-craft a corrupted v3 blob that uses writeInt instead of
-        // writeLong at the nextNodeId offset. If the loader were to
-        // silently accept this layout it would mis-read all subsequent
-        // fields (generation, numSegments, ...) as a shifted view of
-        // the real bytes — likely throwing much later with a cryptic
-        // message. We want it to either reject cleanly OR yield
-        // nextNodeId = 0 (start empty). It must NOT yield
-        // nextNodeId == expectedOldValue, which would indicate the
-        // loader silently migrated the old format.
+        // Hand-craft a corrupted blob that uses writeInt instead of writeLong
+        // at the nextNodeId offset. If the loader were to silently accept this
+        // layout it would mis-read all subsequent fields (generation,
+        // numSegments, ...) as a shifted view of the real bytes — likely
+        // throwing much later with a cryptic message. We want it to either
+        // reject cleanly OR yield nextNodeId = 0 (start empty). It must NOT
+        // yield nextNodeId == expectedOldValue, which would indicate the loader
+        // silently migrated the old format.
         byte[] real = readRawIndexStatus(dsm, uuid);
         // Reconstruct: header fields stay the same until the nextNodeId
         // field, which becomes 4 bytes (writeInt of expectedOldValue).
@@ -280,7 +280,7 @@ public class Issue256CheckpointFormatTest {
         assertTrue("metadata blob must be at least 34 bytes (header), got " + real.length,
                 real.length >= 34);
         try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(real))) {
-            assertEquals(3, dis.readInt());                 // version
+            assertEquals(4, dis.readInt());                 // version (v4 since issue #499)
             assertEquals(16, dis.readInt());                // dim
             assertEquals(16, dis.readInt());                // m
             assertEquals(100, dis.readInt());               // beamWidth

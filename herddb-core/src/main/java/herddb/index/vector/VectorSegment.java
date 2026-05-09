@@ -71,10 +71,15 @@ class VectorSegment implements Closeable {
 
     final int segmentId;
     /**
-     * Globally-unique identifier for segmented-v2 indexes. {@code null} for legacy
-     * (v3 IndexStatus) segments — kept null on read for backward compatibility,
-     * populated when reading v4 IndexStatus. Stable across IS restarts so the
-     * external segment registry can be reconciled with IndexStatus deterministically.
+     * Globally-unique identifier for this segment. Populated from the v4 IndexStatus
+     * on load. {@code null} only for segments that were written by a checkpoint that
+     * ran before a {@link herddb.index.vector.SegmentPublisher} was first attached to
+     * the store — i.e. the very first checkpoint after the external optimizer feature
+     * is enabled. Such segments will acquire a UUID on the next checkpoint that
+     * re-seals or re-writes them.
+     *
+     * <p>Stable across IS restarts so the external segment registry can be reconciled
+     * with IndexStatus deterministically.
      */
     String segmentUuid;
     volatile OnDiskGraphIndex onDiskGraph;
@@ -121,7 +126,6 @@ class VectorSegment implements Closeable {
      * Used by compaction to identify the authoritative segment for a PK
      * (latest wins) and by the retention reaper to decide when a
      * tombstoned segment file is safe to delete across shadow replicas.
-     * Defaults to 0 when loading v3 metadata (no generation field).
      */
     long generation;
 
