@@ -41,7 +41,7 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if or .Values.zookeeper.enabled (eq .Values.indexingService.storageMode "remote") }}
+      {{- if or .Values.zookeeper.enabled (and (eq .Values.indexingService.storageMode "remote") (eq .Values.server.storageMode "remote")) }}
       initContainers:
         {{- if .Values.zookeeper.enabled }}
         - name: wait-for-zookeeper
@@ -61,7 +61,15 @@ spec:
               done
               echo "ZooKeeper is ready."
         {{- end }}
-        {{- if eq .Values.indexingService.storageMode "remote" }}
+        {{- if and (eq .Values.indexingService.storageMode "remote") (eq .Values.server.storageMode "remote") }}
+        {{- /* Prerequisite: the file-server StatefulSet is deployed only when
+             server.storageMode=remote (mirrors the gate in file-server-statefulset.yaml).
+             Gate this initContainer on the same condition so the IS pod does not
+             deadlock waiting on a hostname that will never resolve.
+             DNS-only check: the file server's gRPC port opens immediately after DNS
+             resolves; the RemoteFileServiceClient 10-retry backoff covers the small
+             residual port-not-yet-listening gap, so a /dev/tcp probe is not needed
+             (issue #510). */}}
         - name: wait-for-file-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}

@@ -35,9 +35,12 @@
 #     Combined with the existing retry back-off in RemoteFileServiceClient
 #     this reduced a ~31 s connectivity blackout to at most one retry cycle.
 #   networkaddress.cache.ttl=30 caps the positive DNS cache to 30 s so the
-#     JVM tracks pod-IP changes within one TTL window (the JDK default is
-#     usually -1 = cache forever, which prevents pod-failover recovery
-#     without a JVM restart).
+#     JVM tracks pod-IP changes within one TTL window. Without a SecurityManager
+#     (the normal HerdDB case) the JDK default is 30 s, so this setting is a
+#     no-op for the positive cache — it is stated explicitly for clarity and
+#     to lock in the value should the default ever change or a SecurityManager
+#     be introduced. With a SecurityManager the JDK default is -1 (cache
+#     forever), which would prevent pod-failover recovery without a JVM restart.
 JVECTOR_JAVA_OPTS="--add-modules jdk.incubator.vector -XX:CompileCommandFile=conf/jvector-compiler-directives -Dnetworkaddress.cache.negative.ttl=0 -Dnetworkaddress.cache.ttl=30"
 # JAVA_OPTS / JDK_JAVA_OPTIONS: when set by the caller, REPLACE the defaults.
 # JAVA_OPTS_EXTRA / JDK_JAVA_OPTIONS_EXTRA: appended to the final value, so
