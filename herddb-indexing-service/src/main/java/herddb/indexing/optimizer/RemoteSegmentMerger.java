@@ -89,15 +89,6 @@ public final class RemoteSegmentMerger implements SegmentMerger {
     private final AtomicLong invocations = new AtomicLong();
 
     /**
-     * Optional live-state holder set by {@link IndexOptimizerEngine} before
-     * each merge call so the HTTP server can serve {@code GET /status} with
-     * sub-phase granularity. Written and cleared by the optimizer thread;
-     * read by the HTTP thread only after the optimizer thread has published
-     * updates through the {@code volatile} fields of {@link MergeProgress}.
-     */
-    private MergeProgress mergeProgress;
-
-    /**
      * @param dataStorageManager  remote-backed DSM the merger uses to download inputs and
      *                            upload the merged graph + map files
      * @param tmpDirectory        local scratch directory for staging
@@ -134,9 +125,16 @@ public final class RemoteSegmentMerger implements SegmentMerger {
      * Sets the live-state holder that receives phase-change and batch-progress
      * callbacks during the next {@link #merge} call. Pass {@code null} to stop
      * forwarding. Must be called from the same thread that calls {@link #merge}.
+     *
+     * <p>Note: this method only wires callbacks into the wrapped
+     * {@link RemoteSegmentGraphMerger}; it does not store {@code progress} as
+     * a field (the lambdas below capture the parameter directly). As a result
+     * the method cannot throw a {@link RuntimeException} in any reachable
+     * execution path — the {@code try/catch} in the engine's {@code finally}
+     * block is a compile-time safety net for hypothetical future subclasses or
+     * overrides, not a code path exercised by the production implementation.
      */
     public void setMergeProgress(MergeProgress progress) {
-        this.mergeProgress = progress;
         if (progress != null) {
             graphMerger.setPhaseListener(progress::updatePhase);
             graphMerger.setBatchListener((written, total) -> {

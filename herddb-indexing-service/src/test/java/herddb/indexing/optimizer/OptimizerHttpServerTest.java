@@ -324,6 +324,53 @@ public class OptimizerHttpServerTest {
     }
 
     // -------------------------------------------------------------------------
+    // Issue #503 review item 8: executor lifecycle
+    // -------------------------------------------------------------------------
+
+    @Test
+    public void closeShutsDownExecutorThread() throws Exception {
+        // Verify that close() terminates the optimizer-http executor thread
+        // within a bounded time. A regression that drops the executor.shutdownNow()
+        // call would cause the thread to linger across rolling restarts.
+        //
+        // Strategy: start a fresh OptimizerHttpServer on an ephemeral port,
+        // capture the thread name, call close(), then poll for the thread to
+        // disappear from the live thread set within 5 s.
+        OptimizerHttpServer closeHttp = new OptimizerHttpServer("127.0.0.1", 0, engine);
+        closeHttp.start();
+
+        // The optimizer-http thread is spawned lazily (on first request or by
+        // the executor's thread factory). Trigger one request to ensure the
+        // thread is alive before we call close().
+        fetch(closeHttp, "/health");
+
+        // Locate the optimizer-http thread.
+        Thread httpThread = null;
+        for (Thread t : Thread.getAllStackTraces().keySet()) {
+            if ("optimizer-http".equals(t.getName())) {
+                httpThread = t;
+                break;
+            }
+        }
+        // It may not yet exist if the executor hasn't started it yet (the
+        // single-threaded executor creates the thread on its first task).
+        // In either case close() must terminate it.
+        closeHttp.close();
+
+        if (httpThread != null) {
+            Thread finalThread = httpThread;
+            long deadline = System.currentTimeMillis() + 5_000L;
+            while (finalThread.isAlive() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+            assertTrue("optimizer-http thread must terminate within 5s after close()",
+                    !finalThread.isAlive());
+        }
+        // If httpThread was null the executor had not yet created its thread;
+        // close() still succeeds without throwing — verified by reaching here.
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 

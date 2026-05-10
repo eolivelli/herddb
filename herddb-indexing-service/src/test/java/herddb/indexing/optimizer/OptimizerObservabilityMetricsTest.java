@@ -470,6 +470,64 @@ public class OptimizerObservabilityMetricsTest {
     }
 
     @Test
+    public void postMergePublishFailureResetsMergeProgressAndRecordsFailed() throws Exception {
+        // Verify the safety net added in review item 1 (second pass): if a
+        // SegmentRegistryException escapes the post-merge publish/deprecate
+        // phase (e.g. ZK session loss between merger.merge() and
+        // registry.createSegment()), the engine must:
+        //   (a) reset MergeProgress to "idle"
+        //   (b) bump mergeFailuresTotal by 1
+        //   (c) record a "failed" entry in the merge history
+        //
+        // Mechanism: the postRevalidatePreDeprecateHookForTests field fires
+        // between createSegment(output) and deprecateInputSegment(). Closing
+        // the ZK client there causes the first deprecateInputSegment CAS to
+        // throw a SegmentRegistryException (not VersionMismatch), which
+        // propagates to the outer try/catch added in this PR.
+        registry.createSegment(sample("pmf-a", 100L));
+        registry.createSegment(sample("pmf-b", 100L));
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+
+        IndexOptimizerEngine engine = new IndexOptimizerEngine(registry, merger, TS_UUID,
+                new MergePolicy.SmallestFirstPolicy(2, 1000, 0L, Long.MAX_VALUE),
+                60_000L, () -> 0, fakeClock::get);
+
+        // Close ZK in the hook to force deprecateInputSegment to fail with a
+        // SegmentRegistryException. The exception is swallowed by runOnce()'s
+        // per-index catch so runOnce() returns normally — we then inspect the
+        // engine's observable state.
+        engine.postRevalidatePreDeprecateHookForTests = () -> {
+            try {
+                zk.close();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        };
+
+        // runOnce() swallows the per-index SegmentRegistryException; we check
+        // the engine's observable state after the call.
+        engine.runOnce();
+
+        // (a) MergeProgress must be idle after the failure.
+        assertEquals("MergeProgress must be idle after post-merge failure",
+                "idle", engine.getMergeProgress().snapshot().phase);
+        assertNull("mergeId must be null when idle",
+                engine.getMergeProgress().snapshot().mergeId);
+
+        // (b) mergeFailuresTotal must have advanced.
+        assertEquals("mergeFailuresTotal must be 1 after one post-merge failure",
+                1L, engine.getMergeFailuresTotal());
+
+        // (c) merge history must contain one "failed" record.
+        List<MergeRecord> history = engine.getMergeHistory();
+        assertEquals("exactly one history entry after the failure", 1, history.size());
+        assertEquals("outcome must be 'failed'", "failed", history.get(0).outcome);
+        assertNotNull("mergeId must be set in the failed record",
+                history.get(0).mergeId);
+        assertEquals("indexUuid must match", IDX_UUID, history.get(0).indexUuid);
+    }
+
+    @Test
     public void mergeHistoryEvictsOldestAtCap() throws Exception {
         // Register 2 segments so the policy fires on each tick, then run the
         // engine 21 times (1 above the MERGE_HISTORY_MAX=20 cap) and assert:
@@ -482,32 +540,58 @@ public class OptimizerObservabilityMetricsTest {
         InMemorySegmentMerger merger = new InMemorySegmentMerger();
         merger.setReturnNull(true); // declined every time — no ZK state changes
 
-        // Use a clock that advances by 1 ms per call so mergeId ordering
-        // is deterministic in the history list.
+        // Advance the clock by 1 ms before each tick so every record gets a
+        // distinct, monotonically-increasing startedAtMs value.
         IndexOptimizerEngine engine = new IndexOptimizerEngine(registry, merger, TS_UUID,
                 new MergePolicy.SmallestFirstPolicy(2, 1000, 0L, Long.MAX_VALUE),
                 60_000L, () -> 0, fakeClock::get);
 
-        // Run 21 times to exceed MERGE_HISTORY_MAX=20.
-        for (int i = 0; i < 21; i++) {
+        // Capture the timestamp that will be used by the FIRST tick (tick index 0).
+        // After exactly 21 ticks the 21st-cap forces eviction of the first entry.
+        long firstTickClockMs = fakeClock.incrementAndGet();
+        engine.runOnce();
+        // Record the startedAtMs of the first history entry so we can assert
+        // it was evicted after 20 more ticks land.
+        long firstEntryStartMs = engine.getMergeHistory().get(0).startedAtMs;
+        assertEquals("first entry's startedAtMs must match the first-tick clock value",
+                firstTickClockMs, firstEntryStartMs);
+
+        // Run 20 more ticks to fill the cap exactly…
+        for (int i = 1; i < 20; i++) {
             fakeClock.incrementAndGet();
             engine.runOnce();
         }
+        assertEquals("history must be exactly 20 after 20 ticks", 20,
+                engine.getMergeHistory().size());
+
+        // …then one more tick to trigger eviction of the first entry.
+        fakeClock.incrementAndGet();
+        engine.runOnce();
 
         List<MergeRecord> history = engine.getMergeHistory();
-        assertEquals("history must be capped at 20", 20, history.size());
+        assertEquals("history must be capped at 20 after 21 ticks", 20, history.size());
 
         // Verify all retained entries are "declined".
         for (MergeRecord r : history) {
             assertEquals("all retained entries must be declined", "declined", r.outcome);
         }
 
-        // FIFO: the first entry in the list is the 2nd merge (the 1st was evicted);
-        // the last is the 21st merge. Since fakeClock advances monotonically, the
-        // retained entries should have strictly increasing startedAtMs values.
+        // The first entry from tick 0 must have been evicted: its startedAtMs
+        // must NOT appear anywhere in the retained history.
+        for (MergeRecord r : history) {
+            assertTrue("first-tick entry must have been evicted by FIFO: found startedAtMs="
+                            + r.startedAtMs + " == firstEntryStartMs=" + firstEntryStartMs,
+                    r.startedAtMs != firstEntryStartMs);
+        }
+
+        // FIFO: retained entries must be in strictly ascending order by startedAtMs.
+        // (Each tick increments the clock by 1 ms before calling runOnce, so
+        //  every entry gets a unique, increasing timestamp.)
         for (int i = 1; i < history.size(); i++) {
-            assertTrue("history must be in FIFO order (older entries first)",
-                    history.get(i).startedAtMs >= history.get(i - 1).startedAtMs);
+            assertTrue("history must be in strict FIFO order (older entries first): "
+                            + history.get(i - 1).startedAtMs + " >= "
+                            + history.get(i).startedAtMs,
+                    history.get(i).startedAtMs > history.get(i - 1).startedAtMs);
         }
     }
 
