@@ -192,7 +192,24 @@ public final class OptimizerConfiguration {
     // {@code /herd/file-servers} path.
     // -------------------------------------------------------------------------
 
-    /** Comma-separated list of remote file-service endpoints. Empty → ZK discovery. */
+    /**
+     * Comma-separated list of remote file-service endpoints.
+     * When empty (the default), the optimizer discovers file servers via the
+     * long-lived {@link herddb.cluster.ZookeeperMetadataStorageManager} that stays
+     * open for the pod's lifetime. The built-in {@code fileServersWatcher} in
+     * {@code ZookeeperMetadataStorageManager} reacts to ZK children-changed events
+     * under {@code /<zookeeper-path>/fileServers} (e.g. {@code /herd/fileServers})
+     * and calls the optimizer's {@link herddb.metadata.ServiceDiscoveryListener},
+     * which schedules a merger upgrade tick so a startup-time {@code NoopMerger}
+     * is replaced as soon as the file server appears in ZooKeeper (issue #507).
+     *
+     * <p><b>Note on {@code safeModeFileDeletion=false}</b>: if no file servers are
+     * visible at optimizer startup, the engine is constructed with
+     * {@code safeModeFileDeletion=true} regardless of this property, and a
+     * {@code SEVERE} log is emitted. Physical file deletion will remain disabled
+     * until a pod restart. Ensure the file-server pod starts before the optimizer
+     * to avoid this fallback.
+     */
     public static final String PROPERTY_REMOTE_FILE_SERVERS = "indexoptimizer.remote.file.servers";
     public static final String PROPERTY_REMOTE_FILE_SERVERS_DEFAULT = "";
 

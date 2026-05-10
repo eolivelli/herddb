@@ -22,6 +22,7 @@ package herddb.indexing.optimizer;
 import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.indexing.segment.SegmentRegistryClient;
 import herddb.metadata.MetadataStorageManagerException;
+import herddb.metadata.ServiceDiscoveryListener;
 import herddb.model.TableSpace;
 import herddb.server.RemoteFileClient;
 import herddb.server.RemoteFileServiceFactory;
@@ -48,6 +49,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.zookeeper.AddWatchMode;
@@ -98,6 +100,15 @@ public final class IndexOptimizerMain {
     private final SegmentMerger preconfiguredMerger;
 
     /**
+     * Test seam: when non-null, {@link #maybeUpgradeMerger()} builds the upgraded
+     * merger using this factory instead of {@link #buildRemoteSegmentMerger}.
+     * Never set in production code; package-private so unit tests in
+     * {@code herddb.indexing.optimizer} can inject a synthetic factory (e.g.
+     * returning {@link InMemorySegmentMerger}) without needing a live file server.
+     */
+    Function<List<String>, SegmentMerger> mergerBuilderForTests;
+
+    /**
      * Current ZooKeeper client. Replaced atomically by {@link #reconnectZooKeeper}
      * when the previous session expired (issue #504). Reads through
      * {@link #zkRef} so {@link SegmentRegistryClient} and {@link OptimizerLeaderLock}
@@ -112,6 +123,33 @@ public final class IndexOptimizerMain {
     private final AtomicReference<ZooKeeper> zkRef = new AtomicReference<>();
     private volatile String zkAddress;
     private volatile int zkSessionTimeoutMs;
+    /**
+     * ZooKeeper base path (e.g. {@code /herd}). Stored as a field so that
+     * {@link #buildRemoteSegmentMerger} can access it without re-reading the
+     * configuration (issue #507).
+     */
+    private volatile String zkBasePath;
+
+    /**
+     * Long-lived metadata manager used for:
+     * <ol>
+     *   <li>Resolving the tablespace UUID from the human-readable name at startup.</li>
+     *   <li>Discovering remote file servers via {@code listFileServers()} — which
+     *       installs a ZK children-watch on {@code /herd/fileServers}.</li>
+     *   <li>Reacting to file-server registration events via the
+     *       {@link ServiceDiscoveryListener} registered in {@link #start}: whenever
+     *       {@code onFileServersChanged} fires, the optimizer schedules an upgrade
+     *       tick so a {@link NoopMerger} is replaced as soon as the file server
+     *       appears in ZooKeeper.</li>
+     * </ol>
+     *
+     * <p>Unlike the previous short-lived instance (opened + closed in
+     * {@link #start}), this instance is kept alive for the lifetime of the
+     * optimizer pod so the built-in watcher machinery in
+     * {@link ZookeeperMetadataStorageManager} continuously re-discovers file
+     * servers without any polling (issue #507). Closed by {@link #shutdown}.
+     */
+    private ZookeeperMetadataStorageManager zkMeta;
     /** Coalesces concurrent reconnect attempts triggered by the bootstrap watcher. */
     private final AtomicBoolean reconnectInFlight = new AtomicBoolean(false);
     private final AtomicLong sessionReconnects = new AtomicLong();
@@ -128,8 +166,19 @@ public final class IndexOptimizerMain {
     private OptimizerLeaderLock leaderLock;
     private IndexOptimizerEngine engine;
     private OptimizerHttpServer httpServer;
-    private SegmentMerger merger;
-    private DataStorageManager mergerDataStorageManager;
+    /**
+     * Currently active merger. {@code volatile} so that the unsynchronized
+     * {@link #getMerger()} method (used by tests and future monitoring endpoints)
+     * always sees the latest value written by {@link #maybeUpgradeMerger()} under
+     * {@code synchronized(this)} (JMM visibility guarantee).
+     */
+    private volatile SegmentMerger merger;
+    /**
+     * DataStorageManager wired to the current merger. {@code volatile} for the
+     * same reason as {@link #merger}; both fields are always updated together
+     * inside {@link #maybeUpgradeMerger()} under {@code synchronized(this)}.
+     */
+    private volatile DataStorageManager mergerDataStorageManager;
     private RemoteFileClient mergerFileClient;
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
 
@@ -233,6 +282,8 @@ public final class IndexOptimizerMain {
         String basePath = configuration.getString(
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH,
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH_DEFAULT);
+        // Store as a field so maybeUpgradeMerger() can access it at tick time.
+        this.zkBasePath = basePath;
         String tablespaceName = configuration.getString(
                 OptimizerConfiguration.PROPERTY_TABLESPACE_NAME, null);
         if (tablespaceName == null || tablespaceName.isEmpty()) {
@@ -240,37 +291,84 @@ public final class IndexOptimizerMain {
                     OptimizerConfiguration.PROPERTY_TABLESPACE_NAME + " must be set");
         }
 
-        // Resolve the tablespace UUID from the human-readable name by consulting
-        // the HerdDB cluster metadata in ZooKeeper.  We open a short-lived
-        // ZookeeperMetadataStorageManager exclusively for this lookup and close
-        // it immediately after so that the optimizer's permanent ZK connection
-        // (used by SegmentRegistryClient and OptimizerLeaderLock) is separate
-        // and independently reconnectable.
+        // Open the long-lived ZookeeperMetadataStorageManager used for:
+        //   1. Resolving the tablespace UUID from the human-readable name.
+        //   2. Discovering remote file servers via listFileServers() — which
+        //      installs a ZK children-watch on /herd/fileServers.
+        //   3. Reacting to file-server registration events via ServiceDiscoveryListener
+        //      so a startup-time NoopMerger is replaced as soon as the file server
+        //      appears in ZooKeeper (issue #507).
+        // Unlike the previous short-lived instance, this one stays open for the
+        // pod's lifetime. The ZookeeperMetadataStorageManager's built-in
+        // fileServersWatcher re-installs itself on every listFileServers() call,
+        // so the optimizer continuously re-discovers file servers reactively.
+        this.zkMeta = new ZookeeperMetadataStorageManager(zkAddress, sessionTimeout, basePath);
+        try {
+            zkMeta.start(false); // read-only: do not create/format cluster metadata paths
+        } catch (MetadataStorageManagerException e) {
+            throw new IllegalStateException(
+                    "Failed to start ZookeeperMetadataStorageManager: " + e.getMessage(), e);
+        }
+
+        // Register before listFileServers() so that if file servers appear
+        // between the getChildren call and the watcher registration (highly
+        // unlikely but theoretically possible), the watcher fires after
+        // start() returns and schedules a tick.
+        zkMeta.addServiceDiscoveryListener(new ServiceDiscoveryListener() {
+            @Override
+            public void onFileServersChanged(List<String> addresses) {
+                // Called on the ZK watcher thread — do NOT block it with heavy work.
+                // Schedule a tick on the optimizer scheduler: tickSafe() calls
+                // maybeUpgradeMerger() which builds the real merger if needed.
+                if (addresses == null || addresses.isEmpty()) {
+                    return;
+                }
+                synchronized (IndexOptimizerMain.this) {
+                    // merger is null between addServiceDiscoveryListener() (line above) and
+                    // this.merger = resolveMerger() later in start(). start() holds the
+                    // IndexOptimizerMain monitor the entire time, so this listener will
+                    // block on the synchronized block until start() completes — at which
+                    // point merger is non-null. The null guard is a belt-and-suspenders
+                    // defensive check in case of unexpected future refactoring.
+                    if (merger == null || !(merger instanceof NoopMerger)) {
+                        return; // not yet initialised, or already upgraded — nothing to do
+                    }
+                }
+                LOGGER.log(Level.INFO,
+                        "onFileServersChanged: {0} server(s) discovered; scheduling merger upgrade",
+                        addresses.size());
+                scheduleEventDrivenTick();
+            }
+        });
+
         List<String> discoveredFileServers = new ArrayList<>();
-        try (ZookeeperMetadataStorageManager zkmeta =
-                new ZookeeperMetadataStorageManager(zkAddress, sessionTimeout, basePath)) {
-            zkmeta.start(false); // read-only: do not create/format cluster metadata paths
-            TableSpace ts = zkmeta.describeTableSpace(tablespaceName);
-            if (ts == null) {
-                throw new IllegalStateException(
-                        "No tablespace named '" + tablespaceName + "' found under "
-                        + basePath + "/tableSpaces — ensure the HerdDB cluster has started "
-                        + "and created its default tablespace before starting the optimizer.");
-            }
-            tablespaceUuid = ts.uuid;
-            try {
-                discoveredFileServers.addAll(zkmeta.listFileServers());
-            } catch (MetadataStorageManagerException listErr) {
-                LOGGER.log(Level.WARNING,
-                        "could not discover remote file servers via ZK; the optimizer"
-                                + " will fall back to NoopMerger if the static server list"
-                                + " is also empty: {0}",
-                        listErr.getMessage());
-            }
+        TableSpace ts;
+        try {
+            ts = zkMeta.describeTableSpace(tablespaceName);
         } catch (MetadataStorageManagerException e) {
             throw new IllegalStateException(
                     "Failed to resolve tablespace '" + tablespaceName + "' from ZooKeeper: "
                     + e.getMessage(), e);
+        }
+        if (ts == null) {
+            throw new IllegalStateException(
+                    "No tablespace named '" + tablespaceName + "' found under "
+                    + basePath + "/tableSpaces — ensure the HerdDB cluster has started "
+                    + "and created its default tablespace before starting the optimizer.");
+        }
+        tablespaceUuid = ts.uuid;
+        try {
+            // listFileServers() installs the ZK children-watch on /herd/fileServers.
+            // Even if it returns empty (file server not yet registered), the watch
+            // will fire when the file server registers and onFileServersChanged above
+            // will schedule an upgrade tick automatically.
+            discoveredFileServers.addAll(zkMeta.listFileServers());
+        } catch (MetadataStorageManagerException listErr) {
+            LOGGER.log(Level.WARNING,
+                    "could not discover remote file servers via ZK; the optimizer"
+                            + " will fall back to NoopMerger until the ZK watcher fires"
+                            + " or the static server list is configured: {0}",
+                    listErr.getMessage());
         }
         LOGGER.log(Level.INFO, "Resolved tablespace name ''{0}'' to UUID {1}",
                 new Object[]{tablespaceName, tablespaceUuid});
@@ -315,6 +413,24 @@ public final class IndexOptimizerMain {
         boolean safeModeFileDeletion = configuration.getBoolean(
                 OptimizerConfiguration.PROPERTY_SAFE_MODE_FILE_DELETION,
                 OptimizerConfiguration.PROPERTY_SAFE_MODE_FILE_DELETION_DEFAULT);
+        // When safeModeFileDeletion=false the engine requires a non-null DataStorageManager.
+        // If no file servers were discovered at startup (startup-ordering race), the DSM is
+        // null and the engine constructor would throw IllegalArgumentException — defeating the
+        // self-healing intent of this fix. Coerce to safe mode for this run and log SEVERE so
+        // the operator is aware. Physical file deletion will remain disabled until the pod is
+        // restarted after file servers are visible in ZooKeeper. The merger itself upgrades
+        // reactively via maybeUpgradeMerger() once file servers appear, so merging still works.
+        boolean effectiveSafeMode = safeModeFileDeletion;
+        if (!effectiveSafeMode && mergerDataStorageManager == null) {
+            LOGGER.log(Level.SEVERE,
+                    "safeModeFileDeletion=false was requested but no DataStorageManager is "
+                    + "available (no file servers were discovered at startup). Coercing to "
+                    + "safeModeFileDeletion=true for this run; physical file deletion will "
+                    + "remain disabled until a pod restart after file servers are visible in "
+                    + "ZooKeeper. Ensure the file-server pod starts before the optimizer to "
+                    + "avoid this fallback.");
+            effectiveSafeMode = true;
+        }
         // The merger constructs its own DSM for the merge path. The reaper
         // can use the same DSM to physically delete files at retention if
         // safeMode is opted out (the operator's responsibility).
@@ -323,7 +439,7 @@ public final class IndexOptimizerMain {
                 System::currentTimeMillis,
                 mergerDataStorageManager,
                 leaderLock,
-                safeModeFileDeletion);
+                effectiveSafeMode);
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             FastThreadLocalThread t = new FastThreadLocalThread(r, "index-optimizer-engine");
@@ -378,6 +494,11 @@ public final class IndexOptimizerMain {
 
     private void tickSafe() {
         try {
+            // Issue #507: if the optimizer started with a NoopMerger (because ZK discovery
+            // was empty at startup), attempt to upgrade to a real merger before each tick.
+            // This is the safety-net path; the primary upgrade path is the ZK watcher
+            // in onFileServersChanged() → scheduleEventDrivenTick() registered in start().
+            maybeUpgradeMerger();
             engine.runOnce();
         } catch (herddb.indexing.segment.SegmentRegistryException | RuntimeException e) {
             // Narrow catch (review item H1): the engine's runOnce now declares a typed
@@ -592,8 +713,98 @@ public final class IndexOptimizerMain {
     }
 
     // -------------------------------------------------------------------------
-    // Merger resolution
+    // Merger resolution and late-binding upgrade (issue #507)
     // -------------------------------------------------------------------------
+
+    /**
+     * Issue #507, Option B — tick-time late-binding merger upgrade.
+     *
+     * <p>If the optimizer started with a {@link NoopMerger} (because both the static
+     * {@link OptimizerConfiguration#PROPERTY_REMOTE_FILE_SERVERS} and the startup-time
+     * ZK discovery were empty), this method is called at the top of every
+     * {@link #tickSafe()} to retry ZK discovery and, if file servers are now visible,
+     * build a real {@link RemoteSegmentMerger} and install it atomically via
+     * {@link IndexOptimizerEngine#upgradeMerger}.
+     *
+     * <p>Synchronised on {@code this} for two reasons: (a) the single-threaded
+     * scheduler serialises ticks, but the ZK-session-expiry reconnect path can
+     * also call {@link #scheduleEventDrivenTick} from a different thread, potentially
+     * racing with this path; (b) {@link #merger} and {@link #mergerDataStorageManager}
+     * are both updated here and must be seen together by any subsequent read.
+     *
+     * <p>Skipped entirely when:
+     * <ul>
+     *   <li>The current merger is already a real merger (not {@link NoopMerger}).</li>
+     *   <li>A merger was pre-configured via the constructor (test/SPI path) — the
+     *       pre-configured merger takes priority unconditionally.</li>
+     *   <li>{@link #engine} is not yet initialised (called defensively before
+     *       {@link #start()} completes).</li>
+     * </ul>
+     */
+    private synchronized void maybeUpgradeMerger() {
+        if (preconfiguredMerger != null || engine == null || !(merger instanceof NoopMerger)) {
+            return;
+        }
+        // Re-check static config first — faster than a ZK round-trip and avoids the
+        // network if the operator added the static key after the optimizer started.
+        String staticServers = configuration.getString(
+                OptimizerConfiguration.PROPERTY_REMOTE_FILE_SERVERS,
+                OptimizerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
+        List<String> servers = new ArrayList<>();
+        if (staticServers != null && !staticServers.isEmpty()) {
+            for (String s : staticServers.split(",")) {
+                String trimmed = s.trim();
+                if (!trimmed.isEmpty()) {
+                    servers.add(trimmed);
+                }
+            }
+        }
+        if (servers.isEmpty()) {
+            // Re-attempt ZK discovery via the long-lived zkMeta instance (issue #507).
+            // This reuses the already-open ZK session — no new session overhead —
+            // and also re-arms the fileServersWatcher so future file-server changes
+            // continue to trigger onFileServersChanged callbacks.
+            if (zkMeta == null) {
+                return; // start() not yet complete
+            }
+            try {
+                servers.addAll(zkMeta.listFileServers());
+            } catch (MetadataStorageManagerException zkErr) {
+                LOGGER.log(Level.FINE,
+                        "maybeUpgradeMerger: ZK discovery failed, will retry on next tick: {0}",
+                        zkErr.getMessage());
+                return;
+            }
+        }
+        if (servers.isEmpty()) {
+            return; // still nothing — skip and try again on the next tick
+        }
+        LOGGER.log(Level.INFO,
+                "maybeUpgradeMerger: discovered file servers {0}; upgrading from NoopMerger",
+                servers);
+        try {
+            SegmentMerger upgraded;
+            if (mergerBuilderForTests != null) {
+                // Test seam: use the injected factory instead of the real RemoteSegmentMerger
+                // constructor (which requires a live file server and dim config).
+                upgraded = mergerBuilderForTests.apply(servers);
+            } else {
+                upgraded = buildRemoteSegmentMerger(servers, zkAddress, zkBasePath);
+            }
+            this.merger = upgraded;
+            engine.upgradeMerger(upgraded, mergerDataStorageManager);
+            LOGGER.log(Level.INFO,
+                    "maybeUpgradeMerger: successfully upgraded to {0}",
+                    upgraded.getClass().getSimpleName());
+        } catch (IOException | RuntimeException buildErr) {
+            // Building the merger failed (bad config, unreachable server, etc.).
+            // Log and stay with NoopMerger — the next tick will retry.
+            LOGGER.log(Level.WARNING,
+                    "maybeUpgradeMerger: failed to build RemoteSegmentMerger; "
+                            + "will retry on next tick: {0}",
+                    buildErr.getMessage());
+        }
+    }
 
     /**
      * Resolves the {@link SegmentMerger} for this optimizer. Resolution order:
@@ -645,6 +856,11 @@ public final class IndexOptimizerMain {
             return new NoopMerger();
         }
         try {
+            if (mergerBuilderForTests != null) {
+                // Test seam: use the injected factory instead of the real RemoteSegmentMerger
+                // constructor (which requires a live file server and dim config).
+                return mergerBuilderForTests.apply(servers);
+            }
             return buildRemoteSegmentMerger(servers, zkAddress, basePath);
         } catch (RuntimeException buildErr) {
             // Building the DSM is the plugin boundary — surface and fall back rather
@@ -677,16 +893,10 @@ public final class IndexOptimizerMain {
                         OptimizerConfiguration.PROPERTY_REMOTE_FILE_MAX_INFLIGHT_WRITE_BYTES,
                         OptimizerConfiguration.PROPERTY_REMOTE_FILE_MAX_INFLIGHT_WRITE_BYTES_DEFAULT));
 
-        RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
-        this.mergerFileClient = factory.createClient(servers, clientConfig);
-        Path tmpDir = resolveTmpDirectory();
-        Path metaDir = tmpDir.resolve("merger-metadata");
-        Path remoteTmp = tmpDir.resolve("merger-remote-tmp");
-        Files.createDirectories(metaDir);
-        Files.createDirectories(remoteTmp);
-        this.mergerDataStorageManager = factory.createDataStorageManager(
-                metaDir, remoteTmp, Integer.MAX_VALUE, mergerFileClient);
-
+        // Validate all configuration BEFORE allocating any resources (gRPC channel,
+        // DataStorageManager) to avoid resource leaks when validation fails. Previously
+        // the dim check came after factory.createClient(), leaking a file client on every
+        // failed call (issue #507, reviewer finding).
         int dim = configuration.getInt("indexoptimizer.merge.dim", 0);
         if (dim <= 0) {
             // The merger needs the dimension up front. Fall back: we don't
@@ -716,6 +926,17 @@ public final class IndexOptimizerMain {
                             + " (expected one of " + Arrays.toString(VectorSimilarityFunction.values())
                             + ")", badName);
         }
+
+        RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
+        this.mergerFileClient = factory.createClient(servers, clientConfig);
+        Path tmpDir = resolveTmpDirectory();
+        Path metaDir = tmpDir.resolve("merger-metadata");
+        Path remoteTmp = tmpDir.resolve("merger-remote-tmp");
+        Files.createDirectories(metaDir);
+        Files.createDirectories(remoteTmp);
+        this.mergerDataStorageManager = factory.createDataStorageManager(
+                metaDir, remoteTmp, Integer.MAX_VALUE, mergerFileClient);
+
         return new RemoteSegmentMerger(mergerDataStorageManager, tmpDir,
                 dim, graphM, beamWidth, neighborOverflow, alpha, similarity);
     }
@@ -775,6 +996,19 @@ public final class IndexOptimizerMain {
                 // an earlier exception.
                 LOGGER.log(Level.WARNING, "merger file client close failed: {0}",
                         e.getMessage());
+            }
+        }
+        // Close the long-lived ZookeeperMetadataStorageManager last. Its ZK session
+        // must stay open until after the leader lock is released and the primary ZK
+        // session is closed, so file-server watchers don't fire spuriously during
+        // orderly shutdown.
+        if (zkMeta != null) {
+            try {
+                zkMeta.close();
+            } catch (Exception e) {
+                // Broad catch: MetadataStorageManager.close() declares Exception.
+                // Best-effort cleanup during shutdown — log and proceed.
+                LOGGER.log(Level.WARNING, "zkMeta close failed: {0}", e.getMessage());
             }
         }
         shutdownLatch.countDown();
