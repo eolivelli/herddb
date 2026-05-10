@@ -640,6 +640,49 @@ public class VectorIndexManager extends AbstractIndexManager {
     }
 
     /**
+     * Issue #509: overrides the base-class no-op to notify the IS to begin
+     * eager background cleanup of its ZK segment registry and file-server data
+     * for this index, without waiting for the commit-log tailer to catch up.
+     *
+     * <p>Called synchronously from {@code disposeIndexManager()} (the actual SQL
+     * DROP path) but dispatched from there on a background thread, so the DDL
+     * write lock is never held during gRPC fan-out. Best-effort: a failure is
+     * logged at WARNING and never propagated — the IS tailer-based cleanup path
+     * handles the {@code DROP_INDEX} log entry once the IS recovers.
+     *
+     * <p>Must <em>not</em> be called from follower-download or restore paths;
+     * those call {@link #dropIndexData()} directly and leave the IS state intact
+     * because the index remains live in the cluster schema.
+     */
+    @Override
+    public void notifyIsOfDrop() {
+        // Eagerly notify all IS instances so ZK segment registry and file-server
+        // data are cleaned up before the optimizer's next tick — especially
+        // important when the table is immediately recreated (DROP + CREATE cycle)
+        // because stale ZK entries from the previous run cause optimizer merge
+        // failures against incompletely-written segment files (issue #509).
+        try {
+            RemoteVectorIndexService svc = remoteServiceSupplier.get();
+            if (svc != null) {
+                // Pass index.uuid so the IS can gate the removal: if the IS
+                // has already processed both the DROP and a subsequent
+                // CREATE_INDEX for the same (table, name), the UUID of the
+                // currently-tracked store will differ and the IS will skip
+                // the removal, preventing data loss on fast DROP+CREATE cycles.
+                svc.dropIndex(tableSpaceUUID, index.table, index.name, index.uuid);
+            }
+        } catch (RuntimeException e) {
+            // Plugin boundary: IS may be transiently down (pod restart, GC
+            // pause). The tailer-based cleanup path handles the DROP_INDEX log
+            // entry once the IS recovers, so this is safe to swallow here.
+            LOGGER.log(Level.WARNING,
+                    "notifyIsOfDrop: IS notification failed for index {0} "
+                            + "(cleanup will proceed via commit-log tailer): {1}",
+                    new Object[]{index.name, e.getMessage()});
+        }
+    }
+
+    /**
      * Returns status information from the remote IndexingService.
      */
     public RemoteVectorIndexService.IndexStatusInfo getRemoteIndexStatus() {

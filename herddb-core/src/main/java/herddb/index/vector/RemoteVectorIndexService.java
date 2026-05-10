@@ -80,6 +80,39 @@ public interface RemoteVectorIndexService extends AutoCloseable {
     boolean waitForCatchUp(String tablespace, LogSequenceNumber sequenceNumber, long timeoutMs) throws InterruptedException;
 
     /**
+     * Issue #509: eagerly notifies every IS instance to begin background
+     * cleanup of the ZK segment registry and file-server data for the named
+     * index. Called by {@link herddb.index.vector.VectorIndexManager#notifyIsOfDrop()}
+     * immediately when the HerdDB server processes a DROP TABLE / DROP INDEX,
+     * before the commit-log tailer has had a chance to reach the matching
+     * {@code DROP_INDEX} log entry.
+     *
+     * <p>Best-effort: if an IS instance is unreachable (e.g. pod restart),
+     * the failure is logged at WARNING and the method returns normally.
+     * The commit-log tailer path remains the authoritative cleanup fallback —
+     * the IS handles both the eager RPC and the tailer entry idempotently
+     * (a second removal of a store key that is no longer tracked is a no-op).
+     *
+     * <p>The server does <em>not</em> block waiting for the actual file or
+     * ZK node deletion to complete: the IS queues the cleanup in its
+     * background {@code checkpointExecutor} and returns as soon as the
+     * in-memory store reference has been removed from its tracking map.
+     *
+     * <p>The {@code indexUuid} parameter is a UUID gate: if the IS has already
+     * processed both the DROP and a subsequent CREATE_INDEX for the same
+     * (table, indexName), the currently-tracked store belongs to the new index.
+     * The IS uses the UUID to detect this case and skip the removal, preventing
+     * data loss on fast DROP+CREATE cycles. An empty or null UUID means "unknown"
+     * and the gate is skipped (safe fallback for rolling upgrades).
+     *
+     * @param tablespace the HerdDB tablespace UUID
+     * @param table      the table name
+     * @param indexName  the index name
+     * @param indexUuid  the HerdDB catalog UUID of the specific index being dropped
+     */
+    void dropIndex(String tablespace, String table, String indexName, String indexUuid);
+
+    /**
      * Returns the minimum LSN across all known IndexingService instances for
      * the given tablespace — the floor below which commit-log segments must
      * not be deleted while tailers are active.

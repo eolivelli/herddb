@@ -1968,6 +1968,105 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
     }
 
+    /**
+     * Issue #509: eager DROP trigger called by the IS gRPC server when the
+     * HerdDB server issues a {@code DropIndex} RPC on DROP TABLE / DROP INDEX,
+     * without waiting for the commit-log tailer to process the matching
+     * {@code DROP_INDEX} log entry.
+     *
+     * <p>Removes the vector store from the in-memory {@link #vectorStores} and
+     * {@link #vectorStoreIndexUuids} maps using the caller-supplied
+     * {@code (table, indexName)} key — no {@link SchemaTracker} access is
+     * needed, which keeps this method safe to call from the gRPC server thread
+     * (the tailer owns {@code schemaTracker}; the two maps are
+     * {@link java.util.concurrent.ConcurrentHashMap}s and are safe to mutate
+     * from any thread).
+     *
+     * <p>If a store was found, it is handed to
+     * {@link #submitVectorStoreDeletion} which:
+     * <ol>
+     *   <li>Calls {@code store.close()} to release in-memory resources.</li>
+     *   <li>Calls {@code store.dropAllRegistryEntries()} to sweep the ZK
+     *       segment-registry entries (fast — a handful of znode deletes even
+     *       for a 20B-vector index).</li>
+     *   <li>Calls {@code dataStorageManager.dropIndex()} to delete the
+     *       on-disk / MinIO segment files (may be slow; runs in the
+     *       background {@code checkpointExecutor} so the RPC returns
+     *       before file deletion completes).</li>
+     * </ol>
+     *
+     * <p>Idempotent: if the store is not tracked (already removed by a
+     * previous eager call or by the tailer's own DROP_INDEX path), this
+     * is a harmless no-op.
+     *
+     * @param table     the table name as used in {@link #storeKey}
+     * @param indexName the index name as used in {@link #storeKey}
+     */
+    public void dropIndexImmediate(String table, String indexName, String requestedUuid) {
+        String k = storeKey(table, indexName);
+        // Atomically inspect and, if appropriate, remove the store from
+        // vectorStores.  The UUID gate prevents data loss on DROP+CREATE cycles:
+        // if the IS tailer has already processed both the DROP_INDEX and a
+        // subsequent CREATE_INDEX for the same (table, indexName), the
+        // currently-tracked store has a different UUID and must not be removed.
+        //
+        // We do NOT remove from vectorStoreIndexUuids here: the tailer's own
+        // DROP_INDEX path will do that when it catches up, avoiding a secondary
+        // race where a concurrent CREATE_INDEX could put a new UUID in the map
+        // between our compute() and a separate vectorStoreIndexUuids.remove().
+        //
+        // An empty/null requestedUuid skips the UUID gate — safe fallback for
+        // IS clients built before this field was added (rolling upgrades).
+        AbstractVectorStore[] toDelete = {null};
+        vectorStores.compute(k, (key, currentStore) -> {
+            if (currentStore == null) {
+                // Already gone — tailer cleaned it up or it was never tracked.
+                return null;
+            }
+            if (requestedUuid != null && !requestedUuid.isEmpty()) {
+                String currentUuid = vectorStoreIndexUuids.get(key);
+                if (currentUuid == null) {
+                    // UUID not yet written — createVectorStoreIfNeeded writes UUID
+                    // before the store, so if a UUID is absent here the store entry
+                    // is stale from before the first UUID gate was introduced, or
+                    // we are in an unexpected state. Refuse to delete: conservatively
+                    // keep the store and let the tailer clean up (positive-match policy).
+                    LOGGER.log(Level.INFO,
+                            "dropIndexImmediate: key {0} has no tracked UUID "
+                                    + "(requested uuid={1}); refusing to remove — "
+                                    + "tailer will handle cleanup",
+                            new Object[]{key, requestedUuid});
+                    return currentStore; // keep
+                }
+                if (!currentUuid.equals(requestedUuid)) {
+                    // UUID mismatch: the IS has already processed both the DROP and
+                    // a subsequent CREATE_INDEX — the new store must not be removed.
+                    LOGGER.log(Level.INFO,
+                            "dropIndexImmediate: key {0} already replaced by uuid={1} "
+                                    + "(requested uuid={2}); no-op "
+                                    + "(DROP+CREATE race resolved correctly)",
+                            new Object[]{key, currentUuid, requestedUuid});
+                    return currentStore; // keep the new store
+                }
+            }
+            toDelete[0] = currentStore;
+            return null; // remove atomically
+        });
+
+        if (toDelete[0] != null) {
+            LOGGER.log(Level.INFO,
+                    "dropIndexImmediate: submitting eager deletion for store key {0} "
+                            + "(triggered by HerdDB server DropIndex RPC, issue #509)",
+                    k);
+            submitVectorStoreDeletion(k, toDelete[0]);
+        } else {
+            LOGGER.log(Level.FINE,
+                    "dropIndexImmediate: store key {0} not removed (already dropped, "
+                            + "never seen, or UUID mismatch — tailer will handle it); no-op",
+                    k);
+        }
+    }
+
     private static boolean isDmlType(short type) {
         return type == LogEntryType.INSERT
                 || type == LogEntryType.UPDATE
@@ -2376,8 +2475,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // The vector column is the first (and only) column of the vector index
         String vectorColumnName = index.columnNames[0];
         AbstractVectorStore store = vectorStoreFactory.create(index.name, index.table, vectorColumnName, dataDirectory, index.properties);
-        vectorStores.put(key, store);
+        // IMPORTANT: put the UUID into vectorStoreIndexUuids BEFORE putting the
+        // store into vectorStores.  dropIndexImmediate() uses a compute() on
+        // vectorStores: if it sees currentStore != null it reads vectorStoreIndexUuids
+        // to decide whether to remove the store.  By writing the UUID first we
+        // guarantee that by the time the store is visible in vectorStores, its
+        // UUID is already visible in vectorStoreIndexUuids, making the gate
+        // race-free (issue #509 TOCTOU fix).
         vectorStoreIndexUuids.put(key, index.uuid);
+        vectorStores.put(key, store);
         registerIndexMetrics(index.tablespace, index.table, index.name, store);
         LOGGER.log(Level.INFO, "Created vector store for index {0} on column {1} with properties {2}",
                 new Object[]{index.name, vectorColumnName, index.properties});
