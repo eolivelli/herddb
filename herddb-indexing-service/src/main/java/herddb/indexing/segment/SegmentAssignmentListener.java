@@ -59,8 +59,11 @@ public interface SegmentAssignmentListener {
      * and free associated resources.
      *
      * @param previous the last metadata observed while the local instance still
-     *                 held ownership, or {@code null} if the segment was deleted
-     *                 outright.
+     *                 held ownership. Always non-null: even when the segment znode
+     *                 is deleted outright (rather than first set to DEPRECATED),
+     *                 the watcher passes the last cached copy so downstream
+     *                 listeners can identify and clean up the segment by UUID.
+     *                 (Since issue #514; prior to that, null was passed on deletion.)
      */
     default void onSegmentReleased(SegmentMetadata previous) {
     }

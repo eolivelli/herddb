@@ -243,7 +243,10 @@ public class SegmentOwnershipTransferTest {
 
             VersionedSegmentMetadata current = registry.getSegment(TS_UUID, IDX_UUID, SEG_UUID).orElseThrow();
             registry.casDeleteSegment(current);
-            waitFor(() -> l0.events.contains("RELEASED:<deleted>"));
+            // The watcher passes the cached pre-deletion metadata (not null) so that
+            // downstream listeners (e.g. IndexingServiceEngine) can identify which segment
+            // was removed and call dropSegmentByUuid on it.
+            waitFor(() -> l0.events.contains("RELEASED:" + SEG_UUID));
         }
     }
 
