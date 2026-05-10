@@ -163,23 +163,30 @@ public final class RemoteSegmentGraphMerger {
 
     /**
      * Optional phase-change callback. Receives the new phase name as a
-     * {@code String} at each major transition within the merge. Not thread-safe
-     * — must be set from the same thread that calls {@link #merge}. The HTTP
-     * server thread only reads the effects through the caller-managed
-     * {@code MergeProgress} object that receives the callbacks.
+     * {@code String} at each major transition within the merge.
+     *
+     * <p>Written by the caller from the optimizer thread immediately before
+     * each {@link #merge} call (via {@link #setPhaseListener}), and cleared
+     * from the same thread in a {@code finally} block after {@link #merge}
+     * returns. The HTTP server thread reads the effects only through the
+     * {@code MergeProgress} object that receives callbacks, not this field
+     * directly. Declared {@code volatile} so the assignment is visible to the
+     * optimizer thread's own subsequent reads within {@link #merge} if it were
+     * ever called from a thread that set the listener on a different thread;
+     * also guards any accidental double-checked read inside the merge logic.
      */
-    private Consumer<String> phaseListener;
+    private volatile Consumer<String> phaseListener;
 
     /**
      * Optional batch-progress callback. Receives {@code (written, total)} as
      * a pair of {@code long}s fired every {@value #BATCH_PROGRESS_INTERVAL}
-     * vectors during the legacy graph-build phase. Not thread-safe — same
-     * constraint as {@link #phaseListener}.
+     * vectors during the legacy graph-build phase. Same lifecycle as
+     * {@link #phaseListener}; declared {@code volatile} for the same reason.
      *
      * <p>{@link LongBinaryOperator} is used here purely as a convenient
      * two-{@code long} consumer; the return value is ignored.
      */
-    private LongBinaryOperator batchListener;
+    private volatile LongBinaryOperator batchListener;
 
     /**
      * Timing breakdown of the last completed merge. Written at the end of

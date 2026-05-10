@@ -30,7 +30,9 @@ import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -63,6 +65,8 @@ public final class OptimizerHttpServer implements AutoCloseable {
 
     private final HttpServer server;
     private final IndexOptimizerEngine engine;
+    /** Single-threaded executor backing the JDK HttpServer; shut down in {@link #close()}. */
+    private final ExecutorService executor;
     /** Optional: when non-null, disk-free gauges are computed for this path. */
     private final Path tmpDirectory;
 
@@ -96,11 +100,13 @@ public final class OptimizerHttpServer implements AutoCloseable {
         server.createContext("/status", new StatusHandler());
         server.createContext("/merge-history", new MergeHistoryHandler());
         // Single-threaded executor — these endpoints are admin-grade, not on the hot path.
-        server.setExecutor(Executors.newSingleThreadExecutor(r -> {
+        // Kept in a field so close() can shut it down cleanly.
+        this.executor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "optimizer-http");
             t.setDaemon(true);
             return t;
-        }));
+        });
+        server.setExecutor(executor);
     }
 
     public void start() {
@@ -116,8 +122,17 @@ public final class OptimizerHttpServer implements AutoCloseable {
 
     @Override
     public void close() {
-        // Stop with a 0-second grace; this is a daemon admin endpoint.
+        // Stop the server with a 0-second grace; this is a daemon admin endpoint.
         server.stop(0);
+        // Shut down the executor so the HTTP thread exits cleanly.
+        executor.shutdownNow();
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                LOGGER.log(Level.WARNING, "optimizer-http executor did not terminate within 5s");
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     // -------------------------------------------------------------------------

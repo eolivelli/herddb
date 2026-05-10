@@ -469,6 +469,48 @@ public class OptimizerObservabilityMetricsTest {
         assertEquals(0L, engine.getPhaseUploadMsTotal());
     }
 
+    @Test
+    public void mergeHistoryEvictsOldestAtCap() throws Exception {
+        // Register 2 segments so the policy fires on each tick, then run the
+        // engine 21 times (1 above the MERGE_HISTORY_MAX=20 cap) and assert:
+        //   1. getMergeHistory().size() never exceeds 20.
+        //   2. FIFO order is preserved — the oldest entry is evicted first.
+        // We use InMemorySegmentMerger with returnNull=true (declined) so no
+        // ZK state changes and we can run 21 identical ticks without rebuilding.
+        registry.createSegment(sample("cap-a", 100L));
+        registry.createSegment(sample("cap-b", 100L));
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+        merger.setReturnNull(true); // declined every time — no ZK state changes
+
+        // Use a clock that advances by 1 ms per call so mergeId ordering
+        // is deterministic in the history list.
+        IndexOptimizerEngine engine = new IndexOptimizerEngine(registry, merger, TS_UUID,
+                new MergePolicy.SmallestFirstPolicy(2, 1000, 0L, Long.MAX_VALUE),
+                60_000L, () -> 0, fakeClock::get);
+
+        // Run 21 times to exceed MERGE_HISTORY_MAX=20.
+        for (int i = 0; i < 21; i++) {
+            fakeClock.incrementAndGet();
+            engine.runOnce();
+        }
+
+        List<MergeRecord> history = engine.getMergeHistory();
+        assertEquals("history must be capped at 20", 20, history.size());
+
+        // Verify all retained entries are "declined".
+        for (MergeRecord r : history) {
+            assertEquals("all retained entries must be declined", "declined", r.outcome);
+        }
+
+        // FIFO: the first entry in the list is the 2nd merge (the 1st was evicted);
+        // the last is the 21st merge. Since fakeClock advances monotonically, the
+        // retained entries should have strictly increasing startedAtMs values.
+        for (int i = 1; i < history.size(); i++) {
+            assertTrue("history must be in FIFO order (older entries first)",
+                    history.get(i).startedAtMs >= history.get(i - 1).startedAtMs);
+        }
+    }
+
     private static String readBody(String urlString) throws Exception {
         java.net.URL url = new java.net.URL(urlString);
         java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();

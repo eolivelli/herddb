@@ -234,6 +234,7 @@ public class OptimizerHttpServerTest {
             histEngine.runOnce();
 
             String body = fetch(histHttp, "/merge-history");
+            // Basic presence checks
             assertTrue("/merge-history must not be empty after a run: " + body,
                     body.contains("\"outcome\""));
             assertTrue("outcome must be 'declined': " + body,
@@ -244,6 +245,29 @@ public class OptimizerHttpServerTest {
                     body.contains("\"input_segments\""));
             assertTrue("/merge-history must include started_at_ms: " + body,
                     body.contains("\"started_at_ms\""));
+            // All per-phase timing fields must be present (zero for declined, but present)
+            assertTrue("/merge-history must include finished_at_ms: " + body,
+                    body.contains("\"finished_at_ms\""));
+            assertTrue("/merge-history must include total_ms: " + body,
+                    body.contains("\"total_ms\""));
+            assertTrue("/merge-history must include output_vectors: " + body,
+                    body.contains("\"output_vectors\""));
+            assertTrue("/merge-history must include download_ms: " + body,
+                    body.contains("\"download_ms\""));
+            assertTrue("/merge-history must include pq_training_ms: " + body,
+                    body.contains("\"pq_training_ms\""));
+            assertTrue("/merge-history must include compaction_ms: " + body,
+                    body.contains("\"compaction_ms\""));
+            assertTrue("/merge-history must include upload_ms: " + body,
+                    body.contains("\"upload_ms\""));
+            assertTrue("/merge-history must include zk_register_ms: " + body,
+                    body.contains("\"zk_register_ms\""));
+            assertTrue("/merge-history must include deprecate_ms: " + body,
+                    body.contains("\"deprecate_ms\""));
+            assertTrue("/merge-history must include peak_heap_used_bytes: " + body,
+                    body.contains("\"peak_heap_used_bytes\""));
+            assertTrue("/merge-history must include peak_direct_used_bytes: " + body,
+                    body.contains("\"peak_direct_used_bytes\""));
         } finally {
             histHttp.close();
         }

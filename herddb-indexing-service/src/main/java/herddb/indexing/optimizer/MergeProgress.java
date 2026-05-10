@@ -94,19 +94,33 @@ public final class MergeProgress {
         mergeStartMs = 0;
     }
 
-    void enterMerge(String id, int segments, long vectors) {
+    /**
+     * Transitions from idle to the active merge state.
+     *
+     * @param startMs wall-clock epoch milliseconds obtained from the engine's
+     *                injected clock ({@code clock.getAsLong()}); the caller must
+     *                source this rather than calling {@code System.currentTimeMillis()}
+     *                here so tests that inject a fake clock observe a consistent
+     *                timestamp in {@link Snapshot#mergeStartMs}.
+     */
+    void enterMerge(String id, int segments, long vectors, long startMs) {
         mergeId = id;
         inputSegments = segments;
         inputVectors = vectors;
         batchesWritten = 0;
         batchesTotal = vectors;
-        mergeStartMs = System.currentTimeMillis();
+        mergeStartMs = startMs;
         phase = "downloading";
     }
 
     void updatePhase(String newPhase) {
         phase = newPhase;
         batchesWritten = 0;
+        // Reset batchesTotal as well: the new phase has an unknown total until
+        // the first updateBatchProgress callback fires (or stays at 0 if the
+        // phase does not expose progress). Leaving a stale total from the
+        // previous phase would make pctComplete() return a misleading value.
+        batchesTotal = 0;
     }
 
     void updateBatchProgress(long written, long total) {
