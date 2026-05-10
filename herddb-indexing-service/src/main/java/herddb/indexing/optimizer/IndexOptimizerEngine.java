@@ -338,6 +338,14 @@ public final class IndexOptimizerEngine {
         return relocationsAbortedTotal.get();
     }
 
+    /**
+     * Returns the currently active merger. {@code volatile} read; safe to call
+     * from any thread without synchronization.
+     */
+    public SegmentMerger getMerger() {
+        return merger;
+    }
+
     public long getTicksSkippedNotLeader() {
         return ticksSkippedNotLeader.get();
     }

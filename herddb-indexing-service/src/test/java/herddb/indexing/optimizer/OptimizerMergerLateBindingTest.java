@@ -42,22 +42,20 @@ import org.junit.Test;
  * Verifies the fix for the {@code NoopMerger} startup race (issue #507):
  *
  * <p>The root cause: the optimizer called {@code listFileServers()} exactly once at
- * startup. If the file-server pod had not yet written its ZK znode, the list was
- * empty and {@code resolveMerger()} fell back to {@code NoopMerger} permanently.
+ * startup via a throw-away {@link ZookeeperMetadataStorageManager}. If the file-server
+ * pod had not yet written its ZK znode, the list was empty and {@code resolveMerger()}
+ * fell back to {@code NoopMerger} permanently.
  *
- * <p>The fix uses a single long-lived {@link ZookeeperMetadataStorageManager} that:
- * <ol>
- *   <li>Performs the initial {@code listFileServers()} call, which arms a ZK
- *       children-watch on {@code /herd/fileServers}.</li>
- *   <li>When a file server registers, the watch fires → {@code notifyFileServersChanged}
- *       → {@link IndexOptimizerMain}'s {@code ServiceDiscoveryListener} schedules an
- *       event-driven tick.</li>
- *   <li>The tick's {@code maybeUpgradeMerger()} upgrades the engine from
- *       {@code NoopMerger} to a real merger atomically.</li>
- * </ol>
+ * <p>The fix keeps a single long-lived {@link ZookeeperMetadataStorageManager} open for
+ * the pod's lifetime. {@code listFileServers()} arms a ZK children-watch on
+ * {@code /herd/fileServers}. When a file server registers, the watch fires →
+ * {@code notifyFileServersChanged} → {@link IndexOptimizerMain}'s
+ * {@code ServiceDiscoveryListener} schedules an event-driven tick →
+ * {@code maybeUpgradeMerger()} replaces the {@link IndexOptimizerMain.NoopMerger}.
+ * The periodic tick also calls {@code maybeUpgradeMerger()} as a safety net.
  *
- * <p>Both tests use the package-private {@code mergerBuilderForTests} seam so they
- * can inject an {@link InMemorySegmentMerger} without needing a live remote file server.
+ * <p>All tests use the package-private {@code mergerBuilderForTests} seam to inject an
+ * {@link InMemorySegmentMerger} without needing a live remote file server.
  */
 public class OptimizerMergerLateBindingTest {
 
@@ -66,6 +64,8 @@ public class OptimizerMergerLateBindingTest {
     private static final String TS_UUID = "ts-late-bind";
     private static final String FILE_SERVER_ID = "file-server-0";
     private static final String FILE_SERVER_ADDR = "herddb-file-server-0.svc:9846";
+    private static final String FILE_SERVER_ID_2 = "file-server-1";
+    private static final String FILE_SERVER_ADDR_2 = "herddb-file-server-1.svc:9846";
 
     private TestingServer zkServer;
     private ZooKeeper zk;
@@ -111,11 +111,11 @@ public class OptimizerMergerLateBindingTest {
         }
     }
 
-    private void registerFileServer() throws Exception {
+    private void registerFileServer(String id, String addr) throws Exception {
         try (ZookeeperMetadataStorageManager zkmeta =
                 new ZookeeperMetadataStorageManager(zkServer.getConnectString(), 30000, BASE_PATH)) {
             zkmeta.start(false);
-            zkmeta.registerFileServer(FILE_SERVER_ID, FILE_SERVER_ADDR);
+            zkmeta.registerFileServer(id, addr);
         }
     }
 
@@ -125,7 +125,7 @@ public class OptimizerMergerLateBindingTest {
         p.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT, "30000");
         p.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH, BASE_PATH);
         p.setProperty(OptimizerConfiguration.PROPERTY_TABLESPACE_NAME, TS_NAME);
-        // Long periodic interval; the watcher-driven tick handles the upgrade.
+        // Long periodic interval; the watcher-driven tick handles the upgrade in test 1.
         p.setProperty(OptimizerConfiguration.PROPERTY_INTERVAL_MS, "3600000");
         p.setProperty(OptimizerConfiguration.PROPERTY_RETENTION_MS, "60000");
         p.setProperty(OptimizerConfiguration.PROPERTY_HTTP_PORT, "0");
@@ -133,17 +133,19 @@ public class OptimizerMergerLateBindingTest {
     }
 
     /**
-     * Issue #507 — watcher-driven upgrade (primary fix):
+     * Issue #507 — watcher-driven upgrade (primary fix path):
      *
-     * <p>The optimizer starts with no file server in ZK → resolves {@link IndexOptimizerMain.NoopMerger}.
-     * The long-lived {@link ZookeeperMetadataStorageManager}'s children-watch on
+     * <p>The optimizer starts with no file server in ZK → resolves
+     * {@link IndexOptimizerMain.NoopMerger}. The long-lived
+     * {@link ZookeeperMetadataStorageManager}'s children-watch on
      * {@code /herd/fileServers} is armed by the initial {@code listFileServers()} call.
-     * When a file server registers, the watch fires → {@code ServiceDiscoveryListener.onFileServersChanged}
-     * schedules an event-driven tick → {@code maybeUpgradeMerger()} upgrades the merger
-     * to {@link InMemorySegmentMerger} (via the test seam).
+     * When a file server registers, the watch fires →
+     * {@code ServiceDiscoveryListener.onFileServersChanged} schedules an event-driven
+     * tick → {@code maybeUpgradeMerger()} upgrades the merger to
+     * {@link InMemorySegmentMerger} (via the test seam).
      *
-     * <p>No timing hacks: the upgrade is driven by the reactive ZK watcher, so the
-     * test only needs to wait for the upgrade to complete (up to 10 s).
+     * <p>No timing hacks: the upgrade is driven by the reactive ZK watcher, so the test
+     * only needs to wait for the upgrade to complete (up to 10 s).
      */
     @Test
     public void watcherDrivenUpgradeReplacesNoopMergerWhenFileServerRegisters() throws Exception {
@@ -164,7 +166,7 @@ public class OptimizerMergerLateBindingTest {
 
             // Now register the file server: ZK watch fires → ServiceDiscoveryListener
             // schedules an event-driven tick → maybeUpgradeMerger() upgrades.
-            registerFileServer();
+            registerFileServer(FILE_SERVER_ID, FILE_SERVER_ADDR);
 
             // Wait for the watcher-driven upgrade to complete (up to 10 s).
             long deadline = System.currentTimeMillis() + 10_000L;
@@ -179,27 +181,41 @@ public class OptimizerMergerLateBindingTest {
                     main.getMerger() instanceof IndexOptimizerMain.NoopMerger);
             assertTrue("upgraded merger must be an InMemorySegmentMerger (injected via test seam)",
                     main.getMerger() instanceof InMemorySegmentMerger);
+            // Also verify the engine itself received the new merger so that merge()
+            // calls during runOnce() will actually use it (that's the whole point of
+            // issue #507 — the engine's call to merger.merge() must not hit NoopMerger).
+            assertTrue("engine.getMerger() must also be an InMemorySegmentMerger after upgrade",
+                    main.getEngine().getMerger() instanceof InMemorySegmentMerger);
         } finally {
             main.shutdown();
         }
     }
 
     /**
-     * Issue #507 — tick-time safety-net upgrade (Option B):
+     * Issue #507 — periodic-tick safety-net upgrade path:
      *
-     * <p>Same scenario as above, but here we verify that the periodic tick's
-     * {@code maybeUpgradeMerger()} call also upgrades the merger. This covers the
-     * case where the ZK session-expiry causes the watcher to be lost and a new
-     * {@code listFileServers()} re-arms it at tick time.
+     * <p>Same scenario (no file server at startup → {@link IndexOptimizerMain.NoopMerger}),
+     * but here we verify that the periodic tick's {@code maybeUpgradeMerger()} call upgrades
+     * the merger independently of the ZK watcher.
      *
-     * <p>We trigger the upgrade explicitly by waiting for the short-interval periodic
-     * tick rather than registering AFTER the watcher is armed.
+     * <p>The watcher path is deliberately disabled by setting a very large
+     * {@code EVENT_DEBOUNCE_MS} (one hour), so the watcher-triggered scheduled tick
+     * cannot fire within the 10 s test window. The periodic tick (every 100 ms)
+     * fires {@code tickSafe()} → {@code maybeUpgradeMerger()} → upgrade.
+     *
+     * <p>This covers the recovery scenario where the ZK session expires and the
+     * watcher is lost: the periodic tick re-arms the watch via
+     * {@code zkMeta.listFileServers()} and picks up any newly registered file servers.
      */
     @Test
     public void tickTimeUpgradeReplacesNoopMergerOnceFileServerAppears() throws Exception {
         Properties props = baseProps();
         // Short periodic tick so the safety-net upgrade fires quickly.
         props.setProperty(OptimizerConfiguration.PROPERTY_INTERVAL_MS, "100");
+        // Very large debounce prevents the watcher-triggered (onFileServersChanged)
+        // tick from completing within the 10 s test window. This forces the test
+        // to exercise the periodic-tick path exclusively.
+        props.setProperty(OptimizerConfiguration.PROPERTY_EVENT_DEBOUNCE_MS, "3600000");
 
         IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(props));
         main.mergerBuilderForTests = servers -> new InMemorySegmentMerger();
@@ -214,7 +230,8 @@ public class OptimizerMergerLateBindingTest {
 
             // Register the file server. The next periodic tick calls tickSafe()
             // → maybeUpgradeMerger() → zkMeta.listFileServers() → upgrade.
-            registerFileServer();
+            // The watcher-triggered tick is suppressed by the huge debounce above.
+            registerFileServer(FILE_SERVER_ID, FILE_SERVER_ADDR);
 
             long deadline = System.currentTimeMillis() + 10_000L;
             while (System.currentTimeMillis() < deadline) {
@@ -228,6 +245,62 @@ public class OptimizerMergerLateBindingTest {
                     main.getMerger() instanceof IndexOptimizerMain.NoopMerger);
             assertTrue("upgraded merger must be an InMemorySegmentMerger (injected via test seam)",
                     main.getMerger() instanceof InMemorySegmentMerger);
+            assertTrue("engine.getMerger() must also be an InMemorySegmentMerger after upgrade",
+                    main.getEngine().getMerger() instanceof InMemorySegmentMerger);
+        } finally {
+            main.shutdown();
+        }
+    }
+
+    /**
+     * Issue #507 — churn resilience: the merger stays real after file-server churn.
+     *
+     * <p>Once the optimizer upgrades from {@link IndexOptimizerMain.NoopMerger} to a real
+     * merger it must not downgrade even when additional {@code onFileServersChanged}
+     * callbacks arrive. This test registers a second file server after the initial upgrade
+     * and verifies the merger remains an {@link InMemorySegmentMerger} (not re-created or
+     * reset to {@link IndexOptimizerMain.NoopMerger}).
+     */
+    @Test
+    public void mergerStaysRealAfterFileServerChurn() throws Exception {
+        Properties props = baseProps();
+        props.setProperty(OptimizerConfiguration.PROPERTY_EVENT_DEBOUNCE_MS, "50");
+
+        IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(props));
+        main.mergerBuilderForTests = servers -> new InMemorySegmentMerger();
+
+        try {
+            main.start();
+            assertNotNull("engine must be initialised", main.getEngine());
+            assertTrue("should start as NoopMerger",
+                    main.getMerger() instanceof IndexOptimizerMain.NoopMerger);
+
+            // Register first file server → watcher fires → upgrade.
+            registerFileServer(FILE_SERVER_ID, FILE_SERVER_ADDR);
+
+            long deadline = System.currentTimeMillis() + 10_000L;
+            while (System.currentTimeMillis() < deadline) {
+                if (!(main.getMerger() instanceof IndexOptimizerMain.NoopMerger)) {
+                    break;
+                }
+                Thread.sleep(50);
+            }
+            assertFalse("merger should be real after first registration",
+                    main.getMerger() instanceof IndexOptimizerMain.NoopMerger);
+            SegmentMerger mergerAfterFirstUpgrade = main.getMerger();
+
+            // Register a second file server (simulates churn / scale-out). The
+            // onFileServersChanged callback fires again. Because the merger is already
+            // a real merger (not NoopMerger), the listener short-circuits and no
+            // upgrade attempt is made. The existing merger must remain unchanged.
+            registerFileServer(FILE_SERVER_ID_2, FILE_SERVER_ADDR_2);
+            // Give the watcher event a moment to propagate.
+            Thread.sleep(500);
+
+            assertFalse("merger must still be real after second file-server registration",
+                    main.getMerger() instanceof IndexOptimizerMain.NoopMerger);
+            assertTrue("merger must be the same InMemorySegmentMerger instance (not re-created)",
+                    main.getMerger() == mergerAfterFirstUpgrade);
         } finally {
             main.shutdown();
         }

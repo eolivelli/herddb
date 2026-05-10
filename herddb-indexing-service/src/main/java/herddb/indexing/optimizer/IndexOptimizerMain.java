@@ -49,6 +49,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.zookeeper.AddWatchMode;
@@ -105,7 +106,7 @@ public final class IndexOptimizerMain {
      * {@code herddb.indexing.optimizer} can inject a synthetic factory (e.g.
      * returning {@link InMemorySegmentMerger}) without needing a live file server.
      */
-    java.util.function.Function<List<String>, SegmentMerger> mergerBuilderForTests;
+    Function<List<String>, SegmentMerger> mergerBuilderForTests;
 
     /**
      * Current ZooKeeper client. Replaced atomically by {@link #reconnectZooKeeper}
@@ -165,8 +166,19 @@ public final class IndexOptimizerMain {
     private OptimizerLeaderLock leaderLock;
     private IndexOptimizerEngine engine;
     private OptimizerHttpServer httpServer;
-    private SegmentMerger merger;
-    private DataStorageManager mergerDataStorageManager;
+    /**
+     * Currently active merger. {@code volatile} so that the unsynchronized
+     * {@link #getMerger()} method (used by tests and future monitoring endpoints)
+     * always sees the latest value written by {@link #maybeUpgradeMerger()} under
+     * {@code synchronized(this)} (JMM visibility guarantee).
+     */
+    private volatile SegmentMerger merger;
+    /**
+     * DataStorageManager wired to the current merger. {@code volatile} for the
+     * same reason as {@link #merger}; both fields are always updated together
+     * inside {@link #maybeUpgradeMerger()} under {@code synchronized(this)}.
+     */
+    private volatile DataStorageManager mergerDataStorageManager;
     private RemoteFileClient mergerFileClient;
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
 
@@ -312,8 +324,14 @@ public final class IndexOptimizerMain {
                     return;
                 }
                 synchronized (IndexOptimizerMain.this) {
-                    if (!(merger instanceof NoopMerger)) {
-                        return; // already upgraded, nothing to do
+                    // merger is null between addServiceDiscoveryListener() (line above) and
+                    // this.merger = resolveMerger() later in start(). start() holds the
+                    // IndexOptimizerMain monitor the entire time, so this listener will
+                    // block on the synchronized block until start() completes — at which
+                    // point merger is non-null. The null guard is a belt-and-suspenders
+                    // defensive check in case of unexpected future refactoring.
+                    if (merger == null || !(merger instanceof NoopMerger)) {
+                        return; // not yet initialised, or already upgraded — nothing to do
                     }
                 }
                 LOGGER.log(Level.INFO,
@@ -395,6 +413,24 @@ public final class IndexOptimizerMain {
         boolean safeModeFileDeletion = configuration.getBoolean(
                 OptimizerConfiguration.PROPERTY_SAFE_MODE_FILE_DELETION,
                 OptimizerConfiguration.PROPERTY_SAFE_MODE_FILE_DELETION_DEFAULT);
+        // When safeModeFileDeletion=false the engine requires a non-null DataStorageManager.
+        // If no file servers were discovered at startup (startup-ordering race), the DSM is
+        // null and the engine constructor would throw IllegalArgumentException — defeating the
+        // self-healing intent of this fix. Coerce to safe mode for this run and log SEVERE so
+        // the operator is aware. Physical file deletion will remain disabled until the pod is
+        // restarted after file servers are visible in ZooKeeper. The merger itself upgrades
+        // reactively via maybeUpgradeMerger() once file servers appear, so merging still works.
+        boolean effectiveSafeMode = safeModeFileDeletion;
+        if (!effectiveSafeMode && mergerDataStorageManager == null) {
+            LOGGER.log(Level.SEVERE,
+                    "safeModeFileDeletion=false was requested but no DataStorageManager is "
+                    + "available (no file servers were discovered at startup). Coercing to "
+                    + "safeModeFileDeletion=true for this run; physical file deletion will "
+                    + "remain disabled until a pod restart after file servers are visible in "
+                    + "ZooKeeper. Ensure the file-server pod starts before the optimizer to "
+                    + "avoid this fallback.");
+            effectiveSafeMode = true;
+        }
         // The merger constructs its own DSM for the merge path. The reaper
         // can use the same DSM to physically delete files at retention if
         // safeMode is opted out (the operator's responsibility).
@@ -403,7 +439,7 @@ public final class IndexOptimizerMain {
                 System::currentTimeMillis,
                 mergerDataStorageManager,
                 leaderLock,
-                safeModeFileDeletion);
+                effectiveSafeMode);
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             FastThreadLocalThread t = new FastThreadLocalThread(r, "index-optimizer-engine");
@@ -447,10 +483,10 @@ public final class IndexOptimizerMain {
 
     private void tickSafe() {
         try {
-            // Issue #507, Option B: if the optimizer started with a NoopMerger (because
-            // ZK discovery was empty and the startup retries were exhausted), attempt to
-            // upgrade to a real merger before each tick. This self-heals the startup-
-            // ordering race without requiring a pod restart.
+            // Issue #507: if the optimizer started with a NoopMerger (because ZK discovery
+            // was empty at startup), attempt to upgrade to a real merger before each tick.
+            // This is the safety-net path; the primary upgrade path is the ZK watcher
+            // in onFileServersChanged() → scheduleEventDrivenTick() registered in start().
             maybeUpgradeMerger();
             engine.runOnce();
         } catch (herddb.indexing.segment.SegmentRegistryException | RuntimeException e) {
