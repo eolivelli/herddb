@@ -1825,6 +1825,58 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         }
     }
 
+    /**
+     * Issue #509: eager DROP trigger called by the IS gRPC server when the
+     * HerdDB server issues a {@code DropIndex} RPC on DROP TABLE / DROP INDEX,
+     * without waiting for the commit-log tailer to process the matching
+     * {@code DROP_INDEX} log entry.
+     *
+     * <p>Removes the vector store from the in-memory {@link #vectorStores} and
+     * {@link #vectorStoreIndexUuids} maps using the caller-supplied
+     * {@code (table, indexName)} key — no {@link SchemaTracker} access is
+     * needed, which keeps this method safe to call from the gRPC server thread
+     * (the tailer owns {@code schemaTracker}; the two maps are
+     * {@link java.util.concurrent.ConcurrentHashMap}s and are safe to mutate
+     * from any thread).
+     *
+     * <p>If a store was found, it is handed to
+     * {@link #submitVectorStoreDeletion} which:
+     * <ol>
+     *   <li>Calls {@code store.close()} to release in-memory resources.</li>
+     *   <li>Calls {@code store.dropAllRegistryEntries()} to sweep the ZK
+     *       segment-registry entries (fast — a handful of znode deletes even
+     *       for a 20B-vector index).</li>
+     *   <li>Calls {@code dataStorageManager.dropIndex()} to delete the
+     *       on-disk / MinIO segment files (may be slow; runs in the
+     *       background {@code checkpointExecutor} so the RPC returns
+     *       before file deletion completes).</li>
+     * </ol>
+     *
+     * <p>Idempotent: if the store is not tracked (already removed by a
+     * previous eager call or by the tailer's own DROP_INDEX path), this
+     * is a harmless no-op.
+     *
+     * @param table     the table name as used in {@link #storeKey}
+     * @param indexName the index name as used in {@link #storeKey}
+     */
+    public void dropIndexImmediate(String table, String indexName) {
+        String k = storeKey(table, indexName);
+        AbstractVectorStore removed = vectorStores.remove(k);
+        vectorStoreIndexUuids.remove(k);
+        if (removed != null) {
+            LOGGER.log(Level.INFO,
+                    "dropIndexImmediate: submitting eager deletion for store key {0} "
+                            + "(triggered by HerdDB server DropIndex RPC, issue #509)",
+                    k);
+            submitVectorStoreDeletion(k, removed);
+        } else {
+            LOGGER.log(Level.FINE,
+                    "dropIndexImmediate: store key {0} not tracked (already dropped or "
+                            + "never seen); no-op",
+                    k);
+        }
+    }
+
     private static boolean isDmlType(short type) {
         return type == LogEntryType.INSERT
                 || type == LogEntryType.UPDATE

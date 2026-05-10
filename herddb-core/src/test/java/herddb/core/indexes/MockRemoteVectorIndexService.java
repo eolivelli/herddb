@@ -140,6 +140,14 @@ public class MockRemoteVectorIndexService implements RemoteVectorIndexService {
     }
 
     @Override
+    public void dropIndex(String tablespace, String table, String indexName) {
+        // Best-effort no-op in the mock — tests that need to verify drop
+        // calls should use VectorIndexManagerDropNotifiesRemoteServiceTest's
+        // RecordingRemoteService instead.
+        indexes.remove(indexKey(table, indexName));
+    }
+
+    @Override
     public void close() {
         indexes.clear();
     }

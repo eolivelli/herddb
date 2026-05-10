@@ -119,6 +119,11 @@ public class VectorIndexManagerSearchStreamTest {
         }
 
         @Override
+        public void dropIndex(String tablespace, String table, String indexName) {
+            // no-op in stub
+        }
+
+        @Override
         public void close() {
             // no-op
         }

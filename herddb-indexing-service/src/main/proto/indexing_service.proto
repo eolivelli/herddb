@@ -41,6 +41,15 @@ service IndexingService {
 
     // Returns whether this instance is a shadow replica and its catch-up state.
     rpc GetShadowStatus (GetShadowStatusRequest) returns (GetShadowStatusResponse);
+
+    // Issue #509: eager DROP cleanup trigger. The HerdDB server calls this
+    // when DROP TABLE / DROP INDEX is executed so the IS immediately begins
+    // background cleanup of the ZK segment registry and file-server data for
+    // the named index, without waiting for the commit-log tailer to catch up.
+    // Best-effort from the caller's side: old IS pods that do not yet implement
+    // this RPC return UNIMPLEMENTED, which the client treats as a warning.
+    // The commit-log tailer path remains the authoritative cleanup fallback.
+    rpc DropIndex (DropIndexRequest) returns (DropIndexResponse);
 }
 
 message SearchRequest {
@@ -307,4 +316,20 @@ message GetShadowStatusResponse {
     // Operators compute the shadow data-staleness as
     // `now - loaded_entry_timestamp_ms`. 0 = unknown. Issue #423.
     int64 loaded_entry_timestamp_ms = 11;
+}
+
+// Issue #509: eagerly triggered DROP cleanup (see rpc DropIndex above).
+message DropIndexRequest {
+    // HerdDB tablespace UUID (same value as the IS's configured tablespace UUID).
+    string tablespace = 1;
+    // Table name — used together with index to compute the IS-internal store key
+    // without consulting the SchemaTracker (which lives on the tailer thread).
+    string table = 2;
+    // Index name.
+    string index = 3;
+}
+
+// Intentionally empty: the IS begins cleanup asynchronously and returns as
+// soon as the in-memory store has been removed from its tracking map.
+message DropIndexResponse {
 }

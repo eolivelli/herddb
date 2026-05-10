@@ -23,6 +23,8 @@ package herddb.indexing;
 import com.google.protobuf.ByteString;
 import herddb.indexing.proto.DescribeIndexRequest;
 import herddb.indexing.proto.DescribeIndexResponse;
+import herddb.indexing.proto.DropIndexRequest;
+import herddb.indexing.proto.DropIndexResponse;
 import herddb.indexing.proto.GetEngineStatsRequest;
 import herddb.indexing.proto.GetEngineStatsResponse;
 import herddb.indexing.proto.GetIndexStatusRequest;
@@ -610,6 +612,40 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
             }
         } catch (RuntimeException e) {
             LOGGER.log(Level.SEVERE, "WaitForCheckpoint failed", e);
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(e.getMessage())
+                    .withCause(e)
+                    .asRuntimeException());
+        }
+    }
+
+    /**
+     * Issue #509: eager DROP cleanup trigger. The HerdDB server calls this
+     * RPC on DROP TABLE / DROP INDEX so the IS immediately begins background
+     * cleanup of the named index's ZK segment registry and file-server data,
+     * without waiting for the commit-log tailer to reach the matching
+     * {@code DROP_INDEX} log entry.
+     *
+     * <p>Delegates to {@link IndexingServiceEngine#dropIndexImmediate} which
+     * removes the store from the in-memory tracking maps and submits ZK + file
+     * cleanup to the background {@code checkpointExecutor}. The RPC returns as
+     * soon as the store has been removed from memory (before file deletion
+     * completes), so the caller does not block on large index cleanup.
+     */
+    @Override
+    public void dropIndex(DropIndexRequest request,
+                          StreamObserver<DropIndexResponse> responseObserver) {
+        String indexName = request.getIndex();
+        String table = request.getTable();
+        LOGGER.log(Level.INFO,
+                "DropIndex RPC: index={0} table={1} tablespace={2} (issue #509)",
+                new Object[]{indexName, table, request.getTablespace()});
+        try {
+            engine.dropIndexImmediate(table, indexName);
+            responseObserver.onNext(DropIndexResponse.getDefaultInstance());
+            responseObserver.onCompleted();
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.SEVERE, "DropIndex RPC failed for index " + indexName, e);
             responseObserver.onError(Status.INTERNAL
                     .withDescription(e.getMessage())
                     .withCause(e)

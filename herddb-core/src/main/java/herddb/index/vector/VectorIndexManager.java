@@ -640,6 +640,41 @@ public class VectorIndexManager extends AbstractIndexManager {
     }
 
     /**
+     * Issue #509: overrides the base-class no-op to also notify the IS to
+     * begin eager background cleanup of its ZK segment registry and
+     * file-server data for this index, without waiting for the commit-log
+     * tailer to catch up. Best-effort: a failure is logged at WARNING and
+     * never blocks the local storage cleanup. The IS handles both the RPC
+     * trigger and the later tailer-path {@code DROP_INDEX} log entry
+     * idempotently (second removal of an already-gone store key is a no-op).
+     */
+    @Override
+    public void dropIndexData() throws herddb.storage.DataStorageManagerException {
+        // Eagerly notify all IS instances so ZK segment registry and
+        // file-server data are cleaned up before the optimizer's next tick —
+        // which is especially important when the table is immediately
+        // recreated (DROP + CREATE cycle) because stale ZK entries from the
+        // previous run would otherwise cause optimizer merge failures against
+        // incompletely-written segment files (issue #509).
+        try {
+            RemoteVectorIndexService svc = remoteServiceSupplier.get();
+            if (svc != null) {
+                svc.dropIndex(tableSpaceUUID, index.table, index.name);
+            }
+        } catch (RuntimeException e) {
+            // Plugin boundary: IS may be transiently down (pod restart, GC
+            // pause). The tailer-based cleanup path handles the DROP_INDEX log
+            // entry once the IS recovers, so this is safe to swallow here.
+            LOGGER.log(Level.WARNING,
+                    "dropIndexData: IS drop notification failed for index {0} "
+                            + "(cleanup will proceed via commit-log tailer): {1}",
+                    new Object[]{index.name, e.getMessage()});
+        }
+        // Clean up local (HerdDB catalog) storage for this index.
+        dataStorageManager.dropIndex(tableSpaceUUID, index.uuid);
+    }
+
+    /**
      * Returns status information from the remote IndexingService.
      */
     public RemoteVectorIndexService.IndexStatusInfo getRemoteIndexStatus() {

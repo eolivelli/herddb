@@ -22,6 +22,7 @@ package herddb.indexing;
 
 import com.google.common.util.concurrent.ListenableFuture;
 import herddb.index.vector.RemoteVectorIndexService;
+import herddb.indexing.proto.DropIndexRequest;
 import herddb.indexing.proto.GetIndexStatusRequest;
 import herddb.indexing.proto.GetIndexStatusResponse;
 import herddb.indexing.proto.IndexingServiceGrpc;
@@ -554,6 +555,55 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
             }
         }
         throw new RuntimeException("All IndexingService instances failed for GetIndexStatus");
+    }
+
+    /**
+     * Issue #509: sends a {@code DropIndex} RPC to every IS instance
+     * (not just one) so each instance can immediately begin background
+     * cleanup of its ZK segment registry and file-server data for the
+     * named index. Best-effort: failures are logged at WARNING and do not
+     * propagate — the commit-log tailer path handles cleanup when the IS
+     * recovers. Old IS pods that do not yet implement {@code DropIndex}
+     * return {@code UNIMPLEMENTED}; those failures are also treated as
+     * warnings, not errors.
+     */
+    @Override
+    public void dropIndex(String tablespace, String table, String indexName) {
+        ServerSnapshot s = this.snapshot;
+        if (s.channels.isEmpty()) {
+            LOGGER.log(Level.WARNING,
+                    "dropIndex: no IS instances available for tablespace {0}, "
+                            + "index {1} will be cleaned via commit-log tailer",
+                    new Object[]{tablespace, indexName});
+            return;
+        }
+        DropIndexRequest req = DropIndexRequest.newBuilder()
+                .setTablespace(tablespace)
+                .setTable(table)
+                .setIndex(indexName)
+                .build();
+        // Notify all instances — every IS pod may hold data for this index
+        // and should clean up eagerly.
+        for (Map.Entry<String, ManagedChannel> entry : s.channels.entrySet()) {
+            String addr = entry.getKey();
+            try {
+                IndexingServiceGrpc.IndexingServiceBlockingStub stub =
+                        IndexingServiceGrpc.newBlockingStub(entry.getValue())
+                                .withDeadlineAfter(timeoutSeconds, TimeUnit.SECONDS);
+                stub.dropIndex(req);
+                LOGGER.log(Level.INFO,
+                        "dropIndex: notified IS instance {0} to clean up index {1}",
+                        new Object[]{addr, indexName});
+            } catch (RuntimeException e) {
+                // Plugin boundary: UNIMPLEMENTED means old IS pod; UNAVAILABLE
+                // means the pod is restarting. In both cases the tailer is the
+                // fallback — log a warning and continue with the other instances.
+                LOGGER.log(Level.WARNING,
+                        "dropIndex: RPC to IS instance {0} failed for index {1} "
+                                + "(cleanup via commit-log tailer): {2}",
+                        new Object[]{addr, indexName, e.getMessage()});
+            }
+        }
     }
 
     private static List<Map.Entry<Bytes, Float>> toEntryList(SearchResponse response) {
