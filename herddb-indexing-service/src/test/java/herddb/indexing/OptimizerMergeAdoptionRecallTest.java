@@ -25,9 +25,11 @@ import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
 import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.optimizer.IndexMergeConfig;
 import herddb.indexing.optimizer.IndexOptimizerEngine;
 import herddb.indexing.optimizer.MergePolicy;
 import herddb.indexing.optimizer.RemoteSegmentMerger;
+import herddb.indexing.optimizer.StaticIndexMergeConfigProvider;
 import herddb.indexing.segment.SegmentAssignmentListener;
 import herddb.indexing.segment.SegmentAssignmentWatcher;
 import herddb.indexing.segment.SegmentMetadata;
@@ -295,12 +297,9 @@ public class OptimizerMergeAdoptionRecallTest {
                 // ---------------------------------------------------------------
                 RemoteSegmentMerger merger = new RemoteSegmentMerger(
                         dsm, optimizerTmpDir,
-                        128,    // vector dimension (siftsmall)
-                        16,     // graphM
-                        100,    // beamWidth
-                        1.2f,   // neighborOverflow
-                        1.4f,   // alpha
-                        VectorSimilarityFunction.EUCLIDEAN);
+                        new StaticIndexMergeConfigProvider(
+                                new IndexMergeConfig(16, 100, 1.2f, 1.4f,
+                                        VectorSimilarityFunction.EUCLIDEAN)));
 
                 IndexOptimizerEngine engine = new IndexOptimizerEngine(
                         registry, merger, TABLESPACE_UUID,
@@ -443,8 +442,9 @@ public class OptimizerMergeAdoptionRecallTest {
 
                 RemoteSegmentMerger merger = new RemoteSegmentMerger(
                         dsm, optimizerTmpDir,
-                        128, 16, 100, 1.2f, 1.4f,
-                        VectorSimilarityFunction.EUCLIDEAN);
+                        new StaticIndexMergeConfigProvider(
+                                new IndexMergeConfig(16, 100, 1.2f, 1.4f,
+                                        VectorSimilarityFunction.EUCLIDEAN)));
                 IndexOptimizerEngine engine = new IndexOptimizerEngine(
                         registry, merger, TABLESPACE_UUID,
                         new MergePolicy.SmallestFirstPolicy(2, 2, 1L, Long.MAX_VALUE),
@@ -602,8 +602,9 @@ public class OptimizerMergeAdoptionRecallTest {
 
                 RemoteSegmentMerger merger = new RemoteSegmentMerger(
                         dsm, optimizerTmpDir,
-                        128, 16, 100, 1.2f, 1.4f,
-                        VectorSimilarityFunction.EUCLIDEAN);
+                        new StaticIndexMergeConfigProvider(
+                                new IndexMergeConfig(16, 100, 1.2f, 1.4f,
+                                        VectorSimilarityFunction.EUCLIDEAN)));
                 IndexOptimizerEngine engine = new IndexOptimizerEngine(
                         registry, merger, TABLESPACE_UUID,
                         new MergePolicy.SmallestFirstPolicy(2, 2, 1L, Long.MAX_VALUE),
