@@ -22,6 +22,7 @@ package herddb.indexing.optimizer;
 import herddb.cluster.ZookeeperMetadataStorageManager;
 import herddb.indexing.segment.SegmentRegistryClient;
 import herddb.metadata.MetadataStorageManagerException;
+import herddb.metadata.ServiceDiscoveryListener;
 import herddb.model.TableSpace;
 import herddb.server.RemoteFileClient;
 import herddb.server.RemoteFileServiceFactory;
@@ -123,11 +124,31 @@ public final class IndexOptimizerMain {
     private volatile int zkSessionTimeoutMs;
     /**
      * ZooKeeper base path (e.g. {@code /herd}). Stored as a field so that
-     * {@link #maybeUpgradeMerger()} can open a short-lived
-     * {@link herddb.cluster.ZookeeperMetadataStorageManager} for ZK discovery
-     * retries at tick time without re-reading the configuration (issue #507).
+     * {@link #buildRemoteSegmentMerger} can access it without re-reading the
+     * configuration (issue #507).
      */
     private volatile String zkBasePath;
+
+    /**
+     * Long-lived metadata manager used for:
+     * <ol>
+     *   <li>Resolving the tablespace UUID from the human-readable name at startup.</li>
+     *   <li>Discovering remote file servers via {@code listFileServers()} — which
+     *       installs a ZK children-watch on {@code /herd/fileServers}.</li>
+     *   <li>Reacting to file-server registration events via the
+     *       {@link ServiceDiscoveryListener} registered in {@link #start}: whenever
+     *       {@code onFileServersChanged} fires, the optimizer schedules an upgrade
+     *       tick so a {@link NoopMerger} is replaced as soon as the file server
+     *       appears in ZooKeeper.</li>
+     * </ol>
+     *
+     * <p>Unlike the previous short-lived instance (opened + closed in
+     * {@link #start}), this instance is kept alive for the lifetime of the
+     * optimizer pod so the built-in watcher machinery in
+     * {@link ZookeeperMetadataStorageManager} continuously re-discovers file
+     * servers without any polling (issue #507). Closed by {@link #shutdown}.
+     */
+    private ZookeeperMetadataStorageManager zkMeta;
     /** Coalesces concurrent reconnect attempts triggered by the bootstrap watcher. */
     private final AtomicBoolean reconnectInFlight = new AtomicBoolean(false);
     private final AtomicLong sessionReconnects = new AtomicLong();
@@ -258,87 +279,78 @@ public final class IndexOptimizerMain {
                     OptimizerConfiguration.PROPERTY_TABLESPACE_NAME + " must be set");
         }
 
-        // Resolve the tablespace UUID from the human-readable name by consulting
-        // the HerdDB cluster metadata in ZooKeeper.  We open a short-lived
-        // ZookeeperMetadataStorageManager exclusively for this lookup and close
-        // it immediately after so that the optimizer's permanent ZK connection
-        // (used by SegmentRegistryClient and OptimizerLeaderLock) is separate
-        // and independently reconnectable.
+        // Open the long-lived ZookeeperMetadataStorageManager used for:
+        //   1. Resolving the tablespace UUID from the human-readable name.
+        //   2. Discovering remote file servers via listFileServers() — which
+        //      installs a ZK children-watch on /herd/fileServers.
+        //   3. Reacting to file-server registration events via ServiceDiscoveryListener
+        //      so a startup-time NoopMerger is replaced as soon as the file server
+        //      appears in ZooKeeper (issue #507).
+        // Unlike the previous short-lived instance, this one stays open for the
+        // pod's lifetime. The ZookeeperMetadataStorageManager's built-in
+        // fileServersWatcher re-installs itself on every listFileServers() call,
+        // so the optimizer continuously re-discovers file servers reactively.
+        this.zkMeta = new ZookeeperMetadataStorageManager(zkAddress, sessionTimeout, basePath);
+        try {
+            zkMeta.start(false); // read-only: do not create/format cluster metadata paths
+        } catch (MetadataStorageManagerException e) {
+            throw new IllegalStateException(
+                    "Failed to start ZookeeperMetadataStorageManager: " + e.getMessage(), e);
+        }
+
+        // Register before listFileServers() so that if file servers appear
+        // between the getChildren call and the watcher registration (highly
+        // unlikely but theoretically possible), the watcher fires after
+        // start() returns and schedules a tick.
+        zkMeta.addServiceDiscoveryListener(new ServiceDiscoveryListener() {
+            @Override
+            public void onFileServersChanged(List<String> addresses) {
+                // Called on the ZK watcher thread — do NOT block it with heavy work.
+                // Schedule a tick on the optimizer scheduler: tickSafe() calls
+                // maybeUpgradeMerger() which builds the real merger if needed.
+                if (addresses == null || addresses.isEmpty()) {
+                    return;
+                }
+                synchronized (IndexOptimizerMain.this) {
+                    if (!(merger instanceof NoopMerger)) {
+                        return; // already upgraded, nothing to do
+                    }
+                }
+                LOGGER.log(Level.INFO,
+                        "onFileServersChanged: {0} server(s) discovered; scheduling merger upgrade",
+                        addresses.size());
+                scheduleEventDrivenTick();
+            }
+        });
+
         List<String> discoveredFileServers = new ArrayList<>();
-        try (ZookeeperMetadataStorageManager zkmeta =
-                new ZookeeperMetadataStorageManager(zkAddress, sessionTimeout, basePath)) {
-            zkmeta.start(false); // read-only: do not create/format cluster metadata paths
-            TableSpace ts = zkmeta.describeTableSpace(tablespaceName);
-            if (ts == null) {
-                throw new IllegalStateException(
-                        "No tablespace named '" + tablespaceName + "' found under "
-                        + basePath + "/tableSpaces — ensure the HerdDB cluster has started "
-                        + "and created its default tablespace before starting the optimizer.");
-            }
-            tablespaceUuid = ts.uuid;
-            try {
-                discoveredFileServers.addAll(zkmeta.listFileServers());
-            } catch (MetadataStorageManagerException listErr) {
-                LOGGER.log(Level.WARNING,
-                        "could not discover remote file servers via ZK; the optimizer"
-                                + " will fall back to NoopMerger if the static server list"
-                                + " is also empty: {0}",
-                        listErr.getMessage());
-            }
+        TableSpace ts;
+        try {
+            ts = zkMeta.describeTableSpace(tablespaceName);
         } catch (MetadataStorageManagerException e) {
             throw new IllegalStateException(
                     "Failed to resolve tablespace '" + tablespaceName + "' from ZooKeeper: "
                     + e.getMessage(), e);
         }
-
-        // Issue #507 — Option A: startup retry loop.
-        // If both the static server list and the initial ZK discovery are empty, the
-        // file server may not have finished registering yet (startup-ordering race).
-        // Retry up to PROPERTY_ZK_DISCOVERY_RETRIES times with the configured interval
-        // before falling back to NoopMerger. The tick-time upgrade (Option B,
-        // maybeUpgradeMerger) will self-heal even if all retries are exhausted, so
-        // these retries are an optimisation rather than the sole safety net.
-        String staticServersCheck = configuration.getString(
-                OptimizerConfiguration.PROPERTY_REMOTE_FILE_SERVERS,
-                OptimizerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
-        if (discoveredFileServers.isEmpty() && (staticServersCheck == null || staticServersCheck.isEmpty())) {
-            int retries = configuration.getInt(
-                    OptimizerConfiguration.PROPERTY_ZK_DISCOVERY_RETRIES,
-                    OptimizerConfiguration.PROPERTY_ZK_DISCOVERY_RETRIES_DEFAULT);
-            long retryIntervalMs = configuration.getLong(
-                    OptimizerConfiguration.PROPERTY_ZK_DISCOVERY_RETRY_INTERVAL_MS,
-                    OptimizerConfiguration.PROPERTY_ZK_DISCOVERY_RETRY_INTERVAL_MS_DEFAULT);
-            for (int attempt = 0; attempt < retries && discoveredFileServers.isEmpty(); attempt++) {
-                LOGGER.log(Level.INFO,
-                        "ZK discovery returned no file servers; retrying in {0} ms "
-                                + "(attempt {1}/{2}) — file server may still be starting",
-                        new Object[]{retryIntervalMs, attempt + 1, retries});
-                // Use wait() instead of Thread.sleep() so the monitor is released
-                // during the pause — any concurrent thread that needs this lock
-                // (e.g. shutdown()) can proceed without waiting the full retry interval.
-                // Spurious early wake-ups from wait() are harmless: we simply retry
-                // ZK discovery sooner than planned.
-                try {
-                    wait(retryIntervalMs);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-                try (ZookeeperMetadataStorageManager zkRetry =
-                        new ZookeeperMetadataStorageManager(zkAddress, sessionTimeout, basePath)) {
-                    zkRetry.start(false);
-                    discoveredFileServers.addAll(zkRetry.listFileServers());
-                    if (!discoveredFileServers.isEmpty()) {
-                        LOGGER.log(Level.INFO,
-                                "ZK discovery retry {0}/{1} found file servers: {2}",
-                                new Object[]{attempt + 1, retries, discoveredFileServers});
-                    }
-                } catch (MetadataStorageManagerException retryErr) {
-                    LOGGER.log(Level.WARNING,
-                            "ZK discovery retry {0}/{1} failed: {2}",
-                            new Object[]{attempt + 1, retries, retryErr.getMessage()});
-                }
-            }
+        if (ts == null) {
+            throw new IllegalStateException(
+                    "No tablespace named '" + tablespaceName + "' found under "
+                    + basePath + "/tableSpaces — ensure the HerdDB cluster has started "
+                    + "and created its default tablespace before starting the optimizer.");
+        }
+        tablespaceUuid = ts.uuid;
+        try {
+            // listFileServers() installs the ZK children-watch on /herd/fileServers.
+            // Even if it returns empty (file server not yet registered), the watch
+            // will fire when the file server registers and onFileServersChanged above
+            // will schedule an upgrade tick automatically.
+            discoveredFileServers.addAll(zkMeta.listFileServers());
+        } catch (MetadataStorageManagerException listErr) {
+            LOGGER.log(Level.WARNING,
+                    "could not discover remote file servers via ZK; the optimizer"
+                            + " will fall back to NoopMerger until the ZK watcher fires"
+                            + " or the static server list is configured: {0}",
+                    listErr.getMessage());
         }
         LOGGER.log(Level.INFO, "Resolved tablespace name ''{0}'' to UUID {1}",
                 new Object[]{tablespaceName, tablespaceUuid});
@@ -701,17 +713,15 @@ public final class IndexOptimizerMain {
             }
         }
         if (servers.isEmpty()) {
-            // Re-attempt ZK discovery.
-            String addr = this.zkAddress;
-            int timeout = this.zkSessionTimeoutMs;
-            String basePath = this.zkBasePath;
-            if (addr == null || basePath == null) {
+            // Re-attempt ZK discovery via the long-lived zkMeta instance (issue #507).
+            // This reuses the already-open ZK session — no new session overhead —
+            // and also re-arms the fileServersWatcher so future file-server changes
+            // continue to trigger onFileServersChanged callbacks.
+            if (zkMeta == null) {
                 return; // start() not yet complete
             }
-            try (ZookeeperMetadataStorageManager zkmeta =
-                    new ZookeeperMetadataStorageManager(addr, timeout, basePath)) {
-                zkmeta.start(false);
-                servers.addAll(zkmeta.listFileServers());
+            try {
+                servers.addAll(zkMeta.listFileServers());
             } catch (MetadataStorageManagerException zkErr) {
                 LOGGER.log(Level.FINE,
                         "maybeUpgradeMerger: ZK discovery failed, will retry on next tick: {0}",
@@ -836,16 +846,10 @@ public final class IndexOptimizerMain {
                         OptimizerConfiguration.PROPERTY_REMOTE_FILE_MAX_INFLIGHT_WRITE_BYTES,
                         OptimizerConfiguration.PROPERTY_REMOTE_FILE_MAX_INFLIGHT_WRITE_BYTES_DEFAULT));
 
-        RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
-        this.mergerFileClient = factory.createClient(servers, clientConfig);
-        Path tmpDir = resolveTmpDirectory();
-        Path metaDir = tmpDir.resolve("merger-metadata");
-        Path remoteTmp = tmpDir.resolve("merger-remote-tmp");
-        Files.createDirectories(metaDir);
-        Files.createDirectories(remoteTmp);
-        this.mergerDataStorageManager = factory.createDataStorageManager(
-                metaDir, remoteTmp, Integer.MAX_VALUE, mergerFileClient);
-
+        // Validate all configuration BEFORE allocating any resources (gRPC channel,
+        // DataStorageManager) to avoid resource leaks when validation fails. Previously
+        // the dim check came after factory.createClient(), leaking a file client on every
+        // failed call (issue #507, reviewer finding).
         int dim = configuration.getInt("indexoptimizer.merge.dim", 0);
         if (dim <= 0) {
             // The merger needs the dimension up front. Fall back: we don't
@@ -875,6 +879,17 @@ public final class IndexOptimizerMain {
                             + " (expected one of " + Arrays.toString(VectorSimilarityFunction.values())
                             + ")", badName);
         }
+
+        RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
+        this.mergerFileClient = factory.createClient(servers, clientConfig);
+        Path tmpDir = resolveTmpDirectory();
+        Path metaDir = tmpDir.resolve("merger-metadata");
+        Path remoteTmp = tmpDir.resolve("merger-remote-tmp");
+        Files.createDirectories(metaDir);
+        Files.createDirectories(remoteTmp);
+        this.mergerDataStorageManager = factory.createDataStorageManager(
+                metaDir, remoteTmp, Integer.MAX_VALUE, mergerFileClient);
+
         return new RemoteSegmentMerger(mergerDataStorageManager, tmpDir,
                 dim, graphM, beamWidth, neighborOverflow, alpha, similarity);
     }
@@ -934,6 +949,19 @@ public final class IndexOptimizerMain {
                 // an earlier exception.
                 LOGGER.log(Level.WARNING, "merger file client close failed: {0}",
                         e.getMessage());
+            }
+        }
+        // Close the long-lived ZookeeperMetadataStorageManager last. Its ZK session
+        // must stay open until after the leader lock is released and the primary ZK
+        // session is closed, so file-server watchers don't fire spuriously during
+        // orderly shutdown.
+        if (zkMeta != null) {
+            try {
+                zkMeta.close();
+            } catch (Exception e) {
+                // Broad catch: MetadataStorageManager.close() declares Exception.
+                // Best-effort cleanup during shutdown — log and proceed.
+                LOGGER.log(Level.WARNING, "zkMeta close failed: {0}", e.getMessage());
             }
         }
         shutdownLatch.countDown();
