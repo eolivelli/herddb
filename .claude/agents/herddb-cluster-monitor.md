@@ -111,12 +111,20 @@ For each replica 0 to IS_REPLICAS-1, extract and report:
 - `jvm_heap_used_pct` — IS JVM heap utilisation
 - Parse memory in GiB (divide by 1e9)
 
+Do NOT extract or report `apply_queue_size` or `apply_queue_max` from `engine-stats` output.
+The apply queue is intentionally full during high-throughput ingestion and is not a diagnostic
+signal — it adds noise to the TICK SUMMARY without conveying actionable information.
+
 **IS checkpoint status**: also tail the IS log for these keywords (tail 10 lines):
 ```bash
 kubectl logs --tail=10 herddb-indexing-service-<N>
 ```
 Report if any of these appear: `memory back-pressure`, `checkpoint in progress`,
 `Phase A`, `Phase B`, `Phase C`, `back-pressure released`.
+When reporting a checkpoint-phase keyword, include **only** the phase name and
+back-pressure state — do NOT copy the full log line. Strip any `apply queue X/Y`
+detail before reporting (the apply queue is always near-full during bulk operations
+and adds no diagnostic value).
 
 **Server checkpoint status**: scan the last 5 server log lines for
 `local checkpoint finish` to extract the last completed LSN and duration.
