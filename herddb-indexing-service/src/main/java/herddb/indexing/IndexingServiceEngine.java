@@ -982,6 +982,22 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                                                                 + "): znode has invalid or zero graphFileSize");
                                                 return;
                                             }
+                                            if (m.getGraphPath() == null
+                                                    || m.getGraphPath().isEmpty()
+                                                    || m.getMapPath() == null
+                                                    || m.getMapPath().isEmpty()) {
+                                                // Defensive guard: a znode without a graph or map
+                                                // path (e.g. a partial publish interrupted mid-write)
+                                                // would reach adoptExternalSegment and trigger an
+                                                // IllegalStateException in loadFusedPQSegment.
+                                                // Skip adoption and surface a WARNING instead.
+                                                LOGGER.log(Level.WARNING,
+                                                        "Skipping adoption of segment "
+                                                                + m.getSegmentUuid()
+                                                                + ": znode has null or empty "
+                                                                + "graphPath/mapPath");
+                                                return;
+                                            }
                                             try {
                                                 finalStore.adoptExternalSegment(
                                                         m.getSegmentUuid(),

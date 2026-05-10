@@ -20,6 +20,7 @@
 package herddb.indexing;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.core.MemoryManager;
 import herddb.file.FileDataStorageManager;
@@ -488,6 +489,23 @@ public class OptimizerMergeAdoptionRecallTest {
 
             assertEquals("reloaded store must hold exactly 1 segment (the merged one)",
                     1, reloaded.getOnDiskSegmentCount());
+
+            // V5 externalStorageKey round-trip assertion: the merged segment's
+            // externalStorageKey must survive the checkpoint→restart cycle.
+            // If V5 write was silently downgraded to V4 (or the field is lost on
+            // deserialise), this returns null — which would cause the reloaded store
+            // to fall back to the legacy indexUUID-based storage key, silently
+            // breaking remote-file fetches for optimizer-produced segment files.
+            String reloadedExternalStorageKey =
+                    reloaded.getOnDiskSegmentExternalStorageKeyForTest(0);
+            assertNotNull(
+                    "V5 IndexStatus round-trip must preserve externalStorageKey "
+                            + "(V4 downgrade regression would return null here)",
+                    reloadedExternalStorageKey);
+            assertTrue(
+                    "externalStorageKey must start with capturedIndexUuid + '_seg', "
+                            + "was: " + reloadedExternalStorageKey,
+                    reloadedExternalStorageKey.startsWith(capturedIndexUuid + "_seg"));
 
             double recall10 = measureRecallOn(reloaded, 10);
             double recall100 = measureRecallOn(reloaded, 100);

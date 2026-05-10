@@ -3042,6 +3042,23 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return segments.size();
     }
 
+    /**
+     * Test-only accessor: returns the {@code externalStorageKey} of the
+     * on-disk segment at the given list index (0-based). Used by
+     * {@code OptimizerMergeAdoptionRecallTest.adoptedSegmentSurvivesRestart}
+     * to verify that the V5 IndexStatus round-trip preserves the
+     * {@code externalStorageKey} field so a restart reattaches to the
+     * same optimizer-produced multipart files.
+     *
+     * @param idx 0-based position in the current segments list
+     * @return the {@code externalStorageKey} string, or {@code null} for
+     *         IS-locally-produced segments
+     * @throws IndexOutOfBoundsException if {@code idx >= getOnDiskSegmentCount()}
+     */
+    public String getOnDiskSegmentExternalStorageKeyForTest(int idx) {
+        return segments.get(idx).externalStorageKey;
+    }
+
     VectorSegment preloadCompactedSegment(SegmentWriteResult swr) throws IOException, DataStorageManagerException {
         VectorSegment seg = new VectorSegment(swr.segmentId);
         seg.segmentUuid = swr.segmentUuid;
@@ -3092,8 +3109,20 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         }
 
-        // Build a tentative segment and load its data (IO-heavy; no lock held).
-        int localSegId = nextSegmentId.getAndIncrement();
+        // Allocate the local segment ID under the write lock so the allocation
+        // is serialised against the checkpoint's "wipe-all + nextSegmentId.set(0)"
+        // path (which also holds stateLock.writeLock()). Without this guard, a
+        // concurrent wipe cycle could reset the counter between the allocation
+        // and publication steps, allowing a future IS-local segment to reuse the
+        // same localSegId and thereby collide on the BLink storage key
+        // (indexUUID + "_seg" + localSegId + "_pktonode").
+        int localSegId;
+        stateLock.writeLock().lock();
+        try {
+            localSegId = nextSegmentId.getAndIncrement();
+        } finally {
+            stateLock.writeLock().unlock();
+        }
         VectorSegment tentative = new VectorSegment(localSegId);
         tentative.segmentUuid = segmentUuid;
         tentative.externalStorageKey = indexUUID + "_seg" + externalSegmentId;
@@ -3130,6 +3159,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             "adoptExternalSegment: error closing tentative segment " + segmentUuid
                                     + " after load failure in store " + indexName, closeEx);
                 }
+                // Reclaim the BLink storage entry that loadFusedPQSegment may have created
+                // via createSegmentBLinks before the failure. If readMultipartMapDataToTempFile
+                // failed before loadFusedPQSegment ran, dropSegmentBLinkStorage is a no-op
+                // (DataStorageManagerException is caught and logged internally).
+                dropSegmentBLinkStorage(tentative);
             }
         }
 
@@ -3149,6 +3183,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
             newList.add(tentative);
             segments = newList;
             registerSegmentMemoryEstimate(tentative);
+            // Ensure nextSegmentId stays above localSegId even if a concurrent
+            // checkpoint wipe-path (nextSegmentId.set(0)) ran between the
+            // localSegId allocation (under writeLock above) and this publication.
+            // Without this bump, IS-local segments created after the wipe could
+            // eventually reach localSegId and collide on the BLink storage key.
+            if (nextSegmentId.get() <= localSegId) {
+                nextSegmentId.set(localSegId + 1);
+            }
             // Mark the store dirty so the next checkpoint() call serialises the new
             // segment list (including the adopted segment's externalStorageKey) to the
             // IndexStatus. Without this, the checkpoint gate treats adoption as a
@@ -3162,9 +3204,13 @@ public class PersistentVectorStore extends AbstractVectorStore {
         } finally {
             stateLock.writeLock().unlock();
             if (alreadyAdopted) {
-                // Close the tentative segment outside the writeLock to avoid holding
-                // the lock during potential IO (BLink close, temp-file delete).
+                // Close the tentative segment and reclaim its BLink storage outside
+                // the writeLock to avoid holding the lock during potential IO.
                 tentative.close();
+                // Reclaim the BLink storage entry materialised by createSegmentBLinks
+                // inside loadFusedPQSegment (which completed successfully before the
+                // duplicate was detected under the writeLock).
+                dropSegmentBLinkStorage(tentative);
             }
         }
         return true;
@@ -3223,6 +3269,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
                         "dropSegmentByUuid: error closing segment " + segmentUuid
                                 + " in store " + indexName, closeEx);
             }
+            // Reclaim the per-segment pk-to-node BLink storage entry. For adopted
+            // (external-storage-key) segments this is the entry created by
+            // loadFusedPQSegment → createSegmentBLinks during adoption. Without
+            // this, each optimizer adopt→deprecate→drop cycle leaks one BLink
+            // storage entry indefinitely.
+            dropSegmentBLinkStorage(found);
         } finally {
             stateLock.writeLock().unlock();
         }
