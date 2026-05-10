@@ -132,10 +132,6 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_EVENT_DEBOUNCE_MS = "indexoptimizer.event.debounce.ms";
     public static final long PROPERTY_EVENT_DEBOUNCE_MS_DEFAULT = 500L;
 
-    // jvector params used by the merger when rebuilding the merged graph.
-    // Defaults aligned to {@code PersistentVectorStore} so the merged segment
-    // has the same recall characteristics as in-IS-built segments.
-
     /**
      * Streaming compaction (issue #485). When {@code true}, the optimizer
      * pod drives the merge through jvector's
@@ -157,32 +153,6 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_MERGE_STREAMING_ENABLED =
             "indexoptimizer.merge.streaming.enabled";
     public static final boolean PROPERTY_MERGE_STREAMING_ENABLED_DEFAULT = true;
-
-    /** jvector graph degree (edges per node). */
-    public static final String PROPERTY_MERGE_M = "indexoptimizer.merge.M";
-    public static final int PROPERTY_MERGE_M_DEFAULT = 16;
-
-    /** jvector beam-width during graph build. */
-    public static final String PROPERTY_MERGE_BEAM_WIDTH = "indexoptimizer.merge.beamWidth";
-    public static final int PROPERTY_MERGE_BEAM_WIDTH_DEFAULT = 100;
-
-    /** jvector neighbor-overflow factor during graph build. */
-    public static final String PROPERTY_MERGE_NEIGHBOR_OVERFLOW = "indexoptimizer.merge.neighborOverflow";
-    public static final float PROPERTY_MERGE_NEIGHBOR_OVERFLOW_DEFAULT = 1.2f;
-
-    /** jvector alpha factor during graph build. */
-    public static final String PROPERTY_MERGE_ALPHA = "indexoptimizer.merge.alpha";
-    public static final float PROPERTY_MERGE_ALPHA_DEFAULT = 1.4f;
-
-    /**
-     * Vector similarity used by the merger. Must match the value used by the
-     * IS that produced the inputs, otherwise PQ training and graph
-     * construction will be incoherent. Accepted values match
-     * {@code io.github.jbellis.jvector.vector.VectorSimilarityFunction}:
-     * {@code DOT_PRODUCT}, {@code COSINE}, {@code EUCLIDEAN}.
-     */
-    public static final String PROPERTY_MERGE_SIMILARITY = "indexoptimizer.merge.similarity";
-    public static final String PROPERTY_MERGE_SIMILARITY_DEFAULT = "DOT_PRODUCT";
 
     // -------------------------------------------------------------------------
     // Remote file service client (issue #484: merger needs a DataStorageManager

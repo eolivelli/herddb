@@ -154,9 +154,11 @@ public class RemoteSegmentMergerTest {
         SegmentMetadata b = writeInputSegmentToDsm("seg-B", 200L, /* gen */ 2L, 0xB);
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, /* M */ 16, /* beamWidth */ 64,
-                /* neighborOverflow */ 1.2f, /* alpha */ 1.4f,
-                VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        /* graphM */ 16, /* beamWidth */ 64,
+                        /* neighborOverflow */ 1.2f, /* alpha */ 1.4f,
+                        VectorSimilarityFunction.EUCLIDEAN)));
         SegmentMetadata merged = merger.merge(List.of(a, b), /* newOwnerInstance */ 0);
 
         assertNotNull("merger must produce an output for healthy inputs", merged);
@@ -193,7 +195,9 @@ public class RemoteSegmentMergerTest {
         SegmentMetadata b = writeInputSegmentToDsm("seg-B", 200L, 2L, 0x2);
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, 16, 64, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        16, 64, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN)));
         SegmentMetadata merged = merger.merge(List.of(a, b), 0);
         assertNotNull(merged);
 
@@ -235,7 +239,9 @@ public class RemoteSegmentMergerTest {
                 .sizeBytes(100L).vectorCount(1L).generation(1L).createdAtEpochMillis(0L)
                 .build();
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, 16, 64, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        16, 64, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN)));
         try {
             merger.merge(List.of(a, b), 0);
             org.junit.Assert.fail("expected IllegalArgumentException");
@@ -258,7 +264,9 @@ public class RemoteSegmentMergerTest {
                 .sizeBytes(100L).vectorCount(1L).generation(1L).createdAtEpochMillis(0L)
                 .build();
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, 16, 64, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        16, 64, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN)));
         try {
             merger.merge(List.of(a, b), 0);
             org.junit.Assert.fail("expected IllegalArgumentException");
@@ -270,7 +278,9 @@ public class RemoteSegmentMergerTest {
     @Test
     public void emptyInputReturnsNull() throws Exception {
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, 16, 64, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        16, 64, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN)));
         assertNull("empty input → null output", merger.merge(new ArrayList<>(), 0));
     }
 }
