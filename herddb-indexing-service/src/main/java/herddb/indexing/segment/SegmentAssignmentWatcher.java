@@ -222,7 +222,15 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
         boolean isPending = m.getPendingOwnerInstanceId() == instanceId;
         boolean wasPending = previous != null && previous.getPendingOwnerInstanceId() == instanceId;
 
-        if (isOwner && !wasOwner) {
+        // A segment assigned to this instance is no longer "active for us" if
+        // (a) ownership transferred to a different instance, or
+        // (b) the optimizer deprecated it (state DEPRECATED) — the IS must stop
+        //     serving queries from the deprecated copy regardless of ownerInstanceId.
+        boolean nowDeprecatedOrGone = m.getState() == SegmentState.DEPRECATED
+                || m.getState() == SegmentState.DELETED;
+        boolean wasActive = previous == null || previous.getState() == SegmentState.ACTIVE;
+
+        if (isOwner && !wasOwner && !nowDeprecatedOrGone) {
             fireAssigned(current);
             return;
         }
@@ -230,7 +238,7 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
             firePending(current);
             return;
         }
-        if (wasOwner && !isOwner) {
+        if (wasOwner && (!isOwner || (wasActive && nowDeprecatedOrGone))) {
             fireReleased(previous);
         }
     }

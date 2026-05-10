@@ -957,6 +957,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
     }
 
     /**
+     * Returns the multipart storage key for a segment.
+     *
+     * <p>IS-locally-produced segments use the legacy key
+     * {@code indexUUID + "_seg" + segmentId} (where {@code segmentId} is an {@code int}).
+     * Externally-produced segments (optimizer outputs) carry a 63-bit long segment ID
+     * that does not fit in {@code int}; their storage key is stored explicitly in
+     * {@link VectorSegment#externalStorageKey} during adoption.
+     */
+    private String segmentStorageKey(VectorSegment seg) {
+        return seg.externalStorageKey != null
+                ? seg.externalStorageKey
+                : (indexUUID + "_seg" + seg.segmentId);
+    }
+
+    /**
      * Queues the two multipart files backing a segment (graph + map)
      * for retention-aware deletion. Called by the compaction swap step
      * for every input segment that the merged output replaces.
@@ -964,7 +979,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
     void queueSegmentPendingDelete(VectorSegment seg, long retentionMs) {
         long deadlineMs = System.currentTimeMillis() + retentionMs;
         long sinceGen = currentIndexStatusGeneration.get();
-        String segUuid = indexUUID + "_seg" + seg.segmentId;
+        String segUuid = segmentStorageKey(seg);
         pendingDeletes.add(new PendingDelete(
                 encodeMultipartPath(segUuid, "graph"), deadlineMs, sinceGen));
         if (seg.mapFilePath != null) {
@@ -998,7 +1013,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
         long deadlineMs = System.currentTimeMillis() + vectorIndexCompactionRetentionMs;
         long sinceGen = currentIndexStatusGeneration.get();
-        String segUuid = indexUUID + "_seg" + mergedOutput.segmentId;
+        String segUuid = segmentStorageKey(mergedOutput);
         if (mergedOutput.graphFilePath != null) {
             pendingDeletes.add(new PendingDelete(
                     encodeMultipartPath(segUuid, "graph"), deadlineMs, sinceGen));
@@ -3007,6 +3022,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
         return new ArrayList<>(segments);
     }
 
+    /**
+     * Returns the current number of on-disk (sealed) segments held by this store.
+     * Useful for cross-module tests that need to observe the effect of
+     * {@link #adoptExternalSegment} / {@link #dropSegmentByUuid} without
+     * depending on the package-private {@link VectorSegment} type.
+     */
+    public int getOnDiskSegmentCount() {
+        return segments.size();
+    }
+
     VectorSegment preloadCompactedSegment(SegmentWriteResult swr) throws IOException, DataStorageManagerException {
         VectorSegment seg = new VectorSegment(swr.segmentId);
         seg.segmentUuid = swr.segmentUuid;
@@ -3018,6 +3043,155 @@ public class PersistentVectorStore extends AbstractVectorStore {
         Path mapFile = readMultipartMapDataToTempFile(seg);
         loadFusedPQSegment(seg, mapFile, dimension, nextNodeId.get());
         return seg;
+    }
+
+    /**
+     * Adopts an externally-produced segment (e.g. output of the index-optimizer service)
+     * into this store's active segment list. The segment's graph and map multipart files
+     * must already be present in the underlying {@link herddb.storage.DataStorageManager}
+     * under the key {@code indexUUID + "_seg" + externalSegmentId}.
+     *
+     * <p>The heavy IO (map-file download + graph loading) is performed outside the
+     * write lock to avoid blocking concurrent search queries. A second idempotency check
+     * under the write lock guards against duplicate adoption if the watcher fires twice
+     * for the same segment.
+     *
+     * <p>If {@code dimension} is not yet initialised (i.e. the store has never
+     * checkpointed), an {@link IllegalStateException} is thrown — the optimizer cannot
+     * produce merged segments before the IS has produced at least one checkpoint, so
+     * this state is unexpected and should be surfaced.
+     */
+    @Override
+    public boolean adoptExternalSegment(String segmentUuid, long externalSegmentId,
+            String graphFilePath, long graphFileSize,
+            String mapFilePath, long mapFileSize,
+            long generation) throws IOException, DataStorageManagerException {
+        int snapshotDimension = dimension;
+        if (snapshotDimension == 0) {
+            throw new IllegalStateException(
+                    "adoptExternalSegment called on store " + indexName
+                            + " before dimension is known — store must have checkpointed at least once");
+        }
+        // Quick idempotency check outside the write lock (avoids IO if already loaded).
+        for (VectorSegment existing : segments) {
+            if (segmentUuid.equals(existing.segmentUuid)) {
+                LOGGER.log(Level.FINE,
+                        "adoptExternalSegment: segment {0} already loaded in store {1}; skipping",
+                        new Object[]{segmentUuid, indexName});
+                return false;
+            }
+        }
+
+        // Build a tentative segment and load its data (IO-heavy; no lock held).
+        int localSegId = nextSegmentId.getAndIncrement();
+        VectorSegment tentative = new VectorSegment(localSegId);
+        tentative.segmentUuid = segmentUuid;
+        tentative.externalStorageKey = indexUUID + "_seg" + externalSegmentId;
+        tentative.graphFilePath = graphFilePath;
+        tentative.graphFileSize = graphFileSize;
+        tentative.mapFilePath = mapFilePath;
+        tentative.mapFileSize = mapFileSize;
+        tentative.generation = generation;
+        tentative.estimatedSizeBytes = graphFileSize + mapFileSize;
+
+        // The caller may be a ZK-watcher dispatch thread. NIO FileChannel reads
+        // will throw ClosedByInterruptException if the thread's interrupt flag is
+        // already set (e.g. from a previous ScheduledExecutorService shutdown in a
+        // co-running test, or from a benign wakeup on the dispatch thread). Clearing
+        // the flag before the IO section prevents spurious failures; the flag is
+        // restored afterwards so any legitimate "please stop" signal is not lost.
+        boolean wasInterrupted = Thread.interrupted();
+        boolean loadedOk = false;
+        try {
+            Path mapFile = readMultipartMapDataToTempFile(tentative);
+            loadFusedPQSegment(tentative, mapFile, snapshotDimension, nextNodeId.get());
+            loadedOk = true;
+        } finally {
+            if (wasInterrupted) {
+                // Restore the interrupt flag so callers/wrappers can observe it.
+                Thread.currentThread().interrupt();
+            }
+            if (!loadedOk) {
+                try {
+                    tentative.close();
+                } catch (RuntimeException closeEx) {
+                    // Narrow catch: close() throws only RuntimeException from BLink cleanup.
+                    LOGGER.log(Level.WARNING,
+                            "adoptExternalSegment: error closing tentative segment " + segmentUuid
+                                    + " after load failure in store " + indexName, closeEx);
+                }
+            }
+        }
+
+        // Under write lock: re-check idempotency, then publish.
+        stateLock.writeLock().lock();
+        try {
+            for (VectorSegment existing : segments) {
+                if (segmentUuid.equals(existing.segmentUuid)) {
+                    // Adopted by a concurrent adoption or watcher re-fire; discard.
+                    tentative.close();
+                    return false;
+                }
+            }
+            List<VectorSegment> newList = new java.util.concurrent.CopyOnWriteArrayList<>(segments);
+            newList.add(tentative);
+            segments = newList;
+            registerSegmentMemoryEstimate(tentative);
+            LOGGER.log(Level.INFO,
+                    "adoptExternalSegment: loaded segment {0} (storageKey={1}, generation={2})"
+                            + " into store {3}; total on-disk segments now {4}",
+                    new Object[]{segmentUuid, tentative.externalStorageKey,
+                            generation, indexName, segments.size()});
+        } finally {
+            stateLock.writeLock().unlock();
+        }
+        return true;
+    }
+
+    /**
+     * Removes a segment from the active list by its UUID and releases its resources.
+     * Called when the segment-assignment watcher reports that a segment previously owned
+     * by this IS instance has been deprecated (e.g. superseded by an optimizer merge).
+     *
+     * <p>Idempotent: if the UUID is not present, this method returns immediately.
+     * Does <em>not</em> queue the segment's files for deletion — the optimizer manages
+     * the file lifecycle for segments it produced.
+     */
+    @Override
+    public void dropSegmentByUuid(String segmentUuid) {
+        stateLock.writeLock().lock();
+        VectorSegment found = null;
+        try {
+            List<VectorSegment> newList = new java.util.concurrent.CopyOnWriteArrayList<>();
+            for (VectorSegment s : segments) {
+                if (segmentUuid.equals(s.segmentUuid)) {
+                    found = s;
+                } else {
+                    newList.add(s);
+                }
+            }
+            if (found == null) {
+                return;
+            }
+            segments = newList;
+            unregisterSegmentMemoryEstimate(found);
+            LOGGER.log(Level.INFO,
+                    "dropSegmentByUuid: removed segment {0} from store {1};"
+                            + " total on-disk segments now {2}",
+                    new Object[]{segmentUuid, indexName, segments.size()});
+        } finally {
+            stateLock.writeLock().unlock();
+        }
+        // Reaching here means found != null (the early return above would have fired otherwise).
+        try {
+            found.close();
+        } catch (RuntimeException e) {
+            // Narrow catch: close() only throws RuntimeException from BLink cleanup.
+            // We must not let a stale-handle error mask the segment removal.
+            LOGGER.log(Level.WARNING,
+                    "dropSegmentByUuid: error closing segment " + segmentUuid
+                            + " in store " + indexName, e);
+        }
     }
 
     String indexUUID() {
@@ -5843,7 +6017,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         ReaderSupplier readerSupplier = dataStorageManager.multipartIndexReaderSupplier(
                 tableSpaceUUID,
-                indexUUID + "_seg" + seg.segmentId,
+                segmentStorageKey(seg),
                 "graph",
                 seg.graphFileSize);
         seg.onDiskGraph = OnDiskGraphIndex.load(readerSupplier);
@@ -6091,7 +6265,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 // benefit to routing through the SegmentBlockCache.
                 dataStorageManager.downloadMultipartIndexFile(
                         tableSpaceUUID,
-                        indexUUID + "_seg" + seg.segmentId,
+                        segmentStorageKey(seg),
                         "map",
                         seg.mapFileSize,
                         tempFile);
@@ -6101,7 +6275,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 io.github.jbellis.jvector.disk.ReaderSupplier supplier =
                         dataStorageManager.multipartIndexReaderSupplier(
                                 tableSpaceUUID,
-                                indexUUID + "_seg" + seg.segmentId,
+                                segmentStorageKey(seg),
                                 "map",
                                 seg.mapFileSize);
                 try (io.github.jbellis.jvector.disk.RandomAccessReader reader = supplier.get();

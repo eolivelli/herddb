@@ -339,14 +339,24 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * for the engine — subscribes to every {@code SegmentAssignmentWatcher}
      * created by this IS instance so the gauges + counters reflect the
      * union of segments owned across all indexes. Prometheus exposition
-     * happens through {@link #registerSegmentAssignmentMetrics}; the gauges
-     * stay at zero until the engine actually wires up an
-     * {@code SegmentAssignmentWatcher} (currently future-work — the metrics
-     * surface is live so the Grafana dashboard panels light up the moment
-     * the watcher integration lands).
+     * happens through {@link #registerSegmentAssignmentMetrics}.
      */
     private final herddb.indexing.segment.SegmentAssignmentMetrics segmentAssignmentMetrics =
             new herddb.indexing.segment.SegmentAssignmentMetrics();
+
+    /**
+     * One {@link herddb.indexing.segment.SegmentAssignmentWatcher} per vector store,
+     * keyed by {@link #storeKey}. Each watcher watches the ZK segment-registry subtree
+     * for that store's index and calls
+     * {@link herddb.index.vector.AbstractVectorStore#adoptExternalSegment} /
+     * {@link herddb.index.vector.AbstractVectorStore#dropSegmentByUuid} when the
+     * optimizer produces or deprecates segments (issue #514).
+     *
+     * <p>Populated by the {@code vectorStoreFactory} lambda and closed in
+     * {@link #close()}, before the vector stores themselves are closed.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, herddb.indexing.segment.SegmentAssignmentWatcher>
+            segmentWatchers = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * Issue #471 — engine-wide counters and timings for the
@@ -924,6 +934,73 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     store.start();
                 } catch (Exception e) {
                     throw new RuntimeException("Failed to start PersistentVectorStore " + indexName, e);
+                }
+
+                // Issue #514: arm a SegmentAssignmentWatcher so this store
+                // automatically adopts optimizer-merged segments and drops
+                // deprecated inputs without requiring a restart.
+                // The watcher is created AFTER store.start() so the store is
+                // fully initialised (dimension known, reconcile done) before
+                // the initial scan fires.
+                SegmentRegistryClient watcherRegistry = this.segmentRegistry;
+                if (watcherRegistry != null && tableSpaceUUID != null) {
+                    final herddb.index.vector.AbstractVectorStore finalStore = store;
+                    final String finalIndexUUID = autoIndexUUID;
+                    final String finalIndexName = indexName;
+                    herddb.indexing.segment.SegmentAssignmentWatcher watcher =
+                            new herddb.indexing.segment.SegmentAssignmentWatcher(
+                                    watcherRegistry, instanceId,
+                                    new herddb.indexing.segment.SegmentAssignmentListener() {
+                                        @Override
+                                        public void onSegmentAssigned(
+                                                herddb.indexing.segment.VersionedSegmentMetadata vsm) {
+                                            segmentAssignmentMetrics.onSegmentAssigned(vsm);
+                                            herddb.indexing.segment.SegmentMetadata m = vsm.metadata();
+                                            try {
+                                                finalStore.adoptExternalSegment(
+                                                        m.getSegmentUuid(),
+                                                        m.getSegmentId(),
+                                                        m.getGraphPath(),
+                                                        m.getSizeBytes() - m.getMapFileSize(),
+                                                        m.getMapPath(),
+                                                        m.getMapFileSize(),
+                                                        m.getGeneration());
+                                            } catch (java.io.IOException
+                                                    | herddb.storage.DataStorageManagerException e) {
+                                                LOGGER.log(Level.WARNING,
+                                                        "Failed to adopt external segment "
+                                                                + m.getSegmentUuid()
+                                                                + " into store " + finalIndexUUID, e);
+                                            }
+                                        }
+
+                                        @Override
+                                        public void onSegmentReleased(
+                                                herddb.indexing.segment.SegmentMetadata previous) {
+                                            finalStore.dropSegmentByUuid(previous.getSegmentUuid());
+                                            segmentAssignmentMetrics.onSegmentReleased(previous);
+                                        }
+
+                                        @Override
+                                        public void onPendingAssignment(
+                                                herddb.indexing.segment.VersionedSegmentMetadata vsm) {
+                                            segmentAssignmentMetrics.onPendingAssignment(vsm);
+                                        }
+                                    });
+                    String watcherKey = storeKey(tableName, indexName);
+                    try {
+                        watcher.watchIndex(tableSpaceUUID, autoIndexUUID);
+                        segmentWatchers.put(watcherKey, watcher);
+                        LOGGER.log(Level.INFO,
+                                "SegmentAssignmentWatcher armed for store {0} (indexUuid={1})",
+                                new Object[]{watcherKey, finalIndexUUID});
+                    } catch (herddb.indexing.segment.SegmentRegistryException e) {
+                        LOGGER.log(Level.WARNING,
+                                "Failed to arm SegmentAssignmentWatcher for store " + finalIndexName
+                                        + " (indexUuid=" + finalIndexUUID
+                                        + "); external segment adoption disabled for this store", e);
+                        watcher.close();
+                    }
                 }
                 return store;
             };
@@ -4706,6 +4783,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // S3 — on a wiped-disk restart the service would claim progress it
         // cannot actually replay. Replay from the last checkpoint watermark
         // on next boot is safe (apply is idempotent).
+
+        // Close segment-assignment watchers BEFORE vector stores so no adoption
+        // events fire against a half-closed store (issue #514).
+        for (herddb.indexing.segment.SegmentAssignmentWatcher w : segmentWatchers.values()) {
+            try {
+                w.close();
+            } catch (RuntimeException e) {
+                // close() is void and handles its own InterruptedException internally;
+                // this catch is a safety net for unexpected runtime failures that must
+                // not prevent the remaining shutdown steps from running.
+                LOGGER.log(Level.WARNING, "Error closing segment watcher during shutdown", e);
+            }
+        }
+        segmentWatchers.clear();
 
         // Close and clear all vector stores
         for (AbstractVectorStore store : vectorStores.values()) {
