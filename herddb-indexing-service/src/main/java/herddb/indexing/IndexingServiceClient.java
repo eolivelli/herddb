@@ -645,10 +645,19 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                         "dropIndex: timed out waiting for IS instance {0} for index {1}",
                         new Object[]{addr, indexName});
             } catch (InterruptedException ie) {
+                // Re-set the interrupt flag and stop waiting on any remaining
+                // futures — once interrupted, further get() calls would throw
+                // immediately on every iteration.
                 Thread.currentThread().interrupt();
+                f.getValue().cancel(true);
+                for (int j = inflight.indexOf(f) + 1; j < inflight.size(); j++) {
+                    inflight.get(j).getValue().cancel(true);
+                }
                 LOGGER.log(Level.WARNING,
-                        "dropIndex: interrupted waiting for IS instance {0} for index {1}",
+                        "dropIndex: interrupted waiting for IS instance {0} for index {1}; "
+                                + "cancelling remaining in-flight RPCs",
                         new Object[]{addr, indexName});
+                break;
             }
         }
     }
