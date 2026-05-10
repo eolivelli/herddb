@@ -1055,7 +1055,12 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                         LOGGER.log(Level.INFO,
                                 "SegmentAssignmentWatcher armed for store {0} (indexUuid={1})",
                                 new Object[]{watcherKey, finalIndexUUID});
-                    } catch (herddb.indexing.segment.SegmentRegistryException e) {
+                    } catch (Exception e) {
+                        // Broad catch is intentional: both SegmentRegistryException (from
+                        // watchIndex) and unchecked RuntimeException (e.g. from
+                        // reconcileAdoptedSegments → dropSegmentByUuid → BLink close)
+                        // must close the watcher so its background refresh executor is
+                        // stopped and it does not leak outside segmentWatchers.
                         LOGGER.log(Level.WARNING,
                                 "Failed to arm SegmentAssignmentWatcher for store " + finalIndexName
                                         + " (indexUuid=" + finalIndexUUID
