@@ -21,6 +21,7 @@ package herddb.indexing.optimizer;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.fail;
 import herddb.index.vector.VectorIndexManager;
@@ -254,10 +255,11 @@ public class RemoteMetadataIndexMergeConfigProviderTest {
         provider.invalidateCache();
         IndexMergeConfig second = provider.getMergeConfig(TS_UUID, "docs", "docs_v1", "invalidate-uuid");
 
-        // After invalidation the provider must re-fetch; the returned configs must be equal
-        // (same data) but need not be the same object.
-        assertEquals(first.graphM,          second.graphM);
-        assertEquals(first.beamWidth,       second.beamWidth);
+        // After invalidation the provider must re-fetch and return a NEW object
+        // (not the cached reference). The values must be equal (same metadata).
+        assertNotSame("invalidateCache must force a re-fetch (different object instance)", first, second);
+        assertEquals(first.graphM,           second.graphM);
+        assertEquals(first.beamWidth,        second.beamWidth);
         assertEquals(first.neighborOverflow, second.neighborOverflow, 1e-6f);
         assertEquals(first.alpha,            second.alpha,            1e-6f);
         assertEquals(first.similarity,       second.similarity);
@@ -407,5 +409,186 @@ public class RemoteMetadataIndexMergeConfigProviderTest {
                 fail("error message should reference the bad similarity: " + e.getMessage());
             }
         }
+    }
+
+    @Test
+    public void throwsWhenPropertyIsNonPositive() throws Exception {
+        // m=0 is a non-positive integer — requirePositiveInt must throw.
+        Index idx = Index.builder()
+                .table("docs")
+                .tablespace(TS_UUID)
+                .name("docs_v1")
+                .uuid("nonpos-uuid")
+                .type(Index.TYPE_VECTOR)
+                .column("v", ColumnTypes.FLOATARRAY)
+                .property(VectorIndexManager.PROP_M, "0")  // <= 0: invalid
+                .property(VectorIndexManager.PROP_BEAM_WIDTH, "64")
+                .property(VectorIndexManager.PROP_NEIGHBOR_OVERFLOW, "1.2")
+                .property(VectorIndexManager.PROP_ALPHA, "1.4")
+                .property(VectorIndexManager.PROP_SIMILARITY, "EUCLIDEAN")
+                .build();
+
+        Map<String, byte[]> files = new HashMap<>();
+        files.put(TS_UUID + "/_metadata/latest.checkpoint",
+                buildLatestCheckpointBytes("my-ts", LEDGER, OFFSET));
+        files.put(TS_UUID + "/_metadata/indexes." + LEDGER + "." + OFFSET + ".tablesmetadata",
+                buildIndexDefinitionsBytes("my-ts", LEDGER, OFFSET, List.of(idx)));
+
+        RemoteMetadataIndexMergeConfigProvider provider =
+                new RemoteMetadataIndexMergeConfigProvider(fakeClient(files), TS_UUID);
+
+        try {
+            provider.getMergeConfig(TS_UUID, "docs", "docs_v1", "nonpos-uuid");
+            fail("expected Exception for non-positive property value");
+        } catch (Exception e) {
+            if (e.getMessage() == null || !e.getMessage().contains(VectorIndexManager.PROP_M)) {
+                fail("error message should reference the property key: " + e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    public void throwsWhenPropertyIsNonNumeric() throws Exception {
+        // m=abc is not a valid integer — requirePositiveInt must throw.
+        Index idx = Index.builder()
+                .table("docs")
+                .tablespace(TS_UUID)
+                .name("docs_v1")
+                .uuid("nonnumeric-uuid")
+                .type(Index.TYPE_VECTOR)
+                .column("v", ColumnTypes.FLOATARRAY)
+                .property(VectorIndexManager.PROP_M, "abc")  // not a number
+                .property(VectorIndexManager.PROP_BEAM_WIDTH, "64")
+                .property(VectorIndexManager.PROP_NEIGHBOR_OVERFLOW, "1.2")
+                .property(VectorIndexManager.PROP_ALPHA, "1.4")
+                .property(VectorIndexManager.PROP_SIMILARITY, "EUCLIDEAN")
+                .build();
+
+        Map<String, byte[]> files = new HashMap<>();
+        files.put(TS_UUID + "/_metadata/latest.checkpoint",
+                buildLatestCheckpointBytes("my-ts", LEDGER, OFFSET));
+        files.put(TS_UUID + "/_metadata/indexes." + LEDGER + "." + OFFSET + ".tablesmetadata",
+                buildIndexDefinitionsBytes("my-ts", LEDGER, OFFSET, List.of(idx)));
+
+        RemoteMetadataIndexMergeConfigProvider provider =
+                new RemoteMetadataIndexMergeConfigProvider(fakeClient(files), TS_UUID);
+
+        try {
+            provider.getMergeConfig(TS_UUID, "docs", "docs_v1", "nonnumeric-uuid");
+            fail("expected Exception for non-numeric property value");
+        } catch (Exception e) {
+            if (e.getMessage() == null || !e.getMessage().contains(VectorIndexManager.PROP_M)) {
+                fail("error message should reference the property key: " + e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    public void throwsOnCorruptCheckpointHeader() throws Exception {
+        // Write a latest.checkpoint with version=2 (only 1 is valid) — must throw.
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ExtendedDataOutputStream dos = new ExtendedDataOutputStream(baos)) {
+            dos.writeVLong(2L); // bad version
+            dos.writeVLong(0L);
+            dos.writeUTF("my-ts");
+            dos.writeZLong(LEDGER);
+            dos.writeZLong(OFFSET);
+        }
+
+        Map<String, byte[]> files = new HashMap<>();
+        files.put(TS_UUID + "/_metadata/latest.checkpoint", baos.toByteArray());
+
+        RemoteMetadataIndexMergeConfigProvider provider =
+                new RemoteMetadataIndexMergeConfigProvider(fakeClient(files), TS_UUID);
+
+        try {
+            provider.getMergeConfig(TS_UUID, "docs", "docs_v1", "any-uuid");
+            fail("expected Exception for corrupt checkpoint header");
+        } catch (Exception e) {
+            if (e.getMessage() == null || !e.getMessage().contains("Corrupted")) {
+                fail("error message should indicate corruption: " + e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    public void throwsOnCorruptIndexDefinitionsHeader() throws Exception {
+        // Write latest.checkpoint correctly, but index definitions with version=99.
+        ByteArrayOutputStream idxBaos = new ByteArrayOutputStream();
+        try (ExtendedDataOutputStream dos = new ExtendedDataOutputStream(idxBaos)) {
+            dos.writeVLong(99L); // bad version
+            dos.writeVLong(0L);
+            dos.writeUTF("my-ts");
+            dos.writeZLong(LEDGER);
+            dos.writeZLong(OFFSET);
+            dos.writeInt(0);
+        }
+
+        Map<String, byte[]> files = new HashMap<>();
+        files.put(TS_UUID + "/_metadata/latest.checkpoint",
+                buildLatestCheckpointBytes("my-ts", LEDGER, OFFSET));
+        files.put(TS_UUID + "/_metadata/indexes." + LEDGER + "." + OFFSET + ".tablesmetadata",
+                idxBaos.toByteArray());
+
+        RemoteMetadataIndexMergeConfigProvider provider =
+                new RemoteMetadataIndexMergeConfigProvider(fakeClient(files), TS_UUID);
+
+        try {
+            provider.getMergeConfig(TS_UUID, "docs", "docs_v1", "any-uuid");
+            fail("expected Exception for corrupt index definitions header");
+        } catch (Exception e) {
+            if (e.getMessage() == null || !e.getMessage().contains("Corrupted")) {
+                fail("error message should indicate corruption: " + e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    public void throwsWhenIndexDefinitionsFileMissing() throws Exception {
+        // latest.checkpoint points at a non-START_OF_TIME LSN, but the
+        // indexes file is absent → must throw clearly.
+        Map<String, byte[]> files = new HashMap<>();
+        files.put(TS_UUID + "/_metadata/latest.checkpoint",
+                buildLatestCheckpointBytes("my-ts", LEDGER, OFFSET));
+        // Do NOT add the indexes file.
+
+        RemoteMetadataIndexMergeConfigProvider provider =
+                new RemoteMetadataIndexMergeConfigProvider(fakeClient(files), TS_UUID);
+
+        try {
+            provider.getMergeConfig(TS_UUID, "docs", "docs_v1", "any-uuid");
+            fail("expected Exception when index definitions file is absent");
+        } catch (Exception e) {
+            if (e.getMessage() == null || !e.getMessage().contains("Index definitions file not found")) {
+                fail("error message should mention missing file: " + e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    public void cacheExpiresAfterTtl() throws Exception {
+        // Use a tiny TTL (1 ms). Sleep 10 ms to ensure expiry, then verify a
+        // second getMergeConfig call re-fetches (returns a different object).
+        Index idx = buildVectorIndex("docs", "docs_v1", "ttl-uuid",
+                16, 64, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN);
+
+        Map<String, byte[]> files = new HashMap<>();
+        files.put(TS_UUID + "/_metadata/latest.checkpoint",
+                buildLatestCheckpointBytes("my-ts", LEDGER, OFFSET));
+        files.put(TS_UUID + "/_metadata/indexes." + LEDGER + "." + OFFSET + ".tablesmetadata",
+                buildIndexDefinitionsBytes("my-ts", LEDGER, OFFSET, List.of(idx)));
+
+        // 1 ms TTL — guaranteed to expire even under heavy system load within 10 ms.
+        RemoteMetadataIndexMergeConfigProvider provider =
+                new RemoteMetadataIndexMergeConfigProvider(fakeClient(files), TS_UUID, 1L);
+
+        IndexMergeConfig first = provider.getMergeConfig(TS_UUID, "docs", "docs_v1", "ttl-uuid");
+        Thread.sleep(10L); // ensure TTL has passed
+        IndexMergeConfig second = provider.getMergeConfig(TS_UUID, "docs", "docs_v1", "ttl-uuid");
+
+        // The cache entry has expired; the provider must allocate a fresh IndexMergeConfig.
+        assertNotSame("expired cache must produce a new IndexMergeConfig instance", first, second);
+        assertEquals(first.graphM, second.graphM);
+        assertEquals(first.similarity, second.similarity);
     }
 }

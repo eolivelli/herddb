@@ -181,9 +181,9 @@ public final class RemoteSegmentMerger implements SegmentMerger {
             }
         }
 
-        // Resolve per-index config from the provider. This may call the IS gRPC
-        // API on a cache-miss; any Exception bubbles to the engine which logs
-        // it and skips this index for the tick.
+        // Resolve per-index config from the provider. On a cache-miss this reads
+        // checkpoint metadata from the remote file server; any Exception bubbles
+        // to the engine which logs it and skips this index for the tick.
         IndexMergeConfig config = configProvider.getMergeConfig(
                 tablespaceUuid,
                 sample.getTableName(),
