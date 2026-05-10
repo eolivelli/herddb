@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Dashboard for the HerdDB index-optimizer — compaction activity, observed segments by state, ownership relocations.",
+  "description": "Dashboard for the HerdDB index-optimizer — compaction activity, observed segments by state, ownership relocations, live merge progress, per-phase timing breakdown, JVM memory, and tmp-disk usage (issue #503).",
   "editable": true,
   "graphTooltip": 1,
   "id": null,
@@ -332,6 +332,398 @@
         }
       ],
       "title": "Segment Relocations"
+    },
+    {
+      "collapse": false,
+      "height": 300,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1150,
+          "title": "Current Merge Phase",
+          "description": "1 = the optimizer is currently in this phase; 0 = it is not. All phases are 0 and 'idle' is 1 when no merge is running.",
+          "type": "graph",
+          "fill": 2,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": false,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "herddb_optimizer_current_phase{job=\"index-optimizer\",instance=~\"$instance\",phase=\"downloading\"}",
+              "format": "time_series",
+              "legendFormat": "downloading — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "herddb_optimizer_current_phase{job=\"index-optimizer\",instance=~\"$instance\",phase=\"pq-training\"}",
+              "format": "time_series",
+              "legendFormat": "pq-training — {{instance}}",
+              "refId": "B"
+            },
+            {
+              "expr": "herddb_optimizer_current_phase{job=\"index-optimizer\",instance=~\"$instance\",phase=\"compacting\"}",
+              "format": "time_series",
+              "legendFormat": "compacting — {{instance}}",
+              "refId": "C"
+            },
+            {
+              "expr": "herddb_optimizer_current_phase{job=\"index-optimizer\",instance=~\"$instance\",phase=\"uploading\"}",
+              "format": "time_series",
+              "legendFormat": "uploading — {{instance}}",
+              "refId": "D"
+            },
+            {
+              "expr": "herddb_optimizer_current_phase{job=\"index-optimizer\",instance=~\"$instance\",phase=\"registering-zk\"}",
+              "format": "time_series",
+              "legendFormat": "registering-zk — {{instance}}",
+              "refId": "E"
+            },
+            {
+              "expr": "herddb_optimizer_current_phase{job=\"index-optimizer\",instance=~\"$instance\",phase=\"deprecating-inputs\"}",
+              "format": "time_series",
+              "legendFormat": "deprecating-inputs — {{instance}}",
+              "refId": "F"
+            }
+          ],
+          "yaxes": [{"format": "short", "max": 1, "min": 0}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 1151,
+          "title": "Merge Progress",
+          "description": "Vectors written vs. total in the current phase. Only non-zero during the graph-build phase (legacy path); streaming path does not report batch progress.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": false,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "herddb_optimizer_merge_batches_written{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "written — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "herddb_optimizer_merge_batches_total{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "total — {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        }
+      ],
+      "title": "Current Merge Status"
+    },
+    {
+      "collapse": false,
+      "height": 280,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1152,
+          "title": "Merge Elapsed & ETA",
+          "description": "Elapsed milliseconds since the current merge started and the linear-extrapolated ETA. Both are 0 when idle.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": false,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "herddb_optimizer_merge_elapsed_ms{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "elapsed_ms — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "herddb_optimizer_merge_eta_ms{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "eta_ms — {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "yaxes": [{"format": "ms"}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 1153,
+          "title": "Merge Input Size",
+          "description": "Number of input segments and total input vectors in the current (or last completed) merge cycle.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": false,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "herddb_optimizer_merge_input_segments{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "input segments — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "herddb_optimizer_merge_input_vectors{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "input vectors — {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "yaxes": [{"format": "short"}, {"format": "short"}]
+        }
+      ],
+      "title": "Merge Progress Detail"
+    },
+    {
+      "collapse": false,
+      "height": 280,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1160,
+          "title": "Per-Phase Timing Rate (ms/min)",
+          "description": "Per-minute rate of cumulative time spent in each merge phase. Longer bars = more time in that phase. Compaction dominates on the legacy path; download/upload dominate on the streaming path.",
+          "type": "graph",
+          "fill": 2,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 12,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "rate(herddb_optimizer_phase_ms_total{job=\"index-optimizer\",instance=~\"$instance\",phase=\"download\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "download ms/min — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(herddb_optimizer_phase_ms_total{job=\"index-optimizer\",instance=~\"$instance\",phase=\"compaction\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "compaction ms/min — {{instance}}",
+              "refId": "B"
+            },
+            {
+              "expr": "rate(herddb_optimizer_phase_ms_total{job=\"index-optimizer\",instance=~\"$instance\",phase=\"pq_training\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "pq_training ms/min — {{instance}}",
+              "refId": "C"
+            },
+            {
+              "expr": "rate(herddb_optimizer_phase_ms_total{job=\"index-optimizer\",instance=~\"$instance\",phase=\"upload\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "upload ms/min — {{instance}}",
+              "refId": "D"
+            },
+            {
+              "expr": "rate(herddb_optimizer_phase_ms_total{job=\"index-optimizer\",instance=~\"$instance\",phase=\"zk_register\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "zk_register ms/min — {{instance}}",
+              "refId": "E"
+            },
+            {
+              "expr": "rate(herddb_optimizer_phase_ms_total{job=\"index-optimizer\",instance=~\"$instance\",phase=\"deprecate\"}[5m]) * 60",
+              "format": "time_series",
+              "legendFormat": "deprecate ms/min — {{instance}}",
+              "refId": "F"
+            }
+          ],
+          "yaxes": [{"format": "ms"}, {"format": "short"}]
+        }
+      ],
+      "title": "Per-Phase Timing"
+    },
+    {
+      "collapse": false,
+      "height": 280,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1170,
+          "title": "Optimizer JVM Heap",
+          "description": "Heap used vs. max. A heap-used curve that climbs close to heap-max without GC relief ⇒ the optimizer is OOM-prone. Typical budget is 8 Gi (set by Helm values.yaml).",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "herddb_jvm_heap_used_bytes{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "heap used — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "herddb_jvm_heap_max_bytes{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "heap max — {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "yaxes": [{"format": "bytes"}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 1171,
+          "title": "Optimizer Netty Direct Memory",
+          "description": "Netty-tracked direct (off-heap) memory. The streaming compaction path loads large graph chunks into direct buffers; a rising baseline that doesn't return to zero after the merge completes indicates a direct-memory leak. Value is -1 when Netty defers to JDK accounting.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 6,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "netty_used_direct_memory_bytes{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "direct used — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "netty_max_direct_memory_bytes{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "direct max — {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "yaxes": [{"format": "bytes"}, {"format": "short"}]
+        }
+      ],
+      "title": "Optimizer JVM Memory"
+    },
+    {
+      "collapse": false,
+      "height": 250,
+      "panels": [
+        {
+          "datasource": "Prometheus",
+          "id": 1180,
+          "title": "Optimizer Tmp Disk",
+          "description": "Free and total bytes on the file-store backing the optimizer's tmp directory. The merge writes graph and map temp files here; free bytes dropping near zero will cause the merge to fail. Typical tmp budget should be at least 3× the size of the largest expected merged graph file.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 8,
+          "legend": {
+            "alignAsTable": true,
+            "avg": false,
+            "current": true,
+            "max": false,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "herddb_optimizer_tmp_disk_free_bytes{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "free — {{instance}}",
+              "refId": "A"
+            },
+            {
+              "expr": "herddb_optimizer_tmp_disk_total_bytes{job=\"index-optimizer\",instance=~\"$instance\"}",
+              "format": "time_series",
+              "legendFormat": "total — {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "yaxes": [{"format": "bytes"}, {"format": "short"}]
+        },
+        {
+          "datasource": "Prometheus",
+          "id": 1181,
+          "title": "Optimizer GC Activity",
+          "description": "Rate of GC collections and pause time. Spikes during compaction are expected (in-memory path builds the full graph in heap); sustained high GC pause ⇒ consider increasing heap or switching to the streaming path.",
+          "type": "graph",
+          "fill": 1,
+          "lines": true,
+          "linewidth": 1,
+          "stack": false,
+          "span": 4,
+          "legend": {
+            "alignAsTable": true,
+            "avg": true,
+            "current": true,
+            "max": true,
+            "show": true,
+            "values": true
+          },
+          "targets": [
+            {
+              "expr": "rate(herddb_jvm_gc_time_ms_total{job=\"index-optimizer\",instance=~\"$instance\"}[1m])",
+              "format": "time_series",
+              "legendFormat": "gc ms/s — {{instance}}",
+              "refId": "A"
+            }
+          ],
+          "yaxes": [{"format": "ms"}, {"format": "short"}]
+        }
+      ],
+      "title": "Optimizer Disk & GC"
     }
   ],
   "schemaVersion": 14,
@@ -387,6 +779,6 @@
   },
   "timezone": "",
   "title": "HerdDB Index Optimizer",
-  "version": 1,
+  "version": 2,
   "uid": "index-optimizer"
 }

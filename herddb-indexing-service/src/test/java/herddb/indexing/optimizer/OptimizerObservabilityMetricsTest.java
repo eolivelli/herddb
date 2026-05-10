@@ -20,6 +20,8 @@
 package herddb.indexing.optimizer;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import herddb.indexing.segment.SegmentMetadata;
 import herddb.indexing.segment.SegmentRegistryClient;
@@ -27,6 +29,7 @@ import herddb.indexing.segment.SegmentRegistryException;
 import herddb.indexing.segment.SegmentState;
 import herddb.indexing.segment.VersionedSegmentMetadata;
 import herddb.log.LogSequenceNumber;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -296,6 +299,174 @@ public class OptimizerObservabilityMetricsTest {
         } finally {
             http.close();
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #503: merge history and phase counters
+    // -------------------------------------------------------------------------
+
+    @Test
+    public void mergeHistoryIsEmptyBeforeFirstRun() {
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+        IndexOptimizerEngine engine = new IndexOptimizerEngine(registry, merger, TS_UUID,
+                new MergePolicy.SmallestFirstPolicy(2, 1000, 0L, Long.MAX_VALUE),
+                60_000L, () -> 0, fakeClock::get);
+        List<MergeRecord> history = engine.getMergeHistory();
+        assertNotNull("getMergeHistory() must never return null", history);
+        assertTrue("history must be empty before first run", history.isEmpty());
+    }
+
+    @Test
+    public void mergeHistoryRecordsDeclinedOutcome() throws Exception {
+        registry.createSegment(sample("hist-a", 100L));
+        registry.createSegment(sample("hist-b", 100L));
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+        merger.setReturnNull(true);
+
+        IndexOptimizerEngine engine = new IndexOptimizerEngine(registry, merger, TS_UUID,
+                new MergePolicy.SmallestFirstPolicy(2, 1000, 0L, Long.MAX_VALUE),
+                60_000L, () -> 0, fakeClock::get);
+        engine.runOnce();
+
+        List<MergeRecord> history = engine.getMergeHistory();
+        assertEquals("exactly one history entry after one declined merge", 1, history.size());
+        MergeRecord r = history.get(0);
+        assertEquals("outcome must be declined", "declined", r.outcome);
+        assertNotNull("mergeId must be set", r.mergeId);
+        assertEquals("indexUuid must match", IDX_UUID, r.indexUuid);
+        assertEquals("inputSegments must be 2", 2, r.inputSegments);
+        assertEquals("inputVectors must be sum of segment vector counts", 20L, r.inputVectors);
+        assertEquals("outputVectors is 0 on declined", 0L, r.outputVectors);
+        assertTrue("startedAtMs must be positive", r.startedAtMs > 0);
+        assertTrue("finishedAtMs >= startedAtMs", r.finishedAtMs >= r.startedAtMs);
+        assertEquals("totalMs() = finishedAtMs - startedAtMs",
+                r.finishedAtMs - r.startedAtMs, r.totalMs());
+    }
+
+    @Test
+    public void mergeHistoryRecordsFailedOutcome() throws Exception {
+        registry.createSegment(sample("fail-a", 100L));
+        registry.createSegment(sample("fail-b", 100L));
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+        merger.setFailureMode(true);
+
+        IndexOptimizerEngine engine = new IndexOptimizerEngine(registry, merger, TS_UUID,
+                new MergePolicy.SmallestFirstPolicy(2, 1000, 0L, Long.MAX_VALUE),
+                60_000L, () -> 0, fakeClock::get);
+        engine.runOnce();
+
+        List<MergeRecord> history = engine.getMergeHistory();
+        assertEquals(1, history.size());
+        assertEquals("outcome must be failed", "failed", history.get(0).outcome);
+    }
+
+    @Test
+    public void mergeHistoryRecordsSuccessOutcomeWithTimings() throws Exception {
+        registry.createSegment(sample("ok-a", 100L));
+        registry.createSegment(sample("ok-b", 100L));
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+        // Advance the clock by 200 ms during merge so lastMergeDuration = 200.
+        merger.setHook(() -> fakeClock.addAndGet(200));
+
+        IndexOptimizerEngine engine = new IndexOptimizerEngine(registry, merger, TS_UUID,
+                new MergePolicy.SmallestFirstPolicy(2, 1000, 0L, Long.MAX_VALUE),
+                60_000L, () -> 0, fakeClock::get);
+        engine.runOnce();
+
+        List<MergeRecord> history = engine.getMergeHistory();
+        assertEquals(1, history.size());
+        MergeRecord r = history.get(0);
+        assertEquals("outcome must be success", "success", r.outcome);
+        assertTrue("outputVectors should be positive on success", r.outputVectors > 0);
+        assertTrue("totalMs should be positive", r.totalMs() >= 0);
+        // Phase timings are 0 for InMemorySegmentMerger (no RemoteSegmentGraphMerger),
+        // but they should be present without NPE.
+        assertTrue("downloadMs >= 0", r.downloadMs >= 0);
+        assertTrue("compactionMs >= 0", r.compactionMs >= 0);
+        assertTrue("zkRegisterMs >= 0", r.zkRegisterMs >= 0);
+        assertTrue("deprecateMs >= 0", r.deprecateMs >= 0);
+    }
+
+    @Test
+    public void mergeHistoryRecordsAbortedOutcome() throws Exception {
+        registry.createSegment(sample("abort-a", 100L));
+        registry.createSegment(sample("abort-b", 100L));
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+
+        IndexOptimizerEngine engine = new IndexOptimizerEngine(registry, merger, TS_UUID,
+                new MergePolicy.SmallestFirstPolicy(2, 1000, 0L, Long.MAX_VALUE),
+                60_000L, () -> 0, fakeClock::get);
+
+        // Inject drift so revalidation fails.
+        merger.setHook(() -> {
+            try {
+                VersionedSegmentMetadata v = registry.getSegment(TS_UUID, IDX_UUID, "abort-a")
+                        .orElseThrow();
+                registry.casUpdateSegment(v, v.metadata().toBuilder()
+                        .state(SegmentState.DEPRECATED)
+                        .replacedBy(java.util.Collections.singletonList("other"))
+                        .retentionUntilEpochMillis(System.currentTimeMillis() + 60_000L)
+                        .build());
+            } catch (SegmentRegistryException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        engine.runOnce();
+
+        List<MergeRecord> history = engine.getMergeHistory();
+        assertEquals(1, history.size());
+        assertEquals("outcome must be aborted", "aborted", history.get(0).outcome);
+    }
+
+    @Test
+    public void mergeProgressIsIdleBeforeAndAfterRun() throws Exception {
+        registry.createSegment(sample("prog-a", 100L));
+        registry.createSegment(sample("prog-b", 100L));
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+
+        IndexOptimizerEngine engine = new IndexOptimizerEngine(registry, merger, TS_UUID,
+                new MergePolicy.SmallestFirstPolicy(2, 1000, 0L, Long.MAX_VALUE),
+                60_000L, () -> 0, fakeClock::get);
+
+        // Before any run the progress must be in idle state.
+        MergeProgress.Snapshot before = engine.getMergeProgress().snapshot();
+        assertEquals("phase must be idle before run", "idle", before.phase);
+        assertNull("mergeId must be null when idle", before.mergeId);
+        assertEquals(0, before.inputSegments);
+
+        engine.runOnce();
+
+        // After the run the progress must return to idle.
+        MergeProgress.Snapshot after = engine.getMergeProgress().snapshot();
+        assertEquals("phase must return to idle after run", "idle", after.phase);
+        assertNull("mergeId must be null after run", after.mergeId);
+    }
+
+    @Test
+    public void phaseTimingCountersAccumulateAcrossSuccessfulMerges() throws Exception {
+        // Two separate merge cycles each with the InMemorySegmentMerger.
+        // Phase timing for InMemorySegmentMerger is zero (no RemoteSegmentGraphMerger),
+        // but zkRegister and deprecate timings should be present.
+        registry.createSegment(sample("pt-a1", 100L));
+        registry.createSegment(sample("pt-a2", 100L));
+
+        InMemorySegmentMerger merger = new InMemorySegmentMerger();
+        IndexOptimizerEngine engine = new IndexOptimizerEngine(registry, merger, TS_UUID,
+                new MergePolicy.SmallestFirstPolicy(2, 1000, 0L, Long.MAX_VALUE),
+                60_000L, () -> 0, fakeClock::get);
+        engine.runOnce();
+
+        // ZK register + deprecate durations are non-negative.
+        assertTrue("phaseZkRegisterMsTotal >= 0",
+                engine.getPhaseZkRegisterMsTotal() >= 0);
+        assertTrue("phaseDeprecateMsTotal >= 0",
+                engine.getPhaseDeprecateMsTotal() >= 0);
+        // download/compaction/pqTraining/upload are zero since no RemoteSegmentGraphMerger.
+        assertEquals(0L, engine.getPhaseDownloadMsTotal());
+        assertEquals(0L, engine.getPhaseCompactionMsTotal());
+        assertEquals(0L, engine.getPhasePqTrainingMsTotal());
+        assertEquals(0L, engine.getPhaseUploadMsTotal());
     }
 
     private static String readBody(String urlString) throws Exception {

@@ -19,6 +19,7 @@
  */
 package herddb.indexing.optimizer;
 
+import herddb.index.vector.RemoteSegmentGraphMerger;
 import herddb.indexing.segment.SegmentMetadata;
 import herddb.indexing.segment.SegmentRegistryClient;
 import herddb.indexing.segment.SegmentRegistryException;
@@ -27,10 +28,16 @@ import herddb.indexing.segment.TombstoneOverlayManager;
 import herddb.indexing.segment.VersionedSegmentMetadata;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
+import io.netty.util.internal.PlatformDependent;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.IntSupplier;
 import java.util.function.LongSupplier;
@@ -151,6 +158,39 @@ public final class IndexOptimizerEngine {
     private final AtomicLong relocationsInitiatedTotal = new AtomicLong();
     private final AtomicLong relocationsCompletedTotal = new AtomicLong();
     private final AtomicLong relocationsAbortedTotal = new AtomicLong();
+
+    // -------------------------------------------------------------------------
+    // Extended observability (issue #503)
+    // -------------------------------------------------------------------------
+
+    private static final MemoryMXBean MEMORY_MX = ManagementFactory.getMemoryMXBean();
+
+    /**
+     * Per-phase cumulative timing counters (milliseconds). Updated after each
+     * successful merge cycle; exposed via {@code GET /metrics}.
+     */
+    private final AtomicLong phaseDownloadMsTotal    = new AtomicLong();
+    private final AtomicLong phaseCompactionMsTotal  = new AtomicLong();
+    private final AtomicLong phasePqTrainingMsTotal  = new AtomicLong();
+    private final AtomicLong phaseUploadMsTotal      = new AtomicLong();
+    private final AtomicLong phaseZkRegisterMsTotal  = new AtomicLong();
+    private final AtomicLong phaseDeprecateMsTotal   = new AtomicLong();
+
+    /**
+     * Live-state holder for the current merge. Read by the HTTP server thread
+     * for {@code GET /status}; written by the optimizer thread (single-threaded
+     * scheduler). Created at construction so the HTTP server always gets a
+     * non-null reference.
+     */
+    private final MergeProgress mergeProgress = new MergeProgress();
+
+    /**
+     * Bounded history of the last {@value #MERGE_HISTORY_MAX} completed merges
+     * (including declined and failed ones). Guarded by {@code synchronized}
+     * on {@code mergeHistory} for thread-safe access from the HTTP server.
+     */
+    private static final int MERGE_HISTORY_MAX = 20;
+    private final Deque<MergeRecord> mergeHistory = new ArrayDeque<>(MERGE_HISTORY_MAX + 1);
 
     public IndexOptimizerEngine(SegmentRegistryClient registry,
                                 SegmentMerger merger,
@@ -330,6 +370,48 @@ public final class IndexOptimizerEngine {
         return ticksSkippedNotLeader.get();
     }
 
+    // --- Extended observability getters (issue #503) ---
+
+    public long getPhaseDownloadMsTotal() {
+        return phaseDownloadMsTotal.get();
+    }
+
+    public long getPhaseCompactionMsTotal() {
+        return phaseCompactionMsTotal.get();
+    }
+
+    public long getPhasePqTrainingMsTotal() {
+        return phasePqTrainingMsTotal.get();
+    }
+
+    public long getPhaseUploadMsTotal() {
+        return phaseUploadMsTotal.get();
+    }
+
+    public long getPhaseZkRegisterMsTotal() {
+        return phaseZkRegisterMsTotal.get();
+    }
+
+    public long getPhaseDeprecateMsTotal() {
+        return phaseDeprecateMsTotal.get();
+    }
+
+    /** Returns the live-merge state (never null). Safe to read from any thread. */
+    public MergeProgress getMergeProgress() {
+        return mergeProgress;
+    }
+
+    /**
+     * Returns a snapshot of the merge history (most-recent-last order).
+     * Thread-safe; returns a copy so the caller is not affected by subsequent
+     * writes.
+     */
+    public List<MergeRecord> getMergeHistory() {
+        synchronized (mergeHistory) {
+            return new ArrayList<>(mergeHistory);
+        }
+    }
+
     /**
      * Runs one optimizer tick. Throws {@link SegmentRegistryException} only on
      * top-level registry failures (e.g. ZK session expiry while listing indexes);
@@ -430,23 +512,48 @@ public final class IndexOptimizerEngine {
 
         // 3. Run the merger.
         List<SegmentMetadata> inputMetadata = new ArrayList<>(candidates.size());
+        long totalInputVectors = 0;
         for (VersionedSegmentMetadata v : candidates) {
             inputMetadata.add(v.metadata());
+            totalInputVectors += v.metadata().getVectorCount();
         }
+
+        // Assign a merge ID and update the live-state holder.
+        String mergeId = UUID.randomUUID().toString();
+        long peakHeapUsed = MEMORY_MX.getHeapMemoryUsage().getUsed();
+        long peakDirectUsed = PlatformDependent.usedDirectMemory();
+        mergeProgress.enterMerge(mergeId, candidates.size(), totalInputVectors);
+        if (merger instanceof RemoteSegmentMerger) {
+            ((RemoteSegmentMerger) merger).setMergeProgress(mergeProgress);
+        }
+
         SegmentMetadata output;
         long mergeStartMs = clock.getAsLong();
         try {
             output = merger.merge(inputMetadata, ownerSelector.getAsInt());
         } catch (Exception e) {
             mergeFailuresTotal.incrementAndGet();
+            long mergeEndMs2 = clock.getAsLong();
             LOGGER.log(Level.WARNING,
                     "merger failed for index " + indexUuid + " (" + candidates.size()
                             + " candidates); leaving inputs untouched", e);
+            recordMergeHistory(mergeId, indexUuid, mergeStartMs, mergeEndMs2, "failed",
+                    candidates.size(), totalInputVectors, 0L, peakHeapUsed, peakDirectUsed);
+            mergeProgress.enterIdle();
             return observed;
+        } finally {
+            if (merger instanceof RemoteSegmentMerger) {
+                ((RemoteSegmentMerger) merger).setMergeProgress(null);
+            }
         }
+
         if (output == null) {
             // Merger declined this batch (e.g., not enough live entries); skip publishing.
             mergeDeclinedTotal.incrementAndGet();
+            long mergeEndMs2 = clock.getAsLong();
+            recordMergeHistory(mergeId, indexUuid, mergeStartMs, mergeEndMs2, "declined",
+                    candidates.size(), totalInputVectors, 0L, peakHeapUsed, peakDirectUsed);
+            mergeProgress.enterIdle();
             return observed;
         }
 
@@ -473,6 +580,10 @@ public final class IndexOptimizerEngine {
                         "merger.abandon failed for {0}: {1}",
                         new Object[]{output.getSegmentUuid(), abandonFailed.getMessage()});
             }
+            long mergeEndMs2 = clock.getAsLong();
+            recordMergeHistory(mergeId, indexUuid, mergeStartMs, mergeEndMs2, "aborted",
+                    candidates.size(), totalInputVectors, 0L, peakHeapUsed, peakDirectUsed);
+            mergeProgress.enterIdle();
             return observed;
         }
 
@@ -483,6 +594,8 @@ public final class IndexOptimizerEngine {
         //      new segment; the inputs are still ACTIVE so they get re-merged with
         //      the (now larger) output. We accept that re-merge cost.
         //    - if create failed: nothing happens; inputs remain candidates.
+        mergeProgress.updatePhase("registering-zk");
+        long zkRegisterStartMs = clock.getAsLong();
         try {
             registry.createSegment(output);
             segmentsMerged.incrementAndGet();
@@ -492,6 +605,8 @@ public final class IndexOptimizerEngine {
             LOGGER.log(Level.INFO, "merged segment {0} already registered (idempotent)",
                     output.getSegmentUuid());
         }
+        long zkRegisterMs = Math.max(0L, clock.getAsLong() - zkRegisterStartMs);
+        phaseZkRegisterMsTotal.addAndGet(zkRegisterMs);
 
         // Test hook for review-item R2 (second pr-reviewer pass): inject drift in the
         // narrow window between createSegment-of-output and deprecate-of-inputs.
@@ -500,6 +615,8 @@ public final class IndexOptimizerEngine {
             hook.run();
         }
 
+        mergeProgress.updatePhase("deprecating-inputs");
+        long deprecateStartMs = clock.getAsLong();
         long retentionUntil = (retentionMillis == 0L)
                 ? SegmentMetadata.NO_RETENTION
                 : now + retentionMillis;
@@ -517,11 +634,31 @@ public final class IndexOptimizerEngine {
                         v.metadata().getSegmentUuid());
             }
         }
+        long deprecateMs = Math.max(0L, clock.getAsLong() - deprecateStartMs);
+        phaseDeprecateMsTotal.addAndGet(deprecateMs);
+
         // Record successful merge duration. We capture it AFTER deprecate so
         // the duration reflects the full publish-and-deprecate cycle visible
         // to operators, not just the merger.merge() span.
         long mergeEndMs = clock.getAsLong();
         lastMergeDurationMs.set(Math.max(0L, mergeEndMs - mergeStartMs));
+
+        // Accumulate per-phase totals from the merger's timing breakdown.
+        RemoteSegmentGraphMerger.MergePhaseTimings timings = null;
+        if (merger instanceof RemoteSegmentMerger) {
+            timings = ((RemoteSegmentMerger) merger).getLastMergeTimings();
+        }
+        if (timings != null) {
+            phaseDownloadMsTotal.addAndGet(timings.downloadMs);
+            phaseCompactionMsTotal.addAndGet(timings.compactionMs);
+            phasePqTrainingMsTotal.addAndGet(timings.pqTrainingMs);
+            phaseUploadMsTotal.addAndGet(timings.uploadMs);
+        }
+
+        recordMergeHistory(mergeId, indexUuid, mergeStartMs, mergeEndMs, "success",
+                candidates.size(), totalInputVectors, output.getVectorCount(),
+                peakHeapUsed, peakDirectUsed, timings, zkRegisterMs, deprecateMs);
+        mergeProgress.enterIdle();
         return observed;
     }
 
@@ -672,6 +809,49 @@ public final class IndexOptimizerEngine {
             LOGGER.log(Level.WARNING,
                     "deleteMultipartIndexFile({0},{1},{2}) failed for segment {3}: {4}",
                     new Object[]{tableSpace, uuid, fileType, segmentUuid, e.getMessage()});
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Merge history helpers (issue #503)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Convenience overload for non-success outcomes where no phase timings are
+     * available (failed / declined / aborted).
+     */
+    private void recordMergeHistory(String mergeId, String indexUuid, long startMs, long endMs,
+                                    String outcome, int inputSegments, long inputVectors,
+                                    long outputVectors, long peakHeapUsed, long peakDirectUsed) {
+        recordMergeHistory(mergeId, indexUuid, startMs, endMs, outcome, inputSegments, inputVectors,
+                outputVectors, peakHeapUsed, peakDirectUsed, null, 0L, 0L);
+    }
+
+    /**
+     * Full overload used for the "success" outcome where per-phase timings,
+     * ZK-register duration, and deprecate duration are available.
+     */
+    private void recordMergeHistory(String mergeId, String indexUuid, long startMs, long endMs,
+                                    String outcome, int inputSegments, long inputVectors,
+                                    long outputVectors, long peakHeapUsed, long peakDirectUsed,
+                                    RemoteSegmentGraphMerger.MergePhaseTimings timings,
+                                    long zkRegisterMs, long deprecateMs) {
+        long downloadMs  = timings != null ? timings.downloadMs   : 0L;
+        long pqMs        = timings != null ? timings.pqTrainingMs : 0L;
+        long compactMs   = timings != null ? timings.compactionMs : 0L;
+        long uploadMs    = timings != null ? timings.uploadMs     : 0L;
+
+        MergeRecord record = new MergeRecord(
+                mergeId, indexUuid, startMs, endMs, outcome,
+                inputSegments, inputVectors, outputVectors,
+                downloadMs, pqMs, compactMs, uploadMs,
+                zkRegisterMs, deprecateMs,
+                peakHeapUsed, peakDirectUsed);
+        synchronized (mergeHistory) {
+            mergeHistory.addLast(record);
+            while (mergeHistory.size() > MERGE_HISTORY_MAX) {
+                mergeHistory.pollFirst();
+            }
         }
     }
 }

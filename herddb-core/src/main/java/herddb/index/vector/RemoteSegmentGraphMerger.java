@@ -62,7 +62,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ForkJoinPool;
+import java.util.function.Consumer;
 import java.util.function.IntFunction;
+import java.util.function.LongBinaryOperator;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -97,9 +99,14 @@ import java.util.logging.Logger;
  * layout, same map-file format — so the indexing-service tier can load it
  * with {@code OnDiskGraphIndex.load(...)} as it would any other segment.
  *
- * <p>This class is stateless and thread-hostile (every {@link #merge} call
- * builds its own state and tears it down before returning). The caller is
- * responsible for serialising calls if it really wants to.
+ * <p>This class is nominally stateless and thread-hostile (every {@link #merge}
+ * call builds its own local state and tears it down before returning). The two
+ * optional callback fields ({@link #phaseListener} and {@link #batchListener})
+ * are written by the caller immediately before each {@link #merge} call and
+ * cleared after — no concurrency between writers. The HTTP-server thread reads
+ * {@link #lastMergeTimings} after the merge is complete; the field is
+ * {@code volatile} to ensure the write is visible without synchronisation.
+ * Callers are responsible for serialising calls.
  */
 public final class RemoteSegmentGraphMerger {
 
@@ -115,6 +122,14 @@ public final class RemoteSegmentGraphMerger {
 
     /** Block size used for streaming downloads via the multipart reader. */
     private static final int DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
+
+    /**
+     * How often (in vectors) the batch-progress callback fires during the
+     * legacy graph-build phase. Chosen to be large enough that the callback
+     * overhead is negligible, and small enough to give sub-1 % granularity for
+     * a 1 M-vector merge.
+     */
+    public static final int BATCH_PROGRESS_INTERVAL = 5_000;
 
     /**
      * Sanity caps for the input map-file header values. A corrupt or partially
@@ -141,6 +156,104 @@ public final class RemoteSegmentGraphMerger {
     private final float neighborOverflow;
     private final float alpha;
     private final VectorSimilarityFunction similarity;
+
+    // -------------------------------------------------------------------------
+    // Progress / observability hooks (set by caller before each merge call).
+    // -------------------------------------------------------------------------
+
+    /**
+     * Optional phase-change callback. Receives the new phase name as a
+     * {@code String} at each major transition within the merge. Not thread-safe
+     * — must be set from the same thread that calls {@link #merge}. The HTTP
+     * server thread only reads the effects through the caller-managed
+     * {@code MergeProgress} object that receives the callbacks.
+     */
+    private Consumer<String> phaseListener;
+
+    /**
+     * Optional batch-progress callback. Receives {@code (written, total)} as
+     * a pair of {@code long}s fired every {@value #BATCH_PROGRESS_INTERVAL}
+     * vectors during the legacy graph-build phase. Not thread-safe — same
+     * constraint as {@link #phaseListener}.
+     *
+     * <p>{@link LongBinaryOperator} is used here purely as a convenient
+     * two-{@code long} consumer; the return value is ignored.
+     */
+    private LongBinaryOperator batchListener;
+
+    /**
+     * Timing breakdown of the last completed merge. Written at the end of
+     * {@link #merge} (either path) and visible to the HTTP-server thread via
+     * the {@code volatile} guarantee.
+     */
+    private volatile MergePhaseTimings lastMergeTimings;
+
+    // -------------------------------------------------------------------------
+    // Accessors for the callbacks and timing
+    // -------------------------------------------------------------------------
+
+    /**
+     * Sets the phase-change listener. Pass {@code null} to remove. Must be
+     * called from the same thread that calls {@link #merge}.
+     */
+    public void setPhaseListener(Consumer<String> listener) {
+        this.phaseListener = listener;
+    }
+
+    /**
+     * Sets the batch-progress listener. Pass {@code null} to remove. Must be
+     * called from the same thread that calls {@link #merge}.
+     */
+    public void setBatchListener(LongBinaryOperator listener) {
+        this.batchListener = listener;
+    }
+
+    /**
+     * Returns the timing breakdown of the last completed merge, or {@code null}
+     * if {@link #merge} has never been called on this instance.
+     */
+    public MergePhaseTimings getLastMergeTimings() {
+        return lastMergeTimings;
+    }
+
+    /** Returns the configured graph degree M. Used for /tmp-usage estimation in log messages. */
+    public int getGraphM() {
+        return graphM;
+    }
+
+    // -------------------------------------------------------------------------
+    // Timing breakdown value object
+    // -------------------------------------------------------------------------
+
+    /**
+     * Per-phase wall-clock durations (in milliseconds) from the most recently
+     * completed merge. All times are for the merge path that was actually
+     * taken; unused fields are zero.
+     */
+    public static final class MergePhaseTimings {
+        /** Time downloading input map (+ graph for streaming) files. */
+        public final long downloadMs;
+        /**
+         * Time for PQ K-means training + vector encoding (legacy path only;
+         * 0 for the streaming path and for shards below the FusedPQ threshold).
+         */
+        public final long pqTrainingMs;
+        /**
+         * Time building / compacting the graph (legacy: authority-map + GraphIndexBuilder;
+         * streaming: OnDiskGraphIndexCompactor + output map-file write).
+         */
+        public final long compactionMs;
+        /** Time uploading output graph + map files. */
+        public final long uploadMs;
+
+        public MergePhaseTimings(long downloadMs, long pqTrainingMs,
+                                 long compactionMs, long uploadMs) {
+            this.downloadMs   = downloadMs;
+            this.pqTrainingMs = pqTrainingMs;
+            this.compactionMs = compactionMs;
+            this.uploadMs     = uploadMs;
+        }
+    }
 
     public RemoteSegmentGraphMerger(DataStorageManager dataStorageManager,
                                     Path tmpDirectory,
@@ -360,6 +473,7 @@ public final class RemoteSegmentGraphMerger {
         // 1. Stream each input's map file to a local temp file. We never hold
         //    every map in memory — even for a 1M-vector merge that would be
         //    a few GiB. The temp files are all deleted at the end of merge().
+        notifyPhase("downloading");
         List<Path> mapTempFiles = new ArrayList<>(inputs.size());
         long droppedTombstones = 0;
         long droppedDuplicates = 0;
@@ -367,12 +481,14 @@ public final class RemoteSegmentGraphMerger {
             for (RemoteSegmentInput in : inputs) {
                 mapTempFiles.add(downloadMapFile(in));
             }
+            long downloadNanos = System.nanoTime();
 
             // 2. First pass: walk every map file and decide which (pk, vec) to keep.
             //    Authority map: pk -> (generation, vector). Higher generation wins.
             //    PERF: the inner reads are sequential against the BufferedInputStream;
             //    the de-duplication HashMap is bounded by the union of input PKs (which
             //    is also the upper bound on the merged segment's vector count).
+            notifyPhase("compacting");
             Map<Bytes, AuthorityEntry> authority = new HashMap<>();
             for (int i = 0; i < inputs.size(); i++) {
                 RemoteSegmentInput in = inputs.get(i);
@@ -399,10 +515,12 @@ public final class RemoteSegmentGraphMerger {
             //    because the consumer only cares about (pk -> ordinal -> vector)
             //    consistency, not about a specific layout.
             BuildArtefacts artefacts = buildGraph(authority, dim, keptCount);
+            long compactionNanos = System.nanoTime();
 
             // 4. Write the graph and map files locally. Allocate inside the
             //    outer try so a failure on the second createTempFile call
             //    doesn't leak the first one (issue #485 review item B.7#2).
+            notifyPhase("pq-training");
             Path graphTempFile = null;
             Path mapOutTempFile = null;
             boolean uploadedGraph = false;
@@ -411,19 +529,24 @@ public final class RemoteSegmentGraphMerger {
             String mapPath = null;
             long graphSize;
             long mapSize;
+            long pqNanos = 0L; // assigned inside the try block on the success path
             String multipartUuid = outputIndexUuid + "_seg" + outputSegmentId;
             try {
                 graphTempFile = Files.createTempFile(tmpDirectory,
                         "herddb-merger-graph-", ".idx");
                 mapOutTempFile = Files.createTempFile(tmpDirectory,
                         "herddb-merger-map-", ".tmp");
+                // writeGraph performs PQ training internally; we notify the phase
+                // before and record the elapsed time after.
                 writeGraph(artefacts, dim, graphTempFile);
+                pqNanos = System.nanoTime();
                 graphSize = Files.size(graphTempFile);
                 writeMapFile(artefacts, mapOutTempFile);
                 mapSize = Files.size(mapOutTempFile);
 
                 // 5. Upload both. If the second upload fails we delete the first
                 //    so we don't leak partial output.
+                notifyPhase("uploading");
                 graphPath = dataStorageManager.writeMultipartIndexFile(
                         outputTablespaceUuid, multipartUuid, "graph",
                         graphTempFile, /* progress */ null);
@@ -460,13 +583,23 @@ public final class RemoteSegmentGraphMerger {
                 }
             }
 
-            long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+            long uploadNanos = System.nanoTime();
+            long elapsedMs = (uploadNanos - startNanos) / 1_000_000L;
+            lastMergeTimings = new MergePhaseTimings(
+                    (downloadNanos - startNanos) / 1_000_000L,
+                    (pqNanos - compactionNanos) / 1_000_000L,
+                    (compactionNanos - downloadNanos) / 1_000_000L,
+                    (uploadNanos - pqNanos) / 1_000_000L);
             LOGGER.log(Level.INFO,
                     "RemoteSegmentGraphMerger: merged {0} inputs into segment {1}/{2}_seg{3}"
-                            + " ({4} kept, {5} tombstoned, {6} duplicates dropped, {7} ms)",
+                            + " ({4} kept, {5} tombstoned, {6} duplicates dropped,"
+                            + " total={7} ms, download={8} ms, compaction={9} ms,"
+                            + " pqTraining={10} ms, upload={11} ms)",
                     new Object[]{inputs.size(), outputTablespaceUuid, outputIndexUuid,
                             outputSegmentId, keptCount, droppedTombstones, droppedDuplicates,
-                            elapsedMs});
+                            elapsedMs, lastMergeTimings.downloadMs,
+                            lastMergeTimings.compactionMs, lastMergeTimings.pqTrainingMs,
+                            lastMergeTimings.uploadMs});
             return new MergeOutput(outputTablespaceUuid, outputIndexUuid, outputSegmentId,
                     graphPath, graphSize, mapPath, mapSize,
                     keptCount, droppedTombstones, droppedDuplicates);
@@ -562,10 +695,12 @@ public final class RemoteSegmentGraphMerger {
 
         try {
             // 1. Download every input's graph + map files.
+            notifyPhase("downloading");
             for (RemoteSegmentInput in : inputs) {
                 mapTemps.add(downloadMapFile(in));
                 graphTemps.add(downloadGraphFile(in));
             }
+            long downloadNanos = System.nanoTime();
 
             // 2. Walk every map file once: per-source PK arrays + per-source size.
             //    Validates the same wire-level invariants accumulateAuthority does
@@ -686,6 +821,7 @@ public final class RemoteSegmentGraphMerger {
             //    Allocate both temp files before the inner try so a failure
             //    on the second allocation doesn't leak the first; allocations
             //    happen inside the outer try so the existing finally cleans up.
+            notifyPhase("compacting");
             Path graphOutTemp = null;
             Path mapOutTemp = null;
             String multipartUuid = outputIndexUuid + "_seg" + outputSegmentId;
@@ -714,10 +850,12 @@ public final class RemoteSegmentGraphMerger {
                         mapOutTemp, dim);
                 graphSize = Files.size(graphOutTemp);
                 mapSize = Files.size(mapOutTemp);
+                long compactionNanos = System.nanoTime();
 
                 // 8. Upload. On a partial upload (graph succeeded, map failed)
                 //    best-effort delete the orphan graph so the caller's
                 //    abandon path doesn't see a half-published output.
+                notifyPhase("uploading");
                 graphPath = dataStorageManager.writeMultipartIndexFile(
                         outputTablespaceUuid, multipartUuid, "graph",
                         graphOutTemp, /* progress */ null);
@@ -726,6 +864,12 @@ public final class RemoteSegmentGraphMerger {
                         outputTablespaceUuid, multipartUuid, "map",
                         mapOutTemp, /* progress */ null);
                 uploadedMap = true;
+                long uploadNanos = System.nanoTime();
+                lastMergeTimings = new MergePhaseTimings(
+                        (downloadNanos - startNanos) / 1_000_000L,
+                        /* pqTrainingMs */ 0L,
+                        (compactionNanos - downloadNanos) / 1_000_000L,
+                        (uploadNanos - compactionNanos) / 1_000_000L);
             } finally {
                 if (graphOutTemp != null) {
                     try {
@@ -756,14 +900,19 @@ public final class RemoteSegmentGraphMerger {
                 }
             }
 
+            MergePhaseTimings timings = lastMergeTimings; // set inside inner try
             long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
             LOGGER.log(Level.INFO,
                     "RemoteSegmentGraphMerger (streaming): merged {0} inputs into segment"
                             + " {1}/{2}_seg{3} ({4} kept, {5} tombstoned, {6} duplicates"
-                            + " dropped, {7} ms)",
+                            + " dropped, total={7} ms, download={8} ms, compaction={9} ms,"
+                            + " upload={10} ms)",
                     new Object[]{n, outputTablespaceUuid, outputIndexUuid,
                             outputSegmentId, keptCount, droppedTombstones, droppedDuplicates,
-                            elapsedMs});
+                            elapsedMs,
+                            timings != null ? timings.downloadMs : -1,
+                            timings != null ? timings.compactionMs : -1,
+                            timings != null ? timings.uploadMs : -1});
             return new MergeOutput(outputTablespaceUuid, outputIndexUuid, outputSegmentId,
                     graphPath, graphSize, mapPath, mapSize,
                     keptCount, droppedTombstones, droppedDuplicates);
@@ -1206,6 +1355,7 @@ public final class RemoteSegmentGraphMerger {
                 ForkJoinPool.commonPool(), ForkJoinPool.commonPool(), keptCount);
         List<Bytes> ordinalToPk = new ArrayList<>(keptCount);
         int ord = 0;
+        LongBinaryOperator batchCb = batchListener;
         for (Map.Entry<Bytes, AuthorityEntry> e : authority.entrySet()) {
             ordinalToPk.add(e.getKey());
             storage.set(ord, e.getValue().vector);
@@ -1218,7 +1368,16 @@ public final class RemoteSegmentGraphMerger {
                         "GraphIndexBuilder.addGraphNode failed at ordinal " + ord
                                 + " (" + keptCount + " total)", re);
             }
+            // Fire batch-progress callback every BATCH_PROGRESS_INTERVAL vectors
+            // so the HTTP /status endpoint can show fine-grained build progress.
+            if (batchCb != null && (ord % BATCH_PROGRESS_INTERVAL == 0)) {
+                batchCb.applyAsLong(ord, keptCount);
+            }
             ord++;
+        }
+        // Final batch-progress notification at 100%.
+        if (batchCb != null) {
+            batchCb.applyAsLong(keptCount, keptCount);
         }
         try {
             builder.cleanup();
@@ -1237,10 +1396,26 @@ public final class RemoteSegmentGraphMerger {
         // Mirror PersistentVectorStore.getOrTrainPQ's defaults verbatim
         // (clusterCount=256, centerData=true) so the merged segment is
         // PQ-compatible with everything the IS-side writer produces.
-        ProductQuantization pq = useFusedPQ
-                ? ProductQuantization.compute(art.ravv, pqSubspaces,
-                        /* clusterCount */ 256, /* centerData */ true)
-                : null;
+        ProductQuantization pq;
+        if (useFusedPQ) {
+            // Task #3 (issue #503): emit a start log so operators can distinguish
+            // "PQ K-means is running" from "process is hung / GC-stalled". The
+            // jvector ProductQuantization.compute() runs K-means internally and
+            // does not expose per-iteration callbacks, so we log start + elapsed.
+            LOGGER.log(Level.INFO,
+                    "PQ training starting: {0} vectors, dim={1}, subspaces={2},"
+                            + " clusters=256 — this may take several minutes",
+                    new Object[]{shardSize, dim, pqSubspaces});
+            long pqStartNanos = System.nanoTime();
+            pq = ProductQuantization.compute(art.ravv, pqSubspaces,
+                    /* clusterCount */ 256, /* centerData */ true);
+            long pqElapsedMs = (System.nanoTime() - pqStartNanos) / 1_000_000L;
+            LOGGER.log(Level.INFO,
+                    "PQ training complete in {0} ms ({1} subspaces, {2} clusters)",
+                    new Object[]{pqElapsedMs, pqSubspaces, 256});
+        } else {
+            pq = null;
+        }
         PQVectors pqv = (pq != null) ? pq.encodeAll(art.ravv, ForkJoinPool.commonPool()) : null;
 
         OnDiskGraphIndexWriter.Builder writerBuilder = new OnDiskGraphIndexWriter.Builder(
@@ -1292,6 +1467,21 @@ public final class RemoteSegmentGraphMerger {
                     dos.writeInt(Float.floatToIntBits(vec.get(j)));
                 }
             }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal callback helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Fires the phase-change listener if one is set. No-op when
+     * {@link #phaseListener} is {@code null}.
+     */
+    private void notifyPhase(String phase) {
+        Consumer<String> cb = phaseListener;
+        if (cb != null) {
+            cb.accept(phase);
         }
     }
 }

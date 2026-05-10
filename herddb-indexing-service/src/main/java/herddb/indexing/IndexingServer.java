@@ -24,6 +24,7 @@ import herddb.auth.oidc.OidcBootstrap;
 import herddb.auth.oidc.OidcTokenValidator;
 import herddb.auth.oidc.grpc.JwtAuthServerInterceptor;
 import herddb.core.MemoryManager;
+import herddb.core.stats.NettyMemoryMetrics;
 import herddb.file.FileDataStorageManager;
 import herddb.mem.MemoryDataStorageManager;
 import herddb.metadata.IndexingServiceInstanceDescriptor;
@@ -339,6 +340,9 @@ public class IndexingServer implements AutoCloseable {
         statsConfig.setProperty(PrometheusMetricsProvider.PROMETHEUS_STATS_HTTP_ENABLE, false);
         statsProvider.start(statsConfig);
         StatsLogger statsLogger = statsProvider.getStatsLogger("");
+        // Register Netty direct-memory gauges so the JVM dashboard can show
+        // pool-arena footprint for this service (issue #503).
+        NettyMemoryMetrics.register(statsLogger);
 
         engine.setStatsLogger(statsLogger);
         IndexingServiceImpl serviceImpl = new IndexingServiceImpl(engine, statsLogger);

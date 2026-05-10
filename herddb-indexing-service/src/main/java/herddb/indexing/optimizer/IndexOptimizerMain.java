@@ -354,7 +354,18 @@ public final class IndexOptimizerMain {
             String httpHost = configuration.getString(
                     OptimizerConfiguration.PROPERTY_HTTP_HOST,
                     OptimizerConfiguration.PROPERTY_HTTP_HOST_DEFAULT);
-            this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine);
+            // Pass the resolved tmp directory so /metrics can emit
+            // herddb_optimizer_tmp_disk_free_bytes and _total_bytes (issue #503).
+            Path tmpDirForHttp;
+            try {
+                tmpDirForHttp = resolveTmpDirectory();
+            } catch (IOException tmpErr) {
+                LOGGER.log(Level.WARNING,
+                        "could not resolve tmp directory for HTTP metrics; tmp-disk gauges"
+                                + " will be omitted: {0}", tmpErr.getMessage());
+                tmpDirForHttp = null;
+            }
+            this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine, tmpDirForHttp);
             this.httpServer.start();
         }
 
