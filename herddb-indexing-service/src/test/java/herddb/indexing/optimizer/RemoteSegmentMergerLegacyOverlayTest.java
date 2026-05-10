@@ -174,8 +174,10 @@ public class RemoteSegmentMergerLegacyOverlayTest {
                 /* no tombstones */ null, 0L, null);
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, /* M */ 8, /* beamWidth */ 32, 1.2f, 1.4f,
-                VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        /* graphM */ 8, /* beamWidth */ 32, 1.2f, 1.4f,
+                        VectorSimilarityFunction.EUCLIDEAN)));
 
         SegmentMetadata merged = merger.merge(List.of(a, b), 0);
         assertNotNull("merger must produce an output", merged);
@@ -207,7 +209,9 @@ public class RemoteSegmentMergerLegacyOverlayTest {
                 "B", 200L, 0xB, null, 0L, null);
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, 8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN)));
         try {
             merger.merge(List.of(a, b), 0);
             fail("expected TombstoneLoadFailedException for legacy znode with no overlay file");
@@ -230,7 +234,9 @@ public class RemoteSegmentMergerLegacyOverlayTest {
         SegmentMetadata b = writeInputAndPublishOverlay("B", 200L, 0xB, null, 0L, null);
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, 8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN)));
         SegmentMetadata merged = merger.merge(List.of(aModern, b), 0);
         assertNotNull(merged);
         assertTrue("vectorCount must reflect tombstone-filtered A: 47 + 50 = 97",

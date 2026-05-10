@@ -137,8 +137,10 @@ public class RemoteSegmentMergerOverlayLoadFailureTest {
         SegmentMetadata b = writeInput("seg-B", 200L, 0xB, null, 0L);
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, /* M */ 8, /* beam */ 32, 1.2f, 1.4f,
-                VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        /* graphM */ 8, /* beamWidth */ 32, 1.2f, 1.4f,
+                        VectorSimilarityFunction.EUCLIDEAN)));
         try {
             merger.merge(List.of(a, b), /* newOwnerInstance */ 0);
             fail("expected TombstoneLoadFailedException for missing overlay file");
@@ -181,7 +183,9 @@ public class RemoteSegmentMergerOverlayLoadFailureTest {
         Files.deleteIfExists(corruptOverlay);
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, 8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN)));
         try {
             merger.merge(List.of(a, b), 0);
             fail("expected TombstoneLoadFailedException for corrupt overlay file");
@@ -199,7 +203,9 @@ public class RemoteSegmentMergerOverlayLoadFailureTest {
         SegmentMetadata b = writeInput("seg-clean-B", 200L, 0xB, null, 0L);
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, 8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN)));
         SegmentMetadata merged = merger.merge(List.of(a, b), 0);
         assertTrue("two clean inputs must merge successfully",
                 merged != null && merged.getVectorCount() == 2L * VECTORS_PER_SEGMENT);

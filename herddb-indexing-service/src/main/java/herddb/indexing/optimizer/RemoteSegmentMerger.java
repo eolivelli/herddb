@@ -27,7 +27,8 @@ import herddb.indexing.segment.TombstoneOverlayManager;
 import herddb.log.LogSequenceNumber;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
-import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
+import io.github.jbellis.jvector.disk.RandomAccessReader;
+import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
@@ -42,19 +43,21 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Production {@link SegmentMerger} for the index-optimizer service (issue #484).
+ * Production {@link SegmentMerger} for the index-optimizer service (issue #484,
+ * issue #516).
  *
  * <p>Wraps {@link RemoteSegmentGraphMerger} (the actual graph rebuild) and
  * handles the optimizer-side concerns it doesn't know about:
  * <ul>
+ *   <li>Resolving per-index jvector build parameters via
+ *       {@link IndexMergeConfigProvider} at merge time (issue #516). A new
+ *       {@link RemoteSegmentGraphMerger} is created for each merge call using
+ *       the resolved config, so indexes with different dimensions, similarity
+ *       functions, or graph degrees are all handled correctly.</li>
  *   <li>Loading each input's latest {@code TombstoneOverlay} via
  *       {@link TombstoneOverlayManager#loadOverlay} when the segment carries
  *       a {@code tombstonePath} + a non-zero {@code overlayGeneration}, so
  *       tombstoned ordinals are dropped during the merge.</li>
- *   <li>Inferring the merged segment's {@code (vectorDimension)} from the
- *       inputs (we trust they all share a dimension; mismatches throw).</li>
- *   <li>Allocating a fresh {@code segmentId} as a 63-bit non-negative random
- *       long so the merger's outputs never collide with IS-allocated ids.</li>
  *   <li>Building the output {@link SegmentMetadata}: ACTIVE, fresh UUID,
  *       generation = {@code max(input.generation) + 1}, base LSN = the
  *       latest of the inputs', sizeBytes/vectorCount from the merger output,
@@ -76,45 +79,49 @@ public final class RemoteSegmentMerger implements SegmentMerger {
     private static final Logger LOGGER = Logger.getLogger(RemoteSegmentMerger.class.getName());
     private static final MemoryMXBean MEMORY_MX = ManagementFactory.getMemoryMXBean();
 
-    /**
-     * Vector dimension used by the merger when re-building the graph. Must
-     * match the IS-side index dimension; the optimizer reads it from
-     * configuration because the SegmentMetadata znode does not carry the
-     * dimension as a first-class field.
-     */
-    private final int dim;
-    private final RemoteSegmentGraphMerger graphMerger;
     private final DataStorageManager dataStorageManager;
+    private final Path tmpDirectory;
+    private final IndexMergeConfigProvider configProvider;
+
     /** Cumulative count of merge invocations — exposed for observability tests. */
     private final AtomicLong invocations = new AtomicLong();
+
+    /**
+     * The graph merger built for the most recent {@link #merge} call. Kept
+     * so that:
+     * <ul>
+     *   <li>{@link #getLastMergeTimings()} can delegate to it from the HTTP
+     *       server thread after the merge returns.</li>
+     *   <li>{@link #setMergeProgress} applied before the merge call is
+     *       forwarded to the freshly-constructed merger inside {@link #merge}.</li>
+     * </ul>
+     * Written inside {@link #merge} (single-threaded scheduler); read by the
+     * HTTP server thread — {@code volatile} ensures visibility.
+     */
+    private volatile RemoteSegmentGraphMerger lastGraphMerger;
+
+    /**
+     * Progress holder set by the engine before each {@link #merge} call and
+     * cleared (set to {@code null}) in the engine's {@code finally} block
+     * after the call returns. Stored here so it can be wired into the
+     * per-call {@link RemoteSegmentGraphMerger} that is created inside
+     * {@link #merge}. Written and read on the single-threaded scheduler —
+     * {@code volatile} for visibility to the HTTP server thread.
+     */
+    private volatile MergeProgress pendingProgress;
 
     /**
      * @param dataStorageManager  remote-backed DSM the merger uses to download inputs and
      *                            upload the merged graph + map files
      * @param tmpDirectory        local scratch directory for staging
-     * @param dim                 vector dimension of the index being merged
-     * @param graphM              jvector graph degree
-     * @param beamWidth           jvector beam width during build
-     * @param neighborOverflow    jvector neighbor-overflow factor
-     * @param alpha               jvector alpha factor
-     * @param similarity          vector similarity function (must match the IS that produced the inputs)
+     * @param configProvider      source of per-index jvector build parameters (issue #516)
      */
     public RemoteSegmentMerger(DataStorageManager dataStorageManager,
                                Path tmpDirectory,
-                               int dim,
-                               int graphM,
-                               int beamWidth,
-                               float neighborOverflow,
-                               float alpha,
-                               VectorSimilarityFunction similarity) {
+                               IndexMergeConfigProvider configProvider) {
         this.dataStorageManager = Objects.requireNonNull(dataStorageManager, "dataStorageManager");
-        if (dim <= 0) {
-            throw new IllegalArgumentException("dim must be positive: " + dim);
-        }
-        this.dim = dim;
-        this.graphMerger = new RemoteSegmentGraphMerger(
-                dataStorageManager, tmpDirectory, graphM, beamWidth,
-                neighborOverflow, alpha, similarity);
+        this.tmpDirectory = Objects.requireNonNull(tmpDirectory, "tmpDirectory");
+        this.configProvider = Objects.requireNonNull(configProvider, "configProvider");
     }
 
     public long getInvocationCount() {
@@ -126,34 +133,23 @@ public final class RemoteSegmentMerger implements SegmentMerger {
      * callbacks during the next {@link #merge} call. Pass {@code null} to stop
      * forwarding. Must be called from the same thread that calls {@link #merge}.
      *
-     * <p>Note: this method only wires callbacks into the wrapped
-     * {@link RemoteSegmentGraphMerger}; it does not store {@code progress} as
-     * a field (the lambdas below capture the parameter directly). As a result
-     * the method cannot throw a {@link RuntimeException} in any reachable
-     * execution path — the {@code try/catch} in the engine's {@code finally}
-     * block is a compile-time safety net for hypothetical future subclasses or
-     * overrides, not a code path exercised by the production implementation.
+     * <p>The progress object is stored and then applied to the
+     * {@link RemoteSegmentGraphMerger} that is created at the start of each
+     * {@link #merge} call, so this method may be called before or after
+     * previous merges without risk of cross-contamination.
      */
     public void setMergeProgress(MergeProgress progress) {
-        if (progress != null) {
-            graphMerger.setPhaseListener(progress::updatePhase);
-            graphMerger.setBatchListener((written, total) -> {
-                progress.updateBatchProgress(written, total);
-                return 0L; // return value ignored
-            });
-        } else {
-            graphMerger.setPhaseListener(null);
-            graphMerger.setBatchListener(null);
-        }
+        this.pendingProgress = progress;
     }
 
     /**
      * Returns the per-phase timing breakdown of the last completed merge
-     * (delegated from the wrapped {@link RemoteSegmentGraphMerger}), or
-     * {@code null} if no merge has been performed yet.
+     * (delegated from the most recently created {@link RemoteSegmentGraphMerger}),
+     * or {@code null} if no merge has been performed yet.
      */
     public RemoteSegmentGraphMerger.MergePhaseTimings getLastMergeTimings() {
-        return graphMerger.getLastMergeTimings();
+        RemoteSegmentGraphMerger last = lastGraphMerger;
+        return last != null ? last.getLastMergeTimings() : null;
     }
 
     @Override
@@ -183,6 +179,35 @@ public final class RemoteSegmentMerger implements SegmentMerger {
                         "merger input " + m.getSegmentUuid()
                                 + " has no segmentId — cannot reconstruct multipart path");
             }
+        }
+
+        // Resolve per-index config from the provider. On a cache-miss this reads
+        // checkpoint metadata from the remote file server; any Exception bubbles
+        // to the engine which logs it and skips this index for the tick.
+        IndexMergeConfig config = configProvider.getMergeConfig(
+                tablespaceUuid,
+                sample.getTableName(),
+                sample.getIndexName(),
+                indexUuid);
+
+        // Build a fresh RemoteSegmentGraphMerger for this merge using the
+        // per-index config. Construction is cheap (a few field assignments);
+        // the DataStorageManager is shared.
+        RemoteSegmentGraphMerger graphMerger = new RemoteSegmentGraphMerger(
+                dataStorageManager, tmpDirectory,
+                config.graphM, config.beamWidth,
+                config.neighborOverflow, config.alpha,
+                config.similarity);
+        this.lastGraphMerger = graphMerger;
+
+        // Wire progress callbacks before calling merge.
+        MergeProgress progress = pendingProgress;
+        if (progress != null) {
+            graphMerger.setPhaseListener(progress::updatePhase);
+            graphMerger.setBatchListener((written, total) -> {
+                progress.updateBatchProgress(written, total);
+                return 0L;
+            });
         }
 
         // Translate every SegmentMetadata input into a RemoteSegmentInput,
@@ -248,11 +273,17 @@ public final class RemoteSegmentMerger implements SegmentMerger {
 
         long outputSegmentId = newRandomSegmentId();
 
-        // Task #4 (issue #503): log JVM memory snapshot + estimated /tmp usage
-        // at the start of each merge so operators can sanity-check
-        //   jvm_rss_estimate + tmp_estimate < container_limit
-        // without needing a profiler attached to the pod.
-        logMemoryBudgetAtMergeStart(inputs, tablespaceUuid, indexUuid, outputSegmentId);
+        // Peek the vector dimension from the first input's map file. The map file
+        // embeds floatCount (= dim) per entry; reading the first entry's header
+        // avoids any dependency on the static index metadata (Index.properties
+        // does not carry dim — it is embedded in the map file binary format).
+        // By this point all inputs have been validated to have mapFileSize > 0.
+        int dim = peekDimFromMapFile(sample);
+
+        // Log JVM memory snapshot + estimated /tmp usage at the start of each
+        // merge so operators can sanity-check container headroom (issue #503).
+        logMemoryBudgetAtMergeStart(inputs, tablespaceUuid, indexUuid, outputSegmentId,
+                config.graphM, dim);
 
         RemoteSegmentGraphMerger.MergeOutput output = graphMerger.merge(
                 graphInputs, tablespaceUuid, indexUuid, outputSegmentId, dim);
@@ -309,7 +340,17 @@ public final class RemoteSegmentMerger implements SegmentMerger {
         // Reconstruct the MergeOutput just enough to drive the cleanup. The
         // file sizes / vector counts are irrelevant to deleteOutput, which
         // only needs (tablespaceUuid, indexUuid, segmentId).
-        graphMerger.deleteOutput(new RemoteSegmentGraphMerger.MergeOutput(
+        RemoteSegmentGraphMerger last = lastGraphMerger;
+        if (last == null) {
+            // No merge was ever attempted on this merger instance (should not
+            // happen in production since abandon is called after merge).
+            LOGGER.log(Level.WARNING,
+                    "abandon called on RemoteSegmentMerger with no prior merge "
+                            + "(segment={0}); cannot clean up multipart files",
+                    produced.getSegmentUuid());
+            return;
+        }
+        last.deleteOutput(new RemoteSegmentGraphMerger.MergeOutput(
                 produced.getTablespaceUuid(), produced.getIndexUuid(), produced.getSegmentId(),
                 produced.getGraphPath(), 0L,
                 produced.getMapPath(), 0L,
@@ -323,21 +364,13 @@ public final class RemoteSegmentMerger implements SegmentMerger {
     /**
      * Logs the JVM memory snapshot and estimated /tmp usage at merge start so
      * operators can sanity-check whether the available headroom is sufficient.
-     *
-     * <p>Estimated /tmp usage formula (same as the legacy in-memory path; the
-     * streaming path is roughly the same order of magnitude):
-     * <ul>
-     *   <li>graph ≈ {@code totalVectors × graphM × 4 bytes × 1.5} (adjacency lists
-     *       plus InlineVectors)</li>
-     *   <li>map ≈ {@code totalVectors × (pkBytes + dim×4 + 12)} — 12-byte header</li>
-     * </ul>
-     * These are rough upper bounds; the actual size depends on PQ compression,
-     * de-duplication, and tombstone filtering.
      */
     private void logMemoryBudgetAtMergeStart(List<SegmentMetadata> inputs,
                                               String tablespaceUuid,
                                               String indexUuid,
-                                              long outputSegmentId) {
+                                              long outputSegmentId,
+                                              int graphM,
+                                              int dim) {
         long totalVectors = 0;
         long totalInputSizeBytes = 0;
         for (SegmentMetadata m : inputs) {
@@ -352,13 +385,10 @@ public final class RemoteSegmentMerger implements SegmentMerger {
         long directMaxMb  = directMaxBytes >= 0 ? directMaxBytes / (1024 * 1024) : -1L;
 
         // Estimated /tmp disk usage for graph + map files.
-        // graph ≈ (totalVectors × graphM × 4 × 1.5) bytes
-        // map   ≈ (totalVectors × (dim×4 + 24)) bytes (ordinal + pkLen + pk + floats + header)
-        long estimatedGraphBytes = (long) (totalVectors * graphMFromConfig() * 4 * 1.5);
+        long estimatedGraphBytes = (long) (totalVectors * graphM * 4 * 1.5);
         long estimatedMapBytes   = totalVectors * ((long) dim * 4 + 24);
         long estimatedTmpGib     = (estimatedGraphBytes + estimatedMapBytes) / (1024 * 1024 * 1024);
 
-        // Container memory limit from cgroup v2 (best-effort; -1 = unavailable).
         long cgroupLimitGib = readCgroupMemoryLimitGib();
 
         LOGGER.log(Level.INFO,
@@ -383,16 +413,6 @@ public final class RemoteSegmentMerger implements SegmentMerger {
                     "  container memory limit: {0} GiB (from /sys/fs/cgroup/memory.max)",
                     cgroupLimitGib);
         }
-    }
-
-    /**
-     * Returns the configured graph degree (M) from the underlying graph merger.
-     * Used only for the /tmp estimate in the memory-budget log.
-     */
-    private int graphMFromConfig() {
-        // Reflection-free: we know graphMerger is a RemoteSegmentGraphMerger
-        // with graphM stored. Expose it via a package-accessible getter.
-        return graphMerger.getGraphM();
     }
 
     /**
@@ -492,6 +512,64 @@ public final class RemoteSegmentMerger implements SegmentMerger {
             return Long.compare(a.ledgerId, b.ledgerId);
         }
         return Long.compare(a.offset, b.offset);
+    }
+
+    /**
+     * Peeks the vector dimension from the first entry of the given segment's
+     * map file. The map file binary format is:
+     * <pre>
+     *   int  entryCount
+     *   // for each entry:
+     *   int  ordinal
+     *   int  pkLen
+     *   byte[pkLen] pk
+     *   int  floatCount  (= dim)
+     *   int[floatCount] floatBits  (not read here)
+     * </pre>
+     * Only the first entry's header is read (at most {@code 16 + pkLen} bytes).
+     * This avoids downloading the full map file just to discover the dimension.
+     *
+     * <p>The caller must ensure the segment's {@code mapFileSize > 0} and that
+     * the map file contains at least one entry (i.e. the segment is non-empty).
+     *
+     * @throws IOException                 on remote I/O failures
+     * @throws DataStorageManagerException on storage-layer errors
+     * @throws IllegalStateException       if the map file is empty or the first
+     *                                     entry contains an implausible dimension
+     */
+    int peekDimFromMapFile(SegmentMetadata m)
+            throws IOException, DataStorageManagerException {
+        String multipartUuid = m.getIndexUuid() + "_seg" + m.getSegmentId();
+        ReaderSupplier supplier = dataStorageManager.multipartIndexReaderSupplier(
+                m.getTablespaceUuid(), multipartUuid, "map", m.getMapFileSize());
+        try (RandomAccessReader reader = supplier.get()) {
+            reader.seek(0L);
+            int entryCount = reader.readInt();
+            if (entryCount <= 0) {
+                throw new IllegalStateException(
+                        "Cannot peek dim from map file of segment " + m.getSegmentUuid()
+                        + ": entryCount=" + entryCount
+                        + " (empty or corrupt map file)");
+            }
+            reader.readInt(); // ordinal (skip)
+            int pkLen = reader.readInt();
+            if (pkLen < 0 || pkLen > 65_536) {
+                throw new IllegalStateException(
+                        "Cannot peek dim from map file of segment " + m.getSegmentUuid()
+                        + ": pkLen=" + pkLen + " (out of range, likely corrupt)");
+            }
+            // Skip the primary-key bytes.
+            byte[] pk = new byte[pkLen];
+            reader.readFully(pk);
+            int floatCount = reader.readInt();
+            if (floatCount <= 0 || floatCount > 65_536) {
+                throw new IllegalStateException(
+                        "Cannot peek dim from map file of segment " + m.getSegmentUuid()
+                        + ": floatCount=" + floatCount
+                        + " (out of range, likely corrupt)");
+            }
+            return floatCount;
+        }
     }
 
     /**

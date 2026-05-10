@@ -28,7 +28,6 @@ import herddb.server.RemoteFileClient;
 import herddb.server.RemoteFileServiceFactory;
 import herddb.server.ServerConfiguration;
 import herddb.storage.DataStorageManager;
-import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -36,7 +35,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -893,40 +891,6 @@ public final class IndexOptimizerMain {
                         OptimizerConfiguration.PROPERTY_REMOTE_FILE_MAX_INFLIGHT_WRITE_BYTES,
                         OptimizerConfiguration.PROPERTY_REMOTE_FILE_MAX_INFLIGHT_WRITE_BYTES_DEFAULT));
 
-        // Validate all configuration BEFORE allocating any resources (gRPC channel,
-        // DataStorageManager) to avoid resource leaks when validation fails. Previously
-        // the dim check came after factory.createClient(), leaking a file client on every
-        // failed call (issue #507, reviewer finding).
-        int dim = configuration.getInt("indexoptimizer.merge.dim", 0);
-        if (dim <= 0) {
-            // The merger needs the dimension up front. Fall back: we don't
-            // currently store dim in the segment registry, so operators must
-            // configure it explicitly. If it's missing we refuse to merge.
-            throw new IllegalStateException("indexoptimizer.merge.dim must be set to the index"
-                    + " vector dimension (no inference is currently supported)");
-        }
-        int graphM = configuration.getInt(OptimizerConfiguration.PROPERTY_MERGE_M,
-                OptimizerConfiguration.PROPERTY_MERGE_M_DEFAULT);
-        int beamWidth = configuration.getInt(OptimizerConfiguration.PROPERTY_MERGE_BEAM_WIDTH,
-                OptimizerConfiguration.PROPERTY_MERGE_BEAM_WIDTH_DEFAULT);
-        float neighborOverflow = configuration.getFloat(
-                OptimizerConfiguration.PROPERTY_MERGE_NEIGHBOR_OVERFLOW,
-                OptimizerConfiguration.PROPERTY_MERGE_NEIGHBOR_OVERFLOW_DEFAULT);
-        float alpha = configuration.getFloat(OptimizerConfiguration.PROPERTY_MERGE_ALPHA,
-                OptimizerConfiguration.PROPERTY_MERGE_ALPHA_DEFAULT);
-        String similarityName = configuration.getString(
-                OptimizerConfiguration.PROPERTY_MERGE_SIMILARITY,
-                OptimizerConfiguration.PROPERTY_MERGE_SIMILARITY_DEFAULT);
-        VectorSimilarityFunction similarity;
-        try {
-            similarity = VectorSimilarityFunction.valueOf(similarityName);
-        } catch (IllegalArgumentException badName) {
-            throw new IllegalStateException(
-                    "indexoptimizer.merge.similarity has unsupported value: " + similarityName
-                            + " (expected one of " + Arrays.toString(VectorSimilarityFunction.values())
-                            + ")", badName);
-        }
-
         RemoteFileServiceFactory factory = RemoteFileServiceFactory.load();
         this.mergerFileClient = factory.createClient(servers, clientConfig);
         Path tmpDir = resolveTmpDirectory();
@@ -937,8 +901,17 @@ public final class IndexOptimizerMain {
         this.mergerDataStorageManager = factory.createDataStorageManager(
                 metaDir, remoteTmp, Integer.MAX_VALUE, mergerFileClient);
 
-        return new RemoteSegmentMerger(mergerDataStorageManager, tmpDir,
-                dim, graphM, beamWidth, neighborOverflow, alpha, similarity);
+        // Build the config provider that reads per-index jvector build parameters
+        // directly from the checkpoint metadata on the remote file server (issue #516).
+        // This avoids any dependency on IS liveness — the remote file server is
+        // always available as long as the HerdDB leader has completed at least one
+        // checkpoint.
+        IndexMergeConfigProvider configProvider =
+                new RemoteMetadataIndexMergeConfigProvider(mergerFileClient, tablespaceUuid);
+        LOGGER.log(Level.INFO,
+                "index merge config provider: RemoteMetadataIndexMergeConfigProvider"
+                + " (tablespaceUuid={0})", tablespaceUuid);
+        return new RemoteSegmentMerger(mergerDataStorageManager, tmpDir, configProvider);
     }
 
     private Path resolveTmpDirectory() throws IOException {

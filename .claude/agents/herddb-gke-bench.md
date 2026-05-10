@@ -426,7 +426,7 @@ Agent(
   IS-0: vectors=X (X% of rows), mem=X GiB — <OK|WARN>
   IS-1: vectors=X (X% of rows), mem=X GiB — <OK|WARN>
   ServerCkpt: last LSN=(<ledger>,<offset>) <N>m ago  [or: in progress]
-  ISCkpt: <none active | back-pressure Xs, Phase B in progress | etc.>
+  ISCkpt: <none active | back-pressure Xs, Phase B in progress>
   Bookie: [OMIT this line entirely unless blocked>0 or rejected>0 or skipThr>0]
   LogErrors: <none detected | verbatim error lines>
   Verdict: <healthy|warning|fatal>
@@ -443,6 +443,9 @@ Agent(
 - **IS-N mem**: `total_estimated_memory_bytes` from `engine-stats`, in GiB. Warn if > 18 GiB.
 - **ServerCkpt**: last `local checkpoint finish` line from server logs — LSN + age.
 - **ISCkpt**: any active back-pressure or checkpoint phase from IS logs. Omit if nothing active.
+  Report only the phase letter (A/B/C) and back-pressure duration — do NOT include apply queue
+  size (e.g. `apply queue 1997/2000 (full)`). The apply queue is always near-full during bulk
+  ingestion and is not a diagnostic signal.
 - **Bookie line**: omit entirely when `blocked=0`, `rejected=0`, `skipThr=0`.
   Only surface it when at least one of those counters is non-zero.
 
