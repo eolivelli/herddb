@@ -2110,6 +2110,22 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     }
 
     /**
+     * Test-only snapshot of the live {@code segmentWatchers} map (issue #514).
+     * Lets tests assert that DROP_INDEX / DROP_TABLE / TRUNCATE_TABLE correctly
+     * close and remove their corresponding {@link herddb.indexing.segment.SegmentAssignmentWatcher}
+     * entries so no background refresh executor leaks.
+     *
+     * @return an unmodifiable view of the current watcher map; keys are
+     *         {@link #storeKey} strings, values are (possibly already-closed)
+     *         watcher instances
+     */
+    // package-private for testing
+    java.util.Map<String, herddb.indexing.segment.SegmentAssignmentWatcher>
+            snapshotSegmentWatchersForTest() {
+        return java.util.Collections.unmodifiableMap(new java.util.HashMap<>(segmentWatchers));
+    }
+
+    /**
      * Applies a single (committed or non-transactional) entry.
      */
     // package-private for testing
@@ -2160,6 +2176,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 // (table, name) key does not mis-fire the "different UUID" guard and silently
                 // refuse to create the new store (issue #368 review).
                 vectorStoreIndexUuids.entrySet().removeIf(e -> e.getKey().startsWith(droppedTablePrefix));
+                // Close SegmentAssignmentWatchers for all dropped stores so their
+                // background refresh executors are stopped and ZK watcher callbacks
+                // can no longer fire after the stores are gone (issue #514).
+                segmentWatchers.entrySet().removeIf(e -> {
+                    if (e.getKey().startsWith(droppedTablePrefix)) {
+                        e.getValue().close();
+                        return true;
+                    }
+                    return false;
+                });
                 for (Map.Entry<String, AbstractVectorStore> dropped : toClose) {
                     submitVectorStoreDeletion(dropped.getKey(), dropped.getValue());
                 }
@@ -2206,6 +2232,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 });
                 vectorStoreIndexUuids.entrySet().removeIf(
                         e -> e.getKey().startsWith(truncatedTablePrefix));
+                // Close SegmentAssignmentWatchers for the truncated stores.
+                // New watchers are created below when re-creating each store.
+                segmentWatchers.entrySet().removeIf(e -> {
+                    if (e.getKey().startsWith(truncatedTablePrefix)) {
+                        e.getValue().close();
+                        return true;
+                    }
+                    return false;
+                });
                 for (Map.Entry<String, AbstractVectorStore> dropped : toClose) {
                     submitVectorStoreDeletion(dropped.getKey(), dropped.getValue());
                 }
@@ -2248,6 +2283,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     String k = storeKey(idx.table, idx.name);
                     AbstractVectorStore removed = vectorStores.remove(k);
                     vectorStoreIndexUuids.remove(k);
+                    // Close the SegmentAssignmentWatcher so its background refresh
+                    // executor is stopped and no further ZK watcher callbacks fire
+                    // for a store that no longer exists (issue #514).
+                    herddb.indexing.segment.SegmentAssignmentWatcher removedWatcher =
+                            segmentWatchers.remove(k);
+                    if (removedWatcher != null) {
+                        removedWatcher.close();
+                    }
                     if (removed != null) {
                         // Close the store and drop its on-storage data
                         // (graph/map segments + IndexStatus markers).

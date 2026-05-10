@@ -27,6 +27,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Predicate;
 
 /**
@@ -190,7 +191,7 @@ public abstract class AbstractVectorStore implements AutoCloseable {
      *
      * @param knownUuids segment UUIDs currently visible in the ZK registry
      */
-    public void reconcileAdoptedSegments(java.util.Set<String> knownUuids) {
+    public void reconcileAdoptedSegments(Set<String> knownUuids) {
         // No-op for non-persistent stores.
     }
 

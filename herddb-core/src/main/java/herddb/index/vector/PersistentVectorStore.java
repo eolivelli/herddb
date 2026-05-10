@@ -3250,7 +3250,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
      *                   {@link herddb.indexing.segment.SegmentAssignmentWatcher#snapshotKnownSegments()})
      */
     @Override
-    public void reconcileAdoptedSegments(java.util.Set<String> knownUuids) {
+    public void reconcileAdoptedSegments(Set<String> knownUuids) {
         List<String> toDropUuids = new ArrayList<>();
         for (VectorSegment seg : segments) {
             if (seg.externalStorageKey != null
