@@ -28,7 +28,10 @@ import herddb.log.LogSequenceNumber;
 import herddb.storage.DataStorageManager;
 import herddb.storage.DataStorageManagerException;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
+import io.netty.util.internal.PlatformDependent;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -71,6 +74,7 @@ import java.util.logging.Logger;
 public final class RemoteSegmentMerger implements SegmentMerger {
 
     private static final Logger LOGGER = Logger.getLogger(RemoteSegmentMerger.class.getName());
+    private static final MemoryMXBean MEMORY_MX = ManagementFactory.getMemoryMXBean();
 
     /**
      * Vector dimension used by the merger when re-building the graph. Must
@@ -115,6 +119,41 @@ public final class RemoteSegmentMerger implements SegmentMerger {
 
     public long getInvocationCount() {
         return invocations.get();
+    }
+
+    /**
+     * Sets the live-state holder that receives phase-change and batch-progress
+     * callbacks during the next {@link #merge} call. Pass {@code null} to stop
+     * forwarding. Must be called from the same thread that calls {@link #merge}.
+     *
+     * <p>Note: this method only wires callbacks into the wrapped
+     * {@link RemoteSegmentGraphMerger}; it does not store {@code progress} as
+     * a field (the lambdas below capture the parameter directly). As a result
+     * the method cannot throw a {@link RuntimeException} in any reachable
+     * execution path — the {@code try/catch} in the engine's {@code finally}
+     * block is a compile-time safety net for hypothetical future subclasses or
+     * overrides, not a code path exercised by the production implementation.
+     */
+    public void setMergeProgress(MergeProgress progress) {
+        if (progress != null) {
+            graphMerger.setPhaseListener(progress::updatePhase);
+            graphMerger.setBatchListener((written, total) -> {
+                progress.updateBatchProgress(written, total);
+                return 0L; // return value ignored
+            });
+        } else {
+            graphMerger.setPhaseListener(null);
+            graphMerger.setBatchListener(null);
+        }
+    }
+
+    /**
+     * Returns the per-phase timing breakdown of the last completed merge
+     * (delegated from the wrapped {@link RemoteSegmentGraphMerger}), or
+     * {@code null} if no merge has been performed yet.
+     */
+    public RemoteSegmentGraphMerger.MergePhaseTimings getLastMergeTimings() {
+        return graphMerger.getLastMergeTimings();
     }
 
     @Override
@@ -208,6 +247,13 @@ public final class RemoteSegmentMerger implements SegmentMerger {
         }
 
         long outputSegmentId = newRandomSegmentId();
+
+        // Task #4 (issue #503): log JVM memory snapshot + estimated /tmp usage
+        // at the start of each merge so operators can sanity-check
+        //   jvm_rss_estimate + tmp_estimate < container_limit
+        // without needing a profiler attached to the pod.
+        logMemoryBudgetAtMergeStart(inputs, tablespaceUuid, indexUuid, outputSegmentId);
+
         RemoteSegmentGraphMerger.MergeOutput output = graphMerger.merge(
                 graphInputs, tablespaceUuid, indexUuid, outputSegmentId, dim);
         if (output == null) {
@@ -273,6 +319,105 @@ public final class RemoteSegmentMerger implements SegmentMerger {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    /**
+     * Logs the JVM memory snapshot and estimated /tmp usage at merge start so
+     * operators can sanity-check whether the available headroom is sufficient.
+     *
+     * <p>Estimated /tmp usage formula (same as the legacy in-memory path; the
+     * streaming path is roughly the same order of magnitude):
+     * <ul>
+     *   <li>graph ≈ {@code totalVectors × graphM × 4 bytes × 1.5} (adjacency lists
+     *       plus InlineVectors)</li>
+     *   <li>map ≈ {@code totalVectors × (pkBytes + dim×4 + 12)} — 12-byte header</li>
+     * </ul>
+     * These are rough upper bounds; the actual size depends on PQ compression,
+     * de-duplication, and tombstone filtering.
+     */
+    private void logMemoryBudgetAtMergeStart(List<SegmentMetadata> inputs,
+                                              String tablespaceUuid,
+                                              String indexUuid,
+                                              long outputSegmentId) {
+        long totalVectors = 0;
+        long totalInputSizeBytes = 0;
+        for (SegmentMetadata m : inputs) {
+            totalVectors += m.getVectorCount();
+            totalInputSizeBytes += m.getSizeBytes();
+        }
+        long heapUsedMb  = MEMORY_MX.getHeapMemoryUsage().getUsed()  / (1024 * 1024);
+        long heapMaxMb   = MEMORY_MX.getHeapMemoryUsage().getMax()   / (1024 * 1024);
+        long directBytes = PlatformDependent.usedDirectMemory();
+        long directMaxBytes = PlatformDependent.maxDirectMemory();
+        long directUsedMb = directBytes >= 0 ? directBytes / (1024 * 1024) : -1L;
+        long directMaxMb  = directMaxBytes >= 0 ? directMaxBytes / (1024 * 1024) : -1L;
+
+        // Estimated /tmp disk usage for graph + map files.
+        // graph ≈ (totalVectors × graphM × 4 × 1.5) bytes
+        // map   ≈ (totalVectors × (dim×4 + 24)) bytes (ordinal + pkLen + pk + floats + header)
+        long estimatedGraphBytes = (long) (totalVectors * graphMFromConfig() * 4 * 1.5);
+        long estimatedMapBytes   = totalVectors * ((long) dim * 4 + 24);
+        long estimatedTmpGib     = (estimatedGraphBytes + estimatedMapBytes) / (1024 * 1024 * 1024);
+
+        // Container memory limit from cgroup v2 (best-effort; -1 = unavailable).
+        long cgroupLimitGib = readCgroupMemoryLimitGib();
+
+        LOGGER.log(Level.INFO,
+                "Starting merge: {0} inputs, {1} vectors, dim={2},"
+                        + " indexUuid={3}, outputSegmentId={4},"
+                        + " inputSizeBytes={5}",
+                new Object[]{inputs.size(), totalVectors, dim,
+                        indexUuid, outputSegmentId, totalInputSizeBytes});
+        LOGGER.log(Level.INFO,
+                "  estimated /tmp usage: graph≈{0} GiB, map≈{1} GiB, total≈{2} GiB",
+                new Object[]{estimatedGraphBytes / (1024 * 1024 * 1024),
+                        estimatedMapBytes / (1024 * 1024 * 1024),
+                        estimatedTmpGib});
+        LOGGER.log(Level.INFO,
+                "  JVM heap: {0} MiB used / {1} MiB max",
+                new Object[]{heapUsedMb, heapMaxMb});
+        LOGGER.log(Level.INFO,
+                "  JVM direct: {0} MiB used / {1} MiB max (Netty PlatformDependent)",
+                new Object[]{directUsedMb, directMaxMb});
+        if (cgroupLimitGib >= 0) {
+            LOGGER.log(Level.INFO,
+                    "  container memory limit: {0} GiB (from /sys/fs/cgroup/memory.max)",
+                    cgroupLimitGib);
+        }
+    }
+
+    /**
+     * Returns the configured graph degree (M) from the underlying graph merger.
+     * Used only for the /tmp estimate in the memory-budget log.
+     */
+    private int graphMFromConfig() {
+        // Reflection-free: we know graphMerger is a RemoteSegmentGraphMerger
+        // with graphM stored. Expose it via a package-accessible getter.
+        return graphMerger.getGraphM();
+    }
+
+    /**
+     * Reads the container memory limit from the cgroup v2 file
+     * {@code /sys/fs/cgroup/memory.max}. Returns -1 when the file is not
+     * accessible (non-Linux hosts, cgroup v1) or when its value is
+     * {@code "max"} (unlimited). Best-effort: any I/O failure is swallowed.
+     */
+    private static long readCgroupMemoryLimitGib() {
+        try {
+            java.nio.file.Path p = java.nio.file.Paths.get("/sys/fs/cgroup/memory.max");
+            if (!java.nio.file.Files.exists(p)) {
+                return -1L;
+            }
+            String raw = new String(java.nio.file.Files.readAllBytes(p),
+                    java.nio.charset.StandardCharsets.UTF_8).trim();
+            if ("max".equalsIgnoreCase(raw)) {
+                return -1L;
+            }
+            return Long.parseLong(raw) / (1024L * 1024 * 1024);
+        } catch (IOException | NumberFormatException e) {
+            // Best-effort: silently swallow; the log line is just advisory.
+            return -1L;
+        }
+    }
 
     /**
      * Bounded probe window for loading legacy ({@code overlayGeneration == 0})
