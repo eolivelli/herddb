@@ -41,8 +41,9 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.zookeeper.enabled }}
+      {{- if or .Values.zookeeper.enabled (eq .Values.indexingService.storageMode "remote") }}
       initContainers:
+        {{- if .Values.zookeeper.enabled }}
         - name: wait-for-zookeeper
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -59,6 +60,25 @@ spec:
                 sleep 2
               done
               echo "ZooKeeper is ready."
+        {{- end }}
+        {{- if eq .Values.indexingService.storageMode "remote" }}
+        - name: wait-for-file-server
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              {{- $fsHost := printf "%s-file-server-0.%s-file-server.%s.svc.cluster.local"
+                    (include "herddb.fullname" .)
+                    (include "herddb.fullname" .)
+                    .Release.Namespace }}
+              echo "Waiting for file server DNS: {{ $fsHost }}..."
+              until getent hosts {{ $fsHost }} > /dev/null 2>&1; do
+                echo "File server DNS not yet resolvable, retrying in 1s..."
+                sleep 1
+              done
+              echo "File server DNS is resolvable."
+        {{- end }}
       {{- end }}
       containers:
         - name: indexing-service
