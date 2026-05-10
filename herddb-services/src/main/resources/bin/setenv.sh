@@ -17,16 +17,31 @@
 # under the License.
 
 #JAVA_HOME=
-# Mandatory JVM flags for jvector: the Panama Vector API module and the
-# HerdDB-shipped compile-command file that force-inlines jvector's hot paths.
-# Appended unconditionally to JAVA_OPTS so they survive a custom JAVA_OPTS
-# override (e.g. the Helm chart's server.javaOpts) and so they appear on the
-# actual java command line for service processes that pass JAVA_OPTS through
-# (server, indexing-service, file-server, bookkeeper). Tools that don't pass
-# JAVA_OPTS through (herddb-cli.sh, herddb-bench.sh) intentionally don't get
-# them — the CLI doesn't load jvector and the extra startup noise can interfere
-# with output capture in some test/exec environments.
-JVECTOR_JAVA_OPTS="--add-modules jdk.incubator.vector -XX:CompileCommandFile=conf/jvector-compiler-directives"
+# Mandatory JVM flags always appended unconditionally to JAVA_OPTS.
+# They survive a custom JAVA_OPTS override (e.g. the Helm chart's
+# server.javaOpts / indexingService.javaOpts) and appear on the actual java
+# command line for service processes that pass JAVA_OPTS through (server,
+# indexing-service, file-server, bookkeeper). Tools that don't pass JAVA_OPTS
+# through (herddb-cli.sh, herddb-bench.sh) intentionally don't get them.
+#
+# jvector: Panama Vector API module + the HerdDB compile-command file that
+# force-inlines jvector's SIMD hot paths.
+#
+# DNS negative-result caching (issue #510 — CoreDNS propagation race):
+#   networkaddress.cache.negative.ttl=0  prevents the JVM from caching DNS
+#     failures; the JRE default (10 s on most JDKs) causes a 10-second
+#     blackout per retry when CoreDNS hasn't yet published the headless-
+#     Service A record for a freshly started pod (e.g. the file server).
+#     Combined with the existing retry back-off in RemoteFileServiceClient
+#     this reduced a ~31 s connectivity blackout to at most one retry cycle.
+#   networkaddress.cache.ttl=30 caps the positive DNS cache to 30 s so the
+#     JVM tracks pod-IP changes within one TTL window. Without a SecurityManager
+#     (the normal HerdDB case) the JDK default is 30 s, so this setting is a
+#     no-op for the positive cache — it is stated explicitly for clarity and
+#     to lock in the value should the default ever change or a SecurityManager
+#     be introduced. With a SecurityManager the JDK default is -1 (cache
+#     forever), which would prevent pod-failover recovery without a JVM restart.
+JVECTOR_JAVA_OPTS="--add-modules jdk.incubator.vector -XX:CompileCommandFile=conf/jvector-compiler-directives -Dnetworkaddress.cache.negative.ttl=0 -Dnetworkaddress.cache.ttl=30"
 # JAVA_OPTS / JDK_JAVA_OPTIONS: when set by the caller, REPLACE the defaults.
 # JAVA_OPTS_EXTRA / JDK_JAVA_OPTIONS_EXTRA: appended to the final value, so
 # deployments (e.g. the Helm chart's server.javaOptsExtra) can ADD flags
