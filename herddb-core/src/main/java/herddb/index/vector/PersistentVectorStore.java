@@ -281,6 +281,16 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * the index.
      */
     private static final int METADATA_VERSION_MULTI_SEGMENT_V4 = 4;
+    /**
+     * V5 extends V4 with one additional field per segment: the
+     * {@link VectorSegment#externalStorageKey} (written as a UTF string, empty
+     * string = null). Required so that optimizer-adopted segments (which use a
+     * 63-bit long-based storage key rather than the IS-local int-based key) can
+     * be reopened correctly after a restart. Backward-compatible: V4 payloads are
+     * still accepted; segments loaded from V4 get {@code externalStorageKey = null}
+     * (correct, since V4 was written before the adoption feature existed).
+     */
+    private static final int METADATA_VERSION_MULTI_SEGMENT_V5 = 5;
 
     // -------------------------------------------------------------------------
     // Configuration
@@ -3137,6 +3147,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
             newList.add(tentative);
             segments = newList;
             registerSegmentMemoryEstimate(tentative);
+            // Mark the store dirty so the next checkpoint() call serialises the new
+            // segment list (including the adopted segment's externalStorageKey) to the
+            // IndexStatus. Without this, the checkpoint gate treats adoption as a
+            // no-op and the adopted segment is invisible on restart.
+            dirty.set(true);
             LOGGER.log(Level.INFO,
                     "adoptExternalSegment: loaded segment {0} (storageKey={1}, generation={2})"
                             + " into store {3}; total on-disk segments now {4}",
@@ -3175,6 +3190,10 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
             segments = newList;
             unregisterSegmentMemoryEstimate(found);
+            // Mark dirty so the next checkpoint() serialises the reduced segment list.
+            // Without this, dropping a segment leaves a stale entry in the IndexStatus
+            // on disk (the checkpoint gate would see no changes and skip).
+            dirty.set(true);
             LOGGER.log(Level.INFO,
                     "dropSegmentByUuid: removed segment {0} from store {1};"
                             + " total on-disk segments now {2}",
@@ -5687,13 +5706,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             + " optimizer. Delete the index and re-create it to produce a v4"
                             + " checkpoint, or downgrade to a binary that supports v3.");
         }
-        if (version != METADATA_VERSION_MULTI_SEGMENT_V4) {
+        if (version != METADATA_VERSION_MULTI_SEGMENT_V4
+                && version != METADATA_VERSION_MULTI_SEGMENT_V5) {
             // Unknown future version — the previous binary cannot read it.
             // Fail fast: an immediate boot failure is far easier to diagnose
             // than a silent data-loss-equivalent regression.
             throw new DataStorageManagerException(
                     "unsupported vector index metadata version " + version + " for " + indexName
-                            + " (this binary supports v" + METADATA_VERSION_MULTI_SEGMENT_V4
+                            + " (this binary supports v" + METADATA_VERSION_MULTI_SEGMENT_V5
                             + "). Either re-deploy a binary that supports v" + version
                             + " OR delete the index and re-create it.");
         }
@@ -5711,11 +5731,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
         this.dimension = dim;
         newPageId.set(status.newPageId);
 
-        loadMultiSegmentFormat(metaBuf, dim, savedNextNodeId, savedBeamWidth, savedNeighborOverflow, savedAlpha);
+        loadMultiSegmentFormat(metaBuf, version, dim, savedNextNodeId,
+                savedBeamWidth, savedNeighborOverflow, savedAlpha);
     }
 
-    private void loadMultiSegmentFormat(ByteBuffer metaBuf, int dim, long savedNextNodeId,
-                                         int savedBeamWidth, float savedNeighborOverflow, float savedAlpha)
+    private void loadMultiSegmentFormat(ByteBuffer metaBuf, int metaVersion, int dim,
+                                         long savedNextNodeId,
+                                         int savedBeamWidth, float savedNeighborOverflow,
+                                         float savedAlpha)
             throws IOException, DataStorageManagerException {
         java.io.DataInputStream dis = new java.io.DataInputStream(
                 new java.io.ByteArrayInputStream(metaBuf.array(), metaBuf.position(),
@@ -5751,6 +5774,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             long mapFileSize;
             long generation;
             String segmentUuid;
+            String externalStorageKey;
             try {
                 segId = dis.readInt();
                 estimatedSize = dis.readLong();
@@ -5759,12 +5783,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
                 mapFilePath = dis.readUTF();
                 mapFileSize = dis.readLong();
                 generation = dis.readLong();
-                // v4 format always includes a segmentUuid field. An empty string
-                // means the segment has no UUID (should not occur in v4 except during
+                // v4+ format always includes a segmentUuid field. An empty string
+                // means the segment has no UUID (should not occur in v4+ except during
                 // a checkpoint that was written before the publisher was first attached;
                 // treated as null for reconcile purposes).
                 String raw = dis.readUTF();
                 segmentUuid = raw.isEmpty() ? null : raw;
+                // v5 adds externalStorageKey so that optimizer-adopted segments
+                // (which use a 63-bit long-based storage key instead of the
+                // IS-local int-based key) can be reopened correctly after restart.
+                // V4 payloads predate adoption, so externalStorageKey is always null.
+                if (metaVersion >= METADATA_VERSION_MULTI_SEGMENT_V5) {
+                    String extRaw = dis.readUTF();
+                    externalStorageKey = extRaw.isEmpty() ? null : extRaw;
+                } else {
+                    externalStorageKey = null;
+                }
             } catch (IOException e) {
                 throw new DataStorageManagerException("Failed to read segment metadata", e);
             }
@@ -5776,6 +5810,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             seg.mapFileSize = mapFileSize;
             seg.generation = generation;
             seg.segmentUuid = segmentUuid;
+            seg.externalStorageKey = externalStorageKey;
             segList.add(seg);
         }
 
@@ -6318,12 +6353,15 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // Existing (sealed/mergeable) segments keep their stored generation.
         long newGeneration = currentIndexStatusGeneration.get() + 1;
 
-        // Always write v4 format: v3 (which lacked the segmentUuid field) is no
-        // longer supported for reading or writing (issue #499).
+        // Write v5 format: v5 adds externalStorageKey per-segment so that
+        // optimizer-adopted segments survive a restart. v4 (which lacked that
+        // field) is still accepted for reading but will never be written.
+        // v3 (which lacked segmentUuid) is no longer supported for reading or
+        // writing (issue #499).
 
         VisibleByteArrayOutputStream baos = new VisibleByteArrayOutputStream(256);
         try (java.io.DataOutputStream dos = new java.io.DataOutputStream(baos)) {
-            dos.writeInt(METADATA_VERSION_MULTI_SEGMENT_V4);
+            dos.writeInt(METADATA_VERSION_MULTI_SEGMENT_V5);
             dos.writeInt(dimension);
             dos.writeInt(m);
             dos.writeInt(beamWidth);
@@ -6338,17 +6376,21 @@ public class PersistentVectorStore extends AbstractVectorStore {
             for (VectorSegment seg : sealedSegments) {
                 writeSegmentMeta(dos, seg.segmentId, seg.segmentUuid, seg.estimatedSizeBytes,
                         seg.graphFilePath, seg.graphFileSize,
-                        seg.mapFilePath, seg.mapFileSize, seg.generation);
+                        seg.mapFilePath, seg.mapFileSize, seg.generation,
+                        seg.externalStorageKey);
             }
             for (VectorSegment seg : mergeableSegments) {
                 writeSegmentMeta(dos, seg.segmentId, seg.segmentUuid, seg.estimatedSizeBytes,
                         seg.graphFilePath, seg.graphFileSize,
-                        seg.mapFilePath, seg.mapFileSize, seg.generation);
+                        seg.mapFilePath, seg.mapFileSize, seg.generation,
+                        seg.externalStorageKey);
             }
             for (SegmentWriteResult swr : newSegmentResults) {
+                // IS-produced segments have no external storage key.
                 writeSegmentMeta(dos, swr.segmentId, swr.segmentUuid, swr.estimatedSizeBytes,
                         swr.graphFilePath, swr.graphFileSize,
-                        swr.mapFilePath, swr.mapFileSize, newGeneration);
+                        swr.mapFilePath, swr.mapFileSize, newGeneration,
+                        /* externalStorageKey= */ null);
             }
 
             List<PendingDelete> snapshotPending = new ArrayList<>(pendingDeletes);
@@ -6376,7 +6418,7 @@ public class PersistentVectorStore extends AbstractVectorStore {
             int segmentId, String segmentUuid, long estimatedSizeBytes,
             String graphFilePath, long graphFileSize,
             String mapFilePath, long mapFileSize,
-            long generation) throws IOException {
+            long generation, String externalStorageKey) throws IOException {
         dos.writeInt(segmentId);
         dos.writeLong(estimatedSizeBytes);
         dos.writeUTF(graphFilePath);
@@ -6384,9 +6426,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
         dos.writeUTF(mapFilePath != null ? mapFilePath : "");
         dos.writeLong(mapFileSize);
         dos.writeLong(generation);
-        // v4 format always includes segmentUuid. Empty string represents "no UUID assigned"
+        // v4+ format always includes segmentUuid. Empty string represents "no UUID assigned"
         // (written for segments that predate the publisher attachment; read back as null).
         dos.writeUTF(segmentUuid != null ? segmentUuid : "");
+        // v5 adds externalStorageKey so that optimizer-adopted segments survive a restart.
+        // Empty string represents null (no external key — IS-produced segments).
+        dos.writeUTF(externalStorageKey != null ? externalStorageKey : "");
     }
 
     // -------------------------------------------------------------------------

@@ -956,6 +956,18 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                                                 herddb.indexing.segment.VersionedSegmentMetadata vsm) {
                                             segmentAssignmentMetrics.onSegmentAssigned(vsm);
                                             herddb.indexing.segment.SegmentMetadata m = vsm.metadata();
+                                            if (m.getMapFileSize() <= 0L) {
+                                                // Segment znode was written without mapFileSize
+                                                // (pre-issue-#484 format). Skip adoption — the
+                                                // segment cannot be read without a valid map size.
+                                                LOGGER.log(Level.WARNING,
+                                                        "Skipping adoption of segment "
+                                                                + m.getSegmentUuid()
+                                                                + " (mapFileSize="
+                                                                + m.getMapFileSize()
+                                                                + " <= 0): znode predates issue #484 fix");
+                                                return;
+                                            }
                                             try {
                                                 finalStore.adoptExternalSegment(
                                                         m.getSegmentUuid(),
@@ -977,6 +989,11 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                                         @Override
                                         public void onSegmentReleased(
                                                 herddb.indexing.segment.SegmentMetadata previous) {
+                                            if (previous == null) {
+                                                // Segment was deleted from ZK without deprecation;
+                                                // no UUID is available to target the drop.
+                                                return;
+                                            }
                                             finalStore.dropSegmentByUuid(previous.getSegmentUuid());
                                             segmentAssignmentMetrics.onSegmentReleased(previous);
                                         }
