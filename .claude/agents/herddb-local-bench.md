@@ -322,10 +322,14 @@ Phase: <phase>  rows=X/total (X%)  rate=X rows/s  commits=X (recovered=X)
 Processes: server pid=X RSS=X MB ; indexing-service pid=X RSS=X MB
 IS: vectors=X (X% of rows), mem=X GiB — <OK|WARN>
 ServerCkpt: last LSN=(<ledger>,<offset>) <N>m ago  [or: in progress]
-ISCkpt: <none active | back-pressure Xs, Phase B in progress | etc.>
+ISCkpt: <none active | back-pressure Xs, Phase B in progress>
 LogErrors: <none detected | verbatim error lines>
 Verdict: <healthy|warning|fatal>
 ```
+
+ISCkpt field rule: report only the active phase letter (A/B/C) and back-pressure duration — do
+NOT include apply queue size (e.g. `apply queue 1997/2000 (full)`). The apply queue runs
+intentionally full during bulk ingestion and is not a diagnostic signal.
 
 Verdicts:
 - `healthy` — continue to next tick
