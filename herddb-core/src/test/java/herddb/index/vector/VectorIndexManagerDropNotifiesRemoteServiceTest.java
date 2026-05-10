@@ -99,12 +99,14 @@ public class VectorIndexManagerDropNotifiesRemoteServiceTest {
         volatile String lastDropTablespace;
         volatile String lastDropTable;
         volatile String lastDropIndex;
+        volatile String lastDropUuid;
 
         @Override
-        public void dropIndex(String tablespace, String table, String indexName) {
+        public void dropIndex(String tablespace, String table, String indexName, String indexUuid) {
             this.lastDropTablespace = tablespace;
             this.lastDropTable = table;
             this.lastDropIndex = indexName;
+            this.lastDropUuid = indexUuid;
         }
 
         @Override
@@ -143,7 +145,7 @@ public class VectorIndexManagerDropNotifiesRemoteServiceTest {
         volatile boolean dropCalled = false;
 
         @Override
-        public void dropIndex(String tablespace, String table, String indexName) {
+        public void dropIndex(String tablespace, String table, String indexName, String indexUuid) {
             dropCalled = true;
             throw new RuntimeException("simulated IS failure (pod restart)");
         }
@@ -203,6 +205,9 @@ public class VectorIndexManagerDropNotifiesRemoteServiceTest {
         assertEquals("IS.dropIndex tablespace", TS_UUID, mockIs.lastDropTablespace);
         assertEquals("IS.dropIndex table", TABLE, mockIs.lastDropTable);
         assertEquals("IS.dropIndex indexName", INDEX_NAME, mockIs.lastDropIndex);
+        // The index UUID must be passed so the IS can gate the removal against
+        // concurrent DROP+CREATE cycles (issue #509 BLOCK fix).
+        assertEquals("IS.dropIndex indexUuid must equal ix.uuid", ix.uuid, mockIs.lastDropUuid);
     }
 
     /**

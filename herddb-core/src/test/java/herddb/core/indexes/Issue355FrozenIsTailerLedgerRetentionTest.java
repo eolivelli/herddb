@@ -151,7 +151,7 @@ public class Issue355FrozenIsTailerLedgerRetentionTest {
             }
 
             @Override
-            public void dropIndex(String tablespace, String table, String indexName) {
+            public void dropIndex(String tablespace, String table, String indexName, String indexUuid) {
                 // no-op in mock
             }
 

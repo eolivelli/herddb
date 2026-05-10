@@ -919,12 +919,14 @@ public class TableSpaceManager {
     private void disposeIndexManager(AbstractIndexManager indexManager) throws DataStorageManagerException {
         indexManager.dropIndexData();
         // Issue #509: eagerly notify any remote service (e.g. the IS) that this
-        // index has been permanently dropped.  Dispatched asynchronously so the
-        // DDL write lock is released before any gRPC round-trips take place.
+        // index has been permanently dropped.  Dispatched via callbacksExecutor
+        // (bounded, lifecycle-managed) so the DDL write lock is released before
+        // any gRPC round-trips take place and notifications are not starved by
+        // ForkJoinPool.commonPool() activity.
         // notifyIsOfDrop() is only called here — from actual SQL DROP paths —
         // never from follower-download or restore paths (which call
         // dropIndexData() directly and leave the IS state intact).
-        CompletableFuture.runAsync(indexManager::notifyIsOfDrop);
+        callbacksExecutor.execute(indexManager::notifyIsOfDrop);
         indexManager.close();
         indexes.remove(indexManager.getIndex().name);
         Map<String, AbstractIndexManager> indexesForTable =

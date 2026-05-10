@@ -637,11 +637,12 @@ public class IndexingServiceImpl extends IndexingServiceGrpc.IndexingServiceImpl
                           StreamObserver<DropIndexResponse> responseObserver) {
         String indexName = request.getIndex();
         String table = request.getTable();
+        String droppedUuid = request.getDroppedIndexUuid();
         LOGGER.log(Level.INFO,
-                "DropIndex RPC: index={0} table={1} tablespace={2} (issue #509)",
-                new Object[]{indexName, table, request.getTablespace()});
+                "DropIndex RPC: index={0} table={1} tablespace={2} uuid={3} (issue #509)",
+                new Object[]{indexName, table, request.getTablespace(), droppedUuid});
         try {
-            engine.dropIndexImmediate(table, indexName);
+            engine.dropIndexImmediate(table, indexName, droppedUuid);
             responseObserver.onNext(DropIndexResponse.getDefaultInstance());
             responseObserver.onCompleted();
         } catch (RuntimeException e) {

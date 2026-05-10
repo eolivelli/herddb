@@ -578,7 +578,7 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
      * are expected during rolling upgrades.
      */
     @Override
-    public void dropIndex(String tablespace, String table, String indexName) {
+    public void dropIndex(String tablespace, String table, String indexName, String indexUuid) {
         ServerSnapshot s = this.snapshot;
         if (s.channels.isEmpty()) {
             LOGGER.log(Level.WARNING,
@@ -587,11 +587,14 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                     new Object[]{tablespace, indexName});
             return;
         }
-        DropIndexRequest req = DropIndexRequest.newBuilder()
+        DropIndexRequest.Builder reqBuilder = DropIndexRequest.newBuilder()
                 .setTablespace(tablespace)
                 .setTable(table)
-                .setIndex(indexName)
-                .build();
+                .setIndex(indexName);
+        if (indexUuid != null && !indexUuid.isEmpty()) {
+            reqBuilder.setDroppedIndexUuid(indexUuid);
+        }
+        DropIndexRequest req = reqBuilder.build();
 
         // Dispatch all RPCs at once; total wall-time bounded by deadline below.
         long deadlineNanos = System.nanoTime()

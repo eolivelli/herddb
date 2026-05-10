@@ -1859,20 +1859,54 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * @param table     the table name as used in {@link #storeKey}
      * @param indexName the index name as used in {@link #storeKey}
      */
-    public void dropIndexImmediate(String table, String indexName) {
+    public void dropIndexImmediate(String table, String indexName, String requestedUuid) {
         String k = storeKey(table, indexName);
-        AbstractVectorStore removed = vectorStores.remove(k);
-        vectorStoreIndexUuids.remove(k);
-        if (removed != null) {
+        // Atomically inspect and, if appropriate, remove the store from
+        // vectorStores.  The UUID gate prevents data loss on DROP+CREATE cycles:
+        // if the IS tailer has already processed both the DROP_INDEX and a
+        // subsequent CREATE_INDEX for the same (table, indexName), the
+        // currently-tracked store has a different UUID and must not be removed.
+        //
+        // We do NOT remove from vectorStoreIndexUuids here: the tailer's own
+        // DROP_INDEX path will do that when it catches up, avoiding a secondary
+        // race where a concurrent CREATE_INDEX could put a new UUID in the map
+        // between our compute() and a separate vectorStoreIndexUuids.remove().
+        //
+        // An empty/null requestedUuid skips the UUID gate — safe fallback for
+        // IS clients built before this field was added (rolling upgrades).
+        AbstractVectorStore[] toDelete = {null};
+        vectorStores.compute(k, (key, currentStore) -> {
+            if (currentStore == null) {
+                // Already gone — tailer cleaned it up or it was never tracked.
+                return null;
+            }
+            if (requestedUuid != null && !requestedUuid.isEmpty()) {
+                String currentUuid = vectorStoreIndexUuids.get(key);
+                if (currentUuid != null && !currentUuid.equals(requestedUuid)) {
+                    // UUID mismatch: the IS has already processed both the DROP and
+                    // a subsequent CREATE_INDEX — the new store must not be removed.
+                    LOGGER.log(Level.INFO,
+                            "dropIndexImmediate: key {0} already replaced by uuid={1} "
+                                    + "(requested uuid={2}); no-op "
+                                    + "(DROP+CREATE race resolved correctly)",
+                            new Object[]{key, currentUuid, requestedUuid});
+                    return currentStore; // keep the new store
+                }
+            }
+            toDelete[0] = currentStore;
+            return null; // remove atomically
+        });
+
+        if (toDelete[0] != null) {
             LOGGER.log(Level.INFO,
                     "dropIndexImmediate: submitting eager deletion for store key {0} "
                             + "(triggered by HerdDB server DropIndex RPC, issue #509)",
                     k);
-            submitVectorStoreDeletion(k, removed);
+            submitVectorStoreDeletion(k, toDelete[0]);
         } else {
             LOGGER.log(Level.FINE,
-                    "dropIndexImmediate: store key {0} not tracked (already dropped or "
-                            + "never seen); no-op",
+                    "dropIndexImmediate: store key {0} not removed (already dropped, "
+                            + "never seen, or UUID mismatch — tailer will handle it); no-op",
                     k);
         }
     }

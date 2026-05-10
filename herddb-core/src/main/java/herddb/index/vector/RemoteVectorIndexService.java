@@ -82,7 +82,7 @@ public interface RemoteVectorIndexService extends AutoCloseable {
     /**
      * Issue #509: eagerly notifies every IS instance to begin background
      * cleanup of the ZK segment registry and file-server data for the named
-     * index. Called by {@link herddb.index.vector.VectorIndexManager#dropIndexData()}
+     * index. Called by {@link herddb.index.vector.VectorIndexManager#notifyIsOfDrop()}
      * immediately when the HerdDB server processes a DROP TABLE / DROP INDEX,
      * before the commit-log tailer has had a chance to reach the matching
      * {@code DROP_INDEX} log entry.
@@ -98,11 +98,19 @@ public interface RemoteVectorIndexService extends AutoCloseable {
      * background {@code checkpointExecutor} and returns as soon as the
      * in-memory store reference has been removed from its tracking map.
      *
+     * <p>The {@code indexUuid} parameter is a UUID gate: if the IS has already
+     * processed both the DROP and a subsequent CREATE_INDEX for the same
+     * (table, indexName), the currently-tracked store belongs to the new index.
+     * The IS uses the UUID to detect this case and skip the removal, preventing
+     * data loss on fast DROP+CREATE cycles. An empty or null UUID means "unknown"
+     * and the gate is skipped (safe fallback for rolling upgrades).
+     *
      * @param tablespace the HerdDB tablespace UUID
      * @param table      the table name
      * @param indexName  the index name
+     * @param indexUuid  the HerdDB catalog UUID of the specific index being dropped
      */
-    void dropIndex(String tablespace, String table, String indexName);
+    void dropIndex(String tablespace, String table, String indexName, String indexUuid);
 
     /**
      * Returns the minimum LSN across all known IndexingService instances for

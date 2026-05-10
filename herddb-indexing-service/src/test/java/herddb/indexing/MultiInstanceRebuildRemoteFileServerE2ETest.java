@@ -178,7 +178,7 @@ public class MultiInstanceRebuildRemoteFileServerE2ETest {
         }
 
         @Override
-        public void dropIndex(String tablespace, String table, String indexName) {
+        public void dropIndex(String tablespace, String table, String indexName, String indexUuid) {
             // no-op in stub — eager cleanup not exercised by this test
         }
 

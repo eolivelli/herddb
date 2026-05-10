@@ -327,6 +327,14 @@ message DropIndexRequest {
     string table = 2;
     // Index name.
     string index = 3;
+    // HerdDB catalog UUID of the specific index being dropped.  Used by the IS
+    // as a safety gate: if the in-memory store's UUID already differs from this
+    // value, the tailer has already processed both the DROP and a subsequent
+    // CREATE_INDEX for the same (table, index) name — the new store must not be
+    // removed.  Empty string means "unknown / pre-upgrade client" and the gate
+    // is skipped (idempotent fallback, safe because the IS-side UUID check only
+    // prevents false positives, never false negatives).
+    string dropped_index_uuid = 4;
 }
 
 // Intentionally empty: the IS begins cleanup asynchronously and returns as

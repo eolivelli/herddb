@@ -239,8 +239,9 @@ public class IndexingServiceEngineDropIndexImmediateTest {
                 spy = spies.get(0);
             }
 
-            // Eager drop via RPC path (table + indexName computed by the gRPC handler).
-            engine.dropIndexImmediate("t1", "vidx");
+            // Eager drop via RPC path — pass the index UUID so the IS can gate
+            // the removal against concurrent DROP+CREATE cycles (issue #509 BLOCK fix).
+            engine.dropIndexImmediate("t1", "vidx", ix.uuid);
             engine.awaitPendingDeletionsForTest();
 
             // Store must have been closed.
@@ -311,14 +312,14 @@ public class IndexingServiceEngineDropIndexImmediateTest {
             engine.awaitPendingWorkForTest();
 
             // First eager drop.
-            engine.dropIndexImmediate("t2", "vidx2");
+            engine.dropIndexImmediate("t2", "vidx2", ix.uuid);
             engine.awaitPendingDeletionsForTest();
             int afterFirst = dsm.dropIndexCount.get();
             assertEquals("first dropIndexImmediate must call dsm.dropIndex once",
                     1, afterFirst);
 
             // Second eager drop — store is already gone.
-            engine.dropIndexImmediate("t2", "vidx2");
+            engine.dropIndexImmediate("t2", "vidx2", ix.uuid);
             engine.awaitPendingDeletionsForTest();
             assertEquals("second dropIndexImmediate must be a no-op",
                     afterFirst, dsm.dropIndexCount.get());
@@ -382,8 +383,8 @@ public class IndexingServiceEngineDropIndexImmediateTest {
                     LogEntryFactory.createIndex(ix, null));
             engine.awaitPendingWorkForTest();
 
-            // Eager drop via the new RPC path.
-            engine.dropIndexImmediate("t3", "vidx3");
+            // Eager drop via the new RPC path — pass the UUID.
+            engine.dropIndexImmediate("t3", "vidx3", ix.uuid);
             engine.awaitPendingDeletionsForTest();
             int afterEager = dsm.dropIndexCount.get();
             assertEquals("eager drop must call dsm.dropIndex once", 1, afterEager);
@@ -434,11 +435,124 @@ public class IndexingServiceEngineDropIndexImmediateTest {
             engine.start();
 
             // Call for an index that was never registered — must not throw.
-            engine.dropIndexImmediate("nonexistent_table", "nonexistent_index");
+            engine.dropIndexImmediate("nonexistent_table", "nonexistent_index", "any-uuid");
             engine.awaitPendingDeletionsForTest();
 
             assertEquals("dropIndexImmediate for unknown key must not call dsm.dropIndex",
                     0, dsm.dropIndexCount.get());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * DROP+CREATE race regression test (issue #509 BLOCK fix).
+     *
+     * <p>Scenario: the IS tailer has already processed both the {@code DROP_INDEX}
+     * and a subsequent {@code CREATE_INDEX} for the same (table, indexName) — so
+     * the in-memory store now belongs to the new index (UUID_NEW ≠ UUID_OLD). A
+     * late-arriving {@code dropIndexImmediate} RPC carrying UUID_OLD must be a
+     * no-op: it must not remove or close the new store.
+     *
+     * <p>This test pins the correctness of the UUID gate in
+     * {@link IndexingServiceEngine#dropIndexImmediate}.
+     */
+    @Test
+    public void dropIndexImmediateDoesNotRemoveReplacedStoreOnDropCreateRace() throws Exception {
+        Path logDir = folder.newFolder("log").toPath();
+        Path dataDir = folder.newFolder("data").toPath();
+
+        MemoryDataStorageManager backing = new MemoryDataStorageManager();
+        CountingDsm dsm = new CountingDsm(backing);
+        MemoryManager mm = new MemoryManager(64 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+
+        List<CloseSpy> spies = new ArrayList<>();
+        IndexingServiceEngine engine = new IndexingServiceEngine(logDir, dataDir, configuration());
+        engine.setMetadataStorageManager(newMeta());
+        engine.setDataStorageManager(dsm);
+
+        engine.setVectorStoreFactory((indexName, tableName, vectorColumnName,
+                                       dataDirectory, indexProperties) -> {
+            CloseSpy spy = new CloseSpy(
+                    indexName, tableName, engine.getTableSpaceUUID(), vectorColumnName,
+                    dataDirectory, dsm, mm,
+                    16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                    Long.MAX_VALUE, VectorSimilarityFunction.EUCLIDEAN, Long.MAX_VALUE);
+            try {
+                spy.start();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            synchronized (spies) {
+                spies.add(spy);
+            }
+            return spy;
+        });
+
+        engine.setWatermarkStore(new WatermarkStore() {
+            @Override
+            public WatermarkSnapshot load() {
+                return WatermarkSnapshot.START_OF_TIME;
+            }
+
+            @Override
+            public void save(WatermarkSnapshot snapshot) throws IOException {
+            }
+        });
+
+        Table table = buildTable("t_race");
+        // Two indexes with the same (table, name) but different UUIDs —
+        // simulating DROP + CREATE of the same index name.
+        Index ix1 = buildVectorIndex("vidx_race", "t_race");
+        Index ix2 = buildVectorIndex("vidx_race", "t_race"); // different UUID
+
+        try {
+            engine.start();
+            engine.applyEntry(new LogSequenceNumber(1, 1),
+                    LogEntryFactory.createTable(table, null));
+
+            // Tailer processes CREATE_INDEX for ix1 (UUID_OLD).
+            engine.applyEntry(new LogSequenceNumber(1, 2),
+                    LogEntryFactory.createIndex(ix1, null));
+            engine.awaitPendingWorkForTest();
+
+            CloseSpy spyForIx1;
+            synchronized (spies) {
+                assertEquals("one store should have been created (ix1)", 1, spies.size());
+                spyForIx1 = spies.get(0);
+            }
+
+            // Tailer processes DROP_INDEX for ix1 — simulates the commit-log catching up.
+            engine.applyEntry(new LogSequenceNumber(1, 3),
+                    LogEntryFactory.dropIndex("vidx_race", null));
+            engine.awaitPendingWorkForTest();
+            engine.awaitPendingDeletionsForTest();
+
+            assertTrue("tailer DROP_INDEX must close spyForIx1", spyForIx1.wasClosed());
+
+            // Tailer processes CREATE_INDEX for ix2 (UUID_NEW — new index after recreate).
+            engine.applyEntry(new LogSequenceNumber(1, 4),
+                    LogEntryFactory.createIndex(ix2, null));
+            engine.awaitPendingWorkForTest();
+
+            CloseSpy spyForIx2;
+            synchronized (spies) {
+                assertEquals("second store should have been created (ix2)", 2, spies.size());
+                spyForIx2 = spies.get(1);
+            }
+
+            int dsmDropBeforeRpc = dsm.dropIndexCount.get();
+
+            // Late-arriving eager RPC for ix1 (UUID_OLD). The IS has already
+            // replaced the store with ix2 — this must be a UUID-gated no-op.
+            engine.dropIndexImmediate("t_race", "vidx_race", ix1.uuid);
+            engine.awaitPendingDeletionsForTest();
+
+            // The new store (ix2) must NOT have been closed or deleted.
+            assertTrue("late eager RPC with old UUID must NOT close the new store (ix2)",
+                    !spyForIx2.wasClosed());
+            assertEquals("late eager RPC with old UUID must NOT call dsm.dropIndex again",
+                    dsmDropBeforeRpc, dsm.dropIndexCount.get());
         } finally {
             engine.close();
         }

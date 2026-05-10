@@ -664,7 +664,12 @@ public class VectorIndexManager extends AbstractIndexManager {
         try {
             RemoteVectorIndexService svc = remoteServiceSupplier.get();
             if (svc != null) {
-                svc.dropIndex(tableSpaceUUID, index.table, index.name);
+                // Pass index.uuid so the IS can gate the removal: if the IS
+                // has already processed both the DROP and a subsequent
+                // CREATE_INDEX for the same (table, name), the UUID of the
+                // currently-tracked store will differ and the IS will skip
+                // the removal, preventing data loss on fast DROP+CREATE cycles.
+                svc.dropIndex(tableSpaceUUID, index.table, index.name, index.uuid);
             }
         } catch (RuntimeException e) {
             // Plugin boundary: IS may be transiently down (pod restart, GC
