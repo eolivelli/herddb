@@ -454,10 +454,6 @@ indexOptimizer:
     limits:
       memory: "28Gi"
       cpu: "2"
-  # Workaround for issue #498: ZK file server discovery broken after #491 fix.
-  # Provide the file server address directly so the optimizer resolves RemoteSegmentMerger.
-  extraConfig:
-    indexoptimizer.fileserver.address: "herddb-file-server-0.herddb-file-server.default.svc.cluster.local:9846"
 
 tools:
   enabled: true
