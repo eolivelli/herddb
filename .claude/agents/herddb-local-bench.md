@@ -247,7 +247,7 @@ Rules that apply to every workload, including user-specified ones:
    the user has pointed `--zip` at an existing file. If any check fails,
    stop and tell the user exactly which prerequisite is missing and how
    to fix it (typically: run `mvn -pl herddb-services install
-   -DskipTests -Dmaven.repo.local=~/dev/repo2`).
+   -DskipTests`).
 
 2. **Install.** Run `./install.sh` (with whatever heap overrides the user
    explicitly asked for). Stream output to the user. On non-zero exit go

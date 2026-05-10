@@ -200,8 +200,7 @@ Rules that apply to every workload, including user-specified ones:
    that the user has pointed `--zip` at an existing file. If any check
    fails, stop and tell the user exactly which prerequisite is missing
    and how to fix it (typically: run `mvn -pl herddb-services install
-   -DskipTests -Dmaven.repo.local=~/dev/repo2`, or set `YCSB_HOME` to
-   the YCSB binary distribution).
+   -DskipTests`, or set `YCSB_HOME` to the YCSB binary distribution).
 
 2. **Install.** Run `./install.sh` (with whatever heap override the
    user explicitly asked for). Stream output to the user. On non-zero

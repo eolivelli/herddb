@@ -363,6 +363,15 @@ indexingService:
     # on readEntries). Code-level default since issue #392; kept here explicitly
     # for parity with the GKE example. Set to "false" to fall back to V3.
     bookkeeper.useV2WireProtocol: "true"
+    # Raise the live-graph (in-memory HNSW shard) size from the built-in default
+    # of 50000 to 200000 vectors per shard. Larger shards reduce the total number
+    # of segments created during ingest (fewer, bigger segments), which benefits
+    # both checkpoint Phase B merge time and ANN recall accuracy because a single
+    # HNSW graph is searched without cross-segment merging overhead.
+    # Memory impact: gist1m 960-dim, M=16 → ~200k × (16×2×4 B edges + 960×4 B
+    # vector) = ~900 MB heap per live shard. One shard per IS replica fits within
+    # the 7g heap budget; raise heap if using more concurrent shards or larger dims.
+    indexing.vector.maxLiveGraphSize: "200000"
   resources:
     requests:
       memory: "20Gi"
@@ -394,24 +403,61 @@ indexOptimizer:
   # Memory budget for gist1m M=16 merges (issue #499 Bug 1).
   #
   # For a full 8-segment gist1m merge (8 × ~125k vectors, 960-dim):
-  #   PQ codebook retraining reservoir: 96k samples × 960 × 4 B = 353 MB
-  #   jvector OnDiskGraphIndexCompactor working set: ~2–4 GiB
-  #   JVM overhead (code cache, metaspace, thread stacks): ~1 GiB
-  # Total peak: ≈ 6 GiB heap + 1 GiB direct → 8 GiB container.
-  # The previous 4 GiB container caused OOMKill at PQ training time.
+  #   PQ codebook retraining reservoir: 128k samples × 960 × 4 B = ~470 MB
+  #   jvector OnDiskGraphIndexCompactor: streaming batch compaction (~128 nodes/batch)
+  #   JVM overhead (code cache, metaspace, thread stacks): ~500 MB
+  # Observed peak with -Xmx6g: JVM RSS reached 5–7 GiB → kernel OOMKill (exit 137)
+  # during large compaction (2720/2735 batches) or upload phase.
   #
-  #   -Xms6g -Xmx6g: heap fixed at 6 g to avoid GC pauses during long merges
+  # Reducing to -Xmx2g forces the JVM to throw OutOfMemoryError (catchable)
+  # rather than being killed by the kernel. If the compaction algorithm is
+  # streaming, 2 GiB may be sufficient; we investigate to find the floor.
+  #
+  #   -Xms512m (lazy init): heap grows on demand during PQ retraining
+  #   -Xmx2g: heap ceiling — JVM OOM preferred over kernel OOMKill
   #   --add-modules jdk.incubator.vector: Panama Vector API for SIMD kernels
   #   -XX:MaxDirectMemorySize=1g: cap for non-Netty JVM direct buffers
   #   -Djava.net.preferIPv4Stack=true: avoids IPv6 resolution in k3s-local
-  javaOpts: "-Xms6g -Xmx6g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -XX:MaxDirectMemorySize=1g"
+  # k3s-local memory budget: node allocatable ≈ 61.57 GiB; other pods consume
+  # ~59.25 GiB in requests, leaving only ~2.3 GiB for the optimizer request.
+  # Set request=2Gi (scheduling) / limit=12Gi (container ceiling).
+  #
+  # Why limit=12Gi with -Xmx2g:
+  #   JVM heap (max 2g) + direct (1g) + JVM overhead (~0.5g) = 3.5 GiB JVM RSS
+  #   /tmp compacted graph file: up to 3.1 GiB (tmpfs, counted by cgroup)
+  #   /tmp compacted map file:   up to 1.6 GiB (tmpfs, counted by cgroup)
+  #   Input segment page-cache: up to 4–5 GiB during streaming compaction
+  #   Peak without limit headroom → kernel OOMKill at 8 GiB ceiling.
+  #   12 GiB gives ~4 GiB slack for page-cache eviction to run before kill.
+  #
+  # Observed OOMKill sequence (gist1m M=16, 1M × 960-dim):
+  #   limit=8Gi:  400k-vector merge OOMKilled 1s after map upload
+  #               (RSS ~1 GiB + /tmp 4.6 GiB cgroup-counted → over limit)
+  #   limit=12Gi: 400k-vector merge SUCCEEDED (RSS peak ~5.8 GiB during compaction)
+  #   limit=12Gi: 600k-vector merge OOMKilled during compaction
+  #               (RSS ~5.8 GiB at 49% batches + /tmp growing + page cache → over limit)
+  # Pattern: each successive merge is larger (2 merged segments = 2× the vectors).
+  # The full 1M-vector final merge (3 input segments merged at once) requires
+  # > 20 GiB (cgroup-counted):
+  #   JVM RSS: ~4.6 GiB (anonymous, cannot be evicted)
+  #   /tmp output graph: ~7.8 GiB (file cache, evicted only after upload)
+  #   /tmp output map: ~3.9 GiB (sequential with graph, after upload)
+  #   Input page cache: ~6.5 GiB (for 600k-vector segment being read)
+  #   Overlap at 94% batches: JVM + /tmp_graph + residual_page_cache > 20 GiB
+  # Set limit=28Gi to accommodate the full 1M convergence merge.
+  # Kernel reclaims file-backed pages aggressively, so host RAM is not exhausted.
+  javaOpts: "-Xms512m -Xmx2g -Djava.net.preferIPv4Stack=true --add-modules jdk.incubator.vector -XX:MaxDirectMemorySize=1g"
   resources:
     requests:
-      memory: "8Gi"
+      memory: "2Gi"
       cpu: "2"
     limits:
-      memory: "8Gi"
+      memory: "28Gi"
       cpu: "2"
+  # Workaround for issue #498: ZK file server discovery broken after #491 fix.
+  # Provide the file server address directly so the optimizer resolves RemoteSegmentMerger.
+  extraConfig:
+    indexoptimizer.fileserver.address: "herddb-file-server-0.herddb-file-server.default.svc.cluster.local:9846"
 
 tools:
   enabled: true
