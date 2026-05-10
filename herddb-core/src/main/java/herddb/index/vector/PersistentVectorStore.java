@@ -401,8 +401,22 @@ public class PersistentVectorStore extends AbstractVectorStore {
      */
     private final AtomicLong onDiskSegmentsEstimatedMemoryBytes = new AtomicLong(0);
 
-    /** Counter for assigning unique segment IDs. */
+    /** Counter for assigning unique segment IDs to IS-locally-produced segments. Counts up from 0. */
     private final AtomicInteger nextSegmentId = new AtomicInteger(0);
+
+    /**
+     * Counter for assigning unique local storage IDs to adopted (optimizer-produced) segments.
+     * Counts DOWN from {@link Integer#MAX_VALUE} so that adopted segment IDs occupy the
+     * [Integer.MAX_VALUE, ...] space and IS-local segment IDs occupy the [0, ...] space,
+     * making BLink storage key collisions impossible even if the checkpoint wipe path resets
+     * {@link #nextSegmentId} to 0 while an adoption is in flight.
+     *
+     * <p>The counter is NOT reset by the "all-vectors-deleted" wipe path (unlike
+     * {@code nextSegmentId}), because adopted segments live in a disjoint ID space.
+     * On restart, it is re-initialised to {@code minAdoptedSegId - 1} so subsequent
+     * adoptions continue below the lowest previously-used adopted ID.
+     */
+    private final AtomicInteger nextAdoptedSegmentLocalId = new AtomicInteger(Integer.MAX_VALUE);
 
     /**
      * Optional pluggable publisher invoked after each successful checkpoint to
@@ -3109,20 +3123,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
             }
         }
 
-        // Allocate the local segment ID under the write lock so the allocation
-        // is serialised against the checkpoint's "wipe-all + nextSegmentId.set(0)"
-        // path (which also holds stateLock.writeLock()). Without this guard, a
-        // concurrent wipe cycle could reset the counter between the allocation
-        // and publication steps, allowing a future IS-local segment to reuse the
-        // same localSegId and thereby collide on the BLink storage key
-        // (indexUUID + "_seg" + localSegId + "_pktonode").
-        int localSegId;
-        stateLock.writeLock().lock();
-        try {
-            localSegId = nextSegmentId.getAndIncrement();
-        } finally {
-            stateLock.writeLock().unlock();
-        }
+        // Use the adopted-segment ID counter that counts DOWN from Integer.MAX_VALUE.
+        // This keeps adopted-segment BLink storage keys
+        // (indexUUID + "_seg" + localSegId + "_pktonode") in the [MAX_INT, ...] space,
+        // completely disjoint from IS-locally-produced segment keys in the [0, ...] space.
+        // No lock is needed here: the two counters never share range, so even a concurrent
+        // checkpoint wipe that resets nextSegmentId to 0 cannot cause a collision with
+        // this adoption's localSegId.
+        int localSegId = nextAdoptedSegmentLocalId.getAndDecrement();
         VectorSegment tentative = new VectorSegment(localSegId);
         tentative.segmentUuid = segmentUuid;
         tentative.externalStorageKey = indexUUID + "_seg" + externalSegmentId;
@@ -3183,14 +3191,6 @@ public class PersistentVectorStore extends AbstractVectorStore {
             newList.add(tentative);
             segments = newList;
             registerSegmentMemoryEstimate(tentative);
-            // Ensure nextSegmentId stays above localSegId even if a concurrent
-            // checkpoint wipe-path (nextSegmentId.set(0)) ran between the
-            // localSegId allocation (under writeLock above) and this publication.
-            // Without this bump, IS-local segments created after the wipe could
-            // eventually reach localSegId and collide on the BLink storage key.
-            if (nextSegmentId.get() <= localSegId) {
-                nextSegmentId.set(localSegId + 1);
-            }
             // Mark the store dirty so the next checkpoint() call serialises the new
             // segment list (including the adopted segment's externalStorageKey) to the
             // IndexStatus. Without this, the checkpoint gate treats adoption as a
@@ -6027,21 +6027,39 @@ public class PersistentVectorStore extends AbstractVectorStore {
         // ----------------------------------------------------------------
         // Phase 3 (serial): register segments and update counters.
         // ----------------------------------------------------------------
-        int maxSegId = -1;
+        int maxIsLocalSegId = -1;
+        // nextAdoptedSegmentLocalId counts DOWN from Integer.MAX_VALUE; on restart
+        // we initialise it to one below the smallest adopted ID seen in this store.
+        int minAdoptedSegId = Integer.MAX_VALUE;
+        boolean hasAdoptedSegments = false;
         long maxGeneration = loadedGeneration;
         for (VectorSegment seg : segList) {
             segments.add(seg);
             // Issue #455: snapshot the segment's in-memory footprint into the
             // on-disk counter so estimatedMemoryUsageBytes() is O(1).
             registerSegmentMemoryEstimate(seg);
-            if (seg.segmentId > maxSegId) {
-                maxSegId = seg.segmentId;
+            if (seg.externalStorageKey == null) {
+                // IS-locally-produced segment: contributes to nextSegmentId counter.
+                if (seg.segmentId > maxIsLocalSegId) {
+                    maxIsLocalSegId = seg.segmentId;
+                }
+            } else {
+                // Adopted (optimizer-produced) segment: contributes to the DOWN counter.
+                hasAdoptedSegments = true;
+                if (seg.segmentId < minAdoptedSegId) {
+                    minAdoptedSegId = seg.segmentId;
+                }
             }
             if (seg.generation > maxGeneration) {
                 maxGeneration = seg.generation;
             }
         }
-        nextSegmentId.set(maxSegId + 1);
+        nextSegmentId.set(maxIsLocalSegId + 1);
+        if (hasAdoptedSegments) {
+            // Resume the adopted-segment counter one below the lowest previously-used
+            // adopted ID so subsequent adoptions stay below all existing adopted IDs.
+            nextAdoptedSegmentLocalId.set(minAdoptedSegId - 1);
+        }
         currentIndexStatusGeneration.set(Math.max(currentIndexStatusGeneration.get(), maxGeneration));
 
         loadPendingDeletes(dis);
