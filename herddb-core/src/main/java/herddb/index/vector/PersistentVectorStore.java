@@ -279,6 +279,12 @@ public class PersistentVectorStore extends AbstractVectorStore {
      * supported for reading or writing. Any attempt to load a v3 index will
      * result in a clear boot failure with instructions to delete and re-create
      * the index.
+     *
+     * <p>V4 is now read-only-legacy: the writer always emits V5
+     * ({@link #METADATA_VERSION_MULTI_SEGMENT_V5}). Existing V4 payloads are
+     * still accepted on read; they receive {@code externalStorageKey = null}
+     * per segment, which is correct since V4 was written before the adoption
+     * feature existed.
      */
     private static final int METADATA_VERSION_MULTI_SEGMENT_V4 = 4;
     /**

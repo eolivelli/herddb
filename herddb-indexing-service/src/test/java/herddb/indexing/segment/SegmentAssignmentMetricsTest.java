@@ -91,10 +91,11 @@ public class SegmentAssignmentMetricsTest {
 
     @Test
     public void releasedWithNullPreviousStillBumpsReleasesCounter() {
-        // RELEASED(null) means "segment deleted outright" (znode disappeared).
-        // The observer can't remove from the owned set (no UUID), so it just
-        // bumps the releases counter. This is the canonical signal for "a
-        // segment we used to own was reaped" — distinct from a transfer-away.
+        // Defence-in-depth: the watcher contract (since issue #514) no longer
+        // delivers null on deletion — the cached metadata is always passed so
+        // listeners can identify the segment by UUID (see SegmentAssignmentListener
+        // javadoc). The metrics observer must remain defensive against a
+        // hypothetical future violation of that contract (e.g. a direct call).
         SegmentAssignmentMetrics m = new SegmentAssignmentMetrics();
         m.onSegmentReleased(null);
         assertEquals(0L, m.getOwnedSegmentsCount());

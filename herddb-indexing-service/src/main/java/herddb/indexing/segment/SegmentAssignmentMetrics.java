@@ -82,11 +82,11 @@ public final class SegmentAssignmentMetrics implements SegmentAssignmentListener
 
     @Override
     public void onSegmentReleased(SegmentMetadata previous) {
-        // RELEASED with previous == null means "segment deleted outright"
-        // (not transferred away). We have no UUID to remove from our set
-        // in that branch, so just bump the counter — the Set state stays
-        // self-consistent because the watcher will not have called
-        // ASSIGNED for it post-deletion.
+        // Defence-in-depth: the watcher contract (since issue #514) guarantees
+        // `previous` is non-null even on znode-gone events; this branch is
+        // unreachable in production. We keep it so the metrics observer never
+        // NPEs if a future code path violates the contract — just bump the
+        // counter and leave the owned-set self-consistent.
         if (previous == null) {
             segmentReleasesTotal.incrementAndGet();
             return;

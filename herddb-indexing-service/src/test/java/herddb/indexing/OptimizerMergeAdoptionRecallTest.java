@@ -434,9 +434,8 @@ public class OptimizerMergeAdoptionRecallTest {
 
                         @Override
                         public void onSegmentReleased(SegmentMetadata previous) {
-                            if (previous != null) {
-                                store.dropSegmentByUuid(previous.getSegmentUuid());
-                            }
+                            // watcher contract guarantees non-null previous (issue #514)
+                            store.dropSegmentByUuid(previous.getSegmentUuid());
                         }
                     });
             try {
@@ -594,9 +593,8 @@ public class OptimizerMergeAdoptionRecallTest {
 
                         @Override
                         public void onSegmentReleased(SegmentMetadata previous) {
-                            if (previous != null) {
-                                store.dropSegmentByUuid(previous.getSegmentUuid());
-                            }
+                            // watcher contract guarantees non-null previous (issue #514)
+                            store.dropSegmentByUuid(previous.getSegmentUuid());
                         }
                     });
             try {
