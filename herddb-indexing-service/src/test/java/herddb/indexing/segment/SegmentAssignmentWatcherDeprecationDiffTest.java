@@ -297,6 +297,56 @@ public class SegmentAssignmentWatcherDeprecationDiffTest {
     }
 
     /**
+     * When the optimizer (or ZK reaper) deletes a segment znode outright while
+     * the IS is running, the watcher's znode-gone path must fire
+     * {@code onSegmentReleased} with the non-null cached metadata so the
+     * listener can drop the segment by UUID.
+     *
+     * <p>This test validates the fix in {@code scanIndex} that changed
+     * {@code toRelease.add(null)} to {@code toRelease.add(entry.getValue())}.
+     */
+    @Test
+    public void znodeRemovedAfterOwnedTransitionFiresReleaseWithMetadata() throws Exception {
+        SegmentMetadata seg = activeSegment("seg-gone", 401L);
+        registry.createSegment(seg);
+
+        List<SegmentMetadata> released = new ArrayList<>();
+
+        SegmentAssignmentWatcher watcher = new SegmentAssignmentWatcher(
+                registry, OWNER,
+                new SegmentAssignmentListener() {
+                    @Override
+                    public void onSegmentAssigned(VersionedSegmentMetadata vsm) {
+                        // not under test
+                    }
+                    @Override
+                    public void onSegmentReleased(SegmentMetadata previous) {
+                        released.add(previous);
+                    }
+                });
+        try {
+            // Initial scan: 1 ACTIVE, owned → 1 assignment; known now contains seg.
+            watcher.watchIndex(TS_UUID, IDX_UUID);
+
+            // Hard-delete the znode (simulates optimizer reaper removing it).
+            VersionedSegmentMetadata v = getVersioned("seg-gone");
+            registry.casDeleteSegment(v);
+
+            // Re-scan: the segment is gone from ZK, known had us as owner →
+            // onSegmentReleased must fire with the cached metadata.
+            watcher.scanIndex(new SegmentAssignmentWatcher.IndexKey(TS_UUID, IDX_UUID));
+
+            assertEquals("znode-gone event must fire exactly 1 onSegmentReleased", 1, released.size());
+            SegmentMetadata rel = released.get(0);
+            assertTrue("onSegmentReleased must receive non-null metadata (not null)", rel != null);
+            assertEquals("released metadata must carry the correct UUID",
+                    "seg-gone", rel.getSegmentUuid());
+        } finally {
+            watcher.close();
+        }
+    }
+
+    /**
      * Corner case: a segment that is NOT owned by this instance transitioning
      * to DEPRECATED must NOT fire onSegmentReleased.
      */

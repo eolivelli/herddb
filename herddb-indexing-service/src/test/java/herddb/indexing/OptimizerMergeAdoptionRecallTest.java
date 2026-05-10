@@ -503,6 +503,123 @@ public class OptimizerMergeAdoptionRecallTest {
         }
     }
 
+    /**
+     * Verifies {@link PersistentVectorStore#reconcileAdoptedSegments}: after
+     * the optimizer merge produces 1 adopted segment and the IS drops the 3
+     * deprecated inputs, calling {@code reconcileAdoptedSegments} with an
+     * empty set (simulating "ZK deleted the segment while IS was down") drops
+     * the adopted segment and leaves the store with 0 on-disk segments.
+     *
+     * <p>This test exercises the startup-reconcile path added to prevent
+     * stale adopted segments from surfacing IO errors when the optimizer has
+     * already deleted the underlying multipart files.
+     */
+    @Test
+    public void reconcileAdoptedSegmentsDropsOrphanedSegment() throws Exception {
+        loadDataset();
+
+        Path dataDir = tmpFolder.newFolder("data-reconcile").toPath();
+        Path storeTmpDir = tmpFolder.newFolder("store-tmp-reconcile").toPath();
+        Path optimizerTmpDir = tmpFolder.newFolder("opt-tmp-reconcile").toPath();
+
+        FileDataStorageManager dsm = new FileDataStorageManager(dataDir);
+        MemoryManager mm = new MemoryManager(512 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+
+        PersistentVectorStore store = new PersistentVectorStore(
+                INDEX_NAME, TABLE_NAME, TABLESPACE_UUID,
+                VECTOR_COL, storeTmpDir, dsm, mm,
+                16, 100, 1.2f, 1.4f, true, 2_000_000_000L, 0,
+                Long.MAX_VALUE,
+                VectorSimilarityFunction.EUCLIDEAN);
+
+        String indexUUID = store.getIndexUuid();
+        SegmentRegistryPublisher publisher = new SegmentRegistryPublisher(
+                registry, TABLESPACE_UUID, TABLE_NAME, indexUUID, INDEX_NAME, INSTANCE_ID);
+        store.setSegmentPublisher(publisher);
+        store.setExternalCompactionEnabled(true);
+
+        try {
+            store.start();
+
+            // Ingest 3 batches, checkpoint each.
+            int batchSize = baseVectors.size() / 3;
+            for (int batch = 0; batch < 3; batch++) {
+                int start = batch * batchSize;
+                int end = (batch == 2) ? baseVectors.size() : start + batchSize;
+                for (int i = start; i < end; i++) {
+                    store.addVector(Bytes.from_int(i), baseVectors.get(i));
+                }
+                store.checkpoint();
+            }
+            assertEquals("pre-merge: 3 on-disk segments", 3, store.getOnDiskSegmentCount());
+
+            AtomicLong adoptions = new AtomicLong();
+
+            SegmentAssignmentWatcher watcher = new SegmentAssignmentWatcher(
+                    registry, INSTANCE_ID,
+                    new SegmentAssignmentListener() {
+                        @Override
+                        public void onSegmentAssigned(VersionedSegmentMetadata vsm) {
+                            SegmentMetadata m = vsm.metadata();
+                            try {
+                                boolean added = store.adoptExternalSegment(
+                                        m.getSegmentUuid(), m.getSegmentId(),
+                                        m.getGraphPath(), m.getSizeBytes() - m.getMapFileSize(),
+                                        m.getMapPath(), m.getMapFileSize(), m.getGeneration());
+                                if (added) {
+                                    adoptions.incrementAndGet();
+                                }
+                            } catch (IOException | DataStorageManagerException e) {
+                                throw new RuntimeException("adoptExternalSegment failed", e);
+                            }
+                        }
+
+                        @Override
+                        public void onSegmentReleased(SegmentMetadata previous) {
+                            if (previous != null) {
+                                store.dropSegmentByUuid(previous.getSegmentUuid());
+                            }
+                        }
+                    });
+            try {
+                watcher.watchIndex(TABLESPACE_UUID, indexUUID);
+
+                RemoteSegmentMerger merger = new RemoteSegmentMerger(
+                        dsm, optimizerTmpDir,
+                        128, 16, 100, 1.2f, 1.4f,
+                        VectorSimilarityFunction.EUCLIDEAN);
+                IndexOptimizerEngine engine = new IndexOptimizerEngine(
+                        registry, merger, TABLESPACE_UUID,
+                        new MergePolicy.SmallestFirstPolicy(2, 2, 1L, Long.MAX_VALUE),
+                        60_000L,
+                        () -> INSTANCE_ID);
+                engine.runOnce();
+
+                long deadline = System.currentTimeMillis() + 30_000L;
+                while (System.currentTimeMillis() < deadline
+                        && (store.getOnDiskSegmentCount() != 1 || adoptions.get() < 1)) {
+                    Thread.sleep(20);
+                }
+                assertEquals("post-merge: 1 adopted segment", 1, store.getOnDiskSegmentCount());
+                assertTrue("at least 1 adoption", adoptions.get() >= 1);
+
+                // ---------------------------------------------------------------
+                // Simulate: optimizer reaper deleted the adopted segment from ZK
+                // while the IS was busy. The reconcile pass with an empty known-set
+                // must drop the orphaned adopted segment.
+                // ---------------------------------------------------------------
+                store.reconcileAdoptedSegments(java.util.Collections.emptySet());
+
+                assertEquals("reconcile with empty known-set must drop the orphaned adopted segment",
+                        0, store.getOnDiskSegmentCount());
+            } finally {
+                watcher.close();
+            }
+        } finally {
+            store.close();
+        }
+    }
+
     /** Helper overload using an arbitrary store instance (not the field {@code store}). */
     private double measureRecallOn(PersistentVectorStore s, int topK) {
         double total = 0;

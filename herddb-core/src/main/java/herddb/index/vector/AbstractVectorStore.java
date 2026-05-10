@@ -177,6 +177,23 @@ public abstract class AbstractVectorStore implements AutoCloseable {
         // No-op for non-persistent stores.
     }
 
+    /**
+     * Reconciles adopted (externally-produced) segments against the ZK-reported
+     * snapshot. Any segment with a non-null external storage key whose UUID is
+     * absent from {@code knownUuids} is dropped via {@link #dropSegmentByUuid}.
+     *
+     * <p>Called at IS startup, after the initial {@code watchIndex} scan, to
+     * handle IS-was-down-while-optimizer-deleted scenarios.
+     *
+     * <p>The default implementation is a no-op (non-persistent stores have no
+     * adopted segments). {@link herddb.index.vector.PersistentVectorStore} overrides.
+     *
+     * @param knownUuids segment UUIDs currently visible in the ZK registry
+     */
+    public void reconcileAdoptedSegments(java.util.Set<String> knownUuids) {
+        // No-op for non-persistent stores.
+    }
+
     @Override
     public void close() throws Exception {
     }

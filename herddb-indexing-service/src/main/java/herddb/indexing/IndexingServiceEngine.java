@@ -968,6 +968,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                                                                 + " <= 0): znode predates issue #484 fix");
                                                 return;
                                             }
+                                            if (m.getSizeBytes() <= m.getMapFileSize()) {
+                                                // Corrupted or legacy znode: sizeBytes must be
+                                                // strictly larger than mapFileSize because
+                                                // sizeBytes = graphFileSize + mapFileSize and
+                                                // graphFileSize must be > 0. A zero or negative
+                                                // graphFileSize would corrupt the multipart read.
+                                                LOGGER.log(Level.WARNING,
+                                                        "Skipping adoption of segment "
+                                                                + m.getSegmentUuid()
+                                                                + " (sizeBytes=" + m.getSizeBytes()
+                                                                + " <= mapFileSize=" + m.getMapFileSize()
+                                                                + "): znode has invalid or zero graphFileSize");
+                                                return;
+                                            }
                                             try {
                                                 finalStore.adoptExternalSegment(
                                                         m.getSegmentUuid(),
@@ -990,8 +1004,13 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                                         public void onSegmentReleased(
                                                 herddb.indexing.segment.SegmentMetadata previous) {
                                             if (previous == null) {
-                                                // Segment was deleted from ZK without deprecation;
-                                                // no UUID is available to target the drop.
+                                                // Defence-in-depth: scanIndex now always passes
+                                                // the cached metadata for znode-gone events, but
+                                                // guard here in case a future code path differs.
+                                                LOGGER.log(Level.WARNING,
+                                                        "onSegmentReleased called with null metadata"
+                                                                + " for store " + finalIndexUUID
+                                                                + "; cannot drop by UUID");
                                                 return;
                                             }
                                             finalStore.dropSegmentByUuid(previous.getSegmentUuid());
@@ -1007,6 +1026,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     String watcherKey = storeKey(tableName, indexName);
                     try {
                         watcher.watchIndex(tableSpaceUUID, autoIndexUUID);
+                        // Startup reconcile: drop any adopted (external-storage-key)
+                        // segments that are not present in ZK. This handles the case
+                        // where the IS was down while the optimizer expired and deleted
+                        // a segment whose UUID is no longer in the registry. Without
+                        // the reconcile, the orphaned segment stays in the store
+                        // indefinitely and will fail at search time if the optimizer
+                        // has also deleted its multipart files.
+                        finalStore.reconcileAdoptedSegments(
+                                watcher.snapshotKnownSegments().keySet());
                         segmentWatchers.put(watcherKey, watcher);
                         LOGGER.log(Level.INFO,
                                 "SegmentAssignmentWatcher armed for store {0} (indexUuid={1})",

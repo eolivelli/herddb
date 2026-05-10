@@ -3134,12 +3134,14 @@ public class PersistentVectorStore extends AbstractVectorStore {
         }
 
         // Under write lock: re-check idempotency, then publish.
+        boolean alreadyAdopted = false;
         stateLock.writeLock().lock();
         try {
             for (VectorSegment existing : segments) {
                 if (segmentUuid.equals(existing.segmentUuid)) {
-                    // Adopted by a concurrent adoption or watcher re-fire; discard.
-                    tentative.close();
+                    // Adopted by a concurrent adoption or watcher re-fire; discard
+                    // tentative AFTER releasing the lock to avoid IO under writeLock.
+                    alreadyAdopted = true;
                     return false;
                 }
             }
@@ -3159,6 +3161,11 @@ public class PersistentVectorStore extends AbstractVectorStore {
                             generation, indexName, segments.size()});
         } finally {
             stateLock.writeLock().unlock();
+            if (alreadyAdopted) {
+                // Close the tentative segment outside the writeLock to avoid holding
+                // the lock during potential IO (BLink close, temp-file delete).
+                tentative.close();
+            }
         }
         return true;
     }
@@ -3198,18 +3205,66 @@ public class PersistentVectorStore extends AbstractVectorStore {
                     "dropSegmentByUuid: removed segment {0} from store {1};"
                             + " total on-disk segments now {2}",
                     new Object[]{segmentUuid, indexName, segments.size()});
+            // Close the segment while holding the write lock. searchInternal snapshots
+            // this.segments and executes seg.search() under stateLock.readLock(). By
+            // closing here (under writeLock) we guarantee that no concurrent search can
+            // be using this segment when close() runs: the writeLock cannot be acquired
+            // until all in-flight readLock holders have released (and thus completed
+            // their seg.search() call). Without this, a search that snapshots the
+            // segment reference before the writeLock is acquired could use a closed
+            // segment, causing ReaderSupplier / OnDiskGraphIndex use-after-close errors.
+            try {
+                found.close();
+            } catch (RuntimeException closeEx) {
+                // Narrow catch: VectorSegment.close() throws only RuntimeException
+                // (BLink cleanup). We must not let a stale-handle error mask the
+                // segment removal or propagate past the writeLock.
+                LOGGER.log(Level.WARNING,
+                        "dropSegmentByUuid: error closing segment " + segmentUuid
+                                + " in store " + indexName, closeEx);
+            }
         } finally {
             stateLock.writeLock().unlock();
         }
-        // Reaching here means found != null (the early return above would have fired otherwise).
-        try {
-            found.close();
-        } catch (RuntimeException e) {
-            // Narrow catch: close() only throws RuntimeException from BLink cleanup.
-            // We must not let a stale-handle error mask the segment removal.
+    }
+
+    /**
+     * Reconciles the store's adopted (externally-produced) segment set against
+     * the ZK-reported ownership snapshot. Any segment that was adopted (i.e.
+     * {@code seg.externalStorageKey != null}) but whose UUID is absent from
+     * {@code knownUuids} is dropped via {@link #dropSegmentByUuid}.
+     *
+     * <p>Called at IS startup, after {@link
+     * herddb.indexing.segment.SegmentAssignmentWatcher#watchIndex} completes its
+     * initial synchronous scan, to handle the case where the IS was down while
+     * the optimizer transitioned and deleted the adopted segment from ZK. Without
+     * this reconcile, the orphaned segment would stay in the active search path
+     * indefinitely (and fail at search time if the optimizer also deleted its
+     * underlying multipart files).
+     *
+     * <p>Idempotent and safe to call multiple times. This method never adds
+     * segments — it only drops ones that are gone from ZK.
+     *
+     * @param knownUuids the set of segment UUIDs currently visible in the ZK
+     *                   registry for this index (from
+     *                   {@link herddb.indexing.segment.SegmentAssignmentWatcher#snapshotKnownSegments()})
+     */
+    @Override
+    public void reconcileAdoptedSegments(java.util.Set<String> knownUuids) {
+        List<String> toDropUuids = new ArrayList<>();
+        for (VectorSegment seg : segments) {
+            if (seg.externalStorageKey != null
+                    && seg.segmentUuid != null
+                    && !knownUuids.contains(seg.segmentUuid)) {
+                toDropUuids.add(seg.segmentUuid);
+            }
+        }
+        for (String uuid : toDropUuids) {
             LOGGER.log(Level.WARNING,
-                    "dropSegmentByUuid: error closing segment " + segmentUuid
-                            + " in store " + indexName, e);
+                    "reconcileAdoptedSegments: dropping orphaned adopted segment {0}"
+                            + " from store {1} (not present in ZK)",
+                    new Object[]{uuid, indexName});
+            dropSegmentByUuid(uuid);
         }
     }
 
@@ -3745,37 +3800,41 @@ public class PersistentVectorStore extends AbstractVectorStore {
 
         List<Callable<List<Map.Entry<Bytes, Float>>>> tasks = new ArrayList<>();
 
-        // Phase 1: on-disk segments.
-        final List<VectorSegment> currentSegments = this.segments;
-        for (final VectorSegment seg : currentSegments) {
-            tasks.add(wrapInContext(ctx, () -> {
-                List<Map.Entry<Bytes, Float>> local = new ArrayList<>(perSourceK);
-                seg.search(qv, perSourceK, similarityFunction, local);
-                return local;
-            }));
-        }
-
-        // Phase 2: live in-memory shards (no pending-deletes filtering).
-        for (final LiveGraphShard shard : liveShards) {
-            if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
-                tasks.add(wrapInContext(ctx, () -> searchLiveShard(shard, qv, perSourceK, null)));
-            }
-        }
-
         List<List<Map.Entry<Bytes, Float>>> partials;
 
-        // Phase 3: frozen + deferred shards. Both are cleaned up by Phase C
-        // under the write lock, so we must hold the read lock to prevent
-        // Phase C from dropping the shards (and their per-shard VectorStorage
-        // references) while GraphSearcher is still accessing them via
-        // shard.mravv. Without this lock, a race would let the shard become
-        // unreachable while jvector's scorer is calling getVector() on its
-        // storage, leading to NullPointerException (issue #129). The lock
-        // is held while invokeSearchTasks blocks on task completion: worker
-        // threads can join as additional readers because ReentrantReadWriteLock
-        // allows multiple concurrent read holders.
+        // The read lock protects three concerns:
+        //   1. On-disk segments (Phase 1): the segment snapshot and task execution
+        //      must happen atomically with respect to dropSegmentByUuid which closes
+        //      segments under the write lock. Moving the snapshot here ensures no
+        //      segment can be closed between the snapshot and task execution (the
+        //      write lock cannot be acquired while we hold the read lock).
+        //   2. Live in-memory shards (Phase 2): liveShards is updated under the
+        //      write lock during addVectorInternal's shard-rotation path; holding
+        //      the read lock keeps the shard list stable across task creation.
+        //   3. Frozen + deferred shards (Phase 3): these are dropped by Phase C of
+        //      checkpoint under the write lock (issue #129); the read lock prevents
+        //      a searcher's GraphSearcher from accessing freed memory.
         stateLock.readLock().lock();
         try {
+            // Phase 1: on-disk segments (snapshotted and tasked under read lock so
+            // that dropSegmentByUuid can safely call found.close() under write lock).
+            final List<VectorSegment> currentSegments = this.segments;
+            for (final VectorSegment seg : currentSegments) {
+                tasks.add(wrapInContext(ctx, () -> {
+                    List<Map.Entry<Bytes, Float>> local = new ArrayList<>(perSourceK);
+                    seg.search(qv, perSourceK, similarityFunction, local);
+                    return local;
+                }));
+            }
+
+            // Phase 2: live in-memory shards (no pending-deletes filtering).
+            for (final LiveGraphShard shard : liveShards) {
+                if (shard.builder != null && !shard.nodeToPk.isEmpty()) {
+                    tasks.add(wrapInContext(ctx, () -> searchLiveShard(shard, qv, perSourceK, null)));
+                }
+            }
+
+            // Phase 3: frozen + deferred shards (the lock was already required for these).
             final PagedPkSet pending = pendingCheckpointDeletes;
             List<LiveGraphShard> frozen = frozenShards;
             if (frozen != null) {

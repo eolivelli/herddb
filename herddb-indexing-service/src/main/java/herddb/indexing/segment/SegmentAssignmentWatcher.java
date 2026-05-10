@@ -187,13 +187,14 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
             collectDiff(v, toAssign, toPending, toRelease);
         }
         // Drop any local entries whose znode is gone, and collect released events
-        // for segments we owned.
+        // for segments we owned. Pass the cached metadata (not null) so downstream
+        // listeners (e.g. IndexingServiceEngine) can call dropSegmentByUuid by UUID.
         Map<String, SegmentMetadata> snapshot = new HashMap<>(known);
         for (Map.Entry<String, SegmentMetadata> entry : snapshot.entrySet()) {
             if (!seen.contains(entry.getKey())) {
                 known.remove(entry.getKey());
                 if (entry.getValue().getOwnerInstanceId() == instanceId) {
-                    toRelease.add(null);
+                    toRelease.add(entry.getValue());
                 }
             }
         }
