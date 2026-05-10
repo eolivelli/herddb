@@ -160,8 +160,10 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
         assertEquals(SegmentMetadata.UNKNOWN_FILE_SIZE, b.getMapFileSize());
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, /* M */ 8, /* beam */ 32, 1.2f, 1.4f,
-                VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        /* graphM */ 8, /* beamWidth */ 32, 1.2f, 1.4f,
+                        VectorSimilarityFunction.EUCLIDEAN)));
         try {
             merger.merge(List.of(a, b), /* newOwnerInstance */ 0);
             fail("expected LegacyMetadataException for legacy znode without mapFileSize");
@@ -234,8 +236,9 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
                 .build();
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                productionLikeDsm, tmpDir, DIM, 8, 32, 1.2f, 1.4f,
-                VectorSimilarityFunction.EUCLIDEAN);
+                productionLikeDsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN)));
         try {
             merger.merge(List.of(oversizedHint1, oversizedHint2), 0);
             fail("expected merge to fail loudly when mapFileSize over-estimates"
@@ -265,8 +268,9 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
         SegmentMetadata other = writeLegacyInput("legacy-prod-B", 200L, 0xB);
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                productionLikeDsm, tmpDir, DIM, 8, 32, 1.2f, 1.4f,
-                VectorSimilarityFunction.EUCLIDEAN);
+                productionLikeDsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN)));
         try {
             merger.merge(List.of(legacy, other), 0);
             fail("expected LegacyMetadataException");
@@ -341,7 +345,9 @@ public class RemoteSegmentMergerLegacyMapFileSizeTest {
                 .build();
 
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
-                dsm, tmpDir, DIM, 8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN);
+                dsm, tmpDir,
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        8, 32, 1.2f, 1.4f, VectorSimilarityFunction.EUCLIDEAN)));
         SegmentMetadata merged = merger.merge(List.of(modern1, modern2), 0);
         assertNotNull(merged);
         assertEquals(20L, merged.getVectorCount());

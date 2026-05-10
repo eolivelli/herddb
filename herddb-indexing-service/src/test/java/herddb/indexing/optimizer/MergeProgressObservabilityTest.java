@@ -191,9 +191,10 @@ public class MergeProgressObservabilityTest {
         Path tmpDir = tmp.newFolder("rsm-obs").toPath();
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
                 new MemoryDataStorageManager(), tmpDir,
-                /* dim */ 8, /* graphM */ 4, /* beamWidth */ 20,
-                /* neighborOverflow */ 1.2f, /* alpha */ 1.2f,
-                VectorSimilarityFunction.DOT_PRODUCT);
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        /* graphM */ 4, /* beamWidth */ 20,
+                        /* neighborOverflow */ 1.2f, /* alpha */ 1.2f,
+                        VectorSimilarityFunction.DOT_PRODUCT)));
 
         assertNull("getLastMergeTimings() must return null before any merge",
                 merger.getLastMergeTimings());
@@ -206,8 +207,8 @@ public class MergeProgressObservabilityTest {
         Path tmpDir = tmp.newFolder("rsm-null").toPath();
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
                 new MemoryDataStorageManager(), tmpDir,
-                8, 4, 20, 1.2f, 1.2f,
-                VectorSimilarityFunction.DOT_PRODUCT);
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        4, 20, 1.2f, 1.2f, VectorSimilarityFunction.DOT_PRODUCT)));
 
         // setMergeProgress(null) when already null — must not throw.
         merger.setMergeProgress(null);
@@ -233,8 +234,8 @@ public class MergeProgressObservabilityTest {
         Path tmpDir = tmp.newFolder("rsm-wire").toPath();
         RemoteSegmentMerger merger = new RemoteSegmentMerger(
                 new MemoryDataStorageManager(), tmpDir,
-                8, 4, 20, 1.2f, 1.2f,
-                VectorSimilarityFunction.DOT_PRODUCT);
+                new StaticIndexMergeConfigProvider(new IndexMergeConfig(
+                        4, 20, 1.2f, 1.2f, VectorSimilarityFunction.DOT_PRODUCT)));
 
         MergeProgress progress = new MergeProgress();
         progress.enterMerge("wired-merge", 2, 50L, 100L);
