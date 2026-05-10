@@ -91,9 +91,13 @@ spec:
             - name: http
               containerPort: {{ .Values.indexOptimizer.httpPort | default 9853 }}
               protocol: TCP
-          # Liveness + readiness probes against the JDK HttpServer admin endpoint
-          # (review item E1+E3). The endpoint is single-threaded but only handles
-          # /health and /metrics so it stays responsive even under heavy ZK load.
+          # Liveness + readiness probes against the JDK HttpServer admin endpoint.
+          # /health unconditionally returns 200 (issue #504) so a long merge tick
+          # cannot race the kubelet's failureThreshold and trigger a SIGKILL, and
+          # a transient ZK session expiry is recovered in-process via
+          # IndexOptimizerMain.reconnectZooKeeper() rather than a pod restart.
+          # Engine staleness alerting belongs on the
+          # herddb_optimizer_last_run_at_seconds gauge from /metrics.
           readinessProbe:
             httpGet:
               path: /health

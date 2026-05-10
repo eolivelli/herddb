@@ -97,7 +97,24 @@ public final class IndexOptimizerMain {
      */
     private final SegmentMerger preconfiguredMerger;
 
-    private ZooKeeper zooKeeper;
+    /**
+     * Current ZooKeeper client. Replaced atomically by {@link #reconnectZooKeeper}
+     * when the previous session expired (issue #504). Reads through
+     * {@link #zkRef} so {@link SegmentRegistryClient} and {@link OptimizerLeaderLock}
+     * always see the live client.
+     */
+    private volatile ZooKeeper zooKeeper;
+    /**
+     * Indirection used by {@link SegmentRegistryClient} and
+     * {@link OptimizerLeaderLock}: they capture a {@code Supplier<ZooKeeper>}
+     * pointing at this reference, so a session restart is transparent.
+     */
+    private final AtomicReference<ZooKeeper> zkRef = new AtomicReference<>();
+    private volatile String zkAddress;
+    private volatile int zkSessionTimeoutMs;
+    /** Coalesces concurrent reconnect attempts triggered by the bootstrap watcher. */
+    private final AtomicBoolean reconnectInFlight = new AtomicBoolean(false);
+    private final AtomicLong sessionReconnects = new AtomicLong();
     /**
      * Scheduler used by both the periodic safety-net tick and the event-driven
      * wakeup. {@code volatile} so the ZK watcher thread (which reads it without
@@ -128,23 +145,6 @@ public final class IndexOptimizerMain {
     private final AtomicLong eventDrivenTicks = new AtomicLong();
     /** Number of distinct ZK events observed by the persistent-recursive watcher. */
     private final AtomicLong watcherEvents = new AtomicLong();
-    /**
-     * Set to {@code true} when the ZooKeeper session expires (or auth
-     * fails). Once set, the persistent-recursive watch is dead, the
-     * leader-lock ephemeral znode is gone, and any registry read against
-     * {@link #zooKeeper} will fail — which means the pod is silently
-     * broken. The HTTP {@code /health} handler consults this flag and
-     * returns 503 so Helm's liveness probe restarts the pod (review item
-     * B.3 from the first pr-reviewer pass).
-     *
-     * <p>The flag is intentionally <strong>one-way</strong>: once tripped,
-     * the only recovery is process restart, which Helm performs in
-     * response to the 503 health check. We do not try to re-establish the
-     * ZK session in-process because the leader-lock would have to be
-     * re-acquired and the persistent-recursive watch re-armed under tight
-     * race conditions — far simpler and safer to let Helm replace us.
-     */
-    private final AtomicBoolean sessionExpired = new AtomicBoolean(false);
     /**
      * Debounce window for the event-driven tick. {@code volatile} for the same
      * reason as {@link #scheduler}: the ZK watcher thread reads it without
@@ -190,12 +190,12 @@ public final class IndexOptimizerMain {
     }
 
     /**
-     * Returns {@code true} when the ZooKeeper session has expired. The HTTP
-     * health handler uses this to flip {@code /health} to 503 so Helm's
-     * liveness probe restarts the pod.
+     * Number of ZooKeeper session-expiry recoveries performed since startup
+     * (issue #504). Observable by tests so they can assert that an injected
+     * session expiry was followed by a fresh session.
      */
-    public boolean isSessionExpired() {
-        return sessionExpired.get();
+    public long getSessionReconnects() {
+        return sessionReconnects.get();
     }
 
     public synchronized void start() throws Exception {
@@ -220,12 +220,16 @@ public final class IndexOptimizerMain {
                 new Object[]{streamingEnabled,
                         OptimizerConfiguration.PROPERTY_MERGE_STREAMING_ENABLED});
 
-        String zkAddress = configuration.getString(
+        this.zkAddress = configuration.getString(
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS,
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS_DEFAULT);
-        int sessionTimeout = configuration.getInt(
+        this.zkSessionTimeoutMs = configuration.getInt(
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT,
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT_DEFAULT);
+        // Local aliases keep the rest of start() readable without re-reading the
+        // configuration on every reference.
+        String zkAddress = this.zkAddress;
+        int sessionTimeout = this.zkSessionTimeoutMs;
         String basePath = configuration.getString(
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH,
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH_DEFAULT);
@@ -271,39 +275,9 @@ public final class IndexOptimizerMain {
         LOGGER.log(Level.INFO, "Resolved tablespace name ''{0}'' to UUID {1}",
                 new Object[]{tablespaceName, tablespaceUuid});
 
-        CountDownLatch zkConnected = new CountDownLatch(1);
-        AtomicReference<ZooKeeper> zkRef = new AtomicReference<>();
-        ZooKeeper zk = new ZooKeeper(zkAddress, sessionTimeout, (WatchedEvent event) -> {
-            switch (event.getState()) {
-                case SyncConnected:
-                    zkConnected.countDown();
-                    break;
-                case Expired:
-                case AuthFailed:
-                    // Session expiry kills the persistent-recursive watch and the
-                    // leader-lock ephemeral znode; AuthFailed is similarly
-                    // unrecoverable (credentials are wrong / revoked). Either way
-                    // the pod is silently broken from here on; flag /health to
-                    // 503 so Helm restarts us (review item B.3 from the first
-                    // pr-reviewer pass; AuthFailed coverage from round 2).
-                    if (sessionExpired.compareAndSet(false, true)) {
-                        LOGGER.log(Level.SEVERE,
-                                "ZooKeeper {0} — /health will return 503 so the pod is restarted.",
-                                event.getState());
-                    }
-                    break;
-                default:
-                    // Disconnected / etc. — log at FINE; the ZK client recovers
-                    // from transient disconnects on its own.
-                    break;
-            }
-        });
-        zkRef.set(zk);
-        if (!zkConnected.await(sessionTimeout, TimeUnit.MILLISECONDS)) {
-            zk.close();
-            throw new IllegalStateException("ZooKeeper connect timed out: " + zkAddress);
-        }
+        ZooKeeper zk = openZooKeeperSession();
         this.zooKeeper = zk;
+        this.zkRef.set(zk);
         this.registry = new SegmentRegistryClient(zkRef::get, basePath);
         registry.ensureRoot();
 
@@ -370,8 +344,9 @@ public final class IndexOptimizerMain {
         // restart the pod if the session ever expires).
         armPersistentRecursiveWatch();
 
-        // Admin HTTP endpoint (review item E1+E3). Disabled when port == 0; otherwise
-        // exposes /health (Helm probe target) and /metrics (Prometheus scrape).
+        // Admin HTTP endpoint. Disabled when port == 0; otherwise exposes
+        // /health (Helm probe target — always 200, see issue #504) and
+        // /metrics (Prometheus scrape).
         int httpPort = configuration.getInt(
                 OptimizerConfiguration.PROPERTY_HTTP_PORT,
                 OptimizerConfiguration.PROPERTY_HTTP_PORT_DEFAULT);
@@ -379,13 +354,7 @@ public final class IndexOptimizerMain {
             String httpHost = configuration.getString(
                     OptimizerConfiguration.PROPERTY_HTTP_HOST,
                     OptimizerConfiguration.PROPERTY_HTTP_HOST_DEFAULT);
-            // Liveness staleness = 2 × tick interval — the engine should have ticked
-            // at least once in that window unless something is stuck (review-item B6
-            // from second pr-reviewer pass).
-            this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine,
-                    /* stalenessThresholdMillis */ 2L * intervalMs,
-                    System::currentTimeMillis,
-                    /* criticalFailure */ this::isSessionExpired);
+            this.httpServer = new OptimizerHttpServer(httpHost, httpPort, engine);
             this.httpServer.start();
         }
 
@@ -405,6 +374,124 @@ public final class IndexOptimizerMain {
             // RuntimeException. Either way we log and let the next tick retry — a
             // misbehaving merger or transient ZK error must never kill the scheduler.
             LOGGER.log(Level.WARNING, "optimizer tick failed", e);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // ZooKeeper session lifecycle (issue #504)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Opens a fresh ZooKeeper session using the configured address + session
+     * timeout, awaits the {@code SyncConnected} event, and returns the live
+     * client. Callers are responsible for publishing it via
+     * {@link #zkRef} / {@link #zooKeeper}. The watcher attached here also drives
+     * automatic reconnect on session expiry.
+     */
+    private ZooKeeper openZooKeeperSession() throws IOException, InterruptedException {
+        CountDownLatch connected = new CountDownLatch(1);
+        ZooKeeper zk = new ZooKeeper(zkAddress, zkSessionTimeoutMs,
+                (WatchedEvent event) -> handleBootstrapEvent(event, connected));
+        if (!connected.await(zkSessionTimeoutMs, TimeUnit.MILLISECONDS)) {
+            try {
+                zk.close();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+            throw new IllegalStateException("ZooKeeper connect timed out: " + zkAddress);
+        }
+        return zk;
+    }
+
+    private void handleBootstrapEvent(WatchedEvent event, CountDownLatch connectLatch) {
+        switch (event.getState()) {
+            case SyncConnected:
+                connectLatch.countDown();
+                break;
+            case Expired:
+                // The persistent-recursive watch is dead and the leader-lock
+                // ephemeral znode is gone with the old session. Schedule an
+                // in-process reconnect so the optimizer recovers without a pod
+                // restart (issue #504 — the liveness probe stays at 200 so
+                // long merges don't trip a kubelet SIGKILL).
+                LOGGER.log(Level.WARNING,
+                        "ZooKeeper session expired — scheduling in-process reconnect");
+                scheduleReconnectZooKeeper();
+                break;
+            case AuthFailed:
+                // Credentials are wrong / revoked: a reconnect with the same
+                // config will hit the same wall, so we log and stop. An
+                // operator must rotate credentials and restart the pod.
+                LOGGER.log(Level.SEVERE,
+                        "ZooKeeper AuthFailed — pod is broken until credentials are fixed.");
+                break;
+            default:
+                // Disconnected / etc. — the ZK client recovers from transient
+                // disconnects on its own.
+                break;
+        }
+    }
+
+    /**
+     * Coalesces concurrent reconnect requests onto the engine scheduler. The
+     * watcher fires from the ZK event thread; we MUST NOT block it, so the
+     * actual reconnect (which opens a fresh ZK and waits for SyncConnected)
+     * runs on the scheduler.
+     */
+    private void scheduleReconnectZooKeeper() {
+        if (!reconnectInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        ScheduledExecutorService sched = scheduler;
+        if (sched == null || sched.isShutdown()) {
+            reconnectInFlight.set(false);
+            return;
+        }
+        try {
+            sched.execute(this::reconnectZooKeeper);
+        } catch (RuntimeException dispatchFailed) {
+            // Scheduler may reject if it's shutting down between our checks.
+            reconnectInFlight.set(false);
+            LOGGER.log(Level.WARNING,
+                    "could not dispatch ZK reconnect: {0}", dispatchFailed.getMessage());
+        }
+    }
+
+    private void reconnectZooKeeper() {
+        try {
+            ZooKeeper old = this.zooKeeper;
+            try {
+                if (old != null) {
+                    old.close();
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+            ZooKeeper fresh;
+            try {
+                fresh = openZooKeeperSession();
+            } catch (IOException | InterruptedException openErr) {
+                if (openErr instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                LOGGER.log(Level.SEVERE,
+                        "ZooKeeper reconnect failed; will retry on next session-expiry event: {0}",
+                        openErr.getMessage());
+                return;
+            }
+            this.zooKeeper = fresh;
+            this.zkRef.set(fresh);
+            // Re-arm the persistent-recursive watch on the new session — the
+            // old session's watch died with it.
+            armPersistentRecursiveWatch();
+            // Kick a tick so the leader lock is re-acquired and any registry
+            // changes that happened during the outage are processed.
+            scheduleEventDrivenTick();
+            sessionReconnects.incrementAndGet();
+            LOGGER.log(Level.INFO, "ZooKeeper session re-established (reconnect #{0})",
+                    sessionReconnects.get());
+        } finally {
+            reconnectInFlight.set(false);
         }
     }
 
