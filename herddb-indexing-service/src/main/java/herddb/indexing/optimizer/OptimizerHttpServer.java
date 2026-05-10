@@ -27,17 +27,18 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Minimal HTTP endpoint for observability of the optimizer service (review
- * items E1 + E3). Exposes:
+ * Minimal HTTP endpoint for observability of the optimizer service. Exposes:
  * <ul>
- *   <li>{@code GET /health} — returns 200 with {@code OK} once the engine is
- *       running. Used by Helm liveness/readiness probes.</li>
+ *   <li>{@code GET /health} — always returns 200 OK. Used by Helm
+ *       liveness/readiness probes; the probe must only fire when the JVM
+ *       itself is unresponsive, not when a long merge tick is running
+ *       (issue #504). Engine progress is tracked via the
+ *       {@code herddb_optimizer_last_run_at_seconds} gauge on /metrics
+ *       for alerting.</li>
  *   <li>{@code GET /metrics} — returns Prometheus-style plain-text counters
  *       (runs, segments_merged, segments_deprecated, segments_deleted,
  *       ticks_skipped_not_leader). Scrape-friendly.</li>
@@ -53,58 +54,9 @@ public final class OptimizerHttpServer implements AutoCloseable {
 
     private final HttpServer server;
     private final IndexOptimizerEngine engine;
-    /**
-     * Heartbeat-staleness threshold for {@code /health} (review-item B6 from second
-     * pr-reviewer pass). When the engine's run counter has not advanced within this
-     * window, /health returns 503 so the Helm liveness probe restarts the pod.
-     * The default is twice the optimizer's tick interval — set via
-     * {@link OptimizerHttpServer#OptimizerHttpServer(String, int, IndexOptimizerEngine, long, LongSupplier)}.
-     */
-    private final long stalenessThresholdMillis;
-    private final LongSupplier clock;
-    /**
-     * Predicate consulted by the {@code /health} handler. When it returns
-     * {@code true}, the handler short-circuits to 503 — the optimizer's ZK
-     * session has expired (or some other unrecoverable lifecycle event has
-     * fired), so Helm should restart the pod regardless of the heartbeat
-     * counter (review item B.3 from the first pr-reviewer pass).
-     */
-    private final java.util.function.BooleanSupplier criticalFailure;
-    private final AtomicLong lastObservedRuns = new AtomicLong(-1);
-    private final AtomicLong lastObservedRunsAtMillis = new AtomicLong(0);
 
-    /**
-     * Convenience constructor with a 2 × intervalMs default staleness threshold and the
-     * system clock. Equivalent to the test-friendly constructor with stalenessThreshold
-     * disabled (Long.MAX_VALUE) — kept for source compatibility with earlier code.
-     */
     public OptimizerHttpServer(String bindHost, int port, IndexOptimizerEngine engine) throws IOException {
-        this(bindHost, port, engine, Long.MAX_VALUE, System::currentTimeMillis,
-                /* criticalFailure */ () -> false);
-    }
-
-    /**
-     * Three-arg constructor wiring the heartbeat-staleness threshold and a clock
-     * for tests. Equivalent to the four-arg constructor with no critical-failure
-     * gate.
-     */
-    public OptimizerHttpServer(String bindHost, int port, IndexOptimizerEngine engine,
-                               long stalenessThresholdMillis, LongSupplier clock) throws IOException {
-        this(bindHost, port, engine, stalenessThresholdMillis, clock,
-                /* criticalFailure */ () -> false);
-    }
-
-    /**
-     * Full constructor wiring the heartbeat-staleness threshold, a clock, and a
-     * critical-failure gate (e.g. ZK session expiry detection).
-     */
-    public OptimizerHttpServer(String bindHost, int port, IndexOptimizerEngine engine,
-                               long stalenessThresholdMillis, LongSupplier clock,
-                               java.util.function.BooleanSupplier criticalFailure) throws IOException {
         this.engine = engine;
-        this.stalenessThresholdMillis = stalenessThresholdMillis;
-        this.clock = clock;
-        this.criticalFailure = criticalFailure == null ? () -> false : criticalFailure;
         this.server = HttpServer.create(new InetSocketAddress(bindHost, port), 0);
         server.createContext("/health", new HealthHandler());
         server.createContext("/metrics", new MetricsHandler());
@@ -133,68 +85,15 @@ public final class OptimizerHttpServer implements AutoCloseable {
         server.stop(0);
     }
 
-    private final class HealthHandler implements HttpHandler {
+    private static final class HealthHandler implements HttpHandler {
+        private static final byte[] OK_BODY = "OK\n".getBytes(StandardCharsets.UTF_8);
+
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            // Critical-failure gate (review item B.3 from the first pr-reviewer
-            // pass): when the ZooKeeper session has expired, the pod is
-            // silently broken — the persistent-recursive watch is dead and the
-            // leader-lock znode is gone. Force 503 so Helm restarts us.
-            if (criticalFailure.getAsBoolean()) {
-                byte[] body = "FAILED: critical lifecycle failure (e.g. ZK session expired)\n"
-                        .getBytes(StandardCharsets.UTF_8);
-                exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
-                exchange.sendResponseHeaders(503, body.length);
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(body);
-                }
-                return;
-            }
-            // Liveness check (review-item B6): the engine's run counter must advance
-            // within stalenessThresholdMillis. We compare the current value against
-            // the last observation; when it has progressed we update both the
-            // counter snapshot and the timestamp. When it has NOT progressed for
-            // longer than the threshold, the pod is stuck and we return 503 so Helm
-            // restarts it.
-            long currentRuns = engine.getRuns();
-            long now = clock.getAsLong();
-            long observedRuns = lastObservedRuns.get();
-            long observedAt = lastObservedRunsAtMillis.get();
-            boolean healthy;
-            String reason;
-            if (stalenessThresholdMillis == Long.MAX_VALUE) {
-                // Liveness gating disabled — preserve the legacy "always 200" behavior.
-                healthy = true;
-                reason = "OK\n";
-            } else if (observedRuns == -1L) {
-                // First call: arm the heartbeat with the current value but mark fresh.
-                lastObservedRuns.set(currentRuns);
-                lastObservedRunsAtMillis.set(now);
-                healthy = true;
-                reason = "OK\n";
-            } else if (currentRuns > observedRuns) {
-                // Engine ticked since last health check — refresh the heartbeat.
-                lastObservedRuns.set(currentRuns);
-                lastObservedRunsAtMillis.set(now);
-                healthy = true;
-                reason = "OK\n";
-            } else {
-                long staleFor = now - observedAt;
-                if (staleFor > stalenessThresholdMillis) {
-                    healthy = false;
-                    reason = "STALE: engine has not ticked for " + staleFor + " ms (threshold "
-                            + stalenessThresholdMillis + " ms)\n";
-                } else {
-                    healthy = true;
-                    reason = "OK (stale " + staleFor + " ms)\n";
-                }
-            }
-
-            byte[] body = reason.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
-            exchange.sendResponseHeaders(healthy ? 200 : 503, body.length);
+            exchange.sendResponseHeaders(200, OK_BODY.length);
             try (OutputStream os = exchange.getResponseBody()) {
-                os.write(body);
+                os.write(OK_BODY);
             }
         }
     }

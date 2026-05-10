@@ -19,6 +19,7 @@
  */
 package herddb.indexing.optimizer;
 
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import herddb.cluster.ZookeeperMetadataStorageManager;
@@ -39,15 +40,20 @@ import org.junit.Before;
 import org.junit.Test;
 
 /**
- * End-to-end test verifying the ZK-session-expiry → {@code /health} 503
- * wiring on a real {@link IndexOptimizerMain} instance (issue #484, round-2
- * review item B.6).
+ * End-to-end test for the optimizer's in-process ZooKeeper session-recovery
+ * path (issue #504). Forces a real {@code KeeperState.Expired} event by
+ * hijacking the optimizer's session id and closing it from a second client
+ * (the canonical "kill ZK session" pattern), then asserts:
+ * <ul>
+ *   <li>{@link IndexOptimizerMain#getSessionReconnects()} crosses zero,</li>
+ *   <li>the optimizer's internal {@link ZooKeeper} reference is replaced with
+ *       a fresh client (different session id),</li>
+ *   <li>the engine can complete a tick after the reconnect.</li>
+ * </ul>
  *
- * <p>The test does not rely on a synthetic predicate; it triggers an actual
- * {@code KeeperState.Expired} event by hijacking the optimizer's session id
- * and closing it from a second client (the canonical "kill ZK session"
- * pattern). The test then asserts {@link IndexOptimizerMain#isSessionExpired}
- * flips within a deadline.
+ * <p>The fix replaces the old "trip /health to 503 so Helm restarts us"
+ * behavior with in-process recovery — long merges no longer race the
+ * liveness probe, and a transient ZK outage does not require a pod restart.
  */
 public class IndexOptimizerSessionExpiredTest {
 
@@ -100,13 +106,15 @@ public class IndexOptimizerSessionExpiredTest {
     }
 
     @Test
-    public void zkSessionExpiryTrippedAndDetected() throws Exception {
+    public void zkSessionExpiryTriggersInProcessReconnect() throws Exception {
         Properties props = new Properties();
         props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_ADDRESS, zkServer.getConnectString());
         // Short ZK session timeout so we can force an expiry quickly.
         props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_SESSION_TIMEOUT, "4000");
         props.setProperty(OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH, BASE_PATH);
         props.setProperty(OptimizerConfiguration.PROPERTY_TABLESPACE_NAME, TS_NAME);
+        // Long periodic interval — we drive ticks via the event-driven path that
+        // the reconnect schedules so the test does not depend on timing.
         props.setProperty(OptimizerConfiguration.PROPERTY_INTERVAL_MS, "60000");
         props.setProperty(OptimizerConfiguration.PROPERTY_RETENTION_MS, "60000");
         props.setProperty(OptimizerConfiguration.PROPERTY_HTTP_PORT, "0");
@@ -117,17 +125,19 @@ public class IndexOptimizerSessionExpiredTest {
         try {
             main.start();
             assertNotNull(main.getEngine());
-            assertTrue("session must NOT be expired immediately after start",
-                    !main.isSessionExpired());
+            assertTrue("baseline reconnect counter must be 0",
+                    main.getSessionReconnects() == 0L);
+
+            ZooKeeper firstZk = extractZkClient(main);
+            long firstSessionId = firstZk.getSessionId();
+            assertTrue("first session must have a non-zero id", firstSessionId != 0L);
 
             // Hijack the optimizer's ZK session id + password and close that
             // session from a second client. ZooKeeper considers this "session
             // moved" — the original client's next operation gets
-            // SessionExpired, which fires the watcher with KeeperState.Expired.
-            ZooKeeper victimSession = extractZkClient(main);
-            long sessionId = victimSession.getSessionId();
-            byte[] passwd = victimSession.getSessionPasswd();
-
+            // SessionExpired, which fires the bootstrap watcher with
+            // KeeperState.Expired and triggers an in-process reconnect.
+            byte[] passwd = firstZk.getSessionPasswd();
             CountDownLatch kicked = new CountDownLatch(1);
             ZooKeeper kicker = new ZooKeeper(zkServer.getConnectString(), 4000,
                     (WatchedEvent ev) -> {
@@ -135,22 +145,33 @@ public class IndexOptimizerSessionExpiredTest {
                             kicked.countDown();
                         }
                     },
-                    sessionId, passwd);
+                    firstSessionId, passwd);
             assertTrue("kicker session must establish",
                     kicked.await(10, TimeUnit.SECONDS));
-            // Closing the kicker session also kills the optimizer's session
-            // (same session id) — the original watcher fires Expired.
             kicker.close();
 
-            // Wait up to 10 s for the optimizer's watcher to observe Expired
-            // and flip the flag. (The timeout is generous because session
-            // expiry detection waits for the next ZK keepalive round-trip.)
-            long deadline = System.currentTimeMillis() + 10_000L;
-            while (System.currentTimeMillis() < deadline && !main.isSessionExpired()) {
+            // Wait up to 30 s for the reconnect to land. The bootstrap watcher
+            // first sees Expired (after the next ZK keepalive round-trip),
+            // schedules the reconnect on the engine scheduler, then opens a
+            // fresh session and increments getSessionReconnects().
+            long deadline = System.currentTimeMillis() + 30_000L;
+            while (System.currentTimeMillis() < deadline && main.getSessionReconnects() == 0L) {
                 Thread.sleep(50);
             }
-            assertTrue("ZK session expiry must trip IndexOptimizerMain.isSessionExpired",
-                    main.isSessionExpired());
+            assertTrue("ZK session expiry must trigger an in-process reconnect; reconnects="
+                            + main.getSessionReconnects(),
+                    main.getSessionReconnects() >= 1L);
+
+            // The second ZK client must be a different session.
+            ZooKeeper secondZk = extractZkClient(main);
+            assertNotNull("post-reconnect ZK reference must be non-null", secondZk);
+            assertNotEquals("post-reconnect session id must differ from the expired one",
+                    firstSessionId, secondZk.getSessionId());
+
+            // Verify the engine is functional after the reconnect by running a tick
+            // directly. If the registry / leader-lock are wired to the new ZK,
+            // this should succeed without throwing.
+            main.getEngine().runOnce();
         } finally {
             main.shutdown();
         }
