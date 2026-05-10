@@ -196,6 +196,23 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_REMOTE_FILE_SERVERS = "indexoptimizer.remote.file.servers";
     public static final String PROPERTY_REMOTE_FILE_SERVERS_DEFAULT = "";
 
+    /**
+     * Number of ZK discovery retries at startup if the initial {@code listFileServers()} call
+     * returns an empty list and no static servers are configured (issue #507, Option A).
+     * Each retry is separated by {@link #PROPERTY_ZK_DISCOVERY_RETRY_INTERVAL_MS} milliseconds.
+     * Set to 0 to disable startup retries and rely solely on tick-time upgrade (Option B).
+     */
+    public static final String PROPERTY_ZK_DISCOVERY_RETRIES = "indexoptimizer.zk.discovery.retries";
+    public static final int PROPERTY_ZK_DISCOVERY_RETRIES_DEFAULT = 3;
+
+    /**
+     * Wait interval between ZK discovery retries at startup, in milliseconds (issue #507).
+     * Defaults to 2 s; use a much shorter value in unit tests to keep tests fast.
+     */
+    public static final String PROPERTY_ZK_DISCOVERY_RETRY_INTERVAL_MS =
+            "indexoptimizer.zk.discovery.retry.interval.ms";
+    public static final long PROPERTY_ZK_DISCOVERY_RETRY_INTERVAL_MS_DEFAULT = 2000L;
+
     /** Per-call deadline for the remote-file client, in seconds. */
     public static final String PROPERTY_REMOTE_FILE_TIMEOUT = "indexoptimizer.remote.file.client.timeout";
     public static final long PROPERTY_REMOTE_FILE_TIMEOUT_DEFAULT = 60L;

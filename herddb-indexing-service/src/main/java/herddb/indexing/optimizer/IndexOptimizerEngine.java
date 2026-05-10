@@ -70,7 +70,15 @@ public final class IndexOptimizerEngine {
     private static final Logger LOGGER = Logger.getLogger(IndexOptimizerEngine.class.getName());
 
     private final SegmentRegistryClient registry;
-    private final SegmentMerger merger;
+    /**
+     * Active merger. {@code volatile} to allow {@link #upgradeMerger} to replace
+     * a startup-time {@link IndexOptimizerMain.NoopMerger} with a real
+     * {@link RemoteSegmentMerger} once ZK discovers a file server (issue #507, Option B).
+     * All writes go through {@link #upgradeMerger} which is {@code synchronized};
+     * reads are unsynchronized but visibility is guaranteed by the {@code volatile}
+     * keyword.
+     */
+    private volatile SegmentMerger merger;
     private final String tablespaceUuid;
     private final MergePolicy mergePolicy;
     private final long retentionMillis;
@@ -82,8 +90,12 @@ public final class IndexOptimizerEngine {
      * current tombstone-overlay files of every reaped segment (review item A8).
      * Pass {@code null} to skip physical-file deletion — useful when the test fakes
      * the storage layer or doesn't care about file residue.
+     *
+     * <p>{@code volatile} so that {@link #upgradeMerger} can update it together
+     * with the merger reference when the optimizer self-heals from NoopMerger
+     * (issue #507, Option B).
      */
-    private final DataStorageManager dataStorageManager;
+    private volatile DataStorageManager dataStorageManager;
     /**
      * Optional: when non-null, every {@link #runOnce()} invocation tries to acquire
      * this lock first and skips the tick if it can't. Enforces the singleton
@@ -328,6 +340,32 @@ public final class IndexOptimizerEngine {
 
     public long getTicksSkippedNotLeader() {
         return ticksSkippedNotLeader.get();
+    }
+
+    /**
+     * Atomically replaces the active merger and the associated
+     * {@link DataStorageManager} (used by the reaper for physical file deletion).
+     * Called by {@link IndexOptimizerMain#maybeUpgradeMerger()} when ZK discovery
+     * finds a file server after the optimizer started with a
+     * {@link IndexOptimizerMain.NoopMerger} due to a startup-ordering race
+     * (issue #507, Option B).
+     *
+     * <p>Synchronisation note: both fields are {@code volatile} so concurrent
+     * readers (the periodic-tick path) always observe either the old or the new
+     * values — never a partial update. {@code synchronized} here serialises
+     * concurrent upgrade attempts from the single-threaded scheduler, but the
+     * {@code volatile} keyword is what ensures visibility on the read side.
+     *
+     * @param newMerger the new merger — must not be {@code null}
+     * @param newDsm    the DataStorageManager embedded in the new merger (may be
+     *                  {@code null} when the reaper's physical-file deletion is still
+     *                  in safe mode)
+     */
+    public synchronized void upgradeMerger(SegmentMerger newMerger, DataStorageManager newDsm) {
+        Objects.requireNonNull(newMerger, "newMerger");
+        this.merger = newMerger;
+        this.dataStorageManager = newDsm;
+        LOGGER.log(Level.INFO, "engine merger upgraded to {0}", newMerger.getClass().getSimpleName());
     }
 
     /**

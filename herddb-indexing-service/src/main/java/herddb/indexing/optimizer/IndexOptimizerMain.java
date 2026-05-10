@@ -98,6 +98,15 @@ public final class IndexOptimizerMain {
     private final SegmentMerger preconfiguredMerger;
 
     /**
+     * Test seam: when non-null, {@link #maybeUpgradeMerger()} builds the upgraded
+     * merger using this factory instead of {@link #buildRemoteSegmentMerger}.
+     * Never set in production code; package-private so unit tests in
+     * {@code herddb.indexing.optimizer} can inject a synthetic factory (e.g.
+     * returning {@link InMemorySegmentMerger}) without needing a live file server.
+     */
+    java.util.function.Function<List<String>, SegmentMerger> mergerBuilderForTests;
+
+    /**
      * Current ZooKeeper client. Replaced atomically by {@link #reconnectZooKeeper}
      * when the previous session expired (issue #504). Reads through
      * {@link #zkRef} so {@link SegmentRegistryClient} and {@link OptimizerLeaderLock}
@@ -112,6 +121,13 @@ public final class IndexOptimizerMain {
     private final AtomicReference<ZooKeeper> zkRef = new AtomicReference<>();
     private volatile String zkAddress;
     private volatile int zkSessionTimeoutMs;
+    /**
+     * ZooKeeper base path (e.g. {@code /herd}). Stored as a field so that
+     * {@link #maybeUpgradeMerger()} can open a short-lived
+     * {@link herddb.cluster.ZookeeperMetadataStorageManager} for ZK discovery
+     * retries at tick time without re-reading the configuration (issue #507).
+     */
+    private volatile String zkBasePath;
     /** Coalesces concurrent reconnect attempts triggered by the bootstrap watcher. */
     private final AtomicBoolean reconnectInFlight = new AtomicBoolean(false);
     private final AtomicLong sessionReconnects = new AtomicLong();
@@ -233,6 +249,8 @@ public final class IndexOptimizerMain {
         String basePath = configuration.getString(
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH,
                 OptimizerConfiguration.PROPERTY_ZOOKEEPER_PATH_DEFAULT);
+        // Store as a field so maybeUpgradeMerger() can access it at tick time.
+        this.zkBasePath = basePath;
         String tablespaceName = configuration.getString(
                 OptimizerConfiguration.PROPERTY_TABLESPACE_NAME, null);
         if (tablespaceName == null || tablespaceName.isEmpty()) {
@@ -271,6 +289,56 @@ public final class IndexOptimizerMain {
             throw new IllegalStateException(
                     "Failed to resolve tablespace '" + tablespaceName + "' from ZooKeeper: "
                     + e.getMessage(), e);
+        }
+
+        // Issue #507 — Option A: startup retry loop.
+        // If both the static server list and the initial ZK discovery are empty, the
+        // file server may not have finished registering yet (startup-ordering race).
+        // Retry up to PROPERTY_ZK_DISCOVERY_RETRIES times with the configured interval
+        // before falling back to NoopMerger. The tick-time upgrade (Option B,
+        // maybeUpgradeMerger) will self-heal even if all retries are exhausted, so
+        // these retries are an optimisation rather than the sole safety net.
+        String staticServersCheck = configuration.getString(
+                OptimizerConfiguration.PROPERTY_REMOTE_FILE_SERVERS,
+                OptimizerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
+        if (discoveredFileServers.isEmpty() && (staticServersCheck == null || staticServersCheck.isEmpty())) {
+            int retries = configuration.getInt(
+                    OptimizerConfiguration.PROPERTY_ZK_DISCOVERY_RETRIES,
+                    OptimizerConfiguration.PROPERTY_ZK_DISCOVERY_RETRIES_DEFAULT);
+            long retryIntervalMs = configuration.getLong(
+                    OptimizerConfiguration.PROPERTY_ZK_DISCOVERY_RETRY_INTERVAL_MS,
+                    OptimizerConfiguration.PROPERTY_ZK_DISCOVERY_RETRY_INTERVAL_MS_DEFAULT);
+            for (int attempt = 0; attempt < retries && discoveredFileServers.isEmpty(); attempt++) {
+                LOGGER.log(Level.INFO,
+                        "ZK discovery returned no file servers; retrying in {0} ms "
+                                + "(attempt {1}/{2}) — file server may still be starting",
+                        new Object[]{retryIntervalMs, attempt + 1, retries});
+                // Use wait() instead of Thread.sleep() so the monitor is released
+                // during the pause — any concurrent thread that needs this lock
+                // (e.g. shutdown()) can proceed without waiting the full retry interval.
+                // Spurious early wake-ups from wait() are harmless: we simply retry
+                // ZK discovery sooner than planned.
+                try {
+                    wait(retryIntervalMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                try (ZookeeperMetadataStorageManager zkRetry =
+                        new ZookeeperMetadataStorageManager(zkAddress, sessionTimeout, basePath)) {
+                    zkRetry.start(false);
+                    discoveredFileServers.addAll(zkRetry.listFileServers());
+                    if (!discoveredFileServers.isEmpty()) {
+                        LOGGER.log(Level.INFO,
+                                "ZK discovery retry {0}/{1} found file servers: {2}",
+                                new Object[]{attempt + 1, retries, discoveredFileServers});
+                    }
+                } catch (MetadataStorageManagerException retryErr) {
+                    LOGGER.log(Level.WARNING,
+                            "ZK discovery retry {0}/{1} failed: {2}",
+                            new Object[]{attempt + 1, retries, retryErr.getMessage()});
+                }
+            }
         }
         LOGGER.log(Level.INFO, "Resolved tablespace name ''{0}'' to UUID {1}",
                 new Object[]{tablespaceName, tablespaceUuid});
@@ -367,6 +435,11 @@ public final class IndexOptimizerMain {
 
     private void tickSafe() {
         try {
+            // Issue #507, Option B: if the optimizer started with a NoopMerger (because
+            // ZK discovery was empty and the startup retries were exhausted), attempt to
+            // upgrade to a real merger before each tick. This self-heals the startup-
+            // ordering race without requiring a pod restart.
+            maybeUpgradeMerger();
             engine.runOnce();
         } catch (herddb.indexing.segment.SegmentRegistryException | RuntimeException e) {
             // Narrow catch (review item H1): the engine's runOnce now declares a typed
@@ -581,8 +654,100 @@ public final class IndexOptimizerMain {
     }
 
     // -------------------------------------------------------------------------
-    // Merger resolution
+    // Merger resolution and late-binding upgrade (issue #507)
     // -------------------------------------------------------------------------
+
+    /**
+     * Issue #507, Option B — tick-time late-binding merger upgrade.
+     *
+     * <p>If the optimizer started with a {@link NoopMerger} (because both the static
+     * {@link OptimizerConfiguration#PROPERTY_REMOTE_FILE_SERVERS} and the startup-time
+     * ZK discovery were empty), this method is called at the top of every
+     * {@link #tickSafe()} to retry ZK discovery and, if file servers are now visible,
+     * build a real {@link RemoteSegmentMerger} and install it atomically via
+     * {@link IndexOptimizerEngine#upgradeMerger}.
+     *
+     * <p>Synchronised on {@code this} for two reasons: (a) the single-threaded
+     * scheduler serialises ticks, but the ZK-session-expiry reconnect path can
+     * also call {@link #scheduleEventDrivenTick} from a different thread, potentially
+     * racing with this path; (b) {@link #merger} and {@link #mergerDataStorageManager}
+     * are both updated here and must be seen together by any subsequent read.
+     *
+     * <p>Skipped entirely when:
+     * <ul>
+     *   <li>The current merger is already a real merger (not {@link NoopMerger}).</li>
+     *   <li>A merger was pre-configured via the constructor (test/SPI path) — the
+     *       pre-configured merger takes priority unconditionally.</li>
+     *   <li>{@link #engine} is not yet initialised (called defensively before
+     *       {@link #start()} completes).</li>
+     * </ul>
+     */
+    private synchronized void maybeUpgradeMerger() {
+        if (preconfiguredMerger != null || engine == null || !(merger instanceof NoopMerger)) {
+            return;
+        }
+        // Re-check static config first — faster than a ZK round-trip and avoids the
+        // network if the operator added the static key after the optimizer started.
+        String staticServers = configuration.getString(
+                OptimizerConfiguration.PROPERTY_REMOTE_FILE_SERVERS,
+                OptimizerConfiguration.PROPERTY_REMOTE_FILE_SERVERS_DEFAULT);
+        List<String> servers = new ArrayList<>();
+        if (staticServers != null && !staticServers.isEmpty()) {
+            for (String s : staticServers.split(",")) {
+                String trimmed = s.trim();
+                if (!trimmed.isEmpty()) {
+                    servers.add(trimmed);
+                }
+            }
+        }
+        if (servers.isEmpty()) {
+            // Re-attempt ZK discovery.
+            String addr = this.zkAddress;
+            int timeout = this.zkSessionTimeoutMs;
+            String basePath = this.zkBasePath;
+            if (addr == null || basePath == null) {
+                return; // start() not yet complete
+            }
+            try (ZookeeperMetadataStorageManager zkmeta =
+                    new ZookeeperMetadataStorageManager(addr, timeout, basePath)) {
+                zkmeta.start(false);
+                servers.addAll(zkmeta.listFileServers());
+            } catch (MetadataStorageManagerException zkErr) {
+                LOGGER.log(Level.FINE,
+                        "maybeUpgradeMerger: ZK discovery failed, will retry on next tick: {0}",
+                        zkErr.getMessage());
+                return;
+            }
+        }
+        if (servers.isEmpty()) {
+            return; // still nothing — skip and try again on the next tick
+        }
+        LOGGER.log(Level.INFO,
+                "maybeUpgradeMerger: discovered file servers {0}; upgrading from NoopMerger",
+                servers);
+        try {
+            SegmentMerger upgraded;
+            if (mergerBuilderForTests != null) {
+                // Test seam: use the injected factory instead of the real RemoteSegmentMerger
+                // constructor (which requires a live file server and dim config).
+                upgraded = mergerBuilderForTests.apply(servers);
+            } else {
+                upgraded = buildRemoteSegmentMerger(servers, zkAddress, zkBasePath);
+            }
+            this.merger = upgraded;
+            engine.upgradeMerger(upgraded, mergerDataStorageManager);
+            LOGGER.log(Level.INFO,
+                    "maybeUpgradeMerger: successfully upgraded to {0}",
+                    upgraded.getClass().getSimpleName());
+        } catch (IOException | RuntimeException buildErr) {
+            // Building the merger failed (bad config, unreachable server, etc.).
+            // Log and stay with NoopMerger — the next tick will retry.
+            LOGGER.log(Level.WARNING,
+                    "maybeUpgradeMerger: failed to build RemoteSegmentMerger; "
+                            + "will retry on next tick: {0}",
+                    buildErr.getMessage());
+        }
+    }
 
     /**
      * Resolves the {@link SegmentMerger} for this optimizer. Resolution order:
@@ -634,6 +799,11 @@ public final class IndexOptimizerMain {
             return new NoopMerger();
         }
         try {
+            if (mergerBuilderForTests != null) {
+                // Test seam: use the injected factory instead of the real RemoteSegmentMerger
+                // constructor (which requires a live file server and dim config).
+                return mergerBuilderForTests.apply(servers);
+            }
             return buildRemoteSegmentMerger(servers, zkAddress, basePath);
         } catch (RuntimeException buildErr) {
             // Building the DSM is the plugin boundary — surface and fall back rather
