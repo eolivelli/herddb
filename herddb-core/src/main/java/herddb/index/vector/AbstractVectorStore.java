@@ -20,11 +20,14 @@
 
 package herddb.index.vector;
 
+import herddb.storage.DataStorageManagerException;
 import herddb.utils.Bytes;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Predicate;
 
 /**
@@ -121,6 +124,75 @@ public abstract class AbstractVectorStore implements AutoCloseable {
      */
     public String getStoreUUID() {
         return null;
+    }
+
+    /**
+     * Adopts an externally-produced segment (e.g. an optimizer merge output) into
+     * this store's active segment list. The segment's graph and map multipart files
+     * must already be present in the underlying data-storage manager under the key
+     * derived from {@code externalSegmentId}.
+     *
+     * <p>Idempotent: if a segment with the same {@code segmentUuid} is already loaded,
+     * this method returns {@code false} immediately without loading it again.
+     *
+     * <p>The default implementation is a no-op (used by in-memory stores that have no
+     * persistent segments). {@link herddb.index.vector.PersistentVectorStore} overrides
+     * this with a full implementation.
+     *
+     * @param segmentUuid       the UUID of the segment (from the ZK registry)
+     * @param externalSegmentId the 63-bit long segment ID allocated by the optimizer;
+     *                          used to reconstruct the multipart storage key
+     *                          ({@code indexUUID + "_seg" + externalSegmentId})
+     * @param graphFilePath     logical path recorded in the segment's ZK znode
+     * @param graphFileSize     exact byte-size of the graph multipart file
+     * @param mapFilePath       logical path recorded in the segment's ZK znode
+     * @param mapFileSize       exact byte-size of the map multipart file
+     * @param generation        segment generation from the ZK znode
+     * @return {@code true} if the segment was newly loaded; {@code false} if it was
+     *         already present (idempotent re-fire) or if the store is non-persistent
+     */
+    public boolean adoptExternalSegment(String segmentUuid, long externalSegmentId,
+            String graphFilePath, long graphFileSize,
+            String mapFilePath, long mapFileSize,
+            long generation) throws IOException, DataStorageManagerException {
+        // No-op for non-persistent stores (e.g. InMemoryVectorStore).
+        return false;
+    }
+
+    /**
+     * Removes a segment from the active list by its UUID and releases its resources.
+     * Called when the segment-assignment watcher reports that a segment previously
+     * owned by this IS instance is now deprecated (e.g. superseded by an
+     * optimizer-produced merge).
+     *
+     * <p>Idempotent: if the UUID is not found, this method returns immediately.
+     * Does <em>not</em> queue the segment's files for deletion — the optimizer is
+     * responsible for managing the lifecycle of files it produced.
+     *
+     * <p>The default implementation is a no-op.
+     * {@link herddb.index.vector.PersistentVectorStore} overrides this.
+     *
+     * @param segmentUuid the UUID of the segment to remove
+     */
+    public void dropSegmentByUuid(String segmentUuid) {
+        // No-op for non-persistent stores.
+    }
+
+    /**
+     * Reconciles adopted (externally-produced) segments against the ZK-reported
+     * snapshot. Any segment with a non-null external storage key whose UUID is
+     * absent from {@code knownUuids} is dropped via {@link #dropSegmentByUuid}.
+     *
+     * <p>Called at IS startup, after the initial {@code watchIndex} scan, to
+     * handle IS-was-down-while-optimizer-deleted scenarios.
+     *
+     * <p>The default implementation is a no-op (non-persistent stores have no
+     * adopted segments). {@link herddb.index.vector.PersistentVectorStore} overrides.
+     *
+     * @param knownUuids segment UUIDs currently visible in the ZK registry
+     */
+    public void reconcileAdoptedSegments(Set<String> knownUuids) {
+        // No-op for non-persistent stores.
     }
 
     @Override

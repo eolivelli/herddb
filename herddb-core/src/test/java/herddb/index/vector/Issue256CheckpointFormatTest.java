@@ -114,11 +114,12 @@ public class Issue256CheckpointFormatTest {
         // + bw (int) + neighborOverflow (float) + alpha (float) + addHierarchy (byte)
         // + fusedPQ (byte) + nextNodeId (long). Total header size = 4*4 + 4*2 + 2 + 8 = 34.
         // Issue #256 moved nextNodeId from writeInt to writeLong at that offset.
-        // Issue #499 dropped v3 support; all checkpoints are now written in v4 format.
+        // Issue #499 dropped v3 support; v4 format was introduced.
+        // Issue #514 adds externalStorageKey per segment; all checkpoints are now written in v5 format.
         byte[] raw = readRawIndexStatus(dsm, uuid);
         ByteBuffer bb = ByteBuffer.wrap(raw);
         int version = bb.getInt();
-        assertEquals("version must be 4 (v3 dropped per issue #499)", 4, version);
+        assertEquals("version must be 5 (V5 adds externalStorageKey per segment, issue #514)", 5, version);
         bb.getInt(); // dim
         bb.getInt(); // m
         bb.getInt(); // beamWidth
@@ -280,7 +281,7 @@ public class Issue256CheckpointFormatTest {
         assertTrue("metadata blob must be at least 34 bytes (header), got " + real.length,
                 real.length >= 34);
         try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(real))) {
-            assertEquals(4, dis.readInt());                 // version (v4 since issue #499)
+            assertEquals(5, dis.readInt());                 // version (v5 since issue #514; v4 was issue #499)
             assertEquals(16, dis.readInt());                // dim
             assertEquals(16, dis.readInt());                // m
             assertEquals(100, dis.readInt());               // beamWidth

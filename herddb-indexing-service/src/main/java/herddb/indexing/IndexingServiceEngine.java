@@ -339,14 +339,24 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
      * for the engine — subscribes to every {@code SegmentAssignmentWatcher}
      * created by this IS instance so the gauges + counters reflect the
      * union of segments owned across all indexes. Prometheus exposition
-     * happens through {@link #registerSegmentAssignmentMetrics}; the gauges
-     * stay at zero until the engine actually wires up an
-     * {@code SegmentAssignmentWatcher} (currently future-work — the metrics
-     * surface is live so the Grafana dashboard panels light up the moment
-     * the watcher integration lands).
+     * happens through {@link #registerSegmentAssignmentMetrics}.
      */
     private final herddb.indexing.segment.SegmentAssignmentMetrics segmentAssignmentMetrics =
             new herddb.indexing.segment.SegmentAssignmentMetrics();
+
+    /**
+     * One {@link herddb.indexing.segment.SegmentAssignmentWatcher} per vector store,
+     * keyed by {@link #storeKey}. Each watcher watches the ZK segment-registry subtree
+     * for that store's index and calls
+     * {@link herddb.index.vector.AbstractVectorStore#adoptExternalSegment} /
+     * {@link herddb.index.vector.AbstractVectorStore#dropSegmentByUuid} when the
+     * optimizer produces or deprecates segments (issue #514).
+     *
+     * <p>Populated by the {@code vectorStoreFactory} lambda and closed in
+     * {@link #close()}, before the vector stores themselves are closed.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, herddb.indexing.segment.SegmentAssignmentWatcher>
+            segmentWatchers = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * Issue #471 — engine-wide counters and timings for the
@@ -924,6 +934,139 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     store.start();
                 } catch (Exception e) {
                     throw new RuntimeException("Failed to start PersistentVectorStore " + indexName, e);
+                }
+
+                // Issue #514: arm a SegmentAssignmentWatcher so this store
+                // automatically adopts optimizer-merged segments and drops
+                // deprecated inputs without requiring a restart.
+                // The watcher is created AFTER store.start() so the store is
+                // fully initialised (dimension known, reconcile done) before
+                // the initial scan fires.
+                SegmentRegistryClient watcherRegistry = this.segmentRegistry;
+                if (watcherRegistry != null && tableSpaceUUID != null) {
+                    final herddb.index.vector.AbstractVectorStore finalStore = store;
+                    final String finalIndexUUID = autoIndexUUID;
+                    final String finalIndexName = indexName;
+                    herddb.indexing.segment.SegmentAssignmentWatcher watcher =
+                            new herddb.indexing.segment.SegmentAssignmentWatcher(
+                                    watcherRegistry, instanceId,
+                                    new herddb.indexing.segment.SegmentAssignmentListener() {
+                                        @Override
+                                        public void onSegmentAssigned(
+                                                herddb.indexing.segment.VersionedSegmentMetadata vsm) {
+                                            segmentAssignmentMetrics.onSegmentAssigned(vsm);
+                                            herddb.indexing.segment.SegmentMetadata m = vsm.metadata();
+                                            if (m.getMapFileSize() <= 0L) {
+                                                // Segment znode was written without mapFileSize
+                                                // (pre-issue-#484 format). Skip adoption — the
+                                                // segment cannot be read without a valid map size.
+                                                LOGGER.log(Level.WARNING,
+                                                        "Skipping adoption of segment "
+                                                                + m.getSegmentUuid()
+                                                                + " (mapFileSize="
+                                                                + m.getMapFileSize()
+                                                                + " <= 0): znode predates issue #484 fix");
+                                                return;
+                                            }
+                                            if (m.getSizeBytes() <= m.getMapFileSize()) {
+                                                // Corrupted or legacy znode: sizeBytes must be
+                                                // strictly larger than mapFileSize because
+                                                // sizeBytes = graphFileSize + mapFileSize and
+                                                // graphFileSize must be > 0. A zero or negative
+                                                // graphFileSize would corrupt the multipart read.
+                                                LOGGER.log(Level.WARNING,
+                                                        "Skipping adoption of segment "
+                                                                + m.getSegmentUuid()
+                                                                + " (sizeBytes=" + m.getSizeBytes()
+                                                                + " <= mapFileSize=" + m.getMapFileSize()
+                                                                + "): znode has invalid or zero graphFileSize");
+                                                return;
+                                            }
+                                            if (m.getGraphPath() == null
+                                                    || m.getGraphPath().isEmpty()
+                                                    || m.getMapPath() == null
+                                                    || m.getMapPath().isEmpty()) {
+                                                // Defensive guard: a znode without a graph or map
+                                                // path (e.g. a partial publish interrupted mid-write)
+                                                // would reach adoptExternalSegment and trigger an
+                                                // IllegalStateException in loadFusedPQSegment.
+                                                // Skip adoption and surface a WARNING instead.
+                                                LOGGER.log(Level.WARNING,
+                                                        "Skipping adoption of segment "
+                                                                + m.getSegmentUuid()
+                                                                + ": znode has null or empty "
+                                                                + "graphPath/mapPath");
+                                                return;
+                                            }
+                                            try {
+                                                finalStore.adoptExternalSegment(
+                                                        m.getSegmentUuid(),
+                                                        m.getSegmentId(),
+                                                        m.getGraphPath(),
+                                                        m.getSizeBytes() - m.getMapFileSize(),
+                                                        m.getMapPath(),
+                                                        m.getMapFileSize(),
+                                                        m.getGeneration());
+                                            } catch (java.io.IOException
+                                                    | herddb.storage.DataStorageManagerException e) {
+                                                LOGGER.log(Level.WARNING,
+                                                        "Failed to adopt external segment "
+                                                                + m.getSegmentUuid()
+                                                                + " into store " + finalIndexUUID, e);
+                                            }
+                                        }
+
+                                        @Override
+                                        public void onSegmentReleased(
+                                                herddb.indexing.segment.SegmentMetadata previous) {
+                                            if (previous == null) {
+                                                // Defence-in-depth: scanIndex now always passes
+                                                // the cached metadata for znode-gone events, but
+                                                // guard here in case a future code path differs.
+                                                LOGGER.log(Level.WARNING,
+                                                        "onSegmentReleased called with null metadata"
+                                                                + " for store " + finalIndexUUID
+                                                                + "; cannot drop by UUID");
+                                                return;
+                                            }
+                                            finalStore.dropSegmentByUuid(previous.getSegmentUuid());
+                                            segmentAssignmentMetrics.onSegmentReleased(previous);
+                                        }
+
+                                        @Override
+                                        public void onPendingAssignment(
+                                                herddb.indexing.segment.VersionedSegmentMetadata vsm) {
+                                            segmentAssignmentMetrics.onPendingAssignment(vsm);
+                                        }
+                                    });
+                    String watcherKey = storeKey(tableName, indexName);
+                    try {
+                        watcher.watchIndex(tableSpaceUUID, autoIndexUUID);
+                        // Startup reconcile: drop any adopted (external-storage-key)
+                        // segments that are not present in ZK. This handles the case
+                        // where the IS was down while the optimizer expired and deleted
+                        // a segment whose UUID is no longer in the registry. Without
+                        // the reconcile, the orphaned segment stays in the store
+                        // indefinitely and will fail at search time if the optimizer
+                        // has also deleted its multipart files.
+                        finalStore.reconcileAdoptedSegments(
+                                watcher.snapshotKnownSegments().keySet());
+                        segmentWatchers.put(watcherKey, watcher);
+                        LOGGER.log(Level.INFO,
+                                "SegmentAssignmentWatcher armed for store {0} (indexUuid={1})",
+                                new Object[]{watcherKey, finalIndexUUID});
+                    } catch (Exception e) {
+                        // Broad catch is intentional: both SegmentRegistryException (from
+                        // watchIndex) and unchecked RuntimeException (e.g. from
+                        // reconcileAdoptedSegments → dropSegmentByUuid → BLink close)
+                        // must close the watcher so its background refresh executor is
+                        // stopped and it does not leak outside segmentWatchers.
+                        LOGGER.log(Level.WARNING,
+                                "Failed to arm SegmentAssignmentWatcher for store " + finalIndexName
+                                        + " (indexUuid=" + finalIndexUUID
+                                        + "); external segment adoption disabled for this store", e);
+                        watcher.close();
+                    }
                 }
                 return store;
             };
@@ -1988,6 +2131,22 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
     }
 
     /**
+     * Test-only snapshot of the live {@code segmentWatchers} map (issue #514).
+     * Lets tests assert that DROP_INDEX / DROP_TABLE / TRUNCATE_TABLE correctly
+     * close and remove their corresponding {@link herddb.indexing.segment.SegmentAssignmentWatcher}
+     * entries so no background refresh executor leaks.
+     *
+     * @return an unmodifiable view of the current watcher map; keys are
+     *         {@link #storeKey} strings, values are (possibly already-closed)
+     *         watcher instances
+     */
+    // package-private for testing
+    java.util.Map<String, herddb.indexing.segment.SegmentAssignmentWatcher>
+            snapshotSegmentWatchersForTest() {
+        return java.util.Collections.unmodifiableMap(new java.util.HashMap<>(segmentWatchers));
+    }
+
+    /**
      * Applies a single (committed or non-transactional) entry.
      */
     // package-private for testing
@@ -2038,6 +2197,16 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 // (table, name) key does not mis-fire the "different UUID" guard and silently
                 // refuse to create the new store (issue #368 review).
                 vectorStoreIndexUuids.entrySet().removeIf(e -> e.getKey().startsWith(droppedTablePrefix));
+                // Close SegmentAssignmentWatchers for all dropped stores so their
+                // background refresh executors are stopped and ZK watcher callbacks
+                // can no longer fire after the stores are gone (issue #514).
+                segmentWatchers.entrySet().removeIf(e -> {
+                    if (e.getKey().startsWith(droppedTablePrefix)) {
+                        e.getValue().close();
+                        return true;
+                    }
+                    return false;
+                });
                 for (Map.Entry<String, AbstractVectorStore> dropped : toClose) {
                     submitVectorStoreDeletion(dropped.getKey(), dropped.getValue());
                 }
@@ -2084,6 +2253,15 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                 });
                 vectorStoreIndexUuids.entrySet().removeIf(
                         e -> e.getKey().startsWith(truncatedTablePrefix));
+                // Close SegmentAssignmentWatchers for the truncated stores.
+                // New watchers are created below when re-creating each store.
+                segmentWatchers.entrySet().removeIf(e -> {
+                    if (e.getKey().startsWith(truncatedTablePrefix)) {
+                        e.getValue().close();
+                        return true;
+                    }
+                    return false;
+                });
                 for (Map.Entry<String, AbstractVectorStore> dropped : toClose) {
                     submitVectorStoreDeletion(dropped.getKey(), dropped.getValue());
                 }
@@ -2126,6 +2304,14 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
                     String k = storeKey(idx.table, idx.name);
                     AbstractVectorStore removed = vectorStores.remove(k);
                     vectorStoreIndexUuids.remove(k);
+                    // Close the SegmentAssignmentWatcher so its background refresh
+                    // executor is stopped and no further ZK watcher callbacks fire
+                    // for a store that no longer exists (issue #514).
+                    herddb.indexing.segment.SegmentAssignmentWatcher removedWatcher =
+                            segmentWatchers.remove(k);
+                    if (removedWatcher != null) {
+                        removedWatcher.close();
+                    }
                     if (removed != null) {
                         // Close the store and drop its on-storage data
                         // (graph/map segments + IndexStatus markers).
@@ -4706,6 +4892,20 @@ public class IndexingServiceEngine implements AutoCloseable, VectorMemoryBudget 
         // S3 — on a wiped-disk restart the service would claim progress it
         // cannot actually replay. Replay from the last checkpoint watermark
         // on next boot is safe (apply is idempotent).
+
+        // Close segment-assignment watchers BEFORE vector stores so no adoption
+        // events fire against a half-closed store (issue #514).
+        for (herddb.indexing.segment.SegmentAssignmentWatcher w : segmentWatchers.values()) {
+            try {
+                w.close();
+            } catch (RuntimeException e) {
+                // close() is void and handles its own InterruptedException internally;
+                // this catch is a safety net for unexpected runtime failures that must
+                // not prevent the remaining shutdown steps from running.
+                LOGGER.log(Level.WARNING, "Error closing segment watcher during shutdown", e);
+            }
+        }
+        segmentWatchers.clear();
 
         // Close and clear all vector stores
         for (AbstractVectorStore store : vectorStores.values()) {

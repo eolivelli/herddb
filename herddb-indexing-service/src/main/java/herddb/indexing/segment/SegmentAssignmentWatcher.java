@@ -20,6 +20,7 @@
 package herddb.indexing.segment;
 
 import io.netty.util.concurrent.FastThreadLocalThread;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -157,11 +158,24 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
      *
      * <p>Synchronised on the watcher instance to serialise overlapping scans
      * (children watcher + data watcher + heartbeat could otherwise race).
+     *
+     * <p>Event ordering guarantee: all {@code onSegmentAssigned} callbacks are
+     * fired <em>before</em> any {@code onSegmentReleased} callback for the same
+     * scan. This prevents a zero-segment search window when the optimizer
+     * produces a merged segment and deprecates its inputs in the same ZK tick —
+     * the new ACTIVE segment is adopted before the deprecated inputs are dropped,
+     * regardless of lexicographic ZK children ordering.
      */
     synchronized void scanIndex(IndexKey key) throws SegmentRegistryException {
         Watcher childrenWatcher = (WatchedEvent event) -> dispatchScan(key);
         List<VersionedSegmentMetadata> current = registry.listSegments(
                 key.tablespaceUuid, key.indexUuid, childrenWatcher);
+
+        // Collect all event decisions first; fire them in two passes (assign,
+        // then release) to avoid a zero-segment window during optimizer adoption.
+        List<VersionedSegmentMetadata> toAssign = new ArrayList<>();
+        List<VersionedSegmentMetadata> toPending = new ArrayList<>();
+        List<SegmentMetadata> toRelease = new ArrayList<>();
 
         Set<String> seen = new HashSet<>();
         for (VersionedSegmentMetadata v : current) {
@@ -170,18 +184,32 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
             Watcher dataWatcher = (WatchedEvent event) -> dispatchScan(key);
             registry.getSegment(key.tablespaceUuid, key.indexUuid,
                     v.metadata().getSegmentUuid(), dataWatcher);
-            applyDiff(v);
+            collectDiff(v, toAssign, toPending, toRelease);
         }
-        // Drop any local entries whose znode is gone, and emit released events
-        // for segments we owned.
+        // Drop any local entries whose znode is gone, and collect released events
+        // for segments we owned. Pass the cached metadata (not null) so downstream
+        // listeners (e.g. IndexingServiceEngine) can call dropSegmentByUuid by UUID.
         Map<String, SegmentMetadata> snapshot = new HashMap<>(known);
         for (Map.Entry<String, SegmentMetadata> entry : snapshot.entrySet()) {
             if (!seen.contains(entry.getKey())) {
                 known.remove(entry.getKey());
                 if (entry.getValue().getOwnerInstanceId() == instanceId) {
-                    fireReleased(null);
+                    toRelease.add(entry.getValue());
                 }
             }
+        }
+
+        // Pass 1: assignments — new segments are live before any deprecated one is dropped.
+        for (VersionedSegmentMetadata vsm : toAssign) {
+            fireAssigned(vsm);
+        }
+        // Pass 2: pending-assignment notifications.
+        for (VersionedSegmentMetadata vsm : toPending) {
+            firePending(vsm);
+        }
+        // Pass 3: releases — deprecated/deleted inputs are dropped last.
+        for (SegmentMetadata m : toRelease) {
+            fireReleased(m);
         }
     }
 
@@ -212,7 +240,18 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
         }
     }
 
-    private void applyDiff(VersionedSegmentMetadata current) {
+    /**
+     * Computes which event (if any) to emit for one segment update and appends
+     * it to the appropriate decision list. Also updates the {@link #known} map.
+     *
+     * <p>Does <em>not</em> fire listener callbacks directly — the caller
+     * ({@link #scanIndex}) fires them after processing all segments, with
+     * assignments ordered before releases.
+     */
+    private void collectDiff(VersionedSegmentMetadata current,
+            List<VersionedSegmentMetadata> toAssign,
+            List<VersionedSegmentMetadata> toPending,
+            List<SegmentMetadata> toRelease) {
         SegmentMetadata m = current.metadata();
         SegmentMetadata previous = known.get(m.getSegmentUuid());
         known.put(m.getSegmentUuid(), m);
@@ -222,16 +261,24 @@ public final class SegmentAssignmentWatcher implements AutoCloseable {
         boolean isPending = m.getPendingOwnerInstanceId() == instanceId;
         boolean wasPending = previous != null && previous.getPendingOwnerInstanceId() == instanceId;
 
-        if (isOwner && !wasOwner) {
-            fireAssigned(current);
+        // A segment assigned to this instance is no longer "active for us" if
+        // (a) ownership transferred to a different instance, or
+        // (b) the optimizer deprecated it (state DEPRECATED) — the IS must stop
+        //     serving queries from the deprecated copy regardless of ownerInstanceId.
+        boolean nowDeprecatedOrGone = m.getState() == SegmentState.DEPRECATED
+                || m.getState() == SegmentState.DELETED;
+        boolean wasActive = previous == null || previous.getState() == SegmentState.ACTIVE;
+
+        if (isOwner && !wasOwner && !nowDeprecatedOrGone) {
+            toAssign.add(current);
             return;
         }
         if (isPending && !wasPending) {
-            firePending(current);
+            toPending.add(current);
             return;
         }
-        if (wasOwner && !isOwner) {
-            fireReleased(previous);
+        if (wasOwner && (!isOwner || (wasActive && nowDeprecatedOrGone))) {
+            toRelease.add(previous);
         }
     }
 

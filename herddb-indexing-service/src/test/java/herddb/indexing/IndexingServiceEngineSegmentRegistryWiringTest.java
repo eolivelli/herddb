@@ -31,14 +31,21 @@ import herddb.file.FileDataStorageManager;
 import herddb.file.FileMetadataStorageManager;
 import herddb.index.vector.AbstractVectorStore;
 import herddb.index.vector.PersistentVectorStore;
+import herddb.indexing.segment.SegmentAssignmentWatcher;
 import herddb.indexing.segment.SegmentMetadata;
 import herddb.indexing.segment.SegmentRegistryClient;
 import herddb.indexing.segment.SegmentState;
 import herddb.indexing.segment.VersionedSegmentMetadata;
+import herddb.log.LogEntryFactory;
+import herddb.log.LogSequenceNumber;
+import herddb.model.ColumnTypes;
+import herddb.model.Index;
+import herddb.model.Table;
 import herddb.utils.Bytes;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -355,6 +362,219 @@ public class IndexingServiceEngineSegmentRegistryWiringTest {
             engineLogger.setLevel(previousLevel);
             fsMeta.close();
         }
+    }
+
+    /**
+     * Regression test for issue #514: DROP_INDEX must close and remove the
+     * {@link SegmentAssignmentWatcher} that was armed when the index was
+     * created. Without the fix, the watcher's background refresh executor
+     * kept running indefinitely after the index was dropped, and its ZK
+     * callbacks could fire against a store that had already been closed.
+     */
+    @Test
+    public void dropIndexClosesSegmentWatcher() throws Exception {
+        Path logDir = tmpFolder.newFolder("log-drop").toPath();
+        Path dataDir = tmpFolder.newFolder("data-drop").toPath();
+        String basePath = "/herd-test-514-drop-watcher";
+
+        Properties props = new Properties();
+        props.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "file");
+        props.setProperty(IndexingServerConfiguration.PROPERTY_INDEX_OPTIMIZER_ENABLED, "true");
+        props.setProperty(IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS, "10000");
+        props.setProperty(IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS, "100");
+        IndexingServerConfiguration config = new IndexingServerConfiguration(props);
+
+        try (ZookeeperMetadataStorageManager zkMeta = new ZookeeperMetadataStorageManager(
+                zkServer.getConnectString(), 30000, basePath)) {
+            zkMeta.start(true);
+            zkMeta.ensureDefaultTableSpace("local", "local", 0, 1);
+
+            FileDataStorageManager dsm = new FileDataStorageManager(dataDir);
+            MemoryManager mm = new MemoryManager(
+                    128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+
+            try (IndexingServiceEngine engine =
+                    new IndexingServiceEngine(logDir, dataDir, config)) {
+                engine.setMetadataStorageManager(zkMeta);
+                engine.setDataStorageManager(dsm);
+                engine.setMemoryManager(mm);
+                engine.start();
+
+                // Apply CREATE_TABLE + CREATE_INDEX so the engine creates a
+                // PersistentVectorStore and arms a SegmentAssignmentWatcher for it.
+                Table table = buildDropTable("drop_t");
+                Index idx = buildDropVectorIndex("drop_v", "drop_t");
+                engine.applyEntry(new LogSequenceNumber(1, 1),
+                        LogEntryFactory.createTable(table, null));
+                engine.applyEntry(new LogSequenceNumber(1, 2),
+                        LogEntryFactory.createIndex(idx, null));
+
+                // Verify the watcher was registered.
+                Map<String, SegmentAssignmentWatcher> watchersBefore =
+                        engine.snapshotSegmentWatchersForTest();
+                assertEquals("watcher must be registered after CREATE_INDEX",
+                        1, watchersBefore.size());
+
+                // Apply DROP_INDEX: must close and remove the watcher.
+                engine.applyEntry(new LogSequenceNumber(1, 3),
+                        LogEntryFactory.dropIndex("drop_v", null));
+                engine.awaitPendingWorkForTest();
+
+                Map<String, SegmentAssignmentWatcher> watchersAfter =
+                        engine.snapshotSegmentWatchersForTest();
+                assertEquals(
+                        "DROP_INDEX must remove the SegmentAssignmentWatcher "
+                                + "(issue #514 watcher-leak fix)",
+                        0, watchersAfter.size());
+            }
+        }
+    }
+
+    /**
+     * Regression test for issue #514: DROP_TABLE must close and remove all
+     * {@link SegmentAssignmentWatcher} entries for that table's vector indexes,
+     * not just the vector stores themselves.
+     */
+    @Test
+    public void dropTableClosesSegmentWatcher() throws Exception {
+        Path logDir = tmpFolder.newFolder("log-droptbl").toPath();
+        Path dataDir = tmpFolder.newFolder("data-droptbl").toPath();
+        String basePath = "/herd-test-514-droptable-watcher";
+
+        Properties props = new Properties();
+        props.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "file");
+        props.setProperty(IndexingServerConfiguration.PROPERTY_INDEX_OPTIMIZER_ENABLED, "true");
+        props.setProperty(IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS, "10000");
+        props.setProperty(IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS, "100");
+        IndexingServerConfiguration config = new IndexingServerConfiguration(props);
+
+        try (ZookeeperMetadataStorageManager zkMeta = new ZookeeperMetadataStorageManager(
+                zkServer.getConnectString(), 30000, basePath)) {
+            zkMeta.start(true);
+            zkMeta.ensureDefaultTableSpace("local", "local", 0, 1);
+
+            FileDataStorageManager dsm = new FileDataStorageManager(dataDir);
+            MemoryManager mm = new MemoryManager(
+                    128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+
+            try (IndexingServiceEngine engine =
+                    new IndexingServiceEngine(logDir, dataDir, config)) {
+                engine.setMetadataStorageManager(zkMeta);
+                engine.setDataStorageManager(dsm);
+                engine.setMemoryManager(mm);
+                engine.start();
+
+                Table table = buildDropTable("droptbl_t");
+                Index idx = buildDropVectorIndex("droptbl_v", "droptbl_t");
+                engine.applyEntry(new LogSequenceNumber(1, 1),
+                        LogEntryFactory.createTable(table, null));
+                engine.applyEntry(new LogSequenceNumber(1, 2),
+                        LogEntryFactory.createIndex(idx, null));
+
+                assertEquals("watcher must be registered after CREATE_INDEX",
+                        1, engine.snapshotSegmentWatchersForTest().size());
+
+                // DROP_TABLE: must close and remove all watchers for this table.
+                engine.applyEntry(new LogSequenceNumber(1, 3),
+                        LogEntryFactory.dropTable(table, null));
+                engine.awaitPendingWorkForTest();
+
+                assertEquals(
+                        "DROP_TABLE must remove the SegmentAssignmentWatcher "
+                                + "(issue #514 watcher-leak fix)",
+                        0, engine.snapshotSegmentWatchersForTest().size());
+            }
+        }
+    }
+
+    /**
+     * Regression test for issue #514: TRUNCATE_TABLE must close the old
+     * {@link SegmentAssignmentWatcher} and the re-created store must arm
+     * a fresh watcher so subsequent optimizer adoption still works.
+     */
+    @Test
+    public void truncateTableClosesAndRecreatesSegmentWatcher() throws Exception {
+        Path logDir = tmpFolder.newFolder("log-trunc").toPath();
+        Path dataDir = tmpFolder.newFolder("data-trunc").toPath();
+        String basePath = "/herd-test-514-truncate-watcher";
+
+        Properties props = new Properties();
+        props.setProperty(IndexingServerConfiguration.PROPERTY_STORAGE_TYPE, "file");
+        props.setProperty(IndexingServerConfiguration.PROPERTY_INDEX_OPTIMIZER_ENABLED, "true");
+        props.setProperty(IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_TIMEOUT_MS, "10000");
+        props.setProperty(IndexingServerConfiguration.PROPERTY_TABLESPACE_WAIT_POLL_INTERVAL_MS, "100");
+        IndexingServerConfiguration config = new IndexingServerConfiguration(props);
+
+        try (ZookeeperMetadataStorageManager zkMeta = new ZookeeperMetadataStorageManager(
+                zkServer.getConnectString(), 30000, basePath)) {
+            zkMeta.start(true);
+            zkMeta.ensureDefaultTableSpace("local", "local", 0, 1);
+
+            FileDataStorageManager dsm = new FileDataStorageManager(dataDir);
+            MemoryManager mm = new MemoryManager(
+                    128 * 1024 * 1024, 0, 1024 * 1024, 1024 * 1024);
+
+            try (IndexingServiceEngine engine =
+                    new IndexingServiceEngine(logDir, dataDir, config)) {
+                engine.setMetadataStorageManager(zkMeta);
+                engine.setDataStorageManager(dsm);
+                engine.setMemoryManager(mm);
+                engine.start();
+
+                Table table = buildDropTable("trunc_t");
+                Index idx = buildDropVectorIndex("trunc_v", "trunc_t");
+                engine.applyEntry(new LogSequenceNumber(1, 1),
+                        LogEntryFactory.createTable(table, null));
+                engine.applyEntry(new LogSequenceNumber(1, 2),
+                        LogEntryFactory.createIndex(idx, null));
+
+                Map<String, SegmentAssignmentWatcher> watchersBefore =
+                        engine.snapshotSegmentWatchersForTest();
+                assertEquals("watcher must be registered after CREATE_INDEX",
+                        1, watchersBefore.size());
+                SegmentAssignmentWatcher oldWatcher =
+                        watchersBefore.values().iterator().next();
+
+                // TRUNCATE_TABLE: closes old watcher, re-creates store, arms new watcher.
+                engine.applyEntry(new LogSequenceNumber(1, 3),
+                        LogEntryFactory.truncate(table, null));
+                engine.awaitPendingWorkForTest();
+
+                Map<String, SegmentAssignmentWatcher> watchersAfter =
+                        engine.snapshotSegmentWatchersForTest();
+                assertEquals(
+                        "TRUNCATE_TABLE must re-arm exactly one SegmentAssignmentWatcher "
+                                + "(issue #514 watcher-leak fix)",
+                        1, watchersAfter.size());
+                SegmentAssignmentWatcher newWatcher =
+                        watchersAfter.values().iterator().next();
+                assertTrue(
+                        "TRUNCATE_TABLE must create a NEW watcher, not keep the old one",
+                        oldWatcher != newWatcher);
+            }
+        }
+    }
+
+    private static Table buildDropTable(String name) {
+        int h = name.hashCode() & 0x7FFFFFFF;
+        return Table.builder()
+                .name(name)
+                .tablespace("default")
+                .column("pk", ColumnTypes.STRING)
+                .column("vec", ColumnTypes.FLOATARRAY)
+                .primaryKey("pk")
+                .tableId(h == 0 ? 1 : h)
+                .build();
+    }
+
+    private static Index buildDropVectorIndex(String name, String tableName) {
+        return Index.builder()
+                .name(name)
+                .table(tableName)
+                .tablespace("default")
+                .type(Index.TYPE_VECTOR)
+                .column("vec", ColumnTypes.FLOATARRAY)
+                .build();
     }
 
     private float[] randomVector(Random rng, int dim) {

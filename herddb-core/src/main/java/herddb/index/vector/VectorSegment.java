@@ -158,6 +158,17 @@ class VectorSegment implements Closeable {
     /** Total size in bytes of the map multipart file (valid only when mapFilePath != null). */
     long mapFileSize;
 
+    /**
+     * Multipart storage key for externally-produced segments (i.e. output of the
+     * index-optimizer service). When non-null, used everywhere in place of the legacy
+     * computed key {@code indexUUID + "_seg" + segmentId}.
+     *
+     * <p>The optimizer allocates 63-bit random {@code long} segment IDs that cannot be
+     * represented by the {@code int segmentId} field, so the storage key must be carried
+     * explicitly. {@code null} for IS-locally-produced segments (the normal case).
+     */
+    String externalStorageKey;
+
     VectorSegment(int segmentId) {
         this.segmentId = segmentId;
     }
