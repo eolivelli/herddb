@@ -23,6 +23,7 @@ package herddb.indexing;
 import com.google.common.util.concurrent.ListenableFuture;
 import herddb.index.vector.RemoteVectorIndexService;
 import herddb.indexing.proto.DropIndexRequest;
+import herddb.indexing.proto.DropIndexResponse;
 import herddb.indexing.proto.GetIndexStatusRequest;
 import herddb.indexing.proto.GetIndexStatusResponse;
 import herddb.indexing.proto.IndexingServiceGrpc;
@@ -557,15 +558,24 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
         throw new RuntimeException("All IndexingService instances failed for GetIndexStatus");
     }
 
+    // Maximum wall-clock time for the entire dropIndex fan-out across all IS pods.
+    // All RPCs are dispatched in parallel so this is the total budget, not per-pod.
+    private static final long DROP_INDEX_TOTAL_TIMEOUT_SECONDS = 3L;
+
     /**
-     * Issue #509: sends a {@code DropIndex} RPC to every IS instance
-     * (not just one) so each instance can immediately begin background
-     * cleanup of its ZK segment registry and file-server data for the
-     * named index. Best-effort: failures are logged at WARNING and do not
-     * propagate — the commit-log tailer path handles cleanup when the IS
-     * recovers. Old IS pods that do not yet implement {@code DropIndex}
-     * return {@code UNIMPLEMENTED}; those failures are also treated as
-     * warnings, not errors.
+     * Issue #509: sends a {@code DropIndex} RPC to every IS instance in
+     * parallel so each pod can immediately begin background cleanup of its ZK
+     * segment registry and file-server data for the named index.
+     *
+     * <p>All RPCs are dispatched concurrently via future stubs; the total
+     * wall-time is bounded by {@value #DROP_INDEX_TOTAL_TIMEOUT_SECONDS}
+     * seconds regardless of pod count.
+     *
+     * <p>Best-effort: failures are logged at WARNING and do not propagate —
+     * the commit-log tailer path handles cleanup when the IS recovers. Old IS
+     * pods that have not yet implemented {@code DropIndex} return
+     * {@code UNIMPLEMENTED}; those are logged at INFO (not WARNING) since they
+     * are expected during rolling upgrades.
      */
     @Override
     public void dropIndex(String tablespace, String table, String indexName) {
@@ -582,26 +592,60 @@ public class IndexingServiceClient implements RemoteVectorIndexService {
                 .setTable(table)
                 .setIndex(indexName)
                 .build();
-        // Notify all instances — every IS pod may hold data for this index
-        // and should clean up eagerly.
+
+        // Dispatch all RPCs at once; total wall-time bounded by deadline below.
+        long deadlineNanos = System.nanoTime()
+                + TimeUnit.SECONDS.toNanos(DROP_INDEX_TOTAL_TIMEOUT_SECONDS);
+        List<Map.Entry<String, ListenableFuture<DropIndexResponse>>> inflight =
+                new ArrayList<>(s.channels.size());
         for (Map.Entry<String, ManagedChannel> entry : s.channels.entrySet()) {
-            String addr = entry.getKey();
+            long remaining = Math.max(1L, deadlineNanos - System.nanoTime());
+            IndexingServiceGrpc.IndexingServiceFutureStub stub =
+                    IndexingServiceGrpc.newFutureStub(entry.getValue())
+                            .withDeadlineAfter(remaining, TimeUnit.NANOSECONDS);
+            inflight.add(new AbstractMap.SimpleImmutableEntry<>(
+                    entry.getKey(), stub.dropIndex(req)));
+        }
+
+        // Collect results; log failures without propagating them.
+        for (Map.Entry<String, ListenableFuture<DropIndexResponse>> f : inflight) {
+            String addr = f.getKey();
+            long remaining = deadlineNanos - System.nanoTime();
+            if (remaining <= 0) {
+                f.getValue().cancel(true);
+                LOGGER.log(Level.WARNING,
+                        "dropIndex: overall deadline expired before awaiting IS "
+                                + "instance {0} for index {1}",
+                        new Object[]{addr, indexName});
+                continue;
+            }
             try {
-                IndexingServiceGrpc.IndexingServiceBlockingStub stub =
-                        IndexingServiceGrpc.newBlockingStub(entry.getValue())
-                                .withDeadlineAfter(timeoutSeconds, TimeUnit.SECONDS);
-                stub.dropIndex(req);
+                f.getValue().get(remaining, TimeUnit.NANOSECONDS);
                 LOGGER.log(Level.INFO,
                         "dropIndex: notified IS instance {0} to clean up index {1}",
                         new Object[]{addr, indexName});
-            } catch (RuntimeException e) {
-                // Plugin boundary: UNIMPLEMENTED means old IS pod; UNAVAILABLE
-                // means the pod is restarting. In both cases the tailer is the
-                // fallback — log a warning and continue with the other instances.
-                LOGGER.log(Level.WARNING,
+            } catch (ExecutionException ee) {
+                Throwable cause = ee.getCause();
+                // UNIMPLEMENTED = old IS pod without DropIndex support
+                // (expected during rolling upgrades) — log at INFO, not WARNING.
+                boolean isUnimplemented = (cause instanceof StatusRuntimeException)
+                        && ((StatusRuntimeException) cause).getStatus().getCode()
+                                == Status.Code.UNIMPLEMENTED;
+                LOGGER.log(isUnimplemented ? Level.INFO : Level.WARNING,
                         "dropIndex: RPC to IS instance {0} failed for index {1} "
                                 + "(cleanup via commit-log tailer): {2}",
-                        new Object[]{addr, indexName, e.getMessage()});
+                        new Object[]{addr, indexName,
+                                cause != null ? cause.getMessage() : "unknown"});
+            } catch (TimeoutException te) {
+                f.getValue().cancel(true);
+                LOGGER.log(Level.WARNING,
+                        "dropIndex: timed out waiting for IS instance {0} for index {1}",
+                        new Object[]{addr, indexName});
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                LOGGER.log(Level.WARNING,
+                        "dropIndex: interrupted waiting for IS instance {0} for index {1}",
+                        new Object[]{addr, indexName});
             }
         }
     }

@@ -235,6 +235,26 @@ public abstract class AbstractIndexManager implements AutoCloseable {
     }
 
     /**
+     * Issue #509: eagerly notifies any remote service (e.g. the IndexingService)
+     * that this index has been permanently dropped, so it can begin background
+     * cleanup of its ZK segment registry and file-server data without waiting
+     * for the commit-log tailer to catch up.
+     *
+     * <p>This method is called synchronously from {@code disposeIndexManager()}
+     * (the actual SQL DROP path) and dispatched asynchronously from there so
+     * that the DDL write lock is not held during gRPC fan-out. It is
+     * intentionally <em>not</em> called from follower-download or restore paths
+     * that invoke {@link #dropIndexData()} directly — those paths only reset
+     * local catalog storage while the index remains live in the cluster schema.
+     *
+     * <p>Default implementation is a no-op; only index types that have a remote
+     * service component (e.g. vector indexes) override this.
+     */
+    public void notifyIsOfDrop() {
+        // no-op for non-remote index types
+    }
+
+    /**
      * Truncate the index from persist storage
      * <p>
      * Differs from {@link #dropIndexData()} because it leaves in place every support structure needed by index runtime (for example if index is persisted into a directory it doesn't delete the
