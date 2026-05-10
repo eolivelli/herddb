@@ -26,12 +26,19 @@
 #   ./install.sh [OPTIONS]
 #
 # Options:
-#   --zip <path>         Path to the herddb-services-*.zip to install.
-#                        Default: auto-discover from herddb-services/target.
-#   --server-heap <size> -Xms/-Xmx for the server JVM (default: 8g).
-#   --reuse              Do not wipe $CLUSTER_DIR if it already exists;
-#                        just (re-)start the server.
-#   --help               Show this help and exit.
+#   --zip <path>                Path to the herddb-services-*.zip to install.
+#                               Default: auto-discover from herddb-services/target.
+#   --server-heap <size>        -Xms/-Xmx for the server JVM (default: 8g).
+#   --pk-memory-percentage <v>  Fraction of io.netty.maxDirectMemory reserved for
+#                               the BLink PK page cache (server.memory.pk.percentage).
+#                               Value is a decimal between 0 and 1 (default: 0.50).
+#   --data-memory-percentage <v> Fraction of io.netty.maxDirectMemory reserved for
+#                               data pages (server.memory.data.percentage).
+#                               Value is a decimal between 0 and 1 (default: 0.30).
+#                               pk + data should stay below 1.0.
+#   --reuse                     Do not wipe $CLUSTER_DIR if it already exists;
+#                               just (re-)start the server.
+#   --help                      Show this help and exit.
 #
 # Directory layout:
 #   The server is installed under $HERDDB_SERVER_HOME when set, otherwise
@@ -46,6 +53,8 @@ source "$SCRIPT_DIR/scripts/common.sh"
 
 ZIP=""
 SERVER_HEAP="8g"
+PK_MEMORY_PERCENTAGE="0.50"
+DATA_MEMORY_PERCENTAGE="0.30"
 REUSE=false
 
 usage() {
@@ -55,10 +64,12 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --zip)          ZIP="$2"; shift 2 ;;
-        --server-heap)  SERVER_HEAP="$2"; shift 2 ;;
-        --reuse)        REUSE=true; shift ;;
-        --help|-h)      usage ;;
+        --zip)                    ZIP="$2"; shift 2 ;;
+        --server-heap)            SERVER_HEAP="$2"; shift 2 ;;
+        --pk-memory-percentage)   PK_MEMORY_PERCENTAGE="$2"; shift 2 ;;
+        --data-memory-percentage) DATA_MEMORY_PERCENTAGE="$2"; shift 2 ;;
+        --reuse)                  REUSE=true; shift ;;
+        --help|-h)                usage ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -129,6 +140,21 @@ if ! grep -q '^server.checkpoint.period=' "$CONFIGFILE"; then
     echo "server.checkpoint.period=450000" >> "$CONFIGFILE"
 fi
 
+# BLink PK page-cache memory fraction: controls how much of io.netty.maxDirectMemory
+# is reserved for the BLink primary-key page cache.
+# Default HerdDB value is 0.20; we raise it to give the PK index more room at
+# high row counts.  Pair with a reduced data percentage so pk + data < 1.0.
+if ! grep -q '^server.memory.pk.percentage=' "$CONFIGFILE"; then
+    echo "server.memory.pk.percentage=${PK_MEMORY_PERCENTAGE}" >> "$CONFIGFILE"
+fi
+
+# Data page-cache memory fraction: controls how much of io.netty.maxDirectMemory
+# is reserved for data pages.  Default HerdDB value is 0.50; reduced here to
+# make room for the enlarged PK cache above.
+if ! grep -q '^server.memory.data.percentage=' "$CONFIGFILE"; then
+    echo "server.memory.data.percentage=${DATA_MEMORY_PERCENTAGE}" >> "$CONFIGFILE"
+fi
+
 # Optionally relocate the commit log.
 if [[ -n "$COMMIT_LOG_DIR" ]]; then
     if grep -q '^server.log.dir=' "$CONFIGFILE"; then
@@ -139,10 +165,10 @@ if [[ -n "$COMMIT_LOG_DIR" ]]; then
 fi
 
 # ── Start the server ─────────────────────────────────────────────────────────
-section "Starting HerdDB server (heap=${SERVER_HEAP})"
+section "Starting HerdDB server (heap=${SERVER_HEAP}, pk-memory-percentage=${PK_MEMORY_PERCENTAGE}, data-memory-percentage=${DATA_MEMORY_PERCENTAGE})"
 export JAVA_OPTS="-XX:+UseG1GC -Duser.language=en -Xmx${SERVER_HEAP} -Xms${SERVER_HEAP} \
 -Djava.net.preferIPv4Stack=true \
--XX:MaxDirectMemorySize=4g -Dio.netty.maxDirectMemory=4294967296 \
+-XX:MaxDirectMemorySize=8g -Dio.netty.maxDirectMemory=8589934592 \
 -XX:+DisableExplicitGC -Djava.awt.headless=true \
 -Djava.util.logging.config.file=conf/logging.properties \
 --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError \
