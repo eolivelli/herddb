@@ -126,7 +126,17 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     public static final int DEFAULT_BLOCK_SIZE = 4 * 1024 * 1024;
     /** Default cap on in-flight read bytes: 256 MiB (issue #246). */
     public static final long DEFAULT_CLIENT_MAX_INFLIGHT_READ_BYTES = 256L * 1024 * 1024;
-    /** Default cap on in-flight write bytes: 256 MiB (issue #468). */
+    /**
+     * Default cap on in-flight write bytes: 256 MiB (issue #468).
+     *
+     * <p>This value intentionally keeps back-pressure active. Payloads that
+     * exceed the cap (e.g. a large serialised open-transactions blob written
+     * during a checkpoint — issue #523) are handled without deadlocking by
+     * {@link #acquireInflightWriteBytes}: the acquisition is capped to
+     * {@code writePermits} and performed in {@link #blockSize}-sized chunks
+     * so that the full semaphore capacity is never requested in a single
+     * {@code acquireUninterruptibly} call.
+     */
     public static final long DEFAULT_CLIENT_MAX_INFLIGHT_WRITE_BYTES = 256L * 1024 * 1024;
     /**
      * Emit a WARNING log line if acquiring the in-flight reservation
@@ -165,6 +175,8 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     private final long maxInflightReadBytes;
     private final Semaphore inflightReadBytes;
     private final long maxInflightWriteBytes;
+    /** Semaphore capacity for writes: {@code min(maxInflightWriteBytes, Integer.MAX_VALUE)}. */
+    private final int writePermits;
     private final Semaphore inflightWriteBytes;
     private final ScheduledExecutorService retryScheduler;
     private final Supplier<String> oidcTokenSupplier;
@@ -232,10 +244,10 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
                     + ") so a single full-block write is always admissible");
         }
         this.maxInflightWriteBytes = configuredMaxInflightWriteBytes;
-        int writePermits = maxInflightWriteBytes > Integer.MAX_VALUE
+        this.writePermits = maxInflightWriteBytes > Integer.MAX_VALUE
                 ? Integer.MAX_VALUE
                 : (int) maxInflightWriteBytes;
-        this.inflightWriteBytes = new Semaphore(writePermits);
+        this.inflightWriteBytes = new Semaphore(this.writePermits);
         this.retryScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             FastThreadLocalThread t = new FastThreadLocalThread(r, "remote-file-retry");
             t.setDaemon(true);
@@ -330,25 +342,79 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
         inflightReadBytes.release(bytes);
     }
 
-    private void acquireInflightWriteBytes(int bytes) {
+    /**
+     * Acquires permits from the in-flight write-bytes semaphore and returns
+     * the number of permits actually taken (which may be less than
+     * {@code bytes} when the payload exceeds the configured cap — see below).
+     *
+     * <h3>Deadlock prevention (issue #523)</h3>
+     * <p>{@link java.util.concurrent.Semaphore#acquireUninterruptibly(int)}
+     * blocks forever when the requested count exceeds the semaphore's total
+     * capacity. Large single-shot writes (e.g. the serialised
+     * open-transactions blob written during a checkpoint) can exceed the
+     * 256 MiB default. To avoid the permanent block:
+     * <ol>
+     *   <li>The requested permits are capped to {@link #writePermits} (the
+     *       semaphore's initial capacity): {@code toAcquire = min(bytes, writePermits)}.
+     *   <li>On the slow path the acquisition is done in chunks of
+     *       {@link #blockSize} so that smaller concurrent writes can
+     *       interleave between chunks.
+     *   <li>A WARNING is logged when the payload exceeds the cap (so
+     *       operators can tune {@link #CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES})
+     *       and a separate WARNING is logged before blocking begins
+     *       (previously the warning only fired after unblocking).
+     * </ol>
+     *
+     * @return the number of permits actually acquired; always
+     *         {@code min(bytes, writePermits)} and always &gt; 0.
+     */
+    private int acquireInflightWriteBytes(int bytes) {
         if (bytes <= 0) {
             throw new IllegalArgumentException("bytes must be > 0, got " + bytes);
         }
-        if (inflightWriteBytes.tryAcquire(bytes)) {
-            return;
+        // Cap to semaphore capacity — requesting more than writePermits would
+        // deadlock on acquireUninterruptibly.
+        int toAcquire = Math.min(bytes, writePermits);
+        if (bytes > writePermits) {
+            // Payload exceeds the cap. We will hold up to writePermits permits at
+            // a time; smaller concurrent writes can interleave between chunks.
+            logPreservingInterrupt(Level.WARNING,
+                    "remote file client write payload ({0} bytes) exceeds inflight-write cap "
+                            + "({1} bytes); will hold up to {1} permits at a time during "
+                            + "this write — consider raising "
+                            + CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
+                    new Object[]{bytes, writePermits});
         }
+        // Fast path: all permits available right now.
+        if (inflightWriteBytes.tryAcquire(toAcquire)) {
+            return toAcquire;
+        }
+        // Slow path: acquire in chunks of blockSize so smaller concurrent
+        // writes can interleave. Warn before blocking starts.
+        logPreservingInterrupt(Level.WARNING,
+                "remote file client inflight-write reservation blocked "
+                        + "(requested={0} bytes, available={1}/{2}); waiting — consider raising "
+                        + CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES
+                        + " or reducing concurrent compaction/page-write load",
+                new Object[]{toAcquire, inflightWriteBytes.availablePermits(),
+                        maxInflightWriteBytes});
         long startNanos = System.nanoTime();
-        inflightWriteBytes.acquireUninterruptibly(bytes);
+        int acquired = 0;
+        while (acquired < toAcquire) {
+            int chunk = Math.min(toAcquire - acquired, blockSize);
+            inflightWriteBytes.acquireUninterruptibly(chunk);
+            acquired += chunk;
+        }
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
         if (elapsedMs >= PERMIT_ACQUIRE_WARN_THRESHOLD_MS) {
-            LOGGER.log(Level.WARNING,
-                    "remote file client inflight-write reservation blocked for {0}ms "
+            logPreservingInterrupt(Level.WARNING,
+                    "remote file client inflight-write reservation unblocked after {0}ms "
                             + "(requested={1} bytes, available={2}/{3}); consider raising "
-                            + CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES
-                            + " or reducing concurrent compaction/page-write load",
-                    new Object[]{elapsedMs, bytes, inflightWriteBytes.availablePermits(),
+                            + CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES,
+                    new Object[]{elapsedMs, toAcquire, inflightWriteBytes.availablePermits(),
                             maxInflightWriteBytes});
         }
+        return toAcquire;
     }
 
     private void releaseInflightWriteBytes(int bytes) {
@@ -356,26 +422,55 @@ public class RemoteFileServiceClient implements AutoCloseable, RemoteFileClient 
     }
 
     /**
-     * Acquires {@code bytes} from the in-flight write-bytes budget and
-     * returns an idempotent {@link Runnable} that releases the same number
-     * of permits exactly once. Callers wire the runnable into the
-     * {@code whenComplete} hook of the future returned by
-     * {@code sendRequest}, and into every synchronous failure branch (e.g.
-     * {@code writeChannelForBlock} throwing) so the reservation is always
-     * returned. Empty payloads ({@code bytes == 0}) skip both the acquire
-     * and the release — {@link #writeAsMultipart} legitimately uses
+     * Emits a log record at the given level while preserving the calling
+     * thread's interrupt status.
+     *
+     * <p>Some I/O streams that back the log handler (e.g. a pipe that Maven
+     * Surefire uses to capture test output) silently consume the interrupt
+     * flag. Callers that need interrupt-sensitive semantics around
+     * {@link java.util.concurrent.Semaphore#acquireUninterruptibly} must
+     * use this wrapper so that the flag survives the log call.
+     */
+    private static void logPreservingInterrupt(Level level, String msg, Object[] params) {
+        boolean interrupted = Thread.interrupted();
+        try {
+            LOGGER.log(level, msg, params);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * Acquires permits from the in-flight write-bytes budget via
+     * {@link #acquireInflightWriteBytes} and returns an idempotent
+     * {@link Runnable} that releases the same number of permits exactly once.
+     *
+     * <p>Callers wire the runnable into the {@code whenComplete} hook of the
+     * future returned by {@code sendRequest}, and into every synchronous
+     * failure branch (e.g. {@code writeChannelForBlock} throwing) so the
+     * reservation is always returned.
+     *
+     * <p>Empty payloads ({@code bytes == 0}) skip both the acquire and the
+     * release — {@link #writeAsMultipart} legitimately uses
      * {@code Unpooled.EMPTY_BUFFER} to materialise an empty file marker
      * and would otherwise be rejected by {@link #acquireInflightWriteBytes}.
+     *
+     * <p>When {@code bytes > writePermits} the returned runnable releases
+     * only {@code writePermits} permits (the amount actually acquired),
+     * never {@code bytes}, so the semaphore is never over-inflated.
      */
     private Runnable reserveInflightWriteBytes(int bytes) {
         if (bytes <= 0) {
             return () -> { };
         }
-        acquireInflightWriteBytes(bytes);
+        // acquired may be < bytes when the payload exceeds the cap.
+        int acquired = acquireInflightWriteBytes(bytes);
         AtomicBoolean released = new AtomicBoolean(false);
         return () -> {
             if (released.compareAndSet(false, true)) {
-                releaseInflightWriteBytes(bytes);
+                releaseInflightWriteBytes(acquired);
             }
         };
     }

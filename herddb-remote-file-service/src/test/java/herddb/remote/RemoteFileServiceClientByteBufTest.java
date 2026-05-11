@@ -1184,4 +1184,222 @@ public class RemoteFileServiceClientByteBufTest {
                 client.maxInflightWriteBytes(),
                 client.availableInflightWriteBytes());
     }
+
+    // -----------------------------------------------------------------
+    // Issue #523 — oversized single-shot write (payload > cap) must not
+    // deadlock and must restore the budget exactly.
+    // -----------------------------------------------------------------
+
+    /**
+     * Regression test for issue #523: a single {@code writeFile} whose
+     * payload exceeds the configured inflight-write cap used to block
+     * forever on {@code Semaphore.acquireUninterruptibly(bytes)} because a
+     * semaphore can never grant more permits than its initial count.
+     *
+     * <p>The fix caps the acquisition to {@code min(bytes, writePermits)} and
+     * acquires on the slow path in {@link RemoteFileServiceClient#blockSize}-
+     * sized chunks. This test uses a cap equal to exactly one block (4 MiB)
+     * and a payload of two blocks (8 MiB); before the fix the test would hang
+     * until the 30-second {@code @Test(timeout)} fires.
+     */
+    @Test(timeout = 30_000)
+    public void testInflightWriteBytes_oversizedWriteDoesNotDeadlock() throws Exception {
+        int blockSize = RemoteFileServiceClient.DEFAULT_BLOCK_SIZE;
+        long cap = blockSize; // 1 block = 4 MiB cap
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, blockSize);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, cap);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            // 2× cap — with the old code this would deadlock:
+            // acquireUninterruptibly(2*cap) on a semaphore with cap permits.
+            byte[] payload = new byte[blockSize * 2];
+            Arrays.fill(payload, (byte) 0xAB);
+            tuned.writeFile("test/permits/write/oversized-nodead.bin", payload);
+            assertEquals("budget restored to cap (not to raw bytes) after oversized write",
+                    cap, tuned.availableInflightWriteBytes());
+        }
+    }
+
+    /**
+     * After an oversized {@code writeFile} (payload &gt; cap) completes, the
+     * inflight-write budget must be restored to exactly {@code cap} — not to
+     * the raw payload size. Before the fix, {@code reserveInflightWriteBytes}
+     * released {@code bytes} permits (the raw argument) rather than the number
+     * actually acquired ({@code min(bytes, writePermits)}), which would have
+     * over-inflated the semaphore and made subsequent reads of
+     * {@link RemoteFileServiceClient#availableInflightWriteBytes()} return a
+     * value larger than the configured cap.
+     */
+    @Test(timeout = 30_000)
+    public void testInflightWriteBytes_oversizedWriteReleasesExactAcquired() throws Exception {
+        int blockSize = RemoteFileServiceClient.DEFAULT_BLOCK_SIZE;
+        long cap = blockSize; // 1 block = 4 MiB cap
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, blockSize);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, cap);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            assertEquals("budget starts at cap", cap, tuned.availableInflightWriteBytes());
+            // Write 3× cap to amplify any over-inflation: if release used raw
+            // bytes instead of acquired, available would jump to 3*cap after
+            // the first call and 6*cap after the second.
+            byte[] payload = new byte[blockSize * 3];
+            Arrays.fill(payload, (byte) 0xCD);
+            tuned.writeFile("test/permits/write/oversized-release1.bin", payload);
+            assertEquals("budget must equal cap after first oversized write (not 3*cap)",
+                    cap, tuned.availableInflightWriteBytes());
+            tuned.writeFile("test/permits/write/oversized-release2.bin", payload);
+            assertEquals("budget must equal cap after second oversized write (not 6*cap)",
+                    cap, tuned.availableInflightWriteBytes());
+        }
+    }
+
+    /**
+     * Exercises the slow-path chunked-acquisition while-loop in
+     * {@code acquireInflightWriteBytes}: reflectively drains the write-byte
+     * semaphore to 0 so that {@code tryAcquire(toAcquire)} fails and the
+     * loop runs. The semaphore is then restored by the main thread while the
+     * oversized writer is parked, verifying that each chunk wakes up and the
+     * full loop completes correctly.
+     *
+     * <p>Config: {@code cap = 2 × blockSize} (two loop iterations), payload
+     * {@code = 3 × blockSize} ({@code toAcquire = cap}). The slow-path loop
+     * must execute both iterations ({@code blockSize} + {@code blockSize}
+     * permits), and the budget must be fully restored afterwards.
+     */
+    @Test(timeout = 30_000)
+    public void testInflightWriteBytes_oversizedWriteSlowPathChunkedLoop() throws Exception {
+        int blockSize = 4096;
+        long cap = 2L * blockSize; // 2 chunks so both loop iterations run
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, blockSize);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, cap);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            // Reflectively drain the write-byte semaphore so tryAcquire fails
+            // and the chunked slow path is entered.
+            Field semField = RemoteFileServiceClient.class.getDeclaredField("inflightWriteBytes");
+            semField.setAccessible(true);
+            Semaphore writeSem = (Semaphore) semField.get(tuned);
+            int drained = writeSem.drainPermits();
+            assertEquals("drained exactly cap permits", (int) cap, drained);
+
+            // Launch an oversized write (3× cap → toAcquire = cap) on a
+            // background thread. It will park inside acquireUninterruptibly
+            // for each chunk until the main thread restores the permits.
+            byte[] payload = new byte[blockSize * 3];
+            Arrays.fill(payload, (byte) 0xEF);
+            AtomicReference<Throwable> writeError = new AtomicReference<>();
+            CountDownLatch writeDone = new CountDownLatch(1);
+            Thread writer = new Thread(() -> {
+                try {
+                    tuned.writeFile("test/permits/write/chunked-slow-path.bin", payload);
+                } catch (Throwable t) {
+                    // Catch Throwable so AssertionError or any other Error
+                    // still surfaces via writeError instead of being silently
+                    // swallowed by the daemon thread (per CLAUDE.md guidance).
+                    writeError.set(t);
+                } finally {
+                    writeDone.countDown();
+                }
+            }, "oversized-slow-path-writer");
+            writer.setDaemon(true);
+            writer.start();
+
+            // Wait for the writer to park on the first chunk.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (writer.getState() != Thread.State.WAITING
+                    && writer.getState() != Thread.State.TIMED_WAITING) {
+                if (System.nanoTime() > deadline) {
+                    writeSem.release(drained); // unblock writer before failing
+                    fail("writer did not enter WAITING state within 10 s; state="
+                            + writer.getState() + ", error=" + writeError.get());
+                }
+                Thread.sleep(5);
+            }
+
+            // Restore all drained permits — the chunked loop will consume
+            // them (blockSize at a time) and complete.
+            writeSem.release(drained);
+
+            assertTrue("oversized slow-path write completed within timeout",
+                    writeDone.await(20, TimeUnit.SECONDS));
+            assertNull("oversized slow-path write must not throw", writeError.get());
+            assertEquals("budget restored to cap after chunked slow-path write",
+                    cap, tuned.availableInflightWriteBytes());
+        }
+    }
+
+    /**
+     * Exercises the partial-last-chunk case of the slow-path loop: when
+     * {@code toAcquire} is not a multiple of {@code blockSize}, the final
+     * {@code Math.min(toAcquire - acquired, blockSize)} call produces a
+     * chunk smaller than {@code blockSize}. This test verifies that the
+     * arithmetic is correct and that no permits are leaked.
+     *
+     * <p>Config: {@code cap = blockSize + 100} (not a multiple of
+     * {@code blockSize}), payload {@code = 2 × blockSize} ({@code toAcquire
+     * = blockSize + 100}). Loop iteration breakdown:
+     * <ul>
+     *   <li>Chunk 1: {@code blockSize} permits.</li>
+     *   <li>Chunk 2: {@code 100} permits (partial last chunk).</li>
+     * </ul>
+     * The semaphore is drained to force the slow path.
+     */
+    @Test(timeout = 30_000)
+    public void testInflightWriteBytes_oversizedWriteNonDivisibleCapSlowPath() throws Exception {
+        int blockSize = 4096;
+        long cap = blockSize + 100L; // non-divisible: last chunk = 100 bytes
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, blockSize);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, cap);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            // Drain to force the chunked slow path.
+            Field semField = RemoteFileServiceClient.class.getDeclaredField("inflightWriteBytes");
+            semField.setAccessible(true);
+            Semaphore writeSem = (Semaphore) semField.get(tuned);
+            int drained = writeSem.drainPermits();
+            assertEquals("drained exactly cap permits", (int) cap, drained);
+
+            byte[] payload = new byte[blockSize * 2]; // > cap → toAcquire = cap
+            Arrays.fill(payload, (byte) 0x12);
+            AtomicReference<Throwable> writeError = new AtomicReference<>();
+            CountDownLatch writeDone = new CountDownLatch(1);
+            Thread writer = new Thread(() -> {
+                try {
+                    tuned.writeFile("test/permits/write/nondivisible-slow-path.bin", payload);
+                } catch (Throwable t) {
+                    // Catch Throwable so AssertionError or any other Error
+                    // still surfaces via writeError instead of being silently
+                    // swallowed by the daemon thread (per CLAUDE.md guidance).
+                    writeError.set(t);
+                } finally {
+                    writeDone.countDown();
+                }
+            }, "nondivisible-slow-path-writer");
+            writer.setDaemon(true);
+            writer.start();
+
+            // Wait for the writer to park, then restore all permits.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (writer.getState() != Thread.State.WAITING
+                    && writer.getState() != Thread.State.TIMED_WAITING) {
+                if (System.nanoTime() > deadline) {
+                    writeSem.release(drained);
+                    fail("writer did not enter WAITING state within 10 s; state="
+                            + writer.getState() + ", error=" + writeError.get());
+                }
+                Thread.sleep(5);
+            }
+            writeSem.release(drained);
+
+            assertTrue("non-divisible slow-path write completed within timeout",
+                    writeDone.await(20, TimeUnit.SECONDS));
+            assertNull("non-divisible slow-path write must not throw", writeError.get());
+            assertEquals("budget restored to exactly cap (partial last chunk must not leak)",
+                    cap, tuned.availableInflightWriteBytes());
+        }
+    }
 }
