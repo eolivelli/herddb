@@ -294,6 +294,70 @@ class VectorBenchTest {
     }
 
     @Test
+    void neighborOverflowZeroIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--neighbor-overflow", "0"}),
+                "--neighbor-overflow=0 must be rejected");
+    }
+
+    @Test
+    void neighborOverflowNegativeIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--neighbor-overflow", "-1.0"}),
+                "--neighbor-overflow=-1.0 must be rejected");
+    }
+
+    @Test
+    void neighborOverflowNaNIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--neighbor-overflow", "NaN"}),
+                "--neighbor-overflow=NaN must be rejected");
+    }
+
+    @Test
+    void neighborOverflowInfinityIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--neighbor-overflow", "Infinity"}),
+                "--neighbor-overflow=Infinity must be rejected");
+    }
+
+    @Test
+    void alphaZeroIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--alpha", "0"}),
+                "--alpha=0 must be rejected");
+    }
+
+    @Test
+    void alphaNegativeIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--alpha", "-0.5"}),
+                "--alpha=-0.5 must be rejected");
+    }
+
+    @Test
+    void alphaNaNIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--alpha", "NaN"}),
+                "--alpha=NaN must be rejected");
+    }
+
+    @Test
+    void alphaInfinityIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--alpha", "Infinity"}),
+                "--alpha=Infinity must be rejected");
+    }
+
+    @Test
     void configResumeFromParsedFromCli() throws Exception {
         Config cfg = Config.parse(new String[]{"--resume-from", "500000"});
         assertEquals(500000, cfg.resumeFrom);

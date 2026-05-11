@@ -33,6 +33,7 @@ import herddb.model.StatementEvaluationContext;
 import herddb.model.StatementExecutionException;
 import herddb.model.TransactionContext;
 import herddb.model.commands.CreateTableSpaceStatement;
+import herddb.server.ServerConfiguration;
 import java.nio.file.Path;
 import java.util.Collections;
 import org.junit.Rule;
@@ -43,27 +44,38 @@ import org.junit.rules.TemporaryFolder;
  * Tests for CREATE VECTOR INDEX WITH-clause normalization and default-materialization
  * (issues #520 and #521).
  *
- * <p>Exercises:
+ * <p>This class is intentionally distinct from
+ * {@code herddb.sql.CreateVectorIndexWithClauseTest}, which focuses on the full
+ * property round-trip and the issue-#451 regression.  The tests here focus on:
  * <ul>
- *   <li>lowercase {@code similarity} is normalized to UPPERCASE in stored properties.</li>
- *   <li>unknown similarity values are rejected at DDL time.</li>
- *   <li>absent jvector parameters are filled with canonical defaults so every downstream
+ *   <li>lowercase {@code similarity} normalized to UPPERCASE in stored properties.</li>
+ *   <li>unknown similarity values rejected at DDL time.</li>
+ *   <li>absent jvector parameters filled with canonical defaults so every downstream
  *       consumer (optimizer, replicas) always sees a complete property set.</li>
  *   <li>user-supplied values take precedence over the defaults.</li>
+ *   <li>{@code similarity} is intentionally <em>not</em> defaulted (kept loud) to avoid
+ *       silently applying the wrong distance function for non-EUCLIDEAN datasets.</li>
  * </ul>
+ *
+ * <p>Uses the JSQLParser planner explicitly (the only planner that pre-processes
+ * the WITH clause through {@code JSQLParserPlanner.extractIndexWithClause}).
  */
-public class VectorIndexWithClauseTest {
+public class VectorIndexSimilarityNormalizationAndDefaultsTest {
 
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
 
     private DBManager buildManager(Path dataPath, Path logsPath,
                                    Path metadataPath, Path tmoDir) throws Exception {
+        ServerConfiguration config = new ServerConfiguration();
+        // CREATE VECTOR INDEX WITH-clause pre-processing lives in JSQLParserPlanner.
+        config.set(ServerConfiguration.PROPERTY_PLANNER_TYPE,
+                ServerConfiguration.PLANNER_TYPE_JSQLPARSER);
         DBManager manager = new DBManager("localhost",
                 new FileMetadataStorageManager(metadataPath),
                 new FileDataStorageManager(dataPath),
                 new FileCommitLogManager(logsPath),
-                tmoDir, null);
+                tmoDir, null, config, null);
         manager.setRemoteVectorIndexService(new MockRemoteVectorIndexService());
         return manager;
     }
@@ -162,7 +174,6 @@ public class VectorIndexWithClauseTest {
                         Collections.emptyList());
                 fail("Expected StatementExecutionException for unknown similarity");
             } catch (StatementExecutionException e) {
-                // expected: the message must name the bad value
                 String msg = e.getMessage();
                 assertNotNull(msg);
                 if (!msg.contains("manhattan") && !msg.contains("invalid similarity")) {
@@ -172,16 +183,40 @@ public class VectorIndexWithClauseTest {
         }
     }
 
+    /**
+     * An empty similarity value (e.g. {@code similarity=} with no value after '=')
+     * must be rejected at parse time.  The WITH-clause tokenizer catches empty values
+     * before {@code normalizeSimilarityOrThrow} is called, so the error is also a
+     * {@link StatementExecutionException}.
+     */
+    @Test
+    public void testEmptyValueAfterEqualsIsRejected() throws Exception {
+        try (DBManager manager = startManagerWithTable()) {
+            try {
+                execute(manager,
+                        "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)"
+                                + " WITH m=16 similarity=",
+                        Collections.emptyList());
+                fail("Expected StatementExecutionException for empty similarity value");
+            } catch (StatementExecutionException e) {
+                // expected — empty value after '=' is rejected by the tokenizer
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Issue #520 — default-property materialization
     // -----------------------------------------------------------------------
 
     /**
-     * When the WITH clause is entirely absent the six jvector build parameters
-     * must be filled in with canonical defaults.
+     * When the WITH clause is entirely absent the five numerical jvector build
+     * parameters must be filled in with canonical defaults.  {@code similarity}
+     * is intentionally NOT defaulted — a missing similarity is kept as a loud
+     * failure in the optimizer rather than silently applying the wrong distance
+     * function for non-EUCLIDEAN datasets.
      */
     @Test
-    public void testDefaultsAreMaterializedWhenWithClauseIsAbsent() throws Exception {
+    public void testNumericalDefaultsAreMaterializedWhenWithClauseIsAbsent() throws Exception {
         try (DBManager manager = startManagerWithTable()) {
             execute(manager,
                     "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)",
@@ -190,18 +225,21 @@ public class VectorIndexWithClauseTest {
             Index idx = manager.getTableSpaceManager("tblspace1")
                     .getIndexesOnTable("t1").get("vidx").getIndex();
             assertNotNull(idx);
-            assertEquals("16",        idx.properties.get(VectorIndexManager.PROP_M));
-            assertEquals("100",       idx.properties.get(VectorIndexManager.PROP_BEAM_WIDTH));
-            assertEquals("1.2",       idx.properties.get(VectorIndexManager.PROP_NEIGHBOR_OVERFLOW));
-            assertEquals("1.4",       idx.properties.get(VectorIndexManager.PROP_ALPHA));
-            assertEquals("EUCLIDEAN", idx.properties.get(VectorIndexManager.PROP_SIMILARITY));
-            assertEquals("false",     idx.properties.get(VectorIndexManager.PROP_FUSED_PQ));
+            assertEquals("16",    idx.properties.get(VectorIndexManager.PROP_M));
+            assertEquals("100",   idx.properties.get(VectorIndexManager.PROP_BEAM_WIDTH));
+            assertEquals("1.2",   idx.properties.get(VectorIndexManager.PROP_NEIGHBOR_OVERFLOW));
+            assertEquals("1.4",   idx.properties.get(VectorIndexManager.PROP_ALPHA));
+            assertEquals("false", idx.properties.get(VectorIndexManager.PROP_FUSED_PQ));
+            // similarity is NOT defaulted; it must be absent so the optimizer
+            // raises a loud, actionable error rather than silently merging with
+            // the wrong distance function.
+            assertEquals(null, idx.properties.get(VectorIndexManager.PROP_SIMILARITY));
         }
     }
 
     /**
      * When the WITH clause provides only {@code m} and {@code beamWidth},
-     * the remaining jvector parameters must be filled in with defaults.
+     * the remaining numerical jvector parameters must be filled in with defaults.
      */
     @Test
     public void testMissingNeighborOverflowAndAlphaAreFilledWithDefaults() throws Exception {

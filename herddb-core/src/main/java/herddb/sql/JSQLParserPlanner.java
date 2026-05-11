@@ -927,9 +927,14 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
      * Normalizes a user-supplied similarity value (e.g. {@code "euclidean"}) to
      * the canonical UPPERCASE form expected by {@code VectorSimilarityFunction.valueOf}.
      * Throws {@link StatementExecutionException} with a clear message when the value
-     * is not one of the known enum constants. Issue #521.
+     * is {@code null}, empty, or not one of the known enum constants. Issue #521.
      */
     static String normalizeSimilarityOrThrow(String raw) throws StatementExecutionException {
+        if (raw == null || raw.isEmpty()) {
+            throw new StatementExecutionException(
+                    "invalid similarity '" + raw + "': expected one of "
+                    + Arrays.toString(VectorSimilarityFunction.values()));
+        }
         String upper = raw.toUpperCase(Locale.ROOT);
         try {
             VectorSimilarityFunction.valueOf(upper);
@@ -945,15 +950,21 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
      * Fills in jvector build-parameter defaults on a VECTOR {@link herddb.model.Index.Builder}
      * for any property the user omitted in the {@code WITH} clause. Issue #520.
      *
-     * <p>Defaults:
+     * <p>Defaults applied:
      * <ul>
      *   <li>{@code m=16}</li>
      *   <li>{@code beamWidth=100}</li>
      *   <li>{@code neighborOverflow=1.2}</li>
      *   <li>{@code alpha=1.4}</li>
-     *   <li>{@code similarity=EUCLIDEAN}</li>
      *   <li>{@code fusedPQ=false}</li>
      * </ul>
+     *
+     * <p>{@code similarity} is intentionally <em>not</em> defaulted: different
+     * datasets use different distance functions (EUCLIDEAN vs COSINE vs DOT_PRODUCT)
+     * and silently defaulting to the wrong one would degrade recall without any
+     * error signal.  The optimizer ({@code RemoteMetadataIndexMergeConfigProvider})
+     * will raise a loud error when {@code similarity} is absent, steering the
+     * operator to fix the DDL explicitly.
      *
      * <p>User-supplied values (already applied to the builder via
      * {@link herddb.model.Index.Builder#property}) are never overwritten because
@@ -964,7 +975,6 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
         builder.propertyIfAbsent(VectorIndexManager.PROP_BEAM_WIDTH, "100");
         builder.propertyIfAbsent(VectorIndexManager.PROP_NEIGHBOR_OVERFLOW, "1.2");
         builder.propertyIfAbsent(VectorIndexManager.PROP_ALPHA, "1.4");
-        builder.propertyIfAbsent(VectorIndexManager.PROP_SIMILARITY, "EUCLIDEAN");
         builder.propertyIfAbsent(VectorIndexManager.PROP_FUSED_PQ, "false");
     }
 

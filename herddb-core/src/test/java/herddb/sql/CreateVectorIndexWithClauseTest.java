@@ -127,7 +127,8 @@ public class CreateVectorIndexWithClauseTest {
             assertEquals(Index.TYPE_VECTOR, idx.type);
             assertEquals("16", idx.properties.get(VectorIndexManager.PROP_M));
             assertEquals("100", idx.properties.get(VectorIndexManager.PROP_BEAM_WIDTH));
-            assertEquals("cosine", idx.properties.get("similarity"));
+            // Issue #521: similarity is now normalized to UPPERCASE at DDL time.
+            assertEquals("COSINE", idx.properties.get("similarity"));
             assertEquals("true", idx.properties.get(VectorIndexManager.PROP_FUSED_PQ));
             // The headline assertion: the routing knob actually made it
             // through. Pre-fix this returned null and the cluster
@@ -257,24 +258,29 @@ public class CreateVectorIndexWithClauseTest {
             // Anything that drifts here (e.g. dropping the '=' on numShards)
             // breaks the indexing-service cluster's load distribution — see
             // issue #451.
+            // Issue #520: VectorBench now always emits neighborOverflow and alpha.
+            // Issue #521: similarity is stored as UPPERCASE after normalization.
             execute(manager,
                     "CREATE VECTOR INDEX vidx ON tblspace1.t1(vec)"
                             + " WITH m=16 beamWidth=100 similarity=euclidean"
-                            + " fusedPQ=true numShards=4",
+                            + " fusedPQ=true neighborOverflow=1.2 alpha=1.4 numShards=4",
                     Collections.emptyList());
 
             Index idx = getVectorIndex(manager);
-            assertEquals("16", idx.properties.get(VectorIndexManager.PROP_M));
-            assertEquals("100", idx.properties.get(VectorIndexManager.PROP_BEAM_WIDTH));
-            assertEquals("euclidean", idx.properties.get("similarity"));
-            assertEquals("true", idx.properties.get(VectorIndexManager.PROP_FUSED_PQ));
-            assertEquals("4", idx.properties.get(VectorIndexManager.PROP_NUM_SHARDS));
+            assertEquals("16",        idx.properties.get(VectorIndexManager.PROP_M));
+            assertEquals("100",       idx.properties.get(VectorIndexManager.PROP_BEAM_WIDTH));
+            // Issue #521: similarity is normalized to UPPERCASE at DDL time.
+            assertEquals("EUCLIDEAN", idx.properties.get(VectorIndexManager.PROP_SIMILARITY));
+            assertEquals("true",      idx.properties.get(VectorIndexManager.PROP_FUSED_PQ));
+            assertEquals("1.2",       idx.properties.get(VectorIndexManager.PROP_NEIGHBOR_OVERFLOW));
+            assertEquals("1.4",       idx.properties.get(VectorIndexManager.PROP_ALPHA));
+            assertEquals("4",         idx.properties.get(VectorIndexManager.PROP_NUM_SHARDS));
             // The whole point of the fix: numShards must round-trip with
             // exactly the value the user typed, so the IS routing math
             // (shardId % numInstances == instanceId) actually splits the
             // workload across replicas.
-            assertEquals("Index must carry exactly the 5 WITH-clause props",
-                    5, idx.properties.size());
+            assertEquals("Index must carry exactly the 7 WITH-clause props",
+                    7, idx.properties.size());
         }
     }
 

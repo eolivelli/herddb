@@ -163,7 +163,7 @@ public class Config {
         opts.addOption(null, "skip-verify", false, "Skip row count verification after ingestion");
         opts.addOption(null, "drop-table", false, "Drop table before starting");
         opts.addOption(null, "checkpoint", false, "Force checkpoint after ingestion and after index creation");
-        opts.addOption(null, "similarity", true, "Similarity function: euclidean, cosine, dot (default: from dataset)");
+        opts.addOption(null, "similarity", true, "Similarity function: euclidean, cosine, dot_product (default: from dataset)");
         opts.addOption(null, "client-timeout", true, "Client request timeout in seconds (default: 7200)");
         opts.addOption(null, "index-before-ingest", false, "Create vector index before ingestion instead of after");
         opts.addOption(null, "resume-from", true,
@@ -345,6 +345,7 @@ public class Config {
         // ParseException because they are user-supplied configuration errors and
         // the rest of parse() also throws ParseException for input issues.
         validateBatchAndTransactionInvariants(cfg);
+        validateIndexBuildParams(cfg);
 
         // Env var fallbacks (only applied when the CLI flag was not set).
         if (!cmd.hasOption("no-progress") && !cfg.noProgress) {
@@ -572,6 +573,28 @@ public class Config {
                     + ") must be <= --ingest-max-ops (" + cfg.ingestMaxOpsPerSecond
                     + "). Either lower --batch-size/--transaction-size or raise --ingest-max-ops "
                     + "(or set --ingest-max-ops 0 for unlimited).");
+        }
+    }
+
+    /**
+     * Validates the jvector index-build float parameters.
+     *
+     * <ul>
+     *   <li>{@code neighborOverflow} must be finite and {@code > 0}</li>
+     *   <li>{@code alpha} must be finite and {@code > 0}</li>
+     * </ul>
+     *
+     * @throws ParseException if any invariant is violated, with a message that
+     *         names the offending parameter and its value.
+     */
+    static void validateIndexBuildParams(Config cfg) throws ParseException {
+        if (!Float.isFinite(cfg.indexNeighborOverflow) || cfg.indexNeighborOverflow <= 0) {
+            throw new ParseException("--neighbor-overflow must be a finite positive number, got "
+                    + cfg.indexNeighborOverflow);
+        }
+        if (!Float.isFinite(cfg.indexAlpha) || cfg.indexAlpha <= 0) {
+            throw new ParseException("--alpha must be a finite positive number, got "
+                    + cfg.indexAlpha);
         }
     }
 

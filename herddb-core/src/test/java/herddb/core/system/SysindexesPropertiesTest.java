@@ -173,9 +173,12 @@ public class SysindexesPropertiesTest {
                 // and we can assert it verbatim — locking down the format so
                 // operator dashboards / tests / scripts that parse this column
                 // do not have to cope with insertion-order flakes.
+                // Issue #520: neighborOverflow and alpha are now materialized as defaults.
+                // Issue #521: similarity is stored as uppercase COSINE after normalization.
                 assertEquals(
-                        "{\"beamWidth\":\"100\",\"fusedPQ\":\"true\","
-                                + "\"m\":\"16\",\"numShards\":\"4\",\"similarity\":\"cosine\"}",
+                        "{\"alpha\":\"1.4\",\"beamWidth\":\"100\",\"fusedPQ\":\"true\","
+                                + "\"m\":\"16\",\"neighborOverflow\":\"1.2\","
+                                + "\"numShards\":\"4\",\"similarity\":\"COSINE\"}",
                         vecPropsStr);
                 // Belt-and-suspenders: the JSON must contain every WITH-clause
                 // value the user typed, regardless of key ordering.
@@ -183,8 +186,9 @@ public class SysindexesPropertiesTest {
                         vecPropsStr.contains("\"numShards\":\"4\""));
                 assertTrue("must contain m=16: " + vecPropsStr,
                         vecPropsStr.contains("\"m\":\"16\""));
-                assertTrue("must contain similarity=cosine: " + vecPropsStr,
-                        vecPropsStr.contains("\"similarity\":\"cosine\""));
+                // Issue #521: similarity is stored as UPPERCASE.
+                assertTrue("must contain similarity=COSINE: " + vecPropsStr,
+                        vecPropsStr.contains("\"similarity\":\"COSINE\""));
             }
         }
     }
