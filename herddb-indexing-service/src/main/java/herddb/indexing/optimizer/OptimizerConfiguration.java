@@ -228,6 +228,71 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_MERGE_KWAY_MAX = "indexoptimizer.merge.kway.max";
     public static final int PROPERTY_MERGE_KWAY_MAX_DEFAULT = 0;
 
+    // -------------------------------------------------------------------------
+    // Horizontal scalability: pod role detection (step 1)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Explicit pod role override. {@code true} / {@code false} forces leader /
+     * worker; {@code auto} (the default) falls back to the environment-variable
+     * and hostname-regex heuristics in {@link OptimizerRole#detect}.
+     */
+    public static final String PROPERTY_ROLE_IS_LEADER = "indexoptimizer.role.is.leader";
+    public static final String PROPERTY_ROLE_IS_LEADER_DEFAULT = "auto";
+
+    /**
+     * Name of the env var that carries this pod's StatefulSet ordinal. Helm
+     * wires this from the K8s downward API field
+     * {@code metadata.labels['apps.kubernetes.io/pod-index']}.
+     */
+    public static final String PROPERTY_ROLE_POD_ORDINAL_ENV = "indexoptimizer.role.pod.ordinal.env";
+    public static final String PROPERTY_ROLE_POD_ORDINAL_ENV_DEFAULT = "POD_ORDINAL";
+
+    /** Regex extracting the ordinal from {@code HOSTNAME} when the env var is absent. */
+    public static final String PROPERTY_ROLE_HOSTNAME_ORDINAL_REGEX =
+            "indexoptimizer.role.hostname.ordinal.regex";
+    public static final String PROPERTY_ROLE_HOSTNAME_ORDINAL_REGEX_DEFAULT = "^.*-(\\d+)$";
+
+    /**
+     * When {@code false}, the leader produces tasks but never consumes them —
+     * pure scheduler mode. Used by the K8s multi-replica acceptance test to
+     * prove that a worker pod actually performs the merge work; also a
+     * legitimate operator knob for "dedicated scheduler" deployments.
+     */
+    public static final String PROPERTY_ROLE_LEADER_EXECUTE_TASKS =
+            "indexoptimizer.role.leader.execute.tasks";
+    public static final boolean PROPERTY_ROLE_LEADER_EXECUTE_TASKS_DEFAULT = true;
+
+    // -------------------------------------------------------------------------
+    // Owner-instance selector (step 1 introduces; step 2 makes LEAST_LOADED default)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Owner-selection policy applied at task creation time. One of
+     * {@code FIXED_ZERO}, {@code ROUND_ROBIN}, {@code STATIC}, {@code LEAST_LOADED}.
+     * Step 1 default is {@code FIXED_ZERO} so behaviour is unchanged across
+     * the boundary; step 2 flips the default to {@code LEAST_LOADED} together
+     * with the live-instance discovery wiring.
+     */
+    public static final String PROPERTY_OWNER_SELECTOR_POLICY = "indexoptimizer.owner.selector.policy";
+    public static final String PROPERTY_OWNER_SELECTOR_POLICY_DEFAULT = "FIXED_ZERO";
+
+    /**
+     * Comma-separated list of instance ordinals consumed cyclically by
+     * {@link StaticAssignmentOwnerSelector}. Read only when policy=STATIC.
+     */
+    public static final String PROPERTY_OWNER_SELECTOR_STATIC_ASSIGNMENT =
+            "indexoptimizer.owner.selector.static.assignment";
+
+    /**
+     * Number of indexing-service instances the optimizer will assign segments
+     * across. {@code 0} (default) means "auto-discover from ZK". The
+     * auto-discovery wiring lands in step 2; until then operators that want
+     * non-zero owner ordinals must set this knob explicitly.
+     */
+    public static final String PROPERTY_INDEXING_NUM_INSTANCES = "indexoptimizer.indexing.num.instances";
+    public static final int PROPERTY_INDEXING_NUM_INSTANCES_DEFAULT = 0;
+
     private final Properties properties;
 
     public OptimizerConfiguration(Properties properties) {

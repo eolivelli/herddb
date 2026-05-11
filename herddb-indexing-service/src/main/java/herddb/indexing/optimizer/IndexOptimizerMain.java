@@ -440,11 +440,25 @@ public final class IndexOptimizerMain {
                     + "avoid this fallback.");
             effectiveSafeMode = true;
         }
+        // Horizontal scalability — step 1: detect the pod role (LEADER for ordinal 0,
+        // WORKER otherwise) and resolve the owner-selector via OwnerSelectorFactory.
+        // Default policy stays FIXED_ZERO so this step preserves the legacy "every
+        // merged segment owned by instance 0" behaviour. Step 2 flips the factory
+        // default to LEAST_LOADED together with the live-instance discovery wiring.
+        OptimizerRole role = OptimizerRole.detect(configuration, System.getenv());
+        boolean leaderExecutesTasks = configuration.getBoolean(
+                OptimizerConfiguration.PROPERTY_ROLE_LEADER_EXECUTE_TASKS,
+                OptimizerConfiguration.PROPERTY_ROLE_LEADER_EXECUTE_TASKS_DEFAULT);
+        OwnerSelector ownerSelector = OwnerSelectorFactory.create(configuration, /* probe */ null);
+        LOGGER.log(Level.INFO,
+                "optimizer pod role: {0} (leaderExecutesTasks={1}, ownerSelector={2})",
+                new Object[]{role, leaderExecutesTasks, ownerSelector.getClass().getSimpleName()});
+
         // The merger constructs its own DSM for the merge path. The reaper
         // can use the same DSM to physically delete files at retention if
         // safeMode is opted out (the operator's responsibility).
         this.engine = new IndexOptimizerEngine(registry, merger, tablespaceUuid, policy, retentionMs,
-                () -> 0 /* MVP: assign new segments to instance 0 — see step 7 for owner-aware routing */,
+                ownerSelector,
                 System::currentTimeMillis,
                 mergerDataStorageManager,
                 leaderLock,

@@ -89,7 +89,13 @@ public final class IndexOptimizerEngine {
     private final String tablespaceUuid;
     private final MergePolicy mergePolicy;
     private final long retentionMillis;
-    private final IntSupplier ownerSelector;
+    /**
+     * Owner-instance selector consulted once per merge to decide which IS
+     * instance becomes the owner of the merged output (step 1). The IntSupplier
+     * constructor overloads adapt {@code () -> int} into the new interface for
+     * back-compat with existing tests.
+     */
+    private final OwnerSelector ownerSelector;
     private final LongSupplier clock;
     /**
      * Optional: when non-null, the reaper invokes
@@ -282,6 +288,28 @@ public final class IndexOptimizerEngine {
                                 DataStorageManager dataStorageManager,
                                 OptimizerLeaderLock leaderLock,
                                 boolean safeModeFileDeletion) {
+        this(registry, merger, tablespaceUuid, mergePolicy, retentionMillis,
+                adaptIntSupplier(ownerSelector), clock, dataStorageManager, leaderLock,
+                safeModeFileDeletion);
+    }
+
+    /**
+     * Step 1 — new terminal constructor accepting an {@link OwnerSelector}. The
+     * IntSupplier overloads above adapt their argument into this interface so
+     * existing tests still compile; new callers (notably
+     * {@link IndexOptimizerMain}) wire an {@code OwnerSelector} from
+     * {@link OwnerSelectorFactory} directly.
+     */
+    public IndexOptimizerEngine(SegmentRegistryClient registry,
+                                SegmentMerger merger,
+                                String tablespaceUuid,
+                                MergePolicy mergePolicy,
+                                long retentionMillis,
+                                OwnerSelector ownerSelector,
+                                LongSupplier clock,
+                                DataStorageManager dataStorageManager,
+                                OptimizerLeaderLock leaderLock,
+                                boolean safeModeFileDeletion) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.merger = Objects.requireNonNull(merger, "merger");
         this.tablespaceUuid = Objects.requireNonNull(tablespaceUuid, "tablespaceUuid");
@@ -305,6 +333,11 @@ public final class IndexOptimizerEngine {
                             + " ownership-change events; otherwise the IS will fail to"
                             + " load on next restart with file-not-found.");
         }
+    }
+
+    private static OwnerSelector adaptIntSupplier(IntSupplier supplier) {
+        Objects.requireNonNull(supplier, "ownerSelector");
+        return (tablespaceUuid, indexUuid) -> supplier.getAsInt();
     }
 
     public long getRuns() {
@@ -580,7 +613,7 @@ public final class IndexOptimizerEngine {
 
         SegmentMetadata output;
         try {
-            output = merger.merge(inputMetadata, ownerSelector.getAsInt());
+            output = merger.merge(inputMetadata, ownerSelector.selectOwner(tablespaceUuid, indexUuid));
         } catch (Exception e) {
             mergeFailuresTotal.incrementAndGet();
             long mergeEndMs2 = clock.getAsLong();
