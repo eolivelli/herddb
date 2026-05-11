@@ -1413,13 +1413,13 @@ public final class RemoteSegmentGraphMerger {
             // Fire batch-progress callback every BATCH_PROGRESS_INTERVAL vectors
             // so the HTTP /status endpoint can show fine-grained build progress.
             if (batchCb != null && (ord % BATCH_PROGRESS_INTERVAL == 0)) {
-                batchCb.applyAsLong(ord, keptCount);
+                fireBatchProgress(batchCb, ord, keptCount);
             }
             ord++;
         }
         // Final batch-progress notification at 100%.
         if (batchCb != null) {
-            batchCb.applyAsLong(keptCount, keptCount);
+            fireBatchProgress(batchCb, keptCount, keptCount);
         }
         try {
             builder.cleanup();

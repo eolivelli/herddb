@@ -66,9 +66,11 @@ public class StreamingCompactionBatchProgressTest {
     public TemporaryFolder tmpFolder = new TemporaryFolder();
 
     private boolean savedStreamingFlag;
+    private int savedMinLiveVectors;
 
     @Before
     public void setUp() {
+        savedMinLiveVectors = PersistentVectorStore.minLiveVectorsForCheckpoint;
         PersistentVectorStore.minLiveVectorsForCheckpoint = 0;
         savedStreamingFlag = VectorIndexCompactor.streamingCompactionEnabled;
         VectorIndexCompactor.streamingCompactionEnabled = true;
@@ -76,7 +78,7 @@ public class StreamingCompactionBatchProgressTest {
 
     @After
     public void tearDown() {
-        PersistentVectorStore.minLiveVectorsForCheckpoint = 50_000;
+        PersistentVectorStore.minLiveVectorsForCheckpoint = savedMinLiveVectors;
         VectorIndexCompactor.streamingCompactionEnabled = savedStreamingFlag;
     }
 
