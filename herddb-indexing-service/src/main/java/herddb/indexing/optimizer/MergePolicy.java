@@ -108,18 +108,46 @@ public interface MergePolicy {
      * optimizer to leave small graphs un-merged for hours under sustained
      * load, which is precisely the failure mode this policy fixes.
      *
-     * <p>Selection: smallest-first; the picked set is capped at
-     * {@code perCycleMaxBytes} of input data per cycle (write-amplification
-     * budget) and at {@code maxCount} segments. The 2-segment minimum
-     * always overrides those caps so a cycle with two segments whose sum
-     * exceeds the byte cap still proceeds.
+     * <p>Selection (k-way mode, issue #524): when {@code kwayMax >= 2}, the
+     * policy picks up to {@code min(kwayMax, maxCount, candidates.size())}
+     * segments in a single cycle, smallest-first, <em>ignoring</em>
+     * {@code perCycleMaxBytes}. This collapses N sub-target segments into
+     * one merge round instead of the O(N) rounds that the byte-cap forces,
+     * cutting cumulative vector-processing work from O(N²) to O(N).
+     *
+     * <p>Selection (legacy mode, {@code kwayMax == 0}): smallest-first; the
+     * picked set is capped at {@code perCycleMaxBytes} of input data per
+     * cycle (write-amplification budget) and at {@code maxCount} segments.
+     * The 2-segment minimum always overrides the byte cap so a cycle with
+     * two segments whose sum exceeds the cap still proceeds.
      */
     final class AggressivePolicy implements MergePolicy {
         private final long targetMaxBytes;
         private final long perCycleMaxBytes;
         private final int maxCount;
+        /**
+         * K-way max (issue #524). When {@code >= 2}: pick up to this many
+         * candidates per cycle, bypassing {@code perCycleMaxBytes}. When
+         * {@code 0}: legacy byte-cap behaviour.
+         */
+        private final int kwayMax;
 
+        /**
+         * Backward-compatible 3-arg constructor: uses legacy {@code perCycleMaxBytes}
+         * candidate selection ({@code kwayMax = 0}).
+         */
         public AggressivePolicy(long targetMaxBytes, long perCycleMaxBytes, int maxCount) {
+            this(targetMaxBytes, perCycleMaxBytes, maxCount, /* kwayMax */ 0);
+        }
+
+        /**
+         * Full constructor adding k-way candidate selection (issue #524).
+         *
+         * @param kwayMax  max inputs per merge cycle in k-way mode (0 = legacy byte-cap
+         *                 mode; must be 0 or {@code >= 2})
+         */
+        public AggressivePolicy(long targetMaxBytes, long perCycleMaxBytes, int maxCount,
+                                int kwayMax) {
             if (targetMaxBytes <= 0L) {
                 throw new IllegalArgumentException("targetMaxBytes must be positive: " + targetMaxBytes);
             }
@@ -129,9 +157,13 @@ public interface MergePolicy {
             if (maxCount < 2) {
                 throw new IllegalArgumentException("maxCount must be >= 2: " + maxCount);
             }
+            if (kwayMax != 0 && kwayMax < 2) {
+                throw new IllegalArgumentException("kwayMax must be 0 (disabled) or >= 2: " + kwayMax);
+            }
             this.targetMaxBytes = targetMaxBytes;
             this.perCycleMaxBytes = perCycleMaxBytes;
             this.maxCount = maxCount;
+            this.kwayMax = kwayMax;
         }
 
         public long getTargetMaxBytes() {
@@ -144,6 +176,11 @@ public interface MergePolicy {
 
         public int getMaxCount() {
             return maxCount;
+        }
+
+        /** Returns the configured k-way max (0 = legacy byte-cap mode). */
+        public int getKwayMax() {
+            return kwayMax;
         }
 
         @Override
@@ -165,6 +202,18 @@ public interface MergePolicy {
             }
             mergeable.sort(Comparator.comparingLong(v -> v.metadata().getSizeBytes()));
 
+            if (kwayMax >= 2) {
+                // K-way mode (issue #524): pick up to min(kwayMax, maxCount) candidates,
+                // ignoring perCycleMaxBytes. This merges all sub-target segments in one
+                // pass (O(N) work) instead of sequential 2-way rounds (O(N²) work).
+                int limit = Math.min(kwayMax, maxCount);
+                List<VersionedSegmentMetadata> picked = mergeable.size() <= limit
+                        ? new ArrayList<>(mergeable)
+                        : new ArrayList<>(mergeable.subList(0, limit));
+                return picked.size() >= 2 ? picked : new ArrayList<>();
+            }
+
+            // Legacy byte-cap mode: respect perCycleMaxBytes.
             List<VersionedSegmentMetadata> picked = new ArrayList<>();
             long pickedBytes = 0L;
             for (VersionedSegmentMetadata v : mergeable) {

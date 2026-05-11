@@ -399,8 +399,19 @@ public final class IndexOptimizerMain {
         // Issue #484: aggressive policy by default. Segments at or above
         // targetMaxBytes are graduated; everything else is mergeable as long
         // as ≥2 sub-target segments exist — there's no minCount/minBytes gate.
+        // Issue #524: k-way mode (kwayMax >= 2) collapses all sub-target
+        // segments into one merge round per cycle, bypassing perCycleMaxBytes.
+        // Set indexoptimizer.merge.kway.max=0 to revert to the legacy byte-cap
+        // behaviour (serial 2-way merges bounded by perCycleMaxBytes).
+        int kwayMax = configuration.getInt(
+                OptimizerConfiguration.PROPERTY_MERGE_KWAY_MAX,
+                OptimizerConfiguration.PROPERTY_MERGE_KWAY_MAX_DEFAULT);
         MergePolicy policy = new MergePolicy.AggressivePolicy(
-                targetMaxBytes, perCycleMaxBytes, maxCount);
+                targetMaxBytes, perCycleMaxBytes, maxCount, kwayMax);
+        LOGGER.log(Level.INFO,
+                "merge policy: AggressivePolicy(targetMaxBytes={0}, perCycleMaxBytes={1},"
+                        + " maxCount={2}, kwayMax={3})",
+                new Object[]{targetMaxBytes, perCycleMaxBytes, maxCount, kwayMax});
 
         // Resolve the merger (SPI override → preconfigured → RemoteSegmentMerger
         // → NoopMerger) and the DataStorageManager that drives it (only when
