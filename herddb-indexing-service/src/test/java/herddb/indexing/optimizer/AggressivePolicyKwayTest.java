@@ -216,4 +216,57 @@ public class AggressivePolicyKwayTest {
         List<VersionedSegmentMetadata> picked = policy.pickMergeCandidates(makeSegments(4));
         assertEquals("kwayMax=2 picks exactly 2 (smallest)", 2, picked.size());
     }
+
+    // -------------------------------------------------------------------------
+    // Additional edge cases (requested by pr-reviewer)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Zero-size sub-target segments are still included in k-way picks.
+     * The legacy byte-cap path clamps size to {@code Math.max(0, sizeBytes)};
+     * k-way must not silently drop zero-size candidates or trip on them.
+     */
+    @Test
+    public void kwayHandlesZeroSizeSegments() {
+        MergePolicy policy = new MergePolicy.AggressivePolicy(10_000L, 1L, 100, 8);
+        List<VersionedSegmentMetadata> all = new ArrayList<>();
+        all.add(seg("zero1", 0L));
+        all.add(seg("zero2", 0L));
+        all.add(seg("small", 50L));
+        List<VersionedSegmentMetadata> picked = policy.pickMergeCandidates(all);
+        assertEquals("zero-size sub-target segments must still be picked in k-way mode",
+                3, picked.size());
+    }
+
+    /**
+     * When {@code mergeable.size() == maxCount < kwayMax}, the policy picks
+     * exactly {@code maxCount} candidates — the limit is {@code min(kwayMax, maxCount)}.
+     */
+    @Test
+    public void kwayMaxAboveMaxCountWithExactlyMaxCountCandidates() {
+        // kwayMax=20, maxCount=5, exactly 5 sub-target candidates → pick all 5
+        // (limited by maxCount, not kwayMax).
+        MergePolicy policy = new MergePolicy.AggressivePolicy(
+                10_000L, 1L, /* maxCount */ 5, /* kwayMax */ 20);
+        List<VersionedSegmentMetadata> picked = policy.pickMergeCandidates(makeSegments(5));
+        assertEquals("when candidates.size() == maxCount < kwayMax, pick all maxCount",
+                5, picked.size());
+    }
+
+    /**
+     * When more candidates exist than {@code maxCount}, exactly {@code maxCount}
+     * are picked even though {@code kwayMax > maxCount}.
+     */
+    @Test
+    public void kwayMaxAboveMaxCountWithMoreCandidatesThanMaxCount() {
+        MergePolicy policy = new MergePolicy.AggressivePolicy(
+                10_000L, 1L, /* maxCount */ 5, /* kwayMax */ 20);
+        List<VersionedSegmentMetadata> picked = policy.pickMergeCandidates(makeSegments(10));
+        assertEquals("maxCount must cap the result even when kwayMax is higher", 5, picked.size());
+        // Verify smallest-first ordering.
+        for (int i = 0; i < picked.size(); i++) {
+            assertEquals("must pick smallest maxCount segments",
+                    "s" + (i + 1), picked.get(i).metadata().getSegmentUuid());
+        }
+    }
 }

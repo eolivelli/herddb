@@ -207,9 +207,15 @@ public interface MergePolicy {
                 // ignoring perCycleMaxBytes. This merges all sub-target segments in one
                 // pass (O(N) work) instead of sequential 2-way rounds (O(N²) work).
                 int limit = Math.min(kwayMax, maxCount);
-                List<VersionedSegmentMetadata> picked = mergeable.size() <= limit
-                        ? new ArrayList<>(mergeable)
-                        : new ArrayList<>(mergeable.subList(0, limit));
+                // subList(0, n) works for both n == size and n < size; the returned
+                // view is then copied into a fresh ArrayList to avoid holding a
+                // reference to the sorted intermediate list.
+                List<VersionedSegmentMetadata> picked =
+                        new ArrayList<>(mergeable.subList(0, Math.min(limit, mergeable.size())));
+                // Invariant: mergeable.size() >= 2 (checked above) and limit >= 2
+                // (constructor enforces kwayMax >= 2 and maxCount >= 2), so
+                // picked.size() >= 2 is always true here. The guard is kept as a
+                // defensive belt-and-suspenders check.
                 return picked.size() >= 2 ? picked : new ArrayList<>();
             }
 

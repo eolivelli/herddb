@@ -21,6 +21,7 @@ package herddb.indexing.optimizer;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import herddb.indexing.segment.OwnershipTransfer;
 import herddb.indexing.segment.SegmentMetadata;
 import herddb.indexing.segment.SegmentRegistryClient;
 import herddb.indexing.segment.SegmentState;
@@ -31,6 +32,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.curator.test.TestingServer;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.Watcher;
@@ -118,16 +120,27 @@ public class IndexOptimizerEngineKwayMergeTest {
      * Thin wrapper that delegates to {@link InMemorySegmentMerger} and records
      * the input count of each {@link #merge} call. We use delegation instead of
      * subclassing because {@link InMemorySegmentMerger} is {@code final}.
+     *
+     * <p>An optional {@link #mergeHook} {@code Runnable} is invoked at the
+     * start of each {@link #merge} call (before the delegate), allowing tests
+     * to inject concurrent registry mutations (e.g. deprecating an input) that
+     * simulate drift in the pick→revalidate window.
      */
     private static final class TrackingMerger implements SegmentMerger {
         private final InMemorySegmentMerger delegate = new InMemorySegmentMerger();
         private final AtomicInteger invocations = new AtomicInteger(0);
         private final AtomicInteger lastInputCount = new AtomicInteger(0);
+        /** Hook invoked at the start of each merge call. {@code null} = no-op. */
+        volatile Runnable mergeHook;
 
         @Override
         public SegmentMetadata merge(List<SegmentMetadata> inputs, int newOwnerInstance) {
             invocations.incrementAndGet();
             lastInputCount.set(inputs.size());
+            Runnable hook = mergeHook;
+            if (hook != null) {
+                hook.run();
+            }
             return delegate.merge(inputs, newOwnerInstance);
         }
 
@@ -141,18 +154,18 @@ public class IndexOptimizerEngineKwayMergeTest {
     }
 
     /**
-     * The core k-way test: 8 sub-target segments are merged into 1 in a single
-     * optimizer tick. The merger is called exactly once with all 8 inputs, not
-     * 7 times with 2 inputs each.
+     * Verifies that the policy passes all 8 candidates to the merger in a single
+     * call when {@code kwayMax=8}, rather than requiring 7 sequential 2-way rounds.
      *
-     * <p>This reproduces the gist1m / 8-initial-segments scenario from the issue.
-     * With the legacy byte-cap policy (perCycleMaxBytes=1 GiB, segments ~400 MiB
-     * each), only 2-3 segments were picked per cycle, forcing 7 sequential rounds.
-     * K-way picks all 8 in one shot.
+     * <p>The segments are sized to simulate the gist1m workload (400 MiB each) so
+     * that the legacy {@code perCycleMaxBytes=1 GiB} cap would have limited picks
+     * to 2 per cycle. The merger here is {@link InMemorySegmentMerger} — it does
+     * not exercise real graph I/O or peak heap/disk behaviour; it proves only the
+     * policy-to-engine contract (all 8 inputs passed in one call).
      */
     @Test
     public void eightSegmentsMergedInOneTickWithKway8() throws Exception {
-        long segBytes = 400L * 1024L * 1024L; // 400 MiB each — realistic for gist1m shards
+        long segBytes = 400L * 1024L * 1024L; // 400 MiB each — matches gist1m shard size
         for (int i = 0; i < 8; i++) {
             registry.createSegment(seg("seg-" + i, segBytes + i /* distinct sizes */));
         }
@@ -255,5 +268,69 @@ public class IndexOptimizerEngineKwayMergeTest {
         assertEquals("merger called once", 1, trackingMerger.getInvocations());
         assertEquals("legacy mode: perCycleMaxBytes caps at 2 inputs",
                 2, trackingMerger.getLastInputCount());
+    }
+
+    /**
+     * Drift-abort: one of the 8 candidates is externally deprecated (simulating
+     * an ownership change or another optimizer pod racing) DURING the merge call,
+     * i.e. between pick-candidates and the pre-publish revalidation. The engine
+     * must detect the drift in {@code revalidateInputsStillActive}, abort the
+     * publish, increment {@code mergeAbortsRevalidateFailedTotal}, and leave no
+     * orphan ACTIVE output.
+     *
+     * <p>This verifies that k-way's larger fan-in does not weaken the revalidation
+     * safety net — a drift in any one of the 8 inputs still causes an abort.
+     */
+    @Test
+    public void kwayAbortsMergeWhenInputDriftsDuringMerge() throws Exception {
+        for (int i = 0; i < 8; i++) {
+            registry.createSegment(seg("seg-" + i, 100L + i));
+        }
+
+        MergePolicy policy = new MergePolicy.AggressivePolicy(
+                10_000L, 1L, 200, 8);
+
+        // Capture the first input UUID the merger receives so we can deprecate it.
+        AtomicReference<String> firstInputUuid = new AtomicReference<>();
+        TrackingMerger trackingMerger = new TrackingMerger();
+        trackingMerger.mergeHook = () -> {
+            // Deprecate "seg-0" while the merge is running (before revalidation).
+            try {
+                VersionedSegmentMetadata seg0 =
+                        registry.getSegment(TS_UUID, IDX_UUID, "seg-0").orElseThrow();
+                firstInputUuid.set(seg0.metadata().getSegmentUuid());
+                // Initiate an ownership transfer on seg-0, which changes its state to
+                // TRANSFERRING — enough to fail the ACTIVE+version check in revalidate.
+                OwnershipTransfer.initiate(registry, seg0, /* newOwner */ 1);
+            } catch (Exception e) {
+                throw new RuntimeException("drift hook failed: " + e, e);
+            }
+        };
+
+        IndexOptimizerEngine engine = new IndexOptimizerEngine(
+                registry, trackingMerger, TS_UUID, policy,
+                60_000L, () -> 0, fakeClock::get);
+
+        engine.runOnce();
+
+        // Merger was still called (the drift happens inside merge(), before revalidate).
+        assertEquals("merger invoked once", 1, trackingMerger.getInvocations());
+        assertEquals("all 8 inputs passed to merger", 8, trackingMerger.getLastInputCount());
+
+        // Revalidation detected the drift → publish aborted.
+        assertEquals("merge aborted due to input drift",
+                1L, engine.getMergeAbortsRevalidateFailedTotal());
+        assertEquals("no output published", 0L, engine.getSegmentsMerged());
+
+        // No ACTIVE output segment must exist — only the 7 still-ACTIVE inputs
+        // (seg-1..seg-7) and the one TRANSFERRING segment (seg-0).
+        List<VersionedSegmentMetadata> all = registry.listSegments(TS_UUID, IDX_UUID);
+        long activeCount = all.stream()
+                .filter(v -> v.metadata().getState() == SegmentState.ACTIVE).count();
+        long transferringCount = all.stream()
+                .filter(v -> v.metadata().getState() == SegmentState.TRANSFERRING).count();
+        assertEquals("7 inputs remain ACTIVE (seg-1..seg-7)", 7L, activeCount);
+        assertEquals("seg-0 is TRANSFERRING (drifted)", 1L, transferringCount);
+        assertEquals("no other znodes created (output must be abandoned)", 8L, all.size());
     }
 }

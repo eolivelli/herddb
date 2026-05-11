@@ -222,7 +222,14 @@ public final class OptimizerConfiguration {
      * always respected regardless of this setting.
      */
     public static final String PROPERTY_MERGE_KWAY_MAX = "indexoptimizer.merge.kway.max";
-    public static final int PROPERTY_MERGE_KWAY_MAX_DEFAULT = 8;
+    /**
+     * Default is {@code 0} (disabled = legacy byte-cap mode) so that existing
+     * deployments are not silently affected by the larger per-cycle input footprint
+     * that k-way implies. Operators opt in by setting this to {@code >= 2}
+     * (e.g. {@code 8} for the gist1m workload) once they have verified the
+     * optimizer pod has enough heap and local disk for the fan-in.
+     */
+    public static final int PROPERTY_MERGE_KWAY_MAX_DEFAULT = 0;
 
     private final Properties properties;
 
