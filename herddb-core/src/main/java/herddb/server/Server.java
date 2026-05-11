@@ -506,10 +506,13 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                         dataDirectory, tmpDirectory, diskswapThreshold, client, dsmConfig,
                         statsLogger.scope("remote_storage"));
 
-                // Optionally enable checkpoint metadata publication to S3 for read replicas
+                // Enable checkpoint metadata publication by default in remote storage mode so that
+                // the Index Optimizer and read replicas can discover consistent checkpoint snapshots
+                // without requiring the operator to set the flag explicitly. Override to false only
+                // for unit tests or specialised read-replica scenarios that must suppress publishing.
                 boolean publishToRemote = configuration.getBoolean(
                         ServerConfiguration.PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE,
-                        ServerConfiguration.PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE_DEFAULT);
+                        true /* default true when storage.mode=remote */);
                 if (publishToRemote) {
                     LOGGER.log(Level.INFO, "Checkpoint metadata publication to remote storage enabled");
                     SharedCheckpointMetadata metaMgr = factory.createSharedCheckpointMetadata(client);
@@ -537,6 +540,11 @@ public class Server implements AutoCloseable, ServerSideConnectionAcceptor<Serve
                     LOGGER.log(Level.INFO,
                             "Replica-aware page retention enabled: min={0}ms, max={1}ms",
                             new Object[]{minRetentionMillis, maxRetentionMillis});
+                } else {
+                    LOGGER.log(Level.INFO,
+                            "Checkpoint metadata publication to remote storage disabled "
+                                    + "(set {0}=true to enable)",
+                            ServerConfiguration.PROPERTY_CHECKPOINT_PUBLISH_TO_REMOTE);
                 }
 
                 return dsm;
