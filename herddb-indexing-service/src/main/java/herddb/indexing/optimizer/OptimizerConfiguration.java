@@ -296,6 +296,56 @@ public final class OptimizerConfiguration {
     public static final String PROPERTY_INDEXING_NUM_INSTANCES = "indexoptimizer.indexing.num.instances";
     public static final int PROPERTY_INDEXING_NUM_INSTANCES_DEFAULT = 0;
 
+    // -------------------------------------------------------------------------
+    // Task queue lifecycle knobs (step 5)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Maximum retries for a failed task before it is moved to {@code POISON}
+     * (terminal-for-retry but does not block input re-selection).
+     */
+    public static final String PROPERTY_TASKS_MAX_ATTEMPTS = "indexoptimizer.tasks.max.attempts";
+    public static final int PROPERTY_TASKS_MAX_ATTEMPTS_DEFAULT = 3;
+
+    /**
+     * Retention window for terminal {@code DONE} / {@code FAILED} tasks before
+     * the orphan scanner GCs them. {@code POISON} uses
+     * {@link #PROPERTY_TASKS_POISON_RETENTION_MS} so operators have a longer
+     * window to investigate.
+     */
+    public static final String PROPERTY_TASKS_TERMINAL_RETENTION_MS =
+            "indexoptimizer.tasks.terminal.retention.ms";
+    public static final long PROPERTY_TASKS_TERMINAL_RETENTION_MS_DEFAULT = 3_600_000L;
+
+    /**
+     * Retention window for {@code POISON} tasks. Longer than the regular
+     * terminal retention because operators need time to investigate (default
+     * 7 days).
+     */
+    public static final String PROPERTY_TASKS_POISON_RETENTION_MS =
+            "indexoptimizer.tasks.poison.retention.ms";
+    public static final long PROPERTY_TASKS_POISON_RETENTION_MS_DEFAULT = 604_800_000L;
+
+    /**
+     * Minimum age of a {@code CLAIMED} task with no live lease znode before
+     * the orphan scanner considers it orphaned and resets / poisons it.
+     * Operators MUST configure this to be ≥ 2 × {@code zookeeper.session.timeout}
+     * so an actually-alive worker whose session is briefly disconnected does
+     * not get its task yanked from under it.
+     */
+    public static final String PROPERTY_TASKS_ORPHAN_RESET_MS =
+            "indexoptimizer.tasks.orphan.reset.ms";
+    public static final long PROPERTY_TASKS_ORPHAN_RESET_MS_DEFAULT = 30_000L;
+
+    /**
+     * Maximum number of consumer iterations per scheduler tick. Bounds the
+     * time spent draining the queue so the leader's producer step still gets
+     * cycles when the pod is busy.
+     */
+    public static final String PROPERTY_CONSUMER_MAX_TASKS_PER_TICK =
+            "indexoptimizer.consumer.max.tasks.per.tick";
+    public static final int PROPERTY_CONSUMER_MAX_TASKS_PER_TICK_DEFAULT = 4;
+
     private final Properties properties;
 
     public OptimizerConfiguration(Properties properties) {
