@@ -67,6 +67,22 @@ public class Config {
     int indexM = 16;
     int indexBeamWidth = 100;
     int indexNumShards = 4;
+    /**
+     * jvector {@code neighborOverflow} build parameter.  Controls how
+     * aggressively the graph builder admits slightly-suboptimal edges during
+     * construction.  Default 1.2 matches the jvector {@code GraphIndexBuilder}
+     * default.  Always emitted in the {@code CREATE VECTOR INDEX} DDL so the
+     * optimizer can read it from the index metadata (issue #520).
+     */
+    float indexNeighborOverflow = 1.2f;
+    /**
+     * jvector {@code alpha} build parameter.  Scales the minimum-spanning-tree
+     * pruning criterion.  Default 1.4 matches the jvector
+     * {@code GraphIndexBuilder} default.  Always emitted in the
+     * {@code CREATE VECTOR INDEX} DDL so the optimizer can read it from the
+     * index metadata (issue #520).
+     */
+    float indexAlpha = 1.4f;
     boolean skipIngest = false;
     boolean skipIndex = false;
     boolean skipVerify = false;
@@ -136,6 +152,12 @@ public class Config {
         opts.addOption(null, "index-num-shards", true,
                 "Vector index numShards (default: 4). Set to 1 to disable sharding; "
                         + "otherwise emitted as `numShards=N` in the CREATE VECTOR INDEX DDL.");
+        opts.addOption(null, "neighbor-overflow", true,
+                "jvector neighborOverflow build parameter (default: 1.2). "
+                        + "Always emitted in the CREATE VECTOR INDEX DDL so the optimizer can read it.");
+        opts.addOption(null, "alpha", true,
+                "jvector alpha build parameter (default: 1.4). "
+                        + "Always emitted in the CREATE VECTOR INDEX DDL so the optimizer can read it.");
         opts.addOption(null, "skip-ingest", false, "Skip ingestion phase");
         opts.addOption(null, "skip-index", false, "Skip index creation");
         opts.addOption(null, "skip-verify", false, "Skip row count verification after ingestion");
@@ -250,6 +272,12 @@ public class Config {
         }
         if (cmd.hasOption("index-num-shards")) {
             cfg.indexNumShards = Integer.parseInt(cmd.getOptionValue("index-num-shards"));
+        }
+        if (cmd.hasOption("neighbor-overflow")) {
+            cfg.indexNeighborOverflow = Float.parseFloat(cmd.getOptionValue("neighbor-overflow"));
+        }
+        if (cmd.hasOption("alpha")) {
+            cfg.indexAlpha = Float.parseFloat(cmd.getOptionValue("alpha"));
         }
         if (cmd.hasOption("skip-ingest")) {
             cfg.skipIngest = true;
@@ -401,6 +429,12 @@ public class Config {
         }
         if (props.containsKey("index-num-shards")) {
             indexNumShards = Integer.parseInt(props.getProperty("index-num-shards"));
+        }
+        if (props.containsKey("neighbor-overflow")) {
+            indexNeighborOverflow = Float.parseFloat(props.getProperty("neighbor-overflow"));
+        }
+        if (props.containsKey("alpha")) {
+            indexAlpha = Float.parseFloat(props.getProperty("alpha"));
         }
         if (props.containsKey("skip-ingest")) {
             skipIngest = Boolean.parseBoolean(props.getProperty("skip-ingest"));
@@ -583,6 +617,8 @@ public class Config {
                 + ", topK=" + topK
                 + ", indexM=" + indexM
                 + ", beamWidth=" + indexBeamWidth
+                + ", neighborOverflow=" + indexNeighborOverflow
+                + ", alpha=" + indexAlpha
                 + ", similarity=" + effectiveSimilarity()
                 + (similarity != null ? " (override)" : " (dataset default)")
                 + (resumeFrom > 0 ? ", resumeFrom=" + resumeFrom : "")

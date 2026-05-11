@@ -286,6 +286,17 @@ public class Index implements ColumnsList {
             return this;
         }
 
+        /**
+         * Adds {@code key=value} to this builder's properties only when
+         * {@code key} is not already present.  Used by
+         * {@link herddb.sql.JSQLParserPlanner} to materialize jvector
+         * defaults without overriding user-supplied values.
+         */
+        public Builder propertyIfAbsent(String key, String value) {
+            this.properties.putIfAbsent(key, value);
+            return this;
+        }
+
         public Builder column(String name, int type) {
             if (name == null || name.isEmpty()) {
                 throw new IllegalArgumentException();
