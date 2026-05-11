@@ -270,12 +270,15 @@ public final class OptimizerConfiguration {
     /**
      * Owner-selection policy applied at task creation time. One of
      * {@code FIXED_ZERO}, {@code ROUND_ROBIN}, {@code STATIC}, {@code LEAST_LOADED}.
-     * Step 1 default is {@code FIXED_ZERO} so behaviour is unchanged across
-     * the boundary; step 2 flips the default to {@code LEAST_LOADED} together
-     * with the live-instance discovery wiring.
+     * Default since step 2 is {@code LEAST_LOADED} (load-aware assignment via
+     * live-instance discovery from ZK ephemerals). Single-IS deployments and
+     * tests with no instance ephemerals keep producing {@code ownerInstanceId=0}
+     * because {@link ZkIndexingServiceInstanceDirectory} falls back to
+     * {@code [0..PROPERTY_INDEXING_NUM_INSTANCES)} (default 0 → empty → selector
+     * throws, engine logs and retries on the next tick).
      */
     public static final String PROPERTY_OWNER_SELECTOR_POLICY = "indexoptimizer.owner.selector.policy";
-    public static final String PROPERTY_OWNER_SELECTOR_POLICY_DEFAULT = "FIXED_ZERO";
+    public static final String PROPERTY_OWNER_SELECTOR_POLICY_DEFAULT = "LEAST_LOADED";
 
     /**
      * Comma-separated list of instance ordinals consumed cyclically by

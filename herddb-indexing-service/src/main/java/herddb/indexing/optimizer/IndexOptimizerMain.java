@@ -440,16 +440,22 @@ public final class IndexOptimizerMain {
                     + "avoid this fallback.");
             effectiveSafeMode = true;
         }
-        // Horizontal scalability — step 1: detect the pod role (LEADER for ordinal 0,
-        // WORKER otherwise) and resolve the owner-selector via OwnerSelectorFactory.
-        // Default policy stays FIXED_ZERO so this step preserves the legacy "every
-        // merged segment owned by instance 0" behaviour. Step 2 flips the factory
-        // default to LEAST_LOADED together with the live-instance discovery wiring.
+        // Horizontal scalability — step 2: detect the pod role (LEADER for ordinal 0,
+        // WORKER otherwise), discover live IS instances from ZK ephemerals, and wire
+        // a load-aware OwnerSelector that distributes merge outputs across them. Default
+        // policy is LEAST_LOADED; single-IS deployments fall back via the configured
+        // num-instances knob.
         OptimizerRole role = OptimizerRole.detect(configuration, System.getenv());
         boolean leaderExecutesTasks = configuration.getBoolean(
                 OptimizerConfiguration.PROPERTY_ROLE_LEADER_EXECUTE_TASKS,
                 OptimizerConfiguration.PROPERTY_ROLE_LEADER_EXECUTE_TASKS_DEFAULT);
-        OwnerSelector ownerSelector = OwnerSelectorFactory.create(configuration, /* probe */ null);
+        IndexingServiceInstanceDirectory instanceDirectory =
+                new ZkIndexingServiceInstanceDirectory(zkMeta,
+                        () -> configuration.getInt(
+                                OptimizerConfiguration.PROPERTY_INDEXING_NUM_INSTANCES,
+                                OptimizerConfiguration.PROPERTY_INDEXING_NUM_INSTANCES_DEFAULT));
+        InstanceLoadProbe loadProbe = new RegistryBackedInstanceLoadProbe(registry, instanceDirectory);
+        OwnerSelector ownerSelector = OwnerSelectorFactory.create(configuration, loadProbe);
         LOGGER.log(Level.INFO,
                 "optimizer pod role: {0} (leaderExecutesTasks={1}, ownerSelector={2})",
                 new Object[]{role, leaderExecutesTasks, ownerSelector.getClass().getSimpleName()});

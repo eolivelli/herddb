@@ -154,6 +154,10 @@ public class IndexOptimizerMainTest {
         // assertion (1 merge invocation) doesn't race with watcher-driven
         // wakeups from the createSegment / deprecate side-effects.
         props.setProperty(OptimizerConfiguration.PROPERTY_EVENT_DEBOUNCE_MS, "60000");
+        // Step 2 default is LEAST_LOADED which requires live IS instance ephemerals
+        // in ZK — this single-pod test doesn't register any, so pin to FIXED_ZERO
+        // to preserve the pre-step-2 "owner = 0" semantics for the merge output.
+        props.setProperty(OptimizerConfiguration.PROPERTY_OWNER_SELECTOR_POLICY, "FIXED_ZERO");
 
         InMemorySegmentMerger merger = new InMemorySegmentMerger();
         IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(props), merger);
