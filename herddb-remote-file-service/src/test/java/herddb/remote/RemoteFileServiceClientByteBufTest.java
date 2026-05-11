@@ -1184,4 +1184,74 @@ public class RemoteFileServiceClientByteBufTest {
                 client.maxInflightWriteBytes(),
                 client.availableInflightWriteBytes());
     }
+
+    // -----------------------------------------------------------------
+    // Issue #523 — oversized single-shot write (payload > cap) must not
+    // deadlock and must restore the budget exactly.
+    // -----------------------------------------------------------------
+
+    /**
+     * Regression test for issue #523: a single {@code writeFile} whose
+     * payload exceeds the configured inflight-write cap used to block
+     * forever on {@code Semaphore.acquireUninterruptibly(bytes)} because a
+     * semaphore can never grant more permits than its initial count.
+     *
+     * <p>The fix caps the acquisition to {@code min(bytes, writePermits)} and
+     * acquires on the slow path in {@link RemoteFileServiceClient#blockSize}-
+     * sized chunks. This test uses a cap equal to exactly one block (4 MiB)
+     * and a payload of two blocks (8 MiB); before the fix the test would hang
+     * until the 30-second {@code @Test(timeout)} fires.
+     */
+    @Test(timeout = 30_000)
+    public void testInflightWriteBytes_oversizedWriteDoesNotDeadlock() throws Exception {
+        int blockSize = RemoteFileServiceClient.DEFAULT_BLOCK_SIZE;
+        long cap = blockSize; // 1 block = 4 MiB cap
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, blockSize);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, cap);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            // 2× cap — with the old code this would deadlock:
+            // acquireUninterruptibly(2*cap) on a semaphore with cap permits.
+            byte[] payload = new byte[blockSize * 2];
+            Arrays.fill(payload, (byte) 0xAB);
+            tuned.writeFile("test/permits/write/oversized-nodead.bin", payload);
+            assertEquals("budget restored to cap (not to raw bytes) after oversized write",
+                    cap, tuned.availableInflightWriteBytes());
+        }
+    }
+
+    /**
+     * After an oversized {@code writeFile} (payload &gt; cap) completes, the
+     * inflight-write budget must be restored to exactly {@code cap} — not to
+     * the raw payload size. Before the fix, {@code reserveInflightWriteBytes}
+     * released {@code bytes} permits (the raw argument) rather than the number
+     * actually acquired ({@code min(bytes, writePermits)}), which would have
+     * over-inflated the semaphore and made subsequent reads of
+     * {@link RemoteFileServiceClient#availableInflightWriteBytes()} return a
+     * value larger than the configured cap.
+     */
+    @Test(timeout = 30_000)
+    public void testInflightWriteBytes_oversizedWriteReleasesExactAcquired() throws Exception {
+        int blockSize = RemoteFileServiceClient.DEFAULT_BLOCK_SIZE;
+        long cap = blockSize; // 1 block = 4 MiB cap
+        Map<String, Object> cfg = new HashMap<>();
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_BLOCK_SIZE, blockSize);
+        cfg.put(RemoteFileServiceClient.CONFIG_CLIENT_MAX_INFLIGHT_WRITE_BYTES, cap);
+        try (RemoteFileServiceClient tuned = new RemoteFileServiceClient(
+                Arrays.asList("localhost:" + server.getPort()), cfg)) {
+            assertEquals("budget starts at cap", cap, tuned.availableInflightWriteBytes());
+            // Write 3× cap to amplify any over-inflation: if release used raw
+            // bytes instead of acquired, available would jump to 3*cap after
+            // the first call and 6*cap after the second.
+            byte[] payload = new byte[blockSize * 3];
+            Arrays.fill(payload, (byte) 0xCD);
+            tuned.writeFile("test/permits/write/oversized-release1.bin", payload);
+            assertEquals("budget must equal cap after first oversized write (not 3*cap)",
+                    cap, tuned.availableInflightWriteBytes());
+            tuned.writeFile("test/permits/write/oversized-release2.bin", payload);
+            assertEquals("budget must equal cap after second oversized write (not 6*cap)",
+                    cap, tuned.availableInflightWriteBytes());
+        }
+    }
 }
