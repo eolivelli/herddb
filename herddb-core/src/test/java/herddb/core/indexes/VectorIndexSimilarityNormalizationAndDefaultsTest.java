@@ -22,6 +22,7 @@ package herddb.core.indexes;
 import static herddb.core.TestUtils.execute;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.fail;
 import herddb.core.DBManager;
 import herddb.file.FileCommitLogManager;
@@ -233,7 +234,7 @@ public class VectorIndexSimilarityNormalizationAndDefaultsTest {
             // similarity is NOT defaulted; it must be absent so the optimizer
             // raises a loud, actionable error rather than silently merging with
             // the wrong distance function.
-            assertEquals(null, idx.properties.get(VectorIndexManager.PROP_SIMILARITY));
+            assertNull(idx.properties.get(VectorIndexManager.PROP_SIMILARITY));
         }
     }
 
