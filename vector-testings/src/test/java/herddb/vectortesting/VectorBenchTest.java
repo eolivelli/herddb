@@ -154,7 +154,9 @@ class VectorBenchTest {
         assertEquals(
                 "CREATE VECTOR INDEX vidx ON vector_bench(vec)"
                         + " WITH m=16 beamWidth=100 similarity=" + cfg.effectiveSimilarity()
-                        + " fusedPQ=true numShards=4",
+                        + " fusedPQ=true"
+                        + " neighborOverflow=1.2 alpha=1.4"
+                        + " numShards=4",
                 sql);
     }
 
@@ -170,7 +172,8 @@ class VectorBenchTest {
         assertEquals(
                 "CREATE VECTOR INDEX vidx ON vector_bench(vec)"
                         + " WITH m=16 beamWidth=100 similarity=" + cfg.effectiveSimilarity()
-                        + " fusedPQ=true",
+                        + " fusedPQ=true"
+                        + " neighborOverflow=1.2 alpha=1.4",
                 sql);
     }
 
@@ -211,8 +214,147 @@ class VectorBenchTest {
         assertEquals(
                 "CREATE VECTOR INDEX vidx ON my_vectors(vec)"
                         + " WITH m=32 beamWidth=200 similarity=cosine"
-                        + " fusedPQ=true numShards=2",
+                        + " fusedPQ=true"
+                        + " neighborOverflow=1.2 alpha=1.4"
+                        + " numShards=2",
                 sql);
+    }
+
+    // -----------------------------------------------------------------------
+    // --neighbor-overflow / --alpha  (issue #520)
+    // -----------------------------------------------------------------------
+
+    @Test
+    void configNeighborOverflowDefaultIs1_2() throws Exception {
+        Config cfg = Config.parse(new String[]{});
+        assertEquals(1.2f, cfg.indexNeighborOverflow, 0.0001f);
+    }
+
+    @Test
+    void configAlphaDefaultIs1_4() throws Exception {
+        Config cfg = Config.parse(new String[]{});
+        assertEquals(1.4f, cfg.indexAlpha, 0.0001f);
+    }
+
+    @Test
+    void configNeighborOverflowParsedFromCli() throws Exception {
+        Config cfg = Config.parse(new String[]{"--neighbor-overflow", "1.5"});
+        assertEquals(1.5f, cfg.indexNeighborOverflow, 0.0001f);
+    }
+
+    @Test
+    void configAlphaParsedFromCli() throws Exception {
+        Config cfg = Config.parse(new String[]{"--alpha", "2.0"});
+        assertEquals(2.0f, cfg.indexAlpha, 0.0001f);
+    }
+
+    @Test
+    void buildCreateVectorIndexSqlIncludesNeighborOverflowAndAlpha() throws Exception {
+        Config cfg = Config.parse(new String[]{
+                "--neighbor-overflow", "1.5",
+                "--alpha", "2.0"
+        });
+
+        String sql = VectorBench.buildCreateVectorIndexSql(cfg);
+
+        org.junit.jupiter.api.Assertions.assertTrue(
+                sql.contains("neighborOverflow=1.5"),
+                "SQL must include neighborOverflow=1.5; got: " + sql);
+        org.junit.jupiter.api.Assertions.assertTrue(
+                sql.contains("alpha=2.0"),
+                "SQL must include alpha=2.0; got: " + sql);
+    }
+
+    @Test
+    void configNeighborOverflowAndAlphaParsedFromPropertiesFile(@TempDir java.io.File tmpDir)
+            throws Exception {
+        java.io.File props = new java.io.File(tmpDir, "bench.properties");
+        try (java.io.PrintWriter pw = new java.io.PrintWriter(props)) {
+            pw.println("neighbor-overflow=1.6");
+            pw.println("alpha=1.8");
+        }
+        Config cfg = Config.parse(new String[]{"--config", props.getAbsolutePath()});
+        assertEquals(1.6f, cfg.indexNeighborOverflow, 0.0001f);
+        assertEquals(1.8f, cfg.indexAlpha, 0.0001f);
+    }
+
+    @Test
+    void configToStringIncludesNeighborOverflowAndAlpha() throws Exception {
+        Config cfg = Config.parse(new String[]{
+                "--neighbor-overflow", "1.3",
+                "--alpha", "1.5"
+        });
+        String s = cfg.toString();
+        org.junit.jupiter.api.Assertions.assertTrue(
+                s.contains("neighborOverflow=1.3"),
+                "toString() must include neighborOverflow=1.3; got: " + s);
+        org.junit.jupiter.api.Assertions.assertTrue(
+                s.contains("alpha=1.5"),
+                "toString() must include alpha=1.5; got: " + s);
+    }
+
+    @Test
+    void neighborOverflowZeroIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--neighbor-overflow", "0"}),
+                "--neighbor-overflow=0 must be rejected");
+    }
+
+    @Test
+    void neighborOverflowNegativeIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--neighbor-overflow", "-1.0"}),
+                "--neighbor-overflow=-1.0 must be rejected");
+    }
+
+    @Test
+    void neighborOverflowNaNIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--neighbor-overflow", "NaN"}),
+                "--neighbor-overflow=NaN must be rejected");
+    }
+
+    @Test
+    void neighborOverflowInfinityIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--neighbor-overflow", "Infinity"}),
+                "--neighbor-overflow=Infinity must be rejected");
+    }
+
+    @Test
+    void alphaZeroIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--alpha", "0"}),
+                "--alpha=0 must be rejected");
+    }
+
+    @Test
+    void alphaNegativeIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--alpha", "-0.5"}),
+                "--alpha=-0.5 must be rejected");
+    }
+
+    @Test
+    void alphaNaNIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--alpha", "NaN"}),
+                "--alpha=NaN must be rejected");
+    }
+
+    @Test
+    void alphaInfinityIsRejected() {
+        org.junit.jupiter.api.Assertions.assertThrows(
+                org.apache.commons.cli.ParseException.class,
+                () -> Config.parse(new String[]{"--alpha", "Infinity"}),
+                "--alpha=Infinity must be rejected");
     }
 
     @Test

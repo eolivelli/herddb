@@ -67,6 +67,22 @@ public class Config {
     int indexM = 16;
     int indexBeamWidth = 100;
     int indexNumShards = 4;
+    /**
+     * jvector {@code neighborOverflow} build parameter.  Controls how
+     * aggressively the graph builder admits slightly-suboptimal edges during
+     * construction.  Default 1.2 matches the jvector {@code GraphIndexBuilder}
+     * default.  Always emitted in the {@code CREATE VECTOR INDEX} DDL so the
+     * optimizer can read it from the index metadata (issue #520).
+     */
+    float indexNeighborOverflow = 1.2f;
+    /**
+     * jvector {@code alpha} build parameter.  Scales the minimum-spanning-tree
+     * pruning criterion.  Default 1.4 matches the jvector
+     * {@code GraphIndexBuilder} default.  Always emitted in the
+     * {@code CREATE VECTOR INDEX} DDL so the optimizer can read it from the
+     * index metadata (issue #520).
+     */
+    float indexAlpha = 1.4f;
     boolean skipIngest = false;
     boolean skipIndex = false;
     boolean skipVerify = false;
@@ -136,12 +152,18 @@ public class Config {
         opts.addOption(null, "index-num-shards", true,
                 "Vector index numShards (default: 4). Set to 1 to disable sharding; "
                         + "otherwise emitted as `numShards=N` in the CREATE VECTOR INDEX DDL.");
+        opts.addOption(null, "neighbor-overflow", true,
+                "jvector neighborOverflow build parameter (default: 1.2). "
+                        + "Always emitted in the CREATE VECTOR INDEX DDL so the optimizer can read it.");
+        opts.addOption(null, "alpha", true,
+                "jvector alpha build parameter (default: 1.4). "
+                        + "Always emitted in the CREATE VECTOR INDEX DDL so the optimizer can read it.");
         opts.addOption(null, "skip-ingest", false, "Skip ingestion phase");
         opts.addOption(null, "skip-index", false, "Skip index creation");
         opts.addOption(null, "skip-verify", false, "Skip row count verification after ingestion");
         opts.addOption(null, "drop-table", false, "Drop table before starting");
         opts.addOption(null, "checkpoint", false, "Force checkpoint after ingestion and after index creation");
-        opts.addOption(null, "similarity", true, "Similarity function: euclidean, cosine, dot (default: from dataset)");
+        opts.addOption(null, "similarity", true, "Similarity function: euclidean, cosine, dot_product (default: from dataset)");
         opts.addOption(null, "client-timeout", true, "Client request timeout in seconds (default: 7200)");
         opts.addOption(null, "index-before-ingest", false, "Create vector index before ingestion instead of after");
         opts.addOption(null, "resume-from", true,
@@ -251,6 +273,12 @@ public class Config {
         if (cmd.hasOption("index-num-shards")) {
             cfg.indexNumShards = Integer.parseInt(cmd.getOptionValue("index-num-shards"));
         }
+        if (cmd.hasOption("neighbor-overflow")) {
+            cfg.indexNeighborOverflow = Float.parseFloat(cmd.getOptionValue("neighbor-overflow"));
+        }
+        if (cmd.hasOption("alpha")) {
+            cfg.indexAlpha = Float.parseFloat(cmd.getOptionValue("alpha"));
+        }
         if (cmd.hasOption("skip-ingest")) {
             cfg.skipIngest = true;
         }
@@ -317,6 +345,7 @@ public class Config {
         // ParseException because they are user-supplied configuration errors and
         // the rest of parse() also throws ParseException for input issues.
         validateBatchAndTransactionInvariants(cfg);
+        validateIndexBuildParams(cfg);
 
         // Env var fallbacks (only applied when the CLI flag was not set).
         if (!cmd.hasOption("no-progress") && !cfg.noProgress) {
@@ -401,6 +430,12 @@ public class Config {
         }
         if (props.containsKey("index-num-shards")) {
             indexNumShards = Integer.parseInt(props.getProperty("index-num-shards"));
+        }
+        if (props.containsKey("neighbor-overflow")) {
+            indexNeighborOverflow = Float.parseFloat(props.getProperty("neighbor-overflow"));
+        }
+        if (props.containsKey("alpha")) {
+            indexAlpha = Float.parseFloat(props.getProperty("alpha"));
         }
         if (props.containsKey("skip-ingest")) {
             skipIngest = Boolean.parseBoolean(props.getProperty("skip-ingest"));
@@ -541,6 +576,28 @@ public class Config {
         }
     }
 
+    /**
+     * Validates the jvector index-build float parameters.
+     *
+     * <ul>
+     *   <li>{@code neighborOverflow} must be finite and {@code > 0}</li>
+     *   <li>{@code alpha} must be finite and {@code > 0}</li>
+     * </ul>
+     *
+     * @throws ParseException if any invariant is violated, with a message that
+     *         names the offending parameter and its value.
+     */
+    static void validateIndexBuildParams(Config cfg) throws ParseException {
+        if (!Float.isFinite(cfg.indexNeighborOverflow) || cfg.indexNeighborOverflow <= 0) {
+            throw new ParseException("--neighbor-overflow must be a finite positive number, got "
+                    + cfg.indexNeighborOverflow);
+        }
+        if (!Float.isFinite(cfg.indexAlpha) || cfg.indexAlpha <= 0) {
+            throw new ParseException("--alpha must be a finite positive number, got "
+                    + cfg.indexAlpha);
+        }
+    }
+
     /** Returns the similarity function: CLI override if set, otherwise dataset default. */
     String effectiveSimilarity() {
         return similarity != null ? similarity : dataset.similarity;
@@ -583,6 +640,8 @@ public class Config {
                 + ", topK=" + topK
                 + ", indexM=" + indexM
                 + ", beamWidth=" + indexBeamWidth
+                + ", neighborOverflow=" + indexNeighborOverflow
+                + ", alpha=" + indexAlpha
                 + ", similarity=" + effectiveSimilarity()
                 + (similarity != null ? " (override)" : " (dataset default)")
                 + (resumeFrom > 0 ? ", resumeFrom=" + resumeFrom : "")

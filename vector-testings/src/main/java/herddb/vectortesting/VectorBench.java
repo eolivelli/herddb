@@ -55,7 +55,11 @@ public class VectorBench {
                 .append(" WITH m=").append(config.indexM)
                 .append(" beamWidth=").append(config.indexBeamWidth)
                 .append(" similarity=").append(config.effectiveSimilarity())
-                .append(" fusedPQ=true");
+                .append(" fusedPQ=true")
+                // Issue #520: always emit neighborOverflow and alpha so the index
+                // metadata is complete and the optimizer can read them without failing.
+                .append(" neighborOverflow=").append(config.indexNeighborOverflow)
+                .append(" alpha=").append(config.indexAlpha);
         if (config.indexNumShards > 1) {
             // Use key=value syntax to match every other property in the WITH
             // clause. Space-separated "numShards 4" was silently dropped by

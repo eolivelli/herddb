@@ -30,6 +30,7 @@ import herddb.core.AbstractTableManager;
 import herddb.core.DBManager;
 import herddb.core.HerdDBInternalException;
 import herddb.core.TableSpaceManager;
+import herddb.index.vector.VectorIndexManager;
 import herddb.metadata.MetadataStorageManagerException;
 import herddb.model.AutoIncrementPrimaryKeyRecordFunction;
 import herddb.model.Column;
@@ -102,12 +103,14 @@ import herddb.sql.functions.BuiltinFunctions;
 import herddb.utils.Bytes;
 import herddb.utils.IntHolder;
 import herddb.utils.SQLUtils;
+import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -752,6 +755,13 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
                 parseIndexWithClause(tailParams, builder);
             }
 
+            // Issue #520: for VECTOR indexes, fill in jvector defaults for any property
+            // the user omitted so every downstream consumer (optimizer, replicas) sees a
+            // complete, canonical property set.  User-supplied values are never overwritten.
+            if (herddb.model.Index.TYPE_VECTOR.equals(indexType)) {
+                materializeVectorIndexDefaults(builder);
+            }
+
             CreateIndexStatement statement = new CreateIndexStatement(builder.build());
             return statement;
         } catch (IllegalArgumentException err) {
@@ -801,6 +811,11 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
             if (key.isEmpty() || value.isEmpty()) {
                 throw new StatementExecutionException(
                         "invalid index property syntax: expected key=value but got '" + part + "'");
+            }
+            // Issue #521: normalize similarity to UPPERCASE so every downstream consumer
+            // sees a canonical value regardless of how the user typed it in the DDL.
+            if (VectorIndexManager.PROP_SIMILARITY.equalsIgnoreCase(key)) {
+                value = normalizeSimilarityOrThrow(value);
             }
             builder.property(key, value);
         }
@@ -867,7 +882,14 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
                         "invalid index property syntax: expected key=value but got '"
                                 + part + "' in WITH clause '" + withText + "'");
             }
-            props.put(part.substring(0, eq).trim(), part.substring(eq + 1).trim());
+            String key = part.substring(0, eq).trim();
+            String value = part.substring(eq + 1).trim();
+            // Issue #521: normalize similarity to the canonical UPPERCASE form so every
+            // downstream consumer (optimizer, replicas) sees a consistent value.
+            if (VectorIndexManager.PROP_SIMILARITY.equalsIgnoreCase(key)) {
+                value = normalizeSimilarityOrThrow(value);
+            }
+            props.put(key, value);
         }
 
         if (!props.isEmpty()) {
@@ -899,6 +921,61 @@ public class JSQLParserPlanner extends AbstractSQLPlanner {
                 throw new StatementExecutionException("Invalid index type " + indexType);
         }
         return indexType;
+    }
+
+    /**
+     * Normalizes a user-supplied similarity value (e.g. {@code "euclidean"}) to
+     * the canonical UPPERCASE form expected by {@code VectorSimilarityFunction.valueOf}.
+     * Throws {@link StatementExecutionException} with a clear message when the value
+     * is {@code null}, empty, or not one of the known enum constants. Issue #521.
+     */
+    static String normalizeSimilarityOrThrow(String raw) throws StatementExecutionException {
+        if (raw == null || raw.isEmpty()) {
+            throw new StatementExecutionException(
+                    "invalid similarity '" + raw + "': expected one of "
+                    + Arrays.toString(VectorSimilarityFunction.values()));
+        }
+        String upper = raw.toUpperCase(Locale.ROOT);
+        try {
+            VectorSimilarityFunction.valueOf(upper);
+        } catch (IllegalArgumentException e) {
+            throw new StatementExecutionException(
+                    "invalid similarity '" + raw + "': expected one of "
+                    + Arrays.toString(VectorSimilarityFunction.values()), e);
+        }
+        return upper;
+    }
+
+    /**
+     * Fills in jvector build-parameter defaults on a VECTOR {@link herddb.model.Index.Builder}
+     * for any property the user omitted in the {@code WITH} clause. Issue #520.
+     *
+     * <p>Defaults applied:
+     * <ul>
+     *   <li>{@code m=16}</li>
+     *   <li>{@code beamWidth=100}</li>
+     *   <li>{@code neighborOverflow=1.2}</li>
+     *   <li>{@code alpha=1.4}</li>
+     *   <li>{@code fusedPQ=false}</li>
+     * </ul>
+     *
+     * <p>{@code similarity} is intentionally <em>not</em> defaulted: different
+     * datasets use different distance functions (EUCLIDEAN vs COSINE vs DOT_PRODUCT)
+     * and silently defaulting to the wrong one would degrade recall without any
+     * error signal.  The optimizer ({@code RemoteMetadataIndexMergeConfigProvider})
+     * will raise a loud error when {@code similarity} is absent, steering the
+     * operator to fix the DDL explicitly.
+     *
+     * <p>User-supplied values (already applied to the builder via
+     * {@link herddb.model.Index.Builder#property}) are never overwritten because
+     * {@link herddb.model.Index.Builder#propertyIfAbsent} uses {@code putIfAbsent}.
+     */
+    private static void materializeVectorIndexDefaults(herddb.model.Index.Builder builder) {
+        builder.propertyIfAbsent(VectorIndexManager.PROP_M, "16");
+        builder.propertyIfAbsent(VectorIndexManager.PROP_BEAM_WIDTH, "100");
+        builder.propertyIfAbsent(VectorIndexManager.PROP_NEIGHBOR_OVERFLOW, "1.2");
+        builder.propertyIfAbsent(VectorIndexManager.PROP_ALPHA, "1.4");
+        builder.propertyIfAbsent(VectorIndexManager.PROP_FUSED_PQ, "false");
     }
 
     public static int sqlDataTypeToColumnType(ColDataType dataType) throws StatementExecutionException {
