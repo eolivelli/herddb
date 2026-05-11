@@ -73,6 +73,7 @@ flowchart LR
     ISvcP["Primary<br/>(writes index)"]
     ISvcS1["Shadow 1<br/>(read-only)"]
     ISvcS2["Shadow 2<br/>(read-only)"]
+    IndexOpt["Index Optimizer<br/>(singleton; merges<br/>segments in background)"]
   end
 
   subgraph "Storage tier"
@@ -95,14 +96,16 @@ flowchart LR
   ISvcP --> RFS
   ISvcS1 --> RFS
   ISvcS2 --> RFS
+  IndexOpt --> RFS
   RFS --> OBJ
 
   Leader -. elect / heartbeat .-> ZK
   Replica -. watch checkpoint state .-> ZK
   Leader -. discover indexing instances .-> ZK
-  ISvcP -. publish IndexStatus .-> ZK
+  ISvcP -. publish IndexStatus + segments .-> ZK
   ISvcS1 -. watch .-> ZK
   ISvcS2 -. watch .-> ZK
+  IndexOpt -. CAS register / deprecate segments .-> ZK
 ```
 
 The rest of this section zooms in on individual layers.
@@ -296,18 +299,30 @@ flowchart LR
     S3["Shadow N"]
   end
 
+  subgraph Optimizer["Index Optimizer (singleton, background)"]
+    O["Watches segment registry → merges<br/>small segments → publishes output,<br/>CAS-deprecates inputs"]
+  end
+
   JDBC["JDBC client"]
   Server["HerdDB server<br/>(vector-search LB)"]
 
   WAL --> P
   P -->|write segments + status| OBJ
-  P -->|publish durable LSN| ZK
+  P -->|publish durable LSN + segments| ZK
   ZK -. notify .-> S1
   ZK -. notify .-> S2
   ZK -. notify .-> S3
   OBJ -. reload IndexStatus .-> S1
   OBJ -. reload IndexStatus .-> S2
   OBJ -. reload IndexStatus .-> S3
+
+  ZK -. watch new sealed segments .-> O
+  O -->|read inputs / write merged output| OBJ
+  O -. CAS register + deprecate segments .-> ZK
+  ZK -. notify merged segment .-> P
+  ZK -. notify merged segment .-> S1
+  ZK -. notify merged segment .-> S2
+  ZK -. notify merged segment .-> S3
 
   JDBC -->|SQL search| Server
   Server -. gRPC search .-> P
@@ -320,6 +335,51 @@ Scope is strictly horizontal **read** scalability. Shadow-to-primary
 promotion is explicitly out of scope, and shadows require
 `indexing.storage.type=remote` (i.e. shared storage) — any other
 configuration fails fast at boot.
+
+#### Index Optimizer (background segment merger)
+
+Every checkpoint that a primary writes produces fresh on-disk segments;
+left alone, segments accumulate and queries fan out across more and more
+of them, dragging vector-search latency. The **Index Optimizer** is a
+separate JVM that runs continuously in the background, picks small
+sealed segments, fuses them into a single larger graph, and atomically
+swaps the larger output in for the inputs — keeping the per-query
+fan-out bounded while data grows.
+
+It only runs in the **vector-search deployment profile** alongside the
+indexing service: it requires cluster mode, the Remote File Service,
+and segments living on shared object storage. It will not start
+otherwise.
+
+**Coordination via a ZK segment registry.** Each indexing-service
+primary publishes every newly-sealed segment to a ZooKeeper segment
+registry (`/{basePath}/index-segments/{tablespaceUuid}/{indexUuid}/...`)
+via `SegmentRegistryPublisher`. The optimizer watches that registry,
+downloads merge inputs from the Remote File Service, writes the merged
+output back, CAS-creates the new segment znode, and CAS-deprecates the
+inputs — every state transition is a ZooKeeper CAS, so a stray second
+optimizer cannot corrupt anything (it would simply lose every race).
+The primary and shadows watch the same registry via
+`SegmentAssignmentWatcher` and live-reload merged outputs without a
+restart.
+
+**Singleton deployment.** Packaged inside `herddb-services` and shipped
+in the Helm chart as a separate StatefulSet (`replicas: 1`,
+`herddb-kubernetes/.../templates/index-optimizer-statefulset.yaml`)
+with its own ConfigMap, a Pod Disruption Budget, and a small PVC for
+merge scratch files. An `OptimizerLeaderLock` ephemeral znode
+additionally guards against two optimizers racing on the same
+tablespace during a rolling upgrade.
+
+**Pressure-driven IS-local fallback.** The indexing service keeps its
+own in-process compaction loop, but with the optimizer enabled that
+loop becomes a fallback — it short-circuits in steady state and only
+fires when locally-observed segment count crosses a kick-fraction
+threshold, signalling that the optimizer is falling behind.
+
+Details: [VECTOR.md §`index-optimizer` service](./VECTOR.md) (merge
+policies, ZK registry shape, configuration knobs, operational
+requirements).
 
 Details: [VECTOR.md](./VECTOR.md) (architecture, SQL, shard
 lifecycle), [VECTOR_SEARCH_METRICS.md](./VECTOR_SEARCH_METRICS.md)
