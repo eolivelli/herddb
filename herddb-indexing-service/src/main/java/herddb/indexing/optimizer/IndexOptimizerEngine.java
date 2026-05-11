@@ -492,6 +492,60 @@ public final class IndexOptimizerEngine {
     }
 
     /**
+     * Step-7 production path: lists indexes and reaps every DEPRECATED segment
+     * whose retention has elapsed. Called by {@link IndexOptimizerMain} on the
+     * leader at every scheduler tick. The legacy {@link #runOnce} flow is kept
+     * intact for back-compat tests that exercise the full inline merge cycle
+     * (pick / merge / publish / deprecate) — production no longer calls it.
+     */
+    public void reapDeprecatedSegments(long now) throws SegmentRegistryException {
+        List<String> indexes = registry.listIndexes(tablespaceUuid);
+        long activeTotal = 0;
+        long deprecatedTotal = 0;
+        long transferringTotal = 0;
+        long provisionalTotal = 0;
+        for (String indexUuid : indexes) {
+            List<VersionedSegmentMetadata> all;
+            try {
+                all = registry.listSegments(tablespaceUuid, indexUuid);
+            } catch (SegmentRegistryException e) {
+                LOGGER.log(Level.WARNING,
+                        "reaper failed to list segments for index " + indexUuid, e);
+                continue;
+            }
+            for (VersionedSegmentMetadata v : all) {
+                switch (v.metadata().getState()) {
+                    case ACTIVE:
+                        activeTotal++;
+                        break;
+                    case DEPRECATED:
+                        deprecatedTotal++;
+                        long retentionUntil = v.metadata().getRetentionUntilEpochMillis();
+                        if (retentionUntil != SegmentMetadata.NO_RETENTION && now >= retentionUntil) {
+                            deleteRetainedSegment(v);
+                        }
+                        break;
+                    case TRANSFERRING:
+                        transferringTotal++;
+                        break;
+                    case PROVISIONAL:
+                        provisionalTotal++;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+        observedIndexes.set(indexes.size());
+        observedActiveSegments.set(activeTotal);
+        observedDeprecatedSegments.set(deprecatedTotal);
+        observedTransferringSegments.set(transferringTotal);
+        observedProvisionalSegments.set(provisionalTotal);
+        lastRunAtMillis.set(now);
+        runs.incrementAndGet();
+    }
+
+    /**
      * Runs one optimizer tick. Throws {@link SegmentRegistryException} only on
      * top-level registry failures (e.g. ZK session expiry while listing indexes);
      * per-index failures are caught internally and logged, so a single bad index

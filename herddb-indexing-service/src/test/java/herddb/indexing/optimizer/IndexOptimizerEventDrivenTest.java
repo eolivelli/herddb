@@ -145,6 +145,14 @@ public class IndexOptimizerEventDrivenTest {
         // Disable HTTP probe — keeps the test self-contained.
         props.setProperty(OptimizerConfiguration.PROPERTY_HTTP_PORT, "0");
         props.setProperty(OptimizerConfiguration.PROPERTY_RETENTION_MS, "60000");
+        // Step 7 wiring: production tickSafe routes through producer + consumer
+        // for the LEADER role; pin LEADER so engine.runs (the assertion below)
+        // increments via engine.reapDeprecatedSegments. Without this the auto
+        // detection falls back to WORKER (HOSTNAME does not match the K8s
+        // StatefulSet pattern in tests) and the LEADER branch is skipped.
+        props.setProperty(OptimizerConfiguration.PROPERTY_ROLE_IS_LEADER, "true");
+        props.setProperty(OptimizerConfiguration.PROPERTY_OWNER_SELECTOR_POLICY, "FIXED_ZERO");
+        props.setProperty(OptimizerConfiguration.PROPERTY_TASKS_ORPHAN_RESET_MS, "120000");
 
         InMemorySegmentMerger merger = new InMemorySegmentMerger();
         IndexOptimizerMain main = new IndexOptimizerMain(

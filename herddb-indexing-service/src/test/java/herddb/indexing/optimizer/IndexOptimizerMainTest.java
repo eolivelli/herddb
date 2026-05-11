@@ -158,6 +158,12 @@ public class IndexOptimizerMainTest {
         // in ZK — this single-pod test doesn't register any, so pin to FIXED_ZERO
         // to preserve the pre-step-2 "owner = 0" semantics for the merge output.
         props.setProperty(OptimizerConfiguration.PROPERTY_OWNER_SELECTOR_POLICY, "FIXED_ZERO");
+        // Step 7: pin role to LEADER so the single-pod test reliably drives
+        // the producer + consumer through tickSafe (the default "auto" detection
+        // falls back to WORKER when HOSTNAME doesn't match the StatefulSet regex).
+        props.setProperty(OptimizerConfiguration.PROPERTY_ROLE_IS_LEADER, "true");
+        // orphan.reset.ms must be >= 2 × session timeout (startup validation).
+        props.setProperty(OptimizerConfiguration.PROPERTY_TASKS_ORPHAN_RESET_MS, "120000");
 
         InMemorySegmentMerger merger = new InMemorySegmentMerger();
         IndexOptimizerMain main = new IndexOptimizerMain(new OptimizerConfiguration(props), merger);

@@ -335,7 +335,9 @@ public final class OptimizerConfiguration {
      */
     public static final String PROPERTY_TASKS_ORPHAN_RESET_MS =
             "indexoptimizer.tasks.orphan.reset.ms";
-    public static final long PROPERTY_TASKS_ORPHAN_RESET_MS_DEFAULT = 30_000L;
+    // 120 s default — comfortably above the 2 × 40 s default ZK session timeout
+    // floor enforced at startup (see IndexOptimizerMain.start).
+    public static final long PROPERTY_TASKS_ORPHAN_RESET_MS_DEFAULT = 120_000L;
 
     /**
      * Maximum number of consumer iterations per scheduler tick. Bounds the
