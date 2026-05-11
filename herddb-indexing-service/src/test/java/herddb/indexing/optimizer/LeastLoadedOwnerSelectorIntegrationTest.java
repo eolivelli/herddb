@@ -220,4 +220,23 @@ public class LeastLoadedOwnerSelectorIntegrationTest {
         // Fallback is ignored when ZK reports live primaries.
         assertArrayEquals(new int[]{0, 1}, directory.liveInstanceOrdinals());
     }
+
+    @Test
+    public void registryFailureSurfacesAsSelectorThrow() throws Exception {
+        registerPrimary(0);
+        registerPrimary(1);
+        // Close the ZK session out from under the probe. The next
+        // listSegments() call will fail with SegmentRegistryException; the probe
+        // catches it and returns an empty array; the selector treats that as
+        // "no live instances" and throws, letting the engine's tick handler
+        // record a merge failure and retry on the next tick.
+        zk.close();
+        LeastLoadedOwnerSelector sel = selector(0);
+        try {
+            sel.selectOwner(TS_UUID, IDX_UUID);
+            fail("expected IllegalStateException");
+        } catch (IllegalStateException ok) {
+            assertTrue(ok.getMessage().contains("no live instances"));
+        }
+    }
 }

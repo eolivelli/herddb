@@ -76,6 +76,9 @@ public final class ZkIndexingServiceInstanceDirectory implements IndexingService
         if (ordinals.isEmpty()) {
             int n = fallbackNumInstances.getAsInt();
             if (n > 0) {
+                LOGGER.log(Level.FINE,
+                        "no live IS primaries discoverable from ZK; using configured fallback {0}",
+                        n);
                 IntStream.range(0, n).forEach(ordinals::add);
             }
         }
